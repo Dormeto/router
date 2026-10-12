@@ -157,7 +157,8 @@ test('resume removes the operator pause only: the router pause and an exclusion 
 test('request-nap: refused with the reason while paused or not awake, else the nap runs in its own invocation', async () => {
   const s = setup({ run: { state: STATES.AWAKE } });
   assert.deepEqual(await s.handler({ action: 'request-nap', workloadId: 'demo', by: 'ops' }), { requested: true });
-  assert.deepEqual(s.invocations, [{ action: 'nap', workloadId: 'demo' }]);
+  // Who asked goes with it (the state change says the manager asked).
+  assert.deepEqual(s.invocations, [{ action: 'nap', workloadId: 'demo', by: 'ops' }]);
   await s.handler(pauseEvent());
   assert.deepEqual(await s.handler({ action: 'request-nap', workloadId: 'demo', by: 'ops' }), { requested: false, reason: 'paused by ops@example.com: incident 42' });
   const asleep = setup({ run: { state: STATES.ASLEEP }, instance: 'stopped', target: 'waker' });

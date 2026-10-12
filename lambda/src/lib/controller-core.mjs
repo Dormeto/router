@@ -87,7 +87,7 @@ export function createController({
     };
     const fail = async (err) => {
       log.error('WakeFailed', { workloadId, wakeId, error: err.message });
-      await store.transition(workloadId, { cond: { state: STATES.WAKING, wakeId }, set: { state: STATES.FAILED, failedAt: now(), holders: 0 } });
+      await store.transition(workloadId, { cond: { state: STATES.WAKING, wakeId }, set: { state: STATES.FAILED, failedAt: now(), holders: 0 }, cause: 'wake-failed' });
       return { state: STATES.FAILED, error: err.message };
     };
     let run;
@@ -129,7 +129,8 @@ export function createController({
     }
   }
 
-  async function nap(workloadId) {
+  // cause: what asked for it, the idle check or the manager (the state change event says so).
+  async function nap(workloadId, { cause = 'idle' } = {}) {
     const cfg = await config(workloadId);
     // A nap requested before a pause (idle check, manager) is refused when it starts.
     if (await isPaused(workloadId)) {
@@ -152,6 +153,7 @@ export function createController({
       cond: { state: STATES.AWAKE },
       set: { state: STATES.NAPPING, napBackends: JSON.stringify(backends.map(toRecord)) },
       remove: ['pendingWake'],
+      cause,
     });
     if (!napping) return { state: 'SKIPPED' };
     log.info('NapStarted', { workloadId });
@@ -168,6 +170,7 @@ export function createController({
           cond: { state: STATES.NAPPING },
           set: { state: STATES.AWAKE, awakeSince: now() },
           remove: ['pendingWake', 'stopping'],
+          cause: paused ? 'paused' : 'pending-wake',
         });
         log.info('NapAborted', { workloadId, ...(paused ? { reason: 'paused' } : {}) });
         return { state: STATES.AWAKE, aborted: true };
@@ -178,7 +181,7 @@ export function createController({
       }
     } catch (err) {
       log.error('NapFailed', { workloadId, error: err.message });
-      await store.transition(workloadId, { cond: { state: STATES.NAPPING }, set: { state: STATES.FAILED, failedAt: now(), holders: 0 }, remove: ['stopping'] });
+      await store.transition(workloadId, { cond: { state: STATES.NAPPING }, set: { state: STATES.FAILED, failedAt: now(), holders: 0 }, remove: ['stopping'], cause: 'nap-failed' });
       return { state: STATES.FAILED, error: err.message };
     }
     const asleep = await store.transition(workloadId, { cond: { state: STATES.NAPPING, pendingWake: false }, set: { state: STATES.ASLEEP, holders: 0 }, remove: ['stopping'] });
@@ -192,6 +195,7 @@ export function createController({
       set: { state: STATES.WAKING, wakeId, wakeStartedAt: now() },
       remove: ['stopping', 'pendingWake'],
       increment: ['wakeCount'],
+      cause: 'pending-wake',
     });
     if (!waking) return { state: 'UNKNOWN' };
     log.info('WakeRequested', { workloadId, wakeId, reason: 'pendingWake' });
@@ -219,6 +223,7 @@ export function createController({
         cond: { state: STATES.NAPPING, olderThan: { field: 'updatedAt', ms: stuckBefore } },
         set: { state: STATES.FAILED, failedAt: now(), holders: 0 },
         remove: ['stopping'],
+        cause: 'nap-stuck',
       })) ?? store.getRun(workloadId);
     }
     const wakeStuckBefore = now() - cfg.wakeTimeoutSeconds * 1000 - WAKING_STUCK_GRACE_MS;
@@ -227,6 +232,7 @@ export function createController({
       return (await store.transition(workloadId, {
         cond: { state: STATES.WAKING, wakeId: run.wakeId },
         set: { state: STATES.FAILED, failedAt: now(), holders: 0 },
+        cause: 'wake-stuck',
       })) ?? store.getRun(workloadId);
     }
     if (![STATES.AWAKE, STATES.ASLEEP, STATES.FAILED].includes(run.state)) return run;
@@ -246,6 +252,7 @@ export function createController({
       await routeTo(cfg, 'app');
       run = (await store.transition(workloadId, {
         cond: { state: from }, set: { state: STATES.AWAKE, awakeSince: now() }, remove: ['napBackends', 'napInstances'],
+        cause: from === STATES.FAILED ? 'recovered' : 'external-start',
       }))
         ?? (await store.getRun(workloadId));
     } else if (from !== STATES.ASLEEP && all('stopped')) {
@@ -253,7 +260,7 @@ export function createController({
       // The backend is already stopped: the instrumented rules go to the waker whatever the issues.
       await routeTo(cfg, 'waker', { allowIssues: true });
       await stopCompanions(clients, companions);
-      run = (await store.transition(workloadId, { cond: { state: from }, set: { state: STATES.ASLEEP, holders: 0 } }))
+      run = (await store.transition(workloadId, { cond: { state: from }, set: { state: STATES.ASLEEP, holders: 0 }, cause: from === STATES.FAILED ? 'recovered' : 'external-stop' }))
         ?? (await store.getRun(workloadId));
     }
 
@@ -413,7 +420,7 @@ export function createController({
     if (run?.state === STATES.ASLEEP || run?.state === STATES.FAILED) {
       const wakeId = newId();
       const next = await store.transition(workloadId, {
-        cond: { state: run.state }, set: { state: STATES.WAKING, wakeId, wakeStartedAt: now() }, remove: ['failedAt'], increment: ['wakeCount'],
+        cond: { state: run.state }, set: { state: STATES.WAKING, wakeId, wakeStartedAt: now() }, remove: ['failedAt'], increment: ['wakeCount'], cause: kind,
       });
       if (!next) return { state: (await store.getRun(workloadId))?.state };
       log.info('WakeRequested', { workloadId, wakeId, trigger: { kind, by } });
@@ -664,7 +671,7 @@ export function createController({
     const [first] = await pausesFor(workloadId);
     if (first) return { requested: false, reason: pauseText(first) };
     if (queueWork) await queueWork({ action: 'nap', workloadId, requestedAt: now(), by });
-    else await invokeSelf({ action: 'nap', workloadId });
+    else await invokeSelf({ action: 'nap', workloadId, by });
     log.info('NapRequested', { workloadId, trigger: { kind: 'manager', by } });
     return { requested: true };
   }
@@ -674,7 +681,7 @@ export function createController({
   // A nap the check (or the manager) queued: refused when the workload is no longer awake (delivered twice, or napped
   // since), woke since it was asked for, had requests since (when it waited more than a minute), or when it waited too
   // long (the next check decides again).
-  async function queuedNap({ workloadId, requestedAt }) {
+  async function queuedNap({ workloadId, requestedAt, by }) {
     const run = await store.getRun(workloadId);
     let reason = run?.state !== STATES.AWAKE ? `not awake (${run?.state ?? 'UNKNOWN'})`
       : (run.awakeSince ?? 0) > requestedAt ? 'woken since it was requested'
@@ -686,7 +693,7 @@ export function createController({
       log.warn('NapSkipped', { workloadId, reason });
       return { state: 'SKIPPED', reason };
     }
-    return nap(workloadId);
+    return nap(workloadId, { cause: by ? 'manager' : 'idle' });
   }
 
   // A wake a router pause queued: skipped when the workload is gone (offboarded since) or no pause applies any more
@@ -814,7 +821,7 @@ export function createController({
     if (Array.isArray(event?.Records)) return runQueued(event.Records);
     switch (event?.action) {
       case 'wake': return wake(event.workloadId, event.wakeId);
-      case 'nap': return nap(event.workloadId);
+      case 'nap': return nap(event.workloadId, { cause: event.by ? 'manager' : 'idle' });
       case 'check': return check(event.source);
       case 'ensure-awake': return ensureAwake(event.workloadId);
       case 'refresh-lists': return lists ? lists.refresh(event.names ?? []) : [];

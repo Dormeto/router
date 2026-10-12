@@ -50,6 +50,7 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
       set: { state: STATES.WAKING, wakeId, wakeStartedAt: now() },
       remove: ['failedAt'],
       increment: ['wakeCount'],
+      cause: trigger.kind,
     });
     if (!next) return (await store.getRun(workloadId)) ?? run;
     log.info('WakeRequested', { workloadId, wakeId, trigger });
@@ -64,6 +65,7 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
       return (await store.transition(workloadId, {
         cond: { state: STATES.WAKING, wakeId },
         set: { state: STATES.FAILED, failedAt: now() },
+        cause: 'invoke-failed',
       })) ?? next;
     }
   }

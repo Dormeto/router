@@ -64,12 +64,13 @@ export const PUBLISH_BUDGET_MS = 1000;
 // The store, with every successful state transition published (controller and waker): one place, none missed.
 export function withTransitionEvents(store, publisher, { now = Date.now, log = null, budgetMs = PUBLISH_BUDGET_MS } = {}) {
   return Object.assign(Object.create(store), store, {
-    async transition(workloadId, spec) {
+    // spec.cause (what started a wake or a nap, or ended one early) goes in the event only, never to the store.
+    async transition(workloadId, { cause, ...spec } = {}) {
       const next = await store.transition(workloadId, spec);
       const to = spec?.set?.state;
       if (next && to) {
         const from = typeof spec.cond?.state === 'string' ? spec.cond.state : null;
-        const change = { workloadId, from, to, at: new Date(now()).toISOString(), ...(spec.set.wakeId ? { wakeId: spec.set.wakeId } : {}) };
+        const change = { workloadId, from, to, at: new Date(now()).toISOString(), ...(spec.set.wakeId ? { wakeId: spec.set.wakeId } : {}), ...(cause ? { cause } : {}) };
         let timer;
         const slow = new Promise((resolve) => { timer = setTimeout(() => resolve('slow'), budgetMs); });
         try {

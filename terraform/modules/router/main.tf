@@ -105,7 +105,7 @@ resource "aws_lambda_function" "waker" {
   filename         = data.archive_file.lambda.output_path
   source_code_hash = data.archive_file.lambda.output_base64sha256
   timeout          = var.waker_timeout_seconds
-  memory_size      = 256
+  memory_size      = var.waker_memory_mb
 
   environment {
     variables = {

@@ -69,3 +69,9 @@ variable "no_wake_rules" {
     error_message = "Each no_wake_rules header needs either value or pattern."
   }
 }
+
+variable "waker_memory_mb" {
+  description = "Waker memory (Lambda CPU grows with it): 512 MB keeps the waiter page fast and loads the admin dashboard SDK clients in about 2 s on first use."
+  type        = number
+  default     = 512
+}

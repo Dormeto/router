@@ -3,7 +3,7 @@
 // (an unknown item), never guessed; describing never stops the nap.
 const ITEMS_MAX = 50;
 
-const osOf = (platform) => (!platform || platform === 'Linux/UNIX' ? 'Linux' : platform.startsWith('Windows') ? 'Windows' : platform);
+const osOf = (platform) => (!platform || platform === 'Linux/UNIX' ? 'Linux' : platform);
 const unknown = (backend, err) => ({ kind: 'unknown', backend, reason: String(err?.message ?? err).slice(0, 200) });
 
 async function instances(ec2, ids) {

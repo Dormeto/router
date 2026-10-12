@@ -43,6 +43,12 @@ test('an OS that is neither Linux nor Windows is said as it is (the manager does
   assert.deepEqual(item, { kind: 'ec2', type: 'm5.large', count: 1, os: 'Red Hat Enterprise Linux' });
 });
 
+test('Windows with its own license or with SQL Server is said as it is, not as plain Windows (review I3)', async () => {
+  const items = await describeStopped({ ec2: ec2({ 'i-1': { InstanceType: 'm5.large', PlatformDetails: 'Windows BYOL' }, 'i-2': { InstanceType: 'm5.large', PlatformDetails: 'Windows with SQL Server Standard' } }) },
+    [{ kind: 'instance', id: 'i-1' }, { kind: 'instance', id: 'i-2' }]);
+  assert.deepEqual(items.map((i) => i.os), ['Windows BYOL', 'Windows with SQL Server Standard']);
+});
+
 test('a Fargate service: its task size times its desired count; ARM; on a capacity provider; one on EC2 capacity is not counted', async () => {
   const task = { cpu: '512', memory: '1024', runtimePlatform: { cpuArchitecture: 'ARM64', operatingSystemFamily: 'LINUX' } };
   assert.deepEqual(await describeStopped({ ecs: ecs({ service: { launchType: 'FARGATE' }, task }) }, [{ kind: 'ecs', id: SERVICE, cluster: CLUSTER, desired: 2 }]),

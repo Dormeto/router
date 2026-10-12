@@ -7,12 +7,38 @@ const RETRY_MS = HOUR_MS;
 // Parts of a version expire 30 days after its download (later versions replace it long before).
 const PART_TTL_S = 30 * 86_400;
 
-export async function downloadText(url, { fetch = globalThis.fetch, timeoutMs = 20_000, maxBytes = 20 * 1024 * 1024 } = {}) {
-  const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs), headers: { 'user-agent': 'dormeto-router' } });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+// s3://bucket/key: a list stored in S3 (private lists, lists prepared elsewhere), read with the S3 API.
+const S3_URL = /^s3:\/\/([a-z0-9][a-z0-9.-]{1,61}[a-z0-9])\/(.+)$/;
+
+export function parseS3Url(url) {
+  const match = S3_URL.exec(url ?? '');
+  return match ? { bucket: match[1], key: match[2] } : null;
+}
+
+// Supported list sources: http(s) URLs and S3 URIs.
+export const isListUrl = (url) => /^https?:\/\//.test(url ?? '') || parseS3Url(url) !== null;
+
+// getObject({ bucket, key, signal }) returns the object body (async iterable of chunks): the S3 port of the controller.
+export async function downloadText(url, { fetch = globalThis.fetch, getObject, timeoutMs = 20_000, maxBytes = 20 * 1024 * 1024 } = {}) {
+  const signal = AbortSignal.timeout(timeoutMs);
+  const s3 = parseS3Url(url);
+  let body;
+  if (s3) {
+    if (!getObject) throw new Error('S3 lists need the S3 client');
+    try {
+      body = await getObject({ ...s3, signal });
+    } catch (err) {
+      // S3 service errors carry their code in the name (NoSuchKey, AccessDenied, NoSuchBucket).
+      throw new Error(`S3 ${err.name}`);
+    }
+  } else {
+    const res = await fetch(url, { signal, headers: { 'user-agent': 'dormeto-router' } });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    body = res.body;
+  }
   const chunks = [];
   let size = 0;
-  for await (const chunk of res.body) {
+  for await (const chunk of body) {
     size += chunk.length;
     if (size > maxBytes) throw new Error(`larger than ${maxBytes} bytes`);
     chunks.push(chunk);

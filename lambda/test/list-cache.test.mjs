@@ -22,9 +22,16 @@ test('parseLists reads the router lists and skips invalid ones', () => {
     { name: 'ipsum', url: 'https://x', action: 'defer', refreshHours: 24 },
     { name: 'no-url', action: 'defer' },
     { name: 'odd', url: 'https://y', action: 'block' },
+    { name: 'private', url: 's3://dmt-lists/scanners/censys.txt', action: 'ignore', refreshHours: 6 },
+    { name: 'no-key', url: 's3://dmt-lists' },
+    { name: 'bad-bucket', url: 's3://Bad_Bucket/list.txt' },
+    { name: 'ftp', url: 'ftp://x/list.txt' },
   ]), (e) => errors.push(e));
-  assert.deepEqual(lists, [{ name: 'ipsum', url: 'https://x', action: 'defer', refreshHours: 24 }]);
-  assert.equal(errors.length, 2);
+  assert.deepEqual(lists, [
+    { name: 'ipsum', url: 'https://x', action: 'defer', refreshHours: 24 },
+    { name: 'private', url: 's3://dmt-lists/scanners/censys.txt', action: 'ignore', refreshHours: 6 },
+  ]);
+  assert.equal(errors.length, 5);
   assert.deepEqual(parseLists(undefined), []);
 });
 

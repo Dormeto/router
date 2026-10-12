@@ -63,10 +63,16 @@ example AWS `ip-ranges.json`) or text (first column of each line: ipsum, FireHOL
 ranges are dropped at download. Behind a CDN or proxy the source address is the proxy's: do not use cloud range lists
 there.
 
+A list can also be an S3 object (`s3://bucket/key`), read with the S3 API: private lists, or lists prepared elsewhere.
+The module grants the controller `s3:GetObject` on that object only; a bucket in another account must allow the
+controller role in its bucket policy, and a customer managed KMS key in its key policy. Without `s3:ListBucket`, a
+missing object is reported as `S3 AccessDenied`.
+
 ```hcl
 ip_lists = [
   { name = "ipsum", url = "https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt" },
   { name = "aws", url = "https://ip-ranges.amazonaws.com/ip-ranges.json" },
+  { name = "censys", url = "s3://my-ip-lists/scanners/censys.txt", action = "ignore" },
 ]
 ```
 

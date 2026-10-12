@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createListRefresher, downloadText } from '../src/lib/list-refresh.mjs';
+import { createListRefresher, downloadText, parseS3Url } from '../src/lib/list-refresh.mjs';
 import { unpackList } from '../src/lib/ip-lists.mjs';
 import { fakeClock, fakeStore, silentLog, testConfig } from './fakes.mjs';
 
@@ -102,4 +102,47 @@ test('a list stored in an older format is due again', async () => {
   delete store.state.lists.ipsum.meta.format;
   delete store.state.lists.ipsum.meta.attemptFormat;
   assert.deepEqual(await refresher.due(), ['ipsum']);
+});
+
+// Body of an S3 object: an async iterable of chunks, as the SDK stream.
+async function* chunks(...parts) {
+  for (const part of parts) yield Buffer.from(part);
+}
+
+test('parseS3Url splits bucket and key, and rejects anything else', () => {
+  assert.deepEqual(parseS3Url('s3://dmt-dev-lists-1/scanners/censys.txt'), { bucket: 'dmt-dev-lists-1', key: 'scanners/censys.txt' });
+  assert.equal(parseS3Url('s3://dmt-dev-lists-1'), null);
+  assert.equal(parseS3Url('s3://dmt-dev-lists-1/'), null);
+  assert.equal(parseS3Url('s3://Upper_Case/key'), null);
+  assert.equal(parseS3Url('https://dmt-dev-lists-1.s3.amazonaws.com/key'), null);
+  assert.equal(parseS3Url(undefined), null);
+});
+
+test('downloadText reads an s3:// list with the S3 API, within the size limit and the timeout', async () => {
+  const calls = [];
+  const getObject = async (input) => { calls.push(input); return chunks('45.130.203.183\n', '142.93.0.0/16\n'); };
+  const fetch = async () => { throw new Error('no HTTP for S3 lists'); };
+  assert.equal(await downloadText('s3://dmt-lists/a/b.txt', { fetch, getObject }), '45.130.203.183\n142.93.0.0/16\n');
+  assert.equal(calls[0].bucket, 'dmt-lists');
+  assert.equal(calls[0].key, 'a/b.txt');
+  assert.ok(calls[0].signal instanceof AbortSignal);
+  await assert.rejects(downloadText('s3://dmt-lists/big', { getObject: async () => chunks('x'.repeat(600), 'x'.repeat(600)), maxBytes: 1024 }), /larger than 1024 bytes/);
+});
+
+test('downloadText reports S3 errors by their code, and S3 lists without a client', async () => {
+  const denied = async () => { throw Object.assign(new Error('User: arn:aws:sts::1:assumed-role/x is not authorized'), { name: 'AccessDenied' }); };
+  await assert.rejects(downloadText('s3://dmt-lists/a.txt', { getObject: denied }), { message: 'S3 AccessDenied' });
+  await assert.rejects(downloadText('s3://dmt-lists/a.txt'), { message: 'S3 lists need the S3 client' });
+});
+
+test('an s3:// list refreshes like an HTTP one', async () => {
+  const list = { name: 'private', url: 's3://dmt-lists/private.txt', action: 'ignore', refreshHours: 6 };
+  const clock = fakeClock();
+  const store = fakeStore({ config: testConfig(), run: { state: 'AWAKE' }, clock });
+  const download = (url) => downloadText(url, { getObject: async () => chunks('45.130.203.183\n') });
+  const refresher = createListRefresher({ store, lists: [list], download, now: clock.now, log: silentLog });
+  assert.deepEqual(await refresher.refresh(await refresher.due()), [{ name: 'private', entries: 1, dropped: 0 }]);
+  assert.equal(store.state.lists.private.meta.url, list.url);
+  clock.advance(6 * HOUR);
+  assert.deepEqual(await refresher.due(), ['private']);
 });

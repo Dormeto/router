@@ -83,7 +83,7 @@ variable "metrics_enabled" {
 }
 
 variable "ip_lists" {
-  description = "IP reputation lists downloaded by the controller (refresh_hours) and used by the waker for every workload. action defer: a listed source only wakes through the waiter page probe (browser mode for it); ignore: never wakes. The x-dormeto-wake header and wake rules override the lists. Formats: JSON (every address or CIDR string) or text (first column). Behind a CDN or proxy the source is the proxy: do not use cloud range lists there."
+  description = "IP reputation lists downloaded by the controller (refresh_hours) and used by the waker for every workload. url: http(s) URL, or s3://bucket/key read with the S3 API (the controller role gets s3:GetObject on that object; a bucket in another account must allow the role in its bucket policy, a customer managed KMS key in its key policy). action defer: a listed source only wakes through the waiter page probe (browser mode for it); ignore: never wakes. The x-dormeto-wake header and wake rules override the lists. Formats: JSON (every address or CIDR string) or text (first column). Behind a CDN or proxy the source is the proxy: do not use cloud range lists there."
   type = list(object({
     name          = string
     url           = string
@@ -96,7 +96,7 @@ variable "ip_lists" {
     error_message = "ip_lists names must be unique, 1-64 characters among letters, digits, '.', '_' and '-'."
   }
   validation {
-    condition     = alltrue([for l in var.ip_lists : can(regex("^https?://", l.url)) && contains(["defer", "ignore"], l.action) && l.refresh_hours >= 1])
-    error_message = "Each ip_lists entry needs an http(s) url, action defer or ignore, and refresh_hours of at least 1."
+    condition     = alltrue([for l in var.ip_lists : can(regex("^(https?://|s3://[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]/.+)", l.url)) && contains(["defer", "ignore"], l.action) && l.refresh_hours >= 1])
+    error_message = "Each ip_lists entry needs an http(s) url or an s3://bucket/key URI, action defer or ignore, and refresh_hours of at least 1."
   }
 }

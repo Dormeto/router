@@ -12,6 +12,8 @@ module "router" {
     { name = "aws", url = "https://ip-ranges.amazonaws.com/ip-ranges.json" },
     { name = "gcp", url = "https://www.gstatic.com/ipranges/cloud.json" },
     { name = "digitalocean", url = "https://digitalocean.com/geo/google.csv" },
+    # Read with the S3 API (ip-lists.tf); the object key is static so the controller policy is known at plan.
+    { name = "censys", url = "s3://${local.ip_lists_bucket}/scanners/censys.txt", action = "ignore" },
   ]
   # Lets dormeto-e2e check that a matching request (and its waiter probe) never wakes a workload.
   no_wake_rules = [{ name = "e2e-no-wake", headers = [{ name = "x-dormeto-e2e", value = "no-wake" }] }]

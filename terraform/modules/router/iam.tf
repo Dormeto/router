@@ -4,8 +4,10 @@ data "aws_partition" "current" {}
 
 locals {
   arn_prefix = "arn:${data.aws_partition.current.partition}"
-  region     = data.aws_region.current.region
-  account_id = data.aws_caller_identity.current.account_id
+  # s3://bucket/key of the IP lists stored in S3, as object ARNs.
+  s3_list_objects = [for l in var.ip_lists : "${local.arn_prefix}:s3:::${trimprefix(l.url, "s3://")}" if startswith(l.url, "s3://")]
+  region          = data.aws_region.current.region
+  account_id      = data.aws_caller_identity.current.account_id
 }
 
 data "aws_iam_policy_document" "lambda_assume" {
@@ -142,6 +144,15 @@ data "aws_iam_policy_document" "controller" {
   statement {
     actions   = ["logs:CreateLogStream", "logs:PutLogEvents"]
     resources = ["${aws_cloudwatch_log_group.controller.arn}:*"]
+  }
+  dynamic "statement" {
+    # IP lists given as s3:// URIs: read their objects only (a bucket in another account also needs its bucket policy).
+    for_each = length(local.s3_list_objects) > 0 ? [1] : []
+    content {
+      sid       = "IpListObjects"
+      actions   = ["s3:GetObject"]
+      resources = local.s3_list_objects
+    }
   }
 }
 

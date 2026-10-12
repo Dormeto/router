@@ -1,11 +1,12 @@
 // Waker side of the IP reputation lists: one lookup structure per list and container, refreshed when the controller
 // stored a new version (META checked every few minutes).
 import { FORMAT, unpackList } from './ip-lists.mjs';
+import { isListUrl } from './list-refresh.mjs';
 
 const CHECK_MS = 5 * 60_000;
 const ACTIONS = new Set(['defer', 'ignore']);
 
-// Router lists from the environment (Terraform ip_lists): [{ name, url, action, refreshHours }].
+// Router lists from the environment (Terraform ip_lists): [{ name, url (http(s) or s3://), action, refreshHours }].
 export function parseLists(text, onError = () => {}) {
   if (!text) return [];
   let raw;
@@ -17,7 +18,7 @@ export function parseLists(text, onError = () => {}) {
   }
   const lists = [];
   for (const list of Array.isArray(raw) ? raw : []) {
-    if (!list?.name || !/^https?:\/\//.test(list.url ?? '') || !ACTIONS.has(list.action ?? 'defer')) {
+    if (!list?.name || !isListUrl(list.url) || !ACTIONS.has(list.action ?? 'defer')) {
       onError(`invalid list: ${JSON.stringify(list)}`);
       continue;
     }

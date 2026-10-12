@@ -11,7 +11,8 @@ onboards them; `dormeto-e2e` runs its acceptance.
 - **Demos** (`charts/demos`): `web` (a Deployment), `cache` (a StatefulSet), `api` (with an HPA) and `docs` (on Fargate)
   behind one IngressGroup, at `https://<demo>.eks.dev.dormeto.com/`; `solo` behind a lone Ingress
   (`-var lone_ingress=true`, its own ALB) and `bind` behind a TargetGroupBinding to an ALB this root owns
-  (`-var target_group_binding=true`), each about $22 a month while set.
+  (`-var target_group_binding=true`), each about $22 a month while set. Each answers a page saying "Dormeto demo", its
+  pod and when it started, as the dev instances do: `dormeto-e2e` knows the application by it.
 - **Cost:** about $155 a month while it exists (the control plane $73, the NAT gateway $35, the group's ALB $22, the
   system node $25), the demos napped by Dormeto. Kept while R10.5 is built, then created for each e2e campaign and
   destroyed after.

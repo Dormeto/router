@@ -1,4 +1,5 @@
-{{/* A demo's Deployment or StatefulSet pod template: nginx answering on 80, with requests (the savings price them). */}}
+{{/* A demo's Deployment or StatefulSet pod template: nginx answering on 80, with requests (the savings price them). Its
+page says "Dormeto demo", the pod and when it started, as the dev instances do: dormeto-e2e knows the application by it. */}}
 {{- define "demos.pod" -}}
 metadata:
   labels:
@@ -7,6 +8,15 @@ spec:
   containers:
     - name: web
       image: {{ .image }}
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          cat > /usr/share/nginx/html/index.html <<HTML
+          <!doctype html>
+          <html lang="en"><head><meta charset="utf-8"><title>Dormeto demo</title></head>
+          <body><h1>Dormeto demo</h1><p>{{ .name }}: pod <code>$HOSTNAME</code> started at <time>$(date -u +%Y-%m-%dT%H:%M:%SZ)</time>.</p></body></html>
+          HTML
+          exec /docker-entrypoint.sh nginx -g 'daemon off;'
       ports:
         - containerPort: 80
       readinessProbe:

@@ -25,6 +25,8 @@ export function workloadSummary(cfg, run = {}, host = null, stats7d = null, paus
     failedAt: iso(run?.failedAt),
     updatedAt: iso(run?.updatedAt),
     pendingWake: run?.pendingWake === true,
+    // The kinds of its backends (instance, asg, ecs, then its databases), as the last idle check found them.
+    backends: run?.backendKinds ? run.backendKinds.split(',') : [],
     pauses,
     stats7d,
     settings: {

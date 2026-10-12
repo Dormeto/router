@@ -242,6 +242,11 @@ export function createController({
     // The primary backends decide the state; companions (databases) follow it.
     const primaries = backends.filter((b) => !isCompanion(b));
     const companions = backends.filter(isCompanion);
+    // The kinds of its backends, for the manager's lists: written when they change.
+    const kinds = [...new Set([...primaries, ...companions].map((b) => b.kind))].join(',');
+    if (kinds !== (run.backendKinds ?? '')) {
+      await store.setBackendKinds(workloadId, kinds).catch((err) => log.warn('BackendKindsUnwritten', { workloadId, error: err.message }));
+    }
     // No managed primary backend: nothing to infer (every() would be vacuously true).
     const all = (name) => primaries.length > 0 && primaries.every((b) => statuses[backendKey(b)] === name);
     const from = run.state;

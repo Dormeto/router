@@ -772,6 +772,17 @@ test('list returns the router and its workloads from the state table', async () 
   assert.deepEqual(workload.stats7d, { ignored: 0, deferred: 0, wakes: 0 });
 });
 
+test('the idle check records the kinds of a workload\'s backends, written again only when they change, and list gives them', async () => {
+  const s = setup({ run: { state: STATES.AWAKE } });
+  s.store.state.run.awakeSince = s.clock.now() - 60_000;
+  assert.deepEqual((await s.handler({ action: 'list' })).workloads[0].backends, []);
+  await s.handler({ action: 'check' });
+  assert.deepEqual((await s.handler({ action: 'list' })).workloads[0].backends, ['instance']);
+  const writes = s.store.state.backendKindWrites;
+  await s.handler({ action: 'check' });
+  assert.equal(s.store.state.backendKindWrites, writes);
+});
+
 test('list adds the 7-day totals of each workload, null when they cannot be read', async () => {
   const s = managerSetup({ run: { state: STATES.AWAKE } });
   s.store.state.stats = { 'ignored:HEAD': 2, 'ignored:bot user agent': 3, 'deferred:browser mode': 1, 'wake:probe': 4 };

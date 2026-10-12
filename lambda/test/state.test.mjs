@@ -101,6 +101,16 @@ test('store transition rethrows other errors', async () => {
   await assert.rejects(createStore({ dynamo, table: 't' }).transition('demo', { cond: { state: 'AWAKE' } }), /throttled/);
 });
 
+test('store backend kinds are set on an existing run, its version untouched', async () => {
+  const dynamo = fakeDynamo({ updateItem: async () => ({}) });
+  assert.equal(await createStore({ dynamo, table: 't' }).setBackendKinds('demo', 'asg,rds-instance'), true);
+  const [[, input]] = dynamo.calls;
+  assert.deepEqual(input.Key, { pk: { S: 'WL#demo' }, sk: { S: 'RUN' } });
+  assert.equal(input.UpdateExpression, 'SET #kinds = :kinds');
+  assert.equal(input.ConditionExpression, 'attribute_exists(pk)');
+  assert.deepEqual(input.ExpressionAttributeValues, { ':kinds': { S: 'asg,rds-instance' } });
+});
+
 test('store pendingWake and holder updates are conditional', async () => {
   const outcomes = [{}, Object.assign(new Error('c'), { name: 'ConditionalCheckFailedException' })];
   const dynamo = fakeDynamo({ updateItem: async () => { const o = outcomes.shift() ?? {}; if (o instanceof Error) throw o; return o; } });

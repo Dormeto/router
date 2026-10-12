@@ -74,6 +74,11 @@ export function crowdedAccount({ workloads = 1500, balancers = 300, latencyMs = 
       run.updatedAt = clock.now();
       return structuredClone(run);
     },
+    async setBackendKinds(id, kinds) {
+      const run = runs.get(id);
+      if (run) run.backendKinds = kinds;
+      return Boolean(run);
+    },
     async recordScheduledCheck(at) { check.lastScheduledCheckAt = at; },
     async getCheck() { return structuredClone(check); },
     async acquireCheckLease(holder, until, now) {

@@ -63,6 +63,12 @@ export function fakeStore({ config, run, clock }) {
       state.run.updatedAt = clock.now();
       return copy();
     },
+    async setBackendKinds(id, kinds) {
+      if (id !== config.workloadId || !state.run) return false;
+      state.backendKindWrites = (state.backendKindWrites ?? 0) + 1;
+      state.run.backendKinds = kinds;
+      return true;
+    },
     async setPendingWake() {
       if (state.run.state !== STATES.NAPPING || state.run.pendingWake === true) return false;
       state.run.pendingWake = true;

@@ -432,6 +432,19 @@ export function createStore({ dynamo, table, now = Date.now }) {
       return parts;
     },
 
+    // The kinds of a workload's backends, as the idle check found them ('instance', 'asg,rds-instance'): written apart from
+    // the transitions (no version change).
+    async setBackendKinds(workloadId, kinds) {
+      return (await update({
+        TableName: table,
+        Key: itemKey(workloadId, 'RUN'),
+        UpdateExpression: 'SET #kinds = :kinds',
+        ConditionExpression: 'attribute_exists(pk)',
+        ExpressionAttributeNames: { '#kinds': 'backendKinds' },
+        ExpressionAttributeValues: { ':kinds': { S: kinds } },
+      })) !== null;
+    },
+
     async setPendingWake(workloadId) {
       const out = await update({
         TableName: table,

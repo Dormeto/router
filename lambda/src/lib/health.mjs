@@ -54,36 +54,38 @@ const QUEUES = {
   controller: 'controller-failures queue: naps or wakes that failed in their own invocation',
 };
 
-// { status: ok | warning | error, problems: [{ level, text }] }: only a late idle check is an error (no nap happens).
+// { status: ok | warning | error, problems: [{ level, code, text }] }: only a late idle check is an error (no nap
+// happens). The code is stable whatever the figures in the text: the manager's alarms open and resolve on it.
 export function healthOf({ checkSchedule, lastScheduledCheckAt, now, lambda = {}, queues = {}, ipLists = [], failed = 0, concurrency = null }) {
   const problems = [];
-  const warn = (text) => problems.push({ level: 'warning', text });
+  const warn = (code, text) => problems.push({ level: 'warning', code, text });
   if (checkLate(checkSchedule, lastScheduledCheckAt, now)) {
     problems.push({
       level: 'error',
+      code: 'check-late',
       text: lastScheduledCheckAt
         ? `idle check late: the last scheduled check ran ${ago(now - lastScheduledCheckAt)}, workloads do not nap on their own`
         : 'no scheduled idle check recorded: workloads do not nap on their own',
     });
   }
-  if (queues.error) warn(`failure queues unreadable: ${queues.error}`);
-  for (const [name, text] of Object.entries(QUEUES)) if (queues[name] > 0) warn(`${count(queues[name], 'message')} in the ${text}`);
-  if (lambda.error) warn(`Lambda metrics unreadable: ${lambda.error}`);
+  if (queues.error) warn('queues-unreadable', `failure queues unreadable: ${queues.error}`);
+  for (const [name, text] of Object.entries(QUEUES)) if (queues[name] > 0) warn(`queue-${name}`, `${count(queues[name], 'message')} in the ${text}`);
+  if (lambda.error) warn('metrics-unreadable', `Lambda metrics unreadable: ${lambda.error}`);
   for (const role of ['controller', 'waker']) {
     const figures = lambda[role];
-    if (figures?.errors > 0) warn(`${role}: ${count(figures.errors, 'error')} in 24 hours`);
-    if (figures?.throttles > 0) warn(`${role}: ${count(figures.throttles, 'throttle')} in 24 hours`);
+    if (figures?.errors > 0) warn(`${role}-errors`, `${role}: ${count(figures.errors, 'error')} in 24 hours`);
+    if (figures?.throttles > 0) warn(`${role}-throttles`, `${role}: ${count(figures.throttles, 'throttle')} in 24 hours`);
   }
   for (const list of ipLists) {
-    if (list.error) warn(`IP list ${list.name}: ${list.error}`);
-    else if (list.fetchedAt && now - Date.parse(list.fetchedAt) > 2 * (list.refreshHours ?? 24) * HOUR_MS) warn(`IP list ${list.name}: last downloaded ${ago(now - Date.parse(list.fetchedAt))}`);
+    if (list.error) warn(`ip-list:${list.name}`, `IP list ${list.name}: ${list.error}`);
+    else if (list.fetchedAt && now - Date.parse(list.fetchedAt) > 2 * (list.refreshHours ?? 24) * HOUR_MS) warn(`ip-list:${list.name}`, `IP list ${list.name}: last downloaded ${ago(now - Date.parse(list.fetchedAt))}`);
   }
-  if (failed > 0) warn(`${count(failed, 'failed workload')}`);
+  if (failed > 0) warn('failed-workloads', `${count(failed, 'failed workload')}`);
   // A region the account barely uses can be limited to 10 concurrent executions: held requests beyond it get errors. The
   // limit is shared by every function of the account: a warning once the router can need more than 80% of it.
-  if (concurrency?.error) warn(`Lambda concurrency limit unreadable: ${concurrency.error}`);
+  if (concurrency?.error) warn('concurrency-unreadable', `Lambda concurrency limit unreadable: ${concurrency.error}`);
   else if (concurrency && concurrency.needed > CONCURRENCY_SHARE * concurrency.limit) {
-    warn(`Lambda concurrency limit of the account in this region is ${concurrency.limit}: the router can need up to ${concurrency.needed} at once (its waker's 24-hour peak, plus its queued naps and wakes, drift repairs and the check), more than ${CONCURRENCY_SHARE * 100}% of it; requests beyond the limit get errors: request a higher quota`);
+    warn('concurrency', `Lambda concurrency limit of the account in this region is ${concurrency.limit}: the router can need up to ${concurrency.needed} at once (its waker's 24-hour peak, plus its queued naps and wakes, drift repairs and the check), more than ${CONCURRENCY_SHARE * 100}% of it; requests beyond the limit get errors: request a higher quota`);
   }
   const status = problems.some((p) => p.level === 'error') ? 'error' : problems.length ? 'warning' : 'ok';
   return { status, problems };

@@ -68,13 +68,24 @@ const healthy = {
   failed: 0,
 };
 
+test('healthOf: every problem carries a stable code, its text aside (the manager alarms on the codes)', () => {
+  const health = healthOf({
+    ...healthy, lastScheduledCheckAt: null,
+    lambda: { controller: { errors: 1, throttles: 1 }, waker: { errors: 1, throttles: 1, peakConcurrency: 1 } },
+    queues: { check: 1, controller: 1 }, failed: 2, concurrency: { limit: 10, needed: 9 },
+  });
+  assert.deepEqual(health.problems.map((p) => p.code), [
+    'check-late', 'queue-check', 'queue-controller', 'controller-errors', 'controller-throttles', 'waker-errors', 'waker-throttles', 'failed-workloads', 'concurrency',
+  ]);
+});
+
 test('healthOf: ok without problem', () => {
   assert.deepEqual(healthOf(healthy), { status: 'ok', problems: [] });
 });
 
 test('healthOf: a late idle check is an error', () => {
   assert.deepEqual(healthOf({ ...healthy, lastScheduledCheckAt: NOW - HOUR }), {
-    status: 'error', problems: [{ level: 'error', text: 'idle check late: the last scheduled check ran 60 minutes ago, workloads do not nap on their own' }],
+    status: 'error', problems: [{ level: 'error', code: 'check-late', text: 'idle check late: the last scheduled check ran 60 minutes ago, workloads do not nap on their own' }],
   });
   assert.equal(healthOf({ ...healthy, lastScheduledCheckAt: null }).problems[0].text, 'no scheduled idle check recorded: workloads do not nap on their own');
 });
@@ -88,31 +99,31 @@ test('healthOf: failure queue messages, Lambda errors and throttles, IP lists an
     failed: 1,
   });
   assert.equal(health.status, 'warning');
-  assert.deepEqual(health.problems.map((p) => [p.level, p.text]), [
-    ['warning', '1 message in the check-failures queue: scheduled idle checks that could not invoke the controller'],
-    ['warning', '3 messages in the controller-failures queue: naps or wakes that failed in their own invocation'],
-    ['warning', 'controller: 2 errors in 24 hours'],
-    ['warning', 'waker: 5 throttles in 24 hours'],
-    ['warning', 'IP list ipsum: HTTP 404'],
-    ['warning', 'IP list tor: last downloaded 49 hours ago'],
-    ['warning', '1 failed workload'],
+  assert.deepEqual(health.problems.map((p) => [p.level, p.code, p.text]), [
+    ['warning', 'queue-check', '1 message in the check-failures queue: scheduled idle checks that could not invoke the controller'],
+    ['warning', 'queue-controller', '3 messages in the controller-failures queue: naps or wakes that failed in their own invocation'],
+    ['warning', 'controller-errors', 'controller: 2 errors in 24 hours'],
+    ['warning', 'waker-throttles', 'waker: 5 throttles in 24 hours'],
+    ['warning', 'ip-list:ipsum', 'IP list ipsum: HTTP 404'],
+    ['warning', 'ip-list:tor', 'IP list tor: last downloaded 49 hours ago'],
+    ['warning', 'failed-workloads', '1 failed workload'],
   ]);
 });
 
 test('healthOf: a router using more than 80% of the Lambda concurrency limit is a warning; the worst case is information only', () => {
   assert.deepEqual(healthOf({ ...healthy, concurrency: { limit: 100, needed: 80, worstCase: 7513 } }), { status: 'ok', problems: [] });
   assert.deepEqual(healthOf({ ...healthy, concurrency: { limit: 100, needed: 81, worstCase: 7513 } }).problems, [{
-    level: 'warning',
+    level: 'warning', code: 'concurrency',
     text: 'Lambda concurrency limit of the account in this region is 100: the router can need up to 81 at once (its waker\'s 24-hour peak, plus its queued naps and wakes, drift repairs and the check), more than 80% of it; requests beyond the limit get errors: request a higher quota',
   }]);
-  assert.deepEqual(healthOf({ ...healthy, concurrency: { error: 'AccessDenied' } }).problems, [{ level: 'warning', text: 'Lambda concurrency limit unreadable: AccessDenied' }]);
+  assert.deepEqual(healthOf({ ...healthy, concurrency: { error: 'AccessDenied' } }).problems, [{ level: 'warning', code: 'concurrency-unreadable', text: 'Lambda concurrency limit unreadable: AccessDenied' }]);
 });
 
 test('healthOf: metrics or queues that cannot be read are warnings', () => {
   const health = healthOf({ ...healthy, lambda: { error: 'AccessDenied' }, queues: { error: 'throttled' } });
   assert.deepEqual(health, { status: 'warning', problems: [
-    { level: 'warning', text: 'failure queues unreadable: throttled' },
-    { level: 'warning', text: 'Lambda metrics unreadable: AccessDenied' },
+    { level: 'warning', code: 'queues-unreadable', text: 'failure queues unreadable: throttled' },
+    { level: 'warning', code: 'metrics-unreadable', text: 'Lambda metrics unreadable: AccessDenied' },
   ] });
 });
 
@@ -215,5 +226,5 @@ test('router action answers when CloudWatch, SQS and the table fail', async () =
   assert.equal(info.health.status, 'error', 'no scheduled check known');
   assert.ok(info.health.problems.some((p) => p.text === 'Lambda metrics unreadable: AccessDenied'));
   assert.ok(info.health.problems.some((p) => p.text === 'failure queues unreadable: throttled'));
-  assert.ok(info.health.problems.some((p) => p.text === 'pauses unreadable: table'));
+  assert.ok(info.health.problems.some((p) => p.code === 'pauses-unreadable' && p.text === 'pauses unreadable: table'));
 });

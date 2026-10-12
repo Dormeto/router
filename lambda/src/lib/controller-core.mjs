@@ -781,15 +781,16 @@ export function createController({
       lambda: measured.lambda, queues: measured.queues, ipLists: lists, failed: byState[STATES.FAILED] ?? 0, concurrency,
     });
     if (pausesError) {
-      health.problems.push({ level: 'warning', text: `pauses unreadable: ${pausesError}` });
+      health.problems.push({ level: 'warning', code: 'pauses-unreadable', text: `pauses unreadable: ${pausesError}` });
       if (health.status === 'ok') health.status = 'warning';
     }
-    // Repairs of the last 24 hours (R4c): the customer's infrastructure as code keeps changing what onboarding added.
+    // Repairs of the last 24 hours (R4c): something outside Dormeto keeps changing what onboarding added (the customer's
+    // infrastructure as code, or a person).
     const dayAgo = iso(t - 86_400_000);
     const drift24h = (await Promise.all(configs.map((c) => (store.listDrift ? store.listDrift(c.workloadId, 50).catch(() => []) : []))))
       .flat().filter((e) => e.at >= dayAgo).length;
     if (drift24h) {
-      health.problems.push({ level: 'warning', text: `${drift24h} drift repair${drift24h === 1 ? '' : 's'} in 24 hours: infrastructure as code changed what onboarding added (see the workloads)` });
+      health.problems.push({ level: 'warning', code: 'drift', text: `${drift24h} drift repair${drift24h === 1 ? '' : 's'} in 24 hours: rules or tags changed outside Dormeto, repaired (see the workloads)` });
       if (health.status === 'ok') health.status = 'warning';
     }
     return {

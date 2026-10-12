@@ -269,7 +269,7 @@ test('status lists the latest drift repairs, and the router health counts those 
   assert.deepEqual(status.drift.map((e) => e.kind), ['shadow created', 'backend tag restored']);
   const info = await s.handler({ action: 'router' });
   assert.equal(info.health.drift24h, 1);
-  assert.ok(info.health.problems.some((p) => p.text === '1 drift repair in 24 hours: infrastructure as code changed what onboarding added (see the workloads)'));
+  assert.ok(info.health.problems.some((p) => p.code === 'drift' && p.text === '1 drift repair in 24 hours: rules or tags changed outside Dormeto, repaired (see the workloads)'));
 });
 
 test('an orphan shadow asks the onboarder for a repair without waking the workload, and a failing onboarder never stops the check', async () => {

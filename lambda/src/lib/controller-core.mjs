@@ -336,9 +336,12 @@ export function createController({
   // load balancer for all workloads, cached five minutes.
   async function workloadHosts(configs) {
     if (now() - hosts.at < 5 * 60_000 && configs.every((c) => hosts.byWorkload.has(c.workloadId))) return hosts.byWorkload;
-    const found = await resolveRules(elbv2, configs).catch(() => new Map());
+    return rememberHosts(configs, await resolveRules(elbv2, configs).catch(() => new Map()), now());
+  }
+  // The check's own listing fills the cache: its report lists no load balancer again.
+  function rememberHosts(configs, found, at) {
     hosts.byWorkload = new Map(configs.map((c) => [c.workloadId, (found.get(c.workloadId)?.rules ?? []).map(hostOf).find(Boolean) ?? null]));
-    hosts.at = now();
+    hosts.at = at;
     return hosts.byWorkload;
   }
 
@@ -456,10 +459,12 @@ export function createController({
       const from = cursor ? configs.findIndex((c) => c.workloadId > cursor) : 0;
       const order = from > 0 ? [...configs.slice(from), ...configs.slice(0, from)] : configs;
       // The rules of every workload, each load balancer listed once; backends found by tag once.
+      const listedAt = now();
       const rules = await resolveRules(elbv2, configs).catch((err) => {
         log.warn('CheckRulesUnread', { error: err.message });
         return null;
       });
+      if (rules) rememberHosts(configs, rules, listedAt);
       const ctx = { rules, scope: checkScope(clients) };
       const deadline = Math.min(started + CHECK_BUDGET_MS, budgetEnd);
       const results = [];

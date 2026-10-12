@@ -74,6 +74,7 @@ export function crowdedAccount({ workloads = 1500, balancers = 300, latencyMs = 
     async listPauses() { return []; },
     async getPauses() { return []; },
     async listDrift() { return []; },
+    async getStats() { return null; },
     async getHealth() { return null; },
     async putHealth() {},
     async count() {},

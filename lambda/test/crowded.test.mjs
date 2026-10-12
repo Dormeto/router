@@ -14,8 +14,11 @@ function setup({ workloads = 1500, balancers = 300, latencyMs = 400, lastRequest
   const clock = simClock();
   const account = crowdedAccount({ workloads, balancers, latencyMs, clock, lastRequest });
   const { store, ...aws } = account.clients;
+  // The router reports to the manager after each check (its workloads as the list gives them).
+  const reports = [];
+  const publisher = { enabled: true, checked: async (report) => { reports.push(report); }, stateChanged: async () => {} };
   const handler = createController({
-    store, ...aws, invokeSelf: account.invokeSelf, now: clock.now, sleep: clock.sleep, log: silentLog,
+    store, ...aws, invokeSelf: account.invokeSelf, now: clock.now, sleep: clock.sleep, log: silentLog, publisher,
     router: { name: 'dmtr-dev', region: 'eu-west-3', checkSchedule: 'rate(5 minutes)' },
   });
   // One check, as the schedule starts it; the next one starts 5 minutes after it.
@@ -28,10 +31,10 @@ function setup({ workloads = 1500, balancers = 300, latencyMs = 400, lastRequest
     clock.advance(Math.max(0, 5 * MINUTE - ms));
     return { result, ms, relisted };
   }
-  return { clock, account, handler, check };
+  return { clock, account, handler, check, reports };
 }
 
-test('a crowded check lists each load balancer once, stays within its budget, and reaches every workload within a few checks', async () => {
+test('a crowded check lists each load balancer once, its report to the manager included, stays within its budget, and reaches every workload within a few checks', async () => {
   const s = setup();
   const seen = new Set();
   const durations = [];
@@ -43,6 +46,9 @@ test('a crowded check lists each load balancer once, stays within its budget, an
     durations.push(ms);
   }
   assert.equal(seen.size, 1500);
+  // Each check reported every workload, with its host, from the check's own listing.
+  assert.equal(s.reports.length, durations.length);
+  for (const report of s.reports) assert.equal(report.workloads.filter((w) => w.url).length, 1500);
   assert.ok(durations.length >= 2 && durations.length <= 3, `${durations.length} checks`);
   for (const ms of durations) assert.ok(ms <= BUDGET_MS + 5_000, `a check took ${ms / 1000} s`);
   // Backends found by tag once per check, not once per workload.

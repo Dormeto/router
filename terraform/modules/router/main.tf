@@ -70,10 +70,12 @@ resource "aws_lambda_function" "controller" {
 
   environment {
     variables = {
-      DMT_TABLE    = aws_dynamodb_table.router.name
-      DMT_VERSION  = var.router_version
-      DMT_BUILD    = local.build
-      DMT_IP_LISTS = local.ip_lists
+      DMT_TABLE         = aws_dynamodb_table.router.name
+      DMT_VERSION       = var.router_version
+      DMT_BUILD         = local.build
+      DMT_IP_LISTS      = local.ip_lists
+      DMT_TG_PREFIX     = "${var.name}-"
+      DMT_NO_WAKE_RULES = jsonencode(local.no_wake_rules)
     }
   }
 

@@ -2,6 +2,11 @@ import { randomUUID } from 'node:crypto';
 import { STATES } from './state.mjs';
 import { setRoute } from './route.mjs';
 import { healthyCount, waitTargetsReleased } from './instances.mjs';
+import { createStatus } from './status.mjs';
+import { describeRules } from './no-wake.mjs';
+import { describeStoredLists } from './list-cache.mjs';
+import { STATS_DAYS, workloadSummary } from './summary.mjs';
+import { discoverCandidates } from './candidates.mjs';
 import { requestSum } from './metrics.mjs';
 import {
   backendKey, backendStatuses, isCompanion, resolveBackends, resumeBackends, sleepBackends, startCompanions, stopCompanions, toRecord, wakeBackends,
@@ -18,7 +23,10 @@ const TIMEOUT_MARGIN_MS = 30_000;
 // Held requests last at most waitSeconds: a counter untouched for longer is a leak (killed waker).
 const HOLDERS_STALE_MS = 2 * 60_000;
 
-export function createController({ store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, invokeSelf, now = Date.now, sleep, newId = randomUUID, log, lists = null }) {
+export function createController({
+  store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, invokeSelf, now = Date.now, sleep, newId = randomUUID, log,
+  lists = null, router = {}, defaultRules = [], ipLists = [],
+}) {
   const clients = { ec2, elbv2, autoscaling, ecs, tagging, appscaling, rds };
   let budgetEnd = Infinity;
 
@@ -237,6 +245,71 @@ export function createController({ store, ec2, elbv2, cloudwatch, autoscaling, e
     return nap(cfg.workloadId);
   }
 
+  // --- Manager interface: list, status, force-wake ------------------------------------------------------------------
+
+  const status = createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, now, version: router });
+  // Host conditions of the workload rules, for their URL: one DescribeRules call, cached (rules rarely change).
+  const hosts = { at: 0, byRule: new Map() };
+  async function ruleHosts(configs) {
+    if (now() - hosts.at < 5 * 60_000 && configs.every((c) => hosts.byRule.has(c.ruleArn))) return hosts.byRule;
+    const arns = configs.map((c) => c.ruleArn).filter(Boolean);
+    const { Rules = [] } = arns.length ? await elbv2.describeRules({ RuleArns: arns }).catch(() => ({})) : {};
+    hosts.byRule = new Map(Rules.map((r) => [r.RuleArn, r.Conditions?.find((c) => c.Field === 'host-header')?.HostHeaderConfig?.Values?.[0] ?? null]));
+    hosts.at = now();
+    return hosts.byRule;
+  }
+
+  async function list() {
+    const configs = await store.listConfigs();
+    const byRule = await ruleHosts(configs);
+    const workloads = await Promise.all(configs.map(async (cfg) => workloadSummary(cfg, await store.getRun(cfg.workloadId), byRule.get(cfg.ruleArn))));
+    return { router: { name: router.name, version: router.version, build: router.build }, workloads };
+  }
+
+  async function workloadStatus(workloadId) {
+    const cfg = await config(workloadId);
+    const run = await store.getRun(workloadId);
+    return status(workloadId, cfg, run ?? {}, {
+      noWakeRules: describeRules([{ level: 'router', rules: defaultRules }, { level: 'workload', rules: cfg.noWakeRules }]),
+      wakeRules: describeRules([{ level: 'wake', rules: cfg.wakeRules }]),
+      loadStats: () => store.getStats(workloadId, STATS_DAYS),
+      loadLists: () => describeStoredLists(store, ipLists),
+    });
+  }
+
+  async function count(workloadId, counter) {
+    try {
+      await store.count(workloadId, counter);
+    } catch (err) {
+      log.warn('StatsWriteFailed', { workloadId, counter, error: err.message });
+    }
+  }
+
+  // Operator request from the manager: no retry delay; the wake itself runs in its own invocation.
+  async function forceWake(workloadId, by) {
+    await config(workloadId);
+    const run = await store.getRun(workloadId);
+    if (run?.state === STATES.ASLEEP || run?.state === STATES.FAILED) {
+      const wakeId = newId();
+      const next = await store.transition(workloadId, {
+        cond: { state: run.state }, set: { state: STATES.WAKING, wakeId, wakeStartedAt: now() }, remove: ['failedAt'], increment: ['wakeCount'],
+      });
+      if (!next) return { state: (await store.getRun(workloadId))?.state };
+      log.info('WakeRequested', { workloadId, wakeId, trigger: { kind: 'manager', by } });
+      await count(workloadId, 'wake:manager');
+      await invokeSelf({ action: 'wake', workloadId, wakeId });
+      return { state: STATES.WAKING };
+    }
+    if (run?.state === STATES.NAPPING) {
+      if (await store.setPendingWake(workloadId)) {
+        log.info('PendingWake', { workloadId, trigger: { kind: 'manager', by } });
+        await count(workloadId, 'wake:manager');
+      }
+      return { state: STATES.NAPPING, pendingWake: true };
+    }
+    return { state: run?.state };
+  }
+
   // IP reputation lists: downloads run in their own invocation, never delaying the workload checks.
   async function requestListRefresh() {
     if (!lists || !invokeSelf) return;
@@ -283,6 +356,10 @@ export function createController({ store, ec2, elbv2, cloudwatch, autoscaling, e
       case 'check': return check();
       case 'ensure-awake': return ensureAwake(event.workloadId);
       case 'refresh-lists': return lists ? lists.refresh(event.names ?? []) : [];
+      case 'list': return list();
+      case 'status': return workloadStatus(event.workloadId);
+      case 'force-wake': return forceWake(event.workloadId, event.by);
+      case 'discover': return discoverCandidates({ elbv2, autoscaling, ecs, cloudwatch }, { now });
       default: throw new Error(`unknown action: ${event?.action}`);
     }
   };

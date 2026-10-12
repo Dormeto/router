@@ -575,3 +575,77 @@ test('refresh-lists refreshes the requested lists', async () => {
   assert.deepEqual(await s.handler({ action: 'refresh-lists', names: ['ipsum'] }), [{ name: 'ipsum', entries: 1 }]);
   assert.deepEqual(s.calls, [['ipsum']]);
 });
+
+// --- Manager interface ----------------------------------------------------------------------------------------------
+
+function managerSetup({ run, defaultRules = [], lists = [] }) {
+  const s = setup({ run });
+  const handler = createController({
+    store: s.store, ec2: s.ec2, elbv2: s.elbv2, cloudwatch: s.cloudwatch, autoscaling: s.autoscaling, ecs: s.ecs,
+    appscaling: s.appscaling, invokeSelf: async (payload) => { s.invocations.push(payload); }, now: s.clock.now,
+    sleep: s.clock.sleep, newId: () => 'w-manager', log: silentLog,
+    router: { name: 'dmt-dev', version: '0.11.0', build: 'abc' }, defaultRules, ipLists: lists,
+  });
+  return { ...s, handler };
+}
+
+test('list returns the router and its workloads from the state table', async () => {
+  const s = managerSetup({ run: { state: STATES.ASLEEP, wakeCount: 3, updatedAt: 1_700_000_000_000 } });
+  const result = await s.handler({ action: 'list' });
+  assert.deepEqual(result.router, { name: 'dmt-dev', version: '0.11.0', build: 'abc' });
+  const [workload] = result.workloads;
+  assert.equal(workload.workloadId, 'demo');
+  assert.equal(workload.state, STATES.ASLEEP);
+  assert.equal(workload.wakeCount, 3);
+  assert.equal(workload.wakeMode, 'any');
+  assert.equal(workload.updatedAt, '2023-11-14T22:13:20.000Z');
+  assert.equal(workload.settings.idleMinutes, 15);
+});
+
+test('status returns the live status of a workload, with router rules, statistics and lists', async () => {
+  const s = managerSetup({
+    run: { state: STATES.AWAKE, awakeSince: 0 },
+    defaultRules: [{ name: 'e2e', headers: [{ name: 'x-e2e', value: '1' }] }],
+    lists: [{ name: 'ipsum', url: 'https://x', action: 'defer', refreshHours: 24 }],
+  });
+  s.store.state.lists.ipsum = { meta: { version: 'v1', format: 'ranges-v1', entries: 42, fetchedAt: 1_700_000_000_000 }, parts: {} };
+  s.store.state.stats = { 'ignored:HEAD': 2 };
+  const status = await s.handler({ action: 'status', workloadId: 'demo' });
+  assert.equal(status.workloadId, 'demo');
+  assert.equal(status.state, STATES.AWAKE);
+  assert.equal(status.route, 'app');
+  assert.deepEqual(status.router, { version: '0.11.0', build: 'abc' });
+  assert.deepEqual(status.noWakeRules.map((r) => [r.name, r.level]), [['e2e', 'router']]);
+  assert.deepEqual(status.stats.total.ignored, { HEAD: 2 });
+  assert.deepEqual(status.ipLists.map((l) => [l.name, l.entries]), [['ipsum', 42]]);
+});
+
+test('status of an unknown workload is an error', async () => {
+  const s = managerSetup({ run: { state: STATES.AWAKE } });
+  await assert.rejects(s.handler({ action: 'status', workloadId: 'nope' }), /workload not configured: nope/);
+});
+
+test('force-wake wakes an asleep or failed workload, marks a pending wake during a nap, and is counted', async () => {
+  for (const state of [STATES.ASLEEP, STATES.FAILED]) {
+    const s = managerSetup({ run: { state, failedAt: 1 } });
+    assert.deepEqual(await s.handler({ action: 'force-wake', workloadId: 'demo', by: 'ops@example.com' }), { state: STATES.WAKING });
+    assert.deepEqual(s.invocations.filter((i) => i.action === 'wake'), [{ action: 'wake', workloadId: 'demo', wakeId: 'w-manager' }]);
+    assert.equal(s.store.state.stats['wake:manager'], 1);
+  }
+  const napping = managerSetup({ run: { state: STATES.NAPPING } });
+  assert.deepEqual(await napping.handler({ action: 'force-wake', workloadId: 'demo' }), { state: STATES.NAPPING, pendingWake: true });
+  assert.equal(napping.store.state.run.pendingWake, true);
+  const awake = managerSetup({ run: { state: STATES.AWAKE } });
+  assert.deepEqual(await awake.handler({ action: 'force-wake', workloadId: 'demo' }), { state: STATES.AWAKE });
+});
+
+test('discover runs the discovery with the controller clients', async () => {
+  const s = managerSetup({ run: { state: STATES.AWAKE } });
+  s.elbv2.describeLoadBalancers = async () => ({ LoadBalancers: [] });
+  s.elbv2.describeTargetGroups = async () => ({ TargetGroups: [] });
+  s.elbv2.describeTags = async () => ({ TagDescriptions: [] });
+  s.ecs.listClusters = async () => ({ clusterArns: [] });
+  const result = await s.handler({ action: 'discover' });
+  assert.deepEqual(result.candidates, []);
+  assert.match(result.generatedAt, /^\d{4}-\d\d-\d\dT/);
+});

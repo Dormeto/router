@@ -1,0 +1,26 @@
+// Workload summary for the manager `list` action: state table only (configuration, runtime state, rule host).
+export const STATS_DAYS = 7;
+
+const iso = (ms) => (typeof ms === 'number' && ms > 0 ? new Date(ms).toISOString() : null);
+
+export function workloadSummary(cfg, run = {}, host = null) {
+  return {
+    workloadId: cfg.workloadId,
+    state: run?.state ?? 'UNKNOWN',
+    url: host ? `https://${host}/` : null,
+    wakeMode: cfg.wakeMode ?? 'any',
+    wakeCount: run?.wakeCount ?? 0,
+    awakeSince: iso(run?.awakeSince),
+    wakeStartedAt: iso(run?.wakeStartedAt),
+    failedAt: iso(run?.failedAt),
+    updatedAt: iso(run?.updatedAt),
+    pendingWake: run?.pendingWake === true,
+    settings: {
+      waitSeconds: cfg.waitSeconds,
+      idleMinutes: cfg.idleMinutes,
+      drainSeconds: cfg.drainSeconds,
+      wakeTimeoutSeconds: cfg.wakeTimeoutSeconds,
+      maxHolders: cfg.maxHolders,
+    },
+  };
+}

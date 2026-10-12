@@ -82,3 +82,18 @@ export function createListCache({ store, lists, now = Date.now, log, checkMs = C
     },
   };
 }
+
+// Controller side (manager status): what the controller stored, from META only (no parts read).
+export async function describeStoredLists(store, lists) {
+  return Promise.all(lists.map(async (list) => {
+    const meta = await store.getListMeta(list.name).catch((err) => ({ error: err.message }));
+    return {
+      name: list.name,
+      action: list.action,
+      entries: meta?.version ? meta.entries ?? 0 : 0,
+      dropped: meta?.dropped ?? 0,
+      fetchedAt: meta?.fetchedAt ? new Date(meta.fetchedAt).toISOString() : null,
+      error: meta?.error ?? (meta?.version ? undefined : 'not downloaded yet'),
+    };
+  }));
+}

@@ -4,14 +4,13 @@ import { WAKE_HEADER, acceptsHtml, classify, redirectCount, requestOrigin, reque
 import { renderJson, renderPage } from './page.mjs';
 import { ADMIN_PREFIX, parseAdminPath } from './admin.mjs';
 import { compileRules, describeRules } from './no-wake.mjs';
+import { STATS_DAYS } from './summary.mjs';
 
 const POLL_MS = 1000;
 const STUCK_GRACE_MS = 60_000;
 const MAX_REDIRECTS = 2;
 // ALB rule changes take about 12 s to propagate: right after a wake, requests still reach the waker.
 const ROUTE_GRACE_MS = 15_000;
-// Days of statistics on the admin dashboard.
-const STATS_DAYS = 7;
 
 export function createWaker({ store, invokeController, prefix, now = Date.now, sleep, newId = randomUUID, log, getAdmin, defaultRules = [], listCache = null }) {
   const inRouteGrace = (run) => run.state === STATES.AWAKE && (run.awakeSince ?? 0) > now() - ROUTE_GRACE_MS;

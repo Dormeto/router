@@ -91,6 +91,11 @@ data "aws_iam_policy_document" "controller" {
     resources = ["*"]
   }
   statement {
+    # Discovery of candidate rules for the manager (read-only).
+    actions   = ["elasticloadbalancing:DescribeLoadBalancers", "elasticloadbalancing:DescribeListeners", "elasticloadbalancing:DescribeTargetGroups", "elasticloadbalancing:DescribeTags", "ecs:ListClusters", "ecs:ListServices"]
+    resources = ["*"]
+  }
+  statement {
     actions   = ["rds:StartDBInstance", "rds:StopDBInstance", "rds:StartDBCluster", "rds:StopDBCluster"]
     resources = ["${local.arn_prefix}:rds:${local.region}:${local.account_id}:db:*", "${local.arn_prefix}:rds:${local.region}:${local.account_id}:cluster:*"]
     # Only databases onboarded in Dormeto (tagged dormeto:workload).

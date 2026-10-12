@@ -11,6 +11,7 @@ import { createTagging } from './aws/tagging.mjs';
 import { createController } from './lib/controller-core.mjs';
 import { createListRefresher } from './lib/list-refresh.mjs';
 import { parseLists } from './lib/list-cache.mjs';
+import { parseRules } from './lib/no-wake.mjs';
 import { logger } from './lib/log.mjs';
 import { createStore } from './lib/state.mjs';
 import { sleep } from './lib/time.mjs';
@@ -35,4 +36,8 @@ export const handler = createController({
   sleep,
   log: logger,
   lists: lists.length ? createListRefresher({ store, lists, log: logger }) : null,
+  // Manager interface: router identity, router no-wake rules and IP lists in the status.
+  router: { name: (process.env.DMT_TG_PREFIX ?? '').replace(/-$/, ''), version: process.env.DMT_VERSION, build: process.env.DMT_BUILD },
+  defaultRules: parseRules(process.env.DMT_NO_WAKE_RULES, (error) => logger.error('NoWakeRulesUnreadable', { error })),
+  ipLists: lists,
 });

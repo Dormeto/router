@@ -166,7 +166,9 @@ data "aws_iam_policy_document" "scheduler_assume" {
     condition {
       test     = "ArnEquals"
       variable = "aws:SourceArn"
-      values   = ["${local.arn_prefix}:scheduler:${local.region}:${local.account_id}:schedule/default/${var.name}-check"]
+      # EventBridge Scheduler presents its schedule group as the source, not the schedule: pinning the schedule ARN
+      # broke every scheduled check from 2026-10-03 to 2026-10-04 (target errors, no nap).
+      values = ["${local.arn_prefix}:scheduler:${local.region}:${local.account_id}:schedule-group/default"]
     }
   }
 }
@@ -180,6 +182,10 @@ data "aws_iam_policy_document" "scheduler" {
   statement {
     actions   = ["lambda:InvokeFunction"]
     resources = [aws_lambda_function.controller.arn]
+  }
+  statement {
+    actions   = ["sqs:SendMessage"]
+    resources = [aws_sqs_queue.check_failures.arn]
   }
 }
 

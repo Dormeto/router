@@ -149,5 +149,16 @@ resource "aws_scheduler_schedule" "check" {
     retry_policy {
       maximum_retry_attempts = 0
     }
+
+    # A failed scheduled check lands here with its error code and message (visible, not silently dropped).
+    dead_letter_config {
+      arn = aws_sqs_queue.check_failures.arn
+    }
   }
+}
+
+resource "aws_sqs_queue" "check_failures" {
+  name                      = "${var.name}-check-failures"
+  message_retention_seconds = 1209600
+  sqs_managed_sse_enabled   = true
 }

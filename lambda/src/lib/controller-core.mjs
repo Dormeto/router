@@ -14,7 +14,7 @@ const TIMEOUT_MARGIN_MS = 30_000;
 // Held requests last at most waitSeconds: a counter untouched for longer is a leak (killed waker).
 const HOLDERS_STALE_MS = 2 * 60_000;
 
-export function createController({ store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, now = Date.now, sleep, newId = randomUUID, log }) {
+export function createController({ store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, invokeSelf, now = Date.now, sleep, newId = randomUUID, log }) {
   const clients = { ec2, elbv2, autoscaling, ecs, tagging, appscaling };
   let budgetEnd = Infinity;
 
@@ -202,6 +202,12 @@ export function createController({ store, ec2, elbv2, cloudwatch, autoscaling, e
     if ((run.awakeSince ?? 0) > t - idleMs) return { state: run.state };
     const requests = await requestSum(cloudwatch, cfg, t - idleMs, t);
     if (requests > 0) return { state: run.state, requests };
+    // A nap lasts minutes: run it in its own invocation so that the check (and the other workloads) are not delayed.
+    if (invokeSelf) {
+      await invokeSelf({ action: 'nap', workloadId: cfg.workloadId });
+      log.info('NapRequested', { workloadId: cfg.workloadId });
+      return { state: run.state, nap: 'requested' };
+    }
     return nap(cfg.workloadId);
   }
 

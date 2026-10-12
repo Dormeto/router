@@ -15,10 +15,11 @@ function setup({ run, instance = 'running', target = 'app', healthy = 1, metric 
   const tagging = fakeTagging(ecs);
   const appscaling = fakeAppScaling();
   let ids = 0;
+  const invocations = [];
   const handler = createController({
-    store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, now: clock.now, sleep: clock.sleep, newId: () => `wake-${++ids}`, log: silentLog,
+    store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, invokeSelf: async (payload) => { invocations.push(payload); }, now: clock.now, sleep: clock.sleep, newId: () => `wake-${++ids}`, log: silentLog,
   });
-  return { handler, store, ec2, elbv2, cloudwatch, autoscaling, ecs, appscaling, clock, cfg };
+  return { handler, store, ec2, elbv2, cloudwatch, autoscaling, ecs, appscaling, clock, cfg, invocations };
 }
 
 test('wake: starts the instance, waits for health, switches the route and becomes AWAKE', async () => {
@@ -105,11 +106,12 @@ test('nap: a failure while stopping ends FAILED so that requests retry the wake'
   assert.equal(s.store.state.run.state, STATES.FAILED);
 });
 
-test('check: naps an idle workload', async () => {
+test('check: requests the nap of an idle workload asynchronously, without napping inline', async () => {
   const s = setup({ run: { state: STATES.AWAKE, awakeSince: 1 }, metric: [0, 0, 0] });
   const [result] = await s.handler({ action: 'check' });
-  assert.equal(result.workloadId, 'demo');
-  assert.equal(result.state, STATES.ASLEEP);
+  assert.deepEqual(result, { workloadId: 'demo', state: STATES.AWAKE, nap: 'requested' });
+  assert.deepEqual(s.invocations, [{ action: 'nap', workloadId: 'demo' }]);
+  assert.equal(s.ec2.state.stopped, 0, 'the check itself does not stop anything');
   const query = s.cloudwatch.calls[0];
   assert.equal(query.EndTime.getTime() - query.StartTime.getTime(), 15 * 60_000);
 });

@@ -114,6 +114,11 @@ data "aws_iam_policy_document" "controller" {
     }
   }
   statement {
+    # The scheduled check fans naps out to the controller itself.
+    actions   = ["lambda:InvokeFunction"]
+    resources = ["${local.arn_prefix}:lambda:${local.region}:${local.account_id}:function:${var.name}-controller"]
+  }
+  statement {
     actions   = ["sqs:SendMessage"]
     resources = [aws_sqs_queue.controller_failures.arn]
   }

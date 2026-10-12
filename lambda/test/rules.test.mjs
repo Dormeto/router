@@ -79,6 +79,24 @@ test('a customer rule covered by a shadow with its conditions just before it is 
   assert.deepEqual(found.covered, [{ arn: 'arn:rule/customer', by: 'arn:rule/shadow' }]);
 });
 
+test('a shadow covers its rule whatever the order ELB lists their conditions in, or the values of a condition', async () => {
+  // As ELB answered for a shadow created with its rule's conditions (2026-10-07): a rule matches when all its conditions do.
+  const path = (...values) => ({ Field: 'path-pattern', PathPatternConfig: { Values: values } });
+  const query = (key) => ({ Field: 'query-string', QueryStringConfig: { Values: [{ Key: key, Value: '*' }] } });
+  for (const [customer, shadow] of [
+    [[path('/themes/*', '/dist/*'), host('shop.example.com')], [host('shop.example.com'), path('/themes/*', '/dist/*')]],
+    [[query('api-key'), host('shop.example.com'), query('api-user')], [host('shop.example.com'), query('api-key'), query('api-user')]],
+    [[path('/themes/*', '/dist/*')], [path('/dist/*', '/themes/*')]],
+  ]) {
+    const elbv2 = fakeElbv2(cfg);
+    elbv2.state.rules.set('arn:rule/customer', { actions: appOnly(cfg), conditions: customer, priority: '40', tags: {} });
+    elbv2.state.rules.set('arn:rule/shadow', { actions: elbv2.state.forward(1, 0), conditions: shadow, priority: '39', tags: { 'dormeto:workload': 'demo', 'dormeto:shadows': 'arn:rule/customer' } });
+    const found = (await resolveRules(elbv2, [cfg])).get('demo');
+    assert.deepEqual(found.issues, [], JSON.stringify(shadow));
+    assert.deepEqual(found.covered, [{ arn: 'arn:rule/customer', by: 'arn:rule/shadow' }]);
+  }
+});
+
 test('a shadow with other conditions than its rule, or after it, leaves the rule an issue (to repair)', async () => {
   for (const [conditions, priority, reason] of [
     [[host('old.example.com')], '39', 'rule 40 is shadowed by rule 39 with other conditions'],

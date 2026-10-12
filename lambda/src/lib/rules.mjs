@@ -44,7 +44,14 @@ export function cleanConditions(conditions = []) {
 
 const canonical = (value) => (Array.isArray(value) ? value.map(canonical)
   : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => [k, canonical(v)])) : value);
-export const sameConditions = (a, b) => JSON.stringify(canonical(cleanConditions(a))) === JSON.stringify(canonical(cleanConditions(b)));
+// A rule matches when all its conditions do, and a condition when any of its values does: ELB lists both in its own order
+// (a shadow created with its rule's conditions lists them differently), so they compare as sets.
+const conditionSet = (conditions) => canonical(cleanConditions(conditions)).map((c) => {
+  for (const config of CONFIGS) if (Array.isArray(c[config]?.Values)) c[config].Values = c[config].Values.map((v) => JSON.stringify(v)).sort();
+  if (Array.isArray(c.Values)) c.Values = c.Values.map((v) => JSON.stringify(v)).sort();
+  return JSON.stringify(c);
+}).sort();
+export const sameConditions = (a, b) => JSON.stringify(conditionSet(a)) === JSON.stringify(conditionSet(b));
 
 // Target groups of the forward actions of a rule, whatever their weight.
 export function forwardTargetGroups(rule) {

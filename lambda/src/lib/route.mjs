@@ -34,6 +34,22 @@ export function currentTarget(actions, cfg) {
   return 'mixed';
 }
 
+// Conditions of a rule as text: "host a.example.com, path /static/*".
+export function conditionsOf(rule) {
+  const parts = (rule.Conditions ?? []).map((c) => {
+    if (c.Field === 'host-header') return `host ${(c.HostHeaderConfig?.Values ?? c.Values ?? []).join(' | ')}`;
+    if (c.Field === 'path-pattern') return `path ${(c.PathPatternConfig?.Values ?? c.Values ?? []).join(' | ')}`;
+    return c.Field;
+  });
+  return parts.join(', ') || 'any';
+}
+
+// First host name of a rule's host-header condition, or null.
+export const hostOf = (rule) => {
+  const c = rule?.Conditions?.find((x) => x.Field === 'host-header');
+  return c?.HostHeaderConfig?.Values?.[0] ?? c?.Values?.[0] ?? null;
+};
+
 // Rules of a workload: ruleArns, or the single ruleArn of configurations written before several rules were supported.
 export const rulesOf = (cfg) => (cfg.ruleArns?.length ? cfg.ruleArns : [cfg.ruleArn].filter(Boolean));
 

@@ -2,7 +2,7 @@
 // admin page (waker) and by the controller `status` action (manager).
 import { recommendations } from './advice.mjs';
 import { STATES } from './state.mjs';
-import { currentTarget } from './route.mjs';
+import { conditionsOf, currentTarget, routeOf, rulesOf } from './route.mjs';
 import { instanceStates } from './instances.mjs';
 import { backendKey, backendStatuses, resolveBackends } from './backends.mjs';
 import { lastRequestAt } from './metrics.mjs';
@@ -28,7 +28,7 @@ export function createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging
       resolved.backends.length ? backendStatuses(clients, resolved.backends) : {},
       instanceIds.length ? instanceStates(ec2, instanceIds) : {},
       elbv2.describeTargetHealth({ TargetGroupArn: cfg.appTargetGroupArn }),
-      elbv2.describeRules({ RuleArns: [cfg.ruleArn] }),
+      elbv2.describeRules({ RuleArns: rulesOf(cfg) }),
       lastRequestAt(cloudwatch, cfg, t - cfg.idleMinutes * 60_000, t),
     ]);
     const nap = napEstimate({ cfg, run, lastRequest, now: t });
@@ -45,7 +45,14 @@ export function createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging
       pendingWake: run.pendingWake === true,
       lastRequestAt: iso(lastRequest),
       nap: nap && { eligibleAt: iso(nap.eligibleAt), latestAt: iso(nap.latestAt), inSeconds: nap.inSeconds },
-      route: currentTarget(rules.Rules?.[0]?.Actions ?? [], cfg),
+      // The workload route over all its rules, and each rule (a rule deleted by hand shows as not found).
+      route: routeOf(rules.Rules ?? [], cfg),
+      rules: rulesOf(cfg).map((arn) => {
+        const rule = (rules.Rules ?? []).find((r) => r.RuleArn === arn);
+        return rule
+          ? { arn, priority: rule.Priority ?? null, conditions: conditionsOf(rule), route: currentTarget(rule.Actions ?? [], cfg) }
+          : { arn, priority: null, conditions: 'rule not found', route: 'unknown' };
+      }),
       discovery: resolved.mode,
       instances: instanceIds.map((id) => ({ id, state: instances[id] ?? 'unknown' })),
       backends: resolved.backends.map((b) => {

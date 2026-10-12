@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { STATES } from './state.mjs';
-import { setRoute } from './route.mjs';
+import { hostOf, rulesOf, setRoute } from './route.mjs';
 import { healthyCount, waitTargetsReleased } from './instances.mjs';
 import { createStatus } from './status.mjs';
 import { describeRules } from './no-wake.mjs';
@@ -254,13 +254,19 @@ export function createController({
   // Host conditions of the workload rules, for their URL: one DescribeRules call, cached (rules rarely change).
   const hosts = { at: 0, byRule: new Map() };
   async function ruleHosts(configs) {
-    if (now() - hosts.at < 5 * 60_000 && configs.every((c) => hosts.byRule.has(c.ruleArn))) return hosts.byRule;
-    const arns = configs.map((c) => c.ruleArn).filter(Boolean);
-    const { Rules = [] } = arns.length ? await elbv2.describeRules({ RuleArns: arns }).catch(() => ({})) : {};
-    hosts.byRule = new Map(Rules.map((r) => [r.RuleArn, r.Conditions?.find((c) => c.Field === 'host-header')?.HostHeaderConfig?.Values?.[0] ?? null]));
+    const arns = configs.flatMap(rulesOf);
+    if (now() - hosts.at < 5 * 60_000 && arns.every((a) => hosts.byRule.has(a))) return hosts.byRule;
+    const found = [];
+    for (let i = 0; i < arns.length; i += 20) {
+      const { Rules = [] } = await elbv2.describeRules({ RuleArns: arns.slice(i, i + 20) }).catch(() => ({}));
+      found.push(...Rules);
+    }
+    hosts.byRule = new Map(found.map((r) => [r.RuleArn, hostOf(r)]));
     hosts.at = now();
     return hosts.byRule;
   }
+  // The workload URL: the host of its first rule that has one.
+  const hostFor = (cfg, byRule) => rulesOf(cfg).map((arn) => byRule.get(arn)).find(Boolean) ?? null;
 
   async function list() {
     const configs = await store.listConfigs();
@@ -270,7 +276,7 @@ export function createController({
         store.getRun(cfg.workloadId),
         store.getStats(cfg.workloadId, STATS_DAYS).catch(() => null),
       ]);
-      return workloadSummary(cfg, run, byRule.get(cfg.ruleArn), totals(stats));
+      return workloadSummary(cfg, run, hostFor(cfg, byRule), totals(stats));
     }));
     const health = await store.getCheck().catch(() => null);
     return {

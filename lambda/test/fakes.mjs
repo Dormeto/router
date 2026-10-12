@@ -116,7 +116,11 @@ export function fakeElbv2(cfg, { target = 'app', healthy = 1 } = {}) {
   return {
     state,
     async describeRules({ RuleArns }) {
-      return { Rules: RuleArns.filter((a) => state.rules.has(a)).map((a) => ({ RuleArn: a, Actions: structuredClone(state.rules.get(a)) })) };
+      return {
+        Rules: RuleArns.filter((a) => state.rules.has(a)).map((a) => ({
+          RuleArn: a, Actions: structuredClone(state.rules.get(a)), ...(state.conditions?.has(a) ? { Conditions: state.conditions.get(a), Priority: state.priorities?.get(a) } : {}),
+        })),
+      };
     },
     async modifyRule({ RuleArn, Actions }) {
       if (state.failOn === RuleArn) throw new Error(`ModifyRule failed for ${RuleArn}`);

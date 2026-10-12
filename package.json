@@ -1,0 +1,10 @@
+{
+  "name": "@dormeto/router",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "test": "node --test \"lambda/test/*.test.mjs\"",
+    "check": "node --check lambda/src/waker.mjs && node --check lambda/src/controller.mjs"
+  }
+}

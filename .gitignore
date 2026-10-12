@@ -1,0 +1,9 @@
+node_modules/
+.DS_Store
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+.build/

@@ -39,6 +39,12 @@ module "eks" {
   endpoint_public_access = true
   authentication_mode    = "API"
 
+  # The audit log only, a week: it shows every call the routers make to the cluster (the spike, the e2e). The api and
+  # authenticator logs would add CloudWatch ingestion (the controllers renew their leases every few seconds) that no
+  # test reads.
+  enabled_log_types                      = ["audit"]
+  cloudwatch_log_group_retention_in_days = 7
+
   enable_cluster_creator_admin_permissions = false
   access_entries = {
     admin = {

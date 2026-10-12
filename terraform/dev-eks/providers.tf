@@ -8,8 +8,12 @@ provider "aws" {
   }
 }
 
-# Helm talks to the cluster with the caller's token (its access entry, eks.tf).
+# Helm talks to the cluster with the caller's token (its access entry, main.tf). Its repositories are its own, under
+# .terraform: the caller's Helm repositories are never read (one without a cached index fails every chart lookup).
 provider "helm" {
+  repository_config_path = "${path.module}/.terraform/helm/repositories.yaml"
+  repository_cache       = "${path.module}/.terraform/helm/cache"
+
   kubernetes = {
     host                   = module.eks.cluster_endpoint
     cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)

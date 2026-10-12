@@ -42,6 +42,8 @@ export function createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging
       name: cfg.name ?? workloadId,
       router: { version: version.version ?? 'unknown', build: version.build ?? 'unknown' },
       targetGroupArn: cfg.appTargetGroupArn,
+      // Where the application's requests go: Dormeto's own target group for a grouped Ingress (its rule is first).
+      servingTargetGroupArn: rules.switchTargetGroup ?? cfg.appTargetGroupArn,
       source: cfg.source ?? 'terraform',
       state: run.state,
       stateAt: iso(run.stateAt),

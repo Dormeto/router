@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { currentTarget, routeOf, setRoute, withWeights } from '../src/lib/route.mjs';
-import { fakeElbv2, routeOf as routeOfFake, testConfig } from './fakes.mjs';
+import { fakeElbv2, k8sGroupedConfig, routeOf as routeOfFake, testConfig } from './fakes.mjs';
 
 const cfg = { ruleArn: 'rule', appTargetGroupArn: 'app-tg', wakerTargetGroupArn: 'waker-tg' };
 
@@ -36,6 +36,14 @@ test('currentTarget reads the weights', () => {
   assert.equal(currentTarget([forward(0, 1)], cfg), 'waker');
   assert.equal(currentTarget([forward(1, 1)], cfg), 'mixed');
   assert.equal(currentTarget([oidc], cfg), 'unknown');
+});
+
+test('currentTarget of a grouped Ingress: Dormeto\'s own target group is the application\'s side of its rule', () => {
+  const k = k8sGroupedConfig();
+  const dormeto = (app, waker) => [{ Type: 'forward', ForwardConfig: { TargetGroups: [{ TargetGroupArn: 'arn:tg/k8s-demo-web-1da7898e9b', Weight: app }, { TargetGroupArn: k.wakerTargetGroupArn, Weight: waker }] } }];
+  assert.equal(currentTarget(dormeto(1, 0), k), 'app');
+  assert.equal(currentTarget(dormeto(0, 1), k), 'waker');
+  assert.equal(currentTarget(dormeto(1, 1), k), 'mixed');
 });
 
 const ruleOf = (arn, actions) => ({ RuleArn: arn, Actions: actions });

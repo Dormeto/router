@@ -182,8 +182,11 @@ export function fakeElbv2(cfg, { target = 'app', healthy = 1 } = {}) {
       state.rules.get(RuleArn).actions = structuredClone(Actions);
       return {};
     },
-    async describeTargetHealth() {
-      // Explicit targets ([{ Id, State }]) when a test sets them, else `healthy` anonymous healthy targets.
+    async describeTargetHealth({ TargetGroupArn } = {}) {
+      // A target group's own targets (state.targetsOf[arn]), else explicit targets ([{ Id, State }]) when a test sets
+      // them, else `healthy` anonymous healthy targets.
+      const own = state.targetsOf?.[TargetGroupArn];
+      if (own) return { TargetHealthDescriptions: own.map((t) => ({ Target: { Id: t.Id }, TargetHealth: { State: t.State } })) };
       if (state.targets) {
         return { TargetHealthDescriptions: state.targets.map((t) => ({ Target: { Id: t.Id }, TargetHealth: { State: t.State } })) };
       }
@@ -445,12 +448,52 @@ export function mergePatch(target, patch) {
   return out;
 }
 
+// A JSON patch (RFC 6902): add, replace, remove and test; a failed test or a missing path fails the whole patch.
+export function jsonPatch(doc, ops) {
+  const out = structuredClone(doc);
+  const parse = (path) => path.split('/').slice(1).map((p) => p.replace(/~1/g, '/').replace(/~0/g, '~'));
+  for (const op of ops) {
+    const keys = parse(op.path);
+    const last = keys.pop();
+    const parent = keys.reduce((node, key) => {
+      if (node?.[key] === undefined) throw Object.assign(new Error(`path ${op.path} not found`), { name: 'KubernetesError', status: 422, reason: 'Invalid' });
+      return node[key];
+    }, out);
+    if (op.op === 'test') {
+      if (JSON.stringify(parent[last]) !== JSON.stringify(op.value)) throw Object.assign(new Error(`test of ${op.path} failed`), { name: 'KubernetesError', status: 422, reason: 'Invalid' });
+    } else if (op.op === 'remove') {
+      if (!(last in parent)) throw Object.assign(new Error(`path ${op.path} not found`), { name: 'KubernetesError', status: 422, reason: 'Invalid' });
+      if (Array.isArray(parent)) parent.splice(Number(last), 1);
+      else delete parent[last];
+    } else if (op.op === 'replace' && !(last in parent)) {
+      throw Object.assign(new Error(`path ${op.path} not found`), { name: 'KubernetesError', status: 422, reason: 'Invalid' });
+    } else {
+      parent[last] = structuredClone(op.value);
+    }
+  }
+  return out;
+}
+
 // A cluster's API as lib/k8s.mjs's client gives it: owners (Deployments, StatefulSets), pods, nodes and KEDA
 // ScaledObjects (keda: false, its API missing). A patch of an owner's scale sets its replicas; at 0 its pods terminate
 // and are gone after stopAfter more lists of them (0: at once). Every call is recorded in state.calls; any other call
 // fails, as a write the router must not make would.
-export function fakeKubernetes({ owners = [], pods = [], nodes = [], scaledObjects = [], keda = true, stopAfter = 0 } = {}) {
-  const state = { owners: structuredClone(owners), pods: structuredClone(pods), nodes: structuredClone(nodes), scaledObjects: structuredClone(scaledObjects), calls: [], stopping: new Map() };
+// Ingresses (create, a JSON patch, delete; each write bumps resourceVersion and calls state.onIngress(ingress, before))
+// and their Events (state.events: [{ involvedObject: { kind, name }, type, reason, message, lastTimestamp }]).
+export function fakeKubernetes({ owners = [], pods = [], nodes = [], scaledObjects = [], ingresses = [], events = [], keda = true, stopAfter = 0 } = {}) {
+  const state = {
+    owners: structuredClone(owners), pods: structuredClone(pods), nodes: structuredClone(nodes), scaledObjects: structuredClone(scaledObjects),
+    ingresses: structuredClone(ingresses), events: structuredClone(events), calls: [], stopping: new Map(), onIngress: () => {}, version: 100,
+  };
+  const INGRESS = /^\/apis\/networking\.k8s\.io\/v1\/namespaces\/([^/]+)\/ingresses(?:\/([^/]+))?$/;
+  const ingressAt = (path) => {
+    const [, namespace, name] = INGRESS.exec(path) ?? [];
+    return { namespace, name, index: state.ingresses.findIndex((i) => i.metadata.namespace === namespace && i.metadata.name === name) };
+  };
+  const stored = (ingress) => {
+    state.version += 1;
+    return { ...ingress, metadata: { ...ingress.metadata, resourceVersion: String(state.version) } };
+  };
   const notFound = (what) => Object.assign(new Error(`${what} not found`), { name: 'KubernetesError', status: 404, reason: 'NotFound' });
   const selects = (selector, labels = {}) => !selector || selector.split(',').every((term) => {
     const [key, value] = term.split('=');
@@ -474,6 +517,11 @@ export function fakeKubernetes({ owners = [], pods = [], nodes = [], scaledObjec
         if (!owner) throw notFound(what);
         return structuredClone(owner);
       }
+      if (INGRESS.test(path)) {
+        const { namespace, name, index } = ingressAt(path);
+        if (index < 0) throw notFound(`ingresses.networking.k8s.io "${name}" in ${namespace}`);
+        return structuredClone(state.ingresses[index]);
+      }
       const node = /^\/api\/v1\/nodes\/([^/]+)$/.exec(path);
       if (node) {
         const found = state.nodes.find((n) => n.metadata.name === node[1]);
@@ -494,6 +542,12 @@ export function fakeKubernetes({ owners = [], pods = [], nodes = [], scaledObjec
           else state.stopping.set(pod, left - 1);
         }
         return structuredClone(podsOf(pods[1], query.labelSelector));
+      }
+      const events = /^\/api\/v1\/namespaces\/([^/]+)\/events$/.exec(path);
+      if (events) {
+        const wanted = Object.fromEntries((query.fieldSelector ?? '').split(',').filter(Boolean).map((term) => term.split('=')));
+        return structuredClone(state.events.filter((e) => (e.metadata?.namespace ?? events[1]) === events[1]
+          && Object.entries(wanted).every(([key, value]) => e[key.split('.')[0]]?.[key.split('.')[1]] === value)));
       }
       const scaled = /^\/apis\/keda\.sh\/v1alpha1\/namespaces\/([^/]+)\/scaledobjects$/.exec(path);
       if (scaled) {
@@ -518,6 +572,15 @@ export function fakeKubernetes({ owners = [], pods = [], nodes = [], scaledObjec
         }
         return { kind: 'Scale', spec: { replicas: owner.spec.replicas } };
       }
+      if (INGRESS.test(path)) {
+        const { name, index } = ingressAt(path);
+        if (index < 0) throw notFound(`ingresses.networking.k8s.io "${name}"`);
+        if (type !== 'json') throw new Error(`unexpected call PATCH ${path} (${type})`);
+        const before = state.ingresses[index];
+        state.ingresses[index] = stored(jsonPatch(before, body));
+        await state.onIngress(structuredClone(state.ingresses[index]), structuredClone(before));
+        return structuredClone(state.ingresses[index]);
+      }
       const scaled = /^\/apis\/keda\.sh\/v1alpha1\/namespaces\/([^/]+)\/scaledobjects\/([^/]+)$/.exec(path);
       if (scaled) {
         const index = state.scaledObjects.findIndex((s) => s.metadata.namespace === scaled[1] && s.metadata.name === scaled[2]);
@@ -527,8 +590,27 @@ export function fakeKubernetes({ owners = [], pods = [], nodes = [], scaledObjec
       }
       throw new Error(`unexpected call PATCH ${path}`);
     },
-    async create(path) { throw new Error(`unexpected call POST ${path}`); },
-    async remove(path) { throw new Error(`unexpected call DELETE ${path}`); },
+    async create(path, body) {
+      state.calls.push(['POST', path, body]);
+      const { namespace } = ingressAt(path);
+      if (!INGRESS.test(path) || ingressAt(path).name) throw new Error(`unexpected call POST ${path}`);
+      if (state.ingresses.some((i) => i.metadata.namespace === namespace && i.metadata.name === body.metadata.name)) {
+        throw Object.assign(new Error(`ingresses.networking.k8s.io "${body.metadata.name}" already exists`), { name: 'KubernetesError', status: 409, reason: 'AlreadyExists' });
+      }
+      const created = stored(structuredClone(body));
+      state.ingresses.push(created);
+      await state.onIngress(structuredClone(created), null);
+      return structuredClone(created);
+    },
+    async remove(path) {
+      state.calls.push(['DELETE', path]);
+      if (!INGRESS.test(path)) throw new Error(`unexpected call DELETE ${path}`);
+      const { name, index } = ingressAt(path);
+      if (index < 0) throw notFound(`ingresses.networking.k8s.io "${name}"`);
+      const [gone] = state.ingresses.splice(index, 1);
+      await state.onIngress(null, structuredClone(gone));
+      return { kind: 'Status', status: 'Success' };
+    },
   };
 }
 
@@ -558,3 +640,48 @@ export const k8sConfig = (kubernetes = {}, overrides = {}) => testConfig({
   kubernetes: { cluster: 'eks-demo', namespace: 'demo', owner: { kind: 'Deployment', name: 'web' }, switch: 'ingress', ...kubernetes },
   ...overrides,
 });
+
+// A workload behind an Ingress in an IngressGroup (the switch 'ingress'), and that Ingress.
+export const k8sGroupedConfig = () => k8sConfig({ switch: 'ingress', ingress: { name: 'web', ruleIndex: 1, groupOrder: -100, service: { name: 'web', port: { number: 80 } } } });
+
+// The customer's Ingress in its group: group-wide annotations Dormeto must not copy, target group ones it must.
+export const k8sCustomerIngress = () => ({
+  apiVersion: 'networking.k8s.io/v1', kind: 'Ingress',
+  metadata: {
+    name: 'web', namespace: 'demo', labels: { 'app.kubernetes.io/managed-by': 'Helm' },
+    annotations: {
+      [`alb.ingress.kubernetes.io/group.name`]: 'eks-demo-group',
+      [`alb.ingress.kubernetes.io/listen-ports`]: '[{"HTTP": 80}, {"HTTPS": 443}]',
+      [`alb.ingress.kubernetes.io/scheme`]: 'internet-facing',
+      [`alb.ingress.kubernetes.io/certificate-arn`]: 'arn:aws:acm:eu-west-1:111122223333:certificate/abc',
+      [`alb.ingress.kubernetes.io/ssl-redirect`]: '443',
+      [`alb.ingress.kubernetes.io/tags`]: 'team=web',
+      [`alb.ingress.kubernetes.io/load-balancer-attributes`]: 'idle_timeout.timeout_seconds=60',
+      [`alb.ingress.kubernetes.io/security-groups`]: 'sg-1',
+      [`alb.ingress.kubernetes.io/subnets`]: 'subnet-1,subnet-2',
+      [`alb.ingress.kubernetes.io/wafv2-acl-arn`]: 'arn:aws:wafv2:eu-west-1:111122223333:regional/webacl/x/y',
+      [`alb.ingress.kubernetes.io/target-type`]: 'ip',
+      [`alb.ingress.kubernetes.io/healthcheck-path`]: '/health',
+      [`alb.ingress.kubernetes.io/healthcheck-interval-seconds`]: '10',
+      [`alb.ingress.kubernetes.io/success-codes`]: '200-299',
+      [`alb.ingress.kubernetes.io/healthy-threshold-count`]: '2',
+      [`alb.ingress.kubernetes.io/unhealthy-threshold-count`]: '3',
+      [`alb.ingress.kubernetes.io/backend-protocol`]: 'HTTP',
+      [`alb.ingress.kubernetes.io/backend-protocol-version`]: 'HTTP1',
+      [`alb.ingress.kubernetes.io/target-group-attributes`]: 'deregistration_delay.timeout_seconds=30',
+      [`alb.ingress.kubernetes.io/conditions.web`]: '[{"field":"http-header","httpHeaderConfig":{"httpHeaderName":"X-Env","values":["prod"]}}]',
+      'meta.helm.sh/release-name': 'demos',
+    },
+  },
+  spec: {
+    ingressClassName: 'alb',
+    rules: [
+      { host: 'docs.example.com', http: { paths: [{ path: '/', pathType: 'Prefix', backend: { service: { name: 'docs', port: { number: 80 } } } }] } },
+      { host: 'web.example.com', http: { paths: [
+        { path: '/', pathType: 'Prefix', backend: { service: { name: 'web', port: { number: 80 } } } },
+        { path: '/static', pathType: 'Prefix', backend: { service: { name: 'cdn', port: { number: 80 } } } },
+      ] } },
+    ],
+  },
+});
+

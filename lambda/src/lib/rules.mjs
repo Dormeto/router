@@ -104,14 +104,55 @@ export function shadowGap(shadow, customer, listenerRows, options) {
   return sameConditions(shadow.rule.Conditions, customer.rule.Conditions) ? null : 'with other conditions';
 }
 
+// A patched lone Ingress's rule belongs to the AWS Load Balancer Controller, which owns its tags: never tagged.
 function issueOf(rule, listener, tags, cfg) {
   const label = `rule ${rule.Priority}`;
   if (rule.IsDefault) return `default rule of ${listener.Protocol}:${listener.Port} forwards to the target group (not supported yet)`;
   const groups = forwardTargetGroups(rule);
   if (groups.some((arn) => arn !== cfg.appTargetGroupArn && arn !== cfg.wakerTargetGroupArn)) return `${label} also forwards to other target groups`;
   if (!groups.includes(cfg.wakerTargetGroupArn)) return `${label} forwards to the target group without the waker (not instrumented)`;
-  if (tags[WORKLOAD_TAG] !== cfg.workloadId) return `${label} is not tagged ${WORKLOAD_TAG} = ${cfg.workloadId}`;
+  if (cfg.kubernetes?.switch !== 'patched-ingress' && tags[WORKLOAD_TAG] !== cfg.workloadId) return `${label} is not tagged ${WORKLOAD_TAG} = ${cfg.workloadId}`;
   return null;
+}
+
+const grouped = (cfg) => cfg.kubernetes?.switch === 'ingress';
+
+// A grouped Ingress (vision docs/research/2026-10-11-eks-spike.md): Dormeto's rules are the controller's, untagged, and
+// forward to Dormeto's own target group and the waker (the waker serves one load balancer: they are found by it). Each
+// customer rule forwarding to the target group is covered by one of them (before it, its conditions), else an issue the
+// repair fixes by applying Dormeto's Ingress again; a Dormeto rule covering none is an orphan.
+function groupedRules(cfg, rows, all, attached) {
+  const wakerArn = cfg.wakerTargetGroupArn;
+  const options = { appArn: cfg.appTargetGroupArn, wakerArn, workloadId: cfg.workloadId };
+  const ours = rows.filter(({ rule }) => !rule.IsDefault && forwardTargetGroups(rule).includes(wakerArn));
+  const theirs = rows.filter((row) => !ours.includes(row));
+  const targetGroups = [...new Set(ours.flatMap(({ rule }) => forwardTargetGroups(rule).filter((tg) => tg !== wakerArn)))];
+  // Dormeto's other rules (one per copied path) may lie between one of them and the rule it covers.
+  const passOurs = (row) => (ours.some((o) => o.rule.RuleArn === row.rule.RuleArn) ? { ...row, tags: { [SHADOWS_TAG]: 'dormeto', [WORKLOAD_TAG]: cfg.workloadId } } : row);
+  const instrumented = [];
+  const issues = [];
+  const covered = [];
+  const orphans = [];
+  for (const row of theirs) {
+    const { rule, listener } = row;
+    const listenerRows = all.filter((r) => r.listener.ListenerArn === listener.ListenerArn).map(passOurs);
+    const by = !rule.IsDefault && ours.find((o) => !shadowGap(o, row, listenerRows, options));
+    if (by) covered.push({ arn: rule.RuleArn, by: by.rule.RuleArn });
+    else {
+      const reason = issueOf(rule, listener, {}, cfg);
+      issues.push({ arn: rule.RuleArn, priority: rule.Priority, reason, repairable: !rule.IsDefault && !reason.includes('other target groups') });
+    }
+  }
+  for (const { rule } of ours) {
+    if (!forwardOnly(rule) || forwardTargetGroups(rule).length !== 2) {
+      issues.push({ arn: rule.RuleArn, priority: rule.Priority, reason: `rule ${rule.Priority} of Dormeto's Ingress does not forward to its target group and the waker only`, repairable: true });
+    } else if (covered.some((c) => c.by === rule.RuleArn)) instrumented.push(rule);
+    else orphans.push({ arn: rule.RuleArn, priority: rule.Priority, reason: `rule ${rule.Priority} of Dormeto's Ingress covers no rule of the target group` });
+  }
+  if (targetGroups.length > 1) issues.push({ arn: null, priority: null, reason: 'the rules of Dormeto\'s Ingress forward to several target groups', repairable: true });
+  if (!attached) issues.push({ arn: null, priority: null, reason: DETACHED });
+  else if (!theirs.length) issues.push({ arn: null, priority: null, reason: NO_RULE });
+  return { rules: rows.map(({ rule }) => rule), instrumented, issues, covered, orphans, switchTargetGroup: targetGroups.length === 1 ? targetGroups[0] : null };
 }
 
 // Every rule of every listener of a load balancer: [{ rule, listener }].
@@ -161,7 +202,7 @@ export async function resolveRules(elbv2, cfgs, cache = { balancers: new Map(), 
   await each(lbs, LISTINGS, async (lb) => { listed.set(lb, await listRules(elbv2, lb)); });
   const matching = new Map(cfgs.map((cfg) => [cfg.workloadId, (balancers.get(cfg.appTargetGroupArn) ?? [])
     .flatMap((lb) => listed.get(lb) ?? [])
-    .filter(({ rule }) => forwardTargetGroups(rule).includes(cfg.appTargetGroupArn))]));
+    .filter(({ rule }) => forwardTargetGroups(rule).includes(cfg.appTargetGroupArn) || (grouped(cfg) && forwardTargetGroups(rule).includes(cfg.wakerTargetGroupArn)))]));
   const tags = await ruleTags(elbv2, [...matching.values()].flat().map(({ rule }) => rule), cache.tags);
   return new Map(cfgs.map((cfg) => {
     const rows = matching.get(cfg.workloadId);
@@ -174,6 +215,7 @@ export async function resolveRules(elbv2, cfgs, cache = { balancers: new Map(), 
     const tagsOf = (rule) => tags.get(rule.RuleArn) ?? {};
     const options = { appArn: cfg.appTargetGroupArn, wakerArn: cfg.wakerTargetGroupArn, workloadId: cfg.workloadId };
     const all = (balancers.get(cfg.appTargetGroupArn) ?? []).flatMap((lb) => listed.get(lb) ?? []).map((r) => ({ ...r, tags: tagsOf(r.rule) }));
+    if (grouped(cfg)) return [cfg.workloadId, groupedRules(cfg, rows, all, (balancers.get(cfg.appTargetGroupArn) ?? []).length > 0)];
     const shadows = rows.filter(({ rule }) => tagsOf(rule)[SHADOWS_TAG] && tagsOf(rule)[WORKLOAD_TAG] === cfg.workloadId);
     for (const { rule, listener } of shadows) {
       const target = rows.find((r) => r.rule.RuleArn === tagsOf(rule)[SHADOWS_TAG] && !r.rule.IsDefault);
@@ -198,6 +240,7 @@ export async function resolveRules(elbv2, cfgs, cache = { balancers: new Map(), 
     }
     if (!(balancers.get(cfg.appTargetGroupArn) ?? []).length) issues.push({ arn: null, priority: null, reason: DETACHED });
     else if (!rows.length) issues.push({ arn: null, priority: null, reason: NO_RULE });
-    return [cfg.workloadId, { rules: rows.map(({ rule }) => rule), instrumented, issues, covered, orphans }];
+    // switchTargetGroup: where the instrumented rules send the application's requests.
+    return [cfg.workloadId, { rules: rows.map(({ rule }) => rule), instrumented, issues, covered, orphans, switchTargetGroup: cfg.appTargetGroupArn }];
   }));
 }

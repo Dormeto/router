@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { resolveRules } from '../src/lib/rules.mjs';
-import { fakeElbv2, testConfig } from './fakes.mjs';
+import { fakeElbv2, k8sConfig, k8sGroupedConfig, testConfig } from './fakes.mjs';
 
 const cfg = testConfig({ ruleArns: ['arn:rule/main', 'arn:rule/static'] });
 const host = (h) => ({ Field: 'host-header', HostHeaderConfig: { Values: [h] } });
@@ -176,4 +176,68 @@ test('a target group deleted since the workload was onboarded fails no other wor
   const found = await resolveRules(elbv2, [cfg, other]);
   assert.deepEqual(found.get('shop').instrumented.map((r) => r.RuleArn), ['arn:rule/shop']);
   assert.deepEqual(found.get('demo').issues.map((i) => i.reason), ['target group not attached to a load balancer']);
+});
+
+// Kubernetes workloads (vision docs/specs/2026-10-11-kubernetes-design.md, section 6): Dormeto's rule is the controller's,
+// untagged, found by its forward to the waker target group; its own target group is where the requests go.
+const DORMETO_TG = 'arn:aws:elasticloadbalancing:eu-west-1:111122223333:targetgroup/k8s-demo-web-1da7898e9b/333';
+const path = (p) => ({ Field: 'path-pattern', PathPatternConfig: { Values: [p] } });
+const fwd = (groups) => [{ Type: 'forward', Order: 1, ForwardConfig: { TargetGroups: groups.map(([TargetGroupArn, Weight]) => ({ TargetGroupArn, Weight })) } }];
+
+function groupRules(rules) {
+  const k = k8sGroupedConfig();
+  const elbv2 = fakeElbv2(k);
+  elbv2.state.rules.clear();
+  for (const [arn, rule] of Object.entries(rules(k))) elbv2.state.rules.set(arn, { tags: {}, ...rule });
+  return { k, elbv2 };
+}
+
+test('a grouped Ingress: Dormeto\'s rule (untagged, its own target group and the waker) is instrumented and covers the customer\'s rule', async () => {
+  const { k, elbv2 } = groupRules((c) => ({
+    'arn:rule/dormeto': { actions: fwd([[DORMETO_TG, 1], [c.wakerTargetGroupArn, 0]]), conditions: [path('/*'), host('web.example.com')], priority: '1' },
+    'arn:rule/docs': { actions: fwd([['arn:tg/docs', 1]]), conditions: [host('docs.example.com'), path('/*')], priority: '2' },
+    'arn:rule/customer': { actions: fwd([[c.appTargetGroupArn, 1]]), conditions: [host('web.example.com'), path('/*')], priority: '3' },
+  }));
+  const found = (await resolveRules(elbv2, [k])).get('demo');
+  assert.deepEqual(found.instrumented.map((r) => r.RuleArn), ['arn:rule/dormeto']);
+  assert.deepEqual(found.covered, [{ arn: 'arn:rule/customer', by: 'arn:rule/dormeto' }]);
+  assert.deepEqual([found.issues, found.orphans], [[], []]);
+  assert.equal(found.switchTargetGroup, DORMETO_TG);
+});
+
+test('a grouped Ingress: an uncovered customer rule is a repairable issue, a Dormeto rule covering nothing an orphan, no Dormeto rule no switch', async () => {
+  const extra = groupRules((c) => ({
+    'arn:rule/dormeto': { actions: fwd([[DORMETO_TG, 1], [c.wakerTargetGroupArn, 0]]), conditions: [host('web.example.com'), path('/*')], priority: '1' },
+    'arn:rule/customer': { actions: fwd([[c.appTargetGroupArn, 1]]), conditions: [host('web.example.com'), path('/*')], priority: '2' },
+    'arn:rule/api': { actions: fwd([[c.appTargetGroupArn, 1]]), conditions: [host('api.example.com'), path('/*')], priority: '3' },
+  }));
+  const found = (await resolveRules(extra.elbv2, [extra.k])).get('demo');
+  assert.deepEqual(found.issues.map((i) => [i.arn, i.reason, i.repairable]), [['arn:rule/api', 'rule 3 forwards to the target group without the waker (not instrumented)', true]]);
+
+  const moved = groupRules((c) => ({
+    'arn:rule/dormeto': { actions: fwd([[DORMETO_TG, 1], [c.wakerTargetGroupArn, 0]]), conditions: [host('old.example.com'), path('/*')], priority: '1' },
+    'arn:rule/customer': { actions: fwd([[c.appTargetGroupArn, 1]]), conditions: [host('web.example.com'), path('/*')], priority: '2' },
+  }));
+  const stale = (await resolveRules(moved.elbv2, [moved.k])).get('demo');
+  assert.deepEqual(stale.instrumented, []);
+  assert.deepEqual(stale.orphans.map((o) => [o.arn, o.reason]), [['arn:rule/dormeto', 'rule 1 of Dormeto\'s Ingress covers no rule of the target group']]);
+  assert.deepEqual(stale.issues.map((i) => i.arn), ['arn:rule/customer']);
+
+  const none = groupRules((c) => ({ 'arn:rule/customer': { actions: fwd([[c.appTargetGroupArn, 1]]), conditions: [host('web.example.com')], priority: '2' } }));
+  const missing = (await resolveRules(none.elbv2, [none.k])).get('demo');
+  assert.deepEqual(missing.issues.map((i) => [i.reason, i.repairable]), [['rule 2 forwards to the target group without the waker (not instrumented)', true]]);
+  assert.equal(missing.switchTargetGroup, null);
+});
+
+test('a patched lone Ingress: its rule forwarding to its target group and the waker is instrumented without the workload tag (the controller owns its tags)', async () => {
+  const k = k8sConfig({ switch: 'patched-ingress', ingress: { name: 'solo', ruleIndex: 0, service: { name: 'solo', port: { number: 80 } } } });
+  const elbv2 = fakeElbv2(k);
+  elbv2.state.rules.get(k.ruleArn).tags = {};
+  const found = (await resolveRules(elbv2, [k])).get('demo');
+  assert.deepEqual(found.instrumented.map((r) => r.RuleArn), [k.ruleArn]);
+  assert.deepEqual(found.issues, []);
+  assert.equal(found.switchTargetGroup, k.appTargetGroupArn);
+  // The other workloads keep the tag rule; their requests stay on their target group.
+  const plain = fakeElbv2(cfg);
+  assert.equal((await resolveRules(plain, [cfg])).get('demo').switchTargetGroup, cfg.appTargetGroupArn);
 });

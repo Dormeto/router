@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { STATES } from './state.mjs';
 import { checkName } from './names.mjs';
 import { currentTarget, hostOf, setRoute } from './route.mjs';
+import { dormetoTargetGroup, routeIngress } from './kube-route.mjs';
 import { resolveRules } from './rules.mjs';
 import { healthyCount, waitTargetsReleased } from './instances.mjs';
 import { createStatus } from './status.mjs';
@@ -131,10 +132,11 @@ export function createController({
       });
       // Launch and placement failures end the wake when AWS reports them, not at its timeout (R7a).
       const watch = createWakeWatch(clients, records, { since: run.wakeStartedAt ?? now(), now });
-      while ((await healthyCount(elbv2, cfg.appTargetGroupArn)) < 1) {
+      const serving = await servingGroup(cfg);
+      while ((await healthyCount(elbv2, serving)) < 1) {
         const seen = await watch.check();
         if (seen) throw seen;
-        if (now() >= wakeDeadline) throw watch.capacity ?? await unhealthyError(elbv2, cfg.appTargetGroupArn);
+        if (now() >= wakeDeadline) throw watch.capacity ?? await unhealthyError(elbv2, serving);
         if (now() >= timing.deadline) throw new Error('wake timeout: no healthy target');  // the Lambda time budget
         await sleep(HEALTH_POLL_MS);
       }
@@ -214,7 +216,17 @@ export function createController({
     log.info('NapStarted', { workloadId });
     let stopped;
     try {
-      await routeTo(cfg, 'waker');
+      try {
+        await routeTo(cfg, 'waker');
+      } catch (err) {
+        // A Kubernetes switch the load balancer did not apply: nothing is stopped yet, the application keeps serving
+        // (review focus 2); the next check tries again.
+        if (!kubeRouted(cfg)) throw err;
+        await routeTo(cfg, 'app', { allowIssues: true, wait: false }).catch((back) => log.error('RouteNotRestored', { workloadId, error: back.message }));
+        await store.transition(workloadId, { cond: { state: STATES.NAPPING }, set: { state: STATES.AWAKE, awakeSince: now() }, remove: ['pendingWake'], cause: 'switch-failed' });
+        log.warn('NapAborted', { workloadId, reason: err.message });
+        return { state: STATES.AWAKE, aborted: true, error: err.message };
+      }
       await sleep(cfg.drainSeconds * 1000);
       // Commit point: after this transition the instances are stopped even if a request arrives. A pause written since the
       // nap started aborts it, like a request.
@@ -273,10 +285,22 @@ export function createController({
   // block a switch to the waker).
   const rulesFor = async (cfg) => (await resolveRules(elbv2, [cfg])).get(cfg.workloadId);
   const reasons = (issues) => issues.map((i) => i.reason);
-  // A throttled switch is tried again for up to 3 minutes, within the invocation's budget.
-  const routeTo = (cfg, target, options = {}) => setRoute(elbv2, cfg, target, {
-    ...options, sleep, now, until: Math.min(now() + ROUTE_RETRY_MS, budgetEnd), onIssues: (issues) => log.warn('RuleIssues', { workloadId: cfg.workloadId, issues: reasons(issues) }),
-  });
+  // A throttled switch is tried again for up to 3 minutes, within the invocation's budget. A Kubernetes workload behind an
+  // Ingress is switched through the Ingress the controller reads (vision docs/specs/2026-10-11-kubernetes-design.md, §6).
+  const kubeRouted = (cfg) => cfg.kubernetes?.switch === 'ingress' || cfg.kubernetes?.switch === 'patched-ingress';
+  const routeTo = (cfg, target, options = {}) => {
+    const onIssues = (issues) => log.warn('RuleIssues', { workloadId: cfg.workloadId, issues: reasons(issues) });
+    if (kubeRouted(cfg)) return routeIngress({ elbv2, kubernetesOf }, cfg, target, { ...options, sleep, now, onIssues });
+    return setRoute(elbv2, cfg, target, { ...options, sleep, now, until: Math.min(now() + ROUTE_RETRY_MS, budgetEnd), onIssues });
+  };
+  // The target group the switch sends the application's requests to: Dormeto's own for a grouped Ingress (once the
+  // controller made it), else the workload's.
+  const servingGroup = async (cfg, found) => (cfg.kubernetes?.switch === 'ingress' ? await dormetoTargetGroup(elbv2, cfg, found) : null) ?? cfg.appTargetGroupArn;
+  // The other target groups whose requests count for the idle window.
+  const otherRequestGroups = async (cfg, found) => {
+    const serving = await servingGroup(cfg, found);
+    return serving === cfg.appTargetGroupArn ? [] : [serving.split(':').at(-1)];
+  };
 
   // ctx (an idle check): its rules snapshot (what it compares; anything it changes is read again) and its clients.
   async function reconcile(cfg, ctx = null) {
@@ -377,7 +401,7 @@ export function createController({
       }
       // Every instrumented rule (a rule switched back alone, a mixed route, is repaired too); asleep or failed, the
       // backend does not serve, so the issues do not hold the instrumented rules back from the waker.
-      const repaired = await routeTo(cfg, expected, { found, allowIssues: expected === 'waker' });
+      const repaired = await routeTo(cfg, expected, { found, allowIssues: expected === 'waker', wait: false });
       if (repaired.length) log.warn('RouteRepaired', { workloadId, route: expected, rules: repaired });
     }
 
@@ -410,7 +434,7 @@ export function createController({
     if ((run.awakeSince ?? 0) > t - idleMs) return { state: run.state };
     // The request metric is read once the workload can be idle: not before its last request plus the idle window.
     if ((run.idleNotBefore ?? 0) > t) return { state: run.state, idleNotBefore: run.idleNotBefore };
-    const last = await lastRequestAt(cloudwatch, cfg, t - idleMs, t);
+    const last = await lastRequestAt(cloudwatch, cfg, t - idleMs, t, cfg.kubernetes ? await otherRequestGroups(cfg, ctx?.rules?.get(cfg.workloadId)) : []);
     if (last !== null) {
       const idleNotBefore = last + idleMs;
       await store.transition(cfg.workloadId, { cond: { state: STATES.AWAKE }, set: { idleNotBefore } });
@@ -773,7 +797,8 @@ export function createController({
     let reason = run?.state !== STATES.AWAKE ? `not awake (${run?.state ?? 'UNKNOWN'})`
       : (run.awakeSince ?? 0) > requestedAt ? 'woken since it was requested'
         : now() - requestedAt > NAP_MAX_AGE_MS ? `requested more than ${NAP_MAX_AGE_MS / 60_000} minutes ago` : null;
-    if (!reason && now() - requestedAt > NAP_RECHECK_MS && (await lastRequestAt(cloudwatch, await config(workloadId), requestedAt, now())) !== null) {
+    const recheck = !reason && now() - requestedAt > NAP_RECHECK_MS ? await config(workloadId) : null;
+    if (recheck && (await lastRequestAt(cloudwatch, recheck, requestedAt, now(), recheck.kubernetes ? await otherRequestGroups(recheck) : [])) !== null) {
       reason = 'requests since it was requested';
     }
     if (reason) {

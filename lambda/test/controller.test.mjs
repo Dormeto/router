@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { createController } from '../src/lib/controller-core.mjs';
 import { currentTarget } from '../src/lib/route.mjs';
 import { STATES } from '../src/lib/state.mjs';
-import { asgGroup, ecsService, fakeAppScaling, fakeEcs, fakeKubernetes, fakeRds, fakeRdsTagging, fakeTagging, fakeAutoScaling, fakeClock, fakeCloudWatch, fakeEc2, fakeElbv2, fakeStore, k8sConfig, k8sNode, k8sOwner, k8sPod, routeOf, silentLog, testConfig } from './fakes.mjs';
+import { asgGroup, ecsService, fakeAppScaling, fakeEcs, fakeKubernetes, fakeRds, fakeRdsTagging, fakeTagging, fakeAutoScaling, fakeClock, fakeCloudWatch, fakeEc2, fakeElbv2, fakeStore, k8sConfig, k8sCustomerIngress, k8sGroupedConfig, k8sNode, k8sOwner, k8sPod, routeOf, silentLog, testConfig } from './fakes.mjs';
+import { dormetoIngress, weightsOf } from '../src/lib/kube-route.mjs';
 
 function setup({ run, instance = 'running', target = 'app', healthy = 1, metric = [], metricAt = [], cfg = testConfig(), groups = [], services = [], databases, k8s } = {}) {
   const clock = fakeClock();
@@ -1211,4 +1212,112 @@ test('the status action shows a Kubernetes backend', async () => {
   const status = await s.handler({ action: 'status', workloadId: 'demo' });
   assert.equal(status.discovery, 'kubernetes');
   assert.deepEqual(status.backends.map((b) => [b.kind, b.id, b.status, b.replicas, b.switch]), [['k8s', 'eks-demo/demo/Deployment/web', 'running', 2, 'rule']]);
+});
+
+// A Kubernetes workload behind an Ingress in an IngressGroup: Dormeto's Ingress before the customer's, the load balancer
+// as the controller leaves it (stuck: it does not apply Dormeto's Ingress), each target group with its own targets.
+const DORMETO_TG = 'arn:aws:elasticloadbalancing:eu-west-1:111122223333:targetgroup/k8s-demo-web-1da7898e9b/333';
+const ALB = 'alb.ingress.kubernetes.io/';
+function groupedSetup(run, { stuck = false, events = [], cloudwatch } = {}) {
+  const cfg = k8sGroupedConfig();
+  const awake = run.state === STATES.AWAKE;
+  const target = awake ? 'app' : 'waker';
+  const pods = awake ? [k8sPod('web-1', { ip: '10.0.1.1' }), k8sPod('web-2', { ip: '10.0.1.2' })] : [];
+  const ours = { ...dormetoIngress(cfg, weightsOf(target), k8sCustomerIngress()) };
+  ours.metadata = { ...ours.metadata, resourceVersion: '50' };
+  const k8s = fakeKubernetes({ owners: [k8sOwner('web', { replicas: awake ? 2 : 0 })], pods, ingresses: [k8sCustomerIngress(), ours], events, nodes: [k8sNode('ip-10-0-1-1.eu-west-1.compute.internal')] });
+  const s = setup({ run, cfg, k8s, target });
+  if (cloudwatch) s.handler = createController({ ...s, store: s.store, cloudwatch, kubernetesOf: async () => k8s, invokeSelf: async (p) => { s.invocations.push(p); }, now: s.clock.now, sleep: s.clock.sleep, log: silentLog });
+  const host = (h) => ({ Field: 'host-header', HostHeaderConfig: { Values: [h] } });
+  const conditions = [host('web.example.com'), { Field: 'path-pattern', PathPatternConfig: { Values: ['/*'] } }];
+  const forward = (groups) => [{ Type: 'forward', Order: 1, ForwardConfig: { TargetGroups: groups.map(([TargetGroupArn, Weight]) => ({ TargetGroupArn, Weight })) } }];
+  const rule = ([app, waker]) => ({ actions: forward([[DORMETO_TG, app], [cfg.wakerTargetGroupArn, waker]]), conditions, priority: '1', tags: {} });
+  s.elbv2.state.rules.clear();
+  s.elbv2.state.rules.set('arn:rule/dormeto', rule(awake ? [1, 0] : [0, 1]));
+  s.elbv2.state.rules.set('arn:rule/customer', { actions: forward([[cfg.appTargetGroupArn, 1]]), conditions, priority: '2', tags: {} });
+  const ips = pods.map((p) => ({ Id: p.status.podIP, State: 'healthy' }));
+  s.elbv2.state.targetsOf = { [cfg.appTargetGroupArn]: ips, [DORMETO_TG]: [...ips] };
+  const switches = [];
+  k8s.state.onIngress = (ingress) => {
+    if (ingress?.metadata.name !== 'dormeto-demo') return;
+    const { targetGroups } = JSON.parse(ingress.metadata.annotations[`${ALB}actions.dormeto`]).forwardConfig;
+    switches.push({ at: s.clock.now(), app: targetGroups[0].weight });
+    if (!stuck) s.elbv2.state.rules.set('arn:rule/dormeto', rule([targetGroups[0].weight, targetGroups[1].weight]));
+  };
+  const dormetoWeights = () => s.elbv2.state.rules.get('arn:rule/dormeto').actions[0].ForwardConfig.TargetGroups.map((tg) => tg.Weight);
+  return { ...s, k8s, switches, dormetoWeights };
+}
+
+test('nap of a grouped Ingress workload: Dormeto\'s Ingress switched to the waker (never a rule of the controller), then the owner scaled to 0', async () => {
+  const s = groupedSetup({ state: STATES.AWAKE });
+  const result = await s.handler({ action: 'nap', workloadId: 'demo' });
+  assert.equal(result.state, STATES.ASLEEP);
+  assert.deepEqual(s.dormetoWeights(), [0, 1]);
+  assert.equal(s.elbv2.state.modifyCount, 0, 'no ModifyRule');
+  assert.equal(s.k8s.state.owners[0].spec.replicas, 0);
+});
+
+test('a nap whose switch the load balancer does not apply goes back to the application, still awake, the owner untouched (review focus 2)', async () => {
+  const s = groupedSetup({ state: STATES.AWAKE }, { stuck: true });
+  const result = await s.handler({ action: 'nap', workloadId: 'demo' });
+  assert.equal(result.state, STATES.AWAKE);
+  assert.equal(result.aborted, true);
+  assert.match(result.error, /did not apply the switch to the waker within 120 s/);
+  assert.equal(s.store.state.run.state, STATES.AWAKE);
+  assert.equal(s.k8s.state.owners[0].spec.replicas, 2);
+  const ours = s.k8s.state.ingresses.find((i) => i.metadata.name === 'dormeto-demo');
+  assert.equal(JSON.parse(ours.metadata.annotations[`${ALB}actions.dormeto`]).forwardConfig.targetGroups[0].weight, 1, 'Dormeto\'s Ingress back on the application');
+});
+
+test('a grouped Ingress wake waits for a healthy target in Dormeto\'s own target group, not the customer\'s, before switching back', async () => {
+  const napBackends = JSON.stringify([{ kind: 'k8s', id: 'eks-demo/demo/Deployment/web', cluster: 'eks-demo', namespace: 'demo', owner: { kind: 'Deployment', name: 'web' }, replicas: 2, keda: null }]);
+  const s = groupedSetup({ state: STATES.WAKING, wakeId: 'w1', napBackends });
+  // The customer's target group registers the pods first; Dormeto's a minute later.
+  let healthyAt = null;
+  s.clock.onSleep((t) => {
+    if (s.k8s.state.owners[0].spec.replicas !== 2) return;
+    s.elbv2.state.targetsOf[s.cfg.appTargetGroupArn] = [{ Id: '10.0.1.9', State: 'healthy' }];
+    if (healthyAt === null) healthyAt = t + 60_000;
+    if (t >= healthyAt) s.elbv2.state.targetsOf[DORMETO_TG] = [{ Id: '10.0.1.9', State: 'healthy' }];
+  });
+  const result = await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' });
+  assert.equal(result.state, STATES.AWAKE);
+  assert.deepEqual(s.dormetoWeights(), [1, 0]);
+  assert.ok(s.switches.length === 1 && s.switches[0].app === 1 && s.switches[0].at >= healthyAt, 'switched once Dormeto\'s target group had a healthy target');
+});
+
+test('a wake whose switch back the load balancer does not apply fails as configuration, with the controller\'s warnings', async () => {
+  const napBackends = JSON.stringify([{ kind: 'k8s', id: 'eks-demo/demo/Deployment/web', cluster: 'eks-demo', namespace: 'demo', owner: { kind: 'Deployment', name: 'web' }, replicas: 2, keda: null }]);
+  const events = [{ involvedObject: { kind: 'Ingress', name: 'dormeto-demo' }, type: 'Warning', reason: 'FailedDeployModel', message: 'Failed deploy model due to AccessDenied', lastTimestamp: '2026-10-11T10:00:00Z' }];
+  const s = groupedSetup({ state: STATES.WAKING, wakeId: 'w1', napBackends }, { stuck: true, events });
+  s.elbv2.state.targetsOf[DORMETO_TG] = [{ Id: '10.0.1.9', State: 'healthy' }];
+  const result = await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' });
+  assert.equal(result.state, STATES.FAILED);
+  assert.equal(JSON.parse(s.store.state.run.failure).kind, 'configuration');
+  assert.match(JSON.parse(s.store.state.run.failure).message, /FailedDeployModel: Failed deploy model due to AccessDenied/);
+});
+
+test('the idle check of a grouped Ingress workload counts the requests of Dormeto\'s target group, which takes them while its rule is there', async () => {
+  const minute = fakeClock().now() - 3 * 60_000;
+  const queries = [];
+  const cloudwatch = {
+    async getMetricData(input) {
+      queries.push(input);
+      return { MetricDataResults: input.MetricDataQueries.map((q) => ({ Id: q.Id, Values: q.MetricStat.Metric.Dimensions[1].Value.includes('k8s-demo-web-1da7898e9b') ? [5] : [], Timestamps: [new Date(minute)] })) };
+    },
+  };
+  const s = groupedSetup({ state: STATES.AWAKE, awakeSince: 1 }, { cloudwatch });
+  const [result] = await s.handler({ action: 'check' });
+  assert.equal(result.idleNotBefore, minute + 60_000 + 15 * 60_000);
+  assert.deepEqual(queries[0].MetricDataQueries.map((q) => q.MetricStat.Metric.Dimensions[1].Value), [s.cfg.appTargetGroupDimension, 'targetgroup/k8s-demo-web-1da7898e9b/333']);
+  assert.deepEqual(s.invocations, []);
+});
+
+test('the status of a grouped Ingress workload names the target group its requests go to (Dormeto\'s), for the manager\'s request charts', async () => {
+  const s = groupedSetup({ state: STATES.AWAKE });
+  const status = await s.handler({ action: 'status', workloadId: 'demo' });
+  assert.equal(status.route, 'app');
+  assert.equal(status.servingTargetGroupArn, DORMETO_TG);
+  const plain = setup({ run: { state: STATES.AWAKE } });
+  assert.equal((await plain.handler({ action: 'status', workloadId: 'demo' })).servingTargetGroupArn, plain.cfg.appTargetGroupArn);
 });

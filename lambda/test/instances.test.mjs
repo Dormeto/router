@@ -64,6 +64,14 @@ test('lastRequestAt reads RequestCount of the app target group per minute: the e
   assert.equal(input.EndTime.getTime(), 900_000);
 });
 
+test('lastRequestAt also reads the other target groups the requests may take (a grouped Ingress: Dormeto\'s own)', async () => {
+  let input;
+  const cloudwatch = { getMetricData: async (i) => { input = i; return { MetricDataResults: [{ Id: 'requests', Values: [], Timestamps: [] }, { Id: 'requests1', Values: [4], Timestamps: [new Date(240_000)] }] }; } };
+  const cfg = { loadBalancerDimension: 'app/lb/1', appTargetGroupDimension: 'targetgroup/tg/2' };
+  assert.equal(await lastRequestAt(cloudwatch, cfg, 0, 900_000, ['targetgroup/k8s-demo-web/3']), 300_000);
+  assert.deepEqual(input.MetricDataQueries.map((q) => [q.Id, q.MetricStat.Metric.Dimensions[1].Value]), [['requests', 'targetgroup/tg/2'], ['requests1', 'targetgroup/k8s-demo-web/3']]);
+});
+
 test('lastRequestAt is null without a request', async () => {
   const cloudwatch = { getMetricData: async () => ({ MetricDataResults: [{ Id: 'requests', Values: [] }] }) };
   assert.equal(await lastRequestAt(cloudwatch, {}, 0, 1), null);

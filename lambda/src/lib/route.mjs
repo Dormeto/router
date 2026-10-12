@@ -28,8 +28,12 @@ export function withWeights(actions, weights) {
 export function currentTarget(actions, cfg) {
   const forward = actions.find((a) => a.Type === 'forward' && a.ForwardConfig?.TargetGroups);
   if (!forward) return 'unknown';
-  const weight = (arn) => forward.ForwardConfig.TargetGroups.find((tg) => tg.TargetGroupArn === arn)?.Weight ?? 0;
-  const app = weight(cfg.appTargetGroupArn);
+  const groups = forward.ForwardConfig.TargetGroups;
+  const weight = (arn) => groups.find((tg) => tg.TargetGroupArn === arn)?.Weight ?? 0;
+  // A grouped Ingress: Dormeto's rule forwards to its own target group (the controller's), not to the customer's.
+  const app = cfg.kubernetes?.switch === 'ingress'
+    ? groups.filter((tg) => tg.TargetGroupArn !== cfg.wakerTargetGroupArn).reduce((n, tg) => n + (tg.Weight ?? 0), 0)
+    : weight(cfg.appTargetGroupArn);
   const waker = weight(cfg.wakerTargetGroupArn);
   if (app > 0 && waker === 0) return 'app';
   if (app === 0 && waker > 0) return 'waker';

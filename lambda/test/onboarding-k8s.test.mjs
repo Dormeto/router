@@ -17,15 +17,24 @@ const grouped = () => ({ cluster: 'eks-demo', namespace: 'demo', owner: { kind: 
 
 // The customer's cluster and load balancer: the Ingress web in its group (rule 2 on the ALB), its target group with the
 // pod; the controller makes Dormeto's rule (priority 1, its own target group) from Dormeto's Ingress.
-function setup({ ingress = k8sCustomerIngress(), stuck = false } = {}) {
+function setup({ ingress = k8sCustomerIngress(), stuck = false, scaledObjects = [] } = {}) {
   const a = fakeAccount();
   const tg = a.customer.targetGroup('k8s-demo-web', { type: 'ip', targets: [{ Id: '10.0.1.1' }] });
   const ours = a.customer.targetGroup('k8s-demo-dormeto', { type: 'ip' });
   const customerRule = a.customer.rule(2, tg, { host: 'web.example.com', path: '/*' });
-  const k8s = fakeKubernetes({ owners: [k8sOwner('web', { replicas: 2 })], pods: [k8sPod('web-1', { ip: '10.0.1.1' })], ingresses: [ingress] });
+  const k8s = fakeKubernetes({ owners: [k8sOwner('web', { replicas: 2 })], pods: [k8sPod('web-1', { ip: '10.0.1.1' })], ingresses: [ingress], scaledObjects });
   k8s.state.review = { resourceRules: ROUTER_RULES.map((r) => ({ apiGroups: [r.group], resources: r.resources, verbs: r.verbs })), incomplete: false };
-  k8s.state.onIngress = (object) => {
-    if (stuck || !object) return;
+  k8s.state.onIngress = (object, before) => {
+    if (stuck) return;
+    // Dormeto's Ingress deleted: the controller removes its rule, and the waker target group leaves the load balancer.
+    if (!object && before?.metadata.name.startsWith('dormeto-')) {
+      const rule = a.state.rules.get(`${LISTENER.replace(':listener/', ':listener-rule/')}/dormeto`);
+      a.state.rules.delete(`${LISTENER.replace(':listener/', ':listener-rule/')}/dormeto`);
+      const wakerArn = rule?.actions[0].ForwardConfig.TargetGroups[1].TargetGroupArn;
+      if (wakerArn) a.state.targetGroups.get(wakerArn).lbs = [];
+      return;
+    }
+    if (!object) return;
     const action = object.metadata.annotations?.[`${ALB}actions.dormeto`];
     if (!action) return;
     const [app, waker] = JSON.parse(action).forwardConfig.targetGroups;
@@ -129,4 +138,64 @@ test('a grouped Ingress the controller does not apply undoes the onboarding', as
   await assert.rejects(s.onboarding.onboard({ targetGroupArn: s.tg, kubernetes: grouped(), by: 'alice' }), /did not apply the switch to the app within 120 s.*undone/);
   assert.equal(await s.a.store.getConfig(s.id), null);
   assert.ok(!s.k8s.state.ingresses.some((i) => i.metadata.name.startsWith('dormeto-')), 'Dormeto\'s Ingress removed');
+});
+
+const DORMETO_RULE = `${LISTENER.replace(':listener/', ':listener-rule/')}/dormeto`;
+const writesSince = (s, from) => s.a.state.calls.slice(from).filter((c) => !c.startsWith('describe') && !c.startsWith('list'));
+
+test('repair applies Dormeto\'s Ingress again, for the run\'s state, and never shadows a rule of the controller', async () => {
+  const s = setup();
+  await s.onboarding.onboard({ targetGroupArn: s.tg, kubernetes: grouped(), by: 'alice' });
+  s.k8s.state.ingresses = s.k8s.state.ingresses.filter((i) => !i.metadata.name.startsWith('dormeto-'));
+  s.a.state.rules.delete(DORMETO_RULE);
+  const from = s.a.state.calls.length;
+  const { repaired } = await s.onboarding.repair({ workloadId: s.id, by: 'check' });
+  assert.deepEqual(repaired.map((r) => [r.kind, r.detail]), [['Dormeto Ingress re-applied', `Dormeto's Ingress demo/dormeto-${s.id} is missing`]]);
+  const ours = s.k8s.state.ingresses.find((i) => i.metadata.name === `dormeto-${s.id}`);
+  assert.equal(JSON.parse(ours.metadata.annotations[`${ALB}actions.dormeto`]).forwardConfig.targetGroups[0].weight, 1);
+  assert.deepEqual(writesSince(s, from), ['putDrift'], 'no rule created or changed');
+  assert.deepEqual((await s.onboarding.repair({ workloadId: s.id, by: 'check' })).repaired, [], 'nothing left');
+});
+
+// Puts an onboarded workload to sleep as a nap leaves it: the owner at 0, KEDA paused, the switch on the waker.
+async function asleep(s, kube) {
+  await s.onboarding.onboard({ targetGroupArn: s.tg, kubernetes: kube, by: 'alice' });
+  s.k8s.state.owners[0].spec.replicas = 0;
+  if (s.k8s.state.scaledObjects.length) s.k8s.state.scaledObjects[0].metadata.annotations = { 'autoscaling.keda.sh/paused-replicas': '0' };
+  const napBackends = JSON.stringify([{ kind: 'k8s', id: 'eks-demo/demo/Deployment/web', cluster: 'eks-demo', namespace: 'demo', owner: { kind: 'Deployment', name: 'web' }, replicas: 2, keda: s.k8s.state.scaledObjects.length ? { name: 'web-scaler', paused: null } : null }]);
+  s.a.items.set(`${s.id}/RUN`, { state: 'ASLEEP', version: 3, holders: 0, napBackends });
+  s.k8s.state.calls.length = 0;
+}
+
+test('offboarding an asleep grouped Ingress workload gives its replicas back and unpauses KEDA first, then removes Dormeto\'s Ingress (review focus 5)', async () => {
+  const s = setup({ scaledObjects: [{ metadata: { name: 'web-scaler', namespace: 'demo' }, spec: { scaleTargetRef: { name: 'web' } } }] });
+  await asleep(s, grouped());
+  const { steps } = await s.onboarding.offboard({ workloadId: s.id, by: 'alice' });
+  assert.deepEqual(steps.slice(0, 2).map((x) => [x.name, x.status]), [['restore replicas', 'done'], ['Kubernetes switch', 'done']]);
+  assert.equal(s.k8s.state.owners[0].spec.replicas, 2);
+  assert.deepEqual(s.k8s.state.scaledObjects[0].metadata.annotations, {});
+  const order = s.k8s.state.calls.map(([method, path]) => `${method} ${path.split('/').slice(-2).join('/')}`);
+  assert.ok(order.indexOf('PATCH web/scale') < order.indexOf(`DELETE ingresses/dormeto-${s.id}`), order.join(', '));
+  assert.ok(!s.k8s.state.ingresses.some((i) => i.metadata.name.startsWith('dormeto-')));
+  assert.equal(await s.a.store.getConfig(s.id), null);
+});
+
+test('offboarding an asleep lone Ingress workload gives the Ingress back exactly as it was', async () => {
+  const lone = k8sCustomerIngress();
+  delete lone.metadata.annotations[`${ALB}group.name`];
+  const s = setup({ ingress: structuredClone(lone) });
+  await asleep(s, { ...grouped(), switch: 'patched-ingress', ingress: { name: 'web', ruleIndex: 1, service: { name: 'web', port: { number: 80 } } } });
+  await s.onboarding.offboard({ workloadId: s.id, by: 'alice' });
+  const { resourceVersion, ...metadata } = s.k8s.state.ingresses[0].metadata;
+  assert.deepEqual({ ...s.k8s.state.ingresses[0], metadata }, lone);
+  assert.equal(s.k8s.state.owners[0].spec.replicas, 2);
+});
+
+test('an asleep Kubernetes workload whose replicas cannot be given back is not offboarded (its switch stays)', async () => {
+  const s = setup();
+  await asleep(s, grouped());
+  s.k8s.state.owners = [];
+  await assert.rejects(s.onboarding.offboard({ workloadId: s.id, by: 'alice' }), /restore replicas: .*not found/);
+  assert.ok(s.k8s.state.ingresses.some((i) => i.metadata.name.startsWith('dormeto-')));
+  assert.ok(await s.a.store.getConfig(s.id));
 });

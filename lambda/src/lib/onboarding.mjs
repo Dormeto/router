@@ -5,8 +5,11 @@ import { createHash } from 'node:crypto';
 import { checkName } from './names.mjs';
 import { cleanConditions, forwardTargetGroups, listRules, passable, ruleTags, sameConditions, shadowGap, unshadowable } from './rules.mjs';
 import { conditionsOf } from './route.mjs';
-import { k8sBackend } from './kubernetes.mjs';
-import { applyIngressRoute, dormetoIngress, dormetoIngressName, ingressPath, patchCustomerIngress, patchedPaths, restoreCustomerIngress, waitRoute } from './kube-route.mjs';
+import { k8sBackend, wakeK8s } from './kubernetes.mjs';
+import {
+  applyIngressRoute, dormetoIngress, dormetoIngressName, ingressDrift, ingressPath, patchCustomerIngress, patchedPaths, restoreCustomerIngress, waitRoute, weightsOf,
+} from './kube-route.mjs';
+import { healthyCount } from './instances.mjs';
 import { checkRights } from './kube-access.mjs';
 
 const WORKLOAD_TAG = 'dormeto:workload';
@@ -630,10 +633,17 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
     }
     const waker = await wakerGroup(workloadId);
     const group = await targetGroup(cfg.appTargetGroupArn);
-    if (waker?.ours && group) {
-      // Asleep, failed or between: the instrumentation sends to the waker; awake, to the application.
-      const weights = run?.state === 'AWAKE' ? { app: 1, waker: 0 } : { app: 0, waker: 1 };
-      repairs.push(...await applyRules(group, workloadId, waker.TargetGroupArn, weights));
+    // Asleep, failed or between: the instrumentation sends to the waker; awake, to the application.
+    const target = run?.state === 'AWAKE' ? 'app' : 'waker';
+    if (cfg.kubernetes && cfg.kubernetes.switch !== 'rule') {
+      // The controller owns the rules of an Ingress switch: the Ingress is applied again, never a rule.
+      const [reason] = await ingressDrift({ elbv2, kubernetesOf }, cfg, target);
+      const ingress = cfg.kubernetes.switch === 'ingress';
+      const written = ingress ? (await applyIngressRoute({ elbv2, kubernetesOf }, cfg, target, { wait: false })).length > 0
+        : (await patchCustomerIngress({ kubernetesOf }, cfg, weightsOf(target))).changed;
+      if (written) repairs.push({ kind: ingress ? 'Dormeto Ingress re-applied' : 'Ingress patch re-applied', detail: reason ?? `the weights for the ${target}` });
+    } else if (waker?.ours && group) {
+      repairs.push(...await applyRules(group, workloadId, waker.TargetGroupArn, weightsOf(target)));
     }
     const at = new Date(now()).toISOString();
     for (const e of repairs) await store.putDrift(workloadId, { at, by, ...e });
@@ -740,14 +750,32 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
     return steps;
   }
 
+  // An asleep Kubernetes workload gets its replicas back (KEDA unpaused) before its switch goes, so the customer's own rule
+  // then sends the requests to running pods (vision docs/specs/2026-10-11-kubernetes-design.md, section 8).
+  async function restoreReplicas(cfg, run) {
+    const records = JSON.parse(run.napBackends ?? '[]').filter((r) => r.kind === 'k8s');
+    if (!records.length) return { name: 'restore replicas', status: 'skipped' };
+    try {
+      for (const record of records) await wakeK8s({ kubernetesOf }, record);
+      for (const deadline = now() + KUBERNETES_WAKE_TIMEOUT * 1000; (await healthyCount(elbv2, cfg.appTargetGroupArn)) < 1 && now() < deadline;) await sleep(3000);
+      return { name: 'restore replicas', status: 'done', detail: records.map((r) => `${r.owner.kind} ${r.namespace}/${r.owner.name}: ${Math.max(1, r.replicas)} replicas`).join(', ') };
+    } catch (err) {
+      return { name: 'restore replicas', status: 'failed', detail: err.message };
+    }
+  }
+
   async function offboard({ workloadId, by }) {
     const cfg = await store.getConfig(workloadId);
     if (cfg && !cfg.source) throw new Error(`cannot offboard ${workloadId}: written by Terraform, remove its workload module instead`);
     const run = await store.getRun(workloadId);
     // Paused first: no nap starts, and a nap already draining aborts at its commit point, while the instrumentation goes.
     if (cfg || run) await store.putPause(workloadId, { by: by ?? 'unknown', at: now(), reason: 'offboarding', keepAsleep: true });
-    if (run && run.state !== 'AWAKE') throw new Error(`cannot offboard ${workloadId}: it is ${run.state}, wake it first`);
-    const steps = await clean(workloadId, cfg?.appTargetGroupArn, cfg?.databases, cfg?.tagged);
+    // A Kubernetes workload asleep (or failed) is given its replicas back here; any other must be woken first.
+    const restore = cfg?.kubernetes && ['ASLEEP', 'FAILED'].includes(run?.state);
+    if (run && run.state !== 'AWAKE' && !restore) throw new Error(`cannot offboard ${workloadId}: it is ${run.state}, wake it first`);
+    const first = restore ? [await restoreReplicas(cfg, run)] : [];
+    // Replicas not given back: the switch stays, so requests keep reaching the waker (run it again).
+    const steps = first.some((x) => x.status === 'failed') ? first : [...first, ...await clean(workloadId, cfg?.appTargetGroupArn, cfg?.databases, cfg?.tagged, cfg?.kubernetes)];
     const failed = steps.filter((s) => s.status === 'failed');
     log.info('Offboarded', { workloadId, by, steps: steps.map((s) => `${s.name} ${s.status}`) });
     if (failed.length) throw new Error(`offboard of ${workloadId} incomplete: ${failed.map((s) => `${s.name}: ${s.detail}`).join('; ')}`);

@@ -379,3 +379,19 @@ test('check (asg): a group scaled to zero outside Dormeto while awake is reconci
   assert.equal(result.state, STATES.ASLEEP);
   assert.equal(routeOf(s.elbv2, s.cfg), 'waker');
 });
+
+test('check (asg): an external scale-up resumes the suspended processes and restores MinSize', async () => {
+  const s = asgSetup({
+    run: { state: STATES.ASLEEP, napBackends: JSON.stringify([{ kind: 'asg', name: 'asg-demo', min: 2, max: 3, desired: 2 }]) },
+    desired: 1, target: 'waker', healthy: 1,
+  });
+  const group = s.autoscaling.state.groups[0];
+  group.MinSize = 0;
+  s.autoscaling.state.suspended['asg-demo'] = ['AlarmNotification'];
+  const [result] = await s.handler({ action: 'check' });
+  assert.equal(result.state, STATES.AWAKE);
+  assert.equal(s.autoscaling.state.resumed.length, 1);
+  assert.equal(group.MinSize, 1, 'MinSize restored, capped by the externally chosen capacity');
+  assert.equal(group.DesiredCapacity, 1, 'the externally chosen capacity is kept');
+  assert.equal('napBackends' in s.store.state.run, false);
+});

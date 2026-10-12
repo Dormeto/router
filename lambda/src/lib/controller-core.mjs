@@ -3,7 +3,7 @@ import { STATES } from './state.mjs';
 import { setRoute } from './route.mjs';
 import { healthyCount } from './instances.mjs';
 import { requestSum } from './metrics.mjs';
-import { backendKey, backendStatuses, resolveBackends, sleepBackends, toRecord, wakeBackends } from './backends.mjs';
+import { backendKey, backendStatuses, resolveBackends, resumeBackends, sleepBackends, toRecord, wakeBackends } from './backends.mjs';
 
 const HEALTH_POLL_MS = 3000;
 const STOP_TIMEOUT_MS = 5 * 60_000;
@@ -164,8 +164,11 @@ export function createController({ store, ec2, elbv2, cloudwatch, autoscaling, n
     const from = run.state;
     if (from !== STATES.AWAKE && all('running') && (await healthyCount(elbv2, cfg.appTargetGroupArn)) >= 1) {
       log.warn(from === STATES.FAILED ? 'FailedRecovered' : 'ExternalWake', { workloadId });
+      if (run.napBackends) await resumeBackends(clients, JSON.parse(run.napBackends));
       await setRoute(elbv2, cfg, 'app');
-      run = (await store.transition(workloadId, { cond: { state: from }, set: { state: STATES.AWAKE, awakeSince: now() } }))
+      run = (await store.transition(workloadId, {
+        cond: { state: from }, set: { state: STATES.AWAKE, awakeSince: now() }, remove: ['napBackends', 'napInstances'],
+      }))
         ?? (await store.getRun(workloadId));
     } else if (from !== STATES.ASLEEP && all('stopped')) {
       log.warn(from === STATES.FAILED ? 'FailedRecovered' : 'ExternalStop', { workloadId });

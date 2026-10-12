@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { SCALING_PROCESSES, backendStatuses, resolveBackends, sleepBackends, wakeBackends } from '../src/lib/backends.mjs';
+import { SCALING_PROCESSES, backendStatuses, resolveBackends, resumeBackends, sleepBackends, wakeBackends } from '../src/lib/backends.mjs';
 import { asgGroup, fakeAutoScaling, fakeClock, fakeEc2, fakeElbv2, testConfig } from './fakes.mjs';
 
 const TAG = { 'dormeto:workload': 'demo' };
@@ -108,4 +108,12 @@ test('wake without recorded sizes uses dormeto:wake-desired or 1', async () => {
     { AutoScalingGroupName: 'a', MinSize: 1, MaxSize: 1, DesiredCapacity: 1 },
     { AutoScalingGroupName: 'b', MinSize: 1, MaxSize: 5, DesiredCapacity: 3 },
   ]);
+});
+
+test('resume releases napped groups without changing their desired capacity', async () => {
+  const c = clients();
+  c.autoscaling.state.groups = [asgGroup('asg-demo', { min: 0, max: 3, desired: 1 })];
+  await resumeBackends(c, [{ kind: 'instance', id: 'i-a' }, { kind: 'asg', name: 'asg-demo', min: 2, max: 3, desired: 2 }]);
+  assert.deepEqual(c.autoscaling.state.updates, [{ AutoScalingGroupName: 'asg-demo', MinSize: 1, MaxSize: 3 }]);
+  assert.deepEqual(c.autoscaling.state.resumed, [{ name: 'asg-demo', processes: SCALING_PROCESSES }]);
 });

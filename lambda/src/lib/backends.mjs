@@ -139,3 +139,17 @@ export async function wakeBackends({ ec2, autoscaling }, records, timing) {
   }
   if (ids.length) await startInstances(ec2, ids, timing);
 }
+
+// After a wake done outside Dormeto (a group scaled up by hand): resume scaling and restore the recorded limits,
+// keeping the capacity that was chosen (MinSize capped by it so that the group is not scaled up again).
+export async function resumeBackends({ autoscaling }, records) {
+  const groups = records.filter((r) => r.kind === 'asg');
+  const described = await describeGroups(autoscaling, groups.map((g) => g.name));
+  for (const group of groups) {
+    const desired = described.get(group.name)?.DesiredCapacity ?? group.desired;
+    await autoscaling.updateAutoScalingGroup({
+      AutoScalingGroupName: group.name, MinSize: Math.min(group.min, desired), MaxSize: Math.max(group.max, desired),
+    });
+    await autoscaling.resumeProcesses({ AutoScalingGroupName: group.name, ScalingProcesses: SCALING_PROCESSES });
+  }
+}

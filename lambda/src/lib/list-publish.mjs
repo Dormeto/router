@@ -7,7 +7,8 @@ import { FORMAT, dropReserved, packList, parseList } from './ip-lists.mjs';
 const HOUR_MS = 3_600_000;
 // A failed download of the same URL is retried at most once an hour.
 const RETRY_MS = HOUR_MS;
-// The data objects expire 30 days after they are written (bucket lifecycle): a version kept longer is written again.
+// The data objects (data/<name>/<version>.bin) expire 30 days after they are written (the bucket's lifecycle rule on
+// data/): a version kept longer is written again.
 const REWRITE_MS = 20 * 24 * HOUR_MS;
 // A new version with fewer than half the entries of the current one, from the same URL, is refused.
 const SHRINK = 0.5;
@@ -43,7 +44,7 @@ export function createListPublisher({ s3, bucket, prefix = '', download, now = D
       }
       const data = Buffer.concat(packList(kept));
       const version = String(t);
-      const dataKey = `${list.name}/${version}.bin`;
+      const dataKey = `data/${list.name}/${version}.bin`;
       const manifest = {
         name: list.name, version, format: FORMAT, entries: kept.length, dropped, invalid, bytes: data.length,
         sha256: createHash('sha256').update(data).digest('hex'), fetchedAt: iso(t), refreshHours: list.refreshHours, key: dataKey,
@@ -64,7 +65,7 @@ export function createListPublisher({ s3, bucket, prefix = '', download, now = D
     const manifest = await readJson(`${list.name}/manifest.json`, null);
     if (!manifest?.key) return line;
     const data = (await s3.getObjectIf({ bucket, key: key(manifest.key) })).body;
-    const dataKey = `${list.name}/${manifest.version}-${t}.bin`;
+    const dataKey = `data/${list.name}/${manifest.version}-${t}.bin`;
     await s3.putObject({ bucket, key: key(dataKey), body: data, contentType: 'application/octet-stream' });
     await putJson(`${list.name}/manifest.json`, { ...manifest, key: dataKey });
     log.info('ListRewritten', { name: list.name, version: manifest.version });

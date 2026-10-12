@@ -53,12 +53,12 @@ test('publishes a list: its data, then its manifest, then the status; the reserv
   const { bucket, publisher, clock } = setup();
   await publisher.run();
   const version = String(clock.now());
-  assert.deepEqual(bucket.writes, [`put ipsum/${version}.bin`, 'put ipsum/manifest.json', 'put status.json']);
-  const data = bucket.objects.get(`ipsum/${version}.bin`).body;
+  assert.deepEqual(bucket.writes, [`put data/ipsum/${version}.bin`, 'put ipsum/manifest.json', 'put status.json']);
+  const data = bucket.objects.get(`data/ipsum/${version}.bin`).body;
   const manifest = json(bucket, 'ipsum/manifest.json');
   assert.deepEqual(manifest, {
     name: 'ipsum', version, format: 'ranges-v1', entries: 2, dropped: 1, invalid: 0, bytes: data.length,
-    sha256: createHash('sha256').update(data).digest('hex'), fetchedAt: new Date(clock.now()).toISOString(), refreshHours: 24, key: `ipsum/${version}.bin`,
+    sha256: createHash('sha256').update(data).digest('hex'), fetchedAt: new Date(clock.now()).toISOString(), refreshHours: 24, key: `data/ipsum/${version}.bin`,
   });
   assert.equal(unpackList([data]).has('45.130.203.183'), true);
   assert.equal(unpackList([data]).has('10.0.0.1'), false);
@@ -124,7 +124,7 @@ test('a new URL is downloaded at once, whatever the refresh period', async () =>
   assert.deepEqual(downloads, ['https://x/ipsum', 'https://y/ipsum']);
 });
 
-test('a version 20 days old is written again under a new key (its data expires after 30 days)', async () => {
+test('a version 20 days old is written again under a new key (the data/ prefix expires after 30 days)', async () => {
   const { bucket, publisher, clock, state } = setup({ lists: [{ name: 'ipsum', url: 'https://x/ipsum', action: 'defer', refreshHours: 24 }] });
   await publisher.run();
   const first = json(bucket, 'ipsum/manifest.json');
@@ -137,6 +137,7 @@ test('a version 20 days old is written again under a new key (its data expires a
   assert.notEqual(again.key, first.key);
   assert.deepEqual(bucket.objects.get(again.key).body, bucket.objects.get(first.key).body);
   assert.ok(bucket.writes.includes(`put ${again.key}`));
+  assert.match(again.key, /^data\/ipsum\//);
 });
 
 test('a list removed from the catalog leaves the status, and its manifest is deleted', async () => {

@@ -47,8 +47,9 @@ variable "idle_minutes" {
 }
 
 variable "drain_seconds" {
-  type    = number
-  default = 10
+  description = "Wait between the route switch and the instance stop. Must exceed ALB rule propagation (about 12 s measured)."
+  type        = number
+  default     = 30
 }
 
 variable "wake_timeout_seconds" {

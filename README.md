@@ -10,6 +10,11 @@ This MVP manages one EC2 instance behind an ALB:
 - `controller` Lambda: switches the ALB rule weights, stops and starts the instance, naps idle workloads (scheduled
   check of the ALB `RequestCount`), and reconciles external changes.
 
+Instances are **discovered** from the application target group: every instance target tagged
+`dormeto:workload=<workload id>` is managed; other targets are ignored (and shown on the admin dashboard). The nap records
+the instances it stopped and the wake starts exactly those. A static `instance_ids` list on the `workload` module is
+still supported.
+
 Design: [vision/docs/specs/2026-10-03-mvp-alb-ec2-design.md](https://github.com/Dormeto/vision/blob/main/docs/specs/2026-10-03-mvp-alb-ec2-design.md).
 
 ## Layout

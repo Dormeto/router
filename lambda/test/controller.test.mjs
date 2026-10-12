@@ -44,6 +44,16 @@ test('wake: a superseded wakeId does not overwrite the state', async () => {
   const result = await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'older' });
   assert.equal(result.state, 'SUPERSEDED');
   assert.equal(s.store.state.run.state, STATES.WAKING);
+  assert.equal(s.ec2.state.started, 0, 'no side effect');
+  assert.equal(routeOf(s.elbv2, s.cfg), 'waker');
+});
+
+test('wake: a stale event after the workload went back to sleep has no side effect', async () => {
+  const s = setup({ run: { state: STATES.ASLEEP }, instance: 'stopped', target: 'waker' });
+  const result = await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'stale' });
+  assert.equal(result.state, 'SUPERSEDED');
+  assert.equal(s.ec2.state.started, 0);
+  assert.equal(routeOf(s.elbv2, s.cfg), 'waker');
 });
 
 test('nap: switches to the waker, stops the instance and becomes ASLEEP', async () => {
@@ -168,4 +178,32 @@ test('ensure-awake switches the route back when the workload is awake and health
 test('unknown actions are rejected', async () => {
   const s = setup({ run: { state: STATES.AWAKE } });
   await assert.rejects(s.handler({ action: 'dance' }), /unknown action/);
+});
+
+test('check: recovers FAILED with a running healthy instance to AWAKE', async () => {
+  const s = setup({ run: { state: STATES.FAILED, failedAt: 1 }, instance: 'running', target: 'waker', healthy: 1 });
+  const [result] = await s.handler({ action: 'check' });
+  assert.equal(result.state, STATES.AWAKE);
+  assert.equal(routeOf(s.elbv2, s.cfg), 'app');
+});
+
+test('check: recovers FAILED with a stopped instance to ASLEEP behind the waker', async () => {
+  const s = setup({ run: { state: STATES.FAILED, failedAt: 1 }, instance: 'stopped', target: 'app', healthy: 0 });
+  const [result] = await s.handler({ action: 'check' });
+  assert.equal(result.state, STATES.ASLEEP);
+  assert.equal(routeOf(s.elbv2, s.cfg), 'waker');
+});
+
+test('check: keeps a FAILED workload with an unhealthy instance behind the waker', async () => {
+  const s = setup({ run: { state: STATES.FAILED, failedAt: 1 }, instance: 'running', target: 'app', healthy: 0 });
+  const [result] = await s.handler({ action: 'check' });
+  assert.equal(result.state, STATES.FAILED);
+  assert.equal(routeOf(s.elbv2, s.cfg), 'waker');
+});
+
+test('check: releases a wake stuck beyond wakeTimeoutSeconds to FAILED', async () => {
+  const s = setup({ run: { state: STATES.WAKING, wakeId: 'w' } });
+  s.store.state.run.wakeStartedAt = s.clock.now() - 12 * 60_000;
+  const [result] = await s.handler({ action: 'check' });
+  assert.equal(result.state, STATES.FAILED);
 });

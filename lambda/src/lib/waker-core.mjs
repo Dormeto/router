@@ -2,13 +2,18 @@ import { randomUUID } from 'node:crypto';
 import { STATES } from './state.mjs';
 import { acceptsHtml, classify, redirectCount, requestTarget, response, workloadIdFromEvent } from './http.mjs';
 import { renderJson, renderPage } from './page.mjs';
-import { parseAdminPath } from './admin.mjs';
+import { ADMIN_PREFIX, parseAdminPath } from './admin.mjs';
 
 const POLL_MS = 1000;
 const STUCK_GRACE_MS = 60_000;
 const MAX_REDIRECTS = 2;
+// ALB rule changes take about 12 s to propagate: right after a wake, requests still reach the waker.
+const ROUTE_GRACE_MS = 15_000;
 
 export function createWaker({ store, invokeController, prefix, now = Date.now, sleep, newId = randomUUID, log, getAdmin }) {
+  const inRouteGrace = (run) => run.state === STATES.AWAKE && (run.awakeSince ?? 0) > now() - ROUTE_GRACE_MS;
+  const servable = (run) => run.state === STATES.AWAKE && !inRouteGrace(run);
+
   async function startWake(workloadId, cond, run) {
     const wakeId = newId();
     const next = await store.transition(workloadId, {
@@ -31,7 +36,7 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
     }
   }
 
-  async function trigger(workloadId, cfg, run) {
+  async function trigger(workloadId, cfg, run, kind) {
     const t = now();
     switch (run.state) {
       case STATES.ASLEEP:
@@ -47,7 +52,8 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
         await store.setPendingWake(workloadId);
         return run;
       case STATES.AWAKE:
-        await invokeController({ action: 'ensure-awake', workloadId });
+        // Reaching the waker while awake is expected during the route grace window; later it means drift.
+        if (kind !== 'probe' && !inRouteGrace(run)) await invokeController({ action: 'ensure-awake', workloadId });
         return run;
       default:
         return run;
@@ -76,7 +82,7 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
       while (now() < deadline) {
         await sleep(POLL_MS);
         current = (await store.getRun(workloadId)) ?? current;
-        if (current.state === STATES.AWAKE || current.state === STATES.FAILED) break;
+        if (servable(current) || current.state === STATES.FAILED) break;
       }
     } finally {
       await store.releaseHolder(workloadId);
@@ -95,6 +101,7 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
 
   function answer(event, cfg, run) {
     if (run.state !== STATES.AWAKE) return waiter(event, cfg.pollSeconds, run.state);
+    if (inRouteGrace(run)) return waiter(event, cfg.pollSeconds, STATES.AWAKE);
     const count = redirectCount(event);
     if (count >= MAX_REDIRECTS) return waiter(event, cfg.pollSeconds, STATES.WAKING);
     return response(307, {
@@ -112,6 +119,10 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
       return waiter(event, 10, STATES.FAILED);
     }
     const admin = getAdmin ? parseAdminPath(event.path, cfg) : null;
+    if (!admin && cfg.admin?.enabled && event.path?.startsWith(ADMIN_PREFIX)) {
+      // The ALB sends every /_dormeto/* path here: a wrong secret is a 404, never a wake or a redirect.
+      return response(404, { 'cache-control': 'no-store', 'content-type': 'text/plain' }, 'Not found');
+    }
     if (admin) {
       const handle = await getAdmin();
       return handle({
@@ -121,8 +132,8 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
     }
     const kind = classify(event);
     let run = initial;
-    if (kind !== 'no-wake') run = await trigger(workloadId, cfg, run);
-    if (kind === 'normal' && run.state !== STATES.AWAKE && run.state !== STATES.FAILED && cfg.waitSeconds > 0) {
+    if (kind !== 'no-wake') run = await trigger(workloadId, cfg, run, kind);
+    if (kind === 'normal' && !servable(run) && run.state !== STATES.FAILED && cfg.waitSeconds > 0) {
       run = await hold(workloadId, cfg, run);
     }
     return answer(event, cfg, run);

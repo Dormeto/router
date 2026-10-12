@@ -7,6 +7,7 @@ import { requestSum } from './metrics.mjs';
 const HEALTH_POLL_MS = 3000;
 const STOP_TIMEOUT_MS = 5 * 60_000;
 const NAPPING_STUCK_MS = 15 * 60_000;
+const WAKING_STUCK_GRACE_MS = 60_000;
 
 export function createController({ store, ec2, elbv2, cloudwatch, now = Date.now, sleep, newId = randomUUID, log }) {
   async function config(workloadId) {
@@ -18,22 +19,30 @@ export function createController({ store, ec2, elbv2, cloudwatch, now = Date.now
   async function wake(workloadId, wakeId, knownConfig) {
     const cfg = knownConfig ?? (await config(workloadId));
     const timing = { sleep, now, deadline: now() + cfg.wakeTimeoutSeconds * 1000 };
+    // A delayed or duplicated event must not touch EC2 or the ALB once its wake is no longer the current one.
+    const current = async () => {
+      const run = await store.getRun(workloadId);
+      return run?.state === STATES.WAKING && run.wakeId === wakeId;
+    };
+    const superseded = () => {
+      log.warn('WakeSuperseded', { workloadId, wakeId });
+      return { state: 'SUPERSEDED' };
+    };
+    if (!(await current())) return superseded();
     try {
       await startInstances(ec2, cfg.instanceIds, timing);
       while ((await healthyCount(elbv2, cfg.appTargetGroupArn)) < 1) {
         if (now() >= timing.deadline) throw new Error('wake timeout: no healthy target');
         await sleep(HEALTH_POLL_MS);
       }
+      if (!(await current())) return superseded();
       await setRoute(elbv2, cfg, 'app');
       const done = await store.transition(workloadId, {
         cond: { state: STATES.WAKING, wakeId },
         set: { state: STATES.AWAKE, awakeSince: now(), holders: 0 },
         remove: ['pendingWake'],
       });
-      if (!done) {
-        log.warn('WakeSuperseded', { workloadId, wakeId });
-        return { state: 'SUPERSEDED' };
-      }
+      if (!done) return superseded();
       log.info('WakeCompleted', { workloadId, wakeId });
       return { state: STATES.AWAKE };
     } catch (err) {
@@ -99,24 +108,34 @@ export function createController({ store, ec2, elbv2, cloudwatch, now = Date.now
         remove: ['stopping'],
       })) ?? store.getRun(workloadId);
     }
-    if (run.state !== STATES.AWAKE && run.state !== STATES.ASLEEP) return run;
+    const wakeStuckBefore = now() - cfg.wakeTimeoutSeconds * 1000 - WAKING_STUCK_GRACE_MS;
+    if (run.state === STATES.WAKING && (run.wakeStartedAt ?? 0) < wakeStuckBefore) {
+      log.warn('WakeStuck', { workloadId, wakeId: run.wakeId });
+      return (await store.transition(workloadId, {
+        cond: { state: STATES.WAKING, wakeId: run.wakeId },
+        set: { state: STATES.FAILED, failedAt: now() },
+      })) ?? store.getRun(workloadId);
+    }
+    if (![STATES.AWAKE, STATES.ASLEEP, STATES.FAILED].includes(run.state)) return run;
 
     const states = await instanceStates(ec2, cfg.instanceIds);
     const all = (name) => cfg.instanceIds.every((id) => states[id] === name);
-    if (run.state === STATES.ASLEEP && all('running') && (await healthyCount(elbv2, cfg.appTargetGroupArn)) >= 1) {
-      log.warn('ExternalWake', { workloadId });
+    const from = run.state;
+    if (from !== STATES.AWAKE && all('running') && (await healthyCount(elbv2, cfg.appTargetGroupArn)) >= 1) {
+      log.warn(from === STATES.FAILED ? 'FailedRecovered' : 'ExternalWake', { workloadId });
       await setRoute(elbv2, cfg, 'app');
-      run = (await store.transition(workloadId, { cond: { state: STATES.ASLEEP }, set: { state: STATES.AWAKE, awakeSince: now() } }))
+      run = (await store.transition(workloadId, { cond: { state: from }, set: { state: STATES.AWAKE, awakeSince: now() } }))
         ?? (await store.getRun(workloadId));
-    } else if (run.state === STATES.AWAKE && all('stopped')) {
-      log.warn('ExternalStop', { workloadId });
+    } else if (from !== STATES.ASLEEP && all('stopped')) {
+      log.warn(from === STATES.FAILED ? 'FailedRecovered' : 'ExternalStop', { workloadId });
       await setRoute(elbv2, cfg, 'waker');
-      run = (await store.transition(workloadId, { cond: { state: STATES.AWAKE }, set: { state: STATES.ASLEEP } }))
+      run = (await store.transition(workloadId, { cond: { state: from }, set: { state: STATES.ASLEEP } }))
         ?? (await store.getRun(workloadId));
     }
 
     // Keep the route consistent with the state, for example after a Terraform apply reset the weights.
-    const expected = run.state === STATES.AWAKE ? 'app' : run.state === STATES.ASLEEP ? 'waker' : null;
+    // A FAILED workload stays behind the waker, so that requests retry the wake.
+    const expected = run.state === STATES.AWAKE ? 'app' : [STATES.ASLEEP, STATES.FAILED].includes(run.state) ? 'waker' : null;
     if (expected && (await setRoute(elbv2, cfg, expected))) log.warn('RouteRepaired', { workloadId, route: expected });
     return run;
   }

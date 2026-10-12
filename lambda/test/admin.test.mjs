@@ -131,13 +131,20 @@ test('actions require POST and unknown routes are 404', async () => {
   assert.equal(invocations.length, 0);
 });
 
-test('a wrong secret is handled as a normal request', async () => {
+test('a wrong secret gets a 404 and never wakes the workload', async () => {
   const { handler, store, invocations } = setup({ run: { state: STATES.ASLEEP }, cfg: adminConfig() });
   const res = await handler(albEvent({ path: '/_dormeto/not-the-secret/', headers: { accept: 'application/json' } }));
-  assert.equal(res.statusCode, 503);
-  assert.equal(store.state.run.state, STATES.WAKING);
-  assert.equal(invocations[0].action, 'wake');
+  assert.equal(res.statusCode, 404);
+  assert.equal(store.state.run.state, STATES.ASLEEP);
+  assert.equal(invocations.length, 0);
   assert.doesNotMatch(res.body, /workloadId/);
+});
+
+test('a wrong secret while awake gets a 404, not a redirect loop', async () => {
+  const { handler, invocations } = setup({ run: { state: STATES.AWAKE }, cfg: adminConfig() });
+  const res = await handler(albEvent({ path: '/_dormeto/not-the-secret/status.json' }));
+  assert.equal(res.statusCode, 404);
+  assert.equal(invocations.length, 0);
 });
 
 test('with the feature flag off the secret path is handled as a normal request', async () => {

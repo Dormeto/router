@@ -159,3 +159,31 @@ test('unknown workload configuration answers FAILED without throwing', async () 
   assert.equal(res.statusCode, 503);
   assert.equal(headerOf(res, 'x-dormeto-state'), STATES.FAILED);
 });
+
+test('AWAKE within the route grace window: waiter page, no redirect and no ensure-awake', async () => {
+  const { handler, store, clock, invocations } = setup({ run: { state: STATES.AWAKE }, cfg: testConfig({ waitSeconds: 0 }) });
+  store.state.run.awakeSince = clock.now() - 5_000;
+  const res = await handler(albEvent());
+  assert.equal(res.statusCode, 503);
+  assert.equal(headerOf(res, 'x-dormeto-state'), STATES.AWAKE);
+  assert.match(res.body, /Almost there/);
+  assert.deepEqual(invocations, []);
+});
+
+test('probes never invoke ensure-awake', async () => {
+  const { handler, invocations } = setup({ run: { state: STATES.AWAKE } });
+  const res = await handler(albEvent({ headers: { 'x-dormeto-probe': '1' } }));
+  assert.equal(res.statusCode, 307);
+  assert.deepEqual(invocations, []);
+});
+
+test('a held request redirects only after the route grace window', async () => {
+  const { handler, store, clock } = setup({ run: { state: STATES.ASLEEP } });
+  const start = clock.now();
+  clock.onSleep((t) => {
+    if (t - start >= 2_000 && store.state.run.state !== STATES.AWAKE) Object.assign(store.state.run, { state: STATES.AWAKE, awakeSince: t });
+  });
+  const res = await handler(albEvent());
+  assert.equal(res.statusCode, 307);
+  assert.ok(clock.now() - start >= 17_000, `redirected after ${clock.now() - start} ms`);
+});

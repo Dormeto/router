@@ -61,6 +61,8 @@ resource "aws_lambda_function" "controller" {
 resource "aws_lambda_function_event_invoke_config" "controller" {
   function_name          = aws_lambda_function.controller.function_name
   maximum_retry_attempts = 0
+  # A throttled async event is re-queued for up to 6 hours by default: drop stale wake/nap events instead.
+  maximum_event_age_in_seconds = 120
 }
 
 resource "aws_lambda_function" "waker" {

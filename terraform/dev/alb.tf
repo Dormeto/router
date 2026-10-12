@@ -124,6 +124,8 @@ resource "random_password" "admin" {
 }
 
 # Admin dashboard: same Lambda, reached through the waker target group in every state (awake or asleep).
+# The rule matches the whole /_dormeto/ prefix: the secret is never stored in the ALB configuration (readable
+# with elasticloadbalancing:DescribeRules and in CloudTrail), only as a SHA-256 hash in the workload config.
 resource "aws_lb_listener_rule" "admin" {
   count        = var.admin_dashboard_enabled ? 1 : 0
   listener_arn = aws_lb_listener.https.arn
@@ -137,7 +139,7 @@ resource "aws_lb_listener_rule" "admin" {
 
   condition {
     path_pattern {
-      values = ["/_dormeto/${random_password.admin[0].result}", "/_dormeto/${random_password.admin[0].result}/*"]
+      values = ["/_dormeto/*"]
     }
   }
 

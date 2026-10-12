@@ -120,7 +120,68 @@ manager's savings. A backend it cannot describe is said as unknown; the nap goes
 Spot (`spot: true`): an instance whose lifecycle is `spot` (alone or in an Auto Scaling group: on-demand and Spot
 instances of one type are two items), and a Fargate service's share on `FARGATE_SPOT`, its desired count split by its
 capacity provider strategy as ECS places tasks (the base first, then the weights); a share on EC2 capacity is not
-counted. It reads what the nap already describes: no new permission.
+counted. It reads what the nap already describes: no new permission. Since router 0.29.0 a Kubernetes workload's pods
+are described too: on Fargate as a Fargate item per size (the size in the pod's `CapacityProvisioned` annotation, else
+its requests plus 256 MB for the Kubernetes components, rounded up to a Fargate size), on EC2 nodes as a `k8s-pods` item
+(replicas, each pod's CPU and memory requests, its node's instance type, operating system, allocatable and capacity type,
+and whether a node autoscaler removes the nodes they free: Karpenter's labels, or the configuration's `autoscaler`). Pods
+without requests are said as unknown.
+
+**Kubernetes on EKS (router 0.29.0):** a workload whose application target group serves the pods of one Deployment or
+StatefulSet of an EKS cluster, behind an ALB of the AWS Load Balancer Controller (from an Ingress or a
+TargetGroupBinding), is napped by scaling its owner to 0 through the `scale` subresource once its pods are drained, and
+woken by giving back its recorded replicas (at least 1). A KEDA ScaledObject is paused at 0
+(`autoscaling.keda.sh/paused-replicas: "0"`) for the nap and given back its own pause at the wake; an HPA needs nothing
+(it leaves a target at 0 replicas alone). The router calls the cluster's API over HTTPS with an EKS token its role
+signs and the certificate authority from `eks:DescribeCluster` (no Kubernetes library in the bundles); the endpoint must
+be public and open to every address (a private cluster waits for the in-cluster agent, R10.6). The configuration's
+`kubernetes` (written by the onboarding) names the cluster, namespace, owner, the switching mode and, for an Ingress,
+its name and the Service it routes to; Kubernetes workloads come from the manager's onboarding (the `workload` module
+has no Kubernetes setting). Their wake timeout defaults to 300 s (pods may wait for a node).
+
+The controller deletes the listener rules it does not own, so the switch lives in the objects it reads:
+
+- **TargetGroupBinding** (`rule`): the rules belong to the customer, instrumented as any other rule (shadow rules,
+  weights).
+- **An Ingress in an IngressGroup** (`ingress`): the onboarding adds Dormeto's Ingress `dormeto-<workload id>` (label
+  `dormeto.com/managed`) to the group in the workload's namespace, ranked just before the customer's
+  (`group.order`), with the customer rule's host, path, conditions and `listen-ports` and its target group annotations
+  (health check, success codes, thresholds, protocol, target type, attributes), forwarding by `actions.dormeto` to the
+  Service with the application's weight and to the waker target group with the waker's. It carries no tag nor any
+  annotation the controller applies to the whole group. The controller gives that Ingress its own target group: while
+  Dormeto's rule is there, its target group takes the workload's requests, so the idle check counts both target groups,
+  the wake waits for a healthy target in Dormeto's, and the status names the one serving (`servingTargetGroupArn`). The
+  customer's Ingress is never changed.
+- **An Ingress outside any group** (`patched-ingress`): it owns its ALB, so Dormeto patches it (its rule's backend
+  becomes the same weighted `actions.dormeto`) and offboarding restores it exactly. GitOps owners need to ignore that
+  annotation (the onboarding dialog gives the snippet).
+
+The rule the controller makes for Dormeto's Ingress has no `dormeto:workload` tag: the router finds it by its forward to
+the waker target group. After each switch the router waits until the load balancer's rule shows the weights (120 s,
+else a `configuration` failure quoting the Ingress's Warning Events); a nap whose switch does not show is aborted and the
+workload stays awake (cause `switch-failed`). Wake failures: pods unschedulable (`FailedScheduling`) are `capacity` and
+waited out, image pulls and crash loops `configuration`, a 401 or 403 from the cluster `permission`, an unreachable
+cluster or a 5xx the new class `cluster`, each quoting the pods' latest Warning Events. Kubernetes changes do not reach
+CloudTrail: the idle check finds the replicas set while asleep (GitOps self-heal: a drift event, not a visitor's wake)
+and Dormeto's Ingress or the patch changed or removed, applies the switch again and records the drift.
+
+**Access to a cluster:** the router's controller, waker and onboarder roles have EKS access entries in the Kubernetes
+group `dormeto:router`, made by the manager when it installs or upgrades the router (`DmtCommandRole`'s statement
+`EksAccessEntries`) or by the `eks-access` module (`terraform/modules/eks-access`), which also gives `DmtDiscoveryRole`
+the read-only `AmazonEKSViewPolicy`. The group's rights are in [`kubernetes/dormeto-router.yaml`](kubernetes/dormeto-router.yaml),
+supposed to be applied (`kubectl apply -f`, or by the module with the `kubernetes` provider): a ClusterRole with exactly
+the rights the router checks (read Deployments, StatefulSets, ReplicaSets, Pods, Services, Events, Ingresses, HPAs and
+ScaledObjects; get Nodes; scale Deployments and StatefulSets; patch ScaledObjects; create, patch and delete Ingresses),
+its binding, and a ValidatingAdmissionPolicy (Kubernetes 1.30 or later) refusing the group's create and delete of an
+Ingress without the `dormeto.com/managed` label. A cluster on `aws-auth` only (`CONFIG_MAP`) needs the roles mapped by
+hand or a switch to `API_AND_CONFIG_MAP`. The controller's `clusterCheck` action asks the cluster what the router may do
+(`SelfSubjectRulesReview`, then a `SelfSubjectAccessReview` per right an incomplete review does not list) and names
+what is missing; the onboarding refuses a workload until nothing is.
+
+```bash
+kubectl apply -f kubernetes/dormeto-router.yaml
+aws lambda invoke --function-name dmt-dev-controller --cli-binary-format raw-in-base64-out --payload '{"action":"clusterCheck","cluster":"eks-demo","namespace":"demo"}' /dev/stdout
+```
 
 **Statistics:** while a workload is not awake, the waker counts ignored requests per reason, deferred requests (browser
 mode) and wakes per trigger in a daily item of the state table (`STATS#<day>`, kept 35 days); the admin dashboard shows
@@ -212,6 +273,10 @@ Design: [vision/docs/specs/2026-10-03-mvp-alb-ec2-design.md](https://github.com/
 | `terraform/modules/workload` | Waker target group and workload configuration |
 | `terraform/dev` | `dev` environment: demo VPC, ALB, EC2 on `dev.dormeto.com`, router wiring |
 | `scripts/e2e.sh` | End-to-end acceptance against `dev` |
+| `kubernetes/dormeto-router.yaml` | The rights of the group `dormeto:router` in an EKS cluster (ClusterRole, binding, admission policy) |
+| `terraform/modules/eks-access` | The router roles' access entries, `DmtDiscoveryRole`'s view policy, the manifest |
+| `terraform/dev-eks` | `dev-eks`: an EKS cluster written as a customer would, with six demo workloads (about 155 USD a month while it exists) |
+| `lambda/test-k8s`, `scripts/kind-*.sh` | Kubernetes integration tests in kind (podman by default) |
 
 ## Usage
 
@@ -220,6 +285,7 @@ Requirements: Node.js ≥ 24, Terraform 1.16.5 (tfenv reads `.terraform-version`
 
 ```bash
 npm test                                   # unit tests
+npm run test:k8s                           # Kubernetes integration tests in kind on podman (KIND_EXPERIMENTAL_PROVIDER=docker for Docker; scripts/kind-down.sh after)
 export AWS_PROFILE=kloudy-dormeto-prd
 terraform -chdir=terraform/dev init
 terraform -chdir=terraform/dev apply

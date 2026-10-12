@@ -116,10 +116,10 @@ export async function listRules(elbv2, loadBalancerArn) {
   return rows;
 }
 
-// Tags of rules (never default rules: their reason never depends on tags, and a default rule may not accept tags).
-export async function ruleTags(elbv2, rules) {
-  const tags = new Map();
-  await each(chunks([...new Set(rules.filter((rule) => !rule.IsDefault).map((rule) => rule.RuleArn))], 20), LISTINGS, async (batch) => {
+// Tags of rules (never default rules: their reason never depends on tags, and a default rule may not accept tags); those
+// already in `tags` are not asked again.
+export async function ruleTags(elbv2, rules, tags = new Map()) {
+  await each(chunks([...new Set(rules.filter((rule) => !rule.IsDefault && !tags.has(rule.RuleArn)).map((rule) => rule.RuleArn))], 20), LISTINGS, async (batch) => {
     const { TagDescriptions = [] } = await elbv2.describeTags({ ResourceArns: batch });
     for (const d of TagDescriptions) tags.set(d.ResourceArn, Object.fromEntries((d.Tags ?? []).map((t) => [t.Key, t.Value])));
   });
@@ -141,17 +141,21 @@ async function describeGroups(elbv2, batch) {
   }
 }
 
-export async function resolveRules(elbv2, cfgs) {
-  const balancers = new Map();
-  await each(chunks([...new Set(cfgs.map((c) => c.appTargetGroupArn))], 20), LISTINGS, async (batch) => {
+// cache: what an earlier call of the same idle check described and listed ({ balancers, listed, tags }), reused so that
+// a check resolving its workloads a chunk at a time lists each load balancer once.
+export async function resolveRules(elbv2, cfgs, cache = { balancers: new Map(), listed: new Map(), tags: new Map() }) {
+  const { balancers, listed } = cache;
+  await each(chunks([...new Set(cfgs.map((c) => c.appTargetGroupArn).filter((arn) => !balancers.has(arn)))], 20), LISTINGS, async (batch) => {
     for (const g of await describeGroups(elbv2, batch)) balancers.set(g.TargetGroupArn, g.LoadBalancerArns ?? []);
+    // A target group gone has no load balancer.
+    for (const arn of batch) if (!balancers.has(arn)) balancers.set(arn, []);
   });
-  const listed = new Map();
-  await each([...new Set([...balancers.values()].flat())], LISTINGS, async (lb) => { listed.set(lb, await listRules(elbv2, lb)); });
+  const lbs = [...new Set(cfgs.flatMap((c) => balancers.get(c.appTargetGroupArn) ?? []))].filter((lb) => !listed.has(lb));
+  await each(lbs, LISTINGS, async (lb) => { listed.set(lb, await listRules(elbv2, lb)); });
   const matching = new Map(cfgs.map((cfg) => [cfg.workloadId, (balancers.get(cfg.appTargetGroupArn) ?? [])
     .flatMap((lb) => listed.get(lb) ?? [])
     .filter(({ rule }) => forwardTargetGroups(rule).includes(cfg.appTargetGroupArn))]));
-  const tags = await ruleTags(elbv2, [...matching.values()].flat().map(({ rule }) => rule));
+  const tags = await ruleTags(elbv2, [...matching.values()].flat().map(({ rule }) => rule), cache.tags);
   return new Map(cfgs.map((cfg) => {
     const rows = matching.get(cfg.workloadId);
     const instrumented = [];

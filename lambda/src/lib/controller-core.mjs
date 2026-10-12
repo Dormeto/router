@@ -33,11 +33,15 @@ const HEALTH_REFRESH_MS = 15 * 60_000;
 // period, the next check starting where it stopped; one check at a time (a lease for the controller's 15 minutes at most).
 const CHECK_BUDGET_MS = 240_000;
 const CHECK_CONCURRENCY = 8;
+// Workloads whose rules the check resolves at once, in its order: under ELB throttling a check still reaches some.
+const CHECK_CHUNK = 25;
 const CHECK_LEASE_MS = 15 * 60_000;
 // A queued nap older than this is dropped: the next check decides again with fresh metrics.
 const NAP_MAX_AGE_MS = 10 * 60_000;
 // A queued nap that waited longer than this reads the requests made since it was asked for.
 const NAP_RECHECK_MS = 60_000;
+// A rule switch throttled by ELB (its bucket of mutating calls) is tried again this long (a burst of wakes).
+const ROUTE_RETRY_MS = 180_000;
 // Pauses (router management): automatic resume at most this far ahead, reason length.
 const PAUSE_MAX_MS = 366 * 86_400_000;
 const REASON_MAX = 256;
@@ -198,7 +202,10 @@ export function createController({
   // block a switch to the waker).
   const rulesFor = async (cfg) => (await resolveRules(elbv2, [cfg])).get(cfg.workloadId);
   const reasons = (issues) => issues.map((i) => i.reason);
-  const routeTo = (cfg, target, options = {}) => setRoute(elbv2, cfg, target, { ...options, onIssues: (issues) => log.warn('RuleIssues', { workloadId: cfg.workloadId, issues: reasons(issues) }) });
+  // A throttled switch is tried again for up to 3 minutes, within the invocation's budget.
+  const routeTo = (cfg, target, options = {}) => setRoute(elbv2, cfg, target, {
+    ...options, sleep, now, until: Math.min(now() + ROUTE_RETRY_MS, budgetEnd), onIssues: (issues) => log.warn('RuleIssues', { workloadId: cfg.workloadId, issues: reasons(issues) }),
+  });
 
   // ctx (an idle check): its rules snapshot (what it compares; anything it changes is read again) and its clients.
   async function reconcile(cfg, ctx = null) {
@@ -336,20 +343,21 @@ export function createController({
   const hosts = { at: 0, byWorkload: new Map() };
   // Host of each workload: the first of its rules (found from its target group) with a host condition; one listing per
   // load balancer for all workloads, cached five minutes.
-  async function workloadHosts(configs) {
-    if (now() - hosts.at < 5 * 60_000 && configs.every((c) => hosts.byWorkload.has(c.workloadId))) return hosts.byWorkload;
+  // cachedOnly (the report after a check): the hosts the check found, none for a workload it has not reached yet.
+  async function workloadHosts(configs, { cachedOnly = false } = {}) {
+    if (cachedOnly || (now() - hosts.at < 5 * 60_000 && configs.every((c) => hosts.byWorkload.has(c.workloadId)))) return hosts.byWorkload;
     return rememberHosts(configs, await resolveRules(elbv2, configs).catch(() => new Map()), now());
   }
-  // The check's own listing fills the cache: its report lists no load balancer again.
+  // The check's own listing fills the cache as it goes (the workloads it reached): its report lists no load balancer again.
   function rememberHosts(configs, found, at) {
-    hosts.byWorkload = new Map(configs.map((c) => [c.workloadId, (found.get(c.workloadId)?.rules ?? []).map(hostOf).find(Boolean) ?? null]));
+    for (const c of configs) hosts.byWorkload.set(c.workloadId, (found.get(c.workloadId)?.rules ?? []).map(hostOf).find(Boolean) ?? null);
     hosts.at = at;
     return hosts.byWorkload;
   }
 
-  async function list() {
+  async function list({ cachedHosts = false } = {}) {
     const configs = await store.listConfigs();
-    const byWorkload = await workloadHosts(configs);
+    const byWorkload = await workloadHosts(configs, { cachedOnly: cachedHosts });
     let pausesError;
     const pauses = await store.listPauses().catch((err) => {
       pausesError = err.message;
@@ -460,30 +468,43 @@ export function createController({
       const cursor = (await store.getCheck?.().catch(() => null))?.cursor;
       const from = cursor ? configs.findIndex((c) => c.workloadId > cursor) : 0;
       const order = from > 0 ? [...configs.slice(from), ...configs.slice(0, from)] : configs;
-      // The rules of every workload, each load balancer listed once; backends found by tag once.
-      const listedAt = now();
-      const rules = await resolveRules(elbv2, configs).catch((err) => {
-        log.warn('CheckRulesUnread', { error: err.message });
-        return null;
-      });
-      if (rules) rememberHosts(configs, rules, listedAt);
-      const ctx = { rules, scope: checkScope(clients) };
+      // The rules of the workloads, a chunk at a time in the check's order, each load balancer listed once (the listing
+      // cache); backends found by tag once. A chunk is not started when its listing would end past the budget.
+      const listing = { balancers: new Map(), listed: new Map(), tags: new Map() };
+      const ctx = { rules: new Map(), scope: checkScope(clients) };
       const deadline = Math.min(started + CHECK_BUDGET_MS, budgetEnd);
       const results = [];
       let next = 0;
-      await Promise.all(Array.from({ length: Math.min(CHECK_CONCURRENCY, order.length) }, async () => {
-        while (next < order.length && now() < deadline) {
-          const cfg = order[next++];
-          try {
-            results.push({ workloadId: cfg.workloadId, ...(await checkOne(cfg, paused(cfg.workloadId), ctx)) });
-          } catch (err) {
-            log.error('CheckFailed', { workloadId: cfg.workloadId, error: err.message });
-            results.push({ workloadId: cfg.workloadId, error: err.message });
-          }
+      let listingMs = 0;
+      while (next < order.length && now() < deadline && (next === 0 || now() + listingMs < deadline)) {
+        const chunk = order.slice(next, next + CHECK_CHUNK);
+        const listedAt = now();
+        const found = await resolveRules(elbv2, chunk, listing).catch((err) => {
+          log.warn('CheckRulesUnread', { error: err.message });
+          return null;
+        });
+        listingMs = now() - listedAt;
+        if (found) {
+          for (const [id, rules] of found) ctx.rules.set(id, rules);
+          rememberHosts(chunk, found, listedAt);
         }
-      }));
-      const stopped = next < order.length ? order[next - 1]?.workloadId ?? null : null;
-      if (stopped) log.warn('CheckBudgetReached', { checked: next, workloads: order.length, next: order[next].workloadId });
+        let i = 0;
+        await Promise.all(Array.from({ length: Math.min(CHECK_CONCURRENCY, chunk.length) }, async () => {
+          while (i < chunk.length && now() < deadline) {
+            const cfg = chunk[i++];
+            next += 1;
+            try {
+              results.push({ workloadId: cfg.workloadId, ...(await checkOne(cfg, paused(cfg.workloadId), ctx)) });
+            } catch (err) {
+              log.error('CheckFailed', { workloadId: cfg.workloadId, error: err.message });
+              results.push({ workloadId: cfg.workloadId, error: err.message });
+            }
+          }
+        }));
+      }
+      // Cut short: the next check starts after the last workload checked (where this one started if it checked none).
+      const stopped = next < order.length ? (next > 0 ? order[next - 1].workloadId : cursor ?? null) : null;
+      if (next < order.length) log.warn('CheckBudgetReached', { checked: next, workloads: order.length, next: order[next].workloadId });
       await store.setCheckCursor?.(stopped).catch((err) => log.warn('CheckCursorNotStored', { error: err.message }));
       await report(started);
       return results;
@@ -496,7 +517,7 @@ export function createController({
   async function report(started) {
     if (!publisher.enabled) return;
     try {
-      const [info, listed] = await Promise.all([routerInfo(), list()]);
+      const [info, listed] = await Promise.all([routerInfo(), list({ cachedHosts: true })]);
       await publisher.checked({
         checkedAt: iso(started), durationMs: now() - started, health: info.health, pauses: info.pauses, counts: info.workloads.byState, workloads: listed.workloads,
       });

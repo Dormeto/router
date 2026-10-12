@@ -45,17 +45,22 @@ test('a crowded check lists each load balancer once, its report to the manager i
   const s = setup();
   const seen = new Set();
   const durations = [];
+  const reached = [];
   while (seen.size < 1500 && durations.length < 4) {
     const { result, ms, relisted } = await s.check();
     assert.ok(Array.isArray(result));
     for (const r of result) seen.add(r.workloadId);
+    reached.push(seen.size);
     assert.deepEqual(relisted, [], 'a load balancer listed twice in one check');
     durations.push(ms);
   }
   assert.equal(seen.size, 1500);
-  // Each check reported every workload, with its host, from the check's own listing.
+  // Each check reported every workload, with the host of each one reached so far, from the checks' own listings.
   assert.equal(s.reports.length, durations.length);
-  for (const report of s.reports) assert.equal(report.workloads.filter((w) => w.url).length, 1500);
+  s.reports.forEach((report, i) => {
+    assert.equal(report.workloads.length, 1500);
+    assert.equal(report.workloads.filter((w) => w.url).length, reached[i]);
+  });
   assert.ok(durations.length >= 2 && durations.length <= 3, `${durations.length} checks`);
   for (const ms of durations) assert.ok(ms <= BUDGET_MS + 5_000, `a check took ${ms / 1000} s`);
   // Backends found by tag once per check, not once per workload.
@@ -126,4 +131,21 @@ test('a crowded check of idle and drifted workloads queues every nap and repair:
   assert.deepEqual(s.queued.repair.map((m) => m.workloadId).sort(), s.account.ids.slice(0, 10));
   assert.deepEqual([s.account.naps, s.repairsInvoked], [[], []]);
   assert.ok(ms <= BUDGET_MS, `the check took ${ms / 1000} s`);
+});
+
+test('a crowded check with 2 ELB calls a second left (the account bucket of 40, 10 a second, 8 taken by the customer) checks workloads at every check and reaches them all', async () => {
+  const log = recordingLog();
+  const s = setup({ latencyMs: 40, elb: { burst: 40, rate: 10, shared: 8 }, log });
+  const seen = new Set();
+  const perCheck = [];
+  while (seen.size < 1500 && perCheck.length < 12) {
+    const { result, ms } = await s.check();
+    perCheck.push(result.length);
+    for (const r of result) seen.add(r.workloadId);
+    assert.ok(ms <= BUDGET_MS + 30_000, `a check took ${ms / 1000} s`);
+  }
+  assert.ok(perCheck.every((n) => n > 0), `checks reaching no workload: ${perCheck}`);
+  assert.equal(seen.size, 1500, `${seen.size} workloads reached in ${perCheck.length} checks`);
+  assert.equal(s.retries.stats.failed, 0, 'an ELB call failed');
+  assert.deepEqual(log.events.filter((e) => e !== 'CheckBudgetReached'), []);
 });

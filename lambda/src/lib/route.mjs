@@ -66,7 +66,23 @@ export function routeOf(rules, cfg) {
 // (onIssues): a running backend must not stay behind the waiter page.
 // allowIssues: the backend is already stopped (external stop, failed wake), so the guard no longer protects anything and
 // the instrumented rules must reach the waker.
-export async function setRoute(elbv2, cfg, target, { onIssues = () => {}, found, allowIssues = false } = {}) {
+// ModifyRule shares the account's bucket of mutating ELB calls (20, 3 a second) with every wake, nap and the customer's
+// tools: a switch still throttled after the SDK's retries waits and tries again, until `until` (a burst of wakes then
+// drains at the bucket's rate instead of failing).
+async function modifyRule(elbv2, input, { sleep, now, until, random = Math.random }) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await elbv2.modifyRule(input);
+    } catch (err) {
+      if (err.name !== 'ThrottlingException' || !sleep || !now || !until) throw err;
+      const delay = Math.min(10_000, 1000 * 2 ** attempt) * (0.5 + random() / 2);
+      if (now() + delay > until) throw err;
+      await sleep(delay);
+    }
+  }
+}
+
+export async function setRoute(elbv2, cfg, target, { onIssues = () => {}, found, allowIssues = false, sleep, now, until, random } = {}) {
   if (!TARGETS.has(target)) throw new Error(`invalid target: ${target}`);
   const { instrumented, issues } = found ?? (await resolveRules(elbv2, [cfg])).get(cfg.workloadId);
   if (issues.length) {
@@ -79,7 +95,7 @@ export async function setRoute(elbv2, cfg, target, { onIssues = () => {}, found,
   const changed = [];
   for (const rule of instrumented) {
     if (currentTarget(rule.Actions, cfg) === target) continue;
-    await elbv2.modifyRule({ RuleArn: rule.RuleArn, Actions: withWeights(rule.Actions, weights) });
+    await modifyRule(elbv2, { RuleArn: rule.RuleArn, Actions: withWeights(rule.Actions, weights) }, { sleep, now, until, random });
     changed.push(rule.RuleArn);
   }
   return changed;

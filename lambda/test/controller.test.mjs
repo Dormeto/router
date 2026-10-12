@@ -648,15 +648,9 @@ test('force-wake wakes an asleep or failed workload, marks a pending wake during
   assert.deepEqual(await awake.handler({ action: 'force-wake', workloadId: 'demo' }), { state: STATES.AWAKE });
 });
 
-test('discover runs the discovery with the controller clients', async () => {
+test('discovery moved to the manager: the discover action is unknown', async () => {
   const s = managerSetup({ run: { state: STATES.AWAKE } });
-  s.elbv2.describeLoadBalancers = async () => ({ LoadBalancers: [] });
-  s.elbv2.describeTargetGroups = async () => ({ TargetGroups: [] });
-  s.elbv2.describeTags = async () => ({ TagDescriptions: [] });
-  s.ecs.listClusters = async () => ({ clusterArns: [] });
-  const result = await s.handler({ action: 'discover' });
-  assert.deepEqual(result.candidates, []);
-  assert.match(result.generatedAt, /^\d{4}-\d\d-\d\dT/);
+  await assert.rejects(s.handler({ action: 'discover' }), /unknown action: discover/);
 });
 
 // --- Scheduled check health -----------------------------------------------------------------------------------------

@@ -6,7 +6,6 @@ import { createStatus } from './status.mjs';
 import { describeRules } from './no-wake.mjs';
 import { describeStoredLists } from './list-cache.mjs';
 import { STATS_DAYS, totals, workloadSummary } from './summary.mjs';
-import { discoverCandidates } from './candidates.mjs';
 import { requestSum } from './metrics.mjs';
 import {
   backendKey, backendStatuses, isCompanion, resolveBackends, resumeBackends, sleepBackends, startCompanions, stopCompanions, toRecord, wakeBackends,
@@ -376,7 +375,6 @@ export function createController({
       case 'list': return list();
       case 'status': return workloadStatus(event.workloadId);
       case 'force-wake': return forceWake(event.workloadId, event.by);
-      case 'discover': return discoverCandidates({ elbv2, autoscaling, ecs, cloudwatch }, { now });
       default: throw new Error(`unknown action: ${event?.action}`);
     }
   };

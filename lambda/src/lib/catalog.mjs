@@ -59,7 +59,9 @@ export function createCatalog({ s3, url, own = [], now = Date.now, log, checkMs 
       Object.assign(state, { pending: false });
       if (state.version === state.manifest?.version) state.error = null;
     } catch (err) {
-      const pending = err.name === 'NoSuchKey';
+      // Without s3:ListBucket (the routers' roles have none), a missing object answers AccessDenied: in the bucket whose
+      // catalog was just read, that is a list not published yet.
+      const pending = err.name === 'NoSuchKey' || (err.name === 'AccessDenied' && !catalog.error);
       Object.assign(state, { pending, error: pending ? 'not published by the manager yet' : s3Error(err) });
     }
     return state;

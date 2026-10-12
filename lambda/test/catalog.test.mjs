@@ -118,6 +118,14 @@ test('a list the manager has not published yet is pending, not an error', async 
   ]);
 });
 
+test('a manifest refused while the catalog of the same bucket was read is a list not published yet (no s3:ListBucket: a missing object answers AccessDenied)', async () => {
+  const { catalog, s3 } = setup();
+  s3.failures.set('aws/manifest.json', 'AccessDenied');
+  const aws = (await catalog.describe()).lists.find((l) => l.name === 'aws');
+  assert.equal(aws.pending, true);
+  assert.equal(aws.error, 'not published by the manager yet');
+});
+
 test('describe reads the manifests only, never the data (the controller\'s health and configuration)', async () => {
   const { catalog, s3 } = setup();
   const described = await catalog.describe();

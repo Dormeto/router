@@ -5,6 +5,9 @@ import { createHash } from 'node:crypto';
 import { checkName } from './names.mjs';
 import { cleanConditions, forwardTargetGroups, listRules, passable, ruleTags, sameConditions, shadowGap, unshadowable } from './rules.mjs';
 import { conditionsOf } from './route.mjs';
+import { k8sBackend } from './kubernetes.mjs';
+import { applyIngressRoute, dormetoIngress, dormetoIngressName, ingressPath, patchCustomerIngress, patchedPaths, restoreCustomerIngress, waitRoute } from './kube-route.mjs';
+import { checkRights } from './kube-access.mjs';
 
 const WORKLOAD_TAG = 'dormeto:workload';
 // Target groups per Application Load Balancer: not adjustable (the waker target group counts once its rule uses it).
@@ -38,6 +41,27 @@ const SETTINGS = {
 const INSTANCE_TYPE = /^[a-z][a-z0-9-]*\d[a-z0-9-]*\.[a-z0-9]+$/;
 const FALLBACK_TYPES_MAX = 5;
 const KIND_TEXT = { instance: 'instance', asg: 'Auto Scaling group', ecs: 'ECS service', 'rds-instance': 'RDS instance', 'rds-cluster': 'RDS cluster' };
+// Kubernetes workloads (vision docs/specs/2026-10-11-kubernetes-design.md): how the waker is switched in, what scales, and
+// how long a wake waits (pods may wait for a node: Karpenter launches one in 1 to 2 minutes).
+const SWITCHES = ['rule', 'ingress', 'patched-ingress'];
+const OWNER_KINDS = ['Deployment', 'StatefulSet'];
+const KUBERNETES_WAKE_TIMEOUT = 300;
+const CLUSTER_ROLE = 'apply the ClusterRole Dormeto publishes (kubernetes/dormeto-router.yaml) and its binding to the group dormeto:router';
+// A Lambda target group leaves a load balancer once no rule forwards to it: how long offboarding waits for the controller
+// to remove Dormeto's rule.
+const RELEASE_MS = 120_000;
+
+// The configuration's kubernetes object, from a candidate: only what the router reads.
+const kubernetesConfig = (k) => ({
+  cluster: k.cluster, namespace: k.namespace, owner: { kind: k.owner.kind, name: k.owner.name }, switch: k.switch,
+  ...(k.ingress ? {
+    ingress: {
+      name: k.ingress.name, ruleIndex: k.ingress.ruleIndex, ...(k.ingress.groupOrder === undefined ? {} : { groupOrder: k.ingress.groupOrder }),
+      service: { name: k.ingress.service.name, port: k.ingress.service.port },
+    },
+  } : {}),
+  ...(k.autoscaler ? { autoscaler: k.autoscaler } : {}),
+});
 
 const tagsOf = (list = [], key = 'Key', value = 'Value') => Object.fromEntries(list.map((t) => [t[key], t[value]]));
 const chunks = (list, size) => Array.from({ length: Math.ceil(list.length / size) }, (_, i) => list.slice(i * size, (i + 1) * size));
@@ -165,7 +189,7 @@ const planText = (p) => ({
   refused: 'refused (forwards to other target groups)',
 })[p.action] ?? `instrument in place (${p.reason})`;
 
-export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, store, router, now = Date.now, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), log }) {
+export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, store, router, kubernetesOf, now = Date.now, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), log }) {
   const wakerName = (workloadId) => `${router.name}-${workloadId}`;
 
   async function targetGroup(arn) {
@@ -294,9 +318,51 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
     return problems;
   }
 
+  // A Kubernetes candidate: its owner behind the target group (never pods of another owner), the router's rights in its
+  // namespace, and the Ingress the switch goes through. paths: the rules Dormeto's Ingress adds to the load balancer.
+  async function kubernetesChecks(kube, targetGroupArn, workloadId) {
+    const refused = (problem) => ({ problems: [problem], backends: [], paths: 0 });
+    if (!SWITCHES.includes(kube.switch)) return refused(`kubernetes: switch must be ${SWITCHES.slice(0, -1).join(', ')} or ${SWITCHES.at(-1)}`);
+    if (!kube.cluster || !kube.namespace || !OWNER_KINDS.includes(kube.owner?.kind) || !kube.owner?.name) return refused('kubernetes: cluster, namespace and an owner (Deployment or StatefulSet) are required');
+    if (kube.switch !== 'rule' && !(kube.ingress?.name && Number.isInteger(kube.ingress.ruleIndex) && kube.ingress.service?.name)) return refused('kubernetes: this switch needs the Ingress (its name, rule index and Service)');
+    const problems = [];
+    const backends = [];
+    let paths = 0;
+    const cfg = { workloadId, appTargetGroupArn: targetGroupArn, wakerTargetGroupArn: '', kubernetes: kube };
+    try {
+      const k8s = await kubernetesOf(kube.cluster);
+      const found = await k8sBackend({ elbv2, kubernetesOf: async () => k8s }, cfg);
+      problems.push(...found.ignored.map((i) => i.reason));
+      backends.push(...found.backends.map((b) => ({ kind: 'k8s', id: b.id, tagged: null })));
+      const missing = await checkRights(k8s, kube.namespace);
+      if (missing.length) problems.push(`the router may not ${missing.join('; ')} in namespace ${kube.namespace}: ${CLUSTER_ROLE}`);
+      if (kube.switch !== 'rule') {
+        const ref = `Ingress ${kube.namespace}/${kube.ingress.name}`;
+        const customer = await k8s.get(ingressPath(kube.namespace, kube.ingress.name)).catch((err) => {
+          if (err?.status === 404) return null;
+          throw err;
+        });
+        if (!customer) problems.push(`${ref} not found in cluster ${kube.cluster}`);
+        else {
+          const group = customer.metadata?.annotations?.['alb.ingress.kubernetes.io/group.name'];
+          if (kube.switch === 'patched-ingress' && group) problems.push(`${ref} is in IngressGroup ${group}: Dormeto adds its own Ingress to the group (switch ingress)`);
+          try {
+            if (kube.switch === 'ingress') paths = dormetoIngress(cfg, { app: 1, waker: 0 }, customer).spec.rules[0].http.paths.length;
+            else patchedPaths(cfg, customer);
+          } catch (err) {
+            problems.push(err.message);
+          }
+        }
+      }
+    } catch (err) {
+      problems.push(`cluster ${kube.cluster}: ${err.message}`);
+    }
+    return { problems, backends, paths };
+  }
+
   // What onboarding would do, and why it cannot. `found` (onboard) receives the backends and databases it listed.
   // Without an id, the one of the target group (an explicit id: workloads named before 0.20.0, direct use).
-  async function preview({ targetGroupArn, workloadId = targetGroupArn ? workloadIdOf(targetGroupArn) : undefined, name: wanted, settings, databases }, found = {}) {
+  async function preview({ targetGroupArn, workloadId = targetGroupArn ? workloadIdOf(targetGroupArn) : undefined, name: wanted, settings, databases, kubernetes }, found = {}) {
     const problems = [];
     const name = wakerName(workloadId ?? '');
     const named = checkName(wanted);
@@ -322,6 +388,14 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
 
     const waker = await wakerGroup(workloadId);
     if (waker && !waker.ours) problems.push(`target group ${waker.TargetGroupName} exists and is not the waker of ${workloadId}`);
+    // ELB refuses a Lambda target group on a second load balancer (TargetGroupAssociationLimit, the EKS spike).
+    if (waker?.ours && (waker.LoadBalancerArns ?? []).some((lb) => lb !== result.loadBalancerArn)) {
+      problems.push(`the waker target group ${waker.TargetGroupName} is attached to another load balancer: a Lambda target group serves one load balancer`);
+    }
+    const kube = kubernetes ? await kubernetesChecks(kubernetes, targetGroupArn, workloadId) : null;
+    // The customer's rules of a workload switched by an Ingress are never changed (the controller owns them).
+    const switchedBy = kube && kubernetes.switch === 'ingress' ? `covered by Dormeto's Ingress ${kubernetes.namespace}/${dormetoIngressName({ workloadId })}`
+      : kube && kubernetes.switch === 'patched-ingress' ? `patched: the actions annotation of Ingress ${kubernetes.namespace}/${kubernetes.ingress?.name}` : null;
     const rows = await listenerRows(group);
     const plans = planRules(rows, { targetGroupArn, wakerArn: waker?.ours ? waker.TargetGroupArn : null, workloadId });
     for (const { rule, listener, tags } of rows.filter((r) => forwardTargetGroups(r.rule).includes(targetGroupArn) && !r.tags[SHADOWS_TAG])) {
@@ -329,7 +403,7 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
       const entry = { arn: rule.RuleArn, priority: rule.Priority, conditions: conditionsOf(rule) };
       if (rule.IsDefault) problems.push(`the listener default action of ${listener.Protocol}:${listener.Port} forwards to the target group (not supported yet)`);
       else if (groups.some((g) => g !== targetGroupArn && g !== waker?.TargetGroupArn)) problems.push(`rule ${rule.Priority} also forwards to other target groups`);
-      else entry.action = planText(plans.find((p) => p.row.rule.RuleArn === rule.RuleArn && p.action !== 'orphan'));
+      else entry.action = switchedBy ?? planText(plans.find((p) => p.row.rule.RuleArn === rule.RuleArn && p.action !== 'orphan'));
       result.rules.push(entry);
     }
     // By priority, listener default rules last (DescribeRules gives no order across listeners).
@@ -337,18 +411,25 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
     result.rules.sort((a, b) => rank(a) - rank(b));
     if (lbs.length && !result.rules.length) problems.push('no rule forwards to the target group');
     if (result.loadBalancerArn) {
-      problems.push(...await quotaProblems(result.loadBalancerArn, {
-        wakerExists: Boolean(waker?.ours), shadows: plans.filter((p) => p.action === 'shadow').length, rules: rows.filter((r) => !r.rule.IsDefault).length,
-      }));
+      // Rules Dormeto adds: shadows, or the rules of Dormeto's Ingress; none for a patched Ingress.
+      const added = !kube || kubernetes.switch === 'rule' ? plans.filter((p) => p.action === 'shadow').length : kube.paths;
+      problems.push(...await quotaProblems(result.loadBalancerArn, { wakerExists: Boolean(waker?.ours), shadows: added, rules: rows.filter((r) => !r.rule.IsDefault).length }));
     }
 
-    const backends = await backendsOf(group);
-    found.backends = backends;
-    if (!backends.length) problems.push('no backend: no instance, Auto Scaling group or ECS service feeds the target group');
-    for (const b of backends) {
-      const tagged = b.tags[WORKLOAD_TAG] ?? null;
-      if (tagged && tagged !== workloadId) problems.push(`${KIND_TEXT[b.kind]} ${b.id} belongs to workload ${tagged}`);
-      result.backends.push({ kind: b.kind, id: b.id, tagged });
+    if (kube) {
+      // Its owner scales: nothing is tagged in AWS for it.
+      found.backends = [];
+      problems.push(...kube.problems);
+      result.backends.push(...kube.backends);
+    } else {
+      const backends = await backendsOf(group);
+      found.backends = backends;
+      if (!backends.length) problems.push('no backend: no instance, Auto Scaling group or ECS service feeds the target group');
+      for (const b of backends) {
+        const tagged = b.tags[WORKLOAD_TAG] ?? null;
+        if (tagged && tagged !== workloadId) problems.push(`${KIND_TEXT[b.kind]} ${b.id} belongs to workload ${tagged}`);
+        result.backends.push({ kind: b.kind, id: b.id, tagged });
+      }
     }
     found.databases = await databasesOf(databases);
     for (const db of found.databases) {
@@ -376,10 +457,10 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
     else await rds.removeTagsFromResource({ ResourceName: b.arn, TagKeys: keys });
   }
 
-  async function onboard({ targetGroupArn, workloadId = targetGroupArn ? workloadIdOf(targetGroupArn) : undefined, name, settings = {}, databases = [], by }) {
+  async function onboard({ targetGroupArn, workloadId = targetGroupArn ? workloadIdOf(targetGroupArn) : undefined, name, settings = {}, databases = [], kubernetes, by }) {
     // The backends and databases its preview listed: listed once per onboarding.
     const found = {};
-    const checked = await preview({ workloadId, targetGroupArn, name, settings, databases }, found);
+    const checked = await preview({ workloadId, targetGroupArn, name, settings, databases, kubernetes }, found);
     if (!checked.ok) throw new Error(`cannot onboard ${workloadId}: ${checked.problems.join('; ')}`);
     const steps = [];
     const step = (name, done, detail) => steps.push({ name, status: done ? 'done' : 'skipped', ...(detail ? { detail } : {}) });
@@ -429,22 +510,37 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
         await store.putConfig(workloadId, {
           workloadId, name: checked.name, appTargetGroupArn: targetGroupArn, wakerTargetGroupArn: waker.TargetGroupArn,
           loadBalancerDimension: lb.slice(lb.indexOf('loadbalancer/') + 'loadbalancer/'.length), appTargetGroupDimension: targetGroupArn.split(':').at(-1),
-          instanceIds: [], ...DEFAULTS, ...(databases.length ? { wakeTimeoutSeconds: DATABASE_WAKE_TIMEOUT } : {}), ...settings,
+          instanceIds: [], ...DEFAULTS, ...(kubernetes ? { wakeTimeoutSeconds: KUBERNETES_WAKE_TIMEOUT } : {}), ...(databases.length ? { wakeTimeoutSeconds: DATABASE_WAKE_TIMEOUT } : {}), ...settings,
           noWakeRules: [], wakeRules: [], admin: { enabled: false, secretHash: '', secretParameter: '' },
           source: 'manager', onboardedBy: by ?? 'unknown', onboardedAt: new Date(now()).toISOString(), databases, tagged,
+          ...(kubernetes ? { kubernetes: kubernetesConfig(kubernetes) } : {}),
         });
         await store.initRun(workloadId, now());
         step('workload configuration', true);
       } else step('workload configuration', false);
 
-      const applied = await applyRules({ ...group, LoadBalancerArns: [checked.loadBalancerArn] }, workloadId, waker.TargetGroupArn, { app: 1, waker: 0 });
-      step('instrument rules', applied.length > 0, applied.map((a) => a.detail).join(', '));
+      const cfg = await store.getConfig(workloadId);
+      if (cfg.kubernetes?.switch === 'ingress') {
+        // Dormeto's Ingress in the customer's group, applied once the load balancer shows it (else undone).
+        const written = await applyIngressRoute({ elbv2, kubernetesOf }, cfg, 'app', { sleep, now });
+        step('Dormeto Ingress', written.length > 0, written.map((n) => `Ingress ${cfg.kubernetes.namespace}/${n}`).join(', '));
+      } else if (cfg.kubernetes?.switch === 'patched-ingress') {
+        // The customer's lone Ingress patched; what it replaced is kept for offboarding.
+        const { namespace, ingress } = cfg.kubernetes;
+        const patched = await patchCustomerIngress({ kubernetesOf }, cfg, { app: 1, waker: 0 });
+        if (!ingress.original) await store.putConfig(workloadId, { ...cfg, kubernetes: { ...cfg.kubernetes, ingress: { ...ingress, original: patched.original } } });
+        await waitRoute({ elbv2, kubernetesOf }, cfg, 'app', { ingress: { namespace, name: ingress.name }, sleep, now });
+        step('patch Ingress', patched.changed, `Ingress ${namespace}/${ingress.name}`);
+      } else {
+        const applied = await applyRules({ ...group, LoadBalancerArns: [checked.loadBalancerArn] }, workloadId, waker.TargetGroupArn, { app: 1, waker: 0 });
+        step('instrument rules', applied.length > 0, applied.map((a) => a.detail).join(', '));
+      }
       log.info('Onboarded', { workloadId, targetGroupArn, by, steps: steps.filter((s) => s.status === 'done').map((s) => s.name) });
       return { steps, workload: { workloadId, name: checked.name, wakerTargetGroupArn: waker.TargetGroupArn } };
     } catch (err) {
       if (!fresh || !changed) throw err;
       // Undo: whatever was done is removed, step by step, going on after a failed step.
-      const undo = await clean(workloadId, targetGroupArn, databases, tagged);
+      const undo = await clean(workloadId, targetGroupArn, databases, tagged, kubernetes ? kubernetesConfig(kubernetes) : null);
       const failed = undo.filter((s) => s.status === 'failed');
       log.warn('OnboardUndone', { workloadId, error: err.message, failed: failed.map((s) => s.name) });
       throw new Error(`cannot onboard ${workloadId}: ${err.message} (${failed.length ? `undo incomplete: ${failed.map((s) => `${s.name}: ${s.detail}`).join('; ')}` : 'undone'})`);
@@ -547,7 +643,7 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
 
   // Remove the instrumentation, step by step, each step going on whatever the others did: rules first (traffic stays on
   // the application), then the waker target group (in use by rules until then), the permission, the tags, the workload.
-  async function clean(workloadId, targetGroupArn, databases = [], tagged = []) {
+  async function clean(workloadId, targetGroupArn, databases = [], tagged = [], kubernetes = null) {
     const steps = [];
     const run = async (name, work) => {
       try {
@@ -560,6 +656,25 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
     const group = targetGroupArn ? await targetGroup(targetGroupArn) : null;
     const found = await wakerGroup(workloadId);
     const waker = found?.ours ? found : null;
+    // A Kubernetes switch goes first, the customer's own Ingress then taking the requests again.
+    const ingressSwitched = kubernetes && kubernetes.switch !== 'rule';
+    if (ingressSwitched) {
+      await run('Kubernetes switch', async () => {
+        const { namespace, ingress } = kubernetes;
+        if (kubernetes.switch === 'patched-ingress') {
+          const { changed } = await restoreCustomerIngress({ kubernetesOf }, { workloadId, kubernetes }, ingress.original);
+          return changed ? `Ingress ${namespace}/${ingress.name} restored` : false;
+        }
+        const name = dormetoIngressName({ workloadId });
+        try {
+          await (await kubernetesOf(kubernetes.cluster)).remove(ingressPath(namespace, name));
+        } catch (err) {
+          if (err?.status === 404) return false;
+          throw err;
+        }
+        return `Ingress ${namespace}/${name} removed`;
+      });
+    }
     await run('restore rules', async () => {
       if (!group) return false;
       let restored = 0;
@@ -583,6 +698,8 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
     });
     await run('waker target group', async () => {
       if (!waker) return false;
+      // The controller removes the rules of an Ingress switch on its own: the waker target group is in use until then.
+      for (const deadline = now() + RELEASE_MS; ingressSwitched && (await targetGroup(waker.TargetGroupArn))?.LoadBalancerArns?.length && now() < deadline;) await sleep(3000);
       await elbv2.deregisterTargets({ TargetGroupArn: waker.TargetGroupArn, Targets: [{ Id: router.wakerFunctionArn }] });
       await elbv2.deleteTargetGroup({ TargetGroupArn: waker.TargetGroupArn });
       return waker.TargetGroupName;

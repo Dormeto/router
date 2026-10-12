@@ -6,8 +6,14 @@ import { createElbv2 } from './aws/elbv2.mjs';
 import { createLambda } from './aws/lambda.mjs';
 import { createRds } from './aws/rds.mjs';
 import { createOnboarding } from './lib/onboarding.mjs';
+import { kubernetesConnector } from './lib/k8s.mjs';
+import { memoizeAsync } from './lib/memo.mjs';
 import { logger } from './lib/log.mjs';
 import { createStore } from './lib/state.mjs';
+
+// Kubernetes workloads: the EKS client loads with the first one.
+const getEks = memoizeAsync(() => import('./aws/eks.mjs').then(({ createEks }) => createEks()));
+const eks = { describeCluster: async (input) => (await getEks()).describeCluster(input), credentials: async () => (await getEks()).credentials() };
 
 // Onboarding of workloads, invoked synchronously by the manager (its own role: it changes customer rules and tags).
 const onboarding = createOnboarding({
@@ -17,6 +23,7 @@ const onboarding = createOnboarding({
   ecs: createEcs(),
   rds: createRds(),
   lambda: createLambda(),
+  kubernetesOf: kubernetesConnector({ eks, region: process.env.AWS_REGION }),
   store: createStore({ dynamo: createDynamo(), table: process.env.DMT_TABLE }),
   router: {
     name: (process.env.DMT_TG_PREFIX ?? '').replace(/-$/, ''),

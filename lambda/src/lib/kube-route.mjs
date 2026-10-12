@@ -200,7 +200,7 @@ export async function applyIngressRoute(ports, cfg, target, { sleep, now, found,
 }
 
 // The paths of the customer's rule that lead to the workload's Service, or already to Dormeto's forward.
-function patchedPaths(cfg, current) {
+export function patchedPaths(cfg, current) {
   const { namespace, ingress } = cfg.kubernetes;
   const paths = (current.spec?.rules?.[ingress.ruleIndex]?.http?.paths ?? []).map((p, index) => ({ p, index }))
     .filter(({ p }) => leadsTo(p.backend, ingress.service) || isDormeto(p.backend));

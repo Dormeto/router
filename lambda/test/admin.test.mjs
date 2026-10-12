@@ -23,7 +23,7 @@ function setup({ run, cfg = adminConfig(), metric = [], timestamps = [] } = {}) 
     store, invokeController, prefix: 'dmt-dev-', now: clock.now, sleep: clock.sleep,
     newId: () => 'wake-1', log: silentLog, getAdmin: async () => admin,
   });
-  return { handler, store, clock, invocations, cloudwatch };
+  return { handler, store, clock, invocations, cloudwatch, ec2, elbv2 };
 }
 
 const headerOf = (res, name) => res.multiValueHeaders[name]?.[0];
@@ -160,4 +160,16 @@ test('the action message only reflects known actions', async () => {
   assert.match(ok.body, /Nap requested/);
   const evil = await handler(albEvent({ path: `${BASE}/`, query: { action: ['%3Cscript%3E'] } }));
   assert.doesNotMatch(evil.body, /%3Cscript%3E|<script/);
+});
+
+test('status.json (discovery) lists the managed instances and the ignored targets', async () => {
+  const cfg = testConfig({ instanceIds: [], admin: { enabled: true, secretHash: hashSecret(SECRET) } });
+  const { handler, ec2, elbv2 } = setup({ run: { state: STATES.AWAKE }, cfg });
+  ec2.state.instances = { 'i-a': 'running', 'i-x': 'running' };
+  ec2.state.tags = { 'i-a': { 'dormeto:workload': 'demo' } };
+  elbv2.state.targets = [{ Id: 'i-a', State: 'healthy' }, { Id: 'i-x', State: 'healthy' }];
+  const status = JSON.parse((await handler(albEvent({ path: `${BASE}/status.json` }))).body);
+  assert.equal(status.discovery, 'discovery');
+  assert.deepEqual(status.instances, [{ id: 'i-a', state: 'running' }]);
+  assert.deepEqual(status.ignoredTargets, [{ id: 'i-x', reason: 'untagged' }]);
 });

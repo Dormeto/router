@@ -2,6 +2,7 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { STATES } from './state.mjs';
 import { currentTarget } from './route.mjs';
 import { instanceStates } from './instances.mjs';
+import { resolveInstances } from './discovery.mjs';
 import { lastRequestAt } from './metrics.mjs';
 import { response } from './http.mjs';
 import { renderDashboard } from './dashboard-page.mjs';
@@ -42,8 +43,9 @@ const iso = (ms) => (typeof ms === 'number' && ms > 0 ? new Date(ms).toISOString
 export function createAdmin({ ec2, elbv2, cloudwatch, invokeController, now = Date.now, log }) {
   async function status(workloadId, cfg, run) {
     const t = now();
+    const resolved = await resolveInstances(ec2, elbv2, cfg);
     const [instances, health, rules, lastRequest] = await Promise.all([
-      instanceStates(ec2, cfg.instanceIds),
+      resolved.managed.length ? instanceStates(ec2, resolved.managed) : {},
       elbv2.describeTargetHealth({ TargetGroupArn: cfg.appTargetGroupArn }),
       elbv2.describeRules({ RuleArns: [cfg.ruleArn] }),
       lastRequestAt(cloudwatch, cfg, t - cfg.idleMinutes * 60_000, t),
@@ -62,7 +64,9 @@ export function createAdmin({ ec2, elbv2, cloudwatch, invokeController, now = Da
       lastRequestAt: iso(lastRequest),
       nap: nap && { eligibleAt: iso(nap.eligibleAt), latestAt: iso(nap.latestAt), inSeconds: nap.inSeconds },
       route: currentTarget(rules.Rules?.[0]?.Actions ?? [], cfg),
-      instances: cfg.instanceIds.map((id) => ({ id, state: instances[id] ?? 'unknown' })),
+      discovery: resolved.mode,
+      instances: resolved.managed.map((id) => ({ id, state: instances[id] ?? 'unknown' })),
+      ignoredTargets: resolved.ignored,
       targets: (health.TargetHealthDescriptions ?? []).map((d) => ({ id: d.Target?.Id, state: d.TargetHealth?.State })),
       settings: {
         waitSeconds: cfg.waitSeconds,

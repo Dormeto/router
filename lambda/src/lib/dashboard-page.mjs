@@ -56,7 +56,8 @@ ${row('Wake count', status.wakeCount)}
 ${row('Held requests', status.holders)}
 ${row('Pending wake', status.pendingWake ? 'yes' : 'no')}
 ${row('Route', status.route)}
-${row('Instances', list(status.instances))}
+${row(`Instances (${status.discovery ?? 'static'})`, list(status.instances))}
+${status.ignoredTargets?.length ? row('Ignored targets', status.ignoredTargets.map((t) => `${t.id}: ${t.reason}`).join(', ')) : ''}
 ${row('Target health', list(status.targets))}
 ${row('Settings', Object.entries(status.settings).map(([k, v]) => `${k}=${v}`).join(', '))}
 </table>

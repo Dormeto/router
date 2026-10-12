@@ -31,6 +31,11 @@ resource "aws_iam_role" "waker" {
 
 data "aws_iam_policy_document" "waker" {
   statement {
+    # Kubernetes workloads (R10.5): a cluster's endpoint and certificate authority; its API answers through an access entry.
+    actions   = ["eks:DescribeCluster"]
+    resources = ["${local.arn_prefix}:eks:${local.region}:${local.account_id}:cluster/*"]
+  }
+  statement {
     # Query: IP list parts and, for the admin dashboard, statistics.
     actions   = ["dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:Query"]
     resources = [aws_dynamodb_table.router.arn]
@@ -79,6 +84,11 @@ resource "aws_iam_role" "controller" {
 }
 
 data "aws_iam_policy_document" "controller" {
+  statement {
+    # Kubernetes workloads (R10.5): a cluster's endpoint and certificate authority; its API answers through an access entry.
+    actions   = ["eks:DescribeCluster"]
+    resources = ["${local.arn_prefix}:eks:${local.region}:${local.account_id}:cluster/*"]
+  }
   statement {
     # Query: daily statistics (manager status and list). DeleteItem: pause records (resume, automatic resume).
     actions   = ["dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:Scan", "dynamodb:Query", "dynamodb:DeleteItem"]
@@ -299,6 +309,11 @@ locals {
 }
 
 data "aws_iam_policy_document" "onboarder" {
+  statement {
+    # Kubernetes workloads (R10.5): a cluster's endpoint and certificate authority; its API answers through an access entry.
+    actions   = ["eks:DescribeCluster"]
+    resources = ["${local.arn_prefix}:eks:${local.region}:${local.account_id}:cluster/*"]
+  }
   statement {
     # Workload configuration, runtime state and pauses (offboarding deletes them).
     actions   = ["dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:Query", "dynamodb:Scan", "dynamodb:DeleteItem"]

@@ -1,0 +1,85 @@
+# What a Dormeto router may do in an EKS cluster (vision docs/specs/2026-10-11-kubernetes-design.md, section 4): read the
+# workloads behind the load balancers, scale Deployments and StatefulSets, pause KEDA, and switch the waker in through
+# Ingresses. The router's roles join the group dormeto:router through their EKS access entries (terraform/modules/eks-access,
+# or the manager when it installs the router). Apply with kubectl apply -f dormeto-router.yaml; the router checks these
+# rights before onboarding a workload of the cluster. No Secrets, no change to a workload but its scale.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: dormeto-router
+  labels:
+    app.kubernetes.io/part-of: dormeto
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "replicasets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods", "services", "events"]
+    verbs: ["get", "list", "watch"]
+  # Dormeto's own Ingress in a customer's IngressGroup (create and delete limited by the policy below), and the patch of a
+  # lone Ingress.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch"]
+  # A nap pauses a ScaledObject (its annotation autoscaling.keda.sh/paused-replicas), a wake removes the pause.
+  - apiGroups: ["keda.sh"]
+    resources: ["scaledobjects"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale", "statefulsets/scale"]
+    verbs: ["get", "patch"]
+  # A napped pod's node: its instance type, capacity type and allocatable price the savings.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: dormeto-router
+  labels:
+    app.kubernetes.io/part-of: dormeto
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: dormeto-router
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: dormeto:router
+---
+# RBAC cannot select by label: this policy keeps the group's create and delete to Dormeto's own Ingresses (Kubernetes 1.30
+# and later; before, the router may create and delete any Ingress).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: dormeto-router-ingresses
+  labels:
+    app.kubernetes.io/part-of: dormeto
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["networking.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "DELETE"]
+        resources: ["ingresses"]
+  matchConditions:
+    - name: dormeto-router
+      expression: "'dormeto:router' in request.userInfo.groups"
+  validations:
+    - expression: "request.operation == 'CREATE' ? (has(object.metadata.labels) && object.metadata.labels.exists(k, k == 'dormeto.com/managed' && object.metadata.labels[k] == 'true')) : (has(oldObject.metadata.labels) && oldObject.metadata.labels.exists(k, k == 'dormeto.com/managed' && oldObject.metadata.labels[k] == 'true'))"
+      message: "Dormeto creates and deletes only its own Ingresses (label dormeto.com/managed: \"true\")"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: dormeto-router-ingresses
+  labels:
+    app.kubernetes.io/part-of: dormeto
+spec:
+  policyName: dormeto-router-ingresses
+  validationActions: ["Deny"]

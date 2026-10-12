@@ -298,3 +298,15 @@ test('savings (R9a): the controller may read a Fargate task definition\'s size, 
   assert.ok(routerBoundary().Statement.flatMap((s) => [].concat(s.Action)).includes('ecs:DescribeTaskDefinition'));
   assert.ok((await terraformActions()).controller.includes('ecs:DescribeTaskDefinition'));
 });
+
+test('Kubernetes workloads (R10.5): the controller, the waker and the onboarder may describe the EKS clusters of their account and region, within the boundary, in the blueprint and Terraform', async () => {
+  const b = fill(blueprint({ version: '0.29.0' }), VALUES);
+  const terraform = await terraformActions();
+  for (const key of ['controller', 'waker', 'onboarder']) {
+    const statement = b.roles.find((r) => r.key === key).policy.Statement.find((s) => [].concat(s.Action).includes('eks:DescribeCluster'));
+    assert.deepEqual(statement?.Resource, ['arn:aws:eks:eu-west-3:121014831971:cluster/*'], key);
+    assert.ok(terraform[key].includes('eks:DescribeCluster'), `${key} in iam.tf`);
+  }
+  assert.ok(!b.roles.find((r) => r.key === 'scheduler').policy.Statement.some((s) => [].concat(s.Action).includes('eks:DescribeCluster')));
+  assert.ok(routerBoundary().Statement.flatMap((s) => [].concat(s.Action)).includes('eks:DescribeCluster'));
+});

@@ -71,6 +71,8 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
       allow(['logs:CreateLogStream', 'logs:PutLogEvents'], [logArn('controller')]),
       // The manager's lists: its catalog and manifests (the controller describes them).
       allow(['s3:GetObject'], [listObjects]),
+      // Kubernetes workloads (R10.5): a cluster's endpoint and certificate authority; its API answers through an access entry.
+      allow(['eks:DescribeCluster'], [arn('eks', 'cluster/*')]),
     ),
     waker: policy(
       allow(['dynamodb:GetItem', 'dynamodb:UpdateItem', 'dynamodb:Query'], [tableArn]),
@@ -79,6 +81,8 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
       allow(['logs:CreateLogStream', 'logs:PutLogEvents'], [logArn('waker')]),
       // The manager's lists: its catalog, manifests and data (the waker loads them).
       allow(['s3:GetObject'], [listObjects]),
+      // Kubernetes workloads: the admin dashboard reads their replicas and pods.
+      allow(['eks:DescribeCluster'], [arn('eks', 'cluster/*')]),
     ),
     scheduler: policy(
       allow(['lambda:InvokeFunction'], [functionArn('controller')]),
@@ -100,6 +104,8 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
       allow(['lambda:RemovePermission'], [functionArn('waker')]),
       allow(['sqs:ReceiveMessage', 'sqs:DeleteMessage', 'sqs:GetQueueAttributes', 'sqs:ChangeMessageVisibility'], [queueArn('drift')]),
       allow(['logs:CreateLogStream', 'logs:PutLogEvents'], [logArn('onboarder')]),
+      // Kubernetes workloads: onboarding reads the cluster, applies Dormeto's Ingress or the patch.
+      allow(['eks:DescribeCluster'], [arn('eks', 'cluster/*')]),
     ),
   };
 
@@ -225,6 +231,8 @@ export function routerBoundary({ p = PLACEHOLDERS } = {}) {
           'cloudwatch:GetMetricData', 'tag:GetResources', 's3:GetObject', 'lambda:GetAccountSettings',
           // A rule that authenticates with Amazon Cognito: ELB checks that whoever changes it may read its user pool client.
           'cognito-idp:DescribeUserPoolClient',
+          // Kubernetes workloads (R10.5): a cluster's endpoint and certificate authority (its API answers through an access entry).
+          'eks:DescribeCluster',
         ],
         Resource: '*',
       },

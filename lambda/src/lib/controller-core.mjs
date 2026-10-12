@@ -5,7 +5,7 @@ import { healthyCount, waitTargetsReleased } from './instances.mjs';
 import { createStatus } from './status.mjs';
 import { describeRules } from './no-wake.mjs';
 import { describeStoredLists } from './list-cache.mjs';
-import { STATS_DAYS, workloadSummary } from './summary.mjs';
+import { STATS_DAYS, totals, workloadSummary } from './summary.mjs';
 import { discoverCandidates } from './candidates.mjs';
 import { requestSum } from './metrics.mjs';
 import {
@@ -262,7 +262,13 @@ export function createController({
   async function list() {
     const configs = await store.listConfigs();
     const byRule = await ruleHosts(configs);
-    const workloads = await Promise.all(configs.map(async (cfg) => workloadSummary(cfg, await store.getRun(cfg.workloadId), byRule.get(cfg.ruleArn))));
+    const workloads = await Promise.all(configs.map(async (cfg) => {
+      const [run, stats] = await Promise.all([
+        store.getRun(cfg.workloadId),
+        store.getStats(cfg.workloadId, STATS_DAYS).catch(() => null),
+      ]);
+      return workloadSummary(cfg, run, byRule.get(cfg.ruleArn), totals(stats));
+    }));
     return { router: { name: router.name, version: router.version, build: router.build }, workloads };
   }
 

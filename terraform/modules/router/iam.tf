@@ -60,7 +60,8 @@ resource "aws_iam_role" "controller" {
 
 data "aws_iam_policy_document" "controller" {
   statement {
-    actions   = ["dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:Scan"]
+    # Query: daily statistics (manager status and list).
+    actions   = ["dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:Scan", "dynamodb:Query"]
     resources = [aws_dynamodb_table.router.arn]
   }
   statement {

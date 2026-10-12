@@ -600,6 +600,15 @@ test('list returns the router and its workloads from the state table', async () 
   assert.equal(workload.wakeMode, 'any');
   assert.equal(workload.updatedAt, '2023-11-14T22:13:20.000Z');
   assert.equal(workload.settings.idleMinutes, 15);
+  assert.deepEqual(workload.stats7d, { ignored: 0, deferred: 0, wakes: 0 });
+});
+
+test('list adds the 7-day totals of each workload, null when they cannot be read', async () => {
+  const s = managerSetup({ run: { state: STATES.AWAKE } });
+  s.store.state.stats = { 'ignored:HEAD': 2, 'ignored:bot user agent': 3, 'deferred:browser mode': 1, 'wake:probe': 4 };
+  assert.deepEqual((await s.handler({ action: 'list' })).workloads[0].stats7d, { ignored: 5, deferred: 1, wakes: 4 });
+  s.store.getStats = async () => { throw new Error('AccessDenied'); };
+  assert.equal((await s.handler({ action: 'list' })).workloads[0].stats7d, null);
 });
 
 test('status returns the live status of a workload, with router rules, statistics and lists', async () => {

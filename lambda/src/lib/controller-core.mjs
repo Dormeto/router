@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { STATES } from './state.mjs';
 import { setRoute } from './route.mjs';
-import { healthyCount } from './instances.mjs';
+import { healthyCount, waitTargetsReleased } from './instances.mjs';
 import { requestSum } from './metrics.mjs';
 import {
   backendKey, backendStatuses, isCompanion, resolveBackends, resumeBackends, sleepBackends, startCompanions, stopCompanions, toRecord, wakeBackends,
@@ -9,6 +9,8 @@ import {
 
 const HEALTH_POLL_MS = 3000;
 const STOP_TIMEOUT_MS = 5 * 60_000;
+// Longest wait for the target group to drop the stopped backends (deregistration delay included).
+const RELEASE_TIMEOUT_MS = 2 * 60_000;
 const NAPPING_STUCK_MS = 15 * 60_000;
 const WAKING_STUCK_GRACE_MS = 60_000;
 // Stop working this long before the Lambda timeout, so that a failure is recorded instead of a silent kill.
@@ -122,6 +124,9 @@ export function createController({ store, ec2, elbv2, cloudwatch, autoscaling, e
         return { state: STATES.AWAKE, aborted: true };
       }
       await sleepBackends(clients, backends, { sleep, now, deadline: now() + STOP_TIMEOUT_MS });
+      if (!(await waitTargetsReleased(elbv2, cfg.appTargetGroupArn, { sleep, now, deadline: now() + RELEASE_TIMEOUT_MS }))) {
+        log.warn('TargetsNotReleased', { workloadId });
+      }
     } catch (err) {
       log.error('NapFailed', { workloadId, error: err.message });
       await store.transition(workloadId, { cond: { state: STATES.NAPPING }, set: { state: STATES.FAILED, failedAt: now(), holders: 0 }, remove: ['stopping'] });

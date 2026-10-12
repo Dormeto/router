@@ -31,6 +31,21 @@ export async function stopInstances(ec2, ids, timing) {
   await waitFor(ec2, ids, (s) => s === 'stopped', timing);
 }
 
+// Target states that can still receive (or be counted for) traffic. A stopped instance stays registered as 'unused'.
+const SERVING = new Set(['healthy', 'initial', 'draining', 'unhealthy']);
+
+// After a nap: until the target group has dropped the stopped backends (ECS tasks deregister after the service reports
+// no running task). Otherwise a wake right after the nap sees the old target healthy and switches the route to an
+// empty target group (ALB 503). Returns false when the deadline is reached first.
+export async function waitTargetsReleased(elbv2, targetGroupArn, { sleep, now, deadline, pollMs = 5000 }) {
+  for (;;) {
+    const { TargetHealthDescriptions = [] } = await elbv2.describeTargetHealth({ TargetGroupArn: targetGroupArn });
+    if (!TargetHealthDescriptions.some((d) => SERVING.has(d.TargetHealth?.State))) return true;
+    if (now() >= deadline) return false;
+    await sleep(pollMs);
+  }
+}
+
 export async function healthyCount(elbv2, targetGroupArn) {
   const { TargetHealthDescriptions = [] } = await elbv2.describeTargetHealth({ TargetGroupArn: targetGroupArn });
   return TargetHealthDescriptions.filter((d) => d.TargetHealth?.State === 'healthy').length;

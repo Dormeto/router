@@ -426,6 +426,39 @@ test('nap (ecs): records the desired count and scales the service to zero', asyn
   assert.equal(routeOf(s.elbv2, s.cfg), 'waker');
 });
 
+test('nap (ecs): becomes ASLEEP only once the target group released the stopped tasks', async () => {
+  // ECS reports no running task before the target group drops its target: a wake right after the nap must not see it.
+  const s = ecsSetup({ run: { state: STATES.AWAKE }, desired: 1 });
+  s.elbv2.state.targets = [{ Id: '10.0.0.5', State: 'healthy' }];
+  const describe = s.elbv2.describeTargetHealth;
+  let afterStop = 0;
+  s.elbv2.describeTargetHealth = async (input) => {
+    if (s.ecs.state.services[0].desiredCount === 0) {
+      afterStop += 1;
+      s.elbv2.state.targets = afterStop === 1 ? [{ Id: '10.0.0.5', State: 'healthy' }] : afterStop === 2 ? [{ Id: '10.0.0.5', State: 'draining' }] : [];
+    }
+    return describe(input);
+  };
+  const result = await s.handler({ action: 'nap', workloadId: 'demo' });
+  assert.equal(result.state, STATES.ASLEEP);
+  assert.deepEqual(s.elbv2.state.targets, []);
+  assert.ok(afterStop >= 3);
+});
+
+test('nap: stopped instance targets (unused) do not delay the nap; stuck targets end the wait after a timeout', async () => {
+  const s = setup({ run: { state: STATES.AWAKE } });
+  s.elbv2.state.targets = [{ Id: 'i-0123456789abcdef0', State: 'unused' }];
+  const start = s.clock.now();
+  assert.equal((await s.handler({ action: 'nap', workloadId: 'demo' })).state, STATES.ASLEEP);
+  const quick = s.clock.now() - start;
+
+  const stuck = setup({ run: { state: STATES.AWAKE } });
+  stuck.elbv2.state.targets = [{ Id: 'i-0123456789abcdef0', State: 'draining' }];
+  const t0 = stuck.clock.now();
+  assert.equal((await stuck.handler({ action: 'nap', workloadId: 'demo' })).state, STATES.ASLEEP);
+  assert.ok(stuck.clock.now() - t0 >= quick + 120_000, 'waited up to the release timeout');
+});
+
 test('wake (ecs): restores the desired count and switches the route back', async () => {
   const s = ecsSetup({ run: { state: STATES.WAKING, wakeId: 'w1' }, desired: 0, target: 'waker', healthy: 0 });
   const [service] = s.ecs.state.services;

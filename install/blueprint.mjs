@@ -118,7 +118,7 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
     ].map((f) => ({ ...f, roleArn: roleArn(f.key), runtime: 'nodejs24.x', architectures: ['arm64'] })),
     // Drift repair: CloudTrail events on rules, target groups and workload tags, not caused by the router, to the onboarder.
     eventRule: {
-      name: `${p.name}-drift`, pattern: JSON.stringify(driftPattern).replaceAll('${name}', p.name), target: functionArn('onboarder'),
+      name: `${p.name}-drift`, pattern: JSON.stringify(driftPattern).replaceAll('${name}', p.name).replaceAll('${partition}', p.partition).replaceAll('${account}', p.account), target: functionArn('onboarder'),
       description: 'Dormeto: rules, target groups and workload tags changed outside the router',
     },
     schedule: {

@@ -308,7 +308,8 @@ test('offboard untags what onboarding tagged even when a companion database was 
 test('a foreign rule right before a customer rule leaves no slot for its shadow: that rule is instrumented in place', async () => {
   const s = setup();
   const other = s.a.customer.targetGroup('blog-app');
-  s.a.customer.rule(9, other, { host: 'blog.example.com' });
+  // Any host: it can take requests of rules 10 and 11.
+  s.a.customer.rule(9, other, { path: '/blog/*' });
   const preview = await s.onboarding.preview({ workloadId: 'shop', targetGroupArn: s.tg });
   assert.deepEqual(preview.rules.map((r) => [r.priority, r.action]), [['10', 'instrument in place (no free priority before it)'], ['11', 'instrument in place (no free priority before it)']]);
   await s.onboarding.onboard({ workloadId: 'shop', targetGroupArn: s.tg, by: 'ops' });
@@ -324,8 +325,18 @@ test('a rule with an action before its forward (authentication) is instrumented 
   const auth = { Type: 'authenticate-oidc', Order: 1, AuthenticateOidcConfig: { Issuer: 'https://idp', ClientId: 'x' } };
   const forward = { Type: 'forward', Order: 2, TargetGroupArn: s.tg, ForwardConfig: { TargetGroups: [{ TargetGroupArn: s.tg, Weight: 1 }] } };
   s.a.state.rules.get(s.main).actions = [auth, forward];
+  s.a.state.rules.get(s.statics).conditions = [{ Field: 'path-pattern', PathPatternConfig: { Values: ['/static/*'] } }];
   const preview = await s.onboarding.preview({ workloadId: 'shop', targetGroupArn: s.tg });
-  assert.deepEqual(preview.rules.map((r) => [r.priority, r.action]), [['10', 'instrument in place (actions before the forward)'], ['11', 'shadow at 9']]);
+  // Rule 11 takes any host: its shadow must never jump before the authenticated rule 10 (requests would skip authentication).
+  assert.deepEqual(preview.rules.map((r) => [r.priority, r.action]), [['10', 'instrument in place (actions before the forward)'], ['11', 'instrument in place (no free priority before it)']]);
+});
+
+test('a shadow passes over a foreign rule no request of its rule can match (another host)', async () => {
+  const s = setup();
+  const other = s.a.customer.targetGroup('blog-app');
+  s.a.customer.rule(9, other, { host: 'blog.example.com' });
+  const preview = await s.onboarding.preview({ workloadId: 'shop', targetGroupArn: s.tg });
+  assert.deepEqual(preview.rules.map((r) => [r.priority, r.action]), [['10', 'shadow at 8'], ['11', 'shadow at 7']]);
 });
 
 test('shadows are found again by onboard, and a shadow placed after its rule since is not counted', async () => {
@@ -432,4 +443,95 @@ test('registering the waker is retried while the new invoke permission propagate
   };
   const result = await s.onboarding.onboard({ workloadId: 'shop', targetGroupArn: s.tg, by: 'ops' });
   assert.equal(result.steps.find((x) => x.name === 'register waker').status, 'done');
+});
+
+// --- R4c review fixes -----------------------------------------------------------------------------------------------
+
+test('a shadow never jumps an authentication rule placed before its customer rule', async () => {
+  const s = setup();
+  const auth = { Type: 'authenticate-oidc', Order: 1, AuthenticateOidcConfig: { Issuer: 'https://idp', ClientId: 'x' } };
+  s.a.customer.rule(9, s.tg, { host: 'shop.example.com', actions: [auth, { Type: 'forward', Order: 2, TargetGroupArn: s.tg, ForwardConfig: { TargetGroups: [{ TargetGroupArn: s.tg, Weight: 1 }] } }] });
+  const preview = await s.onboarding.preview({ workloadId: 'shop', targetGroupArn: s.tg });
+  // Rule 11 (another host) may pass over both: no request of it matches them.
+  assert.deepEqual(preview.rules.map((r) => [r.priority, r.action]), [
+    ['9', 'instrument in place (actions before the forward)'], ['10', 'instrument in place (no free priority before it)'], ['11', 'shadow at 8'],
+  ]);
+});
+
+test('shadow slots are searched per listener: a rule of another listener at the same priority does not hide a foreign rule', async () => {
+  const s = setup();
+  s.a.state.rules.clear();
+  const admin = s.a.customer.targetGroup('admin-app');
+  s.a.customer.rule(49, admin, { path: '/admin/*' });
+  const https = s.a.customer.rule(50, s.tg, { host: 'shop.example.com' });
+  const http = s.a.customer.rule(49, s.tg, { host: 'shop.example.com', listener: 'http' });
+  const plans = (await s.onboarding.preview({ workloadId: 'shop', targetGroupArn: s.tg })).rules;
+  assert.deepEqual(plans.map((r) => [r.arn === https ? 'https 50' : r.arn === http ? 'http 49' : r.arn, r.action]).sort(), [
+    ['http 49', 'shadow at 48'], ['https 50', 'instrument in place (no free priority before it)'],
+  ]);
+});
+
+test('a foreign rule placed between a shadow and its rule since makes repair move the shadow after it', async () => {
+  const s = await onboarded();
+  s.a.state.rules.get(s.main).priority = '30';
+  const api = s.a.customer.targetGroup('api-app');
+  s.a.customer.rule(20, api, { host: 'shop.example.com' });
+  const result = await s.onboarding.repair({ workloadId: 'shop', by: 'event' });
+  assert.deepEqual(kinds(result), ['shadow moved']);
+  assert.equal(shadowsOf(s.a).find((x) => x.shadows === s.main).priority, '29');
+});
+
+test('a move with no free slot falls back to instrumenting the rule in place', async () => {
+  const s = await onboarded();
+  s.a.state.rules.get(s.main).priority = '2';
+  const other = s.a.customer.targetGroup('other-app');
+  s.a.customer.rule(1, other, { host: 'other.example.com' });
+  const result = await s.onboarding.repair({ workloadId: 'shop', by: 'check' });
+  // The rule is instrumented while its shadow still hides it: requests never reach it uninstrumented.
+  assert.deepEqual(kinds(result), ['rule instrumented in place', 'shadow removed']);
+  assert.deepEqual(weights(s.a, s.main), [['shop-app', 1], ['dmt-dev-shop', 0]]);
+});
+
+test('a customer rule now forwarding to other target groups too (blue/green) loses its shadow and is never changed', async () => {
+  const s = await onboarded();
+  const v2 = s.a.customer.targetGroup('shop-v2');
+  s.a.state.rules.get(s.main).actions = [{ Type: 'forward', Order: 1, ForwardConfig: { TargetGroups: [{ TargetGroupArn: s.tg, Weight: 0 }, { TargetGroupArn: v2, Weight: 100 }] } }];
+  const result = await s.onboarding.repair({ workloadId: 'shop', by: 'event' });
+  assert.deepEqual(kinds(result), ['shadow removed']);
+  assert.equal(shadowsOf(s.a).some((x) => x.shadows === s.main), false);
+  assert.deepEqual(weights(s.a, s.main), [['shop-app', 0], ['shop-v2', 100]]);
+});
+
+test('a rule with transforms (URL or host rewrite) is instrumented in place: a shadow would not rewrite', async () => {
+  const s = setup();
+  s.a.state.rules.get(s.main).transforms = [{ Type: 'url-rewrite', UrlRewriteConfig: { Rewrites: [{ Regex: '^/api/(.*)$', Replace: '/$1' }] } }];
+  const preview = await s.onboarding.preview({ workloadId: 'shop', targetGroupArn: s.tg });
+  assert.equal(preview.rules.find((r) => r.arn === s.main).action, 'instrument in place (transforms)');
+});
+
+test('repairAll repairs only the workloads the event concerns, and one failing workload does not stop the others', async () => {
+  const s = await onboarded();
+  s.a.items.set('blog/CFG', { workloadId: 'blog', source: 'manager', appTargetGroupArn: 'arn:tg/blog', loadBalancerDimension: 'app/blog/1', tagged: [] });
+  const shadow = shadowsOf(s.a)[0];
+  s.a.state.rules.delete(shadow.arn);
+  const other = await s.onboarding.repairAll({ by: 'event:DeleteRule', detail: { requestParameters: { ruleArn: 'arn:aws:elasticloadbalancing:eu-west-1:111122223333:listener-rule/app/elsewhere/1/2/3' } } });
+  assert.deepEqual(other, { workloads: [] });
+  const ours = await s.onboarding.repairAll({ by: 'event:DeleteRule', detail: { requestParameters: { ruleArn: shadow.arn } } });
+  assert.deepEqual(ours, { workloads: [{ workloadId: 'shop', repaired: ['shadow created'] }] });
+  s.a.items.set('broken/CFG', { workloadId: 'broken', source: 'manager', appTargetGroupArn: 'arn:tg/missing', loadBalancerDimension: 'app/shop/50dc6c495c0c9188', tagged: [{ kind: 'asg', id: 'broken-asg' }] });
+  s.a.state.fail.describeAutoScalingGroups = new Error('Throttling');
+  const all = await s.onboarding.repairAll({ by: 'check' });
+  assert.deepEqual(all.workloads.map((w) => [w.workloadId, w.error ?? 'ok']).sort(), [['blog', 'ok'], ['broken', 'Throttling'], ['shop', 'ok']]);
+});
+
+test('a second shadow of one rule (two repairs at once) is removed, the first one stays', async () => {
+  const s = await onboarded();
+  const first = shadowsOf(s.a).find((x) => x.shadows === s.main);
+  await s.a.elbv2.createRule({
+    ListenerArn: s.a.state.rules.get(first.arn).listener, Priority: 5, Conditions: first.conditions,
+    Actions: s.a.state.rules.get(first.arn).actions, Tags: [{ Key: 'dormeto:workload', Value: 'shop' }, { Key: 'dormeto:shadows', Value: s.main }],
+  });
+  const result = await s.onboarding.repair({ workloadId: 'shop', by: 'event' });
+  assert.deepEqual(kinds(result), ['shadow removed']);
+  assert.deepEqual(shadowsOf(s.a).filter((x) => x.shadows === s.main).map((x) => x.arn), [first.arn]);
 });

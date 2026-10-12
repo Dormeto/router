@@ -242,10 +242,16 @@ export function createController({
     const expected = run.state === STATES.AWAKE ? 'app' : [STATES.ASLEEP, STATES.FAILED].includes(run.state) ? 'waker' : null;
     if (expected) {
       const found = await rulesFor(cfg);
-      // A workload the manager onboarded: the onboarder re-applies what drifted (a shadow deleted, a new customer rule).
-      if (cfg.source && invokeOnboarder && found.issues.some((i) => i.repairable)) {
-        await invokeOnboarder({ action: 'repair', workloadId, by: 'check' });
-        log.info('RepairRequested', { workloadId, issues: reasons(found.issues.filter((i) => i.repairable)) });
+      // A workload the manager onboarded: the onboarder re-applies what drifted (a shadow deleted, a new customer rule) and
+      // removes the orphan shadows; a failure is retried at the next check, never stopping this one.
+      const repairable = [...found.issues.filter((i) => i.repairable), ...(found.orphans ?? [])];
+      if (cfg.source && invokeOnboarder && repairable.length) {
+        try {
+          await invokeOnboarder({ action: 'repair', workloadId, by: 'check' });
+          log.info('RepairRequested', { workloadId, issues: reasons(repairable) });
+        } catch (err) {
+          log.error('RepairRequestFailed', { workloadId, error: err.message });
+        }
       }
       // A rule the router cannot switch sends requests to the stopped backend: wake the workload (it is not napped again
       // until the rule is instrumented or removed). A target group without any rule has no such rule: no wake.

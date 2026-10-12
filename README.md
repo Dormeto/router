@@ -118,10 +118,20 @@ is below the largest `maxHolders` plus 10: held requests beyond it get errors un
 **Onboarding** (`<router>-onboarder`, invoked by the manager): `preview`, `onboard` and `offboard` a workload from its
 application target group, with their own role (the controller keeps its least privilege). Onboarding tags the backends
 `dormeto:workload` (with the marker `dormeto:tagged = onboarder`), creates and registers the waker target group, writes
-the configuration and instruments every rule forwarding to the target group (weighted forward, traffic unchanged); each
-step finds what exists first, and a failed onboarding of a new workload is undone. Offboarding (the workload awake)
-removes only what onboarding added: rules back to a plain forward, waker target group, permission, the tags carrying the
-marker, the configuration. A workload written by the `workload` module is refused (remove the module instead).
+the configuration and covers every rule forwarding to the target group; each step finds what exists first, and a failed
+onboarding of a new workload is undone. Offboarding (the workload awake) removes only what onboarding added: shadows,
+rules back to a plain forward, waker target group, permission, the tags carrying the marker, the configuration. A
+workload written by the `workload` module is refused (remove the module instead).
+
+**Shadow rules:** a customer rule is covered by a Dormeto rule just before it on its listener (same conditions, weighted
+forward, tags `dormeto:workload` and `dormeto:shadows = <rule ARN>`), so the customer's rule and its infrastructure as
+code stay untouched. A shadow only passes over the workload's own rules and rules no request of the customer rule can
+match (other literal host headers): never an authentication, a redirect or another target group that could take those
+requests. A rule with an action before its forward or a rewrite, or with no free priority, is instrumented in place; a
+rule forwarding to other target groups too (blue/green) is left alone (an issue). **Drift:** CloudTrail events on rules,
+target groups and `dormeto:workload` tags (any caller but the router's roles, successful calls only) invoke the
+onboarder, which repairs the workloads they concern; the idle check asks for a repair when it finds one to make. Each
+repair is a drift event (90 days) in the workload status and the router health.
 
 ```bash
 aws lambda invoke --function-name dmt-dev-onboarder --cli-binary-format raw-in-base64-out --payload '{"action":"preview","workloadId":"onb","targetGroupArn":"<arn>"}' /dev/stdout

@@ -5,7 +5,8 @@
       "source": ["aws.elasticloadbalancing"],
       "detail": {
         "eventName": ["ModifyRule", "CreateRule", "DeleteRule", "SetRulePriorities", "DeleteTargetGroup"],
-        "userIdentity": { "sessionContext": { "sessionIssuer": { "userName": [{ "anything-but": { "prefix": "${name}-" } }] } } }
+        "userIdentity": { "arn": [{ "anything-but": { "prefix": "arn:${partition}:sts::${account}:assumed-role/${name}-" } }] },
+        "errorCode": [{ "exists": false }]
       }
     },
     {
@@ -13,7 +14,8 @@
       "detail": {
         "eventName": ["RemoveTags"],
         "requestParameters": { "tagKeys": ["dormeto:workload"] },
-        "userIdentity": { "sessionContext": { "sessionIssuer": { "userName": [{ "anything-but": { "prefix": "${name}-" } }] } } }
+        "userIdentity": { "arn": [{ "anything-but": { "prefix": "arn:${partition}:sts::${account}:assumed-role/${name}-" } }] },
+        "errorCode": [{ "exists": false }]
       }
     },
     {
@@ -21,7 +23,8 @@
       "detail": {
         "eventName": ["DeleteTags"],
         "requestParameters": { "tagSet": { "items": { "key": ["dormeto:workload"] } } },
-        "userIdentity": { "sessionContext": { "sessionIssuer": { "userName": [{ "anything-but": { "prefix": "${name}-" } }] } } }
+        "userIdentity": { "arn": [{ "anything-but": { "prefix": "arn:${partition}:sts::${account}:assumed-role/${name}-" } }] },
+        "errorCode": [{ "exists": false }]
       }
     },
     {
@@ -29,7 +32,8 @@
       "detail": {
         "eventName": ["DeleteTags"],
         "requestParameters": { "tags": { "key": ["dormeto:workload"] } },
-        "userIdentity": { "sessionContext": { "sessionIssuer": { "userName": [{ "anything-but": { "prefix": "${name}-" } }] } } }
+        "userIdentity": { "arn": [{ "anything-but": { "prefix": "arn:${partition}:sts::${account}:assumed-role/${name}-" } }] },
+        "errorCode": [{ "exists": false }]
       }
     },
     {
@@ -37,7 +41,8 @@
       "detail": {
         "eventName": ["UntagResource", "RemoveTagsFromResource"],
         "requestParameters": { "tagKeys": ["dormeto:workload"] },
-        "userIdentity": { "sessionContext": { "sessionIssuer": { "userName": [{ "anything-but": { "prefix": "${name}-" } }] } } }
+        "userIdentity": { "arn": [{ "anything-but": { "prefix": "arn:${partition}:sts::${account}:assumed-role/${name}-" } }] },
+        "errorCode": [{ "exists": false }]
       }
     }
   ]

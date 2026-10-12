@@ -104,7 +104,11 @@ test('the blueprint routes drift events to the onboarder, ignoring the router\'s
   assert.equal(b.eventRule.target, 'arn:aws:lambda:eu-west-3:121014831971:function:dmtr-dev-onboarder');
   const pattern = JSON.parse(b.eventRule.pattern);
   assert.deepEqual(pattern['detail-type'], ['AWS API Call via CloudTrail']);
-  for (const branch of pattern.$or) assert.deepEqual(branch.detail.userIdentity.sessionContext.sessionIssuer.userName, [{ 'anything-but': { prefix: 'dmtr-dev-' } }]);
+  // Every caller has an ARN (IAM users and root have no session issuer); failed calls changed nothing.
+  for (const branch of pattern.$or) {
+    assert.deepEqual(branch.detail.userIdentity, { arn: [{ 'anything-but': { prefix: 'arn:aws:sts::121014831971:assumed-role/dmtr-dev-' } }] });
+    assert.deepEqual(branch.detail.errorCode, [{ exists: false }]);
+  }
   assert.equal(b.functions[0].environment.DMT_ONBOARDER, 'dmtr-dev-onboarder');
 });
 

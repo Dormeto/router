@@ -1,7 +1,7 @@
 // Onboarding (R4a): preview, onboard and offboard a workload from its application target group, in the router's account
 // and region. Every step finds what exists before changing anything, so an action can run again; offboarding removes only
 // what onboarding added (tags carry the dormeto:tagged marker), never what the customer set.
-import { cleanConditions, forwardTargetGroups, listRules, ruleTags, sameConditions } from './rules.mjs';
+import { cleanConditions, forwardTargetGroups, listRules, passable, ruleTags, sameConditions, shadowGap, unshadowable } from './rules.mjs';
 import { conditionsOf } from './route.mjs';
 
 const WORKLOAD_TAG = 'dormeto:workload';
@@ -55,67 +55,89 @@ function instrumentedActions(actions, app, waker, weights) {
   });
 }
 
-// A rule whose only action is a forward (a shadow copies conditions, never other actions such as authentication).
-const forwardOnly = (rule) => (rule.Actions ?? []).length === 1 && rule.Actions[0].Type === 'forward';
-
-// For each customer rule forwarding to the target group (default rules aside): shadowed already, a shadow to create at a
-// free priority before it (rules of the workload in between are fine: they all forward to the same targets; a foreign
-// rule is not), or instrumented in place, with why.
+// For each customer rule forwarding to the target group (default rules aside), per listener: shadowed already, a shadow
+// to create, mirror or move, instrumented in place (with why), or refused; and the shadows to remove. A shadow passes over
+// only what `passable` allows (rules.mjs): anything else between it and its rule would see its requests taken.
 export function planRules(rows, { targetGroupArn, wakerArn, workloadId }) {
+  const options = { appArn: targetGroupArn, wakerArn, workloadId };
   const priority = (row) => Number(row.rule.Priority);
-  const ours = (row) => row.tags?.[WORKLOAD_TAG] === workloadId;
-  const sameWorkload = (row) => forwardTargetGroups(row.rule).every((g) => g === targetGroupArn || g === wakerArn) && forwardTargetGroups(row.rule).includes(targetGroupArn);
+  const isShadow = (row) => Boolean(row.tags?.[SHADOWS_TAG]) && row.tags?.[WORKLOAD_TAG] === workloadId;
   const plans = [];
-  const taken = new Map(rows.filter((r) => !r.rule.IsDefault).map((r) => [priority(r), r]));
-  const customers = rows.filter((r) => !r.rule.IsDefault && !r.tags?.[SHADOWS_TAG] && forwardTargetGroups(r.rule).includes(targetGroupArn));
-  for (const row of customers.sort((a, b) => priority(a) - priority(b))) {
-    const shadow = rows.find((r) => r.tags?.[SHADOWS_TAG] === row.rule.RuleArn && ours(r));
-    const inPlace = wakerArn && forwardTargetGroups(row.rule).includes(wakerArn);
-    if (inPlace) {
-      plans.push({ row, action: 'instrumented' });
-      continue;
-    }
-    // A free priority before the rule: the rules of the workload in between forward to the same targets, a foreign one
-    // stops the search.
-    const slotBefore = () => {
+  const planned = new Set();
+  const orphan = (shadow, reason) => {
+    plans.push({ row: shadow, action: 'orphan', reason });
+    planned.add(shadow.rule.RuleArn);
+  };
+  for (const listenerArn of new Set(rows.map((r) => r.listener.ListenerArn))) {
+    const here = rows.filter((r) => r.listener.ListenerArn === listenerArn && !r.rule.IsDefault);
+    const taken = new Map(here.map((r) => [priority(r), r]));
+    // The first free priority before a rule, passing over only what its shadow may pass over.
+    const slotBefore = (row) => {
       for (let q = priority(row) - 1; q >= 1; q -= 1) {
         const occupant = taken.get(q);
         if (!occupant) return q;
-        if (occupant !== 'planned' && !sameWorkload(occupant) && !ours(occupant)) return null;
+        if (occupant !== 'planned' && !passable(occupant, row.rule, options)) return null;
       }
       return null;
     };
-    if (shadow) {
-      const same = sameConditions(shadow.rule.Conditions, row.rule.Conditions);
-      if (priority(shadow) < priority(row)) {
-        plans.push({ row, shadow, action: same ? 'shadowed' : 'mirror' });
+    const create = (row) => {
+      const slot = slotBefore(row);
+      if (slot === null) return plans.push({ row, action: 'in place', reason: 'no free priority before it' });
+      taken.set(slot, 'planned');
+      return plans.push({ row, action: 'shadow', priority: slot });
+    };
+    const customers = here.filter((r) => !r.tags?.[SHADOWS_TAG] && forwardTargetGroups(r.rule).includes(targetGroupArn)).sort((a, b) => priority(a) - priority(b));
+    for (const row of customers) {
+      // Two repairs at once may each create a shadow: the closest one before the rule stays.
+      const distance = (r) => (priority(r) < priority(row) ? priority(row) - priority(r) : 100000 + priority(r));
+      let [shadow, ...duplicates] = rows.filter((r) => isShadow(r) && r.tags[SHADOWS_TAG] === row.rule.RuleArn).sort((a, b) => distance(a) - distance(b));
+      for (const d of duplicates) orphan(d, 'a second shadow of its rule');
+      const why = unshadowable(row.rule, options);
+      if (why === 'forwards to other target groups') {
+        if (shadow) orphan(shadow, `its rule ${why}`);
+        plans.push({ row, action: 'refused' });
         continue;
       }
-      const slot = slotBefore();
-      if (slot !== null) taken.set(slot, 'planned');
-      plans.push({ row, shadow, action: 'move', priority: slot, mirror: !same });
-      continue;
-    }
-    if (!forwardOnly(row.rule)) {
-      plans.push({ row, action: 'in place', reason: 'actions before the forward' });
-      continue;
-    }
-    const slot = slotBefore();
-    if (slot === null) plans.push({ row, action: 'in place', reason: 'no free priority before it' });
-    else {
-      taken.set(slot, 'planned');
-      plans.push({ row, action: 'shadow', priority: slot });
+      if (wakerArn && forwardTargetGroups(row.rule).includes(wakerArn)) {
+        if (shadow) orphan(shadow, 'its rule is instrumented in place');
+        plans.push({ row, action: 'instrumented' });
+        continue;
+      }
+      // Instrumented in place before its shadow goes (while the shadow exists, the rule is never reached).
+      if (why) {
+        plans.push({ row, action: 'in place', reason: why === 'has transforms' ? 'transforms' : 'actions before the forward' });
+        if (shadow) orphan(shadow, `its rule ${why}`);
+        continue;
+      }
+      const gap = shadow ? shadowGap(shadow, row, here, options) : null;
+      if (gap === 'on another listener') {
+        orphan(shadow, 'on another listener than its rule');
+        shadow = null;
+      }
+      if (!shadow) create(row);
+      else if (!gap) plans.push({ row, shadow, action: 'shadowed' });
+      else if (gap === 'with other conditions') plans.push({ row, shadow, action: 'mirror' });
+      else {
+        const slot = slotBefore(row);
+        if (slot !== null) {
+          taken.set(slot, 'planned');
+          plans.push({ row, shadow, action: 'move', priority: slot, mirror: !sameConditions(shadow.rule.Conditions, row.rule.Conditions) });
+        } else {
+          plans.push({ row, action: 'in place', reason: 'no free priority before it' });
+          orphan(shadow, 'no free priority before its rule');
+        }
+      }
     }
   }
   // Shadows of rules gone (deleted, or no longer forwarding to the target group).
-  for (const row of rows.filter((r) => r.tags?.[SHADOWS_TAG] && ours(r) && !customers.some((c) => c.rule.RuleArn === r.tags[SHADOWS_TAG]))) {
-    plans.push({ row, action: 'orphan' });
-  }
+  const customerArns = new Set(rows.filter((r) => !r.rule.IsDefault && !r.tags?.[SHADOWS_TAG] && forwardTargetGroups(r.rule).includes(targetGroupArn)).map((r) => r.rule.RuleArn));
+  for (const row of rows.filter((r) => isShadow(r) && !planned.has(r.rule.RuleArn) && !customerArns.has(r.tags[SHADOWS_TAG]))) orphan(row, 'its rule is gone');
   return plans;
 }
 
 const planText = (p) => ({
   shadowed: 'shadowed', instrumented: 'instrumented', mirror: 'shadowed (conditions to mirror)', move: 'shadowed (shadow to move before it)', shadow: `shadow at ${p.priority}`,
+  refused: 'refused (forwards to other target groups)',
 })[p.action] ?? `instrument in place (${p.reason})`;
 
 export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, store, router, now = Date.now, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), log }) {
@@ -251,9 +273,12 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
       const entry = { arn: rule.RuleArn, priority: rule.Priority, conditions: conditionsOf(rule) };
       if (rule.IsDefault) problems.push(`the listener default action of ${listener.Protocol}:${listener.Port} forwards to the target group (not supported yet)`);
       else if (groups.some((g) => g !== targetGroupArn && g !== waker?.TargetGroupArn)) problems.push(`rule ${rule.Priority} also forwards to other target groups`);
-      else entry.action = planText(plans.find((p) => p.row.rule.RuleArn === rule.RuleArn));
+      else entry.action = planText(plans.find((p) => p.row.rule.RuleArn === rule.RuleArn && p.action !== 'orphan'));
       result.rules.push(entry);
     }
+    // By priority, listener default rules last (DescribeRules gives no order across listeners).
+    const rank = (r) => (r.priority === 'default' ? Infinity : Number(r.priority));
+    result.rules.sort((a, b) => rank(a) - rank(b));
     if (lbs.length && !result.rules.length) problems.push('no rule forwards to the target group');
 
     const backends = await backendsOf(group);
@@ -395,11 +420,10 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
         await elbv2.modifyRule({ RuleArn: plan.shadow.rule.RuleArn, Conditions: cleanConditions(rule.Conditions) });
       }
       if (plan.action === 'move') {
-        if (plan.priority === null) throw new Error(`no free priority before rule ${rule.Priority} for its shadow`);
         change('shadow moved', `shadow of rule ${rule.Priority} from ${plan.shadow.rule.Priority} to ${plan.priority}`);
         await elbv2.setRulePriorities({ RulePriorities: [{ RuleArn: plan.shadow.rule.RuleArn, Priority: plan.priority }] });
       } else if (plan.action === 'orphan') {
-        change('shadow removed', `shadow at ${rule.Priority}: its rule is gone`);
+        change('shadow removed', `shadow at ${rule.Priority}: ${plan.reason}`);
         await elbv2.deleteRule({ RuleArn: rule.RuleArn });
       } else if (plan.action === 'in place') {
         change('rule instrumented in place', `rule ${rule.Priority} (${plan.reason})`);
@@ -558,11 +582,26 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
   }
 
   // A CloudTrail event (EventBridge) on rules, target groups or tags: repair every workload the manager onboarded.
-  async function repairAll({ by }) {
+  // Whether a CloudTrail event may concern a workload: its parameters name the workload's load balancer (rule and listener
+  // ARNs), its target group, its waker's, or a backend it tagged. Without an event (a manual run), every workload.
+  function concerns(cfg, detail) {
+    if (!detail) return true;
+    const text = JSON.stringify([detail.requestParameters, detail.responseElements]);
+    const marks = [cfg.loadBalancerDimension, cfg.appTargetGroupDimension ?? cfg.appTargetGroupArn, `targetgroup/${router.name}-${cfg.workloadId}/`, ...(cfg.tagged ?? []).map((b) => b.id)];
+    return marks.filter(Boolean).some((mark) => text.includes(mark));
+  }
+
+  // Repair the workloads an event concerns, each on its own: one failing never stops the others.
+  async function repairAll({ by, detail = null }) {
     const workloads = [];
-    for (const cfg of (await store.listConfigs()).filter((c) => c.source)) {
-      const { repaired } = await repair({ workloadId: cfg.workloadId, by });
-      workloads.push({ workloadId: cfg.workloadId, repaired: repaired.map((e) => e.kind) });
+    for (const cfg of (await store.listConfigs()).filter((c) => c.source && concerns(c, detail))) {
+      try {
+        const { repaired } = await repair({ workloadId: cfg.workloadId, by });
+        workloads.push({ workloadId: cfg.workloadId, repaired: repaired.map((e) => e.kind) });
+      } catch (err) {
+        log.error('RepairFailed', { workloadId: cfg.workloadId, by, error: err.message });
+        workloads.push({ workloadId: cfg.workloadId, error: err.message });
+      }
     }
     return { workloads };
   }

@@ -131,7 +131,10 @@ export function fakeElbv2(cfg, { target = 'app', healthy = 1 } = {}) {
     get actions() { return this.rules.get(arns[0])?.actions; },
     set actions(value) { this.rules.get(arns[0]).actions = value; },
   };
-  const toRule = ([RuleArn, r]) => ({ RuleArn, Priority: r.isDefault ? 'default' : r.priority, IsDefault: Boolean(r.isDefault), Conditions: r.conditions ?? [], Actions: structuredClone(r.actions) });
+  const toRule = ([RuleArn, r]) => ({
+    RuleArn, Priority: r.isDefault ? 'default' : r.priority, IsDefault: Boolean(r.isDefault), Conditions: r.conditions ?? [], Actions: structuredClone(r.actions),
+    ...(r.transforms ? { Transforms: r.transforms } : {}),
+  });
   return {
     state,
     async describeTargetGroups({ TargetGroupArns }) {
@@ -140,7 +143,9 @@ export function fakeElbv2(cfg, { target = 'app', healthy = 1 } = {}) {
     },
     async describeListeners({ LoadBalancerArn }) {
       state.calls.listeners += 1;
-      return { Listeners: LoadBalancerArn === FAKE_LB ? [{ ListenerArn: `${FAKE_LB}/listener-443`, Protocol: 'HTTPS', Port: 443 }] : [] };
+      // An HTTP listener too when a rule sits on it (`listener: 'http'`).
+      const http = [...state.rules.values()].some((r) => r.listener === 'http') ? [{ ListenerArn: `${FAKE_LB}/listener-80`, Protocol: 'HTTP', Port: 80 }] : [];
+      return { Listeners: LoadBalancerArn === FAKE_LB ? [{ ListenerArn: `${FAKE_LB}/listener-443`, Protocol: 'HTTPS', Port: 443 }, ...http] : [] };
     },
     async describeRules({ ListenerArn, RuleArns, Marker }) {
       state.calls.rules += 1;
@@ -149,7 +154,7 @@ export function fakeElbv2(cfg, { target = 'app', healthy = 1 } = {}) {
         return { Rules: RuleArns.map((a) => toRule([a, state.rules.get(a)])) };
       }
       // Pages of two rules, to exercise the pagination.
-      const all = [...state.rules].map(toRule);
+      const all = [...state.rules].filter(([, r]) => ListenerArn.endsWith(r.listener === 'http' ? '/listener-80' : '/listener-443')).map(toRule);
       const start = Number(Marker ?? 0);
       return { Rules: ListenerArn.startsWith(FAKE_LB) ? all.slice(start, start + 2) : [], NextMarker: start + 2 < all.length ? String(start + 2) : undefined };
     },

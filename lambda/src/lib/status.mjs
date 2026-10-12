@@ -56,7 +56,8 @@ export function createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging
       // cannot switch (they keep the workload awake).
       route: routeOf(rules.instrumented, cfg),
       rules: rules.rules.map((rule) => {
-        const issue = rules.issues.find((i) => i.arn === rule.RuleArn)?.reason;
+        // Orphan shadows (to remove) too, which never keep the workload awake.
+        const issue = [...rules.issues, ...(rules.orphans ?? [])].find((i) => i.arn === rule.RuleArn)?.reason;
         // A customer rule covered by a Dormeto shadow before it: never reached while the shadow exists.
         const by = (rules.covered ?? []).find((c) => c.arn === rule.RuleArn)?.by;
         const shadow = by && rules.rules.find((r) => r.RuleArn === by);

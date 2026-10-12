@@ -5,9 +5,10 @@ const REGION = 'eu-west-1';
 const ACCOUNT = '111122223333';
 export const LB = `arn:aws:elasticloadbalancing:${REGION}:${ACCOUNT}:loadbalancer/app/shop/50dc6c495c0c9188`;
 export const LISTENER = `arn:aws:elasticloadbalancing:${REGION}:${ACCOUNT}:listener/app/shop/50dc6c495c0c9188/f2f7dc8efc522ab2`;
+export const LISTENER_HTTP = `arn:aws:elasticloadbalancing:${REGION}:${ACCOUNT}:listener/app/shop/50dc6c495c0c9188/a1a1a1a1a1a1a1a1`;
 export const WAKER_ARN = `arn:aws:lambda:${REGION}:${ACCOUNT}:function:dmt-dev-waker`;
 export const tgArn = (name, id = '73e2d6bc24d8a067') => `arn:aws:elasticloadbalancing:${REGION}:${ACCOUNT}:targetgroup/${name}/${id}`;
-const ruleArn = (n) => `arn:aws:elasticloadbalancing:${REGION}:${ACCOUNT}:listener-rule/app/shop/50dc6c495c0c9188/f2f7dc8efc522ab2/${String(n).padStart(16, '0')}`;
+const ruleArn = (n, listener = 'f2f7dc8efc522ab2') => `arn:aws:elasticloadbalancing:${REGION}:${ACCOUNT}:listener-rule/app/shop/50dc6c495c0c9188/${listener}/${String(n).padStart(16, '0')}`;
 
 const error = (name, message = name) => Object.assign(new Error(message), { name });
 const tagList = (tags) => Object.entries(tags).map(([Key, Value]) => ({ Key, Value }));
@@ -42,12 +43,16 @@ export function fakeAccount() {
       state.targetGroups.set(arn, { name, type, lbs: attached ? [LB] : [], targets, tags: {}, attributes: {} });
       return arn;
     },
-    rule(priority, tg, { host, isDefault = false, actions } = {}) {
-      const arn = ruleArn(priority === 'default' ? 99999 : priority);
+    rule(priority, tg, { host, path, isDefault = false, actions, listener = 'https', transforms } = {}) {
+      const arn = ruleArn(priority === 'default' ? 99999 : priority, listener === 'http' ? 'a1a1a1a1a1a1a1a1' : undefined);
       // DescribeRules answers the legacy Values next to the condition's configuration.
+      const conditions = [
+        ...(host ? [{ Field: 'host-header', Values: [host], HostHeaderConfig: { Values: [host] } }] : []),
+        ...(path ? [{ Field: 'path-pattern', Values: [path], PathPatternConfig: { Values: [path] } }] : []),
+      ];
       state.rules.set(arn, {
-        priority: String(priority), isDefault, conditions: host ? [{ Field: 'host-header', Values: [host], HostHeaderConfig: { Values: [host] } }] : [],
-        actions: actions ?? plain(tg), tags: {},
+        priority: String(priority), isDefault, conditions,
+        actions: actions ?? plain(tg), tags: {}, listener: listener === 'http' ? LISTENER_HTTP : LISTENER, ...(transforms ? { transforms } : {}),
       });
       return arn;
     },
@@ -65,7 +70,10 @@ export function fakeAccount() {
     },
   };
 
-  const toRule = ([RuleArn, r]) => ({ RuleArn, Priority: r.isDefault ? 'default' : r.priority, IsDefault: r.isDefault, Conditions: structuredClone(r.conditions), Actions: structuredClone(r.actions) });
+  const toRule = ([RuleArn, r]) => ({
+    RuleArn, Priority: r.isDefault ? 'default' : r.priority, IsDefault: r.isDefault, Conditions: structuredClone(r.conditions), Actions: structuredClone(r.actions),
+    ...(r.transforms ? { Transforms: structuredClone(r.transforms) } : {}),
+  });
   const resourceTags = (arn) => state.targetGroups.get(arn)?.tags ?? state.rules.get(arn)?.tags;
   const referenced = (tg) => [...state.rules.values()].some((r) => r.actions.some((a) => a.TargetGroupArn === tg || a.ForwardConfig?.TargetGroups?.some((g) => g.TargetGroupArn === tg)));
 
@@ -79,12 +87,12 @@ export function fakeAccount() {
     },
     async describeListeners({ LoadBalancerArn }) {
       call('describeListeners');
-      return { Listeners: LoadBalancerArn === LB ? [{ ListenerArn: LISTENER, Protocol: 'HTTPS', Port: 443 }] : [] };
+      return { Listeners: LoadBalancerArn === LB ? [{ ListenerArn: LISTENER, Protocol: 'HTTPS', Port: 443 }, { ListenerArn: LISTENER_HTTP, Protocol: 'HTTP', Port: 80 }] : [] };
     },
     async describeRules({ ListenerArn, RuleArns }) {
       call('describeRules');
       if (RuleArns) return { Rules: RuleArns.map((a) => toRule([a, state.rules.get(a)])) };
-      return { Rules: ListenerArn === LISTENER ? [...state.rules].map(toRule) : [] };
+      return { Rules: [...state.rules].filter(([, r]) => (r.listener ?? LISTENER) === ListenerArn).map(toRule) };
     },
     async describeTags({ ResourceArns }) {
       call('describeTags');
@@ -142,11 +150,11 @@ export function fakeAccount() {
     },
     async createRule({ ListenerArn, Priority, Conditions, Actions, Tags = [] }) {
       call('createRule');
-      if (ListenerArn !== LISTENER) throw error('ListenerNotFoundException');
-      if ([...state.rules.values()].some((r) => r.priority === String(Priority))) throw error('PriorityInUseException', `Priority '${Priority}' is currently in use`);
+      if (ListenerArn !== LISTENER && ListenerArn !== LISTENER_HTTP) throw error('ListenerNotFoundException');
+      if ([...state.rules.values()].some((r) => (r.listener ?? LISTENER) === ListenerArn && r.priority === String(Priority))) throw error('PriorityInUseException', `Priority '${Priority}' is currently in use`);
       for (const c of Conditions) if (c.Values && c.HostHeaderConfig) throw error('ValidationError', 'You cannot both specify Values and HostHeaderConfig');
       const arn = ruleArn(100000 + (ids += 1));
-      state.rules.set(arn, { priority: String(Priority), isDefault: false, conditions: structuredClone(Conditions), actions: structuredClone(Actions), tags: Object.fromEntries(Tags.map((t) => [t.Key, t.Value])) });
+      state.rules.set(arn, { priority: String(Priority), isDefault: false, conditions: structuredClone(Conditions), actions: structuredClone(Actions), tags: Object.fromEntries(Tags.map((t) => [t.Key, t.Value])), listener: ListenerArn });
       for (const g of Actions.flatMap((a) => a.ForwardConfig?.TargetGroups ?? [])) {
         const tg = state.targetGroups.get(g.TargetGroupArn);
         if (!tg.lbs.includes(LB)) tg.lbs.push(LB);
@@ -161,7 +169,8 @@ export function fakeAccount() {
     async setRulePriorities({ RulePriorities }) {
       call('setRulePriorities');
       for (const { RuleArn, Priority } of RulePriorities) {
-        if ([...state.rules].some(([a, r]) => a !== RuleArn && r.priority === String(Priority))) throw error('PriorityInUseException');
+        const listener = state.rules.get(RuleArn).listener ?? LISTENER;
+        if ([...state.rules].some(([a, r]) => a !== RuleArn && (r.listener ?? LISTENER) === listener && r.priority === String(Priority))) throw error('PriorityInUseException');
         state.rules.get(RuleArn).priority = String(Priority);
       }
       return {};

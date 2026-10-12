@@ -205,11 +205,13 @@ resource "aws_sqs_queue" "check_failures" {
 }
 
 # Drift repair (vision docs/specs/2026-10-05-onboarding-design.md, R4c): CloudTrail events on rules, target groups and the
-# dormeto:workload tags, not caused by the router itself, invoke the onboarder (pattern shared with the blueprint).
+# dormeto:workload tags, not caused by the router itself (its roles' sessions), invoke the onboarder (pattern shared with
+# the blueprint).
 resource "aws_cloudwatch_event_rule" "drift" {
-  name          = "${var.name}-drift"
-  description   = "Dormeto: rules, target groups and workload tags changed outside the router"
-  event_pattern = replace(file("${path.module}/../../../install/drift-pattern.json"), "$${name}", var.name)
+  name        = "${var.name}-drift"
+  description = "Dormeto: rules, target groups and workload tags changed outside the router"
+  event_pattern = replace(replace(replace(file("${path.module}/../../../install/drift-pattern.json"),
+    "$${name}", var.name), "$${partition}", data.aws_partition.current.partition), "$${account}", local.account_id)
 }
 
 resource "aws_cloudwatch_event_target" "drift" {

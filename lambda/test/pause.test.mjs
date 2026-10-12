@@ -252,3 +252,25 @@ test('status lists the latest drift repairs, and the router health counts those 
   assert.equal(info.health.drift24h, 1);
   assert.ok(info.health.problems.some((p) => p.text === '1 drift repair in 24 hours: infrastructure as code changed what onboarding added (see the workloads)'));
 });
+
+test('an orphan shadow asks the onboarder for a repair without waking the workload, and a failing onboarder never stops the check', async () => {
+  const s = setup({ run: { state: STATES.ASLEEP } });
+  const repairs = [];
+  let fail = true;
+  const handler = createController({
+    store: s.store, ec2: fakeEc2(s.cfg.instanceIds, { state: 'stopped' }), elbv2: s.elbv2, cloudwatch: fakeCloudWatch([0]), autoscaling: fakeAutoScaling(), ecs: fakeEcs(), tagging: fakeTagging(fakeEcs()), appscaling: fakeAppScaling(),
+    invokeSelf: async () => {}, invokeOnboarder: async (payload) => { repairs.push(payload); if (fail) throw new Error('TooManyRequestsException'); }, now: s.clock.now, sleep: s.clock.sleep, log: { info() {}, warn() {}, error() {} },
+  });
+  s.store.getConfig = async () => ({ ...s.cfg, source: 'manager' });
+  s.store.listConfigs = async () => [{ ...s.cfg, source: 'manager' }];
+  for (const rule of s.elbv2.state.rules.values()) rule.actions = s.elbv2.state.forward(0, 1);
+  s.elbv2.state.rules.set('arn:rule/shadow', { actions: s.elbv2.state.forward(0, 1), conditions: [], priority: '5', tags: { 'dormeto:workload': 'demo', 'dormeto:shadows': 'arn:rule/gone' } });
+  await handler({ action: 'check' });
+  fail = false;
+  await handler({ action: 'check' });
+  assert.deepEqual(repairs, [{ action: 'repair', workloadId: 'demo', by: 'check' }, { action: 'repair', workloadId: 'demo', by: 'check' }]);
+  assert.equal((await s.store.getRun('demo')).state, STATES.ASLEEP);
+  const status = await s.handler({ action: 'status', workloadId: 'demo' });
+  assert.equal(status.rules.find((r) => r.arn === 'arn:rule/shadow').issue, 'rule 5 shadows a rule gone');
+  assert.deepEqual(status.issues, []);
+});

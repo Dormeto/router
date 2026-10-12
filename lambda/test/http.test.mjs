@@ -24,12 +24,12 @@ test('header lookups are case-insensitive and support single-value events', () =
 });
 
 test('classify detects probes, HEAD, bots and normal requests', () => {
-  assert.equal(classify(event()), 'normal');
-  assert.equal(classify(event({ multiValueHeaders: { 'x-dormeto-probe': ['1'] } })), 'probe');
-  assert.equal(classify(event({ httpMethod: 'HEAD' })), 'no-wake');
-  assert.equal(classify(event({ multiValueHeaders: { 'user-agent': ['Googlebot/2.1'] } })), 'no-wake');
-  assert.equal(classify(event({ multiValueHeaders: { 'user-agent': ['ELB-HealthChecker/2.0'] } })), 'no-wake');
-  assert.equal(classify(event({ multiValueHeaders: { 'user-agent': ['UptimeRobot/2.0'] } })), 'no-wake');
+  assert.equal(classify(event()).kind, 'normal');
+  assert.equal(classify(event({ multiValueHeaders: { 'x-dormeto-probe': ['1'] } })).kind, 'probe');
+  assert.equal(classify(event({ httpMethod: 'HEAD' })).kind, 'no-wake');
+  assert.equal(classify(event({ multiValueHeaders: { 'user-agent': ['Googlebot/2.1'] } })).kind, 'no-wake');
+  assert.equal(classify(event({ multiValueHeaders: { 'user-agent': ['ELB-HealthChecker/2.0'] } })).kind, 'no-wake');
+  assert.equal(classify(event({ multiValueHeaders: { 'user-agent': ['UptimeRobot/2.0'] } })).kind, 'no-wake');
 });
 
 test('classify ignores internet scanners', () => {
@@ -41,9 +41,9 @@ test('classify ignores internet scanners', () => {
     'Mozilla/5.0 (compatible; Nmap Scripting Engine; https://nmap.org/book/nse.html)',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Nuclei - Open-source project (github.com/projectdiscovery/nuclei)',
     'masscan/1.3 (https://github.com/robertdavidgraham/masscan)',
-  ]) assert.equal(classify(event({ multiValueHeaders: { 'user-agent': [ua] } })), 'no-wake', ua);
+  ]) assert.equal(classify(event({ multiValueHeaders: { 'user-agent': [ua] } })).kind, 'no-wake', ua);
   const safari = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1';
-  assert.equal(classify(event({ multiValueHeaders: { 'user-agent': [safari] } })), 'normal');
+  assert.equal(classify(event({ multiValueHeaders: { 'user-agent': [safari] } })).kind, 'normal');
 });
 
 test('requestTarget rebuilds path and repeated query parameters', () => {
@@ -81,9 +81,9 @@ test('response uses multi-value headers', () => {
 test('classify treats well-known scanner paths as no-wake', () => {
   for (const path of ['/.env', '/.git/config', '/.github/copilot-instructions.md', '/config.json', '/js/env.js', '/api/config',
     '/AGENTS.md', '/CLAUDE.md', '/README.md', '/wp-login.php', '/xmlrpc.php', '/phpmyadmin/', '/actuator/health', '/index.php', '/.aws/credentials']) {
-    assert.equal(classify(event({ path })), 'no-wake', path);
+    assert.equal(classify(event({ path })).kind, 'no-wake', path);
   }
   for (const path of ['/', '/orders', '/api/orders', '/js/app.js', '/docs/readme-guide']) {
-    assert.equal(classify(event({ path })), 'normal', path);
+    assert.equal(classify(event({ path })).kind, 'normal', path);
   }
 });

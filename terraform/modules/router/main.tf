@@ -24,6 +24,15 @@ resource "aws_dynamodb_table" "router" {
 locals {
   # Identifies the exact deployed code: first 12 hex characters of the Lambda zip SHA-256.
   build = substr(data.archive_file.lambda.output_sha256, 0, 12)
+  # camelCase JSON for the Lambdas; unset conditions stay null or empty (ignored).
+  no_wake_rules = [for r in var.no_wake_rules : {
+    name             = r.name
+    sourceIps        = r.source_ips
+    pathPrefixes     = r.path_prefixes
+    pathPattern      = r.path_pattern
+    userAgentPattern = r.user_agent_pattern
+    headers          = [for h in r.headers : { name = h.name, value = h.value, pattern = h.pattern }]
+  }]
 }
 
 data "archive_file" "lambda" {
@@ -105,6 +114,8 @@ resource "aws_lambda_function" "waker" {
       DMT_TG_PREFIX  = "${var.name}-"
       DMT_VERSION    = var.router_version
       DMT_BUILD      = local.build
+      # Router default no-wake rules, for every workload.
+      DMT_NO_WAKE_RULES = jsonencode(local.no_wake_rules)
     }
   }
 

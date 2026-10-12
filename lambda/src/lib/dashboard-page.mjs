@@ -13,6 +13,19 @@ const backendText = (b) => {
   return `${b.id}: ${b.status}`;
 };
 
+// One no-wake rule as text, for example: office (workload): source 198.51.100.0/24, path /health*
+const ruleText = (rule) => {
+  const c = rule.conditions ?? {};
+  const parts = [
+    c.sourceIps && `source ${c.sourceIps.join(' | ')}`,
+    c.pathPrefixes && `path ${c.pathPrefixes.map((p) => `${p}*`).join(' | ')}`,
+    c.pathPattern && `path ~ ${c.pathPattern}`,
+    c.userAgentPattern && `user agent ~ ${c.userAgentPattern}`,
+    ...(c.headers ?? []).map((h) => (h.pattern ? `header ${h.name} ~ ${h.pattern}` : `header ${h.name} = ${h.value}`)),
+  ].filter(Boolean);
+  return `${rule.name} (${rule.level}): ${rule.invalid ? `invalid, ${rule.invalid}` : parts.join(', ')}`;
+};
+
 const row = (label, value) => `<tr><th scope="row">${escapeHtml(label)}</th><td>${escapeHtml(value ?? '—')}</td></tr>`;
 
 function napText(nap) {
@@ -69,6 +82,7 @@ ${row('Route', status.route)}
 ${row(`Backends (${status.discovery ?? 'static'})`, (status.backends ?? []).map(backendText).join(', ') || '—')}
 ${status.ignoredTargets?.length ? row('Ignored targets', status.ignoredTargets.map((t) => `${t.id}: ${t.reason}`).join(', ')) : ''}
 ${row('Target health', list(status.targets))}
+${row('No-wake rules', (status.noWakeRules ?? []).map(ruleText).join('; ') || 'none (built-in filters only)')}
 ${row('Settings', Object.entries(status.settings).map(([k, v]) => `${k}=${v}`).join(', '))}
 </table>
 <p class="note">Router ${escapeHtml(status.router?.version ?? 'unknown')} (build ${escapeHtml(status.router?.build ?? 'unknown')}). Refreshes every 10 s. JSON: <a href="${escapeHtml(base)}/status.json">status.json</a></p>

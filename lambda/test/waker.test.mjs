@@ -196,7 +196,7 @@ test('logs the request that triggers a wake or a pending wake', async () => {
   const cfg = testConfig({ waitSeconds: 0 });
   const store = fakeStore({ config: cfg, run: { state: STATES.ASLEEP }, clock });
   const handler = createWaker({ store, invokeController: async () => {}, prefix: 'dmt-dev-', now: clock.now, sleep: clock.sleep, newId: () => 'w1', log });
-  await handler(albEvent({ path: '/orders', headers: { 'user-agent': 'curl/8.4', 'x-forwarded-for': '198.51.100.7, 10.0.0.1' } }));
+  await handler(albEvent({ path: '/orders', headers: { 'user-agent': 'curl/8.4', 'x-forwarded-for': '203.0.113.9, 198.51.100.7' } }));
   const [event, fields] = entries.find(([e]) => e === 'WakeRequested');
   assert.equal(event, 'WakeRequested');
   assert.deepEqual(fields.trigger, { kind: 'normal', method: 'GET', path: '/orders', userAgent: 'curl/8.4', sourceIp: '198.51.100.7' });
@@ -205,4 +205,55 @@ test('logs the request that triggers a wake or a pending wake', async () => {
   await handler(albEvent({ path: '/', headers: { 'x-dormeto-probe': '1' } }));
   const pending = entries.find(([e]) => e === 'PendingWake');
   assert.equal(pending[1].trigger.kind, 'probe');
+});
+
+function rulesSetup({ cfg, defaultRules } = {}) {
+  const entries = [];
+  const log = { info: (event, fields) => entries.push([event, fields]), warn: (event, fields) => entries.push([event, fields]), error() {} };
+  const clock = fakeClock();
+  const store = fakeStore({ config: cfg ?? testConfig({ waitSeconds: 0 }), run: { state: STATES.ASLEEP }, clock });
+  const invocations = [];
+  const handler = createWaker({
+    store, invokeController: async (payload) => { invocations.push(payload); }, prefix: 'dmt-dev-',
+    now: clock.now, sleep: clock.sleep, newId: () => 'w1', log, defaultRules,
+  });
+  return { handler, store, entries, invocations };
+}
+
+test('a request matching a workload no-wake rule gets the waiter page without waking, and is logged', async () => {
+  const cfg = testConfig({ waitSeconds: 20, noWakeRules: [{ name: 'office', sourceIps: ['198.51.100.0/24'] }] });
+  const { handler, store, entries, invocations } = rulesSetup({ cfg });
+  const res = await handler(albEvent({ path: '/orders', headers: { 'x-forwarded-for': '198.51.100.20' } }));
+  assert.equal(res.statusCode, 503);
+  assert.equal(headerOf(res, 'x-dormeto-state'), STATES.ASLEEP);
+  assert.equal(invocations.length, 0);
+  assert.equal(store.state.run.state, STATES.ASLEEP);
+  const [, fields] = entries.find(([e]) => e === 'WakeIgnored');
+  assert.equal(fields.reason, 'rule office');
+  assert.equal(fields.trigger.sourceIp, '198.51.100.20');
+  assert.equal(fields.trigger.path, '/orders');
+
+  await handler(albEvent({ headers: { 'x-forwarded-for': '192.0.2.1' } }));
+  assert.equal(store.state.run.state, STATES.WAKING);
+});
+
+test('router default rules apply to every workload, waiter probes included', async () => {
+  const defaultRules = [{ name: 'e2e', headers: [{ name: 'x-dormeto-e2e', value: 'no-wake' }] }];
+  const { handler, store, invocations, entries } = rulesSetup({ defaultRules });
+  await handler(albEvent({ headers: { 'x-dormeto-e2e': 'no-wake' } }));
+  await handler(albEvent({ headers: { 'x-dormeto-e2e': 'no-wake', 'x-dormeto-probe': '1', accept: '*/*' } }));
+  assert.equal(invocations.length, 0);
+  assert.equal(store.state.run.state, STATES.ASLEEP);
+  assert.equal(entries.filter(([e, f]) => e === 'WakeIgnored' && f.reason === 'rule e2e').length, 2);
+});
+
+test('built-in no-wake requests are logged with their reason; invalid rules are reported once', async () => {
+  const cfg = testConfig({ waitSeconds: 0, noWakeRules: [{ name: 'broken', pathPattern: '(' }] });
+  const { handler, entries, store } = rulesSetup({ cfg });
+  await handler(albEvent({ headers: { 'user-agent': 'Googlebot/2.1' } }));
+  await handler(albEvent({ method: 'HEAD' }));
+  assert.deepEqual(entries.filter(([e]) => e === 'WakeIgnored').map(([, f]) => f.reason), ['bot user agent', 'HEAD']);
+  assert.equal(entries.filter(([e]) => e === 'NoWakeRuleInvalid').length, 1);
+  await handler(albEvent());
+  assert.equal(store.state.run.state, STATES.WAKING, 'an invalid rule never blocks a wake');
 });

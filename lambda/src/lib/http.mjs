@@ -33,11 +33,23 @@ export function workloadIdFromEvent(event, prefix) {
   return name.slice(prefix.length);
 }
 
-export function classify(event) {
-  if (header(event, 'x-dormeto-probe') === '1') return 'probe';
-  if (event.httpMethod === 'HEAD' || BOT_PATTERN.test(header(event, 'user-agent') ?? '')) return 'no-wake';
-  if (SCANNER_PATH.test(event.path ?? '')) return 'no-wake';
-  return 'normal';
+// The address the ALB received the connection from: the last X-Forwarded-For entry, appended by the ALB. Earlier
+// entries come from the client and can be forged.
+export function clientIp(event) {
+  const entries = headerValues(event, 'x-forwarded-for').join(',').split(',').map((e) => e.trim()).filter(Boolean);
+  return entries.at(-1) ?? '';
+}
+
+// { kind: 'probe' | 'normal' } or { kind: 'no-wake', reason }. No-wake rules come first, so that a client they match
+// never wakes the workload through the waiter page's probe either.
+export function classify(event, rules = []) {
+  const rule = rules.find((r) => r.matches(event));
+  if (rule) return { kind: 'no-wake', reason: `rule ${rule.name}` };
+  if (header(event, 'x-dormeto-probe') === '1') return { kind: 'probe' };
+  if (event.httpMethod === 'HEAD') return { kind: 'no-wake', reason: 'HEAD' };
+  if (BOT_PATTERN.test(header(event, 'user-agent') ?? '')) return { kind: 'no-wake', reason: 'bot user agent' };
+  if (SCANNER_PATH.test(event.path ?? '')) return { kind: 'no-wake', reason: 'scanner path' };
+  return { kind: 'normal' };
 }
 
 export function requestTarget(event) {
@@ -74,12 +86,11 @@ export function response(statusCode, headers, body = '') {
 
 // Who triggered a wake: for the logs (scanners and bots are the usual unwanted wakers).
 export function requestOrigin(event, kind) {
-  const forwarded = header(event, 'x-forwarded-for') ?? '';
   return {
     kind,
     method: event.httpMethod,
     path: String(event.path ?? '').slice(0, 200),
     userAgent: String(header(event, 'user-agent') ?? '').slice(0, 200),
-    sourceIp: forwarded.split(',')[0].trim(),
+    sourceIp: clientIp(event),
   };
 }

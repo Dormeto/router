@@ -2,6 +2,7 @@ import { createDynamo } from './aws/dynamo.mjs';
 import { createLambda } from './aws/lambda.mjs';
 import { logger } from './lib/log.mjs';
 import { memoizeAsync } from './lib/memo.mjs';
+import { parseRules } from './lib/no-wake.mjs';
 import { createStore } from './lib/state.mjs';
 import { sleep } from './lib/time.mjs';
 import { createWaker } from './lib/waker-core.mjs';
@@ -42,4 +43,6 @@ export const handler = createWaker({
   sleep,
   log: logger,
   getAdmin,
+  // Router defaults for every workload (Terraform router module no_wake_rules).
+  defaultRules: parseRules(process.env.DMT_NO_WAKE_RULES, (error) => logger.error('NoWakeRulesUnreadable', { error })),
 });

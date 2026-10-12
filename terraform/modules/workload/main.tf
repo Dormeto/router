@@ -1,3 +1,15 @@
+locals {
+  # camelCase JSON for the Lambdas; unset conditions stay null or empty (ignored).
+  no_wake_rules = [for r in var.no_wake_rules : {
+    name             = r.name
+    sourceIps        = r.source_ips
+    pathPrefixes     = r.path_prefixes
+    pathPattern      = r.path_pattern
+    userAgentPattern = r.user_agent_pattern
+    headers          = [for h in r.headers : { name = h.name, value = h.value, pattern = h.pattern }]
+  }]
+}
+
 resource "aws_lb_target_group" "waker" {
   name                               = "${var.router.name}-${var.workload_id}"
   target_type                        = "lambda"
@@ -40,6 +52,7 @@ resource "aws_dynamodb_table_item" "config" {
       failedRetrySeconds      = var.failed_retry_seconds
       maxHolders              = var.max_holders
       pollSeconds             = var.poll_seconds
+      noWakeRules             = local.no_wake_rules
       admin = {
         enabled    = var.admin_enabled && var.admin_secret != null
         secretHash = var.admin_enabled && var.admin_secret != null ? sha256(var.admin_secret) : ""

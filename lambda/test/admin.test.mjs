@@ -10,7 +10,7 @@ const SECRET = 'Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4z';
 const BASE = `/_dormeto/${SECRET}`;
 const adminConfig = (enabled = true) => testConfig({ admin: { enabled, secretHash: hashSecret(SECRET) } });
 
-function setup({ run, cfg = adminConfig(), metric = [], timestamps = [] } = {}) {
+function setup({ run, cfg = adminConfig(), metric = [], timestamps = [], defaultRules } = {}) {
   const clock = fakeClock();
   const store = fakeStore({ config: cfg, run, clock });
   const ec2 = fakeEc2(cfg.instanceIds, { state: run.state === STATES.AWAKE ? 'running' : 'stopped' });
@@ -25,7 +25,7 @@ function setup({ run, cfg = adminConfig(), metric = [], timestamps = [] } = {}) 
   const admin = createAdmin({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, invokeController, now: clock.now, log: silentLog, version: { version: '0.3.0', build: 'abc123def456' } });
   const handler = createWaker({
     store, invokeController, prefix: 'dmt-dev-', now: clock.now, sleep: clock.sleep,
-    newId: () => 'wake-1', log: silentLog, getAdmin: async () => admin,
+    newId: () => 'wake-1', log: silentLog, getAdmin: async () => admin, defaultRules,
   });
   return { handler, store, clock, invocations, cloudwatch, ec2, elbv2, autoscaling, ecs };
 }
@@ -244,4 +244,22 @@ test('status.json lists a database companion with its status', async () => {
   assert.deepEqual(status.backends.at(-1), { kind: 'rds-instance', id: 'appdb', status: 'running', companion: true });
   const html = (await handler(albEvent({ path: `${BASE}/` }))).body;
   assert.match(html, /appdb \(database\): running/);
+});
+
+test('status.json and the dashboard list the router and workload no-wake rules', async () => {
+  const cfg = testConfig({
+    admin: { enabled: true, secretHash: hashSecret(SECRET) },
+    noWakeRules: [{ name: 'office', sourceIps: ['198.51.100.0/24'], pathPattern: null }, { name: 'broken', userAgentPattern: '(' }],
+  });
+  const defaultRules = [{ name: 'e2e', headers: [{ name: 'x-dormeto-e2e', value: 'no-wake' }] }];
+  const { handler } = setup({ run: { state: STATES.AWAKE }, cfg, defaultRules });
+  const status = JSON.parse((await handler(albEvent({ path: `${BASE}/status.json`, headers: { accept: 'application/json' } }))).body);
+  assert.deepEqual(status.noWakeRules.map((r) => [r.name, r.level]), [['e2e', 'router'], ['office', 'workload'], ['broken', 'workload']]);
+  assert.deepEqual(status.noWakeRules[1].conditions, { sourceIps: ['198.51.100.0/24'] });
+  assert.match(status.noWakeRules[2].invalid, /userAgentPattern/);
+  const page = (await handler(albEvent({ path: `${BASE}/` }))).body;
+  assert.match(page, /No-wake rules/);
+  assert.match(page, /e2e \(router\): header x-dormeto-e2e = no-wake/);
+  assert.match(page, /office \(workload\): source 198\.51\.100\.0\/24/);
+  assert.match(page, /broken \(workload\): invalid/);
 });

@@ -3,6 +3,7 @@ import { STATES } from './state.mjs';
 import { acceptsHtml, classify, redirectCount, requestOrigin, requestTarget, response, workloadIdFromEvent } from './http.mjs';
 import { renderJson, renderPage } from './page.mjs';
 import { ADMIN_PREFIX, parseAdminPath } from './admin.mjs';
+import { compileRules, describeRules } from './no-wake.mjs';
 
 const POLL_MS = 1000;
 const STUCK_GRACE_MS = 60_000;
@@ -10,9 +11,24 @@ const MAX_REDIRECTS = 2;
 // ALB rule changes take about 12 s to propagate: right after a wake, requests still reach the waker.
 const ROUTE_GRACE_MS = 15_000;
 
-export function createWaker({ store, invokeController, prefix, now = Date.now, sleep, newId = randomUUID, log, getAdmin }) {
+export function createWaker({ store, invokeController, prefix, now = Date.now, sleep, newId = randomUUID, log, getAdmin, defaultRules = [] }) {
   const inRouteGrace = (run) => run.state === STATES.AWAKE && (run.awakeSince ?? 0) > now() - ROUTE_GRACE_MS;
   const servable = (run) => run.state === STATES.AWAKE && !inRouteGrace(run);
+
+  // Compiled once per distinct rule list: an invalid rule is reported once, not on every request.
+  const compiled = new Map();
+  function rulesFor(level, rules) {
+    if (!rules?.length) return [];
+    const key = `${level}:${JSON.stringify(rules)}`;
+    if (!compiled.has(key)) {
+      compiled.set(key, compileRules(rules, {
+        level,
+        onInvalid: (rule, reason) => log.warn('NoWakeRuleInvalid', { level, rule: rule?.name, reason }),
+      }));
+    }
+    return compiled.get(key);
+  }
+  const noWakeRules = (cfg) => [...rulesFor('router', defaultRules), ...rulesFor('workload', cfg.noWakeRules)];
 
   async function startWake(workloadId, cond, run, trigger) {
     const wakeId = newId();
@@ -128,11 +144,13 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
       return handle({
         event, workloadId, cfg, run: initial, base: admin.base, route: admin.route,
         forceWake: (run) => forceWake(workloadId, run),
+        noWakeRules: describeRules([{ level: 'router', rules: defaultRules }, { level: 'workload', rules: cfg.noWakeRules }]),
       });
     }
-    const kind = classify(event);
+    const { kind, reason } = classify(event, noWakeRules(cfg));
     let run = initial;
     if (kind !== 'no-wake') run = await trigger(workloadId, cfg, run, kind, requestOrigin(event, kind));
+    else if (run.state !== STATES.AWAKE) log.info('WakeIgnored', { workloadId, reason, trigger: requestOrigin(event, kind) });
     if (kind === 'normal' && !servable(run) && run.state !== STATES.FAILED && cfg.waitSeconds > 0) {
       run = await hold(workloadId, cfg, run);
     }

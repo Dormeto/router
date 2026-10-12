@@ -141,3 +141,17 @@ test('a list stored in another format is not loaded until the controller rewrite
   assert.deepEqual(await cache.get(), []);
   assert.match((await cache.describe())[0].error, /format/);
 });
+
+test('the cache gives the router\'s own lists, then the catalog\'s (the manager\'s lists, R6b); either may be absent', async () => {
+  const clock = fakeClock();
+  const store = storeWith(clock, { ipsum: ['45.130.203.183/32'] });
+  const catalog = {
+    get: async () => [{ name: 'aws', action: 'ignore', has: (ip) => ip.startsWith('3.5.') }],
+    describe: async () => ({ url: 's3://b/catalog.json', error: null, lists: [{ name: 'aws', action: 'ignore', source: 'manager', entries: 1 }] }),
+  };
+  const cache = createListCache({ store, lists: [LISTS[0]], catalog, now: clock.now, log: silentLog });
+  assert.deepEqual((await cache.get()).map((l) => [l.name, l.has('3.5.1.1'), l.has('45.130.203.183')]), [['ipsum', false, true], ['aws', true, false]]);
+  assert.deepEqual((await cache.describe()).map((l) => [l.name, l.source]), [['ipsum', 'terraform'], ['aws', 'manager']]);
+  const onlyCatalog = createListCache({ store, lists: [], catalog, now: clock.now, log: silentLog });
+  assert.deepEqual((await onlyCatalog.get()).map((l) => l.name), ['aws']);
+});

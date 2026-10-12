@@ -8,6 +8,8 @@ locals {
   manager_bus = var.manager_event_bus_arn == null ? "arn:${data.aws_partition.current.partition}:events:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:event-bus/none" : var.manager_event_bus_arn
   # s3://bucket/key of the IP lists stored in S3, as object ARNs.
   s3_list_objects = [for l in var.ip_lists : "${local.arn_prefix}:s3:::${trimprefix(l.url, "s3://")}" if startswith(l.url, "s3://")]
+  # The manager's IP lists (R6b): every object under its catalog's prefix (catalog, manifests, data).
+  catalog_objects = var.ip_lists_catalog == null ? [] : ["${local.arn_prefix}:s3:::${replace(trimprefix(var.ip_lists_catalog, "s3://"), "/[^/]+$/", "")}*"]
   region          = data.aws_region.current.region
   account_id      = data.aws_caller_identity.current.account_id
 }
@@ -53,6 +55,15 @@ data "aws_iam_policy_document" "waker" {
     # Wake starts to the manager (scale design §3).
     actions   = ["events:PutEvents"]
     resources = [local.manager_bus]
+  }
+  dynamic "statement" {
+    # The manager's lists: its catalog, manifests and data (R6b).
+    for_each = length(local.catalog_objects) > 0 ? [1] : []
+    content {
+      sid       = "ManagerLists"
+      actions   = ["s3:GetObject"]
+      resources = local.catalog_objects
+    }
   }
 }
 
@@ -177,6 +188,15 @@ data "aws_iam_policy_document" "controller" {
       sid       = "IpListObjects"
       actions   = ["s3:GetObject"]
       resources = local.s3_list_objects
+    }
+  }
+  dynamic "statement" {
+    # The manager's lists: its catalog and manifests, described for the health (R6b).
+    for_each = length(local.catalog_objects) > 0 ? [1] : []
+    content {
+      sid       = "ManagerLists"
+      actions   = ["s3:GetObject"]
+      resources = local.catalog_objects
     }
   }
 }

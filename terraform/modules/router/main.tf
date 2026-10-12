@@ -70,13 +70,15 @@ resource "aws_lambda_function" "controller" {
 
   environment {
     variables = {
-      DMT_TABLE          = aws_dynamodb_table.router.name
-      DMT_VERSION        = var.router_version
-      DMT_BUILD          = local.build
-      DMT_IP_LISTS       = local.ip_lists
-      DMT_TG_PREFIX      = "${var.name}-"
-      DMT_NO_WAKE_RULES  = jsonencode(local.no_wake_rules)
-      DMT_CHECK_SCHEDULE = var.check_schedule
+      DMT_TABLE    = aws_dynamodb_table.router.name
+      DMT_VERSION  = var.router_version
+      DMT_BUILD    = local.build
+      DMT_IP_LISTS = local.ip_lists
+      # The manager's lists (R6b): empty, none.
+      DMT_IP_LISTS_CATALOG = var.ip_lists_catalog == null ? "" : var.ip_lists_catalog
+      DMT_TG_PREFIX        = "${var.name}-"
+      DMT_NO_WAKE_RULES    = jsonencode(local.no_wake_rules)
+      DMT_CHECK_SCHEDULE   = var.check_schedule
       # Router health and configuration (manager Routers view): the waker's metrics, the failure queues.
       DMT_METRICS        = tostring(var.metrics_enabled)
       DMT_WAKER_FUNCTION = "${var.name}-waker"
@@ -161,9 +163,10 @@ resource "aws_lambda_function" "waker" {
       DMT_MANAGER_BUS = var.manager_event_bus_arn == null ? "" : var.manager_event_bus_arn
       DMT_BUILD       = local.build
       # Router default no-wake rules, for every workload.
-      DMT_NO_WAKE_RULES = jsonencode(local.no_wake_rules)
-      DMT_METRICS       = tostring(var.metrics_enabled)
-      DMT_IP_LISTS      = local.ip_lists
+      DMT_NO_WAKE_RULES    = jsonencode(local.no_wake_rules)
+      DMT_METRICS          = tostring(var.metrics_enabled)
+      DMT_IP_LISTS         = local.ip_lists
+      DMT_IP_LISTS_CATALOG = var.ip_lists_catalog == null ? "" : var.ip_lists_catalog
     }
   }
 

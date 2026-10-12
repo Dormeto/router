@@ -14,6 +14,8 @@ export const PLACEHOLDERS = {
   managerBus: '${managerBus}',
   // The command role's name (without its path): the forwarder ignores the manager's own calls (packaging design §5).
   commandRole: '${commandRole}',
+  // The manager's IP lists (R6b): its catalog's s3:// URL, and the bucket the controller and the waker may read.
+  ipListsCatalog: '${ipListsCatalog}', ipListsBucket: '${ipListsBucket}',
 };
 
 // Installed routers are named dmtr-<env> and their roles live under this path: DmtCommandRole and DmtRouterBoundary are
@@ -40,6 +42,7 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
   const tags = { 'dormeto:router': p.name };
   const roleName = (role) => `${p.name}-${p.region}-${role}`;
   const roleArn = (role) => `arn:${p.partition}:iam::${p.account}:role${ROLE_PATH}${roleName(role)}`;
+  const listObjects = `arn:${p.partition}:s3:::${p.ipListsBucket}/*`;
 
   const policies = {
     controller: policy(
@@ -60,12 +63,16 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
       allow(['sqs:GetQueueAttributes'], [queueArn('controller-failures'), queueArn('check-failures')]),
       allow(['events:PutEvents'], [p.managerBus]),
       allow(['logs:CreateLogStream', 'logs:PutLogEvents'], [logArn('controller')]),
+      // The manager's lists: its catalog and manifests (the controller describes them).
+      allow(['s3:GetObject'], [listObjects]),
     ),
     waker: policy(
       allow(['dynamodb:GetItem', 'dynamodb:UpdateItem', 'dynamodb:Query'], [tableArn]),
       allow(['lambda:InvokeFunction'], [functionArn('controller')]),
       allow(['events:PutEvents'], [p.managerBus]),
       allow(['logs:CreateLogStream', 'logs:PutLogEvents'], [logArn('waker')]),
+      // The manager's lists: its catalog, manifests and data (the waker loads them).
+      allow(['s3:GetObject'], [listObjects]),
     ),
     scheduler: policy(
       allow(['lambda:InvokeFunction'], [functionArn('controller')]),
@@ -124,7 +131,7 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
       {
         key: 'controller', name: fn('controller'), role: roleName('controller'), handler: 'controller.handler', timeout: 900, memory: 256,
         environment: {
-          ...common, DMT_IP_LISTS: p.ipLists, DMT_NO_WAKE_RULES: p.noWakeRules, DMT_CHECK_SCHEDULE: p.checkSchedule, DMT_METRICS: p.metrics,
+          ...common, DMT_IP_LISTS: p.ipLists, DMT_IP_LISTS_CATALOG: p.ipListsCatalog, DMT_NO_WAKE_RULES: p.noWakeRules, DMT_CHECK_SCHEDULE: p.checkSchedule, DMT_METRICS: p.metrics,
           DMT_WAKER_FUNCTION: fn('waker'), DMT_FAILURE_QUEUES: `{"check":"${queueUrl('check-failures')}","controller":"${queueUrl('controller-failures')}"}`,
           DMT_ONBOARDER: fn('onboarder'), DMT_MANAGER_BUS: p.managerBus, DMT_WORK_QUEUE: queueUrl('work'), DMT_DRIFT_QUEUE: queueUrl('drift'),
         },
@@ -133,7 +140,7 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
       },
       {
         key: 'waker', name: fn('waker'), role: roleName('waker'), handler: 'waker.handler', timeout: wakerTimeoutSeconds, memory: wakerMemoryMb,
-        environment: { ...common, DMT_CONTROLLER: fn('controller'), DMT_NO_WAKE_RULES: p.noWakeRules, DMT_METRICS: p.metrics, DMT_IP_LISTS: p.ipLists, DMT_MANAGER_BUS: p.managerBus },
+        environment: { ...common, DMT_CONTROLLER: fn('controller'), DMT_NO_WAKE_RULES: p.noWakeRules, DMT_METRICS: p.metrics, DMT_IP_LISTS: p.ipLists, DMT_IP_LISTS_CATALOG: p.ipListsCatalog, DMT_MANAGER_BUS: p.managerBus },
       },
       {
         key: 'onboarder', name: fn('onboarder'), role: roleName('onboarder'), handler: 'onboarder.handler', timeout: 300, memory: 256,

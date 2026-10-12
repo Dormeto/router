@@ -106,6 +106,16 @@ variable "ip_lists" {
   }
 }
 
+variable "ip_lists_catalog" {
+  description = "The manager's IP lists (output ip_lists_catalog of the manager): s3://<bucket>/catalog.json. The waker reads the catalog, manifests and data every 5 minutes (only what changed), the controller describes them; a list of ip_lists with the same name wins. Null: only ip_lists."
+  type        = string
+  default     = null
+  validation {
+    condition     = var.ip_lists_catalog == null || can(regex("^s3://[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]/(.+/)?catalog\\.json$", var.ip_lists_catalog))
+    error_message = "ip_lists_catalog must be s3://<bucket>/catalog.json (the manager's output)."
+  }
+}
+
 variable "manager_event_bus_arn" {
   description = "Event bus of the manager (output event_bus_arn of the manager platform): the router sends its state after each idle check and each state change to it. Null: nothing sent, the manager calls the router instead."
   type        = string

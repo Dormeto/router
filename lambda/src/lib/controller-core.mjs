@@ -49,6 +49,8 @@ const REASON_MAX = 256;
 export function createController({
   store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, invokeSelf, now = Date.now, sleep, newId = randomUUID, log,
   lists = null, router = {}, defaultRules = [], ipLists = [], sqs = null, lambda = null, invokeOnboarder = null,
+  // The manager's lists (R6b, lib/catalog.mjs): described from its catalog and manifests, never downloaded here.
+  catalog = null,
   // The router's work queue (scale design §6): naps and the wakes of a router pause, run at most 10 at a time.
   queueWork = null,
   // The drift queue: the check's repair requests, read with the drift events by the onboarder (2 at a time).
@@ -405,7 +407,7 @@ export function createController({
       noWakeRules: describeRules([{ level: 'router', rules: defaultRules }, { level: 'workload', rules: cfg.noWakeRules }]),
       wakeRules: describeRules([{ level: 'wake', rules: cfg.wakeRules }]),
       loadStats: () => store.getStats(workloadId, STATS_DAYS),
-      loadLists: () => describeStoredLists(store, ipLists),
+      loadLists: async () => [...await describeStoredLists(store, ipLists), ...(catalog ? (await catalog.describe()).lists : [])],
     });
   }
 
@@ -775,10 +777,15 @@ export function createController({
     const routerPaused = pauses.some((p) => p.workloadId === null);
     const updated = runs.map((run) => run?.updatedAt ?? 0).filter((ms) => ms > 0);
     const check = await store.getCheck().catch(() => null);
-    const lists = (await describeStoredLists(store, ipLists)).map((l) => ({ ...l, refreshHours: ipLists.find((c) => c.name === l.name)?.refreshHours }));
+    const own = (await describeStoredLists(store, ipLists)).map((l) => ({ ...l, source: TERRAFORM, refreshHours: ipLists.find((c) => c.name === l.name)?.refreshHours }));
+    const managed = catalog ? await catalog.describe() : null;
+    const lists = [...own, ...(managed?.lists ?? [])];
     const health = healthOf({
       checkSchedule: router.checkSchedule, lastScheduledCheckAt: check?.lastScheduledCheckAt ?? null, now: t,
-      lambda: measured.lambda, queues: measured.queues, ipLists: lists, failed: byState[STATES.FAILED] ?? 0, concurrency,
+      lambda: measured.lambda, queues: measured.queues, failed: byState[STATES.FAILED] ?? 0, concurrency,
+      // The manager's lists warn only when the router cannot read them: their freshness is the manager's alarm, once.
+      ipLists: [...own, ...(managed?.lists ?? []).filter((l) => l.error && !l.pending).map(({ name, error }) => ({ name, error }))],
+      catalogError: managed?.error ?? null,
     });
     if (pausesError) {
       health.problems.push({ level: 'warning', code: 'pauses-unreadable', text: `pauses unreadable: ${pausesError}` });
@@ -798,6 +805,7 @@ export function createController({
       configuration: {
         checkSchedule: { value: router.checkSchedule ?? null, source: TERRAFORM },
         ipLists: { value: ipLists.map(({ name, url, action, refreshHours }) => ({ name, url, action, refreshHours })), source: TERRAFORM },
+        ...(managed ? { ipListsCatalog: { value: { url: managed.url, lists: managed.lists.map(({ name, action, refreshHours }) => ({ name, action, refreshHours })) }, source: 'manager' } } : {}),
         noWakeRules: { value: describeRules([{ level: 'router', rules: defaultRules }]), source: TERRAFORM },
         metrics: { value: router.metrics ?? null, source: TERRAFORM },
       },

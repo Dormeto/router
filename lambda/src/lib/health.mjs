@@ -56,7 +56,7 @@ const QUEUES = {
 
 // { status: ok | warning | error, problems: [{ level, code, text }] }: only a late idle check is an error (no nap
 // happens). The code is stable whatever the figures in the text: the manager's alarms open and resolve on it.
-export function healthOf({ checkSchedule, lastScheduledCheckAt, now, lambda = {}, queues = {}, ipLists = [], failed = 0, concurrency = null }) {
+export function healthOf({ checkSchedule, lastScheduledCheckAt, now, lambda = {}, queues = {}, ipLists = [], catalogError = null, failed = 0, concurrency = null }) {
   const problems = [];
   const warn = (code, text) => problems.push({ level: 'warning', code, text });
   if (checkLate(checkSchedule, lastScheduledCheckAt, now)) {
@@ -80,6 +80,7 @@ export function healthOf({ checkSchedule, lastScheduledCheckAt, now, lambda = {}
     if (list.error) warn(`ip-list:${list.name}`, `IP list ${list.name}: ${list.error}`);
     else if (list.fetchedAt && now - Date.parse(list.fetchedAt) > 2 * (list.refreshHours ?? 24) * HOUR_MS) warn(`ip-list:${list.name}`, `IP list ${list.name}: last downloaded ${ago(now - Date.parse(list.fetchedAt))}`);
   }
+  if (catalogError) warn('ip-lists-catalog', `IP lists catalog of the manager: ${catalogError}`);
   if (failed > 0) warn('failed-workloads', `${count(failed, 'failed workload')}`);
   // A region the account barely uses can be limited to 10 concurrent executions: held requests beyond it get errors. The
   // limit is shared by every function of the account: a warning once the router can need more than 80% of it.

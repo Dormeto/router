@@ -17,12 +17,14 @@ const VALUES = {
   checkSchedule: 'rate(5 minutes)', ipLists: '[]', noWakeRules: '[]', metrics: 'false',
   managerBus: 'arn:aws:events:eu-west-1:121014831971:event-bus/dmt-dev-manager',
   commandRole: 'DmtCommandRole',
+  ipListsCatalog: 's3://dmt-dev-manager-ip-lists-121014831971/catalog.json', ipListsBucket: 'dmt-dev-manager-ip-lists-121014831971',
 };
 
-// Actions of each aws_iam_policy_document of the module, without its optional (dynamic) statements.
+// Actions of each aws_iam_policy_document of the module, without its optional (dynamic) statements; those apart.
 async function terraformActions() {
   const text = await readFile(IAM_TF, 'utf8');
   const out = {};
+  out.optional = {};
   for (const match of text.matchAll(/data "aws_iam_policy_document" "(\w+)" \{/g)) {
     let depth = 0;
     let end = match.index + match[0].length - 1;
@@ -40,6 +42,7 @@ async function terraformActions() {
         if (body[e] === '}') d -= 1;
         e += 1;
       } while (d > 0);
+      out.optional[match[1]] = [...(out.optional[match[1]] ?? []), ...[...body.slice(at, e).matchAll(/actions\s*=\s*\[([^\]]*)\]/g)].flatMap((m) => [...m[1].matchAll(/"([^"]+)"/g)].map((a) => a[1]))];
       body = body.slice(0, at) + body.slice(e);
     }
     out[match[1]] = [...body.matchAll(/actions\s*=\s*\[([^\]]*)\]/g)].flatMap((m) => [...m[1].matchAll(/"([^"]+)"/g)].map((a) => a[1])).sort();
@@ -78,10 +81,30 @@ test('the published blueprint has placeholders only, and filling them leaves non
   assert.ok(!JSON.stringify(fill(JSON.parse(text), VALUES)).includes('${'));
 });
 
-test('each router role has exactly the IAM actions of the Terraform module (optional statements aside)', async () => {
+test('each router role has exactly the IAM actions of the Terraform module (its optional statements may be in or out)', async () => {
   const terraform = await terraformActions();
   const b = blueprint({ version: '0.18.0' });
-  for (const role of b.roles) assert.deepEqual(actionsOf(role.policy), terraform[role.key], role.key);
+  for (const role of b.roles) {
+    const optional = terraform.optional[role.key] ?? [];
+    assert.deepEqual([...new Set(actionsOf(role.policy))].filter((a) => !terraform[role.key].includes(a) && !optional.includes(a)), [], `${role.key}: actions the module never grants`);
+    assert.deepEqual(terraform[role.key].filter((a) => !actionsOf(role.policy).includes(a)), [], `${role.key}: actions the blueprint lacks`);
+  }
+});
+
+test('installed routers read the manager\'s lists (R6b): the controller and the waker get its catalog, and may read its bucket\'s objects only', async () => {
+  const b = fill(blueprint({ version: '0.24.0' }), VALUES);
+  for (const key of ['controller', 'waker']) {
+    assert.equal(b.functions.find((f) => f.key === key).environment.DMT_IP_LISTS_CATALOG, 's3://dmt-dev-manager-ip-lists-121014831971/catalog.json', key);
+    const statement = b.roles.find((r) => r.key === key).policy.Statement.find((s) => [].concat(s.Action).includes('s3:GetObject'));
+    assert.deepEqual(statement?.Resource, ['arn:aws:s3:::dmt-dev-manager-ip-lists-121014831971/*'], key);
+  }
+  // The module: the same, from its ip_lists_catalog (optional).
+  const iam = await readFile(IAM_TF, 'utf8');
+  assert.equal((iam.match(/sid\s*=\s*"ManagerLists"/g) ?? []).length, 2, 'a ManagerLists statement for the controller and the waker');
+  const main = await readFile(new URL('../../terraform/modules/router/main.tf', import.meta.url), 'utf8');
+  assert.equal((main.match(/DMT_IP_LISTS_CATALOG\s*=/g) ?? []).length, 2);
+  const variables = await readFile(new URL('../../terraform/modules/router/variables.tf', import.meta.url), 'utf8');
+  assert.match(variables, /variable "ip_lists_catalog"/);
 });
 
 test('every action of every router role is allowed by the permissions boundary', () => {

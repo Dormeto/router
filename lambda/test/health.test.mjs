@@ -129,7 +129,7 @@ test('healthOf: metrics or queues that cannot be read are warnings', () => {
 
 // --- Controller action -----------------------------------------------------------------------------------------------
 
-function setup({ run = { state: STATES.AWAKE, updatedAt: NOW - HOUR }, metrics = {}, depths = {}, concurrency = 1000 } = {}) {
+function setup({ run = { state: STATES.AWAKE, updatedAt: NOW - HOUR }, metrics = {}, depths = {}, concurrency = 1000, catalog = null } = {}) {
   const clock = fakeClock(NOW);
   const cfg = testConfig();
   const store = fakeStore({ config: cfg, run, clock });
@@ -146,6 +146,7 @@ function setup({ run = { state: STATES.AWAKE, updatedAt: NOW - HOUR }, metrics =
     },
     defaultRules: [{ name: 'e2e', headers: [{ name: 'x-e2e', value: '1' }] }],
     ipLists: [{ name: 'ipsum', url: 'https://x', action: 'defer', refreshHours: 24 }],
+    catalog,
   });
   return { handler, store, clock, cloudwatch, sqs };
 }
@@ -227,4 +228,31 @@ test('router action answers when CloudWatch, SQS and the table fail', async () =
   assert.ok(info.health.problems.some((p) => p.text === 'Lambda metrics unreadable: AccessDenied'));
   assert.ok(info.health.problems.some((p) => p.text === 'failure queues unreadable: throttled'));
   assert.ok(info.health.problems.some((p) => p.code === 'pauses-unreadable' && p.text === 'pauses unreadable: table'));
+});
+
+test('router action: the manager\'s lists (R6b) in the configuration and the health; only what the router cannot read warns', async () => {
+  const catalog = {
+    url: 's3://dmt-dev-manager-ip-lists-1/catalog.json',
+    describe: async () => ({
+      url: 's3://dmt-dev-manager-ip-lists-1/catalog.json', error: 'S3 AccessDenied',
+      lists: [
+        { name: 'aws', action: 'ignore', source: 'manager', refreshHours: 24, entries: 9, version: 'v1', fetchedAt: new Date(NOW - 100 * HOUR).toISOString() },
+        { name: 'gcp', action: 'defer', source: 'manager', refreshHours: 24, entries: 0, pending: true, error: 'not published by the manager yet' },
+        { name: 'do', action: 'defer', source: 'manager', refreshHours: 24, entries: 0, error: 'S3 AccessDenied' },
+      ],
+    }),
+  };
+  const s = setup({ catalog });
+  await s.store.recordScheduledCheck(NOW - 60_000);
+  const info = await s.handler({ action: 'router' });
+  assert.deepEqual(info.configuration.ipListsCatalog, {
+    value: { url: 's3://dmt-dev-manager-ip-lists-1/catalog.json', lists: [{ name: 'aws', action: 'ignore', refreshHours: 24 }, { name: 'gcp', action: 'defer', refreshHours: 24 }, { name: 'do', action: 'defer', refreshHours: 24 }] },
+    source: 'manager',
+  });
+  assert.deepEqual(info.health.ipLists.map((l) => [l.name, l.source]), [['ipsum', 'terraform'], ['aws', 'manager'], ['gcp', 'manager'], ['do', 'manager']]);
+  assert.deepEqual(info.health.problems.filter((p) => p.code.startsWith('ip-list')).map((p) => [p.code, p.text]), [
+    ['ip-list:ipsum', 'IP list ipsum: not downloaded yet'],
+    ['ip-list:do', 'IP list do: S3 AccessDenied'],
+    ['ip-lists-catalog', 'IP lists catalog of the manager: S3 AccessDenied'],
+  ]);
 });

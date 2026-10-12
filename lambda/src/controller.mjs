@@ -11,6 +11,7 @@ import { createSqs } from './aws/sqs.mjs';
 import { createElbv2 } from './aws/elbv2.mjs';
 import { createEvents } from './aws/events.mjs';
 import { createTagging } from './aws/tagging.mjs';
+import { createCatalog } from './lib/catalog.mjs';
 import { createController } from './lib/controller-core.mjs';
 import { createPublisher, withTransitionEvents } from './lib/events.mjs';
 import { createListRefresher, downloadText, parseS3Url } from './lib/list-refresh.mjs';
@@ -31,7 +32,11 @@ const store = withTransitionEvents(createStore({ dynamo: createDynamo(), table: 
 // IP reputation lists of the router (Terraform ip_lists).
 const lists = parseLists(process.env.DMT_IP_LISTS, (error) => logger.error('IpListsUnreadable', { error }));
 // Lists given as s3:// URIs are read with the S3 API (controller role: s3:GetObject on their objects).
-const s3 = lists.some((l) => parseS3Url(l.url)) ? createS3() : null;
+const s3 = lists.some((l) => parseS3Url(l.url)) || process.env.DMT_IP_LISTS_CATALOG ? createS3() : null;
+// The manager's lists (R6b): described from its catalog and manifests (the waker loads their data).
+const catalog = process.env.DMT_IP_LISTS_CATALOG
+  ? createCatalog({ s3, url: process.env.DMT_IP_LISTS_CATALOG, own: lists.map((l) => l.name), log: logger })
+  : null;
 const download = (url) => downloadText(url, { getObject: s3?.getObject });
 // Failure queues of the router (router health): { check, controller } queue URLs.
 const queues = JSON.parse(process.env.DMT_FAILURE_QUEUES || '{}');
@@ -72,4 +77,5 @@ export const handler = createController({
   },
   defaultRules: parseRules(process.env.DMT_NO_WAKE_RULES, (error) => logger.error('NoWakeRulesUnreadable', { error })),
   ipLists: lists,
+  catalog,
 });

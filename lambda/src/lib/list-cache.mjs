@@ -27,7 +27,8 @@ export function parseLists(text, onError = () => {}) {
   return lists;
 }
 
-export function createListCache({ store, lists, now = Date.now, log, checkMs = CHECK_MS }) {
+// catalog: the manager's lists (lib/catalog.mjs), after the router's own.
+export function createListCache({ store, lists, catalog = null, now = Date.now, log, checkMs = CHECK_MS }) {
   const loaded = new Map();
 
   async function load(list) {
@@ -67,20 +68,23 @@ export function createListCache({ store, lists, now = Date.now, log, checkMs = C
   return {
     // Loaded lists only: [{ name, action, has(ip) }].
     async get() {
-      return (await loadAll()).filter(({ entry }) => entry.set)
+      const own = (await loadAll()).filter(({ entry }) => entry.set)
         .map(({ list, entry }) => ({ name: list.name, action: list.action, has: (ip) => entry.set.has(ip) }));
+      return catalog ? [...own, ...await catalog.get()] : own;
     },
     // For the dashboard: [{ name, action, entries, fetchedAt, dropped, error }].
     async describe() {
-      return (await loadAll()).map(({ list, entry }) => ({
+      const own = (await loadAll()).map(({ list, entry }) => ({
         name: list.name,
         action: list.action,
+        source: 'terraform',
         url: list.url,
         entries: entry.set ? entry.meta?.entries ?? 0 : 0,
         dropped: entry.meta?.dropped ?? 0,
         fetchedAt: entry.meta?.fetchedAt ? new Date(entry.meta.fetchedAt).toISOString() : null,
         error: entry.error ?? entry.meta?.error ?? (entry.set ? undefined : 'not downloaded yet'),
       }));
+      return catalog ? [...own, ...(await catalog.describe()).lists] : own;
     },
   };
 }

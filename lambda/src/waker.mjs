@@ -1,4 +1,6 @@
 import { createDynamo } from './aws/dynamo.mjs';
+import { createS3 } from './aws/s3.mjs';
+import { createCatalog } from './lib/catalog.mjs';
 import { createEvents } from './aws/events.mjs';
 import { createLambda } from './aws/lambda.mjs';
 import { createPublisher, withTransitionEvents } from './lib/events.mjs';
@@ -51,6 +53,10 @@ const publisher = createPublisher({
 const store = withTransitionEvents(createStore({ dynamo: createDynamo(), table: process.env.DMT_TABLE }), publisher, { log: logger });
 // IP reputation lists of the router (Terraform ip_lists), downloaded by the controller.
 const lists = parseLists(process.env.DMT_IP_LISTS, (error) => logger.error('IpListsUnreadable', { error }));
+// The manager's lists (R6b): its catalog, manifests and data, read from its bucket; the router's own lists win on a name.
+const catalog = process.env.DMT_IP_LISTS_CATALOG
+  ? createCatalog({ s3: createS3(), url: process.env.DMT_IP_LISTS_CATALOG, own: lists.map((l) => l.name), log: logger })
+  : null;
 
 export const handler = createWaker({
   store,
@@ -61,5 +67,5 @@ export const handler = createWaker({
   getAdmin,
   // Router defaults for every workload (Terraform router module no_wake_rules).
   defaultRules: parseRules(process.env.DMT_NO_WAKE_RULES, (error) => logger.error('NoWakeRulesUnreadable', { error })),
-  listCache: lists.length ? createListCache({ store, lists, log: logger }) : null,
+  listCache: lists.length || catalog ? createListCache({ store, lists, catalog, log: logger }) : null,
 });

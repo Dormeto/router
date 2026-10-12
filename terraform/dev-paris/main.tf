@@ -44,7 +44,7 @@ resource "aws_subnet" "public" {
   vpc_id                  = aws_vpc.main.id
   cidr_block              = cidrsubnet(aws_vpc.main.cidr_block, 8, count.index)
   availability_zone       = data.aws_availability_zones.available.names[count.index]
-  map_public_ip_on_launch = true
+  map_public_ip_on_launch = false
   tags                    = { Name = "${local.name}-public-${count.index}" }
 }
 
@@ -104,10 +104,13 @@ resource "aws_vpc_security_group_egress_rule" "app" {
 }
 
 resource "aws_instance" "app" {
-  ami                         = data.aws_ssm_parameter.al2023_arm64.insecure_value
-  instance_type               = "t4g.nano"
-  subnet_id                   = aws_subnet.public[0].id
-  vpc_security_group_ids      = [aws_security_group.app.id]
+  ami                    = data.aws_ssm_parameter.al2023_arm64.insecure_value
+  instance_type          = "t4g.nano"
+  subnet_id              = aws_subnet.public[0].id
+  vpc_security_group_ids = [aws_security_group.app.id]
+  # No public IPv4 (billed hourly while running): the ALB reaches it in the VPC, and it needs no internet (its web server
+  # comes with the image, it only reads the instance metadata).
+  associate_public_ip_address = false
   user_data                   = file("${path.module}/../dev/user-data.sh")
   user_data_replace_on_change = true
 

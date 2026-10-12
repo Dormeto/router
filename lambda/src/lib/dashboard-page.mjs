@@ -26,6 +26,21 @@ const ruleText = (rule) => {
   return `${rule.name} (${rule.level}): ${rule.invalid ? `invalid, ${rule.invalid}` : parts.join(', ')}`;
 };
 
+// "HEAD 2 · 7, bot user agent 0 · 3": today · last days, for every key seen in the period.
+const pairs = (today = {}, total = {}) => Object.keys(total).sort((a, b) => total[b] - total[a])
+  .map((k) => `${k} ${today[k] ?? 0} · ${total[k]}`).join(', ') || 'none';
+
+function statsRows(stats) {
+  if (!stats) return '';
+  if (stats.error) return row('Statistics', `unavailable: ${stats.error}`);
+  const period = `(today · ${stats.days} days)`;
+  return [
+    row(`Ignored requests ${period}`, pairs(stats.today.ignored, stats.total.ignored)),
+    row(`Deferred requests ${period}`, `${stats.today.deferred} · ${stats.total.deferred}`),
+    row(`Wakes by trigger ${period}`, pairs(stats.today.wakes, stats.total.wakes)),
+  ].join('\n');
+}
+
 const row = (label, value) => `<tr><th scope="row">${escapeHtml(label)}</th><td>${escapeHtml(value ?? '—')}</td></tr>`;
 
 function napText(nap) {
@@ -82,6 +97,7 @@ ${row('Route', status.route)}
 ${row(`Backends (${status.discovery ?? 'static'})`, (status.backends ?? []).map(backendText).join(', ') || '—')}
 ${status.ignoredTargets?.length ? row('Ignored targets', status.ignoredTargets.map((t) => `${t.id}: ${t.reason}`).join(', ')) : ''}
 ${row('Target health', list(status.targets))}
+${statsRows(status.stats)}
 ${row('Wake mode', status.wakeMode === 'browser'
     ? `browser: the waiter page probe, the x-dormeto-wake header or a wake rule wakes${(status.wakeRules ?? []).length ? ` (${status.wakeRules.map(ruleText).join('; ')})` : ''}`
     : 'any: every request that passes the filters wakes')}

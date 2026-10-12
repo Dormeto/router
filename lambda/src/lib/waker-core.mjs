@@ -10,6 +10,8 @@ const STUCK_GRACE_MS = 60_000;
 const MAX_REDIRECTS = 2;
 // ALB rule changes take about 12 s to propagate: right after a wake, requests still reach the waker.
 const ROUTE_GRACE_MS = 15_000;
+// Days of statistics on the admin dashboard.
+const STATS_DAYS = 7;
 
 export function createWaker({ store, invokeController, prefix, now = Date.now, sleep, newId = randomUUID, log, getAdmin, defaultRules = [] }) {
   const inRouteGrace = (run) => run.state === STATES.AWAKE && (run.awakeSince ?? 0) > now() - ROUTE_GRACE_MS;
@@ -30,6 +32,15 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
   }
   const noWakeRules = (cfg) => [...rulesFor('router', defaultRules), ...rulesFor('workload', cfg.noWakeRules)];
 
+  // Daily statistics: a failed counter update never changes the answer.
+  async function count(workloadId, counter) {
+    try {
+      await store.count(workloadId, counter);
+    } catch (err) {
+      log.warn('StatsWriteFailed', { workloadId, counter, error: err.message });
+    }
+  }
+
   async function startWake(workloadId, cond, run, trigger) {
     const wakeId = newId();
     const next = await store.transition(workloadId, {
@@ -40,10 +51,13 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
     });
     if (!next) return (await store.getRun(workloadId)) ?? run;
     log.info('WakeRequested', { workloadId, wakeId, trigger });
+    const counted = count(workloadId, `wake:${trigger.kind}`);
     try {
       await invokeController({ action: 'wake', workloadId, wakeId });
+      await counted;
       return next;
     } catch (err) {
+      await counted;
       log.error('WakeInvokeFailed', { workloadId, wakeId, error: err.message });
       return (await store.transition(workloadId, {
         cond: { state: STATES.WAKING, wakeId },
@@ -65,7 +79,10 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
         log.warn('WakeStuck', { workloadId, wakeId: run.wakeId });
         return startWake(workloadId, { state: STATES.WAKING, wakeId: run.wakeId }, run, origin);
       case STATES.NAPPING:
-        if (await store.setPendingWake(workloadId)) log.info('PendingWake', { workloadId, trigger: origin });
+        if (await store.setPendingWake(workloadId)) {
+          log.info('PendingWake', { workloadId, trigger: origin });
+          await count(workloadId, `wake:${origin.kind}`);
+        }
         return run;
       case STATES.AWAKE:
         // Reaching the waker while awake is expected during the route grace window; later it means drift.
@@ -83,7 +100,7 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
       case STATES.FAILED:
         return startWake(workloadId, { state: run.state }, run, { kind: 'admin' });
       case STATES.NAPPING:
-        await store.setPendingWake(workloadId);
+        if (await store.setPendingWake(workloadId)) await count(workloadId, 'wake:admin');
         return run;
       default:
         return run;
@@ -150,6 +167,7 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
         forceWake: (run) => forceWake(workloadId, run),
         noWakeRules: describeRules([{ level: 'router', rules: defaultRules }, { level: 'workload', rules: cfg.noWakeRules }]),
         wakeRules: describeRules([{ level: 'wake', rules: cfg.wakeRules }]),
+        loadStats: () => store.getStats(workloadId, STATS_DAYS),
       });
     }
     const { kind, reason, trigger: by, deferred } = classify(event, noWakeRules(cfg), {
@@ -159,12 +177,16 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
     let run = initial;
     const origin = () => requestOrigin(event, by ?? kind);
     if (kind === 'no-wake') {
-      if (run.state !== STATES.AWAKE) log.info('WakeIgnored', { workloadId, reason, trigger: origin() });
+      if (run.state !== STATES.AWAKE) {
+        log.info('WakeIgnored', { workloadId, reason, trigger: origin() });
+        await count(workloadId, `ignored:${reason}`);
+      }
     } else if (!deferred || run.state === STATES.AWAKE) {
       // Awake: drift repair as in any mode. A deferred request (browser mode) waits for the waiter page's probe.
       run = await trigger(workloadId, cfg, run, kind, origin());
     } else if ([STATES.ASLEEP, STATES.FAILED].includes(run.state)) {
       log.info('WakeDeferred', { workloadId, trigger: origin() });
+      await count(workloadId, 'deferred');
     }
     // A deferred request is held only behind a wake already in progress.
     const holdable = !deferred || run.state === STATES.WAKING;

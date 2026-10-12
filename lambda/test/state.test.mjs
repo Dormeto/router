@@ -49,7 +49,7 @@ test('buildTransition builds a conditional update with version increment', () =>
 function fakeDynamo(handlers) {
   const calls = [];
   const wrap = (name) => async (input) => { calls.push([name, input]); return handlers[name](input); };
-  return { calls, getItem: wrap('getItem'), updateItem: wrap('updateItem'), scan: wrap('scan') };
+  return { calls, getItem: wrap('getItem'), updateItem: wrap('updateItem'), scan: wrap('scan'), query: wrap('query') };
 }
 
 test('store reads config and run items with strong consistency', async () => {
@@ -109,9 +109,46 @@ test('store pendingWake and holder updates are conditional', async () => {
   assert.equal(await store.tryAcquireHolder('demo', 5), false);
   await store.releaseHolder('demo');
   const [pending, acquire, release] = dynamo.calls.map(([, i]) => i);
-  assert.equal(pending.ConditionExpression, '#state = :napping');
+  assert.equal(pending.ConditionExpression, '#state = :napping AND (attribute_not_exists(#pendingWake) OR #pendingWake <> :true)');
   assert.equal(acquire.ConditionExpression, 'attribute_not_exists(#holders) OR #holders < :max');
   assert.deepEqual(acquire.ExpressionAttributeValues[':max'], { N: '5' });
   assert.equal(release.UpdateExpression, 'ADD #holders :minus');
   assert.equal(release.ConditionExpression, '#holders > :zero');
+});
+
+const DAY = Date.UTC(2026, 9, 4, 13, 30); // 2026-10-04T13:30:00Z
+
+test('store count adds to the daily statistics item, with a TTL', async () => {
+  const dynamo = fakeDynamo({ updateItem: async () => ({}) });
+  const store = createStore({ dynamo, table: 't', now: () => DAY });
+  await store.count('demo', 'ignored:bot user agent');
+  const [[, input]] = dynamo.calls;
+  assert.deepEqual(input.Key, { pk: { S: 'WL#demo' }, sk: { S: 'STATS#2026-10-04' } });
+  assert.equal(input.UpdateExpression, 'ADD #c :one SET #exp = if_not_exists(#exp, :exp)');
+  assert.deepEqual(input.ExpressionAttributeNames, { '#c': 'ignored:bot user agent', '#exp': 'expiresAt' });
+  assert.deepEqual(input.ExpressionAttributeValues[':one'], { N: '1' });
+  // Kept 35 days after the end of the day.
+  assert.deepEqual(input.ExpressionAttributeValues[':exp'], { N: String(Date.UTC(2026, 9, 5) / 1000 + 35 * 86400) });
+});
+
+test('store getStats queries the day range and adds the counters up', async () => {
+  const dynamo = fakeDynamo({
+    query: async () => ({
+      Items: [
+        { sk: { S: 'STATS#2026-10-04' }, 'ignored:HEAD': { N: '2' }, 'wake:probe': { N: '1' }, deferred: { N: '3' }, expiresAt: { N: '1' } },
+        { sk: { S: 'STATS#2026-10-01' }, 'ignored:HEAD': { N: '5' }, 'ignored:rule office': { N: '4' }, 'wake:normal': { N: '2' } },
+      ],
+    }),
+  });
+  const stats = await createStore({ dynamo, table: 't', now: () => DAY }).getStats('demo', 7);
+  const [[, input]] = dynamo.calls;
+  assert.equal(input.KeyConditionExpression, '#pk = :pk AND #sk BETWEEN :from AND :to');
+  assert.deepEqual(input.ExpressionAttributeValues[':from'], { S: 'STATS#2026-09-28' });
+  assert.deepEqual(input.ExpressionAttributeValues[':to'], { S: 'STATS#2026-10-04' });
+  assert.deepEqual(stats, {
+    days: 7,
+    since: '2026-09-28',
+    today: { ignored: { HEAD: 2 }, deferred: 3, wakes: { probe: 1 } },
+    total: { ignored: { HEAD: 7, 'rule office': 4 }, deferred: 3, wakes: { probe: 1, normal: 2 } },
+  });
 });

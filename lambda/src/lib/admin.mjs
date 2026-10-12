@@ -42,7 +42,7 @@ const iso = (ms) => (typeof ms === 'number' && ms > 0 ? new Date(ms).toISOString
 
 export function createAdmin({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, invokeController, now = Date.now, log, version = {} }) {
   const clients = { ec2, elbv2, autoscaling, ecs, tagging, appscaling, rds };
-  async function status(workloadId, cfg, run, noWakeRules = [], wakeRules = []) {
+  async function status(workloadId, cfg, run, noWakeRules = [], wakeRules = [], loadStats = null) {
     const t = now();
     const resolved = await resolveBackends(clients, cfg);
     const instanceIds = resolved.backends.filter((b) => b.kind === 'instance').map((b) => b.id);
@@ -86,6 +86,8 @@ export function createAdmin({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging,
         wakeTimeoutSeconds: cfg.wakeTimeoutSeconds,
         maxHolders: cfg.maxHolders,
       },
+      // Requests that reached the waker while the workload was not awake: an unreadable table never breaks the status.
+      stats: loadStats ? await loadStats().catch((err) => ({ error: err.message })) : null,
       wakeMode: cfg.wakeMode ?? 'any',
       wakeRules,
       noWakeRules,
@@ -94,20 +96,20 @@ export function createAdmin({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging,
 
   const notAllowed = (allow) => response(405, { ...SECURITY_HEADERS, allow, 'content-type': 'text/plain' }, 'Method not allowed');
 
-  return async function handle({ event, workloadId, cfg, run, base, route, forceWake, noWakeRules, wakeRules }) {
+  return async function handle({ event, workloadId, cfg, run, base, route, forceWake, noWakeRules, wakeRules, loadStats }) {
     const method = event.httpMethod;
     const read = method === 'GET' || method === 'HEAD';
     if (route === '') {
       if (!read) return notAllowed('GET, HEAD');
       if (method === 'HEAD') return response(200, { ...SECURITY_HEADERS, 'content-type': 'text/html; charset=utf-8' });
       const action = event.multiValueQueryStringParameters?.action?.[0];
-      const body = renderDashboard({ status: await status(workloadId, cfg, run, noWakeRules, wakeRules), base, action: ACTIONS.has(action) ? action : undefined });
+      const body = renderDashboard({ status: await status(workloadId, cfg, run, noWakeRules, wakeRules, loadStats), base, action: ACTIONS.has(action) ? action : undefined });
       return response(200, { ...SECURITY_HEADERS, 'content-type': 'text/html; charset=utf-8' }, body);
     }
     if (route === 'status.json') {
       if (!read) return notAllowed('GET, HEAD');
       if (method === 'HEAD') return response(200, { ...SECURITY_HEADERS, 'content-type': 'application/json' });
-      return response(200, { ...SECURITY_HEADERS, 'content-type': 'application/json' }, JSON.stringify(await status(workloadId, cfg, run, noWakeRules, wakeRules)));
+      return response(200, { ...SECURITY_HEADERS, 'content-type': 'application/json' }, JSON.stringify(await status(workloadId, cfg, run, noWakeRules, wakeRules, loadStats)));
     }
     if (ACTIONS.has(route)) {
       if (method !== 'POST') return notAllowed('POST');

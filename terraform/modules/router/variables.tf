@@ -75,3 +75,9 @@ variable "waker_memory_mb" {
   type        = number
   default     = 512
 }
+
+variable "metrics_enabled" {
+  description = "Publish CloudWatch metrics IgnoredRequests, DeferredRequests and Wakes per workload (namespace Dormeto, embedded metric format: no API call). Each metric costs about 0.30 USD per month."
+  type        = bool
+  default     = false
+}

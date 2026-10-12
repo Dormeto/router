@@ -5,6 +5,7 @@ module "router" {
   waker_timeout_seconds = var.wait_seconds + 10
   router_version        = jsondecode(file("${path.module}/../../package.json")).version
   admin_enabled         = var.admin_dashboard_enabled
+  metrics_enabled       = true
   # Lets dormeto-e2e check that a matching request (and its waiter probe) never wakes a workload.
   no_wake_rules = [{ name = "e2e-no-wake", headers = [{ name = "x-dormeto-e2e", value = "no-wake" }] }]
 }

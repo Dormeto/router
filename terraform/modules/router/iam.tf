@@ -44,6 +44,14 @@ data "aws_iam_policy_document" "waker" {
       resources = ["*"]
     }
   }
+  dynamic "statement" {
+    for_each = var.admin_enabled ? [1] : []
+    content {
+      sid       = "AdminDashboardStats"
+      actions   = ["dynamodb:Query"]
+      resources = [aws_dynamodb_table.router.arn]
+    }
+  }
 }
 
 resource "aws_iam_role_policy" "waker" {

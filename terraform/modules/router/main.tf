@@ -19,6 +19,11 @@ resource "aws_dynamodb_table" "router" {
   server_side_encryption {
     enabled = true
   }
+  # Daily statistics items (STATS#<day>) expire after 35 days.
+  ttl {
+    attribute_name = "expiresAt"
+    enabled        = true
+  }
 }
 
 locals {
@@ -116,6 +121,7 @@ resource "aws_lambda_function" "waker" {
       DMT_BUILD      = local.build
       # Router default no-wake rules, for every workload.
       DMT_NO_WAKE_RULES = jsonencode(local.no_wake_rules)
+      DMT_METRICS       = tostring(var.metrics_enabled)
     }
   }
 

@@ -38,7 +38,7 @@ export function fakeClock(start = 1_700_000_000_000) {
 }
 
 export function fakeStore({ config, run, clock }) {
-  const state = { run: structuredClone(run) };
+  const state = { run: structuredClone(run), stats: {} };
   const copy = () => structuredClone(state.run);
   return {
     state,
@@ -55,9 +55,19 @@ export function fakeStore({ config, run, clock }) {
       return copy();
     },
     async setPendingWake() {
-      if (state.run.state !== STATES.NAPPING) return false;
+      if (state.run.state !== STATES.NAPPING || state.run.pendingWake === true) return false;
       state.run.pendingWake = true;
       return true;
+    },
+    async count(id, counter) { state.stats[counter] = (state.stats[counter] ?? 0) + 1; },
+    async getStats(id, days) {
+      const stats = { ignored: {}, deferred: 0, wakes: {} };
+      for (const [name, n] of Object.entries(state.stats)) {
+        if (name === 'deferred') stats.deferred += n;
+        else if (name.startsWith('ignored:')) stats.ignored[name.slice(8)] = n;
+        else if (name.startsWith('wake:')) stats.wakes[name.slice(5)] = n;
+      }
+      return { days, since: 'fake', today: structuredClone(stats), total: stats };
     },
     async tryAcquireHolder(id, max) {
       if ((state.run.holders ?? 0) >= max) return false;

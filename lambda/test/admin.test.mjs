@@ -285,3 +285,23 @@ test('the wake mode defaults to any', async () => {
   assert.equal(status.wakeMode, 'any');
   assert.deepEqual(status.wakeRules, []);
 });
+
+test('status.json and the dashboard show the statistics of the last 7 days', async () => {
+  const { handler, store } = setup({ run: { state: STATES.AWAKE } });
+  store.state.stats = { 'ignored:HEAD': 2, 'ignored:rule office': 1, deferred: 3, 'wake:probe': 4 };
+  const status = JSON.parse((await handler(albEvent({ path: `${BASE}/status.json`, headers: { accept: 'application/json' } }))).body);
+  assert.equal(status.stats.days, 7);
+  assert.deepEqual(status.stats.total, { ignored: { HEAD: 2, 'rule office': 1 }, deferred: 3, wakes: { probe: 4 } });
+  const page = (await handler(albEvent({ path: `${BASE}/` }))).body;
+  assert.match(page, /Ignored requests \(today · 7 days\)<\/th><td>HEAD 2 · 2, rule office 1 · 1/);
+  assert.match(page, /Deferred requests \(today · 7 days\)<\/th><td>3 · 3/);
+  assert.match(page, /Wakes by trigger \(today · 7 days\)<\/th><td>probe 4 · 4/);
+});
+
+test('statistics that cannot be read do not break the status', async () => {
+  const { handler, store } = setup({ run: { state: STATES.AWAKE } });
+  store.getStats = async () => { throw new Error('AccessDenied'); };
+  const status = JSON.parse((await handler(albEvent({ path: `${BASE}/status.json`, headers: { accept: 'application/json' } }))).body);
+  assert.equal(status.state, STATES.AWAKE);
+  assert.deepEqual(status.stats, { error: 'AccessDenied' });
+});

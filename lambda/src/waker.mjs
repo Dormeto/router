@@ -1,12 +1,16 @@
 import { createDynamo } from './aws/dynamo.mjs';
 import { createLambda } from './aws/lambda.mjs';
-import { logger } from './lib/log.mjs';
+import { createLogger } from './lib/log.mjs';
 import { memoizeAsync } from './lib/memo.mjs';
 import { parseRules } from './lib/no-wake.mjs';
 import { createStore } from './lib/state.mjs';
 import { sleep } from './lib/time.mjs';
 import { createWaker } from './lib/waker-core.mjs';
 
+// Optional CloudWatch metrics (router metrics_enabled), dimension Router = the router name.
+const logger = createLogger({
+  metrics: process.env.DMT_METRICS === 'true' ? { router: (process.env.DMT_TG_PREFIX ?? '').replace(/-$/, '') } : null,
+});
 const lambda = createLambda();
 const invokeController = (payload) => lambda.invokeAsync(process.env.DMT_CONTROLLER, payload);
 

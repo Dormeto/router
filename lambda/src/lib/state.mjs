@@ -8,6 +8,23 @@ export const STATES = Object.freeze({
 
 const itemKey = (workloadId, sk) => ({ pk: { S: `WL#${workloadId}` }, sk: { S: sk } });
 
+const DAY_MS = 86_400_000;
+const STATS_TTL_DAYS = 35;
+const utcDay = (ms) => new Date(ms).toISOString().slice(0, 10);
+
+// Daily statistics item → { ignored: { reason: n }, deferred: n, wakes: { trigger: n } }, added into `into`.
+function addStats(into, item) {
+  for (const [name, attr] of Object.entries(item)) {
+    if (!('N' in attr) || name === 'expiresAt') continue;
+    const n = Number(attr.N);
+    if (name === 'deferred') into.deferred += n;
+    else if (name.startsWith('ignored:')) into.ignored[name.slice(8)] = (into.ignored[name.slice(8)] ?? 0) + n;
+    else if (name.startsWith('wake:')) into.wakes[name.slice(5)] = (into.wakes[name.slice(5)] ?? 0) + n;
+  }
+  return into;
+}
+const emptyStats = () => ({ ignored: {}, deferred: 0, wakes: {} });
+
 export function toValue(value) {
   if (typeof value === 'string') return { S: value };
   if (typeof value === 'number') return { N: String(value) };
@@ -134,12 +151,46 @@ export function createStore({ dynamo, table, now = Date.now }) {
       return update(buildTransition({ table, workloadId, now: now(), ...change }));
     },
 
+    // Daily counter (`ignored:<reason>`, `deferred`, `wake:<trigger>`) in the WL#<id> / STATS#<yyyy-mm-dd> item.
+    async count(workloadId, counter) {
+      const t = now();
+      const expires = (Math.floor(t / DAY_MS) + 1) * (DAY_MS / 1000) + STATS_TTL_DAYS * 86_400;
+      await dynamo.updateItem({
+        TableName: table,
+        Key: itemKey(workloadId, `STATS#${utcDay(t)}`),
+        UpdateExpression: 'ADD #c :one SET #exp = if_not_exists(#exp, :exp)',
+        ExpressionAttributeNames: { '#c': counter, '#exp': 'expiresAt' },
+        ExpressionAttributeValues: { ':one': { N: '1' }, ':exp': { N: String(expires) } },
+      });
+    },
+
+    // Today and the last `days` days (today included), added up.
+    async getStats(workloadId, days) {
+      const t = now();
+      const since = utcDay(t - (days - 1) * DAY_MS);
+      const today = utcDay(t);
+      const { Items = [] } = await dynamo.query({
+        TableName: table,
+        KeyConditionExpression: '#pk = :pk AND #sk BETWEEN :from AND :to',
+        ExpressionAttributeNames: { '#pk': 'pk', '#sk': 'sk' },
+        ExpressionAttributeValues: { ':pk': { S: `WL#${workloadId}` }, ':from': { S: `STATS#${since}` }, ':to': { S: `STATS#${today}` } },
+      });
+      const total = emptyStats();
+      const todayStats = emptyStats();
+      for (const item of Items) {
+        addStats(total, item);
+        if (item.sk?.S === `STATS#${today}`) addStats(todayStats, item);
+      }
+      return { days, since, today: todayStats, total };
+    },
+
     async setPendingWake(workloadId) {
       const out = await update({
         TableName: table,
         Key: itemKey(workloadId, 'RUN'),
         UpdateExpression: 'SET #pendingWake = :true',
-        ConditionExpression: '#state = :napping',
+        // Only the first request of a nap marks it: one log line and one counted wake per pending wake.
+        ConditionExpression: '#state = :napping AND (attribute_not_exists(#pendingWake) OR #pendingWake <> :true)',
         ExpressionAttributeNames: { '#pendingWake': 'pendingWake', '#state': 'state' },
         ExpressionAttributeValues: { ':true': { BOOL: true }, ':napping': { S: STATES.NAPPING } },
       });

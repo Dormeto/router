@@ -95,6 +95,10 @@ export function fakeElbv2(cfg, { target = 'app', healthy = 1 } = {}) {
       return {};
     },
     async describeTargetHealth() {
+      // Explicit targets ([{ Id, State }]) when a test sets them, else `healthy` anonymous healthy targets.
+      if (state.targets) {
+        return { TargetHealthDescriptions: state.targets.map((t) => ({ Target: { Id: t.Id }, TargetHealth: { State: t.State } })) };
+      }
       return { TargetHealthDescriptions: Array.from({ length: state.healthy }, (_, i) => ({ Target: { Id: `i-${i}` }, TargetHealth: { State: 'healthy' } })) };
     },
   };
@@ -103,11 +107,19 @@ export function fakeElbv2(cfg, { target = 'app', healthy = 1 } = {}) {
 export const routeOf = (elbv2, cfg) => currentTarget(elbv2.state.actions, cfg);
 
 export function fakeEc2(ids, { state = 'running' } = {}) {
-  const s = { instances: Object.fromEntries(ids.map((id) => [id, state])), started: 0, stopped: 0, onStart: [], onStop: [] };
+  const s = { instances: Object.fromEntries(ids.map((id) => [id, state])), tags: {}, started: 0, stopped: 0, onStart: [], onStop: [] };
   return {
     state: s,
     async describeInstances({ InstanceIds }) {
-      return { Reservations: [{ Instances: InstanceIds.map((id) => ({ InstanceId: id, State: { Name: s.instances[id] } })) }] };
+      return {
+        Reservations: [{
+          Instances: InstanceIds.map((id) => ({
+            InstanceId: id,
+            State: { Name: s.instances[id] },
+            Tags: Object.entries(s.tags[id] ?? {}).map(([Key, Value]) => ({ Key, Value })),
+          })),
+        }],
+      };
     },
     async startInstances({ InstanceIds }) {
       s.started += 1;

@@ -1,0 +1,47 @@
+# The demos' nodes: small on-demand instances, removed a minute after they are empty (a nap then frees its node).
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: demo
+spec:
+  role: {{ .Values.nodeRole }}
+  amiSelectorTerms:
+    - alias: al2023@latest
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: {{ .Values.cluster }}
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: {{ .Values.cluster }}
+  tags:
+    karpenter.sh/discovery: {{ .Values.cluster }}
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: demo
+spec:
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: demo
+      requirements:
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["arm64", "amd64"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]
+        - key: karpenter.k8s.aws/instance-category
+          operator: In
+          values: ["t", "m"]
+        - key: karpenter.k8s.aws/instance-size
+          operator: In
+          values: ["medium", "large"]
+  limits:
+    cpu: "8"
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 1m

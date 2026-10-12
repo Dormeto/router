@@ -1,0 +1,22 @@
+provider "aws" {
+  region              = var.region
+  profile             = var.aws_profile
+  allowed_account_ids = [var.account_id]
+
+  default_tags {
+    tags = { env = "dev", project = "dormeto-test-customer" }
+  }
+}
+
+# Helm talks to the cluster with the caller's token (its access entry, eks.tf).
+provider "helm" {
+  kubernetes = {
+    host                   = module.eks.cluster_endpoint
+    cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
+    exec = {
+      api_version = "client.authentication.k8s.io/v1beta1"
+      command     = "aws"
+      args        = ["eks", "get-token", "--cluster-name", module.eks.cluster_name, "--region", var.region, "--profile", var.aws_profile]
+    }
+  }
+}

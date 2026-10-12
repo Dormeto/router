@@ -1,0 +1,4 @@
+apiVersion: v2
+name: karpenter-config
+description: The demos' NodePool and EC2NodeClass (dev-eks).
+version: 0.1.0

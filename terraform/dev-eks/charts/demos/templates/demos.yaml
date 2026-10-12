@@ -1,0 +1,156 @@
+{{- $v := dict "image" .Values.image "domain" .Values.domain "group" .Values.group "certificateArn" .Values.certificateArn "lone" false -}}
+# web: a Deployment behind the group (the grouped Ingress case).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+{{ include "demos.pod" (merge (dict "name" "web") $v) | indent 4 }}
+---
+{{ include "demos.service" (dict "name" "web" "namespace" "demo") }}
+---
+{{ include "demos.ingress" (merge (dict "name" "web" "namespace" "demo") $v) }}
+---
+# cache: a StatefulSet behind the group.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cache
+  namespace: demo
+spec:
+  replicas: 1
+  serviceName: cache
+  selector:
+    matchLabels:
+      app: cache
+  template:
+{{ include "demos.pod" (merge (dict "name" "cache") $v) | indent 4 }}
+---
+{{ include "demos.service" (dict "name" "cache" "namespace" "demo") }}
+---
+{{ include "demos.ingress" (merge (dict "name" "cache" "namespace" "demo") $v) }}
+---
+# api: a Deployment with an HPA (min 1), behind the group: an HPA does nothing at 0 replicas.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api
+  template:
+{{ include "demos.pod" (merge (dict "name" "api") $v) | indent 4 }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api
+  namespace: demo
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api
+  minReplicas: 1
+  maxReplicas: 3
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+{{ include "demos.service" (dict "name" "api" "namespace" "demo") }}
+---
+{{ include "demos.ingress" (merge (dict "name" "api" "namespace" "demo") $v) }}
+---
+# docs: a Deployment on Fargate (its namespace's Fargate profile), behind the group.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo-fargate
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: docs
+  namespace: demo-fargate
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: docs
+  template:
+{{ include "demos.pod" (merge (dict "name" "docs") $v) | indent 4 }}
+---
+{{ include "demos.service" (dict "name" "docs" "namespace" "demo-fargate") }}
+---
+{{ include "demos.ingress" (merge (dict "name" "docs" "namespace" "demo-fargate") $v) }}
+{{- if .Values.lone }}
+---
+# solo: a Deployment behind an Ingress outside any group (its own ALB).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: solo
+  namespace: demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: solo
+  template:
+{{ include "demos.pod" (merge (dict "name" "solo") $v) | indent 4 }}
+---
+{{ include "demos.service" (dict "name" "solo" "namespace" "demo") }}
+---
+{{ include "demos.ingress" (merge (dict "name" "solo" "namespace" "demo" "lone" true) $v) }}
+{{- end }}
+{{- if .Values.targetGroupBinding }}
+---
+# bind: a Deployment behind a TargetGroupBinding to the ALB this Terraform owns.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bind
+  namespace: demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bind
+  template:
+{{ include "demos.pod" (merge (dict "name" "bind") $v) | indent 4 }}
+---
+{{ include "demos.service" (dict "name" "bind" "namespace" "demo") }}
+---
+apiVersion: elbv2.k8s.aws/v1beta1
+kind: TargetGroupBinding
+metadata:
+  name: bind
+  namespace: demo
+spec:
+  serviceRef:
+    name: bind
+    port: 80
+  targetGroupARN: {{ .Values.targetGroupBinding }}
+  targetType: ip
+  networking:
+    ingress:
+      - from:
+          - securityGroup:
+              groupID: {{ .Values.bindSecurityGroup }}
+        ports:
+          - protocol: TCP
+            port: 80
+{{- end }}

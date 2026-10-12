@@ -1,0 +1,7 @@
+domain: eks.dev.dormeto.com
+group: eks-demo-group
+certificateArn: ""
+lone: false
+targetGroupBinding: ""
+bindSecurityGroup: ""
+image: public.ecr.aws/nginx/nginx:stable-alpine

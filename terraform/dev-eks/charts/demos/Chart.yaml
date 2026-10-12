@@ -1,0 +1,4 @@
+apiVersion: v2
+name: demos
+description: Dormeto's Kubernetes acceptance workloads (dev-eks).
+version: 0.1.0

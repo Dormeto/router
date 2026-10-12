@@ -116,7 +116,11 @@ same transition); the router keeps none.
 types and OS (an Auto Scaling group at its desired capacity), a Fargate service's task size × desired count, RDS and
 Aurora classes, Aurora Serverless v2 at its minimum capacity — and the event of its end carries them (`stopped`) for the
 manager's savings. A backend it cannot describe is said as unknown; the nap goes on. A Fargate size needs
-`ecs:DescribeTaskDefinition`, in the router's role and DmtRouterBoundary.
+`ecs:DescribeTaskDefinition`, in the router's role and DmtRouterBoundary. Since router 0.28.0 an item says what ran on
+Spot (`spot: true`): an instance whose lifecycle is `spot` (alone or in an Auto Scaling group: on-demand and Spot
+instances of one type are two items), and a Fargate service's share on `FARGATE_SPOT`, its desired count split by its
+capacity provider strategy as ECS places tasks (the base first, then the weights); a share on EC2 capacity is not
+counted. It reads what the nap already describes: no new permission.
 
 **Statistics:** while a workload is not awake, the waker counts ignored requests per reason, deferred requests (browser
 mode) and wakes per trigger in a daily item of the state table (`STATS#<day>`, kept 35 days); the admin dashboard shows

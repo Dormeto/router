@@ -1,7 +1,7 @@
 // What a nap stops (R9a), for the manager's savings: priced by type, never by guess.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { describeStopped } from '../src/lib/stopped.mjs';
+import { describeStopped, strategyCounts } from '../src/lib/stopped.mjs';
 
 const ec2 = (instances) => ({
   async describeInstances({ InstanceIds }) {
@@ -53,7 +53,7 @@ test('a Fargate service: its task size times its desired count; ARM; on a capaci
   const task = { cpu: '512', memory: '1024', runtimePlatform: { cpuArchitecture: 'ARM64', operatingSystemFamily: 'LINUX' } };
   assert.deepEqual(await describeStopped({ ecs: ecs({ service: { launchType: 'FARGATE' }, task }) }, [{ kind: 'ecs', id: SERVICE, cluster: CLUSTER, desired: 2 }]),
     [{ kind: 'fargate', vcpu: 0.5, memoryGb: 1, count: 2, arch: 'arm64', os: 'Linux' }]);
-  const provider = await describeStopped({ ecs: ecs({ service: { capacityProviderStrategy: [{ capacityProvider: 'FARGATE_SPOT', weight: 1 }] }, task: { cpu: '256', memory: '512' } }) },
+  const provider = await describeStopped({ ecs: ecs({ service: { capacityProviderStrategy: [{ capacityProvider: 'FARGATE', weight: 1 }] }, task: { cpu: '256', memory: '512' } }) },
     [{ kind: 'ecs', id: SERVICE, cluster: CLUSTER, desired: 1 }]);
   assert.deepEqual(provider, [{ kind: 'fargate', vcpu: 0.25, memoryGb: 0.5, count: 1, arch: 'x86_64', os: 'Linux' }]);
   assert.deepEqual(await describeStopped({ ecs: ecs({ service: { launchType: 'EC2' }, task }) }, [{ kind: 'ecs', id: SERVICE, cluster: CLUSTER, desired: 2 }]), []);
@@ -83,4 +83,46 @@ test('RDS instances (Multi-AZ said), the provisioned instances of an Aurora clus
     { kind: 'rds', class: 'db.r6g.large', engine: 'aurora-postgresql', multiAz: false },
     { kind: 'aurora-serverless', engine: 'aurora-mysql', acu: 0.5 },
   ]);
+});
+
+// R9.5a: what ran on Spot, for the manager to price it at Spot prices.
+test('an instance on Spot is said so; a group\'s on-demand and Spot instances of one type are two items', async () => {
+  const stopped = await describeStopped({
+    ec2: ec2({ 'i-1': { InstanceType: 't3.medium', PlatformDetails: 'Linux/UNIX', InstanceLifecycle: 'spot' },
+      'i-2': { InstanceType: 't3.medium', PlatformDetails: 'Linux/UNIX' }, 'i-3': { InstanceType: 't3.medium', PlatformDetails: 'Linux/UNIX', InstanceLifecycle: 'spot' }, 'i-4': { InstanceType: 't3.medium', PlatformDetails: 'Linux/UNIX' } }),
+  }, [{ kind: 'instance', id: 'i-1' }, { kind: 'asg', name: 'web', desired: 3, instances: ['i-2', 'i-3', 'i-4'] }]);
+  assert.deepEqual(stopped, [
+    { kind: 'ec2', type: 't3.medium', count: 1, os: 'Linux', spot: true },
+    { kind: 'ec2', type: 't3.medium', count: 2, os: 'Linux' },
+    { kind: 'ec2', type: 't3.medium', count: 1, os: 'Linux', spot: true },
+  ]);
+});
+
+test('a group of Spot instances whose desired capacity was not all described: the rest added to its first item', async () => {
+  const stopped = await describeStopped({ ec2: ec2({ 'i-1': { InstanceType: 't3.small', PlatformDetails: 'Linux/UNIX', InstanceLifecycle: 'spot' } }) },
+    [{ kind: 'asg', name: 'web', desired: 3, instances: ['i-1'] }]);
+  assert.deepEqual(stopped, [{ kind: 'ec2', type: 't3.small', count: 3, os: 'Linux', spot: true }]);
+});
+
+test('a capacity provider strategy splits the desired count as ECS places it: the base first, then the weights', () => {
+  const counts = (strategy, desired) => Object.fromEntries(strategyCounts(strategy, desired));
+  assert.deepEqual(counts([{ capacityProvider: 'FARGATE', base: 1, weight: 1 }, { capacityProvider: 'FARGATE_SPOT', weight: 3 }], 5), { FARGATE: 2, FARGATE_SPOT: 3 });
+  // Rounded with the largest remainder: always the desired count.
+  const even = counts([{ capacityProvider: 'FARGATE', weight: 1 }, { capacityProvider: 'FARGATE_SPOT', weight: 1 }], 3);
+  assert.equal(even.FARGATE + even.FARGATE_SPOT, 3);
+  assert.ok([1, 2].includes(even.FARGATE));
+  assert.deepEqual(counts([{ capacityProvider: 'FARGATE', base: 5, weight: 1 }, { capacityProvider: 'FARGATE_SPOT', weight: 1 }], 2), { FARGATE: 2, FARGATE_SPOT: 0 });
+  // No weight: the base's provider takes the rest.
+  assert.deepEqual(counts([{ capacityProvider: 'FARGATE', base: 1, weight: 0 }, { capacityProvider: 'FARGATE_SPOT', weight: 0 }], 3), { FARGATE: 3, FARGATE_SPOT: 0 });
+  assert.deepEqual(counts([{ capacityProvider: 'app-asg', weight: 1 }, { capacityProvider: 'FARGATE_SPOT', weight: 1 }], 4), { 'app-asg': 2, FARGATE_SPOT: 2 });
+});
+
+test('a Fargate service on Fargate and Fargate Spot: an item each; on Fargate Spot only, one Spot item; a share on EC2 capacity not counted', async () => {
+  const task = { cpu: '256', memory: '512' };
+  const size = { kind: 'fargate', vcpu: 0.25, memoryGb: 0.5, arch: 'x86_64', os: 'Linux' };
+  const of = (capacityProviderStrategy, desired) => describeStopped({ ecs: ecs({ service: { capacityProviderStrategy }, task }) }, [{ kind: 'ecs', id: SERVICE, cluster: CLUSTER, desired }]);
+  assert.deepEqual(await of([{ capacityProvider: 'FARGATE', base: 1, weight: 1 }, { capacityProvider: 'FARGATE_SPOT', weight: 3 }], 5),
+    [{ ...size, count: 2 }, { ...size, count: 3, spot: true }]);
+  assert.deepEqual(await of([{ capacityProvider: 'FARGATE_SPOT', weight: 1 }], 2), [{ ...size, count: 2, spot: true }]);
+  assert.deepEqual(await of([{ capacityProvider: 'app-asg', weight: 1 }, { capacityProvider: 'FARGATE_SPOT', weight: 1 }], 4), [{ ...size, count: 2, spot: true }]);
 });

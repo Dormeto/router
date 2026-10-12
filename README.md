@@ -152,7 +152,11 @@ every 15 minutes): the `router` action reads it instead of calling CloudWatch. P
 **Installed by the manager:** `npm run package` writes `dist/router-<version>.zip`, `dist/blueprint-<version>.json`
 (every resource and IAM policy of a router, placeholders filled by the installer) and `dist/router-boundary.json`
 (`DmtRouterBoundary`). The manager installs, upgrades and removes routers from them by API calls (no Terraform or
-CloudFormation); `lambda/test/blueprint.test.mjs` keeps the blueprint's IAM actions equal to this module's.
+CloudFormation); `lambda/test/blueprint.test.mjs` keeps the blueprint's IAM actions equal to this module's. Since 0.23.0
+the blueprint also describes the **forwarder** of event-driven discovery refresh (one role per account,
+`dmtr-<env>-forwarder`, and one rule per region, `dmtr-<env>-discovery`): the load balancer changes discovery reads
+(`install/forward-pattern.json`, never target registrations nor Dormeto's own calls, `${commandRole}` included), sent
+to the manager's bus.
 `terraform/dev-paris` is a customer-style application in eu-west-3 used to test that path (about 18 USD a month).
 
 The `dev` environment has four workloads: `demo` (one EC2 instance, `https://dev.dormeto.com/`), `demo-asg` (an Auto

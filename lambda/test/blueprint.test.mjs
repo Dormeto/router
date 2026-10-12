@@ -16,6 +16,7 @@ const VALUES = {
   name: 'dmtr-dev', region: 'eu-west-3', account: '121014831971', partition: 'aws', build: 'abc123def456',
   checkSchedule: 'rate(5 minutes)', ipLists: '[]', noWakeRules: '[]', metrics: 'false',
   managerBus: 'arn:aws:events:eu-west-1:121014831971:event-bus/dmt-dev-manager',
+  commandRole: 'DmtCommandRole',
 };
 
 // Actions of each aws_iam_policy_document of the module, without its optional (dynamic) statements.
@@ -192,4 +193,35 @@ test('naps and router-pause wakes go to a queue the controller reads 10 at a tim
   for (const [role, key] of [['controller', 'work'], ['onboarder', 'drift']]) {
     for (const action of ['sqs:ReceiveMessage', 'sqs:DeleteMessage', 'sqs:GetQueueAttributes', 'sqs:ChangeMessageVisibility']) assert.ok(allows(role, action, sqs(`dmtr-dev-${key}`)), `${role} ${action} on ${key}`);
   }
+});
+
+test('the forwarder: a role of the account under the routers\' path, trusted by EventBridge of that account, sending to the manager\'s bus only; a rule per region to that bus', () => {
+  const { role, rule } = fill(blueprint({ version: '0.23.0' }), VALUES).forwarder;
+  assert.deepEqual([role.path, role.name], ['/dormeto/router/', 'dmtr-dev-forwarder']);
+  assert.deepEqual(role.trust, { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Principal: { Service: 'events.amazonaws.com' }, Action: 'sts:AssumeRole', Condition: { StringEquals: { 'aws:SourceAccount': '121014831971' } } }] });
+  assert.deepEqual(role.policy.Statement, [{ Effect: 'Allow', Action: ['events:PutEvents'], Resource: [VALUES.managerBus] }]);
+  assert.deepEqual(role.tags, { 'dormeto:router': 'dmtr-dev' });
+  assert.equal(rule.name, 'dmtr-dev-discovery');
+  assert.equal(rule.targetBus, VALUES.managerBus);
+  assert.equal(rule.roleArn, 'arn:aws:iam::121014831971:role/dormeto/router/dmtr-dev-forwarder');
+  // Within the boundary every role Dormeto creates carries.
+  const allowed = routerBoundary().Statement.filter((st) => [].concat(st.Action).includes('events:PutEvents'));
+  assert.deepEqual(allowed.map((st) => st.Resource), ['arn:${partition}:events:*:*:event-bus/dmt-*-manager']);
+});
+
+test('the forwarder\'s pattern: the ELB calls that change what discovery reads, never target registrations, failed calls nor Dormeto\'s own calls', () => {
+  const pattern = JSON.parse(fill(blueprint({ version: '0.23.0' }), VALUES).forwarder.rule.pattern);
+  assert.deepEqual(pattern.source, ['aws.elasticloadbalancing']);
+  assert.deepEqual(pattern['detail-type'], ['AWS API Call via CloudTrail']);
+  assert.deepEqual([...pattern.detail.eventName].sort(), [
+    'AddTags', 'CreateListener', 'CreateLoadBalancer', 'CreateRule', 'CreateTargetGroup', 'DeleteListener', 'DeleteLoadBalancer',
+    'DeleteRule', 'DeleteTargetGroup', 'ModifyListener', 'ModifyRule', 'ModifyTargetGroup', 'RemoveTags', 'SetRulePriorities',
+  ]);
+  // Auto Scaling and ECS register and deregister targets constantly.
+  assert.ok(!pattern.detail.eventName.some((e) => /Targets$/.test(e)));
+  assert.deepEqual(pattern.detail.errorCode, [{ exists: false }]);
+  // Routers installed (dmtr-) or written in Terraform (dmt-), and the manager's operations through the command role.
+  assert.deepEqual(pattern.detail.userIdentity, { arn: [{ 'anything-but': { prefix: [
+    'arn:aws:sts::121014831971:assumed-role/dmtr-', 'arn:aws:sts::121014831971:assumed-role/dmt-', 'arn:aws:sts::121014831971:assumed-role/DmtCommandRole/',
+  ] } }] });
 });

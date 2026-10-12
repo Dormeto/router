@@ -5,12 +5,15 @@
 // two IAM definitions equal.
 
 import driftPattern from './drift-pattern.json' with { type: 'json' };
+import forwardPattern from './forward-pattern.json' with { type: 'json' };
 
 export const PLACEHOLDERS = {
   name: '${name}', region: '${region}', account: '${account}', partition: '${partition}', build: '${build}',
   checkSchedule: '${checkSchedule}', ipLists: '${ipLists}', noWakeRules: '${noWakeRules}', metrics: '${metrics}',
   // The manager's event bus (scale design §3): routers send their state and state changes to it.
   managerBus: '${managerBus}',
+  // The command role's name (without its path): the forwarder ignores the manager's own calls (packaging design §5).
+  commandRole: '${commandRole}',
 };
 
 // Installed routers are named dmtr-<env> and their roles live under this path: DmtCommandRole and DmtRouterBoundary are
@@ -155,6 +158,23 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
     schedule: {
       name: `${p.name}-check`, expression: p.checkSchedule, target: functionArn('controller'), roleArn: roleArn('scheduler'),
       input: '{"action":"check","source":"schedule"}', deadLetter: queueArn('check-failures'), maximumRetryAttempts: 0,
+    },
+    // Event-driven discovery refresh (vision docs/specs/2026-10-06-packaging-design.md, section 5), installed per account
+    // by the manager's connect operation, apart from the routers: one role of the account (EventBridge needs one to
+    // deliver to another account's bus) and one rule per region on the default bus, forwarding the ELB changes discovery
+    // reads to the manager's bus.
+    forwarder: {
+      role: {
+        name: `${p.name}-forwarder`, path: ROLE_PATH, tags,
+        trust: { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Principal: { Service: 'events.amazonaws.com' }, Action: 'sts:AssumeRole', Condition: { StringEquals: { 'aws:SourceAccount': p.account } } }] },
+        policy: policy(allow(['events:PutEvents'], [p.managerBus])),
+      },
+      rule: {
+        name: `${p.name}-discovery`,
+        pattern: JSON.stringify(forwardPattern).replaceAll('${partition}', p.partition).replaceAll('${account}', p.account).replaceAll('${commandRole}', p.commandRole),
+        targetBus: p.managerBus, roleArn: `arn:${p.partition}:iam::${p.account}:role${ROLE_PATH}${p.name}-forwarder`,
+        description: 'Dormeto: load balancer changes, to the manager\'s discovery',
+      },
     },
   };
 }

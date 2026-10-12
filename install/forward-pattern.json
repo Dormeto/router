@@ -1,0 +1,21 @@
+{
+  "source": ["aws.elasticloadbalancing"],
+  "detail-type": ["AWS API Call via CloudTrail"],
+  "detail": {
+    "eventName": [
+      "CreateLoadBalancer", "DeleteLoadBalancer",
+      "CreateListener", "ModifyListener", "DeleteListener",
+      "CreateRule", "ModifyRule", "DeleteRule", "SetRulePriorities",
+      "CreateTargetGroup", "ModifyTargetGroup", "DeleteTargetGroup",
+      "AddTags", "RemoveTags"
+    ],
+    "userIdentity": {
+      "arn": [{ "anything-but": { "prefix": [
+        "arn:${partition}:sts::${account}:assumed-role/dmtr-",
+        "arn:${partition}:sts::${account}:assumed-role/dmt-",
+        "arn:${partition}:sts::${account}:assumed-role/${commandRole}/"
+      ] } }]
+    },
+    "errorCode": [{ "exists": false }]
+  }
+}

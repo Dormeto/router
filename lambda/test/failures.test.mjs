@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { classify, classifyText } from '../src/lib/failures.mjs';
+import { KINDS, classify, classifyText } from '../src/lib/failures.mjs';
 
 const aws = (name, message) => Object.assign(new Error(message), { name });
 
@@ -34,4 +34,26 @@ test('classifies the texts of Auto Scaling activities and ECS service events', (
   assert.equal(classifyText('The specified launch template, with template ID lt-0123, does not exist.'), 'configuration');
   assert.equal(classifyText('Client.UnauthorizedOperation: You are not authorized to use launch template'), 'permission');
   assert.equal(classifyText('Something else entirely'), 'unknown');
+});
+
+// Kubernetes workloads (vision docs/specs/2026-10-11-kubernetes-design.md, section 7): the cluster API's answers by kind.
+const kube = (status, reason, message) => Object.assign(new Error(message), { name: 'KubernetesError', status, reason });
+
+test('classifies the errors of a cluster: refused rights are permission, an unreachable or failing cluster is the new kind cluster', () => {
+  assert.ok(KINDS.includes('cluster'));
+  const cases = [
+    [kube(401, 'Unauthorized', 'Unauthorized'), 'permission'],
+    [kube(403, 'Forbidden', 'deployments.apps "web" is forbidden: User "arn:aws:sts::1:assumed-role/dmt-dev-controller/x" cannot patch resource "deployments/scale"'), 'permission'],
+    [kube(0, 'Timeout', 'GET /apis/apps/v1/namespaces/demo/deployments/web: no connection within 3000 ms'), 'cluster'],
+    [kube(0, 'ECONNREFUSED', 'connect ECONNREFUSED 10.0.0.1:443'), 'cluster'],
+    [kube(0, 'ENOTFOUND', 'getaddrinfo ENOTFOUND abc.gr7.eu-west-1.eks.amazonaws.com'), 'cluster'],
+    [kube(0, 'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'unable to verify the first certificate'), 'cluster'],
+    [kube(500, 'InternalError', 'etcdserver: request timed out'), 'cluster'],
+    [kube(503, 'ServiceUnavailable', 'the server is currently unable to handle the request'), 'cluster'],
+    [kube(429, 'TooManyRequests', 'too many requests'), 'throttled'],
+    [kube(404, 'NotFound', 'deployments.apps "web" not found'), 'configuration'],
+    [kube(422, 'Invalid', 'Ingress.networking.k8s.io "dormeto-demo" is invalid'), 'configuration'],
+  ];
+  for (const [error, kind] of cases) assert.equal(classify(error).kind, kind, `${error.status} ${error.reason}`);
+  assert.deepEqual(classify(kube(503, 'ServiceUnavailable', 'the server is currently unable to handle the request')), { kind: 'cluster', message: 'the server is currently unable to handle the request' });
 });

@@ -48,6 +48,12 @@ async function ownerOf(k8s, ref) {
   }
 }
 
+// The owner's pods still there; none when the owner is gone.
+export async function ownerPods(k8s, ref) {
+  const object = await ownerOf(k8s, ref);
+  return object ? livePods(k8s, ref, object) : [];
+}
+
 // The owner's ScaledObject: its name and the customer's own pause, if any. A pause at 0 is Dormeto's (a nap in progress
 // or interrupted): a wake never gives it back. Without KEDA's API, none.
 async function scaledObjectOf(k8s, ref) {

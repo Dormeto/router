@@ -1321,3 +1321,34 @@ test('the status of a grouped Ingress workload names the target group its reques
   const plain = setup({ run: { state: STATES.AWAKE } });
   assert.equal((await plain.handler({ action: 'status', workloadId: 'demo' })).servingTargetGroupArn, plain.cfg.appTargetGroupArn);
 });
+
+// A Kubernetes wake whose pod waits for a node (Karpenter launching one): capacity, waited for until the wake's deadline.
+function pendingWake() {
+  const start = fakeClock().now();
+  const napBackends = JSON.stringify([{ kind: 'k8s', id: 'eks-demo/demo/Deployment/web', cluster: 'eks-demo', namespace: 'demo', owner: { kind: 'Deployment', name: 'web' }, replicas: 1, keda: null }]);
+  const k8s = fakeKubernetes({
+    owners: [k8sOwner('web', { replicas: 0 })],
+    pods: [k8sPod('web-5d9c-a1', { labels: { app: 'web' }, phase: 'Pending', ready: false })],
+    events: [{ involvedObject: { kind: 'Pod', name: 'web-5d9c-a1' }, type: 'Warning', reason: 'FailedScheduling', message: '0/1 nodes are available: 1 Insufficient cpu.', lastTimestamp: new Date(start + 5_000).toISOString() }],
+  });
+  const s = setup({ run: { state: STATES.WAKING, wakeId: 'w1', wakeStartedAt: start, napBackends }, cfg: k8sConfig({ switch: 'rule' }), k8s, target: 'waker', healthy: 0 });
+  return { ...s, k8s, start };
+}
+
+test('a Kubernetes wake whose pods wait for a node goes on while the scheduler waits, and completes once a target is healthy', async () => {
+  const s = pendingWake();
+  s.clock.onSleep((t) => { if (t - s.start >= 90_000) s.elbv2.state.healthy = 1; });
+  const result = await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' });
+  assert.equal(result.state, STATES.AWAKE);
+  assert.ok(s.clock.now() - s.start >= 90_000);
+});
+
+test('a Kubernetes wake whose pods never get a node fails at its deadline as capacity, quoting the scheduler\'s Event', async () => {
+  const s = pendingWake();
+  const result = await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' });
+  assert.equal(result.state, STATES.FAILED);
+  const failure = JSON.parse(s.store.state.run.failure);
+  assert.deepEqual([failure.kind, failure.backend], ['capacity', 'k8s:eks-demo/demo/Deployment/web']);
+  assert.equal(failure.message, 'pod web-5d9c-a1: FailedScheduling: 0/1 nodes are available: 1 Insufficient cpu.');
+  assert.ok(s.clock.now() - s.start >= 300_000, 'the Kubernetes wake timeout (5 minutes)');
+});

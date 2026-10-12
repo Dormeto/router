@@ -1,6 +1,6 @@
 // Why a wake failed (vision docs/specs/2026-10-08-failures-notifications-design.md, R7a): a kind the manager, the waiting
 // page and the reactions act on, from the AWS error of a start or the text of an Auto Scaling activity or ECS event.
-export const KINDS = ['capacity', 'quota', 'permission', 'configuration', 'unhealthy', 'throttled', 'timeout', 'unknown'];
+export const KINDS = ['capacity', 'quota', 'permission', 'configuration', 'unhealthy', 'throttled', 'timeout', 'cluster', 'unknown'];
 const MESSAGE_MAX = 300;
 
 // Error names first (the SDK's exception name, or its Code): exact or by pattern.
@@ -21,6 +21,15 @@ const BY_TEXT = [
   [/timeout|timed out|not available yet/i, 'timeout'],
 ];
 
+// A cluster's API (lib/k8s.mjs): rights refused, throttled, unreachable or failing (cluster: no answer, or a server error),
+// else a request the cluster refuses.
+function kubernetesKind({ status }) {
+  if (status === 401 || status === 403) return 'permission';
+  if (status === 429) return 'throttled';
+  if (!status || status >= 500) return 'cluster';
+  return 'configuration';
+}
+
 export function classifyText(text) {
   return BY_TEXT.find(([pattern]) => pattern.test(text ?? ''))?.[1] ?? 'unknown';
 }
@@ -32,6 +41,7 @@ export function classify(error) {
   const name = error?.name && error.name !== 'Error' ? error.name : (error?.Code ?? error?.code ?? '');
   const message = String(error?.message ?? error ?? '');
   if (error?.kind && KINDS.includes(error.kind)) return { kind: error.kind, message: cut(message) };
+  if (error?.name === 'KubernetesError') return { kind: kubernetesKind(error), message: cut(message) };
   const byName = typeof name === 'string' && name ? BY_NAME.find(([pattern]) => pattern.test(name))?.[1] : undefined;
   const kind = byName ?? classifyText(message);
   return { kind, message: cut(kind === 'unknown' && name ? `${name}: ${message}` : message) };

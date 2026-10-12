@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createWakeWatch, unhealthyError } from '../src/lib/wake-watch.mjs';
+import { fakeKubernetes, k8sOwner, k8sPod } from './fakes.mjs';
 
 const SINCE = Date.UTC(2026, 9, 8, 12, 0);
 const at = (s) => new Date(SINCE + s * 1000);
@@ -63,4 +64,44 @@ test('at the deadline, unhealthy targets say why; no target says so', async () =
   assert.equal(unhealthy.message, '2 targets, none healthy: Target.FailedHealthChecks (Health checks failed with these codes: [502])');
   const none = await unhealthyError(clients().elbv2, 'arn:tg');
   assert.deepEqual([none.kind, none.message], ['timeout', 'no target registered in the target group when the wake timed out']);
+});
+
+// A Kubernetes workload: the Events of its pods since the wake started.
+const K8S = { kind: 'k8s', id: 'eks-demo/demo/Deployment/web', cluster: 'eks-demo', namespace: 'demo', owner: { kind: 'Deployment', name: 'web' }, replicas: 2 };
+const podEvent = (pod, reason, message, s, type = 'Warning') => ({ involvedObject: { kind: 'Pod', name: pod }, type, reason, message, lastTimestamp: at(s).toISOString() });
+function kubeWatch(events) {
+  const k8s = fakeKubernetes({
+    owners: [k8sOwner('web', { replicas: 2 }), k8sOwner('web-api', { replicas: 1 })],
+    pods: [k8sPod('web-5d9c-a1', { labels: { app: 'web' }, phase: 'Pending', ready: false }), k8sPod('web-api-77f-b2', { labels: { app: 'web-api' } })],
+    events,
+  });
+  return createWakeWatch({ kubernetesOf: async () => k8s }, [K8S], { since: SINCE, now: () => SINCE + 40_000 });
+}
+
+test('pods the scheduler cannot place yet are noted as capacity while the wake waits (Karpenter launching a node); older events and other owners\' pods are ignored', async () => {
+  const watch = kubeWatch([
+    podEvent('web-5d9c-a1', 'FailedScheduling', '0/2 nodes are available: 2 Insufficient cpu. preemption: 0/2 nodes are available.', 10),
+    podEvent('web-5d9c-a1', 'FailedScheduling', 'an older one', -600),
+    podEvent('web-api-77f-b2', 'Failed', 'Failed to pull image "api:nope": not found', 12),
+  ]);
+  assert.equal(await watch.check(), null, 'the scheduler keeps trying');
+  assert.deepEqual([watch.capacity.kind, watch.capacity.backend], ['capacity', `k8s:${K8S.id}`]);
+  assert.equal(watch.capacity.message, 'pod web-5d9c-a1: FailedScheduling: 0/2 nodes are available: 2 Insufficient cpu. preemption: 0/2 nodes are available.');
+});
+
+test('image pull errors and crash loops end the wake as configuration, quoting the Event', async () => {
+  const cases = [
+    [podEvent('web-5d9c-a1', 'Failed', 'Failed to pull image "web:nope": rpc error: code = NotFound desc = not found', 8), /pod web-5d9c-a1: Failed: Failed to pull image "web:nope"/],
+    [podEvent('web-5d9c-a1', 'Failed', 'Error: ErrImagePull', 8), /ErrImagePull/],
+    [podEvent('web-5d9c-a1', 'BackOff', 'Back-off pulling image "web:nope"', 9), /Back-off pulling image/],
+    [podEvent('web-5d9c-a1', 'Failed', 'Error: ImagePullBackOff', 9), /ImagePullBackOff/],
+    [podEvent('web-5d9c-a1', 'BackOff', 'Back-off restarting failed container app in pod web-5d9c-a1_demo', 30), /Back-off restarting failed container/],
+  ];
+  for (const [event, message] of cases) {
+    const error = await kubeWatch([event]).check();
+    assert.equal(error?.kind, 'configuration', event.message);
+    assert.equal(error.backend, `k8s:${K8S.id}`);
+    assert.match(error.message, message);
+  }
+  assert.equal(await kubeWatch([podEvent('web-5d9c-a1', 'Pulled', 'Successfully pulled image "web:1"', 9, 'Normal')]).check(), null);
 });

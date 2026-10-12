@@ -1,6 +1,14 @@
+<div align="center">
+
+<a href="https://dormeto.com"><img src="https://dormeto.com/img/icon.svg" alt="Dormeto" width="96" height="96"></a>
+
 # Dormeto router
 
-Data plane of [Dormeto](https://github.com/Dormeto/vision) ("nap" in Esperanto): it puts idle web workloads to
+[Website](https://dormeto.com) · [Get started](https://dormeto.com/get-started.html) · [Product](https://dormeto.com/product.html) · [Manager](https://github.com/Dormeto/manager)
+
+</div>
+
+Data plane of [Dormeto](https://dormeto.com) ("nap" in Esperanto): it puts idle web workloads to
 sleep and wakes them just-in-time on the next request.
 
 This MVP manages one EC2 instance behind an ALB:
@@ -261,7 +269,7 @@ The `dev` environment has four workloads: `demo` (one EC2 instance, `https://dev
 Scaling group, `https://asg.dev.dormeto.com/`), `demo-ecs` (an ECS Fargate service in browser wake mode, `https://ecs.dev.dormeto.com/`) and
 `demo-rds` (an ECS Fargate service with a PostgreSQL instance, `https://rds.dev.dormeto.com/`).
 
-Design: [vision/docs/specs/2026-10-03-mvp-alb-ec2-design.md](https://github.com/Dormeto/vision/blob/main/docs/specs/2026-10-03-mvp-alb-ec2-design.md).
+Design: `docs/specs/2026-10-03-mvp-alb-ec2-design.md` in the Dormeto/vision repository (private).
 
 ## Layout
 

@@ -6,12 +6,10 @@ module "router" {
   router_version        = jsondecode(file("${path.module}/../../package.json")).version
   admin_enabled         = var.admin_dashboard_enabled
   metrics_enabled       = true
-  # Sources of the unwanted wakes seen in dev (see vision docs/plans/2026-10-04-ip-reputation-lists.md).
+  # Sources of the unwanted wakes seen in dev (see vision docs/plans/2026-10-04-ip-reputation-lists.md): ipsum and the
+  # AWS, Google Cloud and DigitalOcean ranges are the manager's lists (R6b, its env/dev.tfvars); censys stays the router's.
+  ip_lists_catalog = "s3://dmt-dev-manager-ip-lists-${var.account_id}/catalog.json"
   ip_lists = [
-    { name = "ipsum", url = "https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt" },
-    { name = "aws", url = "https://ip-ranges.amazonaws.com/ip-ranges.json" },
-    { name = "gcp", url = "https://www.gstatic.com/ipranges/cloud.json" },
-    { name = "digitalocean", url = "https://digitalocean.com/geo/google.csv" },
     # Read with the S3 API (ip-lists.tf); the object key is static so the controller policy is known at plan.
     { name = "censys", url = "s3://${local.ip_lists_bucket}/scanners/censys.txt", action = "ignore" },
   ]

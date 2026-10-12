@@ -1,0 +1,107 @@
+import { randomUUID } from 'node:crypto';
+import { STATES } from './state.mjs';
+import { acceptsHtml, classify, redirectCount, requestTarget, response, workloadIdFromEvent } from './http.mjs';
+import { renderJson, renderPage } from './page.mjs';
+
+const POLL_MS = 1000;
+const STUCK_GRACE_MS = 60_000;
+const MAX_REDIRECTS = 2;
+
+export function createWaker({ store, invokeController, prefix, now = Date.now, sleep, newId = randomUUID, log }) {
+  async function startWake(workloadId, cond, run) {
+    const wakeId = newId();
+    const next = await store.transition(workloadId, {
+      cond,
+      set: { state: STATES.WAKING, wakeId, wakeStartedAt: now() },
+      remove: ['failedAt'],
+      increment: ['wakeCount'],
+    });
+    if (!next) return (await store.getRun(workloadId)) ?? run;
+    log.info('WakeRequested', { workloadId, wakeId });
+    try {
+      await invokeController({ action: 'wake', workloadId, wakeId });
+      return next;
+    } catch (err) {
+      log.error('WakeInvokeFailed', { workloadId, wakeId, error: err.message });
+      return (await store.transition(workloadId, {
+        cond: { state: STATES.WAKING, wakeId },
+        set: { state: STATES.FAILED, failedAt: now() },
+      })) ?? next;
+    }
+  }
+
+  async function trigger(workloadId, cfg, run) {
+    const t = now();
+    switch (run.state) {
+      case STATES.ASLEEP:
+        return startWake(workloadId, { state: STATES.ASLEEP }, run);
+      case STATES.FAILED:
+        if ((run.failedAt ?? 0) > t - cfg.failedRetrySeconds * 1000) return run;
+        return startWake(workloadId, { state: STATES.FAILED }, run);
+      case STATES.WAKING:
+        if ((run.wakeStartedAt ?? 0) > t - cfg.wakeTimeoutSeconds * 1000 - STUCK_GRACE_MS) return run;
+        log.warn('WakeStuck', { workloadId, wakeId: run.wakeId });
+        return startWake(workloadId, { state: STATES.WAKING, wakeId: run.wakeId }, run);
+      case STATES.NAPPING:
+        await store.setPendingWake(workloadId);
+        return run;
+      case STATES.AWAKE:
+        await invokeController({ action: 'ensure-awake', workloadId });
+        return run;
+      default:
+        return run;
+    }
+  }
+
+  async function hold(workloadId, cfg, run) {
+    if (!(await store.tryAcquireHolder(workloadId, cfg.maxHolders))) return run;
+    let current = run;
+    try {
+      const deadline = now() + cfg.waitSeconds * 1000;
+      while (now() < deadline) {
+        await sleep(POLL_MS);
+        current = (await store.getRun(workloadId)) ?? current;
+        if (current.state === STATES.AWAKE || current.state === STATES.FAILED) break;
+      }
+    } finally {
+      await store.releaseHolder(workloadId);
+    }
+    return current;
+  }
+
+  function waiter(event, pollSeconds, state) {
+    const headers = { 'cache-control': 'no-store', 'retry-after': String(pollSeconds), 'x-dormeto-state': state };
+    if (event.httpMethod === 'HEAD') return response(503, headers);
+    if (acceptsHtml(event)) {
+      return response(503, { ...headers, 'content-type': 'text/html; charset=utf-8' }, renderPage({ state, pollSeconds }));
+    }
+    return response(503, { ...headers, 'content-type': 'application/json' }, renderJson({ state, pollSeconds }));
+  }
+
+  function answer(event, cfg, run) {
+    if (run.state !== STATES.AWAKE) return waiter(event, cfg.pollSeconds, run.state);
+    const count = redirectCount(event);
+    if (count >= MAX_REDIRECTS) return waiter(event, cfg.pollSeconds, STATES.WAKING);
+    return response(307, {
+      location: requestTarget(event),
+      'cache-control': 'no-store',
+      'set-cookie': `dmt_r=${count + 1}; Max-Age=30; Path=/; Secure; HttpOnly; SameSite=Lax`,
+    });
+  }
+
+  return async function handler(event) {
+    const workloadId = workloadIdFromEvent(event, prefix);
+    const [cfg, initial] = await Promise.all([store.getConfig(workloadId), store.getRun(workloadId)]);
+    if (!cfg || !initial) {
+      log.error('WorkloadNotConfigured', { workloadId });
+      return waiter(event, 10, STATES.FAILED);
+    }
+    const kind = classify(event);
+    let run = initial;
+    if (kind !== 'no-wake') run = await trigger(workloadId, cfg, run);
+    if (kind === 'normal' && run.state !== STATES.AWAKE && run.state !== STATES.FAILED && cfg.waitSeconds > 0) {
+      run = await hold(workloadId, cfg, run);
+    }
+    return answer(event, cfg, run);
+  };
+}

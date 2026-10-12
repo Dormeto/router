@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { STATES } from './state.mjs';
-import { acceptsHtml, classify, redirectCount, requestOrigin, requestTarget, response, workloadIdFromEvent } from './http.mjs';
+import { WAKE_HEADER, acceptsHtml, classify, redirectCount, requestOrigin, requestTarget, response, workloadIdFromEvent } from './http.mjs';
 import { renderJson, renderPage } from './page.mjs';
 import { ADMIN_PREFIX, parseAdminPath } from './admin.mjs';
 import { compileRules, describeRules } from './no-wake.mjs';
@@ -106,17 +106,21 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
     return current;
   }
 
-  function waiter(event, pollSeconds, state) {
+  function waiter(event, pollSeconds, state, wakeHeader) {
     const headers = { 'cache-control': 'no-store', 'retry-after': String(pollSeconds), 'x-dormeto-state': state };
     if (event.httpMethod === 'HEAD') return response(503, headers);
     if (acceptsHtml(event)) {
       return response(503, { ...headers, 'content-type': 'text/html; charset=utf-8' }, renderPage({ state, pollSeconds }));
     }
-    return response(503, { ...headers, 'content-type': 'application/json' }, renderJson({ state, pollSeconds }));
+    return response(503, { ...headers, 'content-type': 'application/json' }, renderJson({ state, pollSeconds, wakeHeader }));
   }
 
   function answer(event, cfg, run) {
-    if (run.state !== STATES.AWAKE) return waiter(event, cfg.pollSeconds, run.state);
+    if (run.state !== STATES.AWAKE) {
+      // Browser mode: API clients learn how to wake the workload.
+      const hint = cfg.wakeMode === 'browser' && [STATES.ASLEEP, STATES.FAILED].includes(run.state) ? WAKE_HEADER : undefined;
+      return waiter(event, cfg.pollSeconds, run.state, hint);
+    }
     if (inRouteGrace(run)) return waiter(event, cfg.pollSeconds, STATES.AWAKE);
     const count = redirectCount(event);
     if (count >= MAX_REDIRECTS) return waiter(event, cfg.pollSeconds, STATES.AWAKE);
@@ -145,13 +149,26 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
         event, workloadId, cfg, run: initial, base: admin.base, route: admin.route,
         forceWake: (run) => forceWake(workloadId, run),
         noWakeRules: describeRules([{ level: 'router', rules: defaultRules }, { level: 'workload', rules: cfg.noWakeRules }]),
+        wakeRules: describeRules([{ level: 'wake', rules: cfg.wakeRules }]),
       });
     }
-    const { kind, reason } = classify(event, noWakeRules(cfg));
+    const { kind, reason, trigger: by, deferred } = classify(event, noWakeRules(cfg), {
+      browserMode: cfg.wakeMode === 'browser',
+      wakeRules: rulesFor('wake', cfg.wakeRules),
+    });
     let run = initial;
-    if (kind !== 'no-wake') run = await trigger(workloadId, cfg, run, kind, requestOrigin(event, kind));
-    else if (run.state !== STATES.AWAKE) log.info('WakeIgnored', { workloadId, reason, trigger: requestOrigin(event, kind) });
-    if (kind === 'normal' && !servable(run) && run.state !== STATES.FAILED && cfg.waitSeconds > 0) {
+    const origin = () => requestOrigin(event, by ?? kind);
+    if (kind === 'no-wake') {
+      if (run.state !== STATES.AWAKE) log.info('WakeIgnored', { workloadId, reason, trigger: origin() });
+    } else if (!deferred || run.state === STATES.AWAKE) {
+      // Awake: drift repair as in any mode. A deferred request (browser mode) waits for the waiter page's probe.
+      run = await trigger(workloadId, cfg, run, kind, origin());
+    } else if ([STATES.ASLEEP, STATES.FAILED].includes(run.state)) {
+      log.info('WakeDeferred', { workloadId, trigger: origin() });
+    }
+    // A deferred request is held only behind a wake already in progress.
+    const holdable = !deferred || run.state === STATES.WAKING;
+    if (kind === 'normal' && holdable && !servable(run) && run.state !== STATES.FAILED && cfg.waitSeconds > 0) {
       run = await hold(workloadId, cfg, run);
     }
     return answer(event, cfg, run);

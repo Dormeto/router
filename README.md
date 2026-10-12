@@ -44,8 +44,15 @@ no_wake_rules = [
 ]
 ```
 
+**Wake mode** (`wake_mode` on the `workload` module): `any` (default) wakes on every request that passes the filters;
+`browser` wakes only on the waiter page's JavaScript probe, the `x-dormeto-wake: 1` header (API clients, scripts) or a
+**wake rule** (`wake_rules`, same format as the no-wake rules, for example `path_prefixes = ["/api/"]`). Other requests
+get the waiter page at once (or JSON naming the wake header), so scanners that do not run JavaScript never wake the
+workload; a request arriving during a wake is held as usual. The filters (no-wake rules, `HEAD`, bots, scanner paths)
+apply to the probe too.
+
 The `dev` environment has four workloads: `demo` (one EC2 instance, `https://dev.dormeto.com/`), `demo-asg` (an Auto
-Scaling group, `https://asg.dev.dormeto.com/`), `demo-ecs` (an ECS Fargate service, `https://ecs.dev.dormeto.com/`) and
+Scaling group, `https://asg.dev.dormeto.com/`), `demo-ecs` (an ECS Fargate service in browser wake mode, `https://ecs.dev.dormeto.com/`) and
 `demo-rds` (an ECS Fargate service with a PostgreSQL instance, `https://rds.dev.dormeto.com/`).
 
 Design: [vision/docs/specs/2026-10-03-mvp-alb-ec2-design.md](https://github.com/Dormeto/vision/blob/main/docs/specs/2026-10-03-mvp-alb-ec2-design.md).

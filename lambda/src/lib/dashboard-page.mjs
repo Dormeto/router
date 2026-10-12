@@ -82,6 +82,9 @@ ${row('Route', status.route)}
 ${row(`Backends (${status.discovery ?? 'static'})`, (status.backends ?? []).map(backendText).join(', ') || '—')}
 ${status.ignoredTargets?.length ? row('Ignored targets', status.ignoredTargets.map((t) => `${t.id}: ${t.reason}`).join(', ')) : ''}
 ${row('Target health', list(status.targets))}
+${row('Wake mode', status.wakeMode === 'browser'
+    ? `browser: the waiter page probe, the x-dormeto-wake header or a wake rule wakes${(status.wakeRules ?? []).length ? ` (${status.wakeRules.map(ruleText).join('; ')})` : ''}`
+    : 'any: every request that passes the filters wakes')}
 ${row('No-wake rules', (status.noWakeRules ?? []).map(ruleText).join('; ') || 'none (built-in filters only)')}
 ${row('Settings', Object.entries(status.settings).map(([k, v]) => `${k}=${v}`).join(', '))}
 </table>

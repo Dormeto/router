@@ -131,3 +131,46 @@ variable "no_wake_rules" {
     error_message = "Each no_wake_rules header needs either value or pattern."
   }
 }
+
+variable "wake_mode" {
+  description = "any: every request that passes the filters wakes the workload. browser: only the waiter page probe (JavaScript), the x-dormeto-wake: 1 header and wake_rules wake it; other requests get the waiter page at once."
+  type        = string
+  default     = "any"
+  validation {
+    condition     = contains(["any", "browser"], var.wake_mode)
+    error_message = "wake_mode must be any or browser."
+  }
+}
+
+variable "wake_rules" {
+  description = "Wake rules (wake_mode browser): matching requests wake the workload without the waiter page probe, for example API paths. Same format as no_wake_rules; no-wake rules and the built-in filters still win."
+  type = list(object({
+    name               = string
+    source_ips         = optional(list(string), [])
+    path_prefixes      = optional(list(string), [])
+    path_pattern       = optional(string)
+    user_agent_pattern = optional(string)
+    headers = optional(list(object({
+      name    = string
+      value   = optional(string)
+      pattern = optional(string)
+    })), [])
+  }))
+  default = []
+  validation {
+    condition     = alltrue([for r in var.wake_rules : can(regex("^[A-Za-z0-9._-]{1,64}$", r.name))]) && length(distinct([for r in var.wake_rules : r.name])) == length(var.wake_rules)
+    error_message = "wake_rules names must be unique, 1-64 characters among letters, digits, '.', '_' and '-'."
+  }
+  validation {
+    condition     = alltrue([for r in var.wake_rules : length(r.source_ips) + length(r.path_prefixes) + length(r.headers) > 0 || r.path_pattern != null || r.user_agent_pattern != null])
+    error_message = "Each wake rule needs at least one condition."
+  }
+  validation {
+    condition     = alltrue(flatten([for r in var.wake_rules : [for ip in r.source_ips : can(cidrhost(strcontains(ip, "/") ? ip : (strcontains(ip, ":") ? "${ip}/128" : "${ip}/32"), 0))]]))
+    error_message = "wake_rules source_ips must be IPv4/IPv6 addresses or CIDR ranges."
+  }
+  validation {
+    condition     = alltrue(flatten([for r in var.wake_rules : [for h in r.headers : (h.value == null) != (h.pattern == null)]]))
+    error_message = "Each wake_rules header needs either value or pattern."
+  }
+}

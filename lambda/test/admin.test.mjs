@@ -263,3 +263,25 @@ test('status.json and the dashboard list the router and workload no-wake rules',
   assert.match(page, /office \(workload\): source 198\.51\.100\.0\/24/);
   assert.match(page, /broken \(workload\): invalid/);
 });
+
+test('status.json and the dashboard show the wake mode and the wake rules', async () => {
+  const cfg = testConfig({
+    admin: { enabled: true, secretHash: hashSecret(SECRET) },
+    wakeMode: 'browser',
+    wakeRules: [{ name: 'api', pathPrefixes: ['/api/'] }],
+  });
+  const { handler } = setup({ run: { state: STATES.AWAKE }, cfg });
+  const status = JSON.parse((await handler(albEvent({ path: `${BASE}/status.json`, headers: { accept: 'application/json' } }))).body);
+  assert.equal(status.wakeMode, 'browser');
+  assert.deepEqual(status.wakeRules, [{ name: 'api', level: 'wake', conditions: { pathPrefixes: ['/api/'] } }]);
+  const page = (await handler(albEvent({ path: `${BASE}/` }))).body;
+  assert.match(page, /Wake mode<\/th><td>browser: the waiter page probe, the x-dormeto-wake header or a wake rule wakes/);
+  assert.match(page, /api \(wake\): path \/api\/\*/);
+});
+
+test('the wake mode defaults to any', async () => {
+  const { handler } = setup({ run: { state: STATES.AWAKE } });
+  const status = JSON.parse((await handler(albEvent({ path: `${BASE}/status.json`, headers: { accept: 'application/json' } }))).body);
+  assert.equal(status.wakeMode, 'any');
+  assert.deepEqual(status.wakeRules, []);
+});

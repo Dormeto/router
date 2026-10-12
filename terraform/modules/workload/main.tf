@@ -8,6 +8,14 @@ locals {
     userAgentPattern = r.user_agent_pattern
     headers          = [for h in r.headers : { name = h.name, value = h.value, pattern = h.pattern }]
   }]
+  wake_rules = [for r in var.wake_rules : {
+    name             = r.name
+    sourceIps        = r.source_ips
+    pathPrefixes     = r.path_prefixes
+    pathPattern      = r.path_pattern
+    userAgentPattern = r.user_agent_pattern
+    headers          = [for h in r.headers : { name = h.name, value = h.value, pattern = h.pattern }]
+  }]
 }
 
 resource "aws_lb_target_group" "waker" {
@@ -53,6 +61,8 @@ resource "aws_dynamodb_table_item" "config" {
       maxHolders              = var.max_holders
       pollSeconds             = var.poll_seconds
       noWakeRules             = local.no_wake_rules
+      wakeMode                = var.wake_mode
+      wakeRules               = local.wake_rules
       admin = {
         enabled    = var.admin_enabled && var.admin_secret != null
         secretHash = var.admin_enabled && var.admin_secret != null ? sha256(var.admin_secret) : ""

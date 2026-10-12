@@ -57,11 +57,15 @@ p{color:var(--muted)}
     }
     setTimeout(probe, pollMs);
   };
-  setTimeout(probe, pollMs);
+  // At once: in browser mode, this probe is what starts the wake.
+  probe();
 })();
 </script>
 </body>
 </html>`;
 }
 
-export const renderJson = ({ state, pollSeconds }) => JSON.stringify({ status: String(state).toLowerCase(), retryAfter: pollSeconds });
+// wakeHeader: in browser mode, tells API clients how to wake the workload.
+export const renderJson = ({ state, pollSeconds, wakeHeader }) => JSON.stringify({
+  status: String(state).toLowerCase(), retryAfter: pollSeconds, ...(wakeHeader ? { wakeHeader } : {}),
+});

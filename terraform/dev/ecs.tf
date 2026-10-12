@@ -170,9 +170,12 @@ resource "aws_lb_listener_rule" "admin_ecs" {
 }
 
 module "demo_ecs_workload" {
-  source                      = "../modules/workload"
-  router                      = module.router
-  workload_id                 = "demo-ecs"
+  source      = "../modules/workload"
+  router      = module.router
+  workload_id = "demo-ecs"
+  # Scanners that do not run JavaScript never wake it; API paths wake it directly.
+  wake_mode                   = "browser"
+  wake_rules                  = [{ name = "api", path_prefixes = ["/api/"] }]
   rule_arn                    = aws_lb_listener_rule.demo_ecs.arn
   app_target_group_arn        = aws_lb_target_group.ecs_app.arn
   app_target_group_arn_suffix = aws_lb_target_group.ecs_app.arn_suffix

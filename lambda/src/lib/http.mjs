@@ -40,16 +40,24 @@ export function clientIp(event) {
   return entries.at(-1) ?? '';
 }
 
-// { kind: 'probe' | 'normal' } or { kind: 'no-wake', reason }. No-wake rules come first, so that a client they match
-// never wakes the workload through the waiter page's probe either.
-export function classify(event, rules = []) {
+export const WAKE_HEADER = 'x-dormeto-wake';
+
+// { kind: 'no-wake', reason } | { kind: 'probe' } | { kind: 'normal', trigger?, deferred? }.
+// Filters first (no-wake rules, HEAD, bots, scanner paths), then the waiter probe: a client they match never wakes the
+// workload through the waiter page's probe either. In browser mode, a normal request wakes only with the wake header or
+// a wake rule (trigger); otherwise it is deferred to the page's probe.
+export function classify(event, rules = [], { browserMode = false, wakeRules = [] } = {}) {
   const rule = rules.find((r) => r.matches(event));
   if (rule) return { kind: 'no-wake', reason: `rule ${rule.name}` };
-  if (header(event, 'x-dormeto-probe') === '1') return { kind: 'probe' };
   if (event.httpMethod === 'HEAD') return { kind: 'no-wake', reason: 'HEAD' };
   if (BOT_PATTERN.test(header(event, 'user-agent') ?? '')) return { kind: 'no-wake', reason: 'bot user agent' };
   if (SCANNER_PATH.test(event.path ?? '')) return { kind: 'no-wake', reason: 'scanner path' };
-  return { kind: 'normal' };
+  if (header(event, 'x-dormeto-probe') === '1') return { kind: 'probe' };
+  if (!browserMode) return { kind: 'normal' };
+  if (header(event, WAKE_HEADER) === '1') return { kind: 'normal', trigger: 'header' };
+  const wakeRule = wakeRules.find((r) => r.matches(event));
+  if (wakeRule) return { kind: 'normal', trigger: `rule ${wakeRule.name}` };
+  return { kind: 'normal', deferred: true };
 }
 
 export function requestTarget(event) {

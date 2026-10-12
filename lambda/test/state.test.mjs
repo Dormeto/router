@@ -49,7 +49,7 @@ test('buildTransition builds a conditional update with version increment', () =>
 function fakeDynamo(handlers) {
   const calls = [];
   const wrap = (name) => async (input) => { calls.push([name, input]); return handlers[name](input); };
-  return { calls, getItem: wrap('getItem'), updateItem: wrap('updateItem'), scan: wrap('scan'), query: wrap('query') };
+  return { calls, getItem: wrap('getItem'), updateItem: wrap('updateItem'), scan: wrap('scan'), query: wrap('query'), deleteItem: wrap('deleteItem') };
 }
 
 test('store reads config and run items with strong consistency', async () => {
@@ -188,4 +188,63 @@ test('store records the last scheduled check in the ROUTER / CHECK item', async 
   assert.deepEqual(update.Key, { pk: { S: 'ROUTER' }, sk: { S: 'CHECK' } });
   assert.equal(update.UpdateExpression, 'SET #at = :at');
   assert.deepEqual(get.Key, { pk: { S: 'ROUTER' }, sk: { S: 'CHECK' } });
+});
+
+// --- Pauses ---------------------------------------------------------------------------------------------------------
+
+test('store writes a pause as one JSON attribute: PAUSE for an operator, PAUSE#<exclusion> for an exclusion', async () => {
+  const dynamo = fakeDynamo({ updateItem: async () => ({}) });
+  const store = createStore({ dynamo, table: 't' });
+  await store.putPause('demo', { by: 'ops@example.com', at: 42, reason: 'incident', keepAsleep: false });
+  await store.putPause(null, { by: 'ops@example.com', at: 43, reason: 'freeze', until: 99, keepAsleep: true });
+  await store.putPause('demo', { by: 'ops@example.com', at: 44, reason: 'excluded: migration', keepAsleep: false, exclusionId: 'x1' });
+  const [[, workload], [, router], [, exclusion]] = dynamo.calls;
+  assert.deepEqual(workload.Key, { pk: { S: 'WL#demo' }, sk: { S: 'PAUSE' } });
+  assert.equal(workload.UpdateExpression, 'SET #pause = :pause, #at = :at');
+  assert.deepEqual(JSON.parse(workload.ExpressionAttributeValues[':pause'].S), { by: 'ops@example.com', at: 42, reason: 'incident', keepAsleep: false });
+  assert.deepEqual(workload.ExpressionAttributeValues[':at'], { N: '42' });
+  assert.deepEqual(router.Key, { pk: { S: 'ROUTER' }, sk: { S: 'PAUSE' } });
+  assert.deepEqual(exclusion.Key, { pk: { S: 'WL#demo' }, sk: { S: 'PAUSE#x1' } });
+});
+
+test('store reads the pauses of a workload and of the router, and lists them all', async () => {
+  const item = (pk, sk, pause) => ({ pk: { S: pk }, sk: { S: sk }, pause: { S: JSON.stringify(pause) }, at: { N: String(pause.at) } });
+  const pages = [
+    { Items: [item('WL#demo', 'PAUSE', { at: 1, reason: 'a' }), item('ROUTER', 'PAUSE', { at: 2, reason: 'b' })], LastEvaluatedKey: { pk: { S: 'x' } } },
+    { Items: [item('WL#other', 'PAUSE#x1', { at: 3, reason: 'c', exclusionId: 'x1' })] },
+  ];
+  const dynamo = fakeDynamo({
+    query: async ({ ExpressionAttributeValues }) => ({ Items: ExpressionAttributeValues[':pk'].S === 'ROUTER' ? [item('ROUTER', 'PAUSE', { at: 2, reason: 'b' })] : [item('WL#demo', 'PAUSE', { at: 1, reason: 'a' })] }),
+    scan: async () => pages.shift(),
+  });
+  const store = createStore({ dynamo, table: 't' });
+  assert.deepEqual(await store.getPauses('demo'), [{ workloadId: 'demo', at: 1, reason: 'a' }]);
+  assert.deepEqual(await store.getPauses(null), [{ workloadId: null, at: 2, reason: 'b' }]);
+  assert.deepEqual(await store.listPauses(), [
+    { workloadId: 'demo', at: 1, reason: 'a' }, { workloadId: null, at: 2, reason: 'b' }, { workloadId: 'other', at: 3, reason: 'c', exclusionId: 'x1' },
+  ]);
+  const [[, workload], [, router], [, scan]] = dynamo.calls;
+  assert.equal(workload.KeyConditionExpression, '#pk = :pk AND begins_with(#sk, :pause)');
+  assert.deepEqual(workload.ExpressionAttributeValues, { ':pk': { S: 'WL#demo' }, ':pause': { S: 'PAUSE' } });
+  assert.equal(workload.ConsistentRead, true);
+  assert.deepEqual(router.ExpressionAttributeValues[':pk'], { S: 'ROUTER' });
+  assert.equal(scan.FilterExpression, 'begins_with(#sk, :pause)');
+});
+
+test('store deletes a pause, only if it is still the same one when its time is given', async () => {
+  const dynamo = fakeDynamo({
+    deleteItem: async ({ ConditionExpression }) => {
+      if (ConditionExpression) throw Object.assign(new Error('changed'), { name: 'ConditionalCheckFailedException' });
+      return {};
+    },
+  });
+  const store = createStore({ dynamo, table: 't' });
+  assert.equal(await store.deletePause('demo'), true);
+  assert.equal(await store.deletePause(null, { exclusionId: 'x1', at: 42 }), false);
+  const [[, plain], [, conditional]] = dynamo.calls;
+  assert.deepEqual(plain.Key, { pk: { S: 'WL#demo' }, sk: { S: 'PAUSE' } });
+  assert.equal(plain.ConditionExpression, undefined);
+  assert.deepEqual(conditional.Key, { pk: { S: 'ROUTER' }, sk: { S: 'PAUSE#x1' } });
+  assert.equal(conditional.ConditionExpression, '#at = :at');
+  assert.deepEqual(conditional.ExpressionAttributeValues, { ':at': { N: '42' } });
 });

@@ -750,7 +750,7 @@ function managerSetup({ run, defaultRules = [], lists = [] }) {
 test('list returns the router and its workloads from the state table', async () => {
   const s = managerSetup({ run: { state: STATES.ASLEEP, wakeCount: 3, updatedAt: 1_700_000_000_000 } });
   const result = await s.handler({ action: 'list' });
-  assert.deepEqual(result.router, { name: 'dmt-dev', version: '0.11.0', build: 'abc', checkSchedule: 'rate(5 minutes)', lastScheduledCheckAt: null });
+  assert.deepEqual(result.router, { name: 'dmt-dev', version: '0.11.0', build: 'abc', checkSchedule: 'rate(5 minutes)', lastScheduledCheckAt: null, pauses: [] });
   const [workload] = result.workloads;
   assert.equal(workload.workloadId, 'demo');
   assert.equal(workload.state, STATES.ASLEEP);

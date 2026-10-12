@@ -8,6 +8,9 @@ export const STATES = Object.freeze({
 
 const itemKey = (workloadId, sk) => ({ pk: { S: `WL#${workloadId}` }, sk: { S: sk } });
 const listKey = (name, sk) => ({ pk: { S: `LIST#${name}` }, sk: { S: sk } });
+// Pause of the router (workloadId null) or of a workload: PAUSE for an operator's pause, PAUSE#<id> for an exclusion's.
+const pauseKey = (workloadId, exclusionId) => ({ pk: { S: workloadId ? `WL#${workloadId}` : 'ROUTER' }, sk: { S: exclusionId ? `PAUSE#${exclusionId}` : 'PAUSE' } });
+const pauseOf = (item) => ({ workloadId: item.pk.S === 'ROUTER' ? null : item.pk.S.slice(3), ...JSON.parse(item.pause.S) });
 
 const DAY_MS = 86_400_000;
 const STATS_TTL_DAYS = 35;
@@ -196,6 +199,61 @@ export function createStore({ dynamo, table, now = Date.now }) {
         ExpressionAttributeNames: { '#at': 'lastScheduledCheckAt' },
         ExpressionAttributeValues: { ':at': { N: String(at) } },
       });
+    },
+
+    // Pauses (router management): one JSON attribute, and its time for a deletion that must not remove a newer pause.
+    async putPause(workloadId, pause) {
+      await dynamo.updateItem({
+        TableName: table,
+        Key: pauseKey(workloadId, pause.exclusionId),
+        UpdateExpression: 'SET #pause = :pause, #at = :at',
+        ExpressionAttributeNames: { '#pause': 'pause', '#at': 'at' },
+        ExpressionAttributeValues: { ':pause': { S: JSON.stringify(pause) }, ':at': { N: String(pause.at) } },
+      });
+    },
+
+    async getPauses(workloadId) {
+      const { Items = [] } = await dynamo.query({
+        TableName: table,
+        KeyConditionExpression: '#pk = :pk AND begins_with(#sk, :pause)',
+        ExpressionAttributeNames: { '#pk': 'pk', '#sk': 'sk' },
+        ExpressionAttributeValues: { ':pk': pauseKey(workloadId).pk, ':pause': { S: 'PAUSE' } },
+        ConsistentRead: true,
+      });
+      return Items.map(pauseOf);
+    },
+
+    async listPauses() {
+      const pauses = [];
+      let ExclusiveStartKey;
+      do {
+        const page = await dynamo.scan({
+          TableName: table,
+          FilterExpression: 'begins_with(#sk, :pause)',
+          ExpressionAttributeNames: { '#sk': 'sk' },
+          ExpressionAttributeValues: { ':pause': { S: 'PAUSE' } },
+          ConsistentRead: true,
+          ExclusiveStartKey,
+        });
+        pauses.push(...(page.Items ?? []).map(pauseOf));
+        ExclusiveStartKey = page.LastEvaluatedKey;
+      } while (ExclusiveStartKey);
+      return pauses;
+    },
+
+    // false when `at` is given and the pause changed meanwhile (a newer pause is kept).
+    async deletePause(workloadId, { exclusionId, at } = {}) {
+      try {
+        await dynamo.deleteItem({
+          TableName: table,
+          Key: pauseKey(workloadId, exclusionId),
+          ...(at === undefined ? {} : { ConditionExpression: '#at = :at', ExpressionAttributeNames: { '#at': 'at' }, ExpressionAttributeValues: { ':at': { N: String(at) } } }),
+        });
+        return true;
+      } catch (err) {
+        if (err?.name === 'ConditionalCheckFailedException') return false;
+        throw err;
+      }
     },
 
     async getCheck() {

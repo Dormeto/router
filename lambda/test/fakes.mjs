@@ -39,7 +39,8 @@ export function fakeClock(start = 1_700_000_000_000) {
 }
 
 export function fakeStore({ config, run, clock }) {
-  const state = { run: structuredClone(run), stats: {}, lists: {} };
+  const state = { run: structuredClone(run), stats: {}, lists: {}, pauses: [] };
+  const samePause = (workloadId, exclusionId) => (p) => p.workloadId === workloadId && (p.exclusionId ?? null) === (exclusionId ?? null);
   const list = (name) => (state.lists[name] ??= { meta: null, parts: {} });
   const copy = () => structuredClone(state.run);
   return {
@@ -64,6 +65,18 @@ export function fakeStore({ config, run, clock }) {
     async count(id, counter) { state.stats[counter] = (state.stats[counter] ?? 0) + 1; },
     async recordScheduledCheck(at) { state.check = { ...(state.check ?? {}), lastScheduledCheckAt: at }; },
     async getCheck() { return structuredClone(state.check ?? null); },
+    // Pauses: { workloadId (null for the router), by, at, reason, until?, keepAsleep, exclusionId? }.
+    async putPause(workloadId, pause) {
+      state.pauses = [...state.pauses.filter((p) => !samePause(workloadId, pause.exclusionId)(p)), { workloadId, ...structuredClone(pause) }];
+    },
+    async getPauses(workloadId) { return structuredClone(state.pauses.filter((p) => p.workloadId === workloadId)); },
+    async listPauses() { return structuredClone(state.pauses); },
+    async deletePause(workloadId, { exclusionId, at } = {}) {
+      const found = state.pauses.find(samePause(workloadId, exclusionId));
+      if (!found || (at !== undefined && found.at !== at)) return at === undefined;
+      state.pauses = state.pauses.filter((p) => p !== found);
+      return true;
+    },
     async getListMeta(name) { return structuredClone(state.lists[name]?.meta ?? null); },
     async setListMeta(name, set, remove = []) {
       const l = list(name);

@@ -22,6 +22,9 @@ const WAKING_STUCK_GRACE_MS = 60_000;
 const TIMEOUT_MARGIN_MS = 30_000;
 // Held requests last at most waitSeconds: a counter untouched for longer is a leak (killed waker).
 const HOLDERS_STALE_MS = 2 * 60_000;
+// Pauses (router management): automatic resume at most this far ahead, reason length.
+const PAUSE_MAX_MS = 366 * 86_400_000;
+const REASON_MAX = 256;
 
 export function createController({
   store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, invokeSelf, now = Date.now, sleep, newId = randomUUID, log,
@@ -103,6 +106,11 @@ export function createController({
 
   async function nap(workloadId) {
     const cfg = await config(workloadId);
+    // A nap requested before a pause (idle check, manager) is refused when it starts.
+    if (await isPaused(workloadId)) {
+      log.warn('NapSkipped', { workloadId, reason: 'paused' });
+      return { state: 'SKIPPED', reason: 'paused' };
+    }
     const backends = await managedBackends(cfg);
     if (!backends.length) {
       // Diverting traffic to the waker with nothing to stop or start would only break the application.
@@ -125,8 +133,10 @@ export function createController({
     try {
       await routeTo(cfg, 'waker');
       await sleep(cfg.drainSeconds * 1000);
-      // Commit point: after this transition the instances are stopped even if a request arrives.
-      const committed = await store.transition(workloadId, { cond: { state: STATES.NAPPING, pendingWake: false }, set: { stopping: true } });
+      // Commit point: after this transition the instances are stopped even if a request arrives. A pause written since the
+      // nap started aborts it, like a request.
+      const paused = await isPaused(workloadId);
+      const committed = !paused && (await store.transition(workloadId, { cond: { state: STATES.NAPPING, pendingWake: false }, set: { stopping: true } }));
       if (!committed) {
         await routeTo(cfg, 'app');
         await store.transition(workloadId, {
@@ -134,7 +144,7 @@ export function createController({
           set: { state: STATES.AWAKE, awakeSince: now() },
           remove: ['pendingWake', 'stopping'],
         });
-        log.info('NapAborted', { workloadId });
+        log.info('NapAborted', { workloadId, ...(paused ? { reason: 'paused' } : {}) });
         return { state: STATES.AWAKE, aborted: true };
       }
       await sleepBackends(clients, backends, { sleep, now, deadline: now() + STOP_TIMEOUT_MS });
@@ -250,7 +260,7 @@ export function createController({
     return run;
   }
 
-  async function checkOne(cfg) {
+  async function checkOne(cfg, paused) {
     const run = await reconcile(cfg);
     if (!run || run.state !== STATES.AWAKE) return { state: run?.state ?? 'UNKNOWN' };
     if (!run.awakeSince) {
@@ -258,6 +268,7 @@ export function createController({
       await store.transition(cfg.workloadId, { cond: { state: STATES.AWAKE }, set: { awakeSince: now() } });
       return { state: run.state };
     }
+    if (paused) return { state: run.state, paused: true };
     const t = now();
     const idleMs = cfg.idleMinutes * 60_000;
     if ((run.awakeSince ?? 0) > t - idleMs) return { state: run.state };
@@ -289,18 +300,27 @@ export function createController({
   async function list() {
     const configs = await store.listConfigs();
     const byWorkload = await workloadHosts(configs);
+    let pausesError;
+    const pauses = await store.listPauses().catch((err) => {
+      pausesError = err.message;
+      log.warn('PausesUnreadable', { error: err.message });
+      return [];
+    });
+    const routerPauses = pauses.filter((p) => p.workloadId === null);
     const workloads = await Promise.all(configs.map(async (cfg) => {
       const [run, stats] = await Promise.all([
         store.getRun(cfg.workloadId),
         store.getStats(cfg.workloadId, STATS_DAYS).catch(() => null),
       ]);
-      return workloadSummary(cfg, run, byWorkload.get(cfg.workloadId), totals(stats));
+      const own = pauses.filter((p) => p.workloadId === cfg.workloadId);
+      return workloadSummary(cfg, run, byWorkload.get(cfg.workloadId), totals(stats), shownPauses([...own, ...routerPauses]));
     }));
     const health = await store.getCheck().catch(() => null);
     return {
       router: {
         name: router.name, version: router.version, build: router.build, checkSchedule: router.checkSchedule ?? null,
         lastScheduledCheckAt: health?.lastScheduledCheckAt ? new Date(health.lastScheduledCheckAt).toISOString() : null,
+        pauses: shownPauses(routerPauses), ...(pausesError ? { pausesError } : {}),
       },
       workloads,
     };
@@ -310,6 +330,7 @@ export function createController({
     const cfg = await config(workloadId);
     const run = await store.getRun(workloadId);
     return status(workloadId, cfg, run ?? {}, {
+      pauses: await pausesFor(workloadId),
       noWakeRules: describeRules([{ level: 'router', rules: defaultRules }, { level: 'workload', rules: cfg.noWakeRules }]),
       wakeRules: describeRules([{ level: 'wake', rules: cfg.wakeRules }]),
       loadStats: () => store.getStats(workloadId, STATS_DAYS),
@@ -342,8 +363,8 @@ export function createController({
     }
     if (run?.state === STATES.NAPPING) {
       if (await store.setPendingWake(workloadId)) {
-        log.info('PendingWake', { workloadId, trigger: { kind: 'manager', by } });
-        await count(workloadId, 'wake:manager');
+        log.info('PendingWake', { workloadId, trigger: { kind, by } });
+        await count(workloadId, `wake:${kind}`);
       }
       return { state: STATES.NAPPING, pendingWake: true };
     }
@@ -369,10 +390,13 @@ export function createController({
       await store.recordScheduledCheck(now()).catch((err) => log.warn('CheckRecordFailed', { error: err.message }));
     }
     await requestListRefresh();
+    const pauses = await activePauses();
+    // Pauses that cannot be read stop every nap of this check (the reconcile still runs).
+    const paused = (workloadId) => pauses === null || pauses.some((p) => p.workloadId === null || p.workloadId === workloadId);
     const results = [];
     for (const cfg of await store.listConfigs()) {
       try {
-        results.push({ workloadId: cfg.workloadId, ...(await checkOne(cfg)) });
+        results.push({ workloadId: cfg.workloadId, ...(await checkOne(cfg, paused(cfg.workloadId))) });
       } catch (err) {
         log.error('CheckFailed', { workloadId: cfg.workloadId, error: err.message });
         results.push({ workloadId: cfg.workloadId, error: err.message });
@@ -391,6 +415,112 @@ export function createController({
     return { state: run.state, changed: repaired.length > 0 };
   }
 
+  // --- Pauses: a paused workload (or every workload of a paused router) is never napped ------------------------------
+
+  const iso = (ms) => new Date(ms).toISOString();
+  const expired = (p) => p.until !== undefined && p.until <= now();
+  // Exclusions first, then the workload's own pause, then the router's; the newest first within each.
+  const rank = (p) => (p.exclusionId ? 0 : p.workloadId ? 1 : 2);
+  const shownPauses = (pauses) => pauses.filter((p) => !expired(p)).sort((a, b) => rank(a) - rank(b) || b.at - a.at)
+    .map(({ workloadId, by, at, reason, until, keepAsleep, exclusionId }) => ({
+      scope: workloadId ? 'workload' : 'router', by, at: iso(at), reason, until: until === undefined ? null : iso(until), keepAsleep: keepAsleep === true,
+      ...(exclusionId ? { exclusionId } : {}),
+    }));
+  const pauseText = (p) => `${p.scope === 'router' ? 'router ' : ''}paused by ${p.by}: ${p.reason}`;
+
+  // Active pauses of a workload: its own and its router's.
+  async function pausesFor(workloadId) {
+    const [own, routerPauses] = await Promise.all([store.getPauses(workloadId), store.getPauses(null)]);
+    return shownPauses([...own, ...routerPauses]);
+  }
+
+  // A nap needs to know: pauses that cannot be read count as a pause.
+  async function isPaused(workloadId) {
+    try {
+      return (await pausesFor(workloadId)).length > 0;
+    } catch (err) {
+      log.warn('PausesUnreadable', { workloadId, error: err.message });
+      return true;
+    }
+  }
+
+  // Every active pause, null when they cannot be read; the expired ones are deleted (unless a newer pause replaced them).
+  async function activePauses() {
+    let pauses;
+    try {
+      pauses = await store.listPauses();
+    } catch (err) {
+      log.warn('PausesUnreadable', { error: err.message });
+      return null;
+    }
+    for (const p of pauses.filter(expired)) {
+      const deleted = await store.deletePause(p.workloadId, { exclusionId: p.exclusionId, at: p.at }).catch((err) => {
+        log.warn('PauseDeleteFailed', { workloadId: p.workloadId, error: err.message });
+        return false;
+      });
+      if (deleted) log.info('PauseExpired', { workloadId: p.workloadId, by: p.by, reason: p.reason, ...(p.exclusionId ? { exclusionId: p.exclusionId } : {}) });
+    }
+    return pauses.filter((p) => !expired(p));
+  }
+
+  function pauseRecord({ by, reason, until, keepAsleep, exclusionId }) {
+    const text = typeof reason === 'string' ? reason.trim() : '';
+    if (!text || text.length > REASON_MAX) throw new Error(`reason required (1 to ${REASON_MAX} characters)`);
+    let untilMs;
+    if (until !== undefined && until !== null) {
+      untilMs = typeof until === 'number' ? until : Date.parse(until);
+      if (!(untilMs > now() && untilMs <= now() + PAUSE_MAX_MS)) throw new Error('until must be in the future, within 366 days');
+    }
+    return {
+      by: by ?? 'unknown', at: now(), reason: text, ...(untilMs === undefined ? {} : { until: untilMs }), keepAsleep: keepAsleep === true,
+      ...(exclusionId ? { exclusionId: String(exclusionId) } : {}),
+    };
+  }
+
+  // Pause the router (no workloadId) or a workload; unless keepAsleep, its asleep and failed workloads are woken and a
+  // napping one gets a pending wake.
+  async function pause(event) {
+    const workloadId = event.workloadId ?? null;
+    if (workloadId) await config(workloadId);
+    const record = pauseRecord(event);
+    await store.putPause(workloadId, record);
+    log.info('Paused', { workloadId, ...record });
+    const woken = [];
+    if (!record.keepAsleep) {
+      const ids = workloadId ? [workloadId] : (await store.listConfigs()).map((c) => c.workloadId);
+      for (const id of ids) {
+        try {
+          const result = await forceWake(id, record.by, 'pause');
+          if (result.state === STATES.WAKING || result.pendingWake) woken.push(id);
+        } catch (err) {
+          log.error('PauseWakeFailed', { workloadId: id, error: err.message });
+        }
+      }
+    }
+    return { pause: shownPauses([{ workloadId, ...record }])[0], woken };
+  }
+
+  // Resume removes one pause: the operator's, or the given exclusion's; the router's and the others stay.
+  async function resume({ workloadId = null, by, exclusionId }) {
+    const existing = (await store.getPauses(workloadId ?? null)).find((p) => (p.exclusionId ?? null) === (exclusionId ?? null));
+    if (!existing) return { resumed: false };
+    await store.deletePause(workloadId ?? null, { exclusionId });
+    log.info('Resumed', { workloadId: workloadId ?? null, by, ...(exclusionId ? { exclusionId } : {}) });
+    return { resumed: true };
+  }
+
+  // Manager nap: refused at once with the reason, else run in its own invocation (a nap outlasts the API call).
+  async function requestNap({ workloadId, by }) {
+    await config(workloadId);
+    const run = await store.getRun(workloadId);
+    if (run?.state !== STATES.AWAKE) return { requested: false, reason: `not awake (${run?.state ?? 'UNKNOWN'})` };
+    const [first] = await pausesFor(workloadId);
+    if (first) return { requested: false, reason: pauseText(first) };
+    await invokeSelf({ action: 'nap', workloadId });
+    log.info('NapRequested', { workloadId, trigger: { kind: 'manager', by } });
+    return { requested: true };
+  }
+
   return async function handler(event, context) {
     const remaining = context?.getRemainingTimeInMillis?.();
     budgetEnd = typeof remaining === 'number' ? now() + remaining - TIMEOUT_MARGIN_MS : Infinity;
@@ -403,6 +533,9 @@ export function createController({
       case 'list': return list();
       case 'status': return workloadStatus(event.workloadId);
       case 'force-wake': return forceWake(event.workloadId, event.by);
+      case 'pause': return pause(event);
+      case 'resume': return resume(event);
+      case 'request-nap': return requestNap(event);
       default: throw new Error(`unknown action: ${event?.action}`);
     }
   };

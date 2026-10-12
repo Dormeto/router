@@ -8,7 +8,7 @@ const sum = (counts = {}) => Object.values(counts).reduce((total, n) => total + 
 // 7-day totals of the daily statistics (null when they could not be read).
 export const totals = (stats) => (stats ? { ignored: sum(stats.total.ignored), deferred: sum(stats.total.deferred), wakes: sum(stats.total.wakes) } : null);
 
-export function workloadSummary(cfg, run = {}, host = null, stats7d = null) {
+export function workloadSummary(cfg, run = {}, host = null, stats7d = null, pauses = []) {
   return {
     workloadId: cfg.workloadId,
     state: run?.state ?? 'UNKNOWN',
@@ -20,6 +20,7 @@ export function workloadSummary(cfg, run = {}, host = null, stats7d = null) {
     failedAt: iso(run?.failedAt),
     updatedAt: iso(run?.updatedAt),
     pendingWake: run?.pendingWake === true,
+    pauses,
     stats7d,
     settings: {
       waitSeconds: cfg.waitSeconds,

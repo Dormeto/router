@@ -1,4 +1,4 @@
-import { DynamoDBClient, GetItemCommand, QueryCommand, ScanCommand, UpdateItemCommand } from '@aws-sdk/client-dynamodb';
+import { DeleteItemCommand, DynamoDBClient, GetItemCommand, QueryCommand, ScanCommand, UpdateItemCommand } from '@aws-sdk/client-dynamodb';
 
 export function createDynamo(client = new DynamoDBClient({})) {
   return {
@@ -6,5 +6,6 @@ export function createDynamo(client = new DynamoDBClient({})) {
     updateItem: (input) => client.send(new UpdateItemCommand(input)),
     scan: (input) => client.send(new ScanCommand(input)),
     query: (input) => client.send(new QueryCommand(input)),
+    deleteItem: (input) => client.send(new DeleteItemCommand(input)),
   };
 }

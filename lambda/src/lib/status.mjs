@@ -21,7 +21,7 @@ const iso = (ms) => (typeof ms === 'number' && ms > 0 ? new Date(ms).toISOString
 export function createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, now = Date.now, version = {} }) {
   const clients = { ec2, elbv2, autoscaling, ecs, tagging, appscaling, rds };
   // Extras that depend on the caller: router rules, wake rules, statistics and IP lists loaders.
-  return async function status(workloadId, cfg, run, { noWakeRules = [], wakeRules = [], loadStats = null, loadLists = null } = {}) {
+  return async function status(workloadId, cfg, run, { pauses = [], noWakeRules = [], wakeRules = [], loadStats = null, loadLists = null } = {}) {
     const t = now();
     const resolved = await resolveBackends(clients, cfg);
     const instanceIds = resolved.backends.filter((b) => b.kind === 'instance').map((b) => b.id);
@@ -32,7 +32,8 @@ export function createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging
       resolveRules(elbv2, [cfg]).then((found) => found.get(cfg.workloadId)),
       lastRequestAt(cloudwatch, cfg, t - cfg.idleMinutes * 60_000, t),
     ]);
-    const nap = napEstimate({ cfg, run, lastRequest, now: t });
+    // Paused: never napped, no estimate.
+    const nap = pauses.length ? null : napEstimate({ cfg, run, lastRequest, now: t });
     return {
       workloadId,
       router: { version: version.version ?? 'unknown', build: version.build ?? 'unknown' },
@@ -44,6 +45,7 @@ export function createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging
       wakeCount: run.wakeCount ?? 0,
       holders: run.holders ?? 0,
       pendingWake: run.pendingWake === true,
+      pauses,
       lastRequestAt: iso(lastRequest),
       nap: nap && { eligibleAt: iso(nap.eligibleAt), latestAt: iso(nap.latestAt), inSeconds: nap.inSeconds },
       // The route over the instrumented rules; every rule forwarding to the target group, with the issue of those the router

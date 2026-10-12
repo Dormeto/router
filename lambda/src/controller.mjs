@@ -37,7 +37,8 @@ const download = (url) => downloadText(url, { getObject: s3?.getObject });
 const queues = JSON.parse(process.env.DMT_FAILURE_QUEUES || '{}');
 // The work queue (routers 0.22.0 and later): naps and the wakes of a router pause, read 10 at a time.
 const workQueue = process.env.DMT_WORK_QUEUE;
-const sqs = Object.values(queues).some(Boolean) || workQueue ? createSqs() : null;
+const driftQueue = process.env.DMT_DRIFT_QUEUE;
+const sqs = Object.values(queues).some(Boolean) || workQueue || driftQueue ? createSqs() : null;
 
 export const handler = createController({
   store,
@@ -55,6 +56,7 @@ export const handler = createController({
   log: logger,
   sqs,
   queueWork: workQueue ? (message) => sqs.sendMessage({ QueueUrl: workQueue, MessageBody: JSON.stringify(message) }) : null,
+  queueRepair: driftQueue ? (message) => sqs.sendMessage({ QueueUrl: driftQueue, MessageBody: JSON.stringify(message) }) : null,
   lambda,
   publisher,
   // Drift repair of the workloads the manager onboarded (R4c).

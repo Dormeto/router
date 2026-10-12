@@ -50,7 +50,7 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
       allow(['application-autoscaling:RegisterScalableTarget'], [arn('application-autoscaling', 'scalable-target/*')]),
       allow(['autoscaling:UpdateAutoScalingGroup', 'autoscaling:SuspendProcesses', 'autoscaling:ResumeProcesses'], [arn('autoscaling', 'autoScalingGroup:*:autoScalingGroupName/*')], tagged),
       allow(['lambda:InvokeFunction'], [functionArn('controller'), functionArn('onboarder')]),
-      allow(['sqs:SendMessage'], [queueArn('controller-failures'), queueArn('work')]),
+      allow(['sqs:SendMessage'], [queueArn('controller-failures'), queueArn('work'), queueArn('drift')]),
       allow(['sqs:ReceiveMessage', 'sqs:DeleteMessage', 'sqs:GetQueueAttributes', 'sqs:ChangeMessageVisibility'], [queueArn('work')]),
       allow(['sqs:GetQueueAttributes'], [queueArn('controller-failures'), queueArn('check-failures')]),
       allow(['events:PutEvents'], [p.managerBus]),
@@ -120,7 +120,7 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
         environment: {
           ...common, DMT_IP_LISTS: p.ipLists, DMT_NO_WAKE_RULES: p.noWakeRules, DMT_CHECK_SCHEDULE: p.checkSchedule, DMT_METRICS: p.metrics,
           DMT_WAKER_FUNCTION: fn('waker'), DMT_FAILURE_QUEUES: `{"check":"${queueUrl('check-failures')}","controller":"${queueUrl('controller-failures')}"}`,
-          DMT_ONBOARDER: fn('onboarder'), DMT_MANAGER_BUS: p.managerBus, DMT_WORK_QUEUE: queueUrl('work'),
+          DMT_ONBOARDER: fn('onboarder'), DMT_MANAGER_BUS: p.managerBus, DMT_WORK_QUEUE: queueUrl('work'), DMT_DRIFT_QUEUE: queueUrl('drift'),
         },
         // Retries would duplicate wakes and naps; stale events are dropped; failures land in a queue.
         asyncInvoke: { maximumRetryAttempts: 0, maximumEventAgeInSeconds: 120, onFailure: queueArn('controller-failures') },

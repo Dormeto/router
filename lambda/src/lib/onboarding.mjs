@@ -645,11 +645,12 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
 
   // Drift events read from the router's queue in a batch (scale design §6): each workload they concern repaired once,
   // however many events name it; a workload offboarded since has no configuration left, so nothing is repaired.
-  async function repairEvents(details) {
+  // requested: the workloads the idle check asked to repair (by: check), each repaired once with those the events concern.
+  async function repairEvents(details, requested = []) {
     const names = [...new Set(details.map((d) => d?.eventName ?? 'unknown'))].join(',');
-    const by = `event:${names}`;
     const workloads = [];
-    for (const cfg of (await store.listConfigs()).filter((c) => c.source && details.some((d) => concerns(c, d)))) {
+    for (const cfg of (await store.listConfigs()).filter((c) => c.source && (requested.includes(c.workloadId) || details.some((d) => concerns(c, d))))) {
+      const by = details.some((d) => concerns(cfg, d)) ? `event:${names}` : 'check';
       try {
         const { repaired } = await repair({ workloadId: cfg.workloadId, by });
         workloads.push({ workloadId: cfg.workloadId, repaired: repaired.map((e) => e.kind) });
@@ -661,5 +662,15 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
     return { workloads };
   }
 
-  return { preview, onboard, offboard, repair, repairAll, repairEvents };
+  // A batch of the drift queue: CloudTrail events of the router's drift rule and the idle check's repair requests, each
+  // workload repaired once; a failing repair is retried by the next check, never by the queue (no message comes back).
+  async function repairBatch(records) {
+    const bodies = records.map((r) => { try { return JSON.parse(r.body); } catch { return null; } }).filter(Boolean);
+    const details = bodies.filter((b) => b.action !== 'repair' && b.detail).map((b) => b.detail);
+    const requested = [...new Set(bodies.filter((b) => b.action === 'repair' && b.workloadId).map((b) => b.workloadId))];
+    const { workloads } = details.length || requested.length ? await repairEvents(details, requested) : { workloads: [] };
+    return { batchItemFailures: [], workloads };
+  }
+
+  return { preview, onboard, offboard, repair, repairAll, repairEvents, repairBatch };
 }

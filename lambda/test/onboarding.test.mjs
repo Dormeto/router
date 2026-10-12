@@ -540,6 +540,19 @@ test('drift events read in one batch repair each workload they concern once; a w
   assert.deepEqual(await s.onboarding.repairEvents([deleted]), { workloads: [] });
 });
 
+test('a drift batch repairs each workload once, whether drift events or the idle check asked for it; an unreadable message is dropped', async () => {
+  const s = await onboarded();
+  const shadow = shadowsOf(s.a)[0];
+  s.a.state.rules.delete(shadow.arn);
+  const event = (detail) => ({ messageId: 'e', body: JSON.stringify({ 'detail-type': 'AWS API Call via CloudTrail', detail }) });
+  const request = (workloadId) => ({ messageId: 'r', body: JSON.stringify({ action: 'repair', workloadId, by: 'check' }) });
+  const both = await s.onboarding.repairBatch([event({ eventName: 'DeleteRule', requestParameters: { ruleArn: shadow.arn } }), request('shop'), request('shop'), { messageId: 'x', body: 'not json' }]);
+  assert.deepEqual(both, { batchItemFailures: [], workloads: [{ workloadId: 'shop', repaired: ['shadow created'] }] });
+  // Asked by the idle check alone.
+  s.a.state.rules.delete(shadowsOf(s.a)[0].arn);
+  assert.deepEqual(await s.onboarding.repairBatch([request('shop')]), { batchItemFailures: [], workloads: [{ workloadId: 'shop', repaired: ['shadow created'] }] });
+});
+
 test('the preview refuses an onboarding its load balancer or region has no room for, with the reason', async () => {
   // A load balancer at its 100 target groups (not adjustable): no room for the waker target group.
   const full = setup();

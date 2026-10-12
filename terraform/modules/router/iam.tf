@@ -144,7 +144,7 @@ data "aws_iam_policy_document" "controller" {
   statement {
     # Failed invocations, and the work queue (naps and the wakes of a router pause).
     actions   = ["sqs:SendMessage"]
-    resources = [aws_sqs_queue.controller_failures.arn, aws_sqs_queue.work.arn]
+    resources = [aws_sqs_queue.controller_failures.arn, aws_sqs_queue.work.arn, aws_sqs_queue.drift.arn]
   }
   statement {
     # The controller reads the work queue (event source mapping).

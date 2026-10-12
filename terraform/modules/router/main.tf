@@ -81,12 +81,15 @@ resource "aws_lambda_function" "controller" {
       DMT_METRICS        = tostring(var.metrics_enabled)
       DMT_WAKER_FUNCTION = "${var.name}-waker"
       DMT_FAILURE_QUEUES = jsonencode({ check = aws_sqs_queue.check_failures.url, controller = aws_sqs_queue.controller_failures.url })
-      # Drift repair of the workloads the manager onboarded, requested by the idle check.
+      # Drift repair of the workloads the manager onboarded, requested by the idle check (a router without the drift
+      # queue invokes the onboarder).
       DMT_ONBOARDER = "${var.name}-onboarder"
       # The manager's event bus (scale design §3): empty, the router publishes nothing.
       DMT_MANAGER_BUS = var.manager_event_bus_arn == null ? "" : var.manager_event_bus_arn
       # The work queue (scale design §6): naps and the wakes of a router pause.
       DMT_WORK_QUEUE = aws_sqs_queue.work.url
+      # The drift queue: the idle check's repair requests, read with the drift events.
+      DMT_DRIFT_QUEUE = aws_sqs_queue.drift.url
     }
   }
 

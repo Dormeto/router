@@ -184,6 +184,11 @@ test('naps and router-pause wakes go to a queue the controller reads 10 at a tim
   const statements = (role) => b.roles.find((r) => r.key === role).policy.Statement;
   const allows = (role, action, resource) => statements(role).some((st) => [].concat(st.Action).includes(action) && [].concat(st.Resource).includes(resource));
   assert.ok(allows('controller', 'sqs:SendMessage', sqs('dmtr-dev-work')));
+  // The idle check's repair requests go to the drift queue, read with the drift events.
+  assert.equal(b.functions.find((f) => f.key === 'controller').environment.DMT_DRIFT_QUEUE, 'https://sqs.eu-west-3.amazonaws.com/121014831971/dmtr-dev-drift');
+  assert.ok(allows('controller', 'sqs:SendMessage', sqs('dmtr-dev-drift')));
+  assert.match(module, /DMT_DRIFT_QUEUE\s+=\s+aws_sqs_queue\.drift\.url/);
+  assert.match(await readFile(IAM_TF, 'utf8'), /actions\s+=\s+\["sqs:SendMessage"\]\s+resources\s+=\s+\[aws_sqs_queue\.controller_failures\.arn, aws_sqs_queue\.work\.arn, aws_sqs_queue\.drift\.arn\]/);
   for (const [role, key] of [['controller', 'work'], ['onboarder', 'drift']]) {
     for (const action of ['sqs:ReceiveMessage', 'sqs:DeleteMessage', 'sqs:GetQueueAttributes', 'sqs:ChangeMessageVisibility']) assert.ok(allows(role, action, sqs(`dmtr-dev-${key}`)), `${role} ${action} on ${key}`);
   }

@@ -47,6 +47,8 @@ export function createController({
   lists = null, router = {}, defaultRules = [], ipLists = [], sqs = null, lambda = null, invokeOnboarder = null,
   // The router's work queue (scale design §6): naps and the wakes of a router pause, run at most 10 at a time.
   queueWork = null,
+  // The drift queue: the check's repair requests, read with the drift events by the onboarder (2 at a time).
+  queueRepair = null,
   publisher = { enabled: false, checked: async () => {}, stateChanged: async () => {} },
 }) {
   const clients = { ec2, elbv2, autoscaling, ecs, tagging, appscaling, rds };
@@ -262,9 +264,9 @@ export function createController({
       // A workload the manager onboarded: the onboarder re-applies what drifted (a shadow deleted, a new customer rule) and
       // removes the orphan shadows; a failure is retried at the next check, never stopping this one.
       const repairable = [...found.issues.filter((i) => i.repairable), ...(found.orphans ?? [])];
-      if (cfg.source && invokeOnboarder && repairable.length) {
+      if (cfg.source && (queueRepair || invokeOnboarder) && repairable.length) {
         try {
-          await invokeOnboarder({ action: 'repair', workloadId, by: 'check' });
+          await (queueRepair ?? invokeOnboarder)({ action: 'repair', workloadId, by: 'check' });
           log.info('RepairRequested', { workloadId, issues: reasons(repairable) });
         } catch (err) {
           log.error('RepairRequestFailed', { workloadId, error: err.message });

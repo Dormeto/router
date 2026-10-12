@@ -240,6 +240,24 @@ test('the idle check asks the onboarder to repair a manager workload with a repa
   }
 });
 
+test('with a drift queue, the idle check queues its repair requests (read 2 at a time with the drift events), never invoking the onboarder', async () => {
+  const s = setup({ run: { state: STATES.AWAKE, awakeSince: 1 } });
+  const queued = [];
+  const invoked = [];
+  const handler = createController({
+    store: s.store, ec2: fakeEc2(s.cfg.instanceIds), elbv2: s.elbv2, cloudwatch: fakeCloudWatch([1]), autoscaling: fakeAutoScaling(), ecs: fakeEcs(), tagging: fakeTagging(fakeEcs()), appscaling: fakeAppScaling(),
+    invokeSelf: async () => {}, invokeOnboarder: async (payload) => { invoked.push(payload); }, queueRepair: async (message) => { queued.push(message); },
+    now: s.clock.now, sleep: s.clock.sleep, log: { info() {}, warn() {}, error() {} },
+  });
+  s.store.getConfig = async () => ({ ...s.cfg, source: 'manager' });
+  s.store.listConfigs = async () => [{ ...s.cfg, source: 'manager' }];
+  const appOnly = [{ Type: 'forward', Order: 1, ForwardConfig: { TargetGroups: [{ TargetGroupArn: s.cfg.appTargetGroupArn, Weight: 1 }] } }];
+  s.elbv2.state.rules.set('arn:rule/new', { actions: appOnly, priority: '30', tags: {} });
+  await handler({ action: 'check' });
+  assert.deepEqual(queued, [{ action: 'repair', workloadId: 'demo', by: 'check' }]);
+  assert.deepEqual(invoked, []);
+});
+
 test('status lists the latest drift repairs, and the router health counts those of the last 24 hours', async () => {
   const s = setup({ run: { state: STATES.AWAKE } });
   s.store.state.drift = [

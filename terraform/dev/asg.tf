@@ -117,6 +117,44 @@ resource "aws_lb_listener_rule" "demo_asg" {
   }
 }
 
+# A second rule of the same workload (same target group): Dormeto switches both rules together.
+resource "aws_lb_listener_rule" "demo_asg_static" {
+  listener_arn = aws_lb_listener.https.arn
+  priority     = 19
+
+  condition {
+    host_header {
+      values = [local.asg_domain]
+    }
+  }
+
+  condition {
+    path_pattern {
+      values = ["/static/*"]
+    }
+  }
+
+  action {
+    type = "forward"
+    forward {
+      target_group {
+        arn    = aws_lb_target_group.asg_app.arn
+        weight = 1
+      }
+      target_group {
+        arn    = module.demo_asg_workload.waker_target_group_arn
+        weight = 0
+      }
+    }
+  }
+
+  tags = { "dormeto:workload" = "demo-asg" }
+
+  lifecycle {
+    ignore_changes = [action]
+  }
+}
+
 resource "aws_lb_listener_rule" "admin_asg" {
   count        = var.admin_dashboard_enabled ? 1 : 0
   listener_arn = aws_lb_listener.https.arn
@@ -146,7 +184,7 @@ module "demo_asg_workload" {
   source                      = "../modules/workload"
   router                      = module.router
   workload_id                 = "demo-asg"
-  rule_arn                    = aws_lb_listener_rule.demo_asg.arn
+  rule_arns                   = [aws_lb_listener_rule.demo_asg.arn, aws_lb_listener_rule.demo_asg_static.arn]
   app_target_group_arn        = aws_lb_target_group.asg_app.arn
   app_target_group_arn_suffix = aws_lb_target_group.asg_app.arn_suffix
   load_balancer_arn_suffix    = aws_lb.demo.arn_suffix

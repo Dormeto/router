@@ -17,7 +17,19 @@ variable "workload_id" {
 }
 
 variable "rule_arn" {
-  type = string
+  description = "The listener rule of a workload with a single rule (rule_arns for several)."
+  type        = string
+  default     = null
+}
+
+variable "rule_arns" {
+  description = "Listener rules forwarding to the application target group, switched together (1 to 10). Each forwards to the application and waker target groups (weighted forward), carries the tag dormeto:workload = <workload_id> and ignores changes to its action."
+  type        = list(string)
+  default     = []
+  validation {
+    condition     = length(var.rule_arns) <= 10 && (length(var.rule_arns) > 0) != (var.rule_arn != null)
+    error_message = "Set either rule_arn or rule_arns (1 to 10 rules), not both."
+  }
 }
 
 variable "app_target_group_arn" {

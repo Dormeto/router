@@ -1,4 +1,5 @@
 locals {
+  rule_arns = length(var.rule_arns) > 0 ? var.rule_arns : [var.rule_arn]
   # camelCase JSON for the Lambdas; unset conditions stay null or empty (ignored).
   no_wake_rules = [for r in var.no_wake_rules : {
     name             = r.name
@@ -46,8 +47,10 @@ resource "aws_dynamodb_table_item" "config" {
     pk = { S = "WL#${var.workload_id}" }
     sk = { S = "CFG" }
     config = { S = jsonencode({
-      workloadId              = var.workload_id
-      ruleArn                 = var.rule_arn
+      workloadId = var.workload_id
+      ruleArns   = local.rule_arns
+      # Routers before 0.14.0 read one rule: keep it during an upgrade.
+      ruleArn                 = local.rule_arns[0]
       appTargetGroupArn       = var.app_target_group_arn
       wakerTargetGroupArn     = aws_lb_target_group.waker.arn
       loadBalancerDimension   = var.load_balancer_arn_suffix

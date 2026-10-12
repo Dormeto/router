@@ -6,7 +6,7 @@ import { createServer as createHttpsServer } from 'node:https';
 import { createServer as createNetServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CLUSTER_TTL_MS, KubernetesError, TIMEOUTS, clusterOf, createKubernetes, eksToken, presignUrl } from '../src/lib/k8s.mjs';
+import { CLUSTER_TTL_MS, KubernetesError, TIMEOUTS, clusterOf, createKubernetes, eksToken, kubernetesConnector, presignUrl } from '../src/lib/k8s.mjs';
 
 // SigV4 by hand (the router imports nothing but Node and AWS SDK clients): checked against AWS's documented presigned URL
 // and against botocore 1.43, the signer of the AWS CLI's `aws eks get-token`.
@@ -278,4 +278,17 @@ test('clusterOf keeps a cluster 15 minutes per EKS client and name, and does not
   await assert.rejects(clusterOf(flaky, 'eks-demo', NOW), { name: 'ResourceNotFoundException' });
   assert.equal((await clusterOf(flaky, 'eks-demo', NOW)).version, '1.36');
   assert.equal(flaky.calls.length, 2);
+});
+
+test('kubernetesConnector gives a cluster\'s client: its endpoint and CA from EKS, a token signed with the caller\'s credentials', async (t) => {
+  const api = await apiServer((req, body, res) => json(res, 200, { gitVersion: 'v1.36.4' }));
+  t.after(api.close);
+  const credentials = { accessKeyId: 'ASIAEXAMPLE', secretAccessKey: SECRET, sessionToken: 'session' };
+  const eks = {
+    describeCluster: async ({ name }) => ({ cluster: { ...CLUSTER, name, endpoint: api.endpoint, certificateAuthority: { data: Buffer.from(ca).toString('base64') } } }),
+    credentials: async () => credentials,
+  };
+  const kubernetesOf = kubernetesConnector({ eks, region: 'eu-west-1', now: () => NOW });
+  assert.deepEqual(await (await kubernetesOf('eks-demo')).get('/version'), { gitVersion: 'v1.36.4' });
+  assert.equal(api.seen[0].headers.authorization, `Bearer ${eksToken({ cluster: 'eks-demo', region: 'eu-west-1', credentials, now: NOW })}`);
 });

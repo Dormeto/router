@@ -13,6 +13,8 @@ import { createEvents } from './aws/events.mjs';
 import { createTagging } from './aws/tagging.mjs';
 import { createCatalog } from './lib/catalog.mjs';
 import { createController } from './lib/controller-core.mjs';
+import { kubernetesConnector } from './lib/k8s.mjs';
+import { memoizeAsync } from './lib/memo.mjs';
 import { createPublisher, withTransitionEvents } from './lib/events.mjs';
 import { createListRefresher, downloadText, parseS3Url } from './lib/list-refresh.mjs';
 import { parseLists } from './lib/list-cache.mjs';
@@ -44,6 +46,9 @@ const queues = JSON.parse(process.env.DMT_FAILURE_QUEUES || '{}');
 const workQueue = process.env.DMT_WORK_QUEUE;
 const driftQueue = process.env.DMT_DRIFT_QUEUE;
 const sqs = Object.values(queues).some(Boolean) || workQueue || driftQueue ? createSqs() : null;
+// Kubernetes workloads: the EKS client loads with the first one (a router without any never pays for it).
+const getEks = memoizeAsync(() => import('./aws/eks.mjs').then(({ createEks }) => createEks()));
+const eks = { describeCluster: async (input) => (await getEks()).describeCluster(input), credentials: async () => (await getEks()).credentials() };
 
 export const handler = createController({
   store,
@@ -55,6 +60,7 @@ export const handler = createController({
   tagging: createTagging(),
   appscaling: createAppScaling(),
   rds: createRds(),
+  kubernetesOf: kubernetesConnector({ eks, region: process.env.AWS_REGION }),
   // Lambda sets AWS_LAMBDA_FUNCTION_NAME: the controller fans naps out to itself.
   invokeSelf: (payload) => lambda.invokeAsync(process.env.AWS_LAMBDA_FUNCTION_NAME, payload),
   sleep,

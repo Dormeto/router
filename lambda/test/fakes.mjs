@@ -433,3 +433,128 @@ export function fakeRdsTagging(rds, workloadId = 'demo') {
     },
   };
 }
+
+// A JSON merge patch (RFC 7396): null removes a key.
+export function mergePatch(target, patch) {
+  if (patch === null || typeof patch !== 'object' || Array.isArray(patch)) return patch;
+  const out = { ...(target && typeof target === 'object' && !Array.isArray(target) ? target : {}) };
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === null) delete out[key];
+    else out[key] = mergePatch(out[key], value);
+  }
+  return out;
+}
+
+// A cluster's API as lib/k8s.mjs's client gives it: owners (Deployments, StatefulSets), pods, nodes and KEDA
+// ScaledObjects (keda: false, its API missing). A patch of an owner's scale sets its replicas; at 0 its pods terminate
+// and are gone after stopAfter more lists of them (0: at once). Every call is recorded in state.calls; any other call
+// fails, as a write the router must not make would.
+export function fakeKubernetes({ owners = [], pods = [], nodes = [], scaledObjects = [], keda = true, stopAfter = 0 } = {}) {
+  const state = { owners: structuredClone(owners), pods: structuredClone(pods), nodes: structuredClone(nodes), scaledObjects: structuredClone(scaledObjects), calls: [], stopping: new Map() };
+  const notFound = (what) => Object.assign(new Error(`${what} not found`), { name: 'KubernetesError', status: 404, reason: 'NotFound' });
+  const selects = (selector, labels = {}) => !selector || selector.split(',').every((term) => {
+    const [key, value] = term.split('=');
+    return labels[key] === value;
+  });
+  const OWNER = /^\/apis\/apps\/v1\/namespaces\/([^/]+)\/(deployments|statefulsets)\/([^/]+)(\/scale)?$/;
+  const KINDS = { deployments: 'Deployment', statefulsets: 'StatefulSet' };
+  const ownerOf = (path) => {
+    const [, namespace, resource, name, scale] = OWNER.exec(path) ?? [];
+    const owner = state.owners.find((o) => o.kind === KINDS[resource] && o.metadata.name === name && o.metadata.namespace === namespace);
+    return { owner, scale, what: `${KINDS[resource]} ${namespace}/${name}` };
+  };
+  const labelsOf = (owner) => Object.entries(owner.spec.selector.matchLabels).map(([k, v]) => `${k}=${v}`).join(',');
+  const podsOf = (namespace, selector) => state.pods.filter((p) => p.metadata.namespace === namespace && selects(selector, p.metadata.labels));
+  return {
+    state,
+    async get(path) {
+      state.calls.push(['GET', path]);
+      if (OWNER.test(path)) {
+        const { owner, what } = ownerOf(path);
+        if (!owner) throw notFound(what);
+        return structuredClone(owner);
+      }
+      const node = /^\/api\/v1\/nodes\/([^/]+)$/.exec(path);
+      if (node) {
+        const found = state.nodes.find((n) => n.metadata.name === node[1]);
+        if (!found) throw notFound(`node ${node[1]}`);
+        return structuredClone(found);
+      }
+      throw new Error(`unexpected call GET ${path}`);
+    },
+    async list(path, query = {}) {
+      state.calls.push(['LIST', path, query]);
+      const pods = /^\/api\/v1\/namespaces\/([^/]+)\/pods$/.exec(path);
+      if (pods) {
+        const found = podsOf(pods[1], query.labelSelector);
+        for (const pod of found) {
+          const left = state.stopping.get(pod);
+          if (left === undefined) continue;
+          if (left <= 0) state.pods = state.pods.filter((p) => p !== pod);
+          else state.stopping.set(pod, left - 1);
+        }
+        return structuredClone(podsOf(pods[1], query.labelSelector));
+      }
+      const scaled = /^\/apis\/keda\.sh\/v1alpha1\/namespaces\/([^/]+)\/scaledobjects$/.exec(path);
+      if (scaled) {
+        if (!keda) throw notFound('the server could not find the requested resource');
+        return structuredClone(state.scaledObjects.filter((s) => s.metadata.namespace === scaled[1]));
+      }
+      throw new Error(`unexpected call LIST ${path}`);
+    },
+    async patch(path, body, type = 'merge') {
+      state.calls.push(['PATCH', path, body, type]);
+      if (OWNER.test(path)) {
+        const { owner, scale, what } = ownerOf(path);
+        if (!owner) throw notFound(what);
+        if (!scale || type !== 'merge') throw new Error(`unexpected call PATCH ${path}`);
+        owner.spec.replicas = body.spec.replicas;
+        if (owner.spec.replicas === 0) {
+          for (const pod of podsOf(owner.metadata.namespace, labelsOf(owner))) {
+            pod.metadata.deletionTimestamp = '2026-10-11T10:00:00Z';
+            state.stopping.set(pod, stopAfter);
+          }
+          if (stopAfter === 0) state.pods = state.pods.filter((p) => !state.stopping.has(p));
+        }
+        return { kind: 'Scale', spec: { replicas: owner.spec.replicas } };
+      }
+      const scaled = /^\/apis\/keda\.sh\/v1alpha1\/namespaces\/([^/]+)\/scaledobjects\/([^/]+)$/.exec(path);
+      if (scaled) {
+        const index = state.scaledObjects.findIndex((s) => s.metadata.namespace === scaled[1] && s.metadata.name === scaled[2]);
+        if (index < 0) throw notFound(`scaledobject ${scaled[2]}`);
+        state.scaledObjects[index] = mergePatch(state.scaledObjects[index], body);
+        return structuredClone(state.scaledObjects[index]);
+      }
+      throw new Error(`unexpected call PATCH ${path}`);
+    },
+    async create(path) { throw new Error(`unexpected call POST ${path}`); },
+    async remove(path) { throw new Error(`unexpected call DELETE ${path}`); },
+  };
+}
+
+export const k8sOwner = (name, { kind = 'Deployment', namespace = 'demo', replicas = 1, labels = { app: name } } = {}) => ({
+  kind, metadata: { name, namespace }, spec: { replicas, selector: { matchLabels: labels } },
+});
+
+export const k8sPod = (name, {
+  namespace = 'demo', labels = { app: name.replace(/-[^-]+$/, '') }, ip, node = 'ip-10-0-1-1.eu-west-1.compute.internal', phase = 'Running', ready = true,
+  requests = { cpu: '250m', memory: '512Mi' }, init, annotations = {}, fargate = false,
+} = {}) => ({
+  metadata: { name, namespace, labels, annotations },
+  spec: {
+    nodeName: node, schedulerName: fargate ? 'fargate-scheduler' : 'default-scheduler',
+    containers: [{ name: 'app', resources: requests ? { requests } : {} }],
+    ...(init ? { initContainers: [{ name: 'init', resources: { requests: init } }] } : {}),
+  },
+  status: { phase, ...(ip ? { podIP: ip } : {}), conditions: [{ type: 'Ready', status: ready ? 'True' : 'False' }] },
+});
+
+export const k8sNode = (name, { type = 'm5.large', os = 'linux', labels = {}, allocatable = { cpu: '1930m', memory: '7220184Ki' } } = {}) => ({
+  metadata: { name, labels: { 'node.kubernetes.io/instance-type': type, 'kubernetes.io/os': os, ...labels } }, status: { allocatable },
+});
+
+export const k8sConfig = (kubernetes = {}, overrides = {}) => testConfig({
+  instanceIds: [], wakeTimeoutSeconds: 300,
+  kubernetes: { cluster: 'eks-demo', namespace: 'demo', owner: { kind: 'Deployment', name: 'web' }, switch: 'ingress', ...kubernetes },
+  ...overrides,
+});

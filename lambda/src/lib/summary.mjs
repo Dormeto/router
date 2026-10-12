@@ -54,7 +54,7 @@ export function workloadSummary(cfg, run = {}, host = null, stats7d = null, paus
     ...(fallbacksOf(run).length ? { fallbacks: fallbacksOf(run) } : {}),
     updatedAt: iso(run?.updatedAt),
     pendingWake: run?.pendingWake === true,
-    // The kinds of its backends (instance, asg, ecs, then its databases), as the last idle check found them.
+    // The kinds of its backends (instance, asg, ecs, k8s, then its databases), as the last idle check found them.
     backends: run?.backendKinds ? run.backendKinds.split(',') : [],
     pauses,
     stats7d,

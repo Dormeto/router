@@ -1,9 +1,11 @@
-// Backends of a workload: standalone EC2 instances and EC2 Auto Scaling groups feeding the app target group.
+// Backends of a workload: standalone EC2 instances and EC2 Auto Scaling groups feeding the app target group, ECS
+// services, a Kubernetes owner (its configuration names it), and their databases.
 // Instances of a group are never managed one by one: the group would replace a stopped instance.
 import { retryCapacity, startWithCapacity } from './capacity.mjs';
 import { instanceStates, stopInstances } from './instances.mjs';
 import { discoverEcsServices, ecsRecord, ecsStatuses, resumeEcs, sleepEcs, wakeEcs } from './ecs.mjs';
 import { discoverDatabases, isCompanion, rdsStatuses, startDatabases, stopDatabases } from './rds.mjs';
+import { k8sBackend, k8sRecord, k8sStatus, resumeK8s, sleepK8s, wakeK8s } from './kubernetes.mjs';
 
 export { isCompanion };
 
@@ -17,6 +19,7 @@ const POLL_MS = 3000;
 
 export const backendKey = (backend) => `${backend.kind}:${backend.kind === 'asg' ? backend.name : backend.id}`;
 const ecsOnly = (list) => list.filter((b) => b.kind === 'ecs');
+const k8sOnly = (list) => list.filter((b) => b.kind === 'k8s');
 const companions = (list) => list.filter(isCompanion);
 
 const tagMap = (tags = []) => Object.fromEntries(tags.map((t) => [t.Key, t.Value]));
@@ -48,7 +51,13 @@ function asgBackend(group) {
   };
 }
 
-export async function resolveBackends({ ec2, elbv2, autoscaling, ecs, tagging, appscaling, rds }, cfg) {
+export async function resolveBackends({ ec2, elbv2, autoscaling, ecs, tagging, appscaling, rds, kubernetesOf }, cfg) {
+  if (cfg.kubernetes) {
+    // Kubernetes objects carry no AWS tags: the owner is the one the configuration names; databases still by tag.
+    const owner = await k8sBackend({ elbv2, kubernetesOf }, cfg);
+    const databases = rds && tagging ? await discoverDatabases({ rds, tagging }, cfg) : { backends: [], ignored: [] };
+    return { mode: 'kubernetes', backends: [...owner.backends, ...databases.backends], ignored: [...owner.ignored, ...databases.ignored] };
+  }
   if (cfg.instanceIds?.length) {
     // Static primary instances; companions (databases) are still discovered by tag.
     const databases = rds && tagging ? await discoverDatabases({ rds, tagging }, cfg) : { backends: [], ignored: [] };
@@ -118,7 +127,7 @@ const split = (backends) => ({
   groups: backends.filter((b) => b.kind === 'asg'),
 });
 
-export async function backendStatuses({ ec2, autoscaling, ecs, rds }, backends) {
+export async function backendStatuses({ ec2, autoscaling, ecs, rds, kubernetesOf }, backends) {
   const { ids, groups } = split(backends);
   const states = ids.length ? await instanceStates(ec2, ids) : {};
   const described = await describeGroups(autoscaling, groups.map((g) => g.name));
@@ -128,6 +137,7 @@ export async function backendStatuses({ ec2, autoscaling, ecs, rds }, backends) 
   }
   for (const group of groups) statuses[`asg:${group.name}`] = groupStatus(described.get(group.name));
   if (ecsOnly(backends).length) Object.assign(statuses, await ecsStatuses({ ecs }, ecsOnly(backends)));
+  for (const b of k8sOnly(backends)) statuses[backendKey(b)] = await k8sStatus({ kubernetesOf }, b);
   if (companions(backends).length) Object.assign(statuses, await rdsStatuses({ rds }, companions(backends)));
   return statuses;
 }
@@ -135,13 +145,15 @@ export async function backendStatuses({ ec2, autoscaling, ecs, rds }, backends) 
 export const toRecord = (backend) => {
   if (isCompanion(backend)) return { kind: backend.kind, id: backend.id };
   if (backend.kind === 'ecs') return ecsRecord(backend);
+  if (backend.kind === 'k8s') return k8sRecord(backend);
   if (backend.kind === 'asg') return { kind: 'asg', name: backend.name, min: backend.min, max: backend.max, desired: backend.desired };
   return { kind: 'instance', id: backend.id };
 };
 
 // Primary backends first (waited), then the companions (databases: stopped without waiting, it takes minutes).
-export async function sleepBackends({ ec2, autoscaling, ecs, appscaling, rds }, backends, timing) {
+export async function sleepBackends({ ec2, autoscaling, ecs, appscaling, rds, kubernetesOf }, backends, timing) {
   if (ecsOnly(backends).length) await sleepEcs({ ecs, appscaling }, ecsOnly(backends), timing);
+  for (const b of k8sOnly(backends)) await sleepK8s({ kubernetesOf }, b, timing);
   const { ids, groups } = split(backends);
   for (const group of groups) {
     await autoscaling.suspendProcesses({ AutoScalingGroupName: group.name, ScalingProcesses: SCALING_PROCESSES });
@@ -171,12 +183,13 @@ async function step(backend, run) {
 }
 
 // options.fallbackTypes: the workload's fallback instance types; options.onFallback(id, { from, to }) (R7a).
-export async function wakeBackends({ ec2, autoscaling, ecs, appscaling, rds }, records, timing, options = {}) {
+export async function wakeBackends({ ec2, autoscaling, ecs, appscaling, rds, kubernetesOf }, records, timing, options = {}) {
   const dbs = companions(records);
   // A database start refused for capacity is tried again within the deadline (R7a).
   if (dbs.length) await step(dbs.map((d) => `rds:${d.id}`).join(','), () => retryCapacity(() => startDatabases({ rds }, dbs, timing), timing));
   const services = ecsOnly(records);
   if (services.length) await step(services.map((x) => `ecs:${x.id}`).join(','), () => wakeEcs({ ecs, appscaling }, services));
+  for (const r of k8sOnly(records)) await step(`k8s:${r.id}`, () => wakeK8s({ kubernetesOf }, r, timing));
   const { ids, groups } = split(records);
   for (const group of groups) {
     // A group recorded at 0 (found asleep by a reconcile) wakes with dormeto:wake-desired or 1 instance.
@@ -195,9 +208,10 @@ export async function wakeBackends({ ec2, autoscaling, ecs, appscaling, rds }, r
 
 // After a wake done outside Dormeto (a group scaled up by hand): resume scaling and restore the recorded limits,
 // keeping the capacity that was chosen (MinSize capped by it so that the group is not scaled up again).
-export async function resumeBackends({ autoscaling, ecs, appscaling, rds }, records) {
+export async function resumeBackends({ autoscaling, ecs, appscaling, rds, kubernetesOf }, records) {
   if (companions(records).length) await startDatabases({ rds }, companions(records), null, { wait: false });
   if (ecsOnly(records).length) await resumeEcs({ ecs, appscaling }, ecsOnly(records));
+  for (const r of k8sOnly(records)) await resumeK8s({ kubernetesOf }, r);
   const groups = records.filter((r) => r.kind === 'asg');
   const described = await describeGroups(autoscaling, groups.map((g) => g.name));
   for (const group of groups) {

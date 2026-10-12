@@ -29,8 +29,10 @@ const getAdmin = memoizeAsync(() => Promise.all([
   import('./aws/tagging.mjs'),
   import('./aws/appscaling.mjs'),
   import('./aws/rds.mjs'),
+  import('./aws/eks.mjs'),
+  import('./lib/k8s.mjs'),
 ]).then(([{ createAdmin }, { createEc2 }, { createElbv2 }, { createCloudWatch }, { createAutoScaling }, { createEcs }, { createTagging },
-  { createAppScaling }, { createRds }]) => createAdmin({
+  { createAppScaling }, { createRds }, { createEks }, { kubernetesConnector }]) => createAdmin({
   ec2: createEc2(),
   elbv2: createElbv2(),
   cloudwatch: createCloudWatch(),
@@ -39,6 +41,7 @@ const getAdmin = memoizeAsync(() => Promise.all([
   tagging: createTagging(),
   appscaling: createAppScaling(),
   rds: createRds(),
+  kubernetesOf: kubernetesConnector({ eks: createEks(), region: process.env.AWS_REGION }),
   invokeController,
   log: logger,
   version: { version: process.env.DMT_VERSION, build: process.env.DMT_BUILD },

@@ -20,8 +20,8 @@ export function napEstimate({ cfg, run, lastRequest, now }) {
 
 const iso = (ms) => (typeof ms === 'number' && ms > 0 ? new Date(ms).toISOString() : null);
 
-export function createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, now = Date.now, version = {} }) {
-  const clients = { ec2, elbv2, autoscaling, ecs, tagging, appscaling, rds };
+export function createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, kubernetesOf, now = Date.now, version = {} }) {
+  const clients = { ec2, elbv2, autoscaling, ecs, tagging, appscaling, rds, kubernetesOf };
   // Extras that depend on the caller: router rules, wake rules, statistics and IP lists loaders.
   return async function status(workloadId, cfg, run, { pauses = [], drift = [], noWakeRules = [], wakeRules = [], loadStats = null, loadLists = null } = {}) {
     const t = now();
@@ -80,6 +80,9 @@ export function createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging
         const status = statuses[backendKey(b)];
         if (b.kind === 'asg') return { kind: 'asg', id: b.name, status, min: b.min, max: b.max, desired: b.desired, warmPool: b.warmPool };
         if (b.kind === 'ecs') return { kind: 'ecs', id: b.id, status, desired: b.desired, scalable: b.scalable };
+        if (b.kind === 'k8s') {
+          return { kind: 'k8s', id: b.id, status, cluster: b.cluster, namespace: b.namespace, owner: b.owner, replicas: b.replicas, keda: Boolean(b.keda), switch: cfg.kubernetes.switch };
+        }
         if (b.kind.startsWith('rds-')) return { kind: b.kind, id: b.id, status, companion: true };
         return { kind: 'instance', id: b.id, status };
       }),

@@ -2,6 +2,8 @@ const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g,
   (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 
 const ACTION_MESSAGES = { nap: 'Nap requested.', wake: 'Wake requested.' };
+// How the waker is switched in for a Kubernetes workload (vision docs/specs/2026-10-11-kubernetes-design.md, section 6).
+const SWITCHES = { rule: 'rule weights', ingress: 'Dormeto Ingress', 'patched-ingress': 'patched Ingress' };
 
 const backendText = (b) => {
   if (b.kind === 'asg') {
@@ -11,6 +13,10 @@ const backendText = (b) => {
   if (b.kind === 'ecs') {
     const scaling = b.scalable ? `, autoscaling ${b.scalable.min}-${b.scalable.max}` : '';
     return `${b.id.split(':')[5] ?? b.id}: ${b.status} (desired ${b.desired}${scaling})`;
+  }
+  if (b.kind === 'k8s') {
+    const details = [`replicas ${b.replicas}`, ...(b.keda ? ['KEDA'] : []), SWITCHES[b.switch] ?? b.switch].join(', ');
+    return `${b.owner.kind} ${b.namespace}/${b.owner.name} (cluster ${b.cluster}): ${b.status} (${details})`;
   }
   if (b.companion) return `${b.id} (database): ${b.status}`;
   return `${b.id}: ${b.status}`;

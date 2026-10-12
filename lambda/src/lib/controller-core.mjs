@@ -51,7 +51,7 @@ const PAUSE_MAX_MS = 366 * 86_400_000;
 const REASON_MAX = 256;
 
 export function createController({
-  store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, invokeSelf, now = Date.now, sleep, newId = randomUUID, log,
+  store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, kubernetesOf, invokeSelf, now = Date.now, sleep, newId = randomUUID, log,
   lists = null, router = {}, defaultRules = [], ipLists = [], sqs = null, lambda = null, invokeOnboarder = null,
   // The manager's lists (R6b, lib/catalog.mjs): described from its catalog and manifests, never downloaded here.
   catalog = null,
@@ -61,7 +61,7 @@ export function createController({
   queueRepair = null,
   publisher = { enabled: false, checked: async () => {}, stateChanged: async () => {} },
 }) {
-  const clients = { ec2, elbv2, autoscaling, ecs, tagging, appscaling, rds };
+  const clients = { ec2, elbv2, autoscaling, ecs, tagging, appscaling, rds, kubernetesOf };
   let budgetEnd = Infinity;
 
   async function config(workloadId) {
@@ -432,7 +432,7 @@ export function createController({
 
   // --- Manager interface: list, status, force-wake ------------------------------------------------------------------
 
-  const status = createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, now, version: router });
+  const status = createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, kubernetesOf, now, version: router });
   const hosts = { at: 0, byWorkload: new Map() };
   // Host of each workload: the first of its rules (found from its target group) with a host condition; one listing per
   // load balancer for all workloads, cached five minutes.

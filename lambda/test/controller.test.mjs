@@ -3,9 +3,9 @@ import assert from 'node:assert/strict';
 import { createController } from '../src/lib/controller-core.mjs';
 import { currentTarget } from '../src/lib/route.mjs';
 import { STATES } from '../src/lib/state.mjs';
-import { asgGroup, ecsService, fakeAppScaling, fakeEcs, fakeRds, fakeRdsTagging, fakeTagging, fakeAutoScaling, fakeClock, fakeCloudWatch, fakeEc2, fakeElbv2, fakeStore, routeOf, silentLog, testConfig } from './fakes.mjs';
+import { asgGroup, ecsService, fakeAppScaling, fakeEcs, fakeKubernetes, fakeRds, fakeRdsTagging, fakeTagging, fakeAutoScaling, fakeClock, fakeCloudWatch, fakeEc2, fakeElbv2, fakeStore, k8sConfig, k8sNode, k8sOwner, k8sPod, routeOf, silentLog, testConfig } from './fakes.mjs';
 
-function setup({ run, instance = 'running', target = 'app', healthy = 1, metric = [], metricAt = [], cfg = testConfig(), groups = [], services = [], databases } = {}) {
+function setup({ run, instance = 'running', target = 'app', healthy = 1, metric = [], metricAt = [], cfg = testConfig(), groups = [], services = [], databases, k8s } = {}) {
   const clock = fakeClock();
   const store = fakeStore({ config: cfg, run, clock });
   const ec2 = fakeEc2(cfg.instanceIds, { state: instance });
@@ -28,7 +28,8 @@ function setup({ run, instance = 'running', target = 'app', healthy = 1, metric 
   const invocations = [];
   const log = { ...silentLog };
   const handler = createController({
-    store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, invokeSelf: async (payload) => { invocations.push(payload); }, now: clock.now, sleep: clock.sleep, newId: () => `wake-${++ids}`, log,
+    store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, kubernetesOf: k8s ? async () => k8s : undefined,
+    invokeSelf: async (payload) => { invocations.push(payload); }, now: clock.now, sleep: clock.sleep, newId: () => `wake-${++ids}`, log,
   });
   return { handler, store, ec2, elbv2, cloudwatch, autoscaling, ecs, appscaling, rds, clock, cfg, invocations, log };
 }
@@ -1160,4 +1161,54 @@ test('check: a failed workload whose backends run without a healthy target is re
   // A release that finds the workload woken meanwhile changes nothing.
   const woken = setup({ run: { state: STATES.AWAKE }, cfg, instance: 'running', target: 'app', healthy: 1 });
   assert.equal((await woken.handler({ action: 'release', workloadId: 'demo' })).state, 'SKIPPED');
+});
+
+// A Kubernetes workload behind a TargetGroupBinding (the rule switch: today's rules), napped and woken by the controller.
+function k8sSetup(run, { replicas = 2, pods = 2 } = {}) {
+  const cfg = k8sConfig({ switch: 'rule' });
+  const node = 'ip-10-0-1-1.eu-west-1.compute.internal';
+  const k8s = fakeKubernetes({
+    owners: [k8sOwner('web', { replicas })],
+    pods: Array.from({ length: pods }, (_, i) => k8sPod(`web-${i + 1}`, { ip: `10.0.1.${i + 1}`, node })),
+    nodes: [k8sNode(node, { labels: { 'karpenter.sh/nodepool': 'default' } })],
+  });
+  const s = setup({ run, cfg, k8s, target: run.state === STATES.AWAKE ? 'app' : 'waker', healthy: run.state === STATES.AWAKE ? pods : 0 });
+  s.elbv2.state.targets = k8s.state.pods.map((p) => ({ Id: p.status.podIP, State: 'healthy' }));
+  return { ...s, k8s };
+}
+
+test('nap of a Kubernetes workload: the waker switched in, the owner scaled to 0, its replicas recorded and its pods described (R9)', async () => {
+  const s = k8sSetup({ state: STATES.AWAKE });
+  const events = [];
+  const store = s.store;
+  const transition = store.transition.bind(store);
+  store.transition = async (id, spec) => { if (spec.event) events.push(spec.event); return transition(id, spec); };
+  const result = await s.handler({ action: 'nap', workloadId: 'demo' });
+  assert.equal(result.state, STATES.ASLEEP);
+  assert.equal(routeOf(s.elbv2, s.cfg), 'waker');
+  assert.equal(s.k8s.state.owners[0].spec.replicas, 0);
+  assert.deepEqual(JSON.parse(s.store.state.run.napBackends), [
+    { kind: 'k8s', id: 'eks-demo/demo/Deployment/web', cluster: 'eks-demo', namespace: 'demo', owner: { kind: 'Deployment', name: 'web' }, replicas: 2, keda: null },
+  ]);
+  assert.deepEqual(events.at(-1).stopped, [
+    { kind: 'k8s-pods', count: 2, cpu: 0.25, memoryGb: 0.5, nodeType: 'm5.large', os: 'Linux', autoscaled: true, allocatable: { cpu: 1.93, memoryGb: 6.886 } },
+  ]);
+});
+
+test('wake of a Kubernetes workload: the recorded replicas back, then the app once a target is healthy', async () => {
+  const napBackends = JSON.stringify([{ kind: 'k8s', id: 'eks-demo/demo/Deployment/web', cluster: 'eks-demo', namespace: 'demo', owner: { kind: 'Deployment', name: 'web' }, replicas: 2, keda: null }]);
+  const s = k8sSetup({ state: STATES.WAKING, wakeId: 'w1', napBackends }, { replicas: 0, pods: 0 });
+  s.elbv2.state.targets = undefined;
+  s.clock.onSleep(() => { if (s.k8s.state.owners[0].spec.replicas === 2) s.elbv2.state.healthy = 1; });
+  const result = await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' });
+  assert.equal(result.state, STATES.AWAKE);
+  assert.equal(s.k8s.state.owners[0].spec.replicas, 2);
+  assert.equal(routeOf(s.elbv2, s.cfg), 'app');
+});
+
+test('the status action shows a Kubernetes backend', async () => {
+  const s = k8sSetup({ state: STATES.AWAKE });
+  const status = await s.handler({ action: 'status', workloadId: 'demo' });
+  assert.equal(status.discovery, 'kubernetes');
+  assert.deepEqual(status.backends.map((b) => [b.kind, b.id, b.status, b.replicas, b.switch]), [['k8s', 'eks-demo/demo/Deployment/web', 'running', 2, 'rule']]);
 });

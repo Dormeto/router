@@ -170,3 +170,12 @@ export function clusterOf(eks, name, now = Date.now()) {
   });
   return entry.pending;
 }
+
+// kubernetesOf(cluster): the client of a cluster by name, with a token signed now with the caller's credentials (eks:
+// describeCluster and credentials(), aws/eks.mjs). EKS takes the token for 15 minutes: a client serves one operation.
+export function kubernetesConnector({ eks, region, now = Date.now }) {
+  return async (cluster) => {
+    const [view, credentials] = await Promise.all([clusterOf(eks, cluster, now()), eks.credentials()]);
+    return createKubernetes({ endpoint: view.endpoint, ca: view.ca, token: eksToken({ cluster, region, credentials, now: now() }) });
+  };
+}

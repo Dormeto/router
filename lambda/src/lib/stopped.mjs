@@ -1,6 +1,8 @@
 // What a nap stops (vision docs/specs/2026-10-08-savings-design.md, R9a): each backend by what prices it — instance type
-// and OS, Fargate task size, database class — for the manager's savings. A backend that cannot be described is said
-// (an unknown item), never guessed; describing never stops the nap.
+// and OS, Fargate task size, database class, Kubernetes pods by node — for the manager's savings. A backend that cannot
+// be described is said (an unknown item), never guessed; describing never stops the nap.
+import { k8sItems } from './kubernetes.mjs';
+
 const ITEMS_MAX = 50;
 
 const osOf = (platform) => (!platform || platform === 'Linux/UNIX' ? 'Linux' : platform);
@@ -97,7 +99,7 @@ async function databaseItems(rds, backend) {
   return DBInstances.map((db) => dbItem(db, cluster));
 }
 
-export async function describeStopped({ ec2, ecs, rds }, backends) {
+export async function describeStopped({ ec2, ecs, rds, kubernetesOf }, backends) {
   const items = [];
   for (const backend of backends) {
     const name = backend.kind === 'asg' ? `asg:${backend.name}` : `${backend.kind}:${backend.id}`;
@@ -105,6 +107,7 @@ export async function describeStopped({ ec2, ecs, rds }, backends) {
       if (backend.kind === 'instance') items.push(...(await instanceItems(ec2, backend)));
       else if (backend.kind === 'asg') items.push(...(await groupItems(ec2, backend)));
       else if (backend.kind === 'ecs') items.push(...(await serviceItems(ecs, backend)));
+      else if (backend.kind === 'k8s') items.push(...(await k8sItems({ kubernetesOf }, backend)));
       else if (backend.kind === 'rds-instance' || backend.kind === 'rds-cluster') items.push(...(await databaseItems(rds, backend)));
     } catch (err) {
       items.push(unknown(name, err));

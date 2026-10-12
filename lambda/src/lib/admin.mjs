@@ -29,8 +29,8 @@ export function parseAdminPath(path, cfg) {
   return { base: `${ADMIN_PREFIX}${secret}`, route: slash === -1 ? '' : rest.slice(slash + 1) };
 }
 
-export function createAdmin({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, invokeController, now = Date.now, log, version = {} }) {
-  const status = createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, now, version });
+export function createAdmin({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, kubernetesOf, invokeController, now = Date.now, log, version = {} }) {
+  const status = createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, kubernetesOf, now, version });
   const notAllowed = (allow) => response(405, { ...SECURITY_HEADERS, allow, 'content-type': 'text/plain' }, 'Method not allowed');
 
   return async function handle({ event, workloadId, cfg, run, base, route, forceWake, noWakeRules, wakeRules, loadStats, loadLists }) {

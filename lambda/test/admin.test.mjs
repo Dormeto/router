@@ -4,7 +4,7 @@ import { createAdmin, hashSecret, napEstimate, parseAdminPath } from '../src/lib
 import { lastRequestAt } from '../src/lib/metrics.mjs';
 import { createWaker } from '../src/lib/waker-core.mjs';
 import { STATES } from '../src/lib/state.mjs';
-import { albEvent, asgGroup, ecsService, fakeAppScaling, fakeEcs, fakeRds, fakeRdsTagging, fakeTagging, fakeAutoScaling, fakeClock, fakeCloudWatch, fakeEc2, fakeElbv2, fakeStore, silentLog, testConfig } from './fakes.mjs';
+import { albEvent, asgGroup, ecsService, fakeAppScaling, fakeEcs, fakeKubernetes, fakeRds, fakeRdsTagging, fakeTagging, fakeAutoScaling, fakeClock, fakeCloudWatch, fakeEc2, fakeElbv2, fakeStore, k8sConfig, k8sOwner, k8sPod, silentLog, testConfig } from './fakes.mjs';
 
 const SECRET = 'Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4z';
 const BASE = `/_dormeto/${SECRET}`;
@@ -244,6 +244,31 @@ test('status.json lists a database companion with its status', async () => {
   assert.deepEqual(status.backends.at(-1), { kind: 'rds-instance', id: 'appdb', status: 'running', companion: true });
   const html = (await handler(albEvent({ path: `${BASE}/` }))).body;
   assert.match(html, /appdb \(database\): running/);
+});
+
+test('status.json and the dashboard show a Kubernetes backend: its owner, cluster, replicas, KEDA and switching mode', async () => {
+  const cfg = k8sConfig({}, { admin: { enabled: true, secretHash: hashSecret(SECRET) } });
+  const clock = fakeClock();
+  const store = fakeStore({ config: cfg, run: { state: STATES.AWAKE }, clock });
+  const k8s = fakeKubernetes({
+    owners: [k8sOwner('web', { replicas: 2 })], pods: [k8sPod('web-1', { ip: '10.0.1.1' })],
+    scaledObjects: [{ metadata: { name: 'web', namespace: 'demo' }, spec: { scaleTargetRef: { name: 'web' } } }],
+  });
+  const elbv2 = fakeElbv2(cfg);
+  elbv2.state.targets = [{ Id: '10.0.1.1', State: 'healthy' }];
+  const admin = createAdmin({
+    ec2: fakeEc2([]), elbv2, cloudwatch: fakeCloudWatch(), autoscaling: fakeAutoScaling(), ecs: fakeEcs(), tagging: fakeTagging(fakeEcs()),
+    appscaling: fakeAppScaling(), kubernetesOf: async () => k8s, invokeController: async () => {}, now: clock.now, log: silentLog,
+  });
+  const handler = createWaker({ store, invokeController: async () => {}, prefix: 'dmt-dev-', now: clock.now, sleep: clock.sleep, log: silentLog, getAdmin: async () => admin });
+  const status = JSON.parse((await handler(albEvent({ path: `${BASE}/status.json`, cfg }))).body);
+  assert.equal(status.discovery, 'kubernetes');
+  assert.deepEqual(status.backends, [{
+    kind: 'k8s', id: 'eks-demo/demo/Deployment/web', status: 'running', cluster: 'eks-demo', namespace: 'demo', owner: { kind: 'Deployment', name: 'web' },
+    replicas: 2, keda: true, switch: 'ingress',
+  }]);
+  const html = (await handler(albEvent({ path: `${BASE}/`, cfg }))).body;
+  assert.match(html, /Deployment demo\/web \(cluster eks-demo\): running \(replicas 2, KEDA, Dormeto Ingress\)/);
 });
 
 test('status.json and the dashboard list the router and workload no-wake rules', async () => {

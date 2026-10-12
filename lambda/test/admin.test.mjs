@@ -4,7 +4,7 @@ import { createAdmin, hashSecret, napEstimate, parseAdminPath } from '../src/lib
 import { lastRequestAt } from '../src/lib/metrics.mjs';
 import { createWaker } from '../src/lib/waker-core.mjs';
 import { STATES } from '../src/lib/state.mjs';
-import { albEvent, asgGroup, fakeAutoScaling, fakeClock, fakeCloudWatch, fakeEc2, fakeElbv2, fakeStore, silentLog, testConfig } from './fakes.mjs';
+import { albEvent, asgGroup, ecsService, fakeAppScaling, fakeEcs, fakeTagging, fakeAutoScaling, fakeClock, fakeCloudWatch, fakeEc2, fakeElbv2, fakeStore, silentLog, testConfig } from './fakes.mjs';
 
 const SECRET = 'Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4z';
 const BASE = `/_dormeto/${SECRET}`;
@@ -19,12 +19,15 @@ function setup({ run, cfg = adminConfig(), metric = [], timestamps = [] } = {}) 
   const invocations = [];
   const invokeController = async (payload) => { invocations.push(payload); };
   const autoscaling = fakeAutoScaling();
-  const admin = createAdmin({ ec2, elbv2, cloudwatch, autoscaling, invokeController, now: clock.now, log: silentLog, version: { version: '0.3.0', build: 'abc123def456' } });
+  const ecs = fakeEcs();
+  const tagging = fakeTagging(ecs);
+  const appscaling = fakeAppScaling();
+  const admin = createAdmin({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, invokeController, now: clock.now, log: silentLog, version: { version: '0.3.0', build: 'abc123def456' } });
   const handler = createWaker({
     store, invokeController, prefix: 'dmt-dev-', now: clock.now, sleep: clock.sleep,
     newId: () => 'wake-1', log: silentLog, getAdmin: async () => admin,
   });
-  return { handler, store, clock, invocations, cloudwatch, ec2, elbv2, autoscaling };
+  return { handler, store, clock, invocations, cloudwatch, ec2, elbv2, autoscaling, ecs };
 }
 
 const headerOf = (res, name) => res.multiValueHeaders[name]?.[0];
@@ -214,4 +217,14 @@ test('status.json and the dashboard show the router version and build', async ()
   assert.deepEqual(status.router, { version: '0.3.0', build: 'abc123def456' });
   const html = (await handler(albEvent({ path: `${BASE}/` }))).body;
   assert.match(html, /Router 0\.3\.0 \(build abc123def456\)/);
+});
+
+test('status.json lists an ECS service backend', async () => {
+  const cfg = testConfig({ instanceIds: [], admin: { enabled: true, secretHash: hashSecret(SECRET) } });
+  const { handler, ecs } = setup({ run: { state: STATES.AWAKE }, cfg });
+  ecs.state.services = [ecsService('web', { desired: 2, targetGroups: [cfg.appTargetGroupArn], tags: { 'dormeto:workload': 'demo' } })];
+  const status = JSON.parse((await handler(albEvent({ path: `${BASE}/status.json` }))).body);
+  assert.deepEqual(status.backends, [{ kind: 'ecs', id: 'arn:aws:ecs:eu-west-1:111122223333:service/dmt-dev/web', status: 'running', desired: 2, scalable: null }]);
+  const html = (await handler(albEvent({ path: `${BASE}/` }))).body;
+  assert.match(html, /service\/dmt-dev\/web: running \(desired 2\)/);
 });

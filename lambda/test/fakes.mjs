@@ -211,3 +211,62 @@ export const asgGroup = (name, { min = 1, max = 2, desired = 1, targetGroups = [
   Instances: instances ?? Array.from({ length: desired }, (_, k) => ({ InstanceId: `i-${name}-${k}`, LifecycleState: 'InService' })),
   Tags: Object.entries(tags).map(([Key, Value]) => ({ Key, Value })),
 });
+
+// ECS services: [{ serviceArn, clusterArn, desiredCount, runningCount, pendingCount, loadBalancers, tags }].
+// UpdateService is immediate: runningCount follows desiredCount.
+export function fakeEcs(services = []) {
+  const state = { services: structuredClone(services), updates: [] };
+  return {
+    state,
+    async describeServices({ cluster, services: arns }) {
+      return { services: structuredClone(state.services.filter((s) => arns.includes(s.serviceArn) && s.clusterArn === cluster)) };
+    },
+    async updateService({ cluster, service, desiredCount }) {
+      state.updates.push({ cluster, service, desiredCount });
+      const found = state.services.find((s) => s.serviceArn === service);
+      Object.assign(found, { desiredCount, runningCount: desiredCount, pendingCount: 0 });
+      return {};
+    },
+  };
+}
+
+export function fakeTagging(ecs) {
+  return {
+    async getResources({ TagFilters, ResourceTypeFilters }) {
+      const [{ Key, Values }] = TagFilters;
+      const list = ResourceTypeFilters.includes('ecs:service') ? ecs.state.services : [];
+      return {
+        ResourceTagMappingList: list
+          .filter((s) => Values.includes((s.tags ?? {})[Key]))
+          .map((s) => ({ ResourceARN: s.serviceArn, Tags: Object.entries(s.tags ?? {}).map(([k, v]) => ({ Key: k, Value: v })) })),
+      };
+    },
+  };
+}
+
+export function fakeAppScaling(targets = []) {
+  const state = { targets: structuredClone(targets), registrations: [] };
+  return {
+    state,
+    async describeScalableTargets({ ResourceIds }) {
+      return { ScalableTargets: structuredClone(state.targets.filter((t) => ResourceIds.includes(t.ResourceId))) };
+    },
+    async registerScalableTarget(input) {
+      state.registrations.push(input);
+      const found = state.targets.find((t) => t.ResourceId === input.ResourceId);
+      if (found) Object.assign(found, input);
+      return {};
+    },
+  };
+}
+
+export const ecsService = (name, { cluster = 'dmt-dev', desired = 1, running, targetGroups = [], tags = {} } = {}) => ({
+  serviceArn: `arn:aws:ecs:eu-west-1:111122223333:service/${cluster}/${name}`,
+  clusterArn: `arn:aws:ecs:eu-west-1:111122223333:cluster/${cluster}`,
+  serviceName: name,
+  desiredCount: desired,
+  runningCount: running ?? desired,
+  pendingCount: 0,
+  loadBalancers: targetGroups.map((targetGroupArn) => ({ targetGroupArn, containerName: 'web', containerPort: 80 })),
+  tags,
+});

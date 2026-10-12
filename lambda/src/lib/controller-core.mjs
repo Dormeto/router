@@ -14,8 +14,8 @@ const TIMEOUT_MARGIN_MS = 30_000;
 // Held requests last at most waitSeconds: a counter untouched for longer is a leak (killed waker).
 const HOLDERS_STALE_MS = 2 * 60_000;
 
-export function createController({ store, ec2, elbv2, cloudwatch, autoscaling, now = Date.now, sleep, newId = randomUUID, log }) {
-  const clients = { ec2, elbv2, autoscaling };
+export function createController({ store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, now = Date.now, sleep, newId = randomUUID, log }) {
+  const clients = { ec2, elbv2, autoscaling, ecs, tagging, appscaling };
   let budgetEnd = Infinity;
 
   async function config(workloadId) {

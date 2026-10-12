@@ -40,8 +40,8 @@ export function napEstimate({ cfg, run, lastRequest, now }) {
 
 const iso = (ms) => (typeof ms === 'number' && ms > 0 ? new Date(ms).toISOString() : null);
 
-export function createAdmin({ ec2, elbv2, cloudwatch, autoscaling, invokeController, now = Date.now, log, version = {} }) {
-  const clients = { ec2, elbv2, autoscaling };
+export function createAdmin({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, invokeController, now = Date.now, log, version = {} }) {
+  const clients = { ec2, elbv2, autoscaling, ecs, tagging, appscaling };
   async function status(workloadId, cfg, run) {
     const t = now();
     const resolved = await resolveBackends(clients, cfg);
@@ -70,9 +70,12 @@ export function createAdmin({ ec2, elbv2, cloudwatch, autoscaling, invokeControl
       route: currentTarget(rules.Rules?.[0]?.Actions ?? [], cfg),
       discovery: resolved.mode,
       instances: instanceIds.map((id) => ({ id, state: instances[id] ?? 'unknown' })),
-      backends: resolved.backends.map((b) => (b.kind === 'asg'
-        ? { kind: 'asg', id: b.name, status: statuses[backendKey(b)], min: b.min, max: b.max, desired: b.desired, warmPool: b.warmPool }
-        : { kind: 'instance', id: b.id, status: statuses[backendKey(b)] })),
+      backends: resolved.backends.map((b) => {
+        const status = statuses[backendKey(b)];
+        if (b.kind === 'asg') return { kind: 'asg', id: b.name, status, min: b.min, max: b.max, desired: b.desired, warmPool: b.warmPool };
+        if (b.kind === 'ecs') return { kind: 'ecs', id: b.id, status, desired: b.desired, scalable: b.scalable };
+        return { kind: 'instance', id: b.id, status };
+      }),
       ignoredTargets: resolved.ignored,
       targets: (health.TargetHealthDescriptions ?? []).map((d) => ({ id: d.Target?.Id, state: d.TargetHealth?.State })),
       settings: {

@@ -2,20 +2,23 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createController } from '../src/lib/controller-core.mjs';
 import { STATES } from '../src/lib/state.mjs';
-import { asgGroup, fakeAutoScaling, fakeClock, fakeCloudWatch, fakeEc2, fakeElbv2, fakeStore, routeOf, silentLog, testConfig } from './fakes.mjs';
+import { asgGroup, ecsService, fakeAppScaling, fakeEcs, fakeTagging, fakeAutoScaling, fakeClock, fakeCloudWatch, fakeEc2, fakeElbv2, fakeStore, routeOf, silentLog, testConfig } from './fakes.mjs';
 
-function setup({ run, instance = 'running', target = 'app', healthy = 1, metric = [], cfg = testConfig(), groups = [] } = {}) {
+function setup({ run, instance = 'running', target = 'app', healthy = 1, metric = [], cfg = testConfig(), groups = [], services = [] } = {}) {
   const clock = fakeClock();
   const store = fakeStore({ config: cfg, run, clock });
   const ec2 = fakeEc2(cfg.instanceIds, { state: instance });
   const elbv2 = fakeElbv2(cfg, { target, healthy });
   const cloudwatch = fakeCloudWatch(metric);
   const autoscaling = fakeAutoScaling(groups);
+  const ecs = fakeEcs(services);
+  const tagging = fakeTagging(ecs);
+  const appscaling = fakeAppScaling();
   let ids = 0;
   const handler = createController({
-    store, ec2, elbv2, cloudwatch, autoscaling, now: clock.now, sleep: clock.sleep, newId: () => `wake-${++ids}`, log: silentLog,
+    store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, now: clock.now, sleep: clock.sleep, newId: () => `wake-${++ids}`, log: silentLog,
   });
-  return { handler, store, ec2, elbv2, cloudwatch, autoscaling, clock, cfg };
+  return { handler, store, ec2, elbv2, cloudwatch, autoscaling, ecs, appscaling, clock, cfg };
 }
 
 test('wake: starts the instance, waits for health, switches the route and becomes AWAKE', async () => {
@@ -394,4 +397,42 @@ test('check (asg): an external scale-up resumes the suspended processes and rest
   assert.equal(group.MinSize, 1, 'MinSize restored, capped by the externally chosen capacity');
   assert.equal(group.DesiredCapacity, 1, 'the externally chosen capacity is kept');
   assert.equal('napBackends' in s.store.state.run, false);
+});
+
+// --- ECS service backends --------------------------------------------------------------------------------------
+
+function ecsSetup({ run, desired = 1, target = 'app', healthy = 1 }) {
+  const cfg = testConfig({ instanceIds: [] });
+  const s = setup({ run, cfg, target, healthy, services: [ecsService('web', { desired, targetGroups: [cfg.appTargetGroupArn], tags: { 'dormeto:workload': 'demo' } })] });
+  s.elbv2.state.healthy = healthy;
+  return s;
+}
+
+test('nap (ecs): records the desired count and scales the service to zero', async () => {
+  const s = ecsSetup({ run: { state: STATES.AWAKE }, desired: 2 });
+  const result = await s.handler({ action: 'nap', workloadId: 'demo' });
+  assert.equal(result.state, STATES.ASLEEP);
+  const [record] = JSON.parse(s.store.state.run.napBackends);
+  assert.equal(record.kind, 'ecs');
+  assert.equal(record.desired, 2);
+  assert.equal(s.ecs.state.services[0].desiredCount, 0);
+  assert.equal(routeOf(s.elbv2, s.cfg), 'waker');
+});
+
+test('wake (ecs): restores the desired count and switches the route back', async () => {
+  const s = ecsSetup({ run: { state: STATES.WAKING, wakeId: 'w1' }, desired: 0, target: 'waker', healthy: 0 });
+  const [service] = s.ecs.state.services;
+  s.store.state.run.napBackends = JSON.stringify([{ kind: 'ecs', id: service.serviceArn, cluster: service.clusterArn, desired: 2, scalable: null }]);
+  const update = s.ecs.updateService;
+  s.ecs.updateService = async (input) => { await update(input); s.elbv2.state.healthy = input.desiredCount; };
+  const result = await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' });
+  assert.equal(result.state, STATES.AWAKE);
+  assert.equal(s.ecs.state.services[0].desiredCount, 2);
+  assert.equal(routeOf(s.elbv2, s.cfg), 'app');
+});
+
+test('check (ecs): a service scaled up outside Dormeto while asleep is reconciled to AWAKE', async () => {
+  const s = ecsSetup({ run: { state: STATES.ASLEEP }, desired: 1, target: 'waker', healthy: 1 });
+  const [result] = await s.handler({ action: 'check' });
+  assert.equal(result.state, STATES.AWAKE);
 });

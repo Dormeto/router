@@ -3,9 +3,14 @@ const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g,
 
 const ACTION_MESSAGES = { nap: 'Nap requested.', wake: 'Wake requested.' };
 
-const backendText = (b) => (b.kind === 'asg'
-  ? `${b.id}: ${b.status} (min ${b.min}, desired ${b.desired}, max ${b.max})${b.warmPool ? ', warm pool' : ''}`
-  : `${b.id}: ${b.status}`);
+const backendText = (b) => {
+  if (b.kind === 'asg') return `${b.id}: ${b.status} (min ${b.min}, desired ${b.desired}, max ${b.max})${b.warmPool ? ', warm pool' : ''}`;
+  if (b.kind === 'ecs') {
+    const scaling = b.scalable ? `, autoscaling ${b.scalable.min}-${b.scalable.max}` : '';
+    return `${b.id.split(':')[5] ?? b.id}: ${b.status} (desired ${b.desired}${scaling})`;
+  }
+  return `${b.id}: ${b.status}`;
+};
 
 const row = (label, value) => `<tr><th scope="row">${escapeHtml(label)}</th><td>${escapeHtml(value ?? '—')}</td></tr>`;
 

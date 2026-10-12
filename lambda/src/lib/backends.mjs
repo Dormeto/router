@@ -1,6 +1,7 @@
 // Backends of a workload: standalone EC2 instances and EC2 Auto Scaling groups feeding the app target group.
 // Instances of a group are never managed one by one: the group would replace a stopped instance.
 import { instanceStates, startInstances, stopInstances } from './instances.mjs';
+import { discoverEcsServices, ecsRecord, ecsStatuses, resumeEcs, sleepEcs, wakeEcs } from './ecs.mjs';
 
 export const WORKLOAD_TAG = 'dormeto:workload';
 export const GROUP_TAG = 'aws:autoscaling:groupName';
@@ -11,6 +12,7 @@ export const SCALING_PROCESSES = ['AlarmNotification', 'ScheduledActions', 'AZRe
 const POLL_MS = 3000;
 
 export const backendKey = (backend) => `${backend.kind}:${backend.kind === 'asg' ? backend.name : backend.id}`;
+const ecsOnly = (list) => list.filter((b) => b.kind === 'ecs');
 
 const tagMap = (tags = []) => Object.fromEntries(tags.map((t) => [t.Key, t.Value]));
 
@@ -28,7 +30,7 @@ function asgBackend(group) {
   };
 }
 
-export async function resolveBackends({ ec2, elbv2, autoscaling }, cfg) {
+export async function resolveBackends({ ec2, elbv2, autoscaling, ecs, tagging, appscaling }, cfg) {
   if (cfg.instanceIds?.length) {
     return { mode: 'static', backends: cfg.instanceIds.map((id) => ({ kind: 'instance', id })), ignored: [] };
   }
@@ -45,6 +47,8 @@ export async function resolveBackends({ ec2, elbv2, autoscaling }, cfg) {
       else ignoredGroups.push({ id: group.AutoScalingGroupName, reason: 'Auto Scaling group does not feed the target group' });
     }
   }
+
+  const services = ecs && tagging ? await discoverEcsServices({ ecs, tagging, appscaling }, cfg, WAKE_DESIRED_TAG) : { backends: [], ignored: [] };
 
   const { TargetHealthDescriptions = [] } = await elbv2.describeTargetHealth({ TargetGroupArn: cfg.appTargetGroupArn });
   const targetIds = TargetHealthDescriptions.map((d) => d.Target?.Id).filter(Boolean);
@@ -67,9 +71,10 @@ export async function resolveBackends({ ec2, elbv2, autoscaling }, cfg) {
     if (workload === cfg.workloadId) backends.push({ kind: 'instance', id });
     else ignored.push({ id, reason: workload ? `tagged for workload ${workload}` : 'untagged' });
   }
-  for (const id of targetIds) if (!id.startsWith('i-')) ignored.push({ id, reason: 'not an instance' });
-  ignored.push(...ignoredGroups);
-  backends.push(...groups.values());
+  // IP targets belong to the tasks of a managed ECS service (awsvpc): not ignored targets then.
+  if (!services.backends.length) for (const id of targetIds) if (!id.startsWith('i-')) ignored.push({ id, reason: 'not an instance' });
+  ignored.push(...ignoredGroups, ...services.ignored);
+  backends.push(...groups.values(), ...services.backends);
   return { mode: 'discovery', backends, ignored };
 }
 
@@ -92,7 +97,7 @@ const split = (backends) => ({
   groups: backends.filter((b) => b.kind === 'asg'),
 });
 
-export async function backendStatuses({ ec2, autoscaling }, backends) {
+export async function backendStatuses({ ec2, autoscaling, ecs }, backends) {
   const { ids, groups } = split(backends);
   const states = ids.length ? await instanceStates(ec2, ids) : {};
   const described = await describeGroups(autoscaling, groups.map((g) => g.name));
@@ -101,14 +106,18 @@ export async function backendStatuses({ ec2, autoscaling }, backends) {
     statuses[`instance:${id}`] = states[id] === 'running' ? 'running' : states[id] === 'stopped' ? 'stopped' : 'transitioning';
   }
   for (const group of groups) statuses[`asg:${group.name}`] = groupStatus(described.get(group.name));
+  if (ecsOnly(backends).length) Object.assign(statuses, await ecsStatuses({ ecs }, ecsOnly(backends)));
   return statuses;
 }
 
-export const toRecord = (backend) => (backend.kind === 'asg'
-  ? { kind: 'asg', name: backend.name, min: backend.min, max: backend.max, desired: backend.desired }
-  : { kind: 'instance', id: backend.id });
+export const toRecord = (backend) => {
+  if (backend.kind === 'ecs') return ecsRecord(backend);
+  if (backend.kind === 'asg') return { kind: 'asg', name: backend.name, min: backend.min, max: backend.max, desired: backend.desired };
+  return { kind: 'instance', id: backend.id };
+};
 
-export async function sleepBackends({ ec2, autoscaling }, backends, timing) {
+export async function sleepBackends({ ec2, autoscaling, ecs, appscaling }, backends, timing) {
+  if (ecsOnly(backends).length) await sleepEcs({ ecs, appscaling }, ecsOnly(backends), timing);
   const { ids, groups } = split(backends);
   for (const group of groups) {
     await autoscaling.suspendProcesses({ AutoScalingGroupName: group.name, ScalingProcesses: SCALING_PROCESSES });
@@ -125,7 +134,8 @@ export async function sleepBackends({ ec2, autoscaling }, backends, timing) {
   return backends.map(toRecord);
 }
 
-export async function wakeBackends({ ec2, autoscaling }, records, timing) {
+export async function wakeBackends({ ec2, autoscaling, ecs, appscaling }, records, timing) {
+  if (ecsOnly(records).length) await wakeEcs({ ecs, appscaling }, ecsOnly(records));
   const { ids, groups } = split(records);
   for (const group of groups) {
     // A group recorded at 0 (found asleep by a reconcile) wakes with dormeto:wake-desired or 1 instance.
@@ -142,7 +152,8 @@ export async function wakeBackends({ ec2, autoscaling }, records, timing) {
 
 // After a wake done outside Dormeto (a group scaled up by hand): resume scaling and restore the recorded limits,
 // keeping the capacity that was chosen (MinSize capped by it so that the group is not scaled up again).
-export async function resumeBackends({ autoscaling }, records) {
+export async function resumeBackends({ autoscaling, ecs, appscaling }, records) {
+  if (ecsOnly(records).length) await resumeEcs({ ecs, appscaling }, ecsOnly(records));
   const groups = records.filter((r) => r.kind === 'asg');
   const described = await describeGroups(autoscaling, groups.map((g) => g.name));
   for (const group of groups) {

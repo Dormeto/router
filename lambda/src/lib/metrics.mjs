@@ -23,11 +23,6 @@ function requestQuery(cfg, startMs, endMs) {
   };
 }
 
-export async function requestSum(cloudwatch, cfg, startMs, endMs) {
-  const out = await cloudwatch.getMetricData(requestQuery(cfg, startMs, endMs));
-  return (out.MetricDataResults ?? []).flatMap((r) => r.Values ?? []).reduce((sum, v) => sum + v, 0);
-}
-
 // End of the last one-minute period with at least one request, or null.
 export async function lastRequestAt(cloudwatch, cfg, startMs, endMs) {
   const out = await cloudwatch.getMetricData(requestQuery(cfg, startMs, endMs));

@@ -190,6 +190,32 @@ test('store records the last scheduled check in the ROUTER / CHECK item', async 
   assert.deepEqual(get.Key, { pk: { S: 'ROUTER' }, sk: { S: 'CHECK' } });
 });
 
+test('store leases the check (one at a time, until it ends or the lease expires) and keeps where it stopped', async () => {
+  let held = false;
+  const dynamo = fakeDynamo({
+    updateItem: async (input) => {
+      if (input.ConditionExpression?.startsWith('attribute_not_exists(#holder)') && held) throw Object.assign(new Error('held'), { name: 'ConditionalCheckFailedException' });
+      if (input.ConditionExpression?.startsWith('attribute_not_exists(#holder)')) held = true;
+      return {};
+    },
+  });
+  const store = createStore({ dynamo, table: 't' });
+  assert.equal(await store.acquireCheckLease('c1', 900_000, 0), true);
+  assert.equal(await store.acquireCheckLease('c2', 900_100, 100), false);
+  await store.releaseCheckLease('c1');
+  await store.setCheckCursor('w0420');
+  await store.setCheckCursor(null);
+  const [[, lease], , [, release], [, cursor], [, cleared]] = dynamo.calls;
+  assert.deepEqual(lease.Key, { pk: { S: 'ROUTER' }, sk: { S: 'CHECK' } });
+  assert.equal(lease.ConditionExpression, 'attribute_not_exists(#holder) OR #until < :now');
+  assert.equal(lease.UpdateExpression, 'SET #holder = :holder, #until = :until');
+  assert.deepEqual([lease.ExpressionAttributeValues[':holder'], lease.ExpressionAttributeValues[':until'], lease.ExpressionAttributeValues[':now']], [{ S: 'c1' }, { N: '900000' }, { N: '0' }]);
+  assert.equal(release.ConditionExpression, '#holder = :holder');
+  assert.equal(release.UpdateExpression, 'REMOVE #holder, #until');
+  assert.equal(cursor.UpdateExpression, 'SET #cursor = :cursor');
+  assert.equal(cleared.UpdateExpression, 'REMOVE #cursor');
+});
+
 // --- Pauses ---------------------------------------------------------------------------------------------------------
 
 test('store writes a pause as one JSON attribute: PAUSE for an operator, PAUSE#<exclusion> for an exclusion', async () => {

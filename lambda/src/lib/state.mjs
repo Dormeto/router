@@ -338,6 +338,44 @@ export function createStore({ dynamo, table, now = Date.now }) {
       });
     },
 
+    // One check at a time (scale design §6): a lease on ROUTER / CHECK until the check ends, or expires (a check that died).
+    async acquireCheckLease(holder, until, now) {
+      try {
+        await dynamo.updateItem({
+          TableName: table, Key: { pk: { S: 'ROUTER' }, sk: { S: 'CHECK' } },
+          UpdateExpression: 'SET #holder = :holder, #until = :until',
+          ConditionExpression: 'attribute_not_exists(#holder) OR #until < :now',
+          ExpressionAttributeNames: { '#holder': 'leaseHolder', '#until': 'leaseUntil' },
+          ExpressionAttributeValues: { ':holder': { S: holder }, ':until': { N: String(until) }, ':now': { N: String(now) } },
+        });
+        return true;
+      } catch (err) {
+        if (err?.name === 'ConditionalCheckFailedException') return false;
+        throw err;
+      }
+    },
+
+    async releaseCheckLease(holder) {
+      try {
+        await dynamo.updateItem({
+          TableName: table, Key: { pk: { S: 'ROUTER' }, sk: { S: 'CHECK' } },
+          UpdateExpression: 'REMOVE #holder, #until', ConditionExpression: '#holder = :holder',
+          ExpressionAttributeNames: { '#holder': 'leaseHolder', '#until': 'leaseUntil' }, ExpressionAttributeValues: { ':holder': { S: holder } },
+        });
+      } catch (err) {
+        if (err?.name !== 'ConditionalCheckFailedException') throw err;
+      }
+    },
+
+    // Where a check stopped at its time budget: the next one starts after it (null: it reached every workload).
+    async setCheckCursor(cursor) {
+      await dynamo.updateItem({
+        TableName: table, Key: { pk: { S: 'ROUTER' }, sk: { S: 'CHECK' } },
+        UpdateExpression: cursor ? 'SET #cursor = :cursor' : 'REMOVE #cursor',
+        ExpressionAttributeNames: { '#cursor': 'cursor' }, ...(cursor ? { ExpressionAttributeValues: { ':cursor': { S: cursor } } } : {}),
+      });
+    },
+
     async getCheck() {
       const { Item } = await dynamo.getItem({ TableName: table, Key: { pk: { S: 'ROUTER' }, sk: { S: 'CHECK' } }, ConsistentRead: true });
       return Item ? fromItem(Item) : null;

@@ -260,8 +260,9 @@ export function fakeAutoScaling(groups = []) {
       let result = state.groups;
       if (AutoScalingGroupNames) result = result.filter((g) => AutoScalingGroupNames.includes(g.AutoScalingGroupName));
       for (const filter of Filters ?? []) {
-        const key = filter.Name.replace(/^tag:/, '');
-        result = result.filter((g) => (g.Tags ?? []).some((t) => t.Key === key && filter.Values.includes(t.Value)));
+        // tag-key: any value of the listed keys; tag:<key>: the listed values of that key (as Auto Scaling filters do).
+        if (filter.Name === 'tag-key') result = result.filter((g) => (g.Tags ?? []).some((t) => filter.Values.includes(t.Key)));
+        else result = result.filter((g) => (g.Tags ?? []).some((t) => t.Key === filter.Name.replace(/^tag:/, '') && filter.Values.includes(t.Value)));
       }
       return { AutoScalingGroups: structuredClone(result) };
     },
@@ -319,11 +320,12 @@ export function fakeEcs(services = []) {
 export function fakeTagging(ecs) {
   return {
     async getResources({ TagFilters, ResourceTypeFilters }) {
+      // A filter without values matches any value of the key (as the tagging API does).
       const [{ Key, Values }] = TagFilters;
       const list = ResourceTypeFilters.includes('ecs:service') ? ecs.state.services : [];
       return {
         ResourceTagMappingList: list
-          .filter((s) => Values.includes((s.tags ?? {})[Key]))
+          .filter((s) => (Values?.length ? Values.includes((s.tags ?? {})[Key]) : Key in (s.tags ?? {})))
           .map((s) => ({ ResourceARN: s.serviceArn, Tags: Object.entries(s.tags ?? {}).map(([k, v]) => ({ Key: k, Value: v })) })),
       };
     },
@@ -392,15 +394,20 @@ export function fakeRds({ instances = {}, clusters = {} } = {}) {
 export function fakeRdsTagging(rds, workloadId = 'demo') {
   return {
     async getResources({ TagFilters, ResourceTypeFilters }) {
+      // A filter without values matches any value of the key; each resource comes with its tags (as the tagging API does).
       const wanted = TagFilters[0].Values;
+      const matching = (db) => {
+        const value = (db.tags ?? {})['dormeto:workload'];
+        return wanted?.length ? wanted.includes(value) : value !== undefined;
+      };
       const list = [];
       if (ResourceTypeFilters.includes('rds:db')) {
-        for (const [id, db] of Object.entries(rds.state.instances)) if (wanted.includes((db.tags ?? {})['dormeto:workload'])) list.push(rds.arn('db', id));
+        for (const [id, db] of Object.entries(rds.state.instances)) if (matching(db)) list.push({ arn: rds.arn('db', id), db });
       }
       if (ResourceTypeFilters.includes('rds:cluster')) {
-        for (const [id, db] of Object.entries(rds.state.clusters)) if (wanted.includes((db.tags ?? {})['dormeto:workload'])) list.push(rds.arn('cluster', id));
+        for (const [id, db] of Object.entries(rds.state.clusters)) if (matching(db)) list.push({ arn: rds.arn('cluster', id), db });
       }
-      return { ResourceTagMappingList: list.map((ResourceARN) => ({ ResourceARN })) };
+      return { ResourceTagMappingList: list.map(({ arn, db }) => ({ ResourceARN: arn, Tags: Object.entries(db.tags ?? {}).map(([Key, Value]) => ({ Key, Value })) })) };
     },
   };
 }

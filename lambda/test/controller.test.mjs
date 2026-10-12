@@ -5,18 +5,24 @@ import { currentTarget } from '../src/lib/route.mjs';
 import { STATES } from '../src/lib/state.mjs';
 import { asgGroup, ecsService, fakeAppScaling, fakeEcs, fakeRds, fakeRdsTagging, fakeTagging, fakeAutoScaling, fakeClock, fakeCloudWatch, fakeEc2, fakeElbv2, fakeStore, routeOf, silentLog, testConfig } from './fakes.mjs';
 
-function setup({ run, instance = 'running', target = 'app', healthy = 1, metric = [], cfg = testConfig(), groups = [], services = [], databases } = {}) {
+function setup({ run, instance = 'running', target = 'app', healthy = 1, metric = [], metricAt = [], cfg = testConfig(), groups = [], services = [], databases } = {}) {
   const clock = fakeClock();
   const store = fakeStore({ config: cfg, run, clock });
   const ec2 = fakeEc2(cfg.instanceIds, { state: instance });
   const elbv2 = fakeElbv2(cfg, { target, healthy });
-  const cloudwatch = fakeCloudWatch(metric);
+  const cloudwatch = fakeCloudWatch(metric, metricAt);
   const autoscaling = fakeAutoScaling(groups);
   const ecs = fakeEcs(services);
   const rds = databases ? fakeRds(databases) : undefined;
   const ecsTagging = fakeTagging(ecs);
   const rdsTagging = rds ? fakeRdsTagging(rds) : null;
-  const tagging = { getResources: (input) => (input.ResourceTypeFilters.includes('ecs:service') || !rdsTagging ? ecsTagging : rdsTagging).getResources(input) };
+  // One call may ask for several resource types (as the tagging API allows): each fake answers for its own.
+  const tagging = {
+    async getResources(input) {
+      const parts = await Promise.all([ecsTagging, rdsTagging].filter(Boolean).map((t) => t.getResources(input)));
+      return { ResourceTagMappingList: parts.flatMap((p) => p.ResourceTagMappingList ?? []) };
+    },
+  };
   const appscaling = fakeAppScaling();
   let ids = 0;
   const invocations = [];
@@ -121,10 +127,15 @@ test('check: requests the nap of an idle workload asynchronously, without nappin
   assert.equal(query.EndTime.getTime() - query.StartTime.getTime(), 15 * 60_000);
 });
 
-test('check: keeps a workload with requests awake', async () => {
-  const s = setup({ run: { state: STATES.AWAKE, awakeSince: 1 }, metric: [0, 4] });
+test('check: keeps a workload with requests awake, until its last request plus the idle window', async () => {
+  const t = fakeClock().now();
+  // Requests in the minute that started 3 minutes ago: idle 15 minutes after the end of that minute at the earliest.
+  const minute = t - 3 * 60_000;
+  const s = setup({ run: { state: STATES.AWAKE, awakeSince: 1 }, metric: [0, 4], metricAt: [new Date(minute - 60_000), new Date(minute)] });
   const [result] = await s.handler({ action: 'check' });
-  assert.deepEqual(result, { workloadId: 'demo', state: STATES.AWAKE, requests: 4 });
+  const idleNotBefore = minute + 60_000 + 15 * 60_000;
+  assert.deepEqual(result, { workloadId: 'demo', state: STATES.AWAKE, idleNotBefore });
+  assert.equal(s.store.state.run.idleNotBefore, idleNotBefore);
   assert.equal(s.ec2.state.stopped, 0);
 });
 

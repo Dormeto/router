@@ -1,14 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import { STATES } from './state.mjs';
 import { checkName } from './names.mjs';
-import { hostOf, setRoute } from './route.mjs';
+import { currentTarget, hostOf, setRoute } from './route.mjs';
 import { resolveRules } from './rules.mjs';
 import { healthyCount, waitTargetsReleased } from './instances.mjs';
 import { createStatus } from './status.mjs';
 import { describeRules } from './no-wake.mjs';
 import { describeStoredLists } from './list-cache.mjs';
 import { STATS_DAYS, totals, workloadSummary } from './summary.mjs';
-import { requestSum } from './metrics.mjs';
+import { lastRequestAt } from './metrics.mjs';
+import { checkScope } from './check-scope.mjs';
 import { healthOf, lambdaMetrics, queueDepths } from './health.mjs';
 import {
   backendKey, backendStatuses, isCompanion, resolveBackends, resumeBackends, sleepBackends, startCompanions, stopCompanions, toRecord, wakeBackends,
@@ -28,6 +29,11 @@ const HOLDERS_STALE_MS = 2 * 60_000;
 // The scheduled check measures the router's health (metrics, queues, concurrency limit) at most this often and stores
 // it; the router action reads what is stored (scale design §3).
 const HEALTH_REFRESH_MS = 15 * 60_000;
+// The idle check of a crowded account-region (scale design §6): workloads checked 8 at a time within 240 s of the 5-minute
+// period, the next check starting where it stopped; one check at a time (a lease for the controller's 15 minutes at most).
+const CHECK_BUDGET_MS = 240_000;
+const CHECK_CONCURRENCY = 8;
+const CHECK_LEASE_MS = 15 * 60_000;
 // Pauses (router management): automatic resume at most this far ahead, reason length.
 const PAUSE_MAX_MS = 366 * 86_400_000;
 const REASON_MAX = 256;
@@ -46,8 +52,8 @@ export function createController({
     return cfg;
   }
 
-  async function managedBackends(cfg) {
-    const { backends, ignored } = await resolveBackends(clients, cfg);
+  async function managedBackends(cfg, scope = clients) {
+    const { backends, ignored } = await resolveBackends(scope, cfg);
     for (const target of ignored) log.info('IgnoredTarget', { workloadId: cfg.workloadId, target: target.id, reason: target.reason });
     return backends;
   }
@@ -186,7 +192,8 @@ export function createController({
   const reasons = (issues) => issues.map((i) => i.reason);
   const routeTo = (cfg, target, options = {}) => setRoute(elbv2, cfg, target, { ...options, onIssues: (issues) => log.warn('RuleIssues', { workloadId: cfg.workloadId, issues: reasons(issues) }) });
 
-  async function reconcile(cfg) {
+  // ctx (an idle check): its rules snapshot (what it compares; anything it changes is read again) and its clients.
+  async function reconcile(cfg, ctx = null) {
     const { workloadId } = cfg;
     let run = await store.getRun(workloadId);
     if (!run) return null;
@@ -209,7 +216,7 @@ export function createController({
     }
     if (![STATES.AWAKE, STATES.ASLEEP, STATES.FAILED].includes(run.state)) return run;
 
-    const backends = await managedBackends(cfg);
+    const backends = await managedBackends(cfg, ctx?.scope);
     const statuses = backends.length ? await backendStatuses(clients, backends) : {};
     // The primary backends decide the state; companions (databases) follow it.
     const primaries = backends.filter((b) => !isCompanion(b));
@@ -245,7 +252,7 @@ export function createController({
     // A FAILED workload stays behind the waker, so that requests retry the wake.
     const expected = run.state === STATES.AWAKE ? 'app' : [STATES.ASLEEP, STATES.FAILED].includes(run.state) ? 'waker' : null;
     if (expected) {
-      const found = await rulesFor(cfg);
+      let found = ctx?.rules?.get(workloadId) ?? (await rulesFor(cfg));
       // A workload the manager onboarded: the onboarder re-applies what drifted (a shadow deleted, a new customer rule) and
       // removes the orphan shadows; a failure is retried at the next check, never stopping this one.
       const repairable = [...found.issues.filter((i) => i.repairable), ...(found.orphans ?? [])];
@@ -257,6 +264,9 @@ export function createController({
           log.error('RepairRequestFailed', { workloadId, error: err.message });
         }
       }
+      // Acting on the snapshot of the check would write back rules as they were minutes ago: read them again first.
+      const switching = found.instrumented.some((rule) => currentTarget(rule.Actions, cfg) !== expected);
+      if (ctx?.rules && (switching || (run.state === STATES.ASLEEP && found.issues.some((i) => i.arn)))) found = await rulesFor(cfg);
       // A rule the router cannot switch sends requests to the stopped backend: wake the workload (it is not napped again
       // until the rule is instrumented or removed). A target group without any rule has no such rule: no wake.
       const ruleIssues = found.issues.filter((i) => i.arn);
@@ -278,8 +288,8 @@ export function createController({
     return run;
   }
 
-  async function checkOne(cfg, paused) {
-    const run = await reconcile(cfg);
+  async function checkOne(cfg, paused, ctx = null) {
+    const run = await reconcile(cfg, ctx);
     if (!run || run.state !== STATES.AWAKE) return { state: run?.state ?? 'UNKNOWN' };
     if (!run.awakeSince) {
       // First check after deployment: the idle window starts now, not at the epoch.
@@ -290,8 +300,14 @@ export function createController({
     const t = now();
     const idleMs = cfg.idleMinutes * 60_000;
     if ((run.awakeSince ?? 0) > t - idleMs) return { state: run.state };
-    const requests = await requestSum(cloudwatch, cfg, t - idleMs, t);
-    if (requests > 0) return { state: run.state, requests };
+    // The request metric is read once the workload can be idle: not before its last request plus the idle window.
+    if ((run.idleNotBefore ?? 0) > t) return { state: run.state, idleNotBefore: run.idleNotBefore };
+    const last = await lastRequestAt(cloudwatch, cfg, t - idleMs, t);
+    if (last !== null) {
+      const idleNotBefore = last + idleMs;
+      await store.transition(cfg.workloadId, { cond: { state: STATES.AWAKE }, set: { idleNotBefore } });
+      return { state: run.state, idleNotBefore };
+    }
     // A nap lasts minutes: run it in its own invocation so that the check (and the other workloads) are not delayed.
     if (invokeSelf) {
       await invokeSelf({ action: 'nap', workloadId: cfg.workloadId });
@@ -405,27 +421,55 @@ export function createController({
 
   async function check(source) {
     const started = now();
-    // Only the schedule proves that naps happen on their own: the e2e and operators also call check.
-    if (source === 'schedule') {
-      await store.recordScheduledCheck(now()).catch((err) => log.warn('CheckRecordFailed', { error: err.message }));
-      // Measured before the work: a check that dies (its timeout lands it in the failure queue) still refreshes it.
-      await storedHealth(now(), { refresh: true });
+    const holder = newId();
+    if (store.acquireCheckLease && !(await store.acquireCheckLease(holder, started + CHECK_LEASE_MS, started))) {
+      log.warn('CheckSkipped', { reason: 'previous check still running' });
+      return { skipped: 'the previous check is still running' };
     }
-    await requestListRefresh();
-    const pauses = await activePauses();
-    // Pauses that cannot be read stop every nap of this check (the reconcile still runs).
-    const paused = (workloadId) => pauses === null || pauses.some((p) => p.workloadId === null || p.workloadId === workloadId);
-    const results = [];
-    for (const cfg of await store.listConfigs()) {
-      try {
-        results.push({ workloadId: cfg.workloadId, ...(await checkOne(cfg, paused(cfg.workloadId))) });
-      } catch (err) {
-        log.error('CheckFailed', { workloadId: cfg.workloadId, error: err.message });
-        results.push({ workloadId: cfg.workloadId, error: err.message });
+    try {
+      // Only the schedule proves that naps happen on their own: the e2e and operators also call check.
+      if (source === 'schedule') {
+        await store.recordScheduledCheck(now()).catch((err) => log.warn('CheckRecordFailed', { error: err.message }));
+        // Measured before the work: a check that dies (its timeout lands it in the failure queue) still refreshes it.
+        await storedHealth(now(), { refresh: true });
       }
+      await requestListRefresh();
+      const pauses = await activePauses();
+      // Pauses that cannot be read stop every nap of this check (the reconcile still runs).
+      const paused = (workloadId) => pauses === null || pauses.some((p) => p.workloadId === null || p.workloadId === workloadId);
+      const configs = (await store.listConfigs()).sort((a, b) => a.workloadId.localeCompare(b.workloadId));
+      // Starting after the workload where the previous check stopped (its time budget), so every workload gets its turn.
+      const cursor = (await store.getCheck?.().catch(() => null))?.cursor;
+      const from = cursor ? configs.findIndex((c) => c.workloadId > cursor) : 0;
+      const order = from > 0 ? [...configs.slice(from), ...configs.slice(0, from)] : configs;
+      // The rules of every workload, each load balancer listed once; backends found by tag once.
+      const rules = await resolveRules(elbv2, configs).catch((err) => {
+        log.warn('CheckRulesUnread', { error: err.message });
+        return null;
+      });
+      const ctx = { rules, scope: checkScope(clients) };
+      const deadline = Math.min(started + CHECK_BUDGET_MS, budgetEnd);
+      const results = [];
+      let next = 0;
+      await Promise.all(Array.from({ length: Math.min(CHECK_CONCURRENCY, order.length) }, async () => {
+        while (next < order.length && now() < deadline) {
+          const cfg = order[next++];
+          try {
+            results.push({ workloadId: cfg.workloadId, ...(await checkOne(cfg, paused(cfg.workloadId), ctx)) });
+          } catch (err) {
+            log.error('CheckFailed', { workloadId: cfg.workloadId, error: err.message });
+            results.push({ workloadId: cfg.workloadId, error: err.message });
+          }
+        }
+      }));
+      const stopped = next < order.length ? order[next - 1]?.workloadId ?? null : null;
+      if (stopped) log.warn('CheckBudgetReached', { checked: next, workloads: order.length, next: order[next].workloadId });
+      await store.setCheckCursor?.(stopped).catch((err) => log.warn('CheckCursorNotStored', { error: err.message }));
+      await report(started);
+      return results;
+    } finally {
+      await store.releaseCheckLease?.(holder).catch((err) => log.warn('CheckLeaseNotReleased', { error: err.message }));
     }
-    await report(started);
-    return results;
   }
 
   // The router's state to the manager after each check: its workloads as the list gives them, counts and health.

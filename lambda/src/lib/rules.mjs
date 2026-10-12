@@ -11,6 +11,16 @@ const NO_RULE = 'no rule forwards to the target group';
 const DETACHED = 'target group not attached to a load balancer';
 
 const chunks = (list, size) => Array.from({ length: Math.ceil(list.length / size) }, (_, i) => list.slice(i * size, (i + 1) * size));
+// ELB calls of one resolution at once: a crowded account lists hundreds of load balancers in a check (scale design §6).
+const LISTINGS = 4;
+
+// Work on the items, at most `size` at once.
+async function each(items, size, work) {
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(size, items.length) }, async () => {
+    while (next < items.length) await work(items[next++]);
+  }));
+}
 
 async function pages(call, key) {
   const items = [];
@@ -109,10 +119,10 @@ export async function listRules(elbv2, loadBalancerArn) {
 // Tags of rules (never default rules: their reason never depends on tags, and a default rule may not accept tags).
 export async function ruleTags(elbv2, rules) {
   const tags = new Map();
-  for (const batch of chunks([...new Set(rules.filter((rule) => !rule.IsDefault).map((rule) => rule.RuleArn))], 20)) {
+  await each(chunks([...new Set(rules.filter((rule) => !rule.IsDefault).map((rule) => rule.RuleArn))], 20), LISTINGS, async (batch) => {
     const { TagDescriptions = [] } = await elbv2.describeTags({ ResourceArns: batch });
     for (const d of TagDescriptions) tags.set(d.ResourceArn, Object.fromEntries((d.Tags ?? []).map((t) => [t.Key, t.Value])));
-  }
+  });
   return tags;
 }
 
@@ -120,12 +130,12 @@ export async function ruleTags(elbv2, rules) {
 // One listing per load balancer, whatever the number of workloads (the workload list resolves them all at once).
 export async function resolveRules(elbv2, cfgs) {
   const balancers = new Map();
-  for (const batch of chunks([...new Set(cfgs.map((c) => c.appTargetGroupArn))], 20)) {
+  await each(chunks([...new Set(cfgs.map((c) => c.appTargetGroupArn))], 20), LISTINGS, async (batch) => {
     const { TargetGroups = [] } = await elbv2.describeTargetGroups({ TargetGroupArns: batch });
     for (const g of TargetGroups) balancers.set(g.TargetGroupArn, g.LoadBalancerArns ?? []);
-  }
+  });
   const listed = new Map();
-  for (const lb of new Set([...balancers.values()].flat())) listed.set(lb, await listRules(elbv2, lb));
+  await each([...new Set([...balancers.values()].flat())], LISTINGS, async (lb) => { listed.set(lb, await listRules(elbv2, lb)); });
   const matching = new Map(cfgs.map((cfg) => [cfg.workloadId, (balancers.get(cfg.appTargetGroupArn) ?? [])
     .flatMap((lb) => listed.get(lb) ?? [])
     .filter(({ rule }) => forwardTargetGroups(rule).includes(cfg.appTargetGroupArn))]));

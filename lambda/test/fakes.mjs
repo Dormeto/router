@@ -1,5 +1,5 @@
 import { matches, STATES } from '../src/lib/state.mjs';
-import { currentTarget } from '../src/lib/route.mjs';
+import { currentTarget, routeOf as aggregateRoute } from '../src/lib/route.mjs';
 
 export const silentLog = { info() {}, warn() {}, error() {} };
 
@@ -92,28 +92,36 @@ export function fakeStore({ config, run, clock }) {
   };
 }
 
+// Load balancer with the rules of the workload (cfg.ruleArns, or cfg.ruleArn): state.rules holds each rule's actions,
+// state.actions is the first rule's (single-rule tests). state.failOn makes ModifyRule fail for that rule.
 export function fakeElbv2(cfg, { target = 'app', healthy = 1 } = {}) {
   const [app, waker] = target === 'app' ? [1, 0] : [0, 1];
+  const actions = () => [{
+    Type: 'forward',
+    Order: 1,
+    ForwardConfig: {
+      TargetGroups: [{ TargetGroupArn: cfg.appTargetGroupArn, Weight: app }, { TargetGroupArn: cfg.wakerTargetGroupArn, Weight: waker }],
+      TargetGroupStickinessConfig: { Enabled: false },
+    },
+  }];
+  const arns = cfg.ruleArns?.length ? cfg.ruleArns : [cfg.ruleArn];
   const state = {
     healthy,
     modifyCount: 0,
-    actions: [{
-      Type: 'forward',
-      Order: 1,
-      ForwardConfig: {
-        TargetGroups: [{ TargetGroupArn: cfg.appTargetGroupArn, Weight: app }, { TargetGroupArn: cfg.wakerTargetGroupArn, Weight: waker }],
-        TargetGroupStickinessConfig: { Enabled: false },
-      },
-    }],
+    failOn: null,
+    rules: new Map(arns.map((arn) => [arn, actions()])),
+    get actions() { return this.rules.get(arns[0]); },
+    set actions(value) { this.rules.set(arns[0], value); },
   };
   return {
     state,
     async describeRules({ RuleArns }) {
-      return { Rules: RuleArns[0] === cfg.ruleArn ? [{ RuleArn: cfg.ruleArn, Actions: structuredClone(state.actions) }] : [] };
+      return { Rules: RuleArns.filter((a) => state.rules.has(a)).map((a) => ({ RuleArn: a, Actions: structuredClone(state.rules.get(a)) })) };
     },
-    async modifyRule({ Actions }) {
+    async modifyRule({ RuleArn, Actions }) {
+      if (state.failOn === RuleArn) throw new Error(`ModifyRule failed for ${RuleArn}`);
       state.modifyCount += 1;
-      state.actions = structuredClone(Actions);
+      state.rules.set(RuleArn ?? arns[0], structuredClone(Actions));
       return {};
     },
     async describeTargetHealth() {
@@ -126,7 +134,8 @@ export function fakeElbv2(cfg, { target = 'app', healthy = 1 } = {}) {
   };
 }
 
-export const routeOf = (elbv2, cfg) => currentTarget(elbv2.state.actions, cfg);
+// Route over every rule of the workload (app, waker, mixed, unknown).
+export const routeOf = (elbv2, cfg) => aggregateRoute([...elbv2.state.rules].map(([RuleArn, Actions]) => ({ RuleArn, Actions })), cfg);
 
 export function fakeEc2(ids, { state = 'running' } = {}) {
   const s = { instances: Object.fromEntries(ids.map((id) => [id, state])), tags: {}, started: 0, stopped: 0, onStart: [], onStop: [] };

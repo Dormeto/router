@@ -19,10 +19,11 @@ function setup({ run, instance = 'running', target = 'app', healthy = 1, metric 
   const appscaling = fakeAppScaling();
   let ids = 0;
   const invocations = [];
+  const log = { ...silentLog };
   const handler = createController({
-    store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, invokeSelf: async (payload) => { invocations.push(payload); }, now: clock.now, sleep: clock.sleep, newId: () => `wake-${++ids}`, log: silentLog,
+    store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, invokeSelf: async (payload) => { invocations.push(payload); }, now: clock.now, sleep: clock.sleep, newId: () => `wake-${++ids}`, log,
   });
-  return { handler, store, ec2, elbv2, cloudwatch, autoscaling, ecs, appscaling, rds, clock, cfg, invocations };
+  return { handler, store, ec2, elbv2, cloudwatch, autoscaling, ecs, appscaling, rds, clock, cfg, invocations, log };
 }
 
 test('wake: starts the instance, waits for health, switches the route and becomes AWAKE', async () => {
@@ -182,6 +183,49 @@ test('ensure-awake switches the route back when the workload is awake and health
   const result = await s.handler({ action: 'ensure-awake', workloadId: 'demo' });
   assert.equal(result.changed, true);
   assert.equal(routeOf(s.elbv2, s.cfg), 'app');
+});
+
+// --- Several rules per workload -------------------------------------------------------------------------------------
+
+const TWO_RULES = testConfig({ ruleArns: ['arn:rule/main', 'arn:rule/static'] });
+
+test('nap and wake switch every rule of a workload with several rules', async () => {
+  const s = setup({ run: { state: STATES.AWAKE, awakeSince: 0 }, cfg: TWO_RULES });
+  await s.handler({ action: 'nap', workloadId: 'demo' });
+  assert.equal(s.store.state.run.state, STATES.ASLEEP);
+  assert.equal(routeOf(s.elbv2, s.cfg), 'waker');
+  assert.equal(s.elbv2.state.modifyCount, 2);
+  s.store.state.run = { ...s.store.state.run, state: STATES.WAKING, wakeId: 'w1' };
+  await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' });
+  assert.equal(s.store.state.run.state, STATES.AWAKE);
+  assert.equal(routeOf(s.elbv2, s.cfg), 'app');
+});
+
+test('a nap failing on the second rule is not a success, and the next check repairs the route', async () => {
+  const s = setup({ run: { state: STATES.AWAKE, awakeSince: 0 }, cfg: TWO_RULES });
+  s.elbv2.state.failOn = 'arn:rule/static';
+  const result = await s.handler({ action: 'nap', workloadId: 'demo' });
+  assert.deepEqual([result.state, s.store.state.run.state], [STATES.FAILED, STATES.FAILED]);
+  assert.match(result.error, /ModifyRule failed/);
+  assert.equal(routeOf(s.elbv2, s.cfg), 'mixed');
+  s.elbv2.state.failOn = null;
+  await s.handler({ action: 'check' });
+  assert.notEqual(routeOf(s.elbv2, s.cfg), 'mixed');
+});
+
+test('check repairs one rule switched back by hand while the workload sleeps, and reports which', async () => {
+  const s = setup({ run: { state: STATES.ASLEEP }, instance: 'stopped', target: 'waker', cfg: TWO_RULES });
+  const warnings = [];
+  s.log.warn = (event, data) => warnings.push([event, data]);
+  s.elbv2.state.rules.set('arn:rule/static', s.elbv2.state.rules.get('arn:rule/static').map((a) => ({
+    ...a, ForwardConfig: { ...a.ForwardConfig, TargetGroups: a.ForwardConfig.TargetGroups.map((tg) => ({ ...tg, Weight: tg.TargetGroupArn === s.cfg.appTargetGroupArn ? 1 : 0 })) },
+  })));
+  assert.equal(routeOf(s.elbv2, s.cfg), 'mixed');
+  await s.handler({ action: 'check' });
+  assert.equal(routeOf(s.elbv2, s.cfg), 'waker');
+  assert.deepEqual(warnings.find(([e]) => e === 'RouteRepaired'), ['RouteRepaired', { workloadId: 'demo', route: 'waker', rules: ['arn:rule/static'] }]);
+  await s.handler({ action: 'check' });
+  assert.equal(warnings.filter(([e]) => e === 'RouteRepaired').length, 1, 'no repair reported when nothing changed');
 });
 
 test('unknown actions are rejected', async () => {

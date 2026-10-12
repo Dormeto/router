@@ -213,7 +213,11 @@ export function createController({
     // Keep the route consistent with the state, for example after a Terraform apply reset the weights.
     // A FAILED workload stays behind the waker, so that requests retry the wake.
     const expected = run.state === STATES.AWAKE ? 'app' : [STATES.ASLEEP, STATES.FAILED].includes(run.state) ? 'waker' : null;
-    if (expected && (await setRoute(elbv2, cfg, expected))) log.warn('RouteRepaired', { workloadId, route: expected });
+    if (expected) {
+      // Every rule of the workload: a rule switched back alone (mixed route) is repaired too.
+      const repaired = await setRoute(elbv2, cfg, expected);
+      if (repaired.length) log.warn('RouteRepaired', { workloadId, route: expected, rules: repaired });
+    }
 
     if ((run.holders ?? 0) > 0 && (run.updatedAt ?? 0) < now() - HOLDERS_STALE_MS) {
       log.warn('HoldersReset', { workloadId, holders: run.holders });
@@ -358,9 +362,9 @@ export function createController({
     const run = await store.getRun(workloadId);
     if (run?.state !== STATES.AWAKE) return { state: run?.state };
     if ((await healthyCount(elbv2, cfg.appTargetGroupArn)) < 1) return { state: run.state, healthy: 0 };
-    const changed = await setRoute(elbv2, cfg, 'app');
-    if (changed) log.warn('RouteRepaired', { workloadId, route: 'app' });
-    return { state: run.state, changed };
+    const repaired = await setRoute(elbv2, cfg, 'app');
+    if (repaired.length) log.warn('RouteRepaired', { workloadId, route: 'app', rules: repaired });
+    return { state: run.state, changed: repaired.length > 0 };
   }
 
   return async function handler(event, context) {

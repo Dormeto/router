@@ -34,15 +34,36 @@ export function currentTarget(actions, cfg) {
   return 'mixed';
 }
 
+// Rules of a workload: ruleArns, or the single ruleArn of configurations written before several rules were supported.
+export const rulesOf = (cfg) => (cfg.ruleArns?.length ? cfg.ruleArns : [cfg.ruleArn].filter(Boolean));
+
+// Route of the workload over all its rules: app or waker when every rule agrees, mixed when they differ, unknown when a
+// rule is missing or has no weighted forward.
+export function routeOf(rules, cfg) {
+  const byArn = new Map(rules.map((r) => [r.RuleArn, r]));
+  const targets = rulesOf(cfg).map((arn) => (byArn.has(arn) ? currentTarget(byArn.get(arn).Actions ?? [], cfg) : 'unknown'));
+  if (!targets.length || targets.includes('unknown')) return 'unknown';
+  return targets.every((t) => t === targets[0]) ? targets[0] : 'mixed';
+}
+
+// Switches every rule of the workload to the target; returns the rules it changed (none when already there). All the
+// rules are read first: a missing rule fails before any change.
 export async function setRoute(elbv2, cfg, target) {
   if (!TARGETS.has(target)) throw new Error(`invalid target: ${target}`);
-  const { Rules = [] } = await elbv2.describeRules({ RuleArns: [cfg.ruleArn] });
-  const rule = Rules[0];
-  if (!rule) throw new Error(`rule not found: ${cfg.ruleArn}`);
-  if (currentTarget(rule.Actions, cfg) === target) return false;
+  const arns = rulesOf(cfg);
+  const { Rules = [] } = await elbv2.describeRules({ RuleArns: arns });
+  const byArn = new Map(Rules.map((r) => [r.RuleArn, r]));
+  const missing = arns.find((arn) => !byArn.has(arn));
+  if (missing) throw new Error(`rule not found: ${missing}`);
   const weights = target === 'app'
     ? { [cfg.appTargetGroupArn]: 1, [cfg.wakerTargetGroupArn]: 0 }
     : { [cfg.appTargetGroupArn]: 0, [cfg.wakerTargetGroupArn]: 1 };
-  await elbv2.modifyRule({ RuleArn: cfg.ruleArn, Actions: withWeights(rule.Actions, weights) });
-  return true;
+  const changed = [];
+  for (const arn of arns) {
+    const rule = byArn.get(arn);
+    if (currentTarget(rule.Actions, cfg) === target) continue;
+    await elbv2.modifyRule({ RuleArn: arn, Actions: withWeights(rule.Actions, weights) });
+    changed.push(arn);
+  }
+  return changed;
 }

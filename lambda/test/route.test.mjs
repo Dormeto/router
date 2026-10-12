@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { currentTarget, setRoute, withWeights } from '../src/lib/route.mjs';
+import { currentTarget, routeOf, rulesOf, setRoute, withWeights } from '../src/lib/route.mjs';
 
 const cfg = { ruleArn: 'rule', appTargetGroupArn: 'app-tg', wakerTargetGroupArn: 'waker-tg' };
 
@@ -48,16 +48,66 @@ function fakeElbv2(actions) {
 
 test('setRoute flips the weights once and is idempotent', async () => {
   const elbv2 = fakeElbv2([forward(1, 0)]);
-  assert.equal(await setRoute(elbv2, cfg, 'waker'), true);
+  assert.deepEqual(await setRoute(elbv2, cfg, 'waker'), ['rule']);
   assert.equal(currentTarget(elbv2.state.actions, cfg), 'waker');
   assert.equal(elbv2.state.modified[0].RuleArn, 'rule');
-  assert.equal(await setRoute(elbv2, cfg, 'waker'), false);
+  assert.deepEqual(await setRoute(elbv2, cfg, 'waker'), []);
   assert.equal(elbv2.state.modified.length, 1);
-  assert.equal(await setRoute(elbv2, cfg, 'app'), true);
+  assert.deepEqual(await setRoute(elbv2, cfg, 'app'), ['rule']);
   assert.equal(currentTarget(elbv2.state.actions, cfg), 'app');
 });
 
 test('setRoute fails on a missing rule or an unknown target', async () => {
   await assert.rejects(setRoute(fakeElbv2([forward(1, 0)]), { ...cfg, ruleArn: 'other' }, 'app'), /rule not found/);
   await assert.rejects(setRoute(fakeElbv2([forward(1, 0)]), cfg, 'nowhere'), /invalid target/);
+});
+
+// --- Several rules per workload -------------------------------------------------------------------------------------
+
+const multi = { ruleArns: ['r1', 'r2'], appTargetGroupArn: 'app-tg', wakerTargetGroupArn: 'waker-tg' };
+
+function fakeRules(byArn) {
+  const state = { rules: new Map(Object.entries(byArn)), modified: [], describeCalls: 0 };
+  return {
+    state,
+    async describeRules({ RuleArns }) {
+      state.describeCalls += 1;
+      return { Rules: RuleArns.filter((a) => state.rules.has(a)).map((a) => ({ RuleArn: a, Actions: structuredClone(state.rules.get(a)) })) };
+    },
+    async modifyRule({ RuleArn, Actions }) {
+      state.modified.push(RuleArn);
+      state.rules.set(RuleArn, Actions);
+      return {};
+    },
+  };
+}
+
+test('rulesOf reads ruleArns, else the single ruleArn of older configurations', () => {
+  assert.deepEqual(rulesOf(multi), ['r1', 'r2']);
+  assert.deepEqual(rulesOf(cfg), ['rule']);
+  assert.deepEqual(rulesOf({ ruleArns: [], ruleArn: 'rule' }), ['rule']);
+});
+
+test('routeOf aggregates the rules: app, waker, mixed, unknown when a rule is missing', () => {
+  const rule = (arn, actions) => ({ RuleArn: arn, Actions: actions });
+  assert.equal(routeOf([rule('r1', [forward(1, 0)]), rule('r2', [forward(1, 0)])], multi), 'app');
+  assert.equal(routeOf([rule('r1', [forward(0, 1)]), rule('r2', [forward(0, 1)])], multi), 'waker');
+  assert.equal(routeOf([rule('r1', [forward(0, 1)]), rule('r2', [forward(1, 0)])], multi), 'mixed');
+  assert.equal(routeOf([rule('r1', [forward(0, 1)])], multi), 'unknown');
+  assert.equal(routeOf([rule('r1', [forward(0, 1)]), rule('r2', [oidc])], multi), 'unknown');
+});
+
+test('setRoute switches every rule with one DescribeRules call, and only the rules that differ', async () => {
+  const elbv2 = fakeRules({ r1: [forward(1, 0)], r2: [forward(0, 1)] });
+  assert.deepEqual(await setRoute(elbv2, multi, 'waker'), ['r1']);
+  assert.equal(elbv2.state.describeCalls, 1);
+  assert.deepEqual(await setRoute(elbv2, multi, 'app'), ['r1', 'r2']);
+  assert.equal(currentTarget(elbv2.state.rules.get('r2'), multi), 'app');
+  assert.deepEqual(await setRoute(elbv2, multi, 'app'), []);
+});
+
+test('setRoute changes nothing when one rule of the workload is missing', async () => {
+  const elbv2 = fakeRules({ r1: [forward(1, 0)] });
+  await assert.rejects(setRoute(elbv2, multi, 'waker'), /rule not found: r2/);
+  assert.deepEqual(elbv2.state.modified, []);
 });

@@ -1,7 +1,9 @@
 # The acceptance at scale (vision docs/specs/2026-10-05-scale-design.md section 7): a burst of onboardings in this account
 # and region, queued by the manager's slots (3 at a time). `burst` small applications, each with its own instance, target
 # group and host rule on the load balancer (burst<N>.paris.dev.dormeto.com, never served); 0 outside the test (about
-# 3 USD a month each while they exist). Offboard them in the manager before setting it back to 0.
+# 4 USD a month each while they exist: the instance and its volume). At most about 48: once onboarded each takes 2 target
+# groups and 2 rules of the load balancer's 100 of each (paris-app takes 2 of each too). Offboard them in the manager
+# before setting it back to 0.
 variable "burst" {
   type    = number
   default = 0

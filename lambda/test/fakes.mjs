@@ -159,3 +159,55 @@ export function albEvent({ method = 'GET', path = '/', query = {}, headers = {},
     isBase64Encoded: false,
   };
 }
+
+// Auto Scaling groups: [{ AutoScalingGroupName, MinSize, MaxSize, DesiredCapacity, TargetGroupARNs, Instances, Tags }].
+// Scaling is immediate: DesiredCapacity N gives N InService instances i-<group>-<k>.
+export function fakeAutoScaling(groups = []) {
+  const state = { groups: structuredClone(groups), suspended: {}, updates: [], resumed: [] };
+  const find = (name) => state.groups.find((g) => g.AutoScalingGroupName === name);
+  const instancesFor = (group, count) => Array.from({ length: count }, (_, k) => ({
+    InstanceId: `i-${group.AutoScalingGroupName}-${k}`, LifecycleState: 'InService',
+  }));
+  return {
+    state,
+    async describeAutoScalingGroups({ AutoScalingGroupNames, Filters } = {}) {
+      let result = state.groups;
+      if (AutoScalingGroupNames) result = result.filter((g) => AutoScalingGroupNames.includes(g.AutoScalingGroupName));
+      for (const filter of Filters ?? []) {
+        const key = filter.Name.replace(/^tag:/, '');
+        result = result.filter((g) => (g.Tags ?? []).some((t) => t.Key === key && filter.Values.includes(t.Value)));
+      }
+      return { AutoScalingGroups: structuredClone(result) };
+    },
+    async updateAutoScalingGroup(input) {
+      state.updates.push(input);
+      const group = find(input.AutoScalingGroupName);
+      if (input.MinSize !== undefined) group.MinSize = input.MinSize;
+      if (input.MaxSize !== undefined) group.MaxSize = input.MaxSize;
+      if (input.DesiredCapacity !== undefined) {
+        group.DesiredCapacity = input.DesiredCapacity;
+        group.Instances = instancesFor(group, input.DesiredCapacity);
+      }
+      return {};
+    },
+    async suspendProcesses({ AutoScalingGroupName, ScalingProcesses }) {
+      state.suspended[AutoScalingGroupName] = [...ScalingProcesses];
+      return {};
+    },
+    async resumeProcesses({ AutoScalingGroupName, ScalingProcesses }) {
+      state.resumed.push({ name: AutoScalingGroupName, processes: [...ScalingProcesses] });
+      delete state.suspended[AutoScalingGroupName];
+      return {};
+    },
+  };
+}
+
+export const asgGroup = (name, { min = 1, max = 2, desired = 1, targetGroups = [], tags = {}, instances } = {}) => ({
+  AutoScalingGroupName: name,
+  MinSize: min,
+  MaxSize: max,
+  DesiredCapacity: desired,
+  TargetGroupARNs: targetGroups,
+  Instances: instances ?? Array.from({ length: desired }, (_, k) => ({ InstanceId: `i-${name}-${k}`, LifecycleState: 'InService' })),
+  Tags: Object.entries(tags).map(([Key, Value]) => ({ Key, Value })),
+});

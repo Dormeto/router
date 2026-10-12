@@ -63,3 +63,13 @@ test('response uses multi-value headers', () => {
     multiValueHeaders: { 'retry-after': ['3'] }, body: 'x',
   });
 });
+
+test('classify treats well-known scanner paths as no-wake', () => {
+  for (const path of ['/.env', '/.git/config', '/.github/copilot-instructions.md', '/config.json', '/js/env.js', '/api/config',
+    '/AGENTS.md', '/CLAUDE.md', '/README.md', '/wp-login.php', '/xmlrpc.php', '/phpmyadmin/', '/actuator/health', '/index.php', '/.aws/credentials']) {
+    assert.equal(classify(event({ path })), 'no-wake', path);
+  }
+  for (const path of ['/', '/orders', '/api/orders', '/js/app.js', '/docs/readme-guide']) {
+    assert.equal(classify(event({ path })), 'normal', path);
+  }
+});

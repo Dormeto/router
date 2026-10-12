@@ -1,4 +1,13 @@
 export const BOT_PATTERN = /bot|crawl|spider|slurp|monitor|uptime|pingdom|ELB-HealthChecker/i;
+// Paths requested by secret and vulnerability scanners (observed on the dev hostnames within minutes of a new
+// certificate): they must not wake a workload.
+export const SCANNER_PATH = new RegExp([
+  '^/\\.(env|git|github|aws|ssh|svn|hg|DS_Store|vscode|idea|docker)',
+  '^/(wp-|wordpress|xmlrpc\\.php|phpmyadmin|pma|cgi-bin|actuator|server-status|solr|vendor/|telescope|_profiler)',
+  '^/(config\\.(json|js|php|ya?ml)|js/env\\.js|api/config|env\\.js)$',
+  '^/(AGENTS|CLAUDE|README|GEMINI)\\.md$',
+  '\\.php$',
+].join('|'), 'i');
 
 const REASONS = { 200: 'OK', 303: 'See Other', 307: 'Temporary Redirect', 404: 'Not Found', 405: 'Method Not Allowed', 503: 'Service Unavailable' };
 
@@ -26,6 +35,7 @@ export function workloadIdFromEvent(event, prefix) {
 export function classify(event) {
   if (header(event, 'x-dormeto-probe') === '1') return 'probe';
   if (event.httpMethod === 'HEAD' || BOT_PATTERN.test(header(event, 'user-agent') ?? '')) return 'no-wake';
+  if (SCANNER_PATH.test(event.path ?? '')) return 'no-wake';
   return 'normal';
 }
 

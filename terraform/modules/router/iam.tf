@@ -40,7 +40,7 @@ data "aws_iam_policy_document" "waker" {
     for_each = var.admin_enabled ? [1] : []
     content {
       sid       = "AdminDashboardRead"
-      actions   = ["ec2:DescribeInstances", "elasticloadbalancing:DescribeRules", "elasticloadbalancing:DescribeTargetHealth", "cloudwatch:GetMetricData"]
+      actions   = ["ec2:DescribeInstances", "elasticloadbalancing:DescribeRules", "elasticloadbalancing:DescribeTargetHealth", "cloudwatch:GetMetricData", "autoscaling:DescribeAutoScalingGroups"]
       resources = ["*"]
     }
   }
@@ -79,6 +79,20 @@ data "aws_iam_policy_document" "controller" {
     actions   = ["elasticloadbalancing:ModifyRule"]
     resources = ["${local.arn_prefix}:elasticloadbalancing:${local.region}:${local.account_id}:listener-rule/app/*"]
     # Only rules onboarded in Dormeto (tagged dormeto:workload).
+    condition {
+      test     = "Null"
+      variable = "aws:ResourceTag/dormeto:workload"
+      values   = ["false"]
+    }
+  }
+  statement {
+    actions   = ["autoscaling:DescribeAutoScalingGroups"]
+    resources = ["*"]
+  }
+  statement {
+    actions   = ["autoscaling:UpdateAutoScalingGroup", "autoscaling:SuspendProcesses", "autoscaling:ResumeProcesses"]
+    resources = ["${local.arn_prefix}:autoscaling:${local.region}:${local.account_id}:autoScalingGroup:*:autoScalingGroupName/*"]
+    # Only groups onboarded in Dormeto (tagged dormeto:workload).
     condition {
       test     = "Null"
       variable = "aws:ResourceTag/dormeto:workload"

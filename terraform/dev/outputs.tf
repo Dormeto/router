@@ -35,3 +35,24 @@ output "admin_url" {
 output "controller_failures_queue_url" {
   value = module.router.controller_failures_queue_url
 }
+
+output "workloads" {
+  description = "Per-workload endpoints for the e2e CLI (sensitive: contains the admin URLs)."
+  sensitive   = true
+  value = {
+    demo = {
+      url         = "https://${local.domain}/"
+      rule_arn    = aws_lb_listener_rule.demo.arn
+      instance_id = aws_instance.demo.id
+      asg_name    = null
+      admin_url   = var.admin_dashboard_enabled ? "https://${local.domain}/_dormeto/${random_password.admin[0].result}/" : ""
+    }
+    demo-asg = {
+      url         = "https://${local.asg_domain}/"
+      rule_arn    = aws_lb_listener_rule.demo_asg.arn
+      instance_id = null
+      asg_name    = aws_autoscaling_group.demo.name
+      admin_url   = var.admin_dashboard_enabled ? "https://${local.asg_domain}/_dormeto/${random_password.admin[0].result}/" : ""
+    }
+  }
+}

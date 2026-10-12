@@ -27,6 +27,8 @@ resource "aws_lb" "demo" {
   security_groups            = [aws_security_group.alb.id]
   subnets                    = aws_subnet.public[*].id
   drop_invalid_header_fields = true
+  # Above the waker Lambda timeout (wait_seconds + 10 s): a held request must not be cut by the ALB.
+  idle_timeout = 120
 }
 
 resource "aws_lb_target_group" "app" {

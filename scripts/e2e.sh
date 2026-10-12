@@ -59,8 +59,8 @@ controller "{\"action\":\"nap\",\"workloadId\":\"$WORKLOAD\"}"
 [ "$(waker_weight)" = "1" ] || fail "waker weight is not 1 while asleep"
 pass "asleep, instance stopped, route on the waker"
 
-# The account Lambda concurrency limit is 10: keep the burst below it (BURST=50 after a quota increase).
-BURST="${BURST:-8}"
+# Held requests use one Lambda execution each (account concurrency 1000, maxHolders 50).
+BURST="${BURST:-50}"
 echo "== 3. Burst of $BURST concurrent requests wakes exactly once"
 BEFORE=$(run_attr wakeCount)
 CODES=$(seq 1 "$BURST" | xargs -P "$BURST" -I{} curl -sS -o /dev/null -w '%{http_code}\n' -H 'Accept: text/html' "$URL" | sort | uniq -c)

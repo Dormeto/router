@@ -40,9 +40,9 @@ variable "idle_minutes" {
 }
 
 variable "wait_seconds" {
-  description = "Maximum time the waker holds a request before the waiter page. 35 s covers a wake (~13 s) plus the 15 s route grace window."
+  description = "Maximum time the waker holds a request before the waiter page. 60 s covers a wake (36-51 s measured from the first request) plus the 15 s route grace window."
   type        = number
-  default     = 35
+  default     = 60
 }
 
 locals {

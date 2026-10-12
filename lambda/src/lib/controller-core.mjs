@@ -359,7 +359,7 @@ export function createController({
       log.warn(from === STATES.FAILED ? 'FailedRecovered' : 'ExternalWake', { workloadId });
       // GitOps resetting replicas behind the waker's back (section 8 of the Kubernetes design): drift, not a visitor's wake.
       for (const b of from === STATES.ASLEEP ? primaries.filter((p) => p.kind === 'k8s') : []) {
-        await recordDrift(workloadId, 'replicas set while asleep', `${b.owner.kind} ${b.namespace}/${b.owner.name} runs ${b.replicas} replicas, set outside Dormeto (a GitOps tool resetting spec.replicas?)`);
+        await recordDrift(workloadId, 'replicas set while asleep', `${b.owner.kind} ${b.namespace}/${b.owner.name} runs ${b.replicas} replica${b.replicas === 1 ? '' : 's'}, set outside Dormeto (a GitOps tool resetting spec.replicas?)`);
       }
       if (run.napBackends) await resumeBackends(clients, JSON.parse(run.napBackends));
       else await startCompanions(clients, companions);

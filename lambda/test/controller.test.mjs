@@ -1424,6 +1424,11 @@ test('GitOps resetting the replicas while asleep: the check marks the workload a
   assert.equal(s.store.state.run.state, STATES.AWAKE);
   assert.equal(s.store.state.run.wakeCount, 4);
   assert.deepEqual(drift(s), [['replicas set while asleep', 'Deployment demo/web runs 2 replicas, set outside Dormeto (a GitOps tool resetting spec.replicas?)']]);
+  // One replica, said so (read on dev-eks: "runs 1 replicas").
+  const one = k8sSetup({ state: STATES.ASLEEP, napBackends, wakeCount: 4 }, { replicas: 1, pods: 1 });
+  one.elbv2.state.healthy = 1;
+  await one.handler({ action: 'check' });
+  assert.deepEqual(drift(one), [['replicas set while asleep', 'Deployment demo/web runs 1 replica, set outside Dormeto (a GitOps tool resetting spec.replicas?)']]);
 });
 
 test('Dormeto\'s Ingress deleted: the check reports it and applies it again', async () => {

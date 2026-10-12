@@ -4,7 +4,7 @@ import { createAdmin, hashSecret, napEstimate, parseAdminPath } from '../src/lib
 import { lastRequestAt } from '../src/lib/metrics.mjs';
 import { createWaker } from '../src/lib/waker-core.mjs';
 import { STATES } from '../src/lib/state.mjs';
-import { albEvent, asgGroup, ecsService, fakeAppScaling, fakeEcs, fakeTagging, fakeAutoScaling, fakeClock, fakeCloudWatch, fakeEc2, fakeElbv2, fakeStore, silentLog, testConfig } from './fakes.mjs';
+import { albEvent, asgGroup, ecsService, fakeAppScaling, fakeEcs, fakeRds, fakeRdsTagging, fakeTagging, fakeAutoScaling, fakeClock, fakeCloudWatch, fakeEc2, fakeElbv2, fakeStore, silentLog, testConfig } from './fakes.mjs';
 
 const SECRET = 'Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4z';
 const BASE = `/_dormeto/${SECRET}`;
@@ -227,4 +227,21 @@ test('status.json lists an ECS service backend', async () => {
   assert.deepEqual(status.backends, [{ kind: 'ecs', id: 'arn:aws:ecs:eu-west-1:111122223333:service/dmt-dev/web', status: 'running', desired: 2, scalable: null }]);
   const html = (await handler(albEvent({ path: `${BASE}/` }))).body;
   assert.match(html, /service\/dmt-dev\/web: running \(desired 2\)/);
+});
+
+test('status.json lists a database companion with its status', async () => {
+  const cfg = testConfig({ admin: { enabled: true, secretHash: hashSecret(SECRET) } });
+  const clock = fakeClock();
+  const store = fakeStore({ config: cfg, run: { state: STATES.AWAKE }, clock });
+  const rds = fakeRds({ instances: { appdb: { status: 'available', tags: { 'dormeto:workload': 'demo' } } } });
+  const admin = createAdmin({
+    ec2: fakeEc2(cfg.instanceIds), elbv2: fakeElbv2(cfg), cloudwatch: fakeCloudWatch(), autoscaling: fakeAutoScaling(),
+    ecs: fakeEcs(), tagging: fakeRdsTagging(rds), appscaling: fakeAppScaling(), rds,
+    invokeController: async () => {}, now: clock.now, log: silentLog,
+  });
+  const handler = createWaker({ store, invokeController: async () => {}, prefix: 'dmt-dev-', now: clock.now, sleep: clock.sleep, log: silentLog, getAdmin: async () => admin });
+  const status = JSON.parse((await handler(albEvent({ path: `${BASE}/status.json` }))).body);
+  assert.deepEqual(status.backends.at(-1), { kind: 'rds-instance', id: 'appdb', status: 'running', companion: true });
+  const html = (await handler(albEvent({ path: `${BASE}/` }))).body;
+  assert.match(html, /appdb \(database\): running/);
 });

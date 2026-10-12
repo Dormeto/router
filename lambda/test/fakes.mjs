@@ -270,3 +270,51 @@ export const ecsService = (name, { cluster = 'dmt-dev', desired = 1, running, ta
   loadBalancers: targetGroups.map((targetGroupArn) => ({ targetGroupArn, containerName: 'web', containerPort: 80 })),
   tags,
 });
+
+// RDS: instances { id: { status, cluster?, replicaSource?, tags } } and clusters { id: { status, engineMode?, tags } }.
+// Start/stop move to starting/stopping; the next describe completes the transition (available/stopped).
+export function fakeRds({ instances = {}, clusters = {} } = {}) {
+  const state = { instances: structuredClone(instances), clusters: structuredClone(clusters), calls: [] };
+  const settle = (db) => {
+    if (db.status === 'starting') db.status = 'available';
+    else if (db.status === 'stopping') db.status = 'stopped';
+  };
+  const arn = (type, id) => `arn:aws:rds:eu-west-1:111122223333:${type}:${id}`;
+  return {
+    state,
+    arn,
+    async describeDBInstances({ DBInstanceIdentifier }) {
+      const db = state.instances[DBInstanceIdentifier];
+      const status = db.status;
+      settle(db);
+      return { DBInstances: [{ DBInstanceIdentifier, DBInstanceArn: arn('db', DBInstanceIdentifier), DBInstanceStatus: status,
+        DBClusterIdentifier: db.cluster, ReadReplicaSourceDBInstanceIdentifier: db.replicaSource, Engine: 'postgres' }] };
+    },
+    async describeDBClusters({ DBClusterIdentifier }) {
+      const db = state.clusters[DBClusterIdentifier];
+      const status = db.status;
+      settle(db);
+      return { DBClusters: [{ DBClusterIdentifier, DBClusterArn: arn('cluster', DBClusterIdentifier), Status: status, EngineMode: db.engineMode ?? 'provisioned' }] };
+    },
+    async startDBInstance({ DBInstanceIdentifier }) { state.calls.push(['start', DBInstanceIdentifier]); state.instances[DBInstanceIdentifier].status = 'starting'; return {}; },
+    async stopDBInstance({ DBInstanceIdentifier }) { state.calls.push(['stop', DBInstanceIdentifier]); state.instances[DBInstanceIdentifier].status = 'stopping'; return {}; },
+    async startDBCluster({ DBClusterIdentifier }) { state.calls.push(['start-cluster', DBClusterIdentifier]); state.clusters[DBClusterIdentifier].status = 'starting'; return {}; },
+    async stopDBCluster({ DBClusterIdentifier }) { state.calls.push(['stop-cluster', DBClusterIdentifier]); state.clusters[DBClusterIdentifier].status = 'stopping'; return {}; },
+  };
+}
+
+export function fakeRdsTagging(rds, workloadId = 'demo') {
+  return {
+    async getResources({ TagFilters, ResourceTypeFilters }) {
+      const wanted = TagFilters[0].Values;
+      const list = [];
+      if (ResourceTypeFilters.includes('rds:db')) {
+        for (const [id, db] of Object.entries(rds.state.instances)) if (wanted.includes((db.tags ?? {})['dormeto:workload'])) list.push(rds.arn('db', id));
+      }
+      if (ResourceTypeFilters.includes('rds:cluster')) {
+        for (const [id, db] of Object.entries(rds.state.clusters)) if (wanted.includes((db.tags ?? {})['dormeto:workload'])) list.push(rds.arn('cluster', id));
+      }
+      return { ResourceTagMappingList: list.map((ResourceARN) => ({ ResourceARN })) };
+    },
+  };
+}

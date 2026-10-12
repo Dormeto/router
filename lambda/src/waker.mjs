@@ -19,8 +19,9 @@ const getAdmin = memoizeAsync(() => Promise.all([
   import('./aws/ecs.mjs'),
   import('./aws/tagging.mjs'),
   import('./aws/appscaling.mjs'),
+  import('./aws/rds.mjs'),
 ]).then(([{ createAdmin }, { createEc2 }, { createElbv2 }, { createCloudWatch }, { createAutoScaling }, { createEcs }, { createTagging },
-  { createAppScaling }]) => createAdmin({
+  { createAppScaling }, { createRds }]) => createAdmin({
   ec2: createEc2(),
   elbv2: createElbv2(),
   cloudwatch: createCloudWatch(),
@@ -28,6 +29,7 @@ const getAdmin = memoizeAsync(() => Promise.all([
   ecs: createEcs(),
   tagging: createTagging(),
   appscaling: createAppScaling(),
+  rds: createRds(),
   invokeController,
   log: logger,
   version: { version: process.env.DMT_VERSION, build: process.env.DMT_BUILD },

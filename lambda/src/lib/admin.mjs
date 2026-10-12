@@ -40,8 +40,8 @@ export function napEstimate({ cfg, run, lastRequest, now }) {
 
 const iso = (ms) => (typeof ms === 'number' && ms > 0 ? new Date(ms).toISOString() : null);
 
-export function createAdmin({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, invokeController, now = Date.now, log, version = {} }) {
-  const clients = { ec2, elbv2, autoscaling, ecs, tagging, appscaling };
+export function createAdmin({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, invokeController, now = Date.now, log, version = {} }) {
+  const clients = { ec2, elbv2, autoscaling, ecs, tagging, appscaling, rds };
   async function status(workloadId, cfg, run) {
     const t = now();
     const resolved = await resolveBackends(clients, cfg);
@@ -74,6 +74,7 @@ export function createAdmin({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging,
         const status = statuses[backendKey(b)];
         if (b.kind === 'asg') return { kind: 'asg', id: b.name, status, min: b.min, max: b.max, desired: b.desired, warmPool: b.warmPool };
         if (b.kind === 'ecs') return { kind: 'ecs', id: b.id, status, desired: b.desired, scalable: b.scalable };
+        if (b.kind.startsWith('rds-')) return { kind: b.kind, id: b.id, status, companion: true };
         return { kind: 'instance', id: b.id, status };
       }),
       ignoredTargets: resolved.ignored,

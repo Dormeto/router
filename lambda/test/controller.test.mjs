@@ -2,9 +2,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createController } from '../src/lib/controller-core.mjs';
 import { STATES } from '../src/lib/state.mjs';
-import { asgGroup, ecsService, fakeAppScaling, fakeEcs, fakeTagging, fakeAutoScaling, fakeClock, fakeCloudWatch, fakeEc2, fakeElbv2, fakeStore, routeOf, silentLog, testConfig } from './fakes.mjs';
+import { asgGroup, ecsService, fakeAppScaling, fakeEcs, fakeRds, fakeRdsTagging, fakeTagging, fakeAutoScaling, fakeClock, fakeCloudWatch, fakeEc2, fakeElbv2, fakeStore, routeOf, silentLog, testConfig } from './fakes.mjs';
 
-function setup({ run, instance = 'running', target = 'app', healthy = 1, metric = [], cfg = testConfig(), groups = [], services = [] } = {}) {
+function setup({ run, instance = 'running', target = 'app', healthy = 1, metric = [], cfg = testConfig(), groups = [], services = [], databases } = {}) {
   const clock = fakeClock();
   const store = fakeStore({ config: cfg, run, clock });
   const ec2 = fakeEc2(cfg.instanceIds, { state: instance });
@@ -12,14 +12,17 @@ function setup({ run, instance = 'running', target = 'app', healthy = 1, metric 
   const cloudwatch = fakeCloudWatch(metric);
   const autoscaling = fakeAutoScaling(groups);
   const ecs = fakeEcs(services);
-  const tagging = fakeTagging(ecs);
+  const rds = databases ? fakeRds(databases) : undefined;
+  const ecsTagging = fakeTagging(ecs);
+  const rdsTagging = rds ? fakeRdsTagging(rds) : null;
+  const tagging = { getResources: (input) => (input.ResourceTypeFilters.includes('ecs:service') || !rdsTagging ? ecsTagging : rdsTagging).getResources(input) };
   const appscaling = fakeAppScaling();
   let ids = 0;
   const invocations = [];
   const handler = createController({
-    store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, invokeSelf: async (payload) => { invocations.push(payload); }, now: clock.now, sleep: clock.sleep, newId: () => `wake-${++ids}`, log: silentLog,
+    store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, invokeSelf: async (payload) => { invocations.push(payload); }, now: clock.now, sleep: clock.sleep, newId: () => `wake-${++ids}`, log: silentLog,
   });
-  return { handler, store, ec2, elbv2, cloudwatch, autoscaling, ecs, appscaling, clock, cfg, invocations };
+  return { handler, store, ec2, elbv2, cloudwatch, autoscaling, ecs, appscaling, rds, clock, cfg, invocations };
 }
 
 test('wake: starts the instance, waits for health, switches the route and becomes AWAKE', async () => {
@@ -313,12 +316,14 @@ test('check clears a leaked held-request counter outside a wake', async () => {
   assert.equal(s.store.state.run.holders, 0);
 });
 
-test('wake stops before the Lambda timeout and ends FAILED', async () => {
+test('wake hands over to a new invocation before the Lambda timeout instead of failing', async () => {
   const s = setup({ run: { state: STATES.WAKING, wakeId: 'w1' }, instance: 'stopped', target: 'waker', healthy: 0 });
+  s.store.state.run.wakeStartedAt = s.clock.now();
   const start = s.clock.now();
   const result = await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' }, { getRemainingTimeInMillis: () => 60_000 });
-  assert.equal(result.state, STATES.FAILED);
-  assert.ok(s.clock.now() - start <= 33_000, `gave up after ${s.clock.now() - start} ms`);
+  assert.deepEqual(result, { state: STATES.WAKING, continued: true });
+  assert.ok(s.clock.now() - start <= 33_000, `handed over after ${s.clock.now() - start} ms`);
+  assert.deepEqual(s.invocations, [{ action: 'wake', workloadId: 'demo', wakeId: 'w1' }]);
 });
 
 test('a configuration read error during wake ends FAILED instead of a stuck WAKING', async () => {
@@ -437,4 +442,71 @@ test('check (ecs): a service scaled up outside Dormeto while asleep is reconcile
   const s = ecsSetup({ run: { state: STATES.ASLEEP }, desired: 1, target: 'waker', healthy: 1 });
   const [result] = await s.handler({ action: 'check' });
   assert.equal(result.state, STATES.AWAKE);
+});
+
+// --- RDS companions --------------------------------------------------------------------------------------------
+
+const DB_TAG = { 'dormeto:workload': 'demo' };
+
+function rdsSetup({ run, instance = 'running', db = 'available', target = 'app', healthy = 1, wakeTimeoutSeconds = 1800 }) {
+  const cfg = testConfig({ wakeTimeoutSeconds });
+  return setup({ run, cfg, instance, target, healthy, databases: { instances: { appdb: { status: db, tags: DB_TAG } } } });
+}
+
+test('nap (rds): stops the database after the application, without waiting for it', async () => {
+  const s = rdsSetup({ run: { state: STATES.AWAKE } });
+  const result = await s.handler({ action: 'nap', workloadId: 'demo' });
+  assert.equal(result.state, STATES.ASLEEP);
+  assert.equal(s.ec2.state.instances[s.cfg.instanceIds[0]], 'stopped');
+  assert.deepEqual(s.rds.state.calls, [['stop', 'appdb']]);
+  assert.deepEqual(JSON.parse(s.store.state.run.napBackends).map((b) => b.kind), ['instance', 'rds-instance']);
+});
+
+test('wake (rds): starts the database first and waits until it is available, then the application', async () => {
+  const s = rdsSetup({ run: { state: STATES.WAKING, wakeId: 'w1' }, instance: 'stopped', db: 'stopped', target: 'waker' });
+  s.store.state.run.wakeStartedAt = s.clock.now();
+  s.store.state.run.napBackends = JSON.stringify([{ kind: 'instance', id: s.cfg.instanceIds[0] }, { kind: 'rds-instance', id: 'appdb' }]);
+  const order = [];
+  const startDb = s.rds.startDBInstance;
+  s.rds.startDBInstance = async (input) => { order.push('db'); return startDb(input); };
+  const startEc2 = s.ec2.startInstances;
+  s.ec2.startInstances = async (input) => { order.push(`app (db ${s.rds.state.instances.appdb.status})`); return startEc2(input); };
+  const result = await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' });
+  assert.equal(result.state, STATES.AWAKE);
+  assert.deepEqual(order, ['db', 'app (db available)']);
+});
+
+test('wake (rds): continues in a new invocation when the budget runs out before the wake deadline', async () => {
+  const s = rdsSetup({ run: { state: STATES.WAKING, wakeId: 'w1' }, instance: 'stopped', db: 'stopped', target: 'waker' });
+  s.store.state.run.wakeStartedAt = s.clock.now();
+  s.store.state.run.napBackends = JSON.stringify([{ kind: 'rds-instance', id: 'appdb' }]);
+  s.rds.startDBInstance = async () => { s.rds.state.instances.appdb.status = 'starting'; s.rds.state.instances.appdb.slow = true; };
+  const describe = s.rds.describeDBInstances;
+  s.rds.describeDBInstances = async (input) => { const out = await describe(input); if (s.rds.state.instances.appdb.slow) s.rds.state.instances.appdb.status = 'starting'; return out; };
+  const result = await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' }, { getRemainingTimeInMillis: () => 120_000 });
+  assert.deepEqual(result, { state: STATES.WAKING, continued: true });
+  assert.deepEqual(s.invocations, [{ action: 'wake', workloadId: 'demo', wakeId: 'w1' }]);
+  assert.equal(s.store.state.run.state, STATES.WAKING, 'not FAILED');
+});
+
+test('wake: the deadline counts from wakeStartedAt, so a continuation past it fails', async () => {
+  const s = rdsSetup({ run: { state: STATES.WAKING, wakeId: 'w1' }, instance: 'stopped', db: 'available', target: 'waker', healthy: 0, wakeTimeoutSeconds: 600 });
+  s.store.state.run.wakeStartedAt = s.clock.now() - 590_000;
+  const result = await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' }, { getRemainingTimeInMillis: () => 900_000 });
+  assert.equal(result.state, STATES.FAILED);
+  assert.equal(s.invocations.length, 0);
+});
+
+test('check (rds): stops a database started by AWS while the workload sleeps', async () => {
+  const s = rdsSetup({ run: { state: STATES.ASLEEP }, instance: 'stopped', db: 'available', target: 'waker', healthy: 0 });
+  await s.handler({ action: 'check' });
+  assert.deepEqual(s.rds.state.calls, [['stop', 'appdb']]);
+  assert.equal(s.store.state.run.state, STATES.ASLEEP);
+});
+
+test('check (rds): an external wake of the application starts the database', async () => {
+  const s = rdsSetup({ run: { state: STATES.ASLEEP }, instance: 'running', db: 'stopped', target: 'waker', healthy: 1 });
+  const [result] = await s.handler({ action: 'check' });
+  assert.equal(result.state, STATES.AWAKE, 'the application decides: primaries running and healthy');
+  assert.deepEqual(s.rds.state.calls, [['start', 'appdb']]);
 });

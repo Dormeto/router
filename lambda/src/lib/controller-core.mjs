@@ -3,7 +3,9 @@ import { STATES } from './state.mjs';
 import { setRoute } from './route.mjs';
 import { healthyCount } from './instances.mjs';
 import { requestSum } from './metrics.mjs';
-import { backendKey, backendStatuses, resolveBackends, resumeBackends, sleepBackends, toRecord, wakeBackends } from './backends.mjs';
+import {
+  backendKey, backendStatuses, isCompanion, resolveBackends, resumeBackends, sleepBackends, startCompanions, stopCompanions, toRecord, wakeBackends,
+} from './backends.mjs';
 
 const HEALTH_POLL_MS = 3000;
 const STOP_TIMEOUT_MS = 5 * 60_000;
@@ -14,8 +16,8 @@ const TIMEOUT_MARGIN_MS = 30_000;
 // Held requests last at most waitSeconds: a counter untouched for longer is a leak (killed waker).
 const HOLDERS_STALE_MS = 2 * 60_000;
 
-export function createController({ store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, invokeSelf, now = Date.now, sleep, newId = randomUUID, log }) {
-  const clients = { ec2, elbv2, autoscaling, ecs, tagging, appscaling };
+export function createController({ store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, invokeSelf, now = Date.now, sleep, newId = randomUUID, log }) {
+  const clients = { ec2, elbv2, autoscaling, ecs, tagging, appscaling, rds };
   let budgetEnd = Infinity;
 
   async function config(workloadId) {
@@ -59,7 +61,9 @@ export function createController({ store, ec2, elbv2, cloudwatch, autoscaling, e
     } catch (err) {
       return fail(err);
     }
-    const timing = { sleep, now, deadline: Math.min(now() + cfg.wakeTimeoutSeconds * 1000, budgetEnd) };
+    // The wake deadline counts from the wake start (RUN), not from this invocation: a wake can span invocations.
+    const wakeDeadline = (run.wakeStartedAt ?? now()) + cfg.wakeTimeoutSeconds * 1000;
+    const timing = { sleep, now, deadline: Math.min(wakeDeadline, budgetEnd) };
     try {
       await wakeBackends(clients, await wakeRecords(run, cfg), timing);
       while ((await healthyCount(elbv2, cfg.appTargetGroupArn)) < 1) {
@@ -77,6 +81,12 @@ export function createController({ store, ec2, elbv2, cloudwatch, autoscaling, e
       log.info('WakeCompleted', { workloadId, wakeId });
       return { state: STATES.AWAKE };
     } catch (err) {
+      // The invocation budget ran out before the wake deadline (a database takes minutes): continue in a new one.
+      if (invokeSelf && budgetEnd < wakeDeadline && now() >= budgetEnd) {
+        await invokeSelf({ action: 'wake', workloadId, wakeId });
+        log.info('WakeContinued', { workloadId, wakeId, reason: err.message });
+        return { state: STATES.WAKING, continued: true };
+      }
       return fail(err);
     }
   }
@@ -159,12 +169,16 @@ export function createController({ store, ec2, elbv2, cloudwatch, autoscaling, e
 
     const backends = await managedBackends(cfg);
     const statuses = backends.length ? await backendStatuses(clients, backends) : {};
-    // No managed backend: nothing to infer (every() would be vacuously true).
-    const all = (name) => backends.length > 0 && backends.every((b) => statuses[backendKey(b)] === name);
+    // The primary backends decide the state; companions (databases) follow it.
+    const primaries = backends.filter((b) => !isCompanion(b));
+    const companions = backends.filter(isCompanion);
+    // No managed primary backend: nothing to infer (every() would be vacuously true).
+    const all = (name) => primaries.length > 0 && primaries.every((b) => statuses[backendKey(b)] === name);
     const from = run.state;
     if (from !== STATES.AWAKE && all('running') && (await healthyCount(elbv2, cfg.appTargetGroupArn)) >= 1) {
       log.warn(from === STATES.FAILED ? 'FailedRecovered' : 'ExternalWake', { workloadId });
       if (run.napBackends) await resumeBackends(clients, JSON.parse(run.napBackends));
+      else await startCompanions(clients, companions);
       await setRoute(elbv2, cfg, 'app');
       run = (await store.transition(workloadId, {
         cond: { state: from }, set: { state: STATES.AWAKE, awakeSince: now() }, remove: ['napBackends', 'napInstances'],
@@ -173,8 +187,15 @@ export function createController({ store, ec2, elbv2, cloudwatch, autoscaling, e
     } else if (from !== STATES.ASLEEP && all('stopped')) {
       log.warn(from === STATES.FAILED ? 'FailedRecovered' : 'ExternalStop', { workloadId });
       await setRoute(elbv2, cfg, 'waker');
+      await stopCompanions(clients, companions);
       run = (await store.transition(workloadId, { cond: { state: from }, set: { state: STATES.ASLEEP, holders: 0 } }))
         ?? (await store.getRun(workloadId));
+    }
+
+    // A database started by AWS after 7 days stopped (or by hand) must not run while the workload sleeps.
+    if (run.state === STATES.ASLEEP && companions.some((b) => statuses[backendKey(b)] === 'running')) {
+      log.warn('DatabaseRestopped', { workloadId });
+      await stopCompanions(clients, companions);
     }
 
     // Keep the route consistent with the state, for example after a Terraform apply reset the weights.

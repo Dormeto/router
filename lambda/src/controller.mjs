@@ -5,6 +5,7 @@ import { createDynamo } from './aws/dynamo.mjs';
 import { createEc2 } from './aws/ec2.mjs';
 import { createEcs } from './aws/ecs.mjs';
 import { createLambda } from './aws/lambda.mjs';
+import { createRds } from './aws/rds.mjs';
 import { createElbv2 } from './aws/elbv2.mjs';
 import { createTagging } from './aws/tagging.mjs';
 import { createController } from './lib/controller-core.mjs';
@@ -23,6 +24,7 @@ export const handler = createController({
   ecs: createEcs(),
   tagging: createTagging(),
   appscaling: createAppScaling(),
+  rds: createRds(),
   // Lambda sets AWS_LAMBDA_FUNCTION_NAME: the controller fans naps out to itself.
   invokeSelf: (payload) => lambda.invokeAsync(process.env.AWS_LAMBDA_FUNCTION_NAME, payload),
   sleep,

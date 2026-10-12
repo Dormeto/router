@@ -2,6 +2,9 @@
 // Instances of a group are never managed one by one: the group would replace a stopped instance.
 import { instanceStates, startInstances, stopInstances } from './instances.mjs';
 import { discoverEcsServices, ecsRecord, ecsStatuses, resumeEcs, sleepEcs, wakeEcs } from './ecs.mjs';
+import { discoverDatabases, isCompanion, rdsStatuses, startDatabases, stopDatabases } from './rds.mjs';
+
+export { isCompanion };
 
 export const WORKLOAD_TAG = 'dormeto:workload';
 export const GROUP_TAG = 'aws:autoscaling:groupName';
@@ -13,6 +16,7 @@ const POLL_MS = 3000;
 
 export const backendKey = (backend) => `${backend.kind}:${backend.kind === 'asg' ? backend.name : backend.id}`;
 const ecsOnly = (list) => list.filter((b) => b.kind === 'ecs');
+const companions = (list) => list.filter(isCompanion);
 
 const tagMap = (tags = []) => Object.fromEntries(tags.map((t) => [t.Key, t.Value]));
 
@@ -30,9 +34,11 @@ function asgBackend(group) {
   };
 }
 
-export async function resolveBackends({ ec2, elbv2, autoscaling, ecs, tagging, appscaling }, cfg) {
+export async function resolveBackends({ ec2, elbv2, autoscaling, ecs, tagging, appscaling, rds }, cfg) {
   if (cfg.instanceIds?.length) {
-    return { mode: 'static', backends: cfg.instanceIds.map((id) => ({ kind: 'instance', id })), ignored: [] };
+    // Static primary instances; companions (databases) are still discovered by tag.
+    const databases = rds && tagging ? await discoverDatabases({ rds, tagging }, cfg) : { backends: [], ignored: [] };
+    return { mode: 'static', backends: [...cfg.instanceIds.map((id) => ({ kind: 'instance', id })), ...databases.backends], ignored: databases.ignored };
   }
   const backends = [];
   const ignored = [];
@@ -73,8 +79,9 @@ export async function resolveBackends({ ec2, elbv2, autoscaling, ecs, tagging, a
   }
   // IP targets belong to the tasks of a managed ECS service (awsvpc): not ignored targets then.
   if (!services.backends.length) for (const id of targetIds) if (!id.startsWith('i-')) ignored.push({ id, reason: 'not an instance' });
-  ignored.push(...ignoredGroups, ...services.ignored);
-  backends.push(...groups.values(), ...services.backends);
+  const databases = rds && tagging ? await discoverDatabases({ rds, tagging }, cfg) : { backends: [], ignored: [] };
+  ignored.push(...ignoredGroups, ...services.ignored, ...databases.ignored);
+  backends.push(...groups.values(), ...services.backends, ...databases.backends);
   return { mode: 'discovery', backends, ignored };
 }
 
@@ -97,7 +104,7 @@ const split = (backends) => ({
   groups: backends.filter((b) => b.kind === 'asg'),
 });
 
-export async function backendStatuses({ ec2, autoscaling, ecs }, backends) {
+export async function backendStatuses({ ec2, autoscaling, ecs, rds }, backends) {
   const { ids, groups } = split(backends);
   const states = ids.length ? await instanceStates(ec2, ids) : {};
   const described = await describeGroups(autoscaling, groups.map((g) => g.name));
@@ -107,16 +114,19 @@ export async function backendStatuses({ ec2, autoscaling, ecs }, backends) {
   }
   for (const group of groups) statuses[`asg:${group.name}`] = groupStatus(described.get(group.name));
   if (ecsOnly(backends).length) Object.assign(statuses, await ecsStatuses({ ecs }, ecsOnly(backends)));
+  if (companions(backends).length) Object.assign(statuses, await rdsStatuses({ rds }, companions(backends)));
   return statuses;
 }
 
 export const toRecord = (backend) => {
+  if (isCompanion(backend)) return { kind: backend.kind, id: backend.id };
   if (backend.kind === 'ecs') return ecsRecord(backend);
   if (backend.kind === 'asg') return { kind: 'asg', name: backend.name, min: backend.min, max: backend.max, desired: backend.desired };
   return { kind: 'instance', id: backend.id };
 };
 
-export async function sleepBackends({ ec2, autoscaling, ecs, appscaling }, backends, timing) {
+// Primary backends first (waited), then the companions (databases: stopped without waiting, it takes minutes).
+export async function sleepBackends({ ec2, autoscaling, ecs, appscaling, rds }, backends, timing) {
   if (ecsOnly(backends).length) await sleepEcs({ ecs, appscaling }, ecsOnly(backends), timing);
   const { ids, groups } = split(backends);
   for (const group of groups) {
@@ -131,10 +141,13 @@ export async function sleepBackends({ ec2, autoscaling, ecs, appscaling }, backe
     if (timing.now() >= timing.deadline) throw new Error(`timeout waiting for Auto Scaling groups to scale in: ${names.join(', ')}`);
     await timing.sleep(POLL_MS);
   }
+  if (companions(backends).length) await stopDatabases({ rds }, companions(backends));
   return backends.map(toRecord);
 }
 
-export async function wakeBackends({ ec2, autoscaling, ecs, appscaling }, records, timing) {
+// Companions first, awaited until available (the application needs its database), then the primary backends.
+export async function wakeBackends({ ec2, autoscaling, ecs, appscaling, rds }, records, timing) {
+  if (companions(records).length) await startDatabases({ rds }, companions(records), timing);
   if (ecsOnly(records).length) await wakeEcs({ ecs, appscaling }, ecsOnly(records));
   const { ids, groups } = split(records);
   for (const group of groups) {
@@ -152,7 +165,8 @@ export async function wakeBackends({ ec2, autoscaling, ecs, appscaling }, record
 
 // After a wake done outside Dormeto (a group scaled up by hand): resume scaling and restore the recorded limits,
 // keeping the capacity that was chosen (MinSize capped by it so that the group is not scaled up again).
-export async function resumeBackends({ autoscaling, ecs, appscaling }, records) {
+export async function resumeBackends({ autoscaling, ecs, appscaling, rds }, records) {
+  if (companions(records).length) await startDatabases({ rds }, companions(records), null, { wait: false });
   if (ecsOnly(records).length) await resumeEcs({ ecs, appscaling }, ecsOnly(records));
   const groups = records.filter((r) => r.kind === 'asg');
   const described = await describeGroups(autoscaling, groups.map((g) => g.name));
@@ -163,4 +177,13 @@ export async function resumeBackends({ autoscaling, ecs, appscaling }, records) 
     });
     await autoscaling.resumeProcesses({ AutoScalingGroupName: group.name, ScalingProcesses: SCALING_PROCESSES });
   }
+}
+
+// Companions that must not run while the workload sleeps (e.g. a database started by AWS after 7 days stopped).
+export async function stopCompanions({ rds }, backends) {
+  if (companions(backends).length) await stopDatabases({ rds }, companions(backends));
+}
+
+export async function startCompanions({ rds }, backends) {
+  if (companions(backends).length) await startDatabases({ rds }, companions(backends), null, { wait: false });
 }

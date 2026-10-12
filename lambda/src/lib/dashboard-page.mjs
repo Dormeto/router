@@ -9,6 +9,7 @@ const backendText = (b) => {
     const scaling = b.scalable ? `, autoscaling ${b.scalable.min}-${b.scalable.max}` : '';
     return `${b.id.split(':')[5] ?? b.id}: ${b.status} (desired ${b.desired}${scaling})`;
   }
+  if (b.companion) return `${b.id} (database): ${b.status}`;
   return `${b.id}: ${b.status}`;
 };
 

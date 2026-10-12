@@ -95,6 +95,16 @@ list's data only when its version changes, checked against the manifest's SHA-25
 the idle check plays no part. A list of `ip_lists` with the same name wins. Routers installed by the manager get the
 catalog without any setting, and a change of the manager's `ip_lists` reaches them within 5 minutes.
 
+**Failed wakes (router 0.25.0):** a failure says why — `capacity`, `quota`, `permission`, `configuration`, `unhealthy`
+(the backends started, no target became healthy), `throttled`, `timeout` or `unknown` — with the backend and the AWS
+message, on the run until a successful wake, in the `FAILED` event to the manager, and on the waiting page with the next
+attempt. A failed Auto Scaling launch or an ECS task that cannot be placed is seen while the wake waits (every 30 s), not
+at its timeout; no capacity is waited out, as Auto Scaling and ECS keep trying. An EC2 or RDS start refused for capacity
+is tried again within the wake (30 s, 60 s, then every 120 s), and an EC2 instance may fall back to the next type of the
+workload's `fallback_instance_types`, given back its own type after its next nap. Between failed wakes, requests wait
+`failed_retry_seconds`, doubled after each consecutive failure, at most 30 minutes. A failed workload whose backends run
+without a healthy target is stopped once its idle window has passed (unless paused), so a failure never keeps paying.
+
 **Statistics:** while a workload is not awake, the waker counts ignored requests per reason, deferred requests (browser
 mode) and wakes per trigger in a daily item of the state table (`STATS#<day>`, kept 35 days); the admin dashboard shows
 today and the last 7 days. With `metrics_enabled` on the `router` module, the same events also publish the CloudWatch

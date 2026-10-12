@@ -159,6 +159,27 @@ export function createController({
     }
   }
 
+  // A failed workload whose backends run for nothing is stopped like a nap and left asleep behind the waker, its failure
+  // kept (the last wake failed); requests wake it again, backed off (R7a, FinOps).
+  async function release(workloadId) {
+    const run = await store.getRun(workloadId);
+    if (run?.state !== STATES.FAILED) return { state: 'SKIPPED', reason: run?.state ?? 'unknown' };
+    if (await isPaused(workloadId)) return { state: 'SKIPPED', reason: 'paused' };
+    const cfg = await config(workloadId);
+    const backends = await managedBackends(cfg);
+    await routeTo(cfg, 'waker', { allowIssues: true });
+    const records = await sleepBackends(clients, backends, { sleep, now, deadline: now() + STOP_TIMEOUT_MS });
+    await revertInstanceTypes(ec2, backends.filter((b) => b.kind === 'instance').map((b) => b.id), log);
+    const asleep = await store.transition(workloadId, {
+      cond: { state: STATES.FAILED, failedAt: run.failedAt },
+      set: { state: STATES.ASLEEP, holders: 0, napBackends: JSON.stringify(records) },
+      remove: ['instanceTypes'],
+      cause: 'failed-released',
+    });
+    log.warn('FailedReleased', { workloadId, backends: records.length });
+    return { state: asleep ? STATES.ASLEEP : 'SUPERSEDED' };
+  }
+
   // cause: what asked for it, the idle check or the manager (the state change event says so).
   async function nap(workloadId, { cause = 'idle' } = {}) {
     const cfg = await config(workloadId);
@@ -360,6 +381,14 @@ export function createController({
 
   async function checkOne(cfg, paused, ctx = null) {
     const run = await reconcile(cfg, ctx);
+    // A failed workload still paying (its backends run without a healthy target: the reconcile left it FAILED) is stopped
+    // once its idle window has passed since the failure (R7a, FinOps); a paused one is left for its team.
+    if (run?.state === STATES.FAILED && !paused && (run.failedAt ?? 0) <= now() - cfg.idleMinutes * 60_000) {
+      if (queueWork) await queueWork({ action: 'release', workloadId: cfg.workloadId, requestedAt: now() });
+      else if (invokeSelf) await invokeSelf({ action: 'release', workloadId: cfg.workloadId });
+      log.info('ReleaseRequested', { workloadId: cfg.workloadId });
+      return { state: run.state, release: 'requested' };
+    }
     if (!run || run.state !== STATES.AWAKE) return { state: run?.state ?? 'UNKNOWN' };
     if (!run.awakeSince) {
       // First check after deployment: the idle window starts now, not at the epoch.
@@ -764,6 +793,7 @@ export function createController({
         const message = JSON.parse(record.body);
         if (message.action === 'nap') await queuedNap(message);
         else if (message.action === 'wake') await queuedWake(message);
+        else if (message.action === 'release') await release(message.workloadId);
         else throw new Error(`unknown queued action: ${message.action}`);
       } catch (err) {
         log.error('QueuedWorkFailed', { messageId: record.messageId, error: err.message });
@@ -877,6 +907,7 @@ export function createController({
     switch (event?.action) {
       case 'wake': return wake(event.workloadId, event.wakeId);
       case 'nap': return nap(event.workloadId, { cause: event.by ? 'manager' : 'idle' });
+      case 'release': return release(event.workloadId);
       case 'check': return check(event.source);
       case 'ensure-awake': return ensureAwake(event.workloadId);
       case 'refresh-lists': return lists ? lists.refresh(event.names ?? []) : [];

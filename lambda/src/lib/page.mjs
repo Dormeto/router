@@ -9,8 +9,21 @@ const MESSAGES = {
 const escapeHtml = (value) => String(value).replace(/[&<>"']/g,
   (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 
-export function renderPage({ state, pollSeconds }) {
-  const message = MESSAGES[state] ?? MESSAGES.WAKING;
+// Why a wake failed, for the visitor (R7a); the next attempt is added to it.
+const FAILURES = {
+  capacity: 'AWS has no capacity for this application right now: the start is retried',
+  other: 'The application could not be started; its team is notified.',
+};
+const inText = (ms) => (ms < 60_000 ? 'less than a minute' : `${Math.round(ms / 60_000)} minute${Math.round(ms / 60_000) === 1 ? '' : 's'}`);
+export function failureMessage(failure, retryInMs) {
+  if (!failure) return MESSAGES.FAILED;
+  const text = FAILURES[failure] ?? FAILURES.other;
+  if (retryInMs === undefined) return text;
+  return failure === 'capacity' ? `${text}, next attempt in ${inText(retryInMs)}.` : `${text} Next attempt in ${inText(retryInMs)}.`;
+}
+
+export function renderPage({ state, pollSeconds, failure, retryInMs }) {
+  const message = state === 'FAILED' ? failureMessage(failure, retryInMs) : MESSAGES[state] ?? MESSAGES.WAKING;
   const seconds = Number(pollSeconds);
   return `<!doctype html>
 <html lang="en">
@@ -42,6 +55,7 @@ p{color:var(--muted)}
 (() => {
   const pollMs = ${seconds * 1000};
   const messages = ${JSON.stringify(MESSAGES)};
+  const failures = ${JSON.stringify(FAILURES)};
   const started = Date.now();
   const message = document.getElementById('message');
   const elapsed = document.getElementById('elapsed');
@@ -51,7 +65,14 @@ p{color:var(--muted)}
       const r = await fetch(location.href, { cache: 'no-store', credentials: 'same-origin', redirect: 'manual', headers: { 'x-dormeto-probe': '1' } });
       const state = r.type === 'opaqueredirect' ? null : r.headers.get('x-dormeto-state');
       if (!state) { location.reload(); return; }
-      message.textContent = messages[state] || messages.WAKING;
+      const failure = r.headers.get('x-dormeto-failure');
+      const retryAt = r.headers.get('x-dormeto-retry-at');
+      if (state === 'FAILED' && failure) {
+        const ms = Math.max(0, Date.parse(retryAt) - Date.now());
+        const when = !retryAt ? '' : ms < 60000 ? 'less than a minute' : Math.round(ms / 60000) + (Math.round(ms / 60000) === 1 ? ' minute' : ' minutes');
+        const text = failures[failure] || failures.other;
+        message.textContent = !when ? text : failure === 'capacity' ? text + ', next attempt in ' + when + '.' : text + ' Next attempt in ' + when + '.';
+      } else message.textContent = messages[state] || messages.WAKING;
     } catch (e) {
       // Network error while the route switches: try again.
     }

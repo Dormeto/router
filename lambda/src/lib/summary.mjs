@@ -1,4 +1,6 @@
 // Workload summary for the manager `list` action: state table only (configuration, runtime state, rule host).
+import { nextAttemptAt } from './failures.mjs';
+
 export const STATS_DAYS = 7;
 
 const iso = (ms) => (typeof ms === 'number' && ms > 0 ? new Date(ms).toISOString() : null);
@@ -35,6 +37,8 @@ export function workloadSummary(cfg, run = {}, host = null, stats7d = null, paus
     failedAt: iso(run?.failedAt),
     failure: failureOf(run),
     consecutiveFailures: run?.consecutiveFailures ?? 0,
+    // When a request may retry a failed wake (R7a: backed off).
+    nextAttemptAt: iso(nextAttemptAt(cfg, run)),
     updatedAt: iso(run?.updatedAt),
     pendingWake: run?.pendingWake === true,
     // The kinds of its backends (instance, asg, ecs, then its databases), as the last idle check found them.

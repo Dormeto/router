@@ -13,3 +13,10 @@ test('a workload summary gives the last failure and the consecutive failures (R7
   assert.equal(awake.consecutiveFailures, 0);
   assert.equal(workloadSummary(testConfig(), { state: 'FAILED', failure: 'not json' }).failure, null, 'an unreadable record is no failure');
 });
+
+test('a failed workload\'s summary gives its next attempt (R7a)', () => {
+  const at = Date.UTC(2026, 9, 8, 12);
+  const summary = workloadSummary(testConfig({ failedRetrySeconds: 60 }), { state: 'FAILED', failedAt: at, consecutiveFailures: 3 });
+  assert.equal(summary.nextAttemptAt, new Date(at + 240_000).toISOString());
+  assert.equal(workloadSummary(testConfig(), { state: 'ASLEEP' }).nextAttemptAt, null);
+});

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { failedSpec } from './failures.mjs';
+import { failedSpec, failureKind, nextAttemptAt } from './failures.mjs';
 import { STATES } from './state.mjs';
 import { WAKE_HEADER, acceptsHtml, classify, redirectCount, requestOrigin, requestTarget, response, workloadIdFromEvent } from './http.mjs';
 import { renderJson, renderPage } from './page.mjs';
@@ -80,7 +80,8 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
       case STATES.ASLEEP:
         return startWake(workloadId, { state: STATES.ASLEEP }, run, origin);
       case STATES.FAILED:
-        if ((run.failedAt ?? 0) > t - cfg.failedRetrySeconds * 1000) return run;
+        // Backed off (R7a): each consecutive failure doubles the wait, at most 30 minutes.
+        if (nextAttemptAt(cfg, run) > t) return run;
         return startWake(workloadId, { state: STATES.FAILED }, run, origin);
       case STATES.WAKING:
         if ((run.wakeStartedAt ?? 0) > t - cfg.wakeTimeoutSeconds * 1000 - STUCK_GRACE_MS) return run;
@@ -135,11 +136,17 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
     return current;
   }
 
-  function waiter(event, pollSeconds, state, wakeHeader) {
-    const headers = { 'cache-control': 'no-store', 'retry-after': String(pollSeconds), 'x-dormeto-state': state };
+  // failed: { kind, retryAt } of a failed workload (R7a): the page says why and when the next attempt is.
+  function waiter(event, pollSeconds, state, wakeHeader, failed = null) {
+    const headers = {
+      'cache-control': 'no-store', 'retry-after': String(pollSeconds), 'x-dormeto-state': state,
+      ...(failed?.kind ? { 'x-dormeto-failure': failed.kind } : {}),
+      ...(failed?.retryAt ? { 'x-dormeto-retry-at': new Date(failed.retryAt).toISOString() } : {}),
+    };
     if (event.httpMethod === 'HEAD') return response(503, headers);
     if (acceptsHtml(event)) {
-      return response(503, { ...headers, 'content-type': 'text/html; charset=utf-8' }, renderPage({ state, pollSeconds }));
+      const retryInMs = failed?.retryAt ? Math.max(0, failed.retryAt - now()) : undefined;
+      return response(503, { ...headers, 'content-type': 'text/html; charset=utf-8' }, renderPage({ state, pollSeconds, failure: failed?.kind, retryInMs }));
     }
     return response(503, { ...headers, 'content-type': 'application/json' }, renderJson({ state, pollSeconds, wakeHeader }));
   }
@@ -148,7 +155,8 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
     if (run.state !== STATES.AWAKE) {
       // Browser mode: API clients learn how to wake the workload.
       const hint = cfg.wakeMode === 'browser' && [STATES.ASLEEP, STATES.FAILED].includes(run.state) ? WAKE_HEADER : undefined;
-      return waiter(event, cfg.pollSeconds, run.state, hint);
+      const failed = run.state === STATES.FAILED ? { kind: failureKind(run), retryAt: nextAttemptAt(cfg, run) } : null;
+      return waiter(event, cfg.pollSeconds, run.state, hint, failed);
     }
     if (inRouteGrace(run)) return waiter(event, cfg.pollSeconds, STATES.AWAKE);
     const count = redirectCount(event);

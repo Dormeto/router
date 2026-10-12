@@ -1096,3 +1096,34 @@ test('wake (asg): no capacity reported by Auto Scaling is waited out (it keeps t
   assert.deepEqual([failure.kind, failure.backend], ['capacity', 'asg:asg-demo']);
   assert.ok(s.clock.now() - started >= 600_000, 'waited until the deadline');
 });
+
+test('check: a failed workload whose backends run without a healthy target is released after its idle window, not before, not paused (R7a, FinOps)', async () => {
+  const cfg = testConfig({ idleMinutes: 15 });
+  const recent = setup({ run: { state: STATES.FAILED, failure: '{"kind":"unhealthy"}', consecutiveFailures: 1 }, cfg, instance: 'running', target: 'waker', healthy: 0 });
+  recent.store.state.run.failedAt = recent.clock.now() - 10 * 60_000;
+  await recent.handler({ action: 'check' });
+  assert.equal(recent.store.state.run.state, STATES.FAILED);
+  assert.equal(recent.ec2.state.stopped, 0);
+  assert.deepEqual(recent.invocations, []);
+
+  const old = setup({ run: { state: STATES.FAILED, failure: '{"kind":"unhealthy"}', consecutiveFailures: 1 }, cfg, instance: 'running', target: 'waker', healthy: 0 });
+  old.store.state.run.failedAt = old.clock.now() - 16 * 60_000;
+  await old.handler({ action: 'check' });
+  assert.deepEqual(old.invocations, [{ action: 'release', workloadId: 'demo' }]);
+  const result = await old.handler({ action: 'release', workloadId: 'demo' });
+  assert.equal(result.state, STATES.ASLEEP);
+  assert.equal(old.ec2.state.instances['i-0123456789abcdef0'], 'stopped');
+  assert.equal(old.store.state.run.state, STATES.ASLEEP);
+  assert.equal(old.store.state.run.failure, '{"kind":"unhealthy"}', 'the last wake failed: kept for the manager');
+  assert.equal(routeOf(old.elbv2, old.cfg), 'waker');
+
+  const paused = setup({ run: { state: STATES.FAILED, failure: '{"kind":"unhealthy"}' }, cfg, instance: 'running', target: 'waker', healthy: 0 });
+  paused.store.state.run.failedAt = paused.clock.now() - 16 * 60_000;
+  await paused.handler({ action: 'pause', by: 'ops', reason: 'debugging' });
+  paused.invocations.length = 0;
+  await paused.handler({ action: 'check' });
+  assert.deepEqual(paused.invocations.filter((i) => i.action === 'release'), [], 'a paused workload is left as it is');
+  // A release that finds the workload woken meanwhile changes nothing.
+  const woken = setup({ run: { state: STATES.AWAKE }, cfg, instance: 'running', target: 'app', healthy: 1 });
+  assert.equal((await woken.handler({ action: 'release', workloadId: 'demo' })).state, 'SKIPPED');
+});

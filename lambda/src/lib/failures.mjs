@@ -47,3 +47,19 @@ export function failedSpec(error, { step, backend = error?.backend, wakeId, at }
 
 // An error of the router's own, of a given kind.
 export const failureError = (kind, message) => Object.assign(new Error(message), { kind });
+
+// Between failed wakes (R7a): failedRetrySeconds after the first failure, doubled after each next one, at most 30 minutes.
+const RETRY_MAX_MS = 30 * 60_000;
+export const retryDelayMs = (cfg, run) => Math.min((cfg.failedRetrySeconds ?? 60) * 1000 * 2 ** (Math.max(1, run?.consecutiveFailures ?? 1) - 1), RETRY_MAX_MS);
+
+// When a request may retry a failed wake (ms), or null when the workload has not failed.
+export const nextAttemptAt = (cfg, run) => (run?.state === 'FAILED' ? (run.failedAt ?? 0) + retryDelayMs(cfg, run) : null);
+
+// The kind of the run's last failure, or null.
+export function failureKind(run) {
+  try {
+    return run?.failure ? JSON.parse(run.failure).kind ?? null : null;
+  } catch {
+    return null;
+  }
+}

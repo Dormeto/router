@@ -21,3 +21,12 @@ test('renderPage shows the failure message and escapes unknown states', () => {
 test('renderJson returns the lower-case status and retry delay', () => {
   assert.deepEqual(JSON.parse(renderJson({ state: 'WAKING', pollSeconds: 3 })), { status: 'waking', retryAfter: 3 });
 });
+
+test('the failure message says the kind and the next attempt (R7a)', async () => {
+  const { renderPage } = await import('../src/lib/page.mjs');
+  const capacity = renderPage({ state: 'FAILED', pollSeconds: 3, failure: 'capacity', retryInMs: 4 * 60_000 });
+  assert.match(capacity, /AWS has no capacity for this application right now: the start is retried, next attempt in 4 minutes/);
+  const other = renderPage({ state: 'FAILED', pollSeconds: 3, failure: 'unhealthy', retryInMs: 30_000 });
+  assert.match(other, /The application could not be started; its team is notified\. Next attempt in less than a minute/);
+  assert.match(renderPage({ state: 'FAILED', pollSeconds: 3 }), /The application could not be started\. Retrying shortly/);
+});

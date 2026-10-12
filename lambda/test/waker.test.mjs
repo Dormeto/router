@@ -279,3 +279,25 @@ test('a controller that cannot be invoked records why (R7a)', async () => {
   assert.deepEqual([failure.kind, failure.step, failure.backend, failure.message], ['throttled', 'wake', 'controller', 'Rate Exceeded.']);
   assert.equal(store.state.run.consecutiveFailures, 1);
 });
+
+test('FAILED: the retry delay doubles with each consecutive failure, at most 30 minutes (R7a)', async () => {
+  for (const [failures, waitMs] of [[1, 60_000], [2, 120_000], [3, 240_000], [6, 1_800_000], [10, 1_800_000]]) {
+    const before = setup({ run: { state: STATES.FAILED, consecutiveFailures: failures }, cfg: testConfig({ waitSeconds: 0 }) });
+    before.store.state.run.failedAt = before.clock.now() - waitMs + 1000;
+    await before.handler(albEvent());
+    assert.equal(before.invocations.length, 0, `${failures} failures: not before ${waitMs} ms`);
+    const after = setup({ run: { state: STATES.FAILED, consecutiveFailures: failures }, cfg: testConfig({ waitSeconds: 0 }) });
+    after.store.state.run.failedAt = after.clock.now() - waitMs - 1000;
+    await after.handler(albEvent());
+    assert.equal(after.invocations.length, 1, `${failures} failures: after ${waitMs} ms`);
+  }
+});
+
+test('FAILED: the waiting page says why and when the next attempt is (R7a)', async () => {
+  const s = setup({ run: { state: STATES.FAILED, consecutiveFailures: 2, failure: JSON.stringify({ kind: 'capacity', step: 'wake', message: 'no capacity', at: 0 }) }, cfg: testConfig({ waitSeconds: 0 }) });
+  s.store.state.run.failedAt = s.clock.now() - 30_000;
+  const res = await s.handler(albEvent({ headers: { accept: 'text/html' } }));
+  assert.equal(headerOf(res, 'x-dormeto-failure'), 'capacity');
+  assert.equal(headerOf(res, 'x-dormeto-retry-at'), new Date(s.clock.now() + 90_000).toISOString());
+  assert.match(res.body, /AWS has no capacity for this application right now: the start is retried, next attempt in 2 minutes/);
+});

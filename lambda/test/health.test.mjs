@@ -160,16 +160,22 @@ test('router action: identity, configuration with its source, workloads per stat
   assert.deepEqual(info.health.ipLists.map((l) => [l.name, l.entries]), [['ipsum', 42]]);
 });
 
-test('router action: metrics and queues are read once a minute, pauses and workloads every time', async () => {
+test('router action reads the health the scheduled check stores: metrics and queues are never read per call', async () => {
   const s = setup();
+  // Nothing stored yet: measured once, and stored.
   await s.handler({ action: 'router' });
   await s.handler({ action: 'pause', by: 'ops', reason: 'freeze', keepAsleep: true });
   const again = await s.handler({ action: 'router' });
-  assert.equal(s.cloudwatch.calls.length, 1);
-  assert.equal(s.sqs.calls.length, 2);
+  assert.deepEqual([s.cloudwatch.calls.length, s.sqs.calls.length], [1, 2]);
   assert.equal(again.pauses.length, 1);
-  s.clock.advance(61_000);
+  s.clock.advance(16 * 60_000);
   await s.handler({ action: 'router' });
+  assert.equal(s.cloudwatch.calls.length, 1, 'a call never measures when a health is stored');
+  // The scheduled check measures again once the stored health is 15 minutes old, not before.
+  await s.handler({ action: 'check', source: 'schedule' });
+  assert.equal(s.cloudwatch.calls.length, 2);
+  s.clock.advance(5 * 60_000);
+  await s.handler({ action: 'check', source: 'schedule' });
   assert.equal(s.cloudwatch.calls.length, 2);
 });
 

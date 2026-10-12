@@ -1,5 +1,7 @@
 import { createDynamo } from './aws/dynamo.mjs';
+import { createEvents } from './aws/events.mjs';
 import { createLambda } from './aws/lambda.mjs';
+import { createPublisher, withTransitionEvents } from './lib/events.mjs';
 import { createLogger } from './lib/log.mjs';
 import { memoizeAsync } from './lib/memo.mjs';
 import { parseRules } from './lib/no-wake.mjs';
@@ -41,7 +43,12 @@ const getAdmin = memoizeAsync(() => Promise.all([
   version: { version: process.env.DMT_VERSION, build: process.env.DMT_BUILD },
 })));
 
-const store = createStore({ dynamo: createDynamo(), table: process.env.DMT_TABLE });
+// Wake starts to the manager's event bus (scale design §3), when the router has one.
+const publisher = createPublisher({
+  events: createEvents(), busArn: process.env.DMT_MANAGER_BUS, log: logger,
+  router: { name: (process.env.DMT_TG_PREFIX ?? '').replace(/-$/, ''), version: process.env.DMT_VERSION, build: process.env.DMT_BUILD },
+});
+const store = withTransitionEvents(createStore({ dynamo: createDynamo(), table: process.env.DMT_TABLE }), publisher, { log: logger });
 // IP reputation lists of the router (Terraform ip_lists), downloaded by the controller.
 const lists = parseLists(process.env.DMT_IP_LISTS, (error) => logger.error('IpListsUnreadable', { error }));
 

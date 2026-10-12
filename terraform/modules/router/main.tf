@@ -83,6 +83,8 @@ resource "aws_lambda_function" "controller" {
       DMT_FAILURE_QUEUES = jsonencode({ check = aws_sqs_queue.check_failures.url, controller = aws_sqs_queue.controller_failures.url })
       # Drift repair of the workloads the manager onboarded, requested by the idle check.
       DMT_ONBOARDER = "${var.name}-onboarder"
+      # The manager's event bus (scale design §3): empty, the router publishes nothing.
+      DMT_MANAGER_BUS = var.manager_event_bus_arn == null ? "" : var.manager_event_bus_arn
     }
   }
 
@@ -125,11 +127,12 @@ resource "aws_lambda_function" "waker" {
 
   environment {
     variables = {
-      DMT_TABLE      = aws_dynamodb_table.router.name
-      DMT_CONTROLLER = aws_lambda_function.controller.function_name
-      DMT_TG_PREFIX  = "${var.name}-"
-      DMT_VERSION    = var.router_version
-      DMT_BUILD      = local.build
+      DMT_TABLE       = aws_dynamodb_table.router.name
+      DMT_CONTROLLER  = aws_lambda_function.controller.function_name
+      DMT_TG_PREFIX   = "${var.name}-"
+      DMT_VERSION     = var.router_version
+      DMT_MANAGER_BUS = var.manager_event_bus_arn == null ? "" : var.manager_event_bus_arn
+      DMT_BUILD       = local.build
       # Router default no-wake rules, for every workload.
       DMT_NO_WAKE_RULES = jsonencode(local.no_wake_rules)
       DMT_METRICS       = tostring(var.metrics_enabled)

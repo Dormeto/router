@@ -25,7 +25,9 @@ const TIMEOUT_MARGIN_MS = 30_000;
 // Held requests last at most waitSeconds: a counter untouched for longer is a leak (killed waker).
 const HOLDERS_STALE_MS = 2 * 60_000;
 // Router health: Lambda metrics and failure queues read at most once a minute (the Routers view polls).
-const HEALTH_CACHE_MS = 60_000;
+// The scheduled check measures the router's health (metrics, queues, concurrency limit) at most this often and stores
+// it; the router action reads what is stored (scale design §3).
+const HEALTH_REFRESH_MS = 15 * 60_000;
 // Pauses (router management): automatic resume at most this far ahead, reason length.
 const PAUSE_MAX_MS = 366 * 86_400_000;
 const REASON_MAX = 256;
@@ -33,6 +35,7 @@ const REASON_MAX = 256;
 export function createController({
   store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, invokeSelf, now = Date.now, sleep, newId = randomUUID, log,
   lists = null, router = {}, defaultRules = [], ipLists = [], sqs = null, lambda = null, invokeOnboarder = null,
+  publisher = { enabled: false, checked: async () => {}, stateChanged: async () => {} },
 }) {
   const clients = { ec2, elbv2, autoscaling, ecs, tagging, appscaling, rds };
   let budgetEnd = Infinity;
@@ -401,6 +404,7 @@ export function createController({
   }
 
   async function check(source) {
+    const started = now();
     // Only the schedule proves that naps happen on their own: the e2e and operators also call check.
     if (source === 'schedule') {
       await store.recordScheduledCheck(now()).catch((err) => log.warn('CheckRecordFailed', { error: err.message }));
@@ -418,7 +422,22 @@ export function createController({
         results.push({ workloadId: cfg.workloadId, error: err.message });
       }
     }
+    if (source === 'schedule') await storedHealth(now(), { refresh: true });
+    await report(started);
     return results;
+  }
+
+  // The router's state to the manager after each check: its workloads as the list gives them, counts and health.
+  async function report(started) {
+    if (!publisher.enabled) return;
+    try {
+      const [info, listed] = await Promise.all([routerInfo(), list()]);
+      await publisher.checked({
+        checkedAt: iso(started), durationMs: now() - started, health: info.health, pauses: info.pauses, counts: info.workloads.byState, workloads: listed.workloads,
+      });
+    } catch (err) {
+      log.warn('ReportFailed', { error: err.message });
+    }
   }
 
   // The name people see (design section 7), for a workload the manager onboarded (Terraform writes the others').
@@ -559,20 +578,28 @@ export function createController({
   // --- Router: identity, configuration with its source, workloads, pauses, health ------------------------------------
 
   const TERRAFORM = 'terraform';
-  let measured = { at: -Infinity, lambda: {}, queues: {}, limit: null };
+  async function measure(t) {
+    const [metrics, queues, limit] = await Promise.all([
+      lambdaMetrics(cloudwatch, router.functions ?? {}, t).catch((err) => ({ error: err.message })),
+      queueDepths(sqs, router.queues).catch((err) => ({ error: err.message })),
+      lambda ? lambda.getAccountSettings({}).then((s) => ({ limit: s.AccountLimit?.ConcurrentExecutions })).catch((err) => ({ error: err.message })) : null,
+    ]);
+    const measured = { at: t, lambda: metrics, queues, limit };
+    await store.putHealth?.(measured).catch((err) => log.warn('HealthNotStored', { error: err.message }));
+    return measured;
+  }
+  // The stored health; measured when there is none, or when refreshing (the scheduled check) and it is 15 minutes old.
+  async function storedHealth(t, { refresh = false } = {}) {
+    const stored = await store.getHealth?.().catch(() => null);
+    if (stored && !(refresh && t - stored.at >= HEALTH_REFRESH_MS)) return stored;
+    return measure(t);
+  }
   // Concurrent executions a burst can need: the largest maxHolders, plus the controller and other invocations.
   const HEADROOM = 10;
 
   async function routerInfo() {
     const t = now();
-    if (t - measured.at >= HEALTH_CACHE_MS) {
-      const [metrics, queues, limit] = await Promise.all([
-        lambdaMetrics(cloudwatch, router.functions ?? {}, t).catch((err) => ({ error: err.message })),
-        queueDepths(sqs, router.queues).catch((err) => ({ error: err.message })),
-        lambda ? lambda.getAccountSettings({}).then((s) => ({ limit: s.AccountLimit?.ConcurrentExecutions })).catch((err) => ({ error: err.message })) : null,
-      ]);
-      measured = { at: t, lambda: metrics, queues, limit };
-    }
+    const measured = await storedHealth(t);
     const configs = await store.listConfigs();
     const needed = Math.max(0, ...configs.map((c) => c.maxHolders ?? 0)) + HEADROOM;
     const concurrency = measured.limit && (measured.limit.error ? { error: measured.limit.error } : { limit: measured.limit.limit, needed });

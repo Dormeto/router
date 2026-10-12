@@ -143,6 +143,12 @@ repair is a drift event (90 days) in the workload status and the router health.
 aws lambda invoke --function-name dmt-dev-onboarder --cli-binary-format raw-in-base64-out --payload '{"action":"preview","workloadId":"onb","targetGroupArn":"<arn>"}' /dev/stdout
 ```
 
+**Events to the manager** (router 0.21.0, `manager_event_bus_arn` or the blueprint's `${managerBus}`): after each idle
+check, the controller sends the router's state (identity, health, pauses, counts, workload summaries, in entries under
+64 KB) to the manager's event bus; the controller and the waker send each workload state change as it happens. The idle
+check also stores the router's health (Lambda errors and throttles, failure queues, concurrency limit, measured at most
+every 15 minutes): the `router` action reads it instead of calling CloudWatch. Publishing never fails the work behind it.
+
 **Installed by the manager:** `npm run package` writes `dist/router-<version>.zip`, `dist/blueprint-<version>.json`
 (every resource and IAM policy of a router, placeholders filled by the installer) and `dist/router-boundary.json`
 (`DmtRouterBoundary`). The manager installs, upgrades and removes routers from them by API calls (no Terraform or

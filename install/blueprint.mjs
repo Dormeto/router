@@ -9,6 +9,8 @@ import driftPattern from './drift-pattern.json' with { type: 'json' };
 export const PLACEHOLDERS = {
   name: '${name}', region: '${region}', account: '${account}', partition: '${partition}', build: '${build}',
   checkSchedule: '${checkSchedule}', ipLists: '${ipLists}', noWakeRules: '${noWakeRules}', metrics: '${metrics}',
+  // The manager's event bus (scale design §3): routers send their state and state changes to it.
+  managerBus: '${managerBus}',
 };
 
 // Installed routers are named dmtr-<env> and their roles live under this path: DmtCommandRole and DmtRouterBoundary are
@@ -50,11 +52,13 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
       allow(['lambda:InvokeFunction'], [functionArn('controller'), functionArn('onboarder')]),
       allow(['sqs:SendMessage'], [queueArn('controller-failures')]),
       allow(['sqs:GetQueueAttributes'], [queueArn('controller-failures'), queueArn('check-failures')]),
+      allow(['events:PutEvents'], [p.managerBus]),
       allow(['logs:CreateLogStream', 'logs:PutLogEvents'], [logArn('controller')]),
     ),
     waker: policy(
       allow(['dynamodb:GetItem', 'dynamodb:UpdateItem', 'dynamodb:Query'], [tableArn]),
       allow(['lambda:InvokeFunction'], [functionArn('controller')]),
+      allow(['events:PutEvents'], [p.managerBus]),
       allow(['logs:CreateLogStream', 'logs:PutLogEvents'], [logArn('waker')]),
     ),
     scheduler: policy(
@@ -103,14 +107,14 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
         environment: {
           ...common, DMT_IP_LISTS: p.ipLists, DMT_NO_WAKE_RULES: p.noWakeRules, DMT_CHECK_SCHEDULE: p.checkSchedule, DMT_METRICS: p.metrics,
           DMT_WAKER_FUNCTION: fn('waker'), DMT_FAILURE_QUEUES: `{"check":"${queueUrl('check-failures')}","controller":"${queueUrl('controller-failures')}"}`,
-          DMT_ONBOARDER: fn('onboarder'),
+          DMT_ONBOARDER: fn('onboarder'), DMT_MANAGER_BUS: p.managerBus,
         },
         // Retries would duplicate wakes and naps; stale events are dropped; failures land in a queue.
         asyncInvoke: { maximumRetryAttempts: 0, maximumEventAgeInSeconds: 120, onFailure: queueArn('controller-failures') },
       },
       {
         key: 'waker', name: fn('waker'), role: roleName('waker'), handler: 'waker.handler', timeout: wakerTimeoutSeconds, memory: wakerMemoryMb,
-        environment: { ...common, DMT_CONTROLLER: fn('controller'), DMT_NO_WAKE_RULES: p.noWakeRules, DMT_METRICS: p.metrics, DMT_IP_LISTS: p.ipLists },
+        environment: { ...common, DMT_CONTROLLER: fn('controller'), DMT_NO_WAKE_RULES: p.noWakeRules, DMT_METRICS: p.metrics, DMT_IP_LISTS: p.ipLists, DMT_MANAGER_BUS: p.managerBus },
       },
       {
         key: 'onboarder', name: fn('onboarder'), role: roleName('onboarder'), handler: 'onboarder.handler', timeout: 300, memory: 256,
@@ -149,6 +153,8 @@ export function routerBoundary({ p = PLACEHOLDERS } = {}) {
       // Onboarding lets the load balancer invoke the waker.
       { Sid: 'WakerPermissions', Effect: 'Allow', Action: ['lambda:RemovePermission'], Resource: any('lambda', 'function:dmtr-*-waker') },
       { Sid: 'RouterLogs', Effect: 'Allow', Action: ['logs:CreateLogStream', 'logs:PutLogEvents'], Resource: any('logs', 'log-group:/aws/lambda/dmtr-*') },
+      // The manager's event bus, in the manager's account (its policy admits the organization only).
+      { Sid: 'ManagerBus', Effect: 'Allow', Action: ['events:PutEvents'], Resource: `arn:${p.partition}:events:*:*:event-bus/dmt-*-manager` },
       {
         Sid: 'Workloads', Effect: 'Allow',
         Action: [

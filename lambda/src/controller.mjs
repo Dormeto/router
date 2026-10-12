@@ -9,8 +9,10 @@ import { createRds } from './aws/rds.mjs';
 import { createS3 } from './aws/s3.mjs';
 import { createSqs } from './aws/sqs.mjs';
 import { createElbv2 } from './aws/elbv2.mjs';
+import { createEvents } from './aws/events.mjs';
 import { createTagging } from './aws/tagging.mjs';
 import { createController } from './lib/controller-core.mjs';
+import { createPublisher, withTransitionEvents } from './lib/events.mjs';
 import { createListRefresher, downloadText, parseS3Url } from './lib/list-refresh.mjs';
 import { parseLists } from './lib/list-cache.mjs';
 import { parseRules } from './lib/no-wake.mjs';
@@ -19,7 +21,13 @@ import { createStore } from './lib/state.mjs';
 import { sleep } from './lib/time.mjs';
 
 const lambda = createLambda();
-const store = createStore({ dynamo: createDynamo(), table: process.env.DMT_TABLE });
+const routerName = (process.env.DMT_TG_PREFIX ?? '').replace(/-$/, '');
+// The router's state and state changes to the manager's event bus (scale design §3), when the router has one.
+const publisher = createPublisher({
+  events: createEvents(), busArn: process.env.DMT_MANAGER_BUS, log: logger,
+  router: { name: routerName, version: process.env.DMT_VERSION, build: process.env.DMT_BUILD, checkSchedule: process.env.DMT_CHECK_SCHEDULE },
+});
+const store = withTransitionEvents(createStore({ dynamo: createDynamo(), table: process.env.DMT_TABLE }), publisher, { log: logger });
 // IP reputation lists of the router (Terraform ip_lists).
 const lists = parseLists(process.env.DMT_IP_LISTS, (error) => logger.error('IpListsUnreadable', { error }));
 // Lists given as s3:// URIs are read with the S3 API (controller role: s3:GetObject on their objects).
@@ -44,12 +52,13 @@ export const handler = createController({
   log: logger,
   sqs: Object.values(queues).some(Boolean) ? createSqs() : null,
   lambda,
+  publisher,
   // Drift repair of the workloads the manager onboarded (R4c).
   invokeOnboarder: process.env.DMT_ONBOARDER ? (payload) => lambda.invokeAsync(process.env.DMT_ONBOARDER, payload) : null,
   lists: lists.length ? createListRefresher({ store, lists, download, log: logger }) : null,
   // Manager interface: router identity, router no-wake rules and IP lists in the status, health and configuration.
   router: {
-    name: (process.env.DMT_TG_PREFIX ?? '').replace(/-$/, ''), version: process.env.DMT_VERSION, build: process.env.DMT_BUILD,
+    name: routerName, version: process.env.DMT_VERSION, build: process.env.DMT_BUILD,
     checkSchedule: process.env.DMT_CHECK_SCHEDULE,
     metrics: process.env.DMT_METRICS === undefined ? null : process.env.DMT_METRICS === 'true',
     functions: { controller: process.env.AWS_LAMBDA_FUNCTION_NAME, waker: process.env.DMT_WAKER_FUNCTION },

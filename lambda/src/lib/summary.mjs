@@ -12,6 +12,8 @@ export function workloadSummary(cfg, run = {}, host = null, stats7d = null, paus
   return {
     workloadId: cfg.workloadId,
     name: cfg.name ?? cfg.workloadId,
+    // The workload's identity in AWS: the manager finds it from its target group (exclusions, discovery).
+    targetGroupArn: cfg.appTargetGroupArn,
     // Written by the Terraform workload module, or onboarded by the manager (only those are offboarded by it).
     source: cfg.source ?? 'terraform',
     state: run?.state ?? 'UNKNOWN',

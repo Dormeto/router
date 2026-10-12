@@ -859,3 +859,23 @@ test('a rename racing an offboarding never writes the configuration back', async
   await assert.rejects(s.handler({ action: 'rename', workloadId: 'demo', name: 'Shop front', by: 'ops' }), /workload not configured: demo/);
   assert.deepEqual(writes, [{ mustExist: true }]);
 });
+
+// --- Scale (R4.5): router events -------------------------------------------------------------------------------------
+
+test('each check sends the router\'s state to the manager: its workloads as the list gives them, counts and health', async () => {
+  const s = setup({ run: { state: STATES.AWAKE }, cfg: testConfig({ name: 'Demo', source: 'manager' }) });
+  const sent = [];
+  const handler = createController({
+    store: s.store, ec2: fakeEc2(s.cfg.instanceIds), elbv2: s.elbv2, cloudwatch: fakeCloudWatch([5]), autoscaling: fakeAutoScaling(), ecs: fakeEcs(), tagging: fakeTagging(fakeEcs()), appscaling: fakeAppScaling(),
+    invokeSelf: async () => {}, now: s.clock.now, sleep: s.clock.sleep, log: silentLog,
+    router: { name: 'dmt-dev', version: '0.21.0', build: 'abc', checkSchedule: 'rate(5 minutes)' },
+    publisher: { enabled: true, checked: async (payload) => { sent.push(payload); }, stateChanged: async () => {} },
+  });
+  await handler({ action: 'check', source: 'schedule' });
+  assert.equal(sent.length, 1);
+  const [payload] = sent;
+  const { workloads } = await handler({ action: 'list' });
+  assert.deepEqual(payload.workloads, workloads.map((w) => ({ ...w, targetGroupArn: s.cfg.appTargetGroupArn })));
+  assert.deepEqual([payload.workloads[0].name, payload.counts, typeof payload.durationMs, payload.checkedAt], ['Demo', { AWAKE: 1 }, 'number', new Date(s.clock.now()).toISOString()]);
+  assert.ok(payload.health.status);
+});

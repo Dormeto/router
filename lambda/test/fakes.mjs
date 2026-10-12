@@ -71,6 +71,8 @@ export function fakeStore({ config, run, clock }) {
     async count(id, counter) { state.stats[counter] = (state.stats[counter] ?? 0) + 1; },
     async recordScheduledCheck(at) { state.check = { ...(state.check ?? {}), lastScheduledCheckAt: at }; },
     async getCheck() { return structuredClone(state.check ?? null); },
+    async getHealth() { return structuredClone(state.health ?? null); },
+    async putHealth(health) { state.health = structuredClone(health); },
     // Pauses: { workloadId (null for the router), by, at, reason, until?, keepAsleep, exclusionId? }.
     async putPause(workloadId, pause) {
       state.pauses = [...state.pauses.filter((p) => !samePause(workloadId, pause.exclusionId)(p)), { workloadId, ...structuredClone(pause) }];

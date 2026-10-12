@@ -105,3 +105,9 @@ variable "ip_lists" {
     error_message = "Each ip_lists entry needs an http(s) url or an s3://bucket/key URI, action defer or ignore, and refresh_hours of at least 1."
   }
 }
+
+variable "manager_event_bus_arn" {
+  description = "Event bus of the manager (output event_bus_arn of the manager platform): the router sends its state after each idle check and each state change to it. Null: nothing sent, the manager calls the router instead."
+  type        = string
+  default     = null
+}

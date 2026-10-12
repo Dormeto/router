@@ -326,6 +326,18 @@ export function createStore({ dynamo, table, now = Date.now }) {
       }
     },
 
+    // Health measured by the scheduled check (scale design §3): { at, lambda, queues, limit }.
+    async getHealth() {
+      const { Item } = await dynamo.getItem({ TableName: table, Key: { pk: { S: 'ROUTER' }, sk: { S: 'HEALTH' } }, ConsistentRead: true });
+      return Item?.health?.S ? JSON.parse(Item.health.S) : null;
+    },
+    async putHealth(health) {
+      await dynamo.updateItem({
+        TableName: table, Key: { pk: { S: 'ROUTER' }, sk: { S: 'HEALTH' } },
+        UpdateExpression: 'SET #health = :health', ExpressionAttributeNames: { '#health': 'health' }, ExpressionAttributeValues: { ':health': { S: JSON.stringify(health) } },
+      });
+    },
+
     async getCheck() {
       const { Item } = await dynamo.getItem({ TableName: table, Key: { pk: { S: 'ROUTER' }, sk: { S: 'CHECK' } }, ConsistentRead: true });
       return Item ? fromItem(Item) : null;

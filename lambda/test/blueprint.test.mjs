@@ -15,6 +15,7 @@ const fill = (value, values) => (typeof value === 'string'
 const VALUES = {
   name: 'dmtr-dev', region: 'eu-west-3', account: '121014831971', partition: 'aws', build: 'abc123def456',
   checkSchedule: 'rate(5 minutes)', ipLists: '[]', noWakeRules: '[]', metrics: 'false',
+  managerBus: 'arn:aws:events:eu-west-1:121014831971:event-bus/dmt-dev-manager',
 };
 
 // Actions of each aws_iam_policy_document of the module, without its optional (dynamic) statements.
@@ -92,7 +93,8 @@ test('every action of every router role is allowed by the permissions boundary',
 });
 
 test('the boundary covers the resources of installed routers only (dmtr-*), never a router written in Terraform or the manager', () => {
-  const resources = routerBoundary().Statement.filter((s) => s.Sid !== 'Workloads').flatMap((s) => [].concat(s.Resource));
+  // Workloads are the customer's resources; the manager's bus is the manager's.
+  const resources = routerBoundary().Statement.filter((s) => s.Sid !== 'Workloads' && s.Sid !== 'ManagerBus').flatMap((s) => [].concat(s.Resource));
   assert.ok(resources.length > 0);
   for (const r of resources) assert.match(r, /:(table\/|function:|log-group:\/aws\/lambda\/|)dmtr-/, r);
   const permissions = routerBoundary().Statement.find((s) => [].concat(s.Action).includes('lambda:RemovePermission'));
@@ -144,4 +146,16 @@ test('the router permission is named outside the per-workload statements, in the
   assert.equal(ROUTER_PERMISSION, 'dormeto-alb');
   const module = await readFile(new URL('../../terraform/modules/router/main.tf', import.meta.url), 'utf8');
   assert.match(module, /statement_id\s+= "dormeto-alb"/);
+});
+
+test('the controller and the waker publish to the manager\'s event bus, within the boundary', () => {
+  const b = fill(blueprint({ version: '0.21.0' }), VALUES);
+  for (const key of ['controller', 'waker']) {
+    assert.equal(b.functions.find((f) => f.key === key).environment.DMT_MANAGER_BUS, VALUES.managerBus, key);
+    const statement = b.roles.find((r) => r.key === key).policy.Statement.find((st) => [].concat(st.Action).includes('events:PutEvents'));
+    assert.deepEqual([].concat(statement.Resource), [VALUES.managerBus], key);
+  }
+  const bus = routerBoundary().Statement.find((st) => [].concat(st.Action).includes('events:PutEvents'));
+  assert.deepEqual([].concat(bus.Resource), ['arn:${partition}:events:*:*:event-bus/dmt-*-manager']);
+  assert.ok(PLACEHOLDERS.managerBus);
 });

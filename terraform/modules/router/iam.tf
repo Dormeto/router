@@ -4,6 +4,8 @@ data "aws_partition" "current" {}
 
 locals {
   arn_prefix = "arn:${data.aws_partition.current.partition}"
+  # Without a manager bus, the statement names one that does not exist (the router publishes nothing).
+  manager_bus = var.manager_event_bus_arn == null ? "arn:${data.aws_partition.current.partition}:events:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:event-bus/none" : var.manager_event_bus_arn
   # s3://bucket/key of the IP lists stored in S3, as object ARNs.
   s3_list_objects = [for l in var.ip_lists : "${local.arn_prefix}:s3:::${trimprefix(l.url, "s3://")}" if startswith(l.url, "s3://")]
   region          = data.aws_region.current.region
@@ -46,6 +48,11 @@ data "aws_iam_policy_document" "waker" {
       actions   = ["ec2:DescribeInstances", "elasticloadbalancing:DescribeRules", "elasticloadbalancing:DescribeTargetHealth", "elasticloadbalancing:DescribeTargetGroups", "elasticloadbalancing:DescribeListeners", "elasticloadbalancing:DescribeTags", "cloudwatch:GetMetricData", "autoscaling:DescribeAutoScalingGroups", "tag:GetResources", "ecs:DescribeServices", "application-autoscaling:DescribeScalableTargets", "rds:DescribeDBInstances", "rds:DescribeDBClusters"]
       resources = ["*"]
     }
+  }
+  statement {
+    # Wake starts to the manager (scale design §3).
+    actions   = ["events:PutEvents"]
+    resources = [local.manager_bus]
   }
 }
 
@@ -142,6 +149,11 @@ data "aws_iam_policy_document" "controller" {
     # Router health: messages waiting in the failure queues.
     actions   = ["sqs:GetQueueAttributes"]
     resources = [aws_sqs_queue.controller_failures.arn, aws_sqs_queue.check_failures.arn]
+  }
+  statement {
+    # The router's state and state changes to the manager (scale design §3).
+    actions   = ["events:PutEvents"]
+    resources = [local.manager_bus]
   }
   statement {
     actions   = ["logs:CreateLogStream", "logs:PutLogEvents"]

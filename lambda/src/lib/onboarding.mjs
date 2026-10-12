@@ -471,12 +471,12 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
     if (!cfg?.source) return { repaired: [], skipped: 'not onboarded by the manager' };
     if ((await store.getPauses(workloadId)).some((p) => p.reason === 'offboarding')) return { repaired: [], skipped: 'being offboarded' };
     const run = await store.getRun(workloadId);
-    const events = [];
+    const repairs = [];
     for (const b of cfg.tagged ?? []) {
       const tags = await currentTags(b);
       if (tags && tags[WORKLOAD_TAG] !== workloadId) {
         await tag(b, workloadId);
-        events.push({ kind: 'backend tag restored', detail: `${KIND_TEXT[b.kind]} ${b.id}` });
+        repairs.push({ kind: 'backend tag restored', detail: `${KIND_TEXT[b.kind]} ${b.id}` });
       }
     }
     const waker = await wakerGroup(workloadId);
@@ -484,12 +484,12 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
     if (waker?.ours && group) {
       // Asleep, failed or between: the instrumentation sends to the waker; awake, to the application.
       const weights = run?.state === 'AWAKE' ? { app: 1, waker: 0 } : { app: 0, waker: 1 };
-      events.push(...await applyRules(group, workloadId, waker.TargetGroupArn, weights));
+      repairs.push(...await applyRules(group, workloadId, waker.TargetGroupArn, weights));
     }
     const at = new Date(now()).toISOString();
-    for (const e of events) await store.putDrift(workloadId, { at, by, ...e });
-    if (events.length) log.warn('DriftRepaired', { workloadId, by, repaired: events.map((e) => `${e.kind}: ${e.detail}`) });
-    return { repaired: events };
+    for (const e of repairs) await store.putDrift(workloadId, { at, by, ...e });
+    if (repairs.length) log.warn('DriftRepaired', { workloadId, by, repaired: repairs.map((e) => `${e.kind}: ${e.detail}`) });
+    return { repaired: repairs };
   }
 
   // Remove the instrumentation, step by step, each step going on whatever the others did: rules first (traffic stays on

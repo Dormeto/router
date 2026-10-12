@@ -9,6 +9,10 @@ export const PLACEHOLDERS = {
   checkSchedule: '${checkSchedule}', ipLists: '${ipLists}', noWakeRules: '${noWakeRules}', metrics: '${metrics}',
 };
 
+// Installed routers are named dmtr-<env> and their roles live under this path: DmtCommandRole and DmtRouterBoundary are
+// scoped to them, so they never reach a router written in Terraform (dmt-<env>) or the manager (dmt-<env>-manager).
+export const ROLE_PATH = '/dormeto/router/';
+
 const lambdaTrust = { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Principal: { Service: 'lambda.amazonaws.com' }, Action: 'sts:AssumeRole' }] };
 
 export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wakerTimeoutSeconds = 70, wakerMemoryMb = 512 }) {
@@ -28,6 +32,7 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
   const policy = (...Statement) => ({ Version: '2012-10-17', Statement });
   const tags = { 'dormeto:router': p.name };
   const roleName = (role) => `${p.name}-${p.region}-${role}`;
+  const roleArn = (role) => `arn:${p.partition}:iam::${p.account}:role${ROLE_PATH}${roleName(role)}`;
 
   const policies = {
     controller: policy(
@@ -82,7 +87,7 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
     router: { name: p.name, region: p.region, account: p.account, version, build: p.build },
     tags,
     roles: ['controller', 'waker', 'scheduler', 'onboarder'].map((role) => ({
-      key: role, name: roleName(role), trust: role === 'scheduler' ? schedulerTrust : lambdaTrust, policyName: role, policy: policies[role],
+      key: role, path: ROLE_PATH, name: roleName(role), trust: role === 'scheduler' ? schedulerTrust : lambdaTrust, policyName: role, policy: policies[role],
     })),
     table: { name: table, hashKey: 'pk', rangeKey: 'sk', ttlAttribute: 'expiresAt', pointInTimeRecovery: true },
     queues: ['check-failures', 'controller-failures'].map((key) => ({ key, name: queue(key), retentionSeconds: 1_209_600, managedEncryption: true })),
@@ -105,25 +110,28 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
         key: 'onboarder', name: fn('onboarder'), role: roleName('onboarder'), handler: 'onboarder.handler', timeout: 300, memory: 256,
         environment: { ...common, DMT_WAKER_FUNCTION: fn('waker'), DMT_WAKER_FUNCTION_ARN: functionArn('waker') },
       },
-    ].map((f) => ({ ...f, roleArn: `arn:${p.partition}:iam::${p.account}:role/${f.role}`, runtime: 'nodejs24.x', architectures: ['arm64'] })),
+    ].map((f) => ({ ...f, roleArn: roleArn(f.key), runtime: 'nodejs24.x', architectures: ['arm64'] })),
     schedule: {
-      name: `${p.name}-check`, expression: p.checkSchedule, target: functionArn('controller'), roleArn: `arn:${p.partition}:iam::${p.account}:role/${roleName('scheduler')}`,
+      name: `${p.name}-check`, expression: p.checkSchedule, target: functionArn('controller'), roleArn: roleArn('scheduler'),
       input: '{"action":"check","source":"schedule"}', deadLetter: queueArn('check-failures'), maximumRetryAttempts: 0,
     },
   };
 }
 
 // Permissions boundary of every role the manager creates in an account (DmtRouterBoundary): the services and actions a
-// router may ever use, on Dormeto resources where they can be scoped; no IAM, Organizations or data access beyond them.
+// router may ever use, on the resources of installed routers (dmtr-*) where they can be scoped; no IAM, Organizations or
+// data access beyond them.
 export function routerBoundary({ p = PLACEHOLDERS } = {}) {
   const any = (service, resource) => `arn:${p.partition}:${service}:*:${p.account}:${resource}`;
   return {
     Version: '2012-10-17',
     Statement: [
-      { Sid: 'RouterTables', Effect: 'Allow', Action: 'dynamodb:*', Resource: any('dynamodb', 'table/dmt-*') },
-      { Sid: 'RouterQueues', Effect: 'Allow', Action: 'sqs:*', Resource: any('sqs', 'dmt-*') },
-      { Sid: 'RouterFunctions', Effect: 'Allow', Action: ['lambda:InvokeFunction', 'lambda:AddPermission', 'lambda:RemovePermission'], Resource: any('lambda', 'function:dmt-*') },
-      { Sid: 'RouterLogs', Effect: 'Allow', Action: ['logs:CreateLogStream', 'logs:PutLogEvents'], Resource: any('logs', 'log-group:/aws/lambda/dmt-*') },
+      { Sid: 'RouterTables', Effect: 'Allow', Action: ['dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:UpdateItem', 'dynamodb:DeleteItem', 'dynamodb:Query', 'dynamodb:Scan'], Resource: any('dynamodb', 'table/dmtr-*') },
+      { Sid: 'RouterQueues', Effect: 'Allow', Action: ['sqs:SendMessage', 'sqs:GetQueueAttributes'], Resource: any('sqs', 'dmtr-*') },
+      { Sid: 'RouterFunctions', Effect: 'Allow', Action: ['lambda:InvokeFunction'], Resource: any('lambda', 'function:dmtr-*') },
+      // Onboarding lets the load balancer invoke the waker.
+      { Sid: 'WakerPermissions', Effect: 'Allow', Action: ['lambda:AddPermission', 'lambda:RemovePermission'], Resource: any('lambda', 'function:dmtr-*-waker') },
+      { Sid: 'RouterLogs', Effect: 'Allow', Action: ['logs:CreateLogStream', 'logs:PutLogEvents'], Resource: any('logs', 'log-group:/aws/lambda/dmtr-*') },
       {
         Sid: 'Workloads', Effect: 'Allow',
         Action: [

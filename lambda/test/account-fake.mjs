@@ -220,7 +220,12 @@ export function fakeAccount() {
       return { DBClusters: [{ DBClusterIdentifier, DBClusterArn: found[0], TagList: tagList(found[1].tags) }] };
     },
     async addTagsToResource({ ResourceName, Tags }) { call('addTagsToResource'); Object.assign(state.databases.get(ResourceName).tags, Object.fromEntries(Tags.map((t) => [t.Key, t.Value]))); return {}; },
-    async removeTagsFromResource({ ResourceName, TagKeys }) { call('removeTagsFromResource'); for (const k of TagKeys) delete state.databases.get(ResourceName).tags[k]; return {}; },
+    async removeTagsFromResource({ ResourceName, TagKeys }) {
+      call('removeTagsFromResource');
+      if (!state.databases.has(ResourceName)) throw error('DBInstanceNotFoundFault');
+      for (const k of TagKeys) delete state.databases.get(ResourceName).tags[k];
+      return {};
+    },
   };
 
   const lambda = {
@@ -250,6 +255,8 @@ export function fakeAccount() {
       return true;
     },
     async deleteWorkload(id) { call('deleteWorkload'); for (const k of [...items.keys()]) if (k.startsWith(`${id}/`)) items.delete(k); },
+    async putPause(id, pause) { call('putPause'); items.set(`${id}/PAUSE${pause.exclusionId ? `#${pause.exclusionId}` : ''}`, structuredClone(pause)); },
+    async getPauses(id) { return [...items].filter(([k]) => k.startsWith(`${id}/PAUSE`)).map(([, v]) => structuredClone(v)); },
   };
 
   return { state, items, customer, elbv2, ec2, autoscaling, ecs, rds, lambda, store };

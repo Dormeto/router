@@ -12,7 +12,7 @@ const fill = (value, values) => (typeof value === 'string'
     : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([k, v]) => [k, fill(v, values)])) : value);
 
 const VALUES = {
-  name: 'dmt-dev', region: 'eu-west-3', account: '121014831971', partition: 'aws', build: 'abc123def456',
+  name: 'dmtr-dev', region: 'eu-west-3', account: '121014831971', partition: 'aws', build: 'abc123def456',
   checkSchedule: 'rate(5 minutes)', ipLists: '[]', noWakeRules: '[]', metrics: 'false',
 };
 
@@ -48,21 +48,25 @@ const actionsOf = (policy) => policy.Statement.flatMap((s) => [].concat(s.Action
 
 test('the blueprint names every resource after the router, with IAM roles per region, all tagged', () => {
   const b = fill(blueprint({ version: '0.18.0' }), VALUES);
-  assert.deepEqual(b.router, { name: 'dmt-dev', region: 'eu-west-3', account: '121014831971', version: '0.18.0', build: 'abc123def456' });
-  assert.deepEqual(b.roles.map((r) => r.name), ['dmt-dev-eu-west-3-controller', 'dmt-dev-eu-west-3-waker', 'dmt-dev-eu-west-3-scheduler', 'dmt-dev-eu-west-3-onboarder']);
-  assert.deepEqual(b.functions.map((f) => [f.name, f.handler, f.roleArn]), [
-    ['dmt-dev-controller', 'controller.handler', 'arn:aws:iam::121014831971:role/dmt-dev-eu-west-3-controller'],
-    ['dmt-dev-waker', 'waker.handler', 'arn:aws:iam::121014831971:role/dmt-dev-eu-west-3-waker'],
-    ['dmt-dev-onboarder', 'onboarder.handler', 'arn:aws:iam::121014831971:role/dmt-dev-eu-west-3-onboarder'],
+  assert.deepEqual(b.router, { name: 'dmtr-dev', region: 'eu-west-3', account: '121014831971', version: '0.18.0', build: 'abc123def456' });
+  assert.deepEqual(b.roles.map((r) => [r.path, r.name]), [
+    ['/dormeto/router/', 'dmtr-dev-eu-west-3-controller'], ['/dormeto/router/', 'dmtr-dev-eu-west-3-waker'],
+    ['/dormeto/router/', 'dmtr-dev-eu-west-3-scheduler'], ['/dormeto/router/', 'dmtr-dev-eu-west-3-onboarder'],
   ]);
-  assert.equal(b.table.name, 'dmt-dev-router');
-  assert.deepEqual(b.queues.map((q) => q.name), ['dmt-dev-check-failures', 'dmt-dev-controller-failures']);
-  assert.deepEqual(b.logGroups.map((l) => l.name), ['/aws/lambda/dmt-dev-controller', '/aws/lambda/dmt-dev-waker', '/aws/lambda/dmt-dev-onboarder']);
-  assert.equal(b.schedule.target, 'arn:aws:lambda:eu-west-3:121014831971:function:dmt-dev-controller');
-  assert.deepEqual(b.tags, { 'dormeto:router': 'dmt-dev' });
+  assert.deepEqual(b.functions.map((f) => [f.name, f.handler, f.roleArn]), [
+    ['dmtr-dev-controller', 'controller.handler', 'arn:aws:iam::121014831971:role/dormeto/router/dmtr-dev-eu-west-3-controller'],
+    ['dmtr-dev-waker', 'waker.handler', 'arn:aws:iam::121014831971:role/dormeto/router/dmtr-dev-eu-west-3-waker'],
+    ['dmtr-dev-onboarder', 'onboarder.handler', 'arn:aws:iam::121014831971:role/dormeto/router/dmtr-dev-eu-west-3-onboarder'],
+  ]);
+  assert.equal(b.schedule.roleArn, 'arn:aws:iam::121014831971:role/dormeto/router/dmtr-dev-eu-west-3-scheduler');
+  assert.equal(b.table.name, 'dmtr-dev-router');
+  assert.deepEqual(b.queues.map((q) => q.name), ['dmtr-dev-check-failures', 'dmtr-dev-controller-failures']);
+  assert.deepEqual(b.logGroups.map((l) => l.name), ['/aws/lambda/dmtr-dev-controller', '/aws/lambda/dmtr-dev-waker', '/aws/lambda/dmtr-dev-onboarder']);
+  assert.equal(b.schedule.target, 'arn:aws:lambda:eu-west-3:121014831971:function:dmtr-dev-controller');
+  assert.deepEqual(b.tags, { 'dormeto:router': 'dmtr-dev' });
   const controller = b.functions[0].environment;
-  assert.equal(controller.DMT_FAILURE_QUEUES, '{"check":"https://sqs.eu-west-3.amazonaws.com/121014831971/dmt-dev-check-failures","controller":"https://sqs.eu-west-3.amazonaws.com/121014831971/dmt-dev-controller-failures"}');
-  assert.equal(b.functions[2].environment.DMT_WAKER_FUNCTION_ARN, 'arn:aws:lambda:eu-west-3:121014831971:function:dmt-dev-waker');
+  assert.equal(controller.DMT_FAILURE_QUEUES, '{"check":"https://sqs.eu-west-3.amazonaws.com/121014831971/dmtr-dev-check-failures","controller":"https://sqs.eu-west-3.amazonaws.com/121014831971/dmtr-dev-controller-failures"}');
+  assert.equal(b.functions[2].environment.DMT_WAKER_FUNCTION_ARN, 'arn:aws:lambda:eu-west-3:121014831971:function:dmtr-dev-waker');
 });
 
 test('the published blueprint has placeholders only, and filling them leaves none', () => {
@@ -84,4 +88,12 @@ test('every action of every router role is allowed by the permissions boundary',
     for (const action of actionsOf(role.policy)) assert.ok(allowed.some((p) => covers(p, action)), `${role.key}: ${action}`);
   }
   assert.ok(!allowed.some((a) => a.startsWith('iam:') || a.startsWith('organizations:') || a === '*'), 'no IAM, Organizations or wildcard');
+});
+
+test('the boundary covers the resources of installed routers only (dmtr-*), never a router written in Terraform or the manager', () => {
+  const resources = routerBoundary().Statement.filter((s) => s.Sid !== 'Workloads').flatMap((s) => [].concat(s.Resource));
+  assert.ok(resources.length > 0);
+  for (const r of resources) assert.match(r, /:(table\/|function:|log-group:\/aws\/lambda\/|)dmtr-/, r);
+  const permissions = routerBoundary().Statement.find((s) => [].concat(s.Action).includes('lambda:AddPermission'));
+  assert.deepEqual([].concat(permissions.Resource), ['arn:${partition}:lambda:*:${account}:function:dmtr-*-waker']);
 });

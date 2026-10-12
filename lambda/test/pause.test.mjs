@@ -198,3 +198,13 @@ test('a pause naming a target group is refused by a router whose workload of tha
   assert.deepEqual(s.store.state.pauses, []);
   assert.equal((await s.handler(pauseEvent({ targetGroupArn: s.cfg.appTargetGroupArn }))).pause.reason, 'incident 42');
 });
+
+test('list and status tell a workload written in Terraform from one onboarded by the manager', async () => {
+  const s = setup({ run: { state: STATES.AWAKE } });
+  assert.equal((await s.handler({ action: 'list' })).workloads[0].source, 'terraform');
+  assert.equal((await s.handler({ action: 'status', workloadId: 'demo' })).source, 'terraform');
+  s.store.getConfig = async () => ({ ...s.cfg, source: 'manager' });
+  s.store.listConfigs = async () => [{ ...s.cfg, source: 'manager' }];
+  assert.equal((await s.handler({ action: 'list' })).workloads[0].source, 'manager');
+  assert.equal((await s.handler({ action: 'status', workloadId: 'demo' })).source, 'manager');
+});

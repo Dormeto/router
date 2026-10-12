@@ -117,15 +117,20 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
     return backends;
   }
 
-  async function databasesOf(list = []) {
+  // Companion databases; with `skipMissing`, a database deleted since is left out (offboarding).
+  async function databasesOf(list = [], { skipMissing = false } = {}) {
     const found = [];
     for (const { kind, id } of list) {
-      if (kind === 'rds-cluster') {
-        const { DBClusters: [db] = [] } = await rds.describeDBClusters({ DBClusterIdentifier: id });
-        found.push({ kind, id, arn: db.DBClusterArn, tags: tagsOf(db.TagList) });
-      } else {
-        const { DBInstances: [db] = [] } = await rds.describeDBInstances({ DBInstanceIdentifier: id });
-        found.push({ kind: 'rds-instance', id, arn: db.DBInstanceArn, tags: tagsOf(db.TagList) });
+      try {
+        if (kind === 'rds-cluster') {
+          const { DBClusters: [db] = [] } = await rds.describeDBClusters({ DBClusterIdentifier: id });
+          found.push({ kind, id, arn: db.DBClusterArn, tags: tagsOf(db.TagList) });
+        } else {
+          const { DBInstances: [db] = [] } = await rds.describeDBInstances({ DBInstanceIdentifier: id });
+          found.push({ kind: 'rds-instance', id, arn: db.DBInstanceArn, tags: tagsOf(db.TagList) });
+        }
+      } catch (err) {
+        if (!(skipMissing && notFound(err, 'DBInstanceNotFoundFault', 'DBClusterNotFoundFault'))) throw err;
       }
     }
     return found;
@@ -219,12 +224,15 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
     // leaves it as it was (run it again).
     const fresh = !(await store.getConfig(workloadId));
     let changed = false;
+    // What this onboarding tagged: recorded in the configuration, removed by offboarding (and by an undo).
+    const tagged = [];
     try {
       const group = await targetGroup(targetGroupArn);
       const untagged = [...(await backendsOf(group)), ...(await databasesOf(databases))].filter((b) => !b.tags[WORKLOAD_TAG]);
       for (const b of untagged) {
         changed = true;
         await tag(b, workloadId);
+        tagged.push({ kind: b.kind, id: b.id, ...(b.arn ? { arn: b.arn } : {}) });
       }
       step('tag backends', untagged.length > 0, untagged.map((b) => `${KIND_TEXT[b.kind]} ${b.id}`).join(', '));
 
@@ -262,7 +270,7 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
           loadBalancerDimension: lb.slice(lb.indexOf('loadbalancer/') + 'loadbalancer/'.length), appTargetGroupDimension: targetGroupArn.split(':').at(-1),
           instanceIds: [], ...DEFAULTS, ...(databases.length ? { wakeTimeoutSeconds: DATABASE_WAKE_TIMEOUT } : {}), ...settings,
           noWakeRules: [], wakeRules: [], admin: { enabled: false, secretHash: '', secretParameter: '' },
-          source: 'manager', onboardedBy: by ?? 'unknown', onboardedAt: new Date(now()).toISOString(), databases,
+          source: 'manager', onboardedBy: by ?? 'unknown', onboardedAt: new Date(now()).toISOString(), databases, tagged,
         });
         await store.initRun(workloadId, now());
         step('workload configuration', true);
@@ -285,7 +293,7 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
     } catch (err) {
       if (!fresh || !changed) throw err;
       // Undo: whatever was done is removed, step by step, going on after a failed step.
-      const undo = await clean(workloadId, targetGroupArn, databases);
+      const undo = await clean(workloadId, targetGroupArn, databases, tagged);
       const failed = undo.filter((s) => s.status === 'failed');
       log.warn('OnboardUndone', { workloadId, error: err.message, failed: failed.map((s) => s.name) });
       throw new Error(`cannot onboard ${workloadId}: ${err.message} (${failed.length ? `undo incomplete: ${failed.map((s) => `${s.name}: ${s.detail}`).join('; ')}` : 'undone'})`);
@@ -294,7 +302,7 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
 
   // Remove the instrumentation, step by step, each step going on whatever the others did: rules first (traffic stays on
   // the application), then the waker target group (in use by rules until then), the permission, the tags, the workload.
-  async function clean(workloadId, targetGroupArn, databases = []) {
+  async function clean(workloadId, targetGroupArn, databases = [], tagged = []) {
     const steps = [];
     const run = async (name, work) => {
       try {
@@ -338,12 +346,25 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
       }
     });
     await run('untag backends', async () => {
-      const found = [...(group ? await backendsOf(group) : []), ...(await databasesOf(databases))]
+      // What onboarding recorded, and what still carries its marker among the backends of the target group.
+      const marked = [...(group ? await backendsOf(group) : []), ...(await databasesOf(databases, { skipMissing: true }))]
         .filter((b) => b.tags[WORKLOAD_TAG] === workloadId && b.tags[MARKER_TAG] === MARKER);
-      for (const b of found) await untag(b);
-      return found.length ? found.map((b) => `${KIND_TEXT[b.kind]} ${b.id}`).join(', ') : false;
+      const found = [...tagged, ...marked.filter((b) => !tagged.some((t) => t.kind === b.kind && t.id === b.id))];
+      const done = [];
+      for (const b of found) {
+        try {
+          await untag(b);
+          done.push(`${KIND_TEXT[b.kind]} ${b.id}`);
+        } catch (err) {
+          // Deleted since onboarding: nothing to untag.
+          if (!notFound(err, 'InvalidInstanceID.NotFound', 'ValidationError', 'ResourceNotFoundException', 'ServiceNotFoundException', 'DBInstanceNotFoundFault', 'DBClusterNotFoundFault')) throw err;
+        }
+      }
+      return done.length ? done.join(', ') : false;
     });
     await run('workload configuration', async () => {
+      // An incomplete offboarding keeps what it needs to finish when run again.
+      if (steps.some((x) => x.status === 'failed')) return false;
       if (!(await store.getConfig(workloadId)) && !(await store.getRun(workloadId))) return false;
       await store.deleteWorkload(workloadId);
       return true;
@@ -355,8 +376,10 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
     const cfg = await store.getConfig(workloadId);
     if (cfg && !cfg.source) throw new Error(`cannot offboard ${workloadId}: written by Terraform, remove its workload module instead`);
     const run = await store.getRun(workloadId);
+    // Paused first: no nap starts, and a nap already draining aborts at its commit point, while the instrumentation goes.
+    if (cfg || run) await store.putPause(workloadId, { by: by ?? 'unknown', at: now(), reason: 'offboarding', keepAsleep: true });
     if (run && run.state !== 'AWAKE') throw new Error(`cannot offboard ${workloadId}: it is ${run.state}, wake it first`);
-    const steps = await clean(workloadId, cfg?.appTargetGroupArn, cfg?.databases);
+    const steps = await clean(workloadId, cfg?.appTargetGroupArn, cfg?.databases, cfg?.tagged);
     const failed = steps.filter((s) => s.status === 'failed');
     log.info('Offboarded', { workloadId, by, steps: steps.map((s) => `${s.name} ${s.status}`) });
     if (failed.length) throw new Error(`offboard of ${workloadId} incomplete: ${failed.map((s) => `${s.name}: ${s.detail}`).join('; ')}`);

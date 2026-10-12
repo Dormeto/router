@@ -117,7 +117,7 @@ test('onboard tags the backend, creates and registers the waker target group, wr
     loadBalancerDimension: 'app/shop/50dc6c495c0c9188', appTargetGroupDimension: s.tg.split(':').at(-1),
     instanceIds: [], waitSeconds: 60, idleMinutes: 30, drainSeconds: 30, wakeTimeoutSeconds: 600, failedRetrySeconds: 60, maxHolders: 50, pollSeconds: 3,
     noWakeRules: [], wakeMode: 'browser', wakeRules: [], admin: { enabled: false, secretHash: '', secretParameter: '' },
-    source: 'manager', onboardedBy: 'ops@example.com', onboardedAt: 'x', databases: [],
+    source: 'manager', onboardedBy: 'ops@example.com', onboardedAt: 'x', databases: [], tagged: [{ kind: 'instance', id: 'i-0aaa' }],
   });
   assert.equal(cfg.onboardedAt, new Date(NOW).toISOString());
   assert.deepEqual(await s.a.store.getRun('shop'), { state: 'AWAKE', version: 0, awakeSince: NOW, holders: 0, wakeCount: 0 });
@@ -244,4 +244,52 @@ test('offboarding never deletes a target group named like the waker but not tagg
   await s.onboarding.offboard({ workloadId: 'shop', by: 'ops' });
   assert.ok(s.a.state.targetGroups.has(lookalike));
   await assert.rejects(s.onboarding.onboard({ workloadId: 'shop', targetGroupArn: s.tg, by: 'ops' }), /target group dmt-dev-shop exists and is not the waker of shop/);
+});
+
+// --- Review fixes -------------------------------------------------------------------------------------------------
+
+test('offboard pauses the workload before anything else, so that no nap starts or commits while it runs', async () => {
+  const s = setup();
+  await s.onboarding.onboard({ workloadId: 'shop', targetGroupArn: s.tg, by: 'ops' });
+  let pausedFirst = null;
+  const modify = s.a.elbv2.modifyRule;
+  s.a.elbv2.modifyRule = async (input) => {
+    pausedFirst ??= s.a.items.has('shop/PAUSE');
+    return modify(input);
+  };
+  await s.onboarding.offboard({ workloadId: 'shop', by: 'ops@example.com' });
+  assert.equal(pausedFirst, true);
+});
+
+test('offboard of a workload that is not awake leaves it paused for offboarding (the workflow wakes it and tries again)', async () => {
+  const s = setup();
+  await s.onboarding.onboard({ workloadId: 'shop', targetGroupArn: s.tg, by: 'ops' });
+  s.a.items.get('shop/RUN').state = 'NAPPING';
+  await assert.rejects(s.onboarding.offboard({ workloadId: 'shop', by: 'ops' }), /it is NAPPING, wake it first/);
+  assert.equal(s.a.items.get('shop/PAUSE').reason, 'offboarding');
+  assert.notEqual(await s.a.store.getConfig('shop'), null);
+});
+
+test('a failed offboard keeps the configuration, so that running it again finishes it', async () => {
+  const s = setup();
+  const db = s.a.customer.database('rds-instance', 'shop-db');
+  await s.onboarding.onboard({ workloadId: 'shop', targetGroupArn: s.tg, databases: [{ kind: 'rds-instance', id: 'shop-db' }], by: 'ops' });
+  s.a.state.fail.deleteTargetGroup = new Error('Throttling');
+  await assert.rejects(s.onboarding.offboard({ workloadId: 'shop', by: 'ops' }), /offboard of shop incomplete: waker target group: Throttling/);
+  assert.notEqual(await s.a.store.getConfig('shop'), null);
+  const again = await s.onboarding.offboard({ workloadId: 'shop', by: 'ops' });
+  assert.equal(again.steps.find((x) => x.name === 'waker target group').status, 'done');
+  assert.deepEqual(s.a.state.databases.get(db).tags, {});
+  assert.equal(await s.a.store.getConfig('shop'), null);
+});
+
+test('offboard untags what onboarding tagged even when a companion database was deleted since', async () => {
+  const s = setup();
+  const db = s.a.customer.database('rds-instance', 'shop-db');
+  await s.onboarding.onboard({ workloadId: 'shop', targetGroupArn: s.tg, databases: [{ kind: 'rds-instance', id: 'shop-db' }], by: 'ops' });
+  assert.deepEqual((await s.a.store.getConfig('shop')).tagged.map((t) => [t.kind, t.id]), [['instance', 'i-0aaa'], ['rds-instance', 'shop-db']]);
+  s.a.state.databases.delete(db);
+  const result = await s.onboarding.offboard({ workloadId: 'shop', by: 'ops' });
+  assert.equal(result.steps.find((x) => x.name === 'untag backends').status, 'done');
+  assert.deepEqual(s.a.state.instances.get('i-0aaa').tags, { Name: 'shop' });
 });

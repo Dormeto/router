@@ -54,3 +54,14 @@ test('reports a target group without any rule, or not attached to a load balance
   elbv2.state.detached = true;
   assert.deepEqual((await resolveRules(elbv2, [cfg])).get('demo').issues.map((i) => i.reason), ['target group not attached to a load balancer']);
 });
+
+test('never asks the tags of a listener default rule', async () => {
+  const elbv2 = fakeElbv2(cfg);
+  const asked = [];
+  const describeTags = elbv2.describeTags;
+  elbv2.describeTags = async (input) => { asked.push(...input.ResourceArns); return describeTags(input); };
+  elbv2.state.rules.set('arn:rule/default', { actions: appOnly(cfg), isDefault: true, tags: {} });
+  const found = (await resolveRules(elbv2, [cfg])).get('demo');
+  assert.equal(asked.includes('arn:rule/default'), false);
+  assert.match(found.issues[0].reason, /default rule/);
+});

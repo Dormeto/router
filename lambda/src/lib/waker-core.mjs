@@ -11,8 +11,11 @@ const STUCK_GRACE_MS = 60_000;
 const MAX_REDIRECTS = 2;
 // ALB rule changes take about 12 s to propagate: right after a wake, requests still reach the waker.
 const ROUTE_GRACE_MS = 15_000;
+// Route repairs requested from a warm waker instance: at most one per workload in this interval.
+const ENSURE_INTERVAL_MS = 10_000;
 
 export function createWaker({ store, invokeController, prefix, now = Date.now, sleep, newId = randomUUID, log, getAdmin, defaultRules = [], listCache = null }) {
+  const ensured = new Map(); // workload id → last ensure-awake request
   const inRouteGrace = (run) => run.state === STATES.AWAKE && (run.awakeSince ?? 0) > now() - ROUTE_GRACE_MS;
   const servable = (run) => run.state === STATES.AWAKE && !inRouteGrace(run);
 
@@ -85,7 +88,11 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
         return run;
       case STATES.AWAKE:
         // Reaching the waker while awake is expected during the route grace window; later it means drift.
-        if (kind !== 'probe' && !inRouteGrace(run)) await invokeController({ action: 'ensure-awake', workloadId });
+        if (kind !== 'probe' && !inRouteGrace(run) && now() - (ensured.get(workloadId) ?? -Infinity) >= ENSURE_INTERVAL_MS) {
+          // At most every 10 s per workload and warm instance: each repair resolves the rules (several ELB calls).
+          ensured.set(workloadId, now());
+          await invokeController({ action: 'ensure-awake', workloadId });
+        }
         return run;
       default:
         return run;

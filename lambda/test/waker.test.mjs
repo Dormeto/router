@@ -154,6 +154,16 @@ test('AWAKE: repairs the route and redirects, with a loop guard', async () => {
   assert.equal(headerOf(looping, 'x-dormeto-state'), STATES.AWAKE);
 });
 
+test('AWAKE: asks the controller to repair the route at most every 10 s per workload', async () => {
+  const { handler, invocations, clock } = setup({ run: { state: STATES.AWAKE } });
+  await handler(albEvent());
+  await handler(albEvent());
+  assert.equal(invocations.filter((i) => i.action === 'ensure-awake').length, 1);
+  clock.advance(10_000);
+  await handler(albEvent());
+  assert.equal(invocations.filter((i) => i.action === 'ensure-awake').length, 2);
+});
+
 test('unknown workload configuration answers FAILED without throwing', async () => {
   const { handler } = setup({ run: { state: STATES.ASLEEP }, cfg: testConfig({ workloadId: 'other' }) });
   const res = await handler(albEvent());

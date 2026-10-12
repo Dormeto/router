@@ -29,7 +29,8 @@ variable "rule_arns" {
 }
 
 variable "app_target_group_arn" {
-  type = string
+  description = "Application target group: it identifies the workload. Its rules are every listener rule of its load balancer that forwards to it, found at runtime. Instrument each one: a weighted forward to this target group (weight 1) and to the waker target group (output waker_target_group_arn, weight 0), the tag dormeto:workload = <workload_id>, and lifecycle ignore_changes = [action]. Any other rule forwarding to the target group keeps the workload awake (shown as an issue in its status)."
+  type        = string
 }
 
 variable "app_target_group_arn_suffix" {

@@ -167,7 +167,7 @@ export function createController({
   // block a switch to the waker).
   const rulesFor = async (cfg) => (await resolveRules(elbv2, [cfg])).get(cfg.workloadId);
   const reasons = (issues) => issues.map((i) => i.reason);
-  const routeTo = (cfg, target, found) => setRoute(elbv2, cfg, target, { found, onIssues: (issues) => log.warn('RuleIssues', { workloadId: cfg.workloadId, issues: reasons(issues) }) });
+  const routeTo = (cfg, target, options = {}) => setRoute(elbv2, cfg, target, { ...options, onIssues: (issues) => log.warn('RuleIssues', { workloadId: cfg.workloadId, issues: reasons(issues) }) });
 
   async function reconcile(cfg) {
     const { workloadId } = cfg;
@@ -211,7 +211,8 @@ export function createController({
         ?? (await store.getRun(workloadId));
     } else if (from !== STATES.ASLEEP && all('stopped')) {
       log.warn(from === STATES.FAILED ? 'FailedRecovered' : 'ExternalStop', { workloadId });
-      await routeTo(cfg, 'waker');
+      // The backend is already stopped: the instrumented rules go to the waker whatever the issues.
+      await routeTo(cfg, 'waker', { allowIssues: true });
       await stopCompanions(clients, companions);
       run = (await store.transition(workloadId, { cond: { state: from }, set: { state: STATES.ASLEEP, holders: 0 } }))
         ?? (await store.getRun(workloadId));
@@ -228,20 +229,18 @@ export function createController({
     const expected = run.state === STATES.AWAKE ? 'app' : [STATES.ASLEEP, STATES.FAILED].includes(run.state) ? 'waker' : null;
     if (expected) {
       const found = await rulesFor(cfg);
-      if (expected === 'waker' && found.issues.length) {
-        // A rule the router cannot switch sends requests to the stopped backend: wake the workload (it is not napped
-        // again until the rule is instrumented or removed).
-        if (run.state === STATES.ASLEEP) {
-          log.warn('WokenForRuleIssues', { workloadId, issues: reasons(found.issues) });
-          await forceWake(workloadId, 'dormeto', 'rule-issues');
-          return (await store.getRun(workloadId)) ?? run;
-        }
-        log.warn('RuleIssues', { workloadId, issues: reasons(found.issues) });
-      } else {
-        // Every instrumented rule: a rule switched back alone (mixed route) is repaired too.
-        const repaired = await routeTo(cfg, expected, found);
-        if (repaired.length) log.warn('RouteRepaired', { workloadId, route: expected, rules: repaired });
+      // A rule the router cannot switch sends requests to the stopped backend: wake the workload (it is not napped again
+      // until the rule is instrumented or removed). A target group without any rule has no such rule: no wake.
+      const ruleIssues = found.issues.filter((i) => i.arn);
+      if (run.state === STATES.ASLEEP && ruleIssues.length) {
+        log.warn('WokenForRuleIssues', { workloadId, issues: reasons(ruleIssues) });
+        await forceWake(workloadId, 'dormeto', 'rule-issues');
+        return (await store.getRun(workloadId)) ?? run;
       }
+      // Every instrumented rule (a rule switched back alone, a mixed route, is repaired too); asleep or failed, the
+      // backend does not serve, so the issues do not hold the instrumented rules back from the waker.
+      const repaired = await routeTo(cfg, expected, { found, allowIssues: expected === 'waker' });
+      if (repaired.length) log.warn('RouteRepaired', { workloadId, route: expected, rules: repaired });
     }
 
     if ((run.holders ?? 0) > 0 && (run.updatedAt ?? 0) < now() - HOLDERS_STALE_MS) {

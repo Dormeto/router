@@ -10,6 +10,17 @@ This MVP manages one EC2 instance behind an ALB:
 - `controller` Lambda: switches the ALB rule weights, stops and starts the instance, naps idle workloads (scheduled
   check of the ALB `RequestCount`), and reconciles external changes.
 
+A workload is identified by its **application target group**. Its **rules** are every listener rule of the target
+group's load balancer that forwards to it, found at each nap, wake and idle check: a nap switches all of them to the waker
+before stopping the backend, a wake switches them back once the targets are healthy. Instrument each rule: a weighted
+forward to the application target group (weight 1) and to the workload's waker target group (weight 0), the tag
+`dormeto:workload = <workload id>` (the controller may only change tagged rules), and `ignore_changes = [action]` in
+Terraform. A rule forwarding to the target group without being instrumented (no waker target group, missing tag, other
+target groups, or a listener default rule) is an **issue**: the router never naps the workload while it exists, wakes it
+if it appears while the workload sleeps (that rule would reach the stopped backend), and shows it in the status.
+Upgrading from 0.14 or earlier: an asleep workload with such a rule (for example an HTTP rule forwarding to the target
+group) is woken at the first idle check and stays awake until the rule is instrumented or removed.
+
 Instances are **discovered** from the application target group: every instance target tagged
 `dormeto:workload=<workload id>` is managed; other targets are ignored (and shown on the admin dashboard). The nap records
 the instances it stopped and the wake starts exactly those. A static `instance_ids` list on the `workload` module is

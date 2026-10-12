@@ -56,7 +56,8 @@ export async function resolveRules(elbv2, cfgs) {
     .flatMap((lb) => listed.get(lb) ?? [])
     .filter(({ rule }) => forwardTargetGroups(rule).includes(cfg.appTargetGroupArn))]));
   const tags = new Map();
-  for (const batch of chunks([...new Set([...matching.values()].flat().map(({ rule }) => rule.RuleArn))], 20)) {
+  // Default rules are left out: their reason never depends on tags (and a default rule may not accept tags).
+  for (const batch of chunks([...new Set([...matching.values()].flat().filter(({ rule }) => !rule.IsDefault).map(({ rule }) => rule.RuleArn))], 20)) {
     const { TagDescriptions = [] } = await elbv2.describeTags({ ResourceArns: batch });
     for (const d of TagDescriptions) tags.set(d.ResourceArn, Object.fromEntries((d.Tags ?? []).map((t) => [t.Key, t.Value])));
   }

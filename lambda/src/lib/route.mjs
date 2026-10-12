@@ -64,11 +64,13 @@ export function routeOf(rules, cfg) {
 // changed. Towards the waker, any rule it cannot switch fails the call before any change: that rule would send traffic
 // to the stopped backend. Towards the application, the instrumented rules are switched and the issues reported
 // (onIssues): a running backend must not stay behind the waiter page.
-export async function setRoute(elbv2, cfg, target, { onIssues = () => {}, found } = {}) {
+// allowIssues: the backend is already stopped (external stop, failed wake), so the guard no longer protects anything and
+// the instrumented rules must reach the waker.
+export async function setRoute(elbv2, cfg, target, { onIssues = () => {}, found, allowIssues = false } = {}) {
   if (!TARGETS.has(target)) throw new Error(`invalid target: ${target}`);
   const { instrumented, issues } = found ?? (await resolveRules(elbv2, [cfg])).get(cfg.workloadId);
   if (issues.length) {
-    if (target === 'waker') throw new Error(`cannot switch to the waker: ${issues.map((i) => i.reason).join('; ')}`);
+    if (target === 'waker' && !allowIssues) throw new Error(`cannot switch to the waker: ${issues.map((i) => i.reason).join('; ')}`);
     onIssues(issues);
   }
   const weights = target === 'app'

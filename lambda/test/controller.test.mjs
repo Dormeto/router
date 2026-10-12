@@ -261,6 +261,44 @@ test('check wakes an asleep workload when a rule forwarding to its target group 
   assert.ok(warnings.some(([e]) => e === 'WokenForRuleIssues'));
 });
 
+test('an asleep workload whose target group has no rule (or no load balancer) is not woken', async () => {
+  const s = setup({ run: { state: STATES.ASLEEP }, instance: 'stopped', target: 'waker', cfg: TWO_RULES });
+  s.elbv2.state.rules.clear();
+  await s.handler({ action: 'check' });
+  assert.equal(s.store.state.run.state, STATES.ASLEEP);
+  assert.equal(s.invocations.some((i) => i.action === 'wake'), false);
+  s.elbv2.state.detached = true;
+  await s.handler({ action: 'check' });
+  assert.equal(s.store.state.run.state, STATES.ASLEEP);
+});
+
+test('a backend stopped outside Dormeto with a rule issue: instrumented rules to the waker, then woken for the issue', async () => {
+  const s = setup({ run: { state: STATES.AWAKE, awakeSince: 0 }, instance: 'stopped', healthy: 0, cfg: TWO_RULES });
+  const warnings = recordWarnings(s);
+  s.elbv2.state.rules.set('arn:rule/new', { actions: appOnly(s.cfg), priority: '19', tags: {} });
+  const [result] = await s.handler({ action: 'check' });
+  assert.equal(result.error, undefined);
+  assert.equal(currentTarget(s.elbv2.state.rules.get('arn:rule/main').actions, s.cfg), 'waker');
+  assert.equal(s.store.state.run.state, STATES.WAKING);
+  assert.ok(warnings.some(([e]) => e === 'WokenForRuleIssues'));
+});
+
+test('a FAILED workload with a stopped backend and a rule issue recovers the same way', async () => {
+  const s = setup({ run: { state: STATES.FAILED, failedAt: 0 }, instance: 'stopped', healthy: 0, cfg: TWO_RULES });
+  s.elbv2.state.rules.set('arn:rule/new', { actions: appOnly(s.cfg), priority: '19', tags: {} });
+  const [result] = await s.handler({ action: 'check' });
+  assert.equal(result.error, undefined);
+  assert.equal(s.store.state.run.state, STATES.WAKING);
+});
+
+test('a FAILED workload with a rule issue keeps its instrumented rules behind the waker', async () => {
+  const s = setup({ run: { state: STATES.FAILED, failedAt: 0 }, instance: 'pending', healthy: 0, cfg: TWO_RULES });
+  s.elbv2.state.rules.set('arn:rule/new', { actions: appOnly(s.cfg), priority: '19', tags: {} });
+  const [result] = await s.handler({ action: 'check' });
+  assert.equal(result.error, undefined);
+  assert.deepEqual(['arn:rule/main', 'arn:rule/static'].map((arn) => currentTarget(s.elbv2.state.rules.get(arn).actions, s.cfg)), ['waker', 'waker']);
+});
+
 test('status reports the rules found from the target group, their route, and the issues', async () => {
   const s = setup({ run: { state: STATES.AWAKE }, cfg: TWO_RULES });
   s.elbv2.state.rules.get('arn:rule/main').conditions = [host('asg.example.com')];

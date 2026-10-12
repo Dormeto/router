@@ -9,8 +9,14 @@ const HEALTH_POLL_MS = 3000;
 const STOP_TIMEOUT_MS = 5 * 60_000;
 const NAPPING_STUCK_MS = 15 * 60_000;
 const WAKING_STUCK_GRACE_MS = 60_000;
+// Stop working this long before the Lambda timeout, so that a failure is recorded instead of a silent kill.
+const TIMEOUT_MARGIN_MS = 30_000;
+// Held requests last at most waitSeconds: a counter untouched for longer is a leak (killed waker).
+const HOLDERS_STALE_MS = 2 * 60_000;
 
 export function createController({ store, ec2, elbv2, cloudwatch, now = Date.now, sleep, newId = randomUUID, log }) {
+  let budgetEnd = Infinity;
+
   async function config(workloadId) {
     const cfg = await store.getConfig(workloadId);
     if (!cfg) throw new Error(`workload not configured: ${workloadId}`);
@@ -24,8 +30,6 @@ export function createController({ store, ec2, elbv2, cloudwatch, now = Date.now
   }
 
   async function wake(workloadId, wakeId, knownConfig) {
-    const cfg = knownConfig ?? (await config(workloadId));
-    const timing = { sleep, now, deadline: now() + cfg.wakeTimeoutSeconds * 1000 };
     // A delayed or duplicated event must not touch EC2 or the ALB once its wake is no longer the current one.
     const isCurrent = (run) => run?.state === STATES.WAKING && run.wakeId === wakeId;
     const current = async () => isCurrent(await store.getRun(workloadId));
@@ -33,14 +37,27 @@ export function createController({ store, ec2, elbv2, cloudwatch, now = Date.now
       log.warn('WakeSuperseded', { workloadId, wakeId });
       return { state: 'SUPERSEDED' };
     };
-    const run = await store.getRun(workloadId);
-    if (!isCurrent(run)) return superseded();
+    const fail = async (err) => {
+      log.error('WakeFailed', { workloadId, wakeId, error: err.message });
+      await store.transition(workloadId, { cond: { state: STATES.WAKING, wakeId }, set: { state: STATES.FAILED, failedAt: now(), holders: 0 } });
+      return { state: STATES.FAILED, error: err.message };
+    };
+    let run;
+    let cfg;
+    try {
+      run = await store.getRun(workloadId);
+      if (!isCurrent(run)) return superseded();
+      cfg = knownConfig ?? (await config(workloadId));
+    } catch (err) {
+      return fail(err);
+    }
+    const timing = { sleep, now, deadline: Math.min(now() + cfg.wakeTimeoutSeconds * 1000, budgetEnd) };
     try {
       // Start what the nap stopped; without that record (wake from a reconciled or failed state), what is managed now.
       const ids = run.napInstances ? JSON.parse(run.napInstances) : await managedInstances(cfg);
       await startInstances(ec2, ids, timing);
       while ((await healthyCount(elbv2, cfg.appTargetGroupArn)) < 1) {
-        if (now() >= timing.deadline) throw new Error('wake timeout: no healthy target');
+        if (now() >= timing.deadline) throw new Error('wake timeout: no healthy target');  // or Lambda time budget
         await sleep(HEALTH_POLL_MS);
       }
       if (!(await current())) return superseded();
@@ -54,9 +71,7 @@ export function createController({ store, ec2, elbv2, cloudwatch, now = Date.now
       log.info('WakeCompleted', { workloadId, wakeId });
       return { state: STATES.AWAKE };
     } catch (err) {
-      log.error('WakeFailed', { workloadId, wakeId, error: err.message });
-      await store.transition(workloadId, { cond: { state: STATES.WAKING, wakeId }, set: { state: STATES.FAILED, failedAt: now() } });
-      return { state: STATES.FAILED, error: err.message };
+      return fail(err);
     }
   }
 
@@ -93,10 +108,10 @@ export function createController({ store, ec2, elbv2, cloudwatch, now = Date.now
       await stopInstances(ec2, ids, { sleep, now, deadline: now() + STOP_TIMEOUT_MS });
     } catch (err) {
       log.error('NapFailed', { workloadId, error: err.message });
-      await store.transition(workloadId, { cond: { state: STATES.NAPPING }, set: { state: STATES.FAILED, failedAt: now() }, remove: ['stopping'] });
+      await store.transition(workloadId, { cond: { state: STATES.NAPPING }, set: { state: STATES.FAILED, failedAt: now(), holders: 0 }, remove: ['stopping'] });
       return { state: STATES.FAILED, error: err.message };
     }
-    const asleep = await store.transition(workloadId, { cond: { state: STATES.NAPPING, pendingWake: false }, set: { state: STATES.ASLEEP }, remove: ['stopping'] });
+    const asleep = await store.transition(workloadId, { cond: { state: STATES.NAPPING, pendingWake: false }, set: { state: STATES.ASLEEP, holders: 0 }, remove: ['stopping'] });
     if (asleep) {
       log.info('NapCompleted', { workloadId });
       return { state: STATES.ASLEEP };
@@ -122,7 +137,7 @@ export function createController({ store, ec2, elbv2, cloudwatch, now = Date.now
       log.warn('NapStuck', { workloadId });
       return (await store.transition(workloadId, {
         cond: { state: STATES.NAPPING, olderThan: { field: 'updatedAt', ms: stuckBefore } },
-        set: { state: STATES.FAILED, failedAt: now() },
+        set: { state: STATES.FAILED, failedAt: now(), holders: 0 },
         remove: ['stopping'],
       })) ?? store.getRun(workloadId);
     }
@@ -131,7 +146,7 @@ export function createController({ store, ec2, elbv2, cloudwatch, now = Date.now
       log.warn('WakeStuck', { workloadId, wakeId: run.wakeId });
       return (await store.transition(workloadId, {
         cond: { state: STATES.WAKING, wakeId: run.wakeId },
-        set: { state: STATES.FAILED, failedAt: now() },
+        set: { state: STATES.FAILED, failedAt: now(), holders: 0 },
       })) ?? store.getRun(workloadId);
     }
     if (![STATES.AWAKE, STATES.ASLEEP, STATES.FAILED].includes(run.state)) return run;
@@ -149,7 +164,7 @@ export function createController({ store, ec2, elbv2, cloudwatch, now = Date.now
     } else if (from !== STATES.ASLEEP && all('stopped')) {
       log.warn(from === STATES.FAILED ? 'FailedRecovered' : 'ExternalStop', { workloadId });
       await setRoute(elbv2, cfg, 'waker');
-      run = (await store.transition(workloadId, { cond: { state: from }, set: { state: STATES.ASLEEP } }))
+      run = (await store.transition(workloadId, { cond: { state: from }, set: { state: STATES.ASLEEP, holders: 0 } }))
         ?? (await store.getRun(workloadId));
     }
 
@@ -157,6 +172,11 @@ export function createController({ store, ec2, elbv2, cloudwatch, now = Date.now
     // A FAILED workload stays behind the waker, so that requests retry the wake.
     const expected = run.state === STATES.AWAKE ? 'app' : [STATES.ASLEEP, STATES.FAILED].includes(run.state) ? 'waker' : null;
     if (expected && (await setRoute(elbv2, cfg, expected))) log.warn('RouteRepaired', { workloadId, route: expected });
+
+    if ((run.holders ?? 0) > 0 && (run.updatedAt ?? 0) < now() - HOLDERS_STALE_MS) {
+      log.warn('HoldersReset', { workloadId, holders: run.holders });
+      run = (await store.transition(workloadId, { cond: { state: run.state }, set: { holders: 0 } })) ?? run;
+    }
     return run;
   }
 
@@ -199,7 +219,9 @@ export function createController({ store, ec2, elbv2, cloudwatch, now = Date.now
     return { state: run.state, changed };
   }
 
-  return async function handler(event) {
+  return async function handler(event, context) {
+    const remaining = context?.getRemainingTimeInMillis?.();
+    budgetEnd = typeof remaining === 'number' ? now() + remaining - TIMEOUT_MARGIN_MS : Infinity;
     switch (event?.action) {
       case 'wake': return wake(event.workloadId, event.wakeId);
       case 'nap': return nap(event.workloadId);

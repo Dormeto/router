@@ -103,7 +103,7 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
     if (run.state !== STATES.AWAKE) return waiter(event, cfg.pollSeconds, run.state);
     if (inRouteGrace(run)) return waiter(event, cfg.pollSeconds, STATES.AWAKE);
     const count = redirectCount(event);
-    if (count >= MAX_REDIRECTS) return waiter(event, cfg.pollSeconds, STATES.WAKING);
+    if (count >= MAX_REDIRECTS) return waiter(event, cfg.pollSeconds, STATES.AWAKE);
     return response(307, {
       location: requestTarget(event),
       'cache-control': 'no-store',

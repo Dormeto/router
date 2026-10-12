@@ -284,3 +284,41 @@ test('check (discovery): an AWAKE workload without managed instance is not marke
   assert.notEqual(s.store.state.run.state, STATES.ASLEEP);
   assert.equal(routeOf(s.elbv2, s.cfg), 'app');
 });
+
+// --- cleanup: holders, time budget, config errors ----------------------------------------------------------------
+
+test('wake failure resets the held-request counter', async () => {
+  const s = setup({ run: { state: STATES.WAKING, wakeId: 'w1', holders: 3 }, instance: 'stopped', target: 'waker', healthy: 0 });
+  await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' });
+  assert.equal(s.store.state.run.state, STATES.FAILED);
+  assert.equal(s.store.state.run.holders, 0);
+});
+
+test('a completed nap resets the held-request counter', async () => {
+  const s = setup({ run: { state: STATES.AWAKE, holders: 2 } });
+  await s.handler({ action: 'nap', workloadId: 'demo' });
+  assert.equal(s.store.state.run.state, STATES.ASLEEP);
+  assert.equal(s.store.state.run.holders, 0);
+});
+
+test('check clears a leaked held-request counter outside a wake', async () => {
+  const s = setup({ run: { state: STATES.AWAKE, awakeSince: 1, holders: 4 }, metric: [1] });
+  await s.handler({ action: 'check' });
+  assert.equal(s.store.state.run.holders, 0);
+});
+
+test('wake stops before the Lambda timeout and ends FAILED', async () => {
+  const s = setup({ run: { state: STATES.WAKING, wakeId: 'w1' }, instance: 'stopped', target: 'waker', healthy: 0 });
+  const start = s.clock.now();
+  const result = await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' }, { getRemainingTimeInMillis: () => 60_000 });
+  assert.equal(result.state, STATES.FAILED);
+  assert.ok(s.clock.now() - start <= 33_000, `gave up after ${s.clock.now() - start} ms`);
+});
+
+test('a configuration read error during wake ends FAILED instead of a stuck WAKING', async () => {
+  const s = setup({ run: { state: STATES.WAKING, wakeId: 'w1' } });
+  s.store.getConfig = async () => { throw new Error('ProvisionedThroughputExceededException'); };
+  const result = await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' });
+  assert.equal(result.state, STATES.FAILED);
+  assert.equal(s.store.state.run.state, STATES.FAILED);
+});

@@ -82,14 +82,17 @@ export function createAdmin({ ec2, elbv2, cloudwatch, invokeController, now = Da
 
   return async function handle({ event, workloadId, cfg, run, base, route, forceWake }) {
     const method = event.httpMethod;
+    const read = method === 'GET' || method === 'HEAD';
     if (route === '') {
-      if (method !== 'GET') return notAllowed('GET');
+      if (!read) return notAllowed('GET, HEAD');
+      if (method === 'HEAD') return response(200, { ...SECURITY_HEADERS, 'content-type': 'text/html; charset=utf-8' });
       const action = event.multiValueQueryStringParameters?.action?.[0];
       const body = renderDashboard({ status: await status(workloadId, cfg, run), base, action: ACTIONS.has(action) ? action : undefined });
       return response(200, { ...SECURITY_HEADERS, 'content-type': 'text/html; charset=utf-8' }, body);
     }
     if (route === 'status.json') {
-      if (method !== 'GET') return notAllowed('GET');
+      if (!read) return notAllowed('GET, HEAD');
+      if (method === 'HEAD') return response(200, { ...SECURITY_HEADERS, 'content-type': 'application/json' });
       return response(200, { ...SECURITY_HEADERS, 'content-type': 'application/json' }, JSON.stringify(await status(workloadId, cfg, run)));
     }
     if (ACTIONS.has(route)) {

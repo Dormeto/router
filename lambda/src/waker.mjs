@@ -1,6 +1,7 @@
 import { createDynamo } from './aws/dynamo.mjs';
 import { createLambda } from './aws/lambda.mjs';
 import { logger } from './lib/log.mjs';
+import { memoizeAsync } from './lib/memo.mjs';
 import { createStore } from './lib/state.mjs';
 import { sleep } from './lib/time.mjs';
 import { createWaker } from './lib/waker-core.mjs';
@@ -9,8 +10,7 @@ const lambda = createLambda();
 const invokeController = (payload) => lambda.invokeAsync(process.env.DMT_CONTROLLER, payload);
 
 // The admin dashboard is a cold path: its SDK clients load on the first admin request only.
-let admin;
-const getAdmin = () => (admin ??= Promise.all([
+const getAdmin = memoizeAsync(() => Promise.all([
   import('./lib/admin.mjs'),
   import('./aws/ec2.mjs'),
   import('./aws/elbv2.mjs'),

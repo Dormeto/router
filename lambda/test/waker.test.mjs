@@ -151,6 +151,7 @@ test('AWAKE: repairs the route and redirects, with a loop guard', async () => {
   assert.deepEqual(invocations, [{ action: 'ensure-awake', workloadId: 'demo' }]);
   const looping = await handler(albEvent({ headers: { cookie: 'dmt_r=2' } }));
   assert.equal(looping.statusCode, 503);
+  assert.equal(headerOf(looping, 'x-dormeto-state'), STATES.AWAKE);
 });
 
 test('unknown workload configuration answers FAILED without throwing', async () => {

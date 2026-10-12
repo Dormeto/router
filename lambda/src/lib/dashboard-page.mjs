@@ -22,7 +22,7 @@ export function renderDashboard({ status, base, action }) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
-<meta http-equiv="refresh" content="10">
+<meta http-equiv="refresh" content="10; url=${escapeHtml(base)}/">
 <title>Dormeto · ${escapeHtml(status.workloadId)}</title>
 <style>
 :root{color-scheme:light dark;--bg:#f7f7f8;--fg:#1d1d1f;--muted:#6b6b70;--line:#d9d9de;--accent:#5b5bd6}

@@ -67,7 +67,7 @@ test('dashboard shows the state, time before nap and underlying resources', asyn
   assert.match(res.body, /i-0123456789abcdef0/);
   assert.match(res.body, new RegExp(`action="${BASE}/nap"`));
   assert.match(res.body, new RegExp(`action="${BASE}/wake"`));
-  assert.match(res.body, /http-equiv="refresh" content="10"/);
+  assert.match(res.body, /http-equiv="refresh" content="10; url=/);
   assert.doesNotMatch(res.body, /<script/);
 });
 
@@ -172,4 +172,19 @@ test('status.json (discovery) lists the managed instances and the ignored target
   assert.equal(status.discovery, 'discovery');
   assert.deepEqual(status.instances, [{ id: 'i-a', state: 'running' }]);
   assert.deepEqual(status.ignoredTargets, [{ id: 'i-x', reason: 'untagged' }]);
+});
+
+test('the dashboard refresh drops the action message', async () => {
+  const { handler } = setup({ run: { state: STATES.AWAKE } });
+  const res = await handler(albEvent({ path: `${BASE}/`, query: { action: ['nap'] } }));
+  assert.match(res.body, new RegExp(`http-equiv="refresh" content="10; url=${BASE}/"`));
+});
+
+test('HEAD is accepted on the dashboard routes without a body', async () => {
+  const { handler } = setup({ run: { state: STATES.AWAKE } });
+  for (const path of [`${BASE}/`, `${BASE}/status.json`]) {
+    const res = await handler(albEvent({ method: 'HEAD', path }));
+    assert.equal(res.statusCode, 200, path);
+    assert.equal(res.body, '');
+  }
 });

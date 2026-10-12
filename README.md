@@ -29,6 +29,21 @@ starting the application. A wake that outlasts one Lambda invocation continues i
 `wake_timeout_seconds` (1800 s for workloads with a database). While a workload sleeps, a database restarted by AWS after
 7 days is stopped again. Read replicas and Aurora Serverless v1 are ignored.
 
+**No-wake requests** get the waiter page without waking the workload: `HEAD`, bot and scanner user agents, well-known
+scanner paths (built in), and the configurable **no-wake rules** (`no_wake_rules` on the `router` module for every
+workload, and on the `workload` module). A rule matches when all its conditions match: `source_ips` (addresses or CIDR
+ranges, from the last `X-Forwarded-For` entry), `path_prefixes`, `path_pattern`, `user_agent_pattern`, `headers` (exact
+`value` or `pattern`). Rules also apply to the waiter page's probe. Ignored requests are logged (`WakeIgnored`, with the
+reason) and the rules are shown on the admin dashboard.
+
+```hcl
+no_wake_rules = [
+  { name = "office", source_ips = ["198.51.100.0/24"] },
+  { name = "uptime-monitor", user_agent_pattern = "^dormeto-uptime/" },
+  { name = "health", path_prefixes = ["/healthz"], headers = [{ name = "x-monitor", value = "yes" }] },
+]
+```
+
 The `dev` environment has four workloads: `demo` (one EC2 instance, `https://dev.dormeto.com/`), `demo-asg` (an Auto
 Scaling group, `https://asg.dev.dormeto.com/`), `demo-ecs` (an ECS Fargate service, `https://ecs.dev.dormeto.com/`) and
 `demo-rds` (an ECS Fargate service with a PostgreSQL instance, `https://rds.dev.dormeto.com/`).

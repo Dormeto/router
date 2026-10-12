@@ -19,7 +19,7 @@ test('every SDK client of the router is created with a bounded request handler',
       if (inline) for (const key of ['connectionTimeout', 'requestTimeout', 'socketTimeout', 'throwOnRequestTimeout: true']) assert.match(inline, new RegExp(key), `${file}: ${key}`);
     }
   }
-  assert.equal(clients, 13, 'one client per AWS service the router calls');
+  assert.equal(clients, 14, 'one client per AWS service the router calls');
 });
 
 test('the bound fails a silent connection in seconds, in every SDK version the Lambda runtime may bundle', async () => {

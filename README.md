@@ -57,6 +57,12 @@ aws lambda invoke --cli-read-timeout 900 --function-name dmt-dev-controller --cl
 aws dynamodb get-item --table-name dmt-dev-router --key '{"pk":{"S":"WL#demo"},"sk":{"S":"RUN"}}'
 ```
 
+## Version
+
+`package.json` holds the router version. Terraform exposes it to both Lambdas as `DMT_VERSION`, with `DMT_BUILD` (first
+12 hex characters of the Lambda zip SHA-256, identifying the exact deployed code). The admin dashboard and `status.json`
+show them, and `dormeto-e2e` records them in its reports.
+
 ## Admin dashboard (feature flag)
 
 With `admin_dashboard_enabled = true` (default in `dev`), the waker Lambda also serves a lightweight dashboard behind a
@@ -68,4 +74,5 @@ curl -sS "$(terraform -chdir=terraform/dev output -raw admin_url)status.json"
 terraform -chdir=terraform/dev apply -replace='random_password.admin[0]'   # rotate the secret
 ```
 
-The secret URL is the only protection: never share it. Disable the flag with `-var admin_dashboard_enabled=false`.
+The secret is also stored as the SSM SecureString `/dmt-<env>/admin-secret`, named in the workload configuration, so
+that operators and `dormeto-e2e` can retrieve it with AWS credentials. The secret URL is the only protection: never share it. Disable the flag with `-var admin_dashboard_enabled=false`.

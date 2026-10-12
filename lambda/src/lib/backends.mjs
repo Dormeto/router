@@ -20,6 +20,19 @@ const companions = (list) => list.filter(isCompanion);
 
 const tagMap = (tags = []) => Object.fromEntries(tags.map((t) => [t.Key, t.Value]));
 
+// Warm pool configuration, as returned by DescribeAutoScalingGroups (null without a pool).
+function warmPoolOf(group) {
+  const pool = group.WarmPoolConfiguration;
+  if (!pool) return null;
+  return {
+    state: pool.PoolState ?? 'Stopped',
+    minSize: pool.MinSize ?? 0,
+    maxPrepared: pool.MaxGroupPreparedCapacity ?? null,
+    reuseOnScaleIn: pool.InstanceReusePolicy?.ReuseOnScaleIn === true,
+    size: group.WarmPoolSize ?? 0,
+  };
+}
+
 function asgBackend(group) {
   const wake = Number.parseInt(tagMap(group.Tags)[WAKE_DESIRED_TAG], 10);
   return {
@@ -29,7 +42,7 @@ function asgBackend(group) {
     max: group.MaxSize,
     desired: group.DesiredCapacity,
     instances: (group.Instances ?? []).map((i) => i.InstanceId),
-    warmPool: Boolean(group.WarmPoolConfiguration),
+    warmPool: warmPoolOf(group),
     wakeDesired: Number.isInteger(wake) && wake > 0 ? wake : null,
   };
 }

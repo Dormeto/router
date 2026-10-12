@@ -17,7 +17,10 @@ still supported.
 
 **Auto Scaling groups** tagged `dormeto:workload=<workload id>` and feeding the application target group are managed as
 a whole: the nap records their sizes, suspends the scaling processes and scales them to 0; the wake restores the sizes
-and resumes the processes. Their instances are never stopped one by one.
+and resumes the processes. Their instances are never stopped one by one. With a **warm pool** in `Stopped` state and
+reuse on scale-in, a nap returns the instances to the pool and a wake restarts them instead of launching new ones (the
+application must start at boot); the admin dashboard recommends that configuration when a group has no pool, a running
+pool or no reuse on scale-in.
 
 **ECS services** tagged `dormeto:workload=<workload id>` and feeding the application target group (found with the
 Resource Groups Tagging API) are napped by `desiredCount = 0`, with their Application Auto Scaling target suspended; the

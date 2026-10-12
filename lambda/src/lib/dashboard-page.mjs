@@ -4,7 +4,10 @@ const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g,
 const ACTION_MESSAGES = { nap: 'Nap requested.', wake: 'Wake requested.' };
 
 const backendText = (b) => {
-  if (b.kind === 'asg') return `${b.id}: ${b.status} (min ${b.min}, desired ${b.desired}, max ${b.max})${b.warmPool ? ', warm pool' : ''}`;
+  if (b.kind === 'asg') {
+    const pool = b.warmPool ? `, warm pool ${b.warmPool.state} (${b.warmPool.size}${b.warmPool.reuseOnScaleIn ? ', reuse on scale-in' : ''})` : '';
+    return `${b.id}: ${b.status} (min ${b.min}, desired ${b.desired}, max ${b.max})${pool}`;
+  }
   if (b.kind === 'ecs') {
     const scaling = b.scalable ? `, autoscaling ${b.scalable.min}-${b.scalable.max}` : '';
     return `${b.id.split(':')[5] ?? b.id}: ${b.status} (desired ${b.desired}${scaling})`;
@@ -98,6 +101,7 @@ ${row('Held requests', status.holders)}
 ${row('Pending wake', status.pendingWake ? 'yes' : 'no')}
 ${row('Route', status.route)}
 ${row(`Backends (${status.discovery ?? 'static'})`, (status.backends ?? []).map(backendText).join(', ') || '—')}
+${status.recommendations?.length ? row('Recommendations', status.recommendations.map((r) => `${r.backend}: ${r.message}`).join('; ')) : ''}
 ${status.ignoredTargets?.length ? row('Ignored targets', status.ignoredTargets.map((t) => `${t.id}: ${t.reason}`).join(', ')) : ''}
 ${row('Target health', list(status.targets))}
 ${statsRows(status.stats)}

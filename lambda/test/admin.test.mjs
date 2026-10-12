@@ -204,7 +204,7 @@ test('status.json lists every backend with its status, including Auto Scaling gr
   const status = JSON.parse(res.body);
   assert.deepEqual(status.backends, [
     { kind: 'instance', id: 'i-a', status: 'running' },
-    { kind: 'asg', id: 'asg-demo', status: 'running', min: 1, max: 2, desired: 1, warmPool: false },
+    { kind: 'asg', id: 'asg-demo', status: 'running', min: 1, max: 2, desired: 1, warmPool: null },
   ]);
   assert.deepEqual(status.instances, [{ id: 'i-a', state: 'running' }]);
   const html = await handler(albEvent({ path: `${BASE}/` }));
@@ -319,4 +319,19 @@ test('status.json and the dashboard show the IP lists', async () => {
   assert.deepEqual(status.ipLists.map((l) => [l.name, l.entries]), [['ipsum', 109695], ['cloud', 0]]);
   const page = (await handler(albEvent({ path: `${BASE}/` }))).body;
   assert.match(page, /IP lists<\/th><td>ipsum \(defer\): 109695 entries, 2026-10-04T10:00:00.000Z; cloud \(defer\): not downloaded yet/);
+});
+
+test('status.json and the dashboard show the warm pool and the recommendations', async () => {
+  const cfg = testConfig({ admin: { enabled: true, secretHash: hashSecret(SECRET) }, instanceIds: [] });
+  const { handler, autoscaling } = setup({ run: { state: STATES.AWAKE }, cfg });
+  autoscaling.state.groups = [
+    { ...asgGroup('asg-pool', { targetGroups: [cfg.appTargetGroupArn], tags: { 'dormeto:workload': 'demo' }, instances: [{ InstanceId: 'i-1', LifecycleState: 'InService' }] }),
+      WarmPoolConfiguration: { PoolState: 'Running', MinSize: 0, InstanceReusePolicy: { ReuseOnScaleIn: true } }, WarmPoolSize: 1 },
+  ];
+  const status = JSON.parse((await handler(albEvent({ path: `${BASE}/status.json`, headers: { accept: 'application/json' } }))).body);
+  assert.equal(status.backends[0].warmPool.state, 'Running');
+  assert.equal(status.recommendations.length, 1);
+  const page = (await handler(albEvent({ path: `${BASE}/` }))).body;
+  assert.match(page, /asg-pool: running \(min 1, desired 1, max 2\), warm pool Running \(1, reuse on scale-in\)/);
+  assert.match(page, /Recommendations<\/th><td>asg-pool: the warm pool keeps running instances/);
 });

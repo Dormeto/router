@@ -34,7 +34,7 @@ test('discovers standalone instances and Auto Scaling groups feeding the app tar
   assert.equal(result.mode, 'discovery');
   assert.deepEqual(result.backends, [
     { kind: 'instance', id: 'i-a' },
-    { kind: 'asg', name: 'asg-demo', min: 1, max: 2, desired: 1, instances: ['i-g1'], warmPool: false, wakeDesired: null },
+    { kind: 'asg', name: 'asg-demo', min: 1, max: 2, desired: 1, instances: ['i-g1'], warmPool: null, wakeDesired: null },
   ]);
   assert.deepEqual(result.ignored, [
     { id: 'i-u', reason: 'member of Auto Scaling group asg-x (not managed)' },
@@ -46,7 +46,7 @@ test('discovers a group scaled to zero while the workload sleeps', async () => {
   const c = clients();
   c.autoscaling.state.groups = [asgGroup('asg-demo', { min: 0, desired: 0, targetGroups: [c.cfg.appTargetGroupArn], tags: { ...TAG, 'dormeto:wake-desired': '2' } })];
   const { backends } = await resolveBackends(c, c.cfg);
-  assert.deepEqual(backends, [{ kind: 'asg', name: 'asg-demo', min: 0, max: 2, desired: 0, instances: [], warmPool: false, wakeDesired: 2 }]);
+  assert.deepEqual(backends, [{ kind: 'asg', name: 'asg-demo', min: 0, max: 2, desired: 0, instances: [], warmPool: null, wakeDesired: 2 }]);
 });
 
 test('without an Auto Scaling client only instances are resolved', async () => {
@@ -77,7 +77,7 @@ test('sleep records sizes, suspends scaling, scales the group to zero and stops 
   const clock = fakeClock();
   const records = await sleepBackends(c, [
     { kind: 'instance', id: 'i-a' },
-    { kind: 'asg', name: 'asg-demo', min: 1, max: 3, desired: 2, instances: [], warmPool: false, wakeDesired: null },
+    { kind: 'asg', name: 'asg-demo', min: 1, max: 3, desired: 2, instances: [], warmPool: null, wakeDesired: null },
   ], { sleep: clock.sleep, now: clock.now, deadline: clock.now() + 300_000 });
   assert.deepEqual(records, [{ kind: 'instance', id: 'i-a' }, { kind: 'asg', name: 'asg-demo', min: 1, max: 3, desired: 2 }]);
   assert.deepEqual(c.autoscaling.state.suspended['asg-demo'], SCALING_PROCESSES);
@@ -116,4 +116,15 @@ test('resume releases napped groups without changing their desired capacity', as
   await resumeBackends(c, [{ kind: 'instance', id: 'i-a' }, { kind: 'asg', name: 'asg-demo', min: 2, max: 3, desired: 2 }]);
   assert.deepEqual(c.autoscaling.state.updates, [{ AutoScalingGroupName: 'asg-demo', MinSize: 1, MaxSize: 3 }]);
   assert.deepEqual(c.autoscaling.state.resumed, [{ name: 'asg-demo', processes: SCALING_PROCESSES }]);
+});
+
+test('a warm pool is described from DescribeAutoScalingGroups', async () => {
+  const c = clients();
+  c.autoscaling.state.groups = [{
+    ...asgGroup('asg-demo', { targetGroups: [c.cfg.appTargetGroupArn], tags: TAG }),
+    WarmPoolConfiguration: { PoolState: 'Stopped', MinSize: 0, InstanceReusePolicy: { ReuseOnScaleIn: true }, Status: 'Active' },
+    WarmPoolSize: 1,
+  }];
+  const { backends: [group] } = await resolveBackends(c, c.cfg);
+  assert.deepEqual(group.warmPool, { state: 'Stopped', minSize: 0, maxPrepared: null, reuseOnScaleIn: true, size: 1 });
 });

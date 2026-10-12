@@ -58,6 +58,16 @@ resource "aws_autoscaling_group" "demo" {
     version = "$Latest"
   }
 
+  # Naps return the instances to the pool (stopped) and wakes restart them: faster than launching new ones. The web
+  # server is an enabled systemd unit, so it starts at boot (user data runs at the first boot only).
+  warm_pool {
+    pool_state = "Stopped"
+    min_size   = 0
+    instance_reuse_policy {
+      reuse_on_scale_in = true
+    }
+  }
+
   tag {
     key                 = "dormeto:workload"
     value               = "demo-asg"

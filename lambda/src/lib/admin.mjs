@@ -1,4 +1,5 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
+import { recommendations } from './advice.mjs';
 import { STATES } from './state.mjs';
 import { currentTarget } from './route.mjs';
 import { instanceStates } from './instances.mjs';
@@ -78,6 +79,7 @@ export function createAdmin({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging,
         return { kind: 'instance', id: b.id, status };
       }),
       ignoredTargets: resolved.ignored,
+      recommendations: recommendations(resolved.backends),
       targets: (health.TargetHealthDescriptions ?? []).map((d) => ({ id: d.Target?.Id, state: d.TargetHealth?.State })),
       settings: {
         waitSeconds: cfg.waitSeconds,

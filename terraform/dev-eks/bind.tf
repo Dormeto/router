@@ -17,6 +17,12 @@ resource "aws_security_group" "bind" {
     protocol    = "-1"
     cidr_blocks = [module.vpc.vpc_cidr_block]
   }
+  # Removed (target_group_binding = false) only after the demos' release no longer names it: the TargetGroupBinding's
+  # rule, which the controller keeps on the nodes' security group while the binding exists, refers to this group, and
+  # AWS refuses its deletion until then (read on dev-eks: a 15-minute DependencyViolation). Created once, never replaced.
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 resource "aws_lb" "bind" {
@@ -38,6 +44,10 @@ resource "aws_lb_target_group" "bind" {
   health_check {
     path    = "/"
     matcher = "200"
+  }
+  # Removed only after the demos' release no longer binds it, as the security group above.
+  lifecycle {
+    create_before_destroy = true
   }
 }
 

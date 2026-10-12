@@ -103,7 +103,7 @@ test('healthOf: a router using more than 80% of the Lambda concurrency limit is 
   assert.deepEqual(healthOf({ ...healthy, concurrency: { limit: 100, needed: 80, worstCase: 7513 } }), { status: 'ok', problems: [] });
   assert.deepEqual(healthOf({ ...healthy, concurrency: { limit: 100, needed: 81, worstCase: 7513 } }).problems, [{
     level: 'warning',
-    text: 'Lambda concurrency limit of the account in this region is 100: the router used up to 81 at once in 24 hours (its waker\'s peak, plus its queued naps and wakes, drift repairs and the check), more than 80% of it; requests beyond the limit get errors: request a higher quota',
+    text: 'Lambda concurrency limit of the account in this region is 100: the router can need up to 81 at once (its waker\'s 24-hour peak, plus its queued naps and wakes, drift repairs and the check), more than 80% of it; requests beyond the limit get errors: request a higher quota',
   }]);
   assert.deepEqual(healthOf({ ...healthy, concurrency: { error: 'AccessDenied' } }).problems, [{ level: 'warning', text: 'Lambda concurrency limit unreadable: AccessDenied' }]);
 });
@@ -195,7 +195,7 @@ test('a scheduled check measures the health before its work, so one that dies st
   assert.equal(s.cloudwatch.calls.length, 3);
 });
 
-test('router action compares the concurrency the router used with the limit: the waker\'s 24-hour peak, 10 queued, 2 repairs and the check', async () => {
+test('router action compares the concurrency the router can need with the limit: the waker\'s 24-hour peak, 10 queued, 2 repairs and the check', async () => {
   // Waker peak 7 in 24 hours, plus 10 queued naps or wakes, 2 drift repairs and the check. The worst case: every workload
   // not awake waking at once, each holding up to its maxHolders (5).
   const awake = await setup({ concurrency: 100, metrics: { wakerConcurrency: [3, 7, 2] } }).handler({ action: 'router' });
@@ -203,7 +203,7 @@ test('router action compares the concurrency the router used with the limit: the
   assert.ok(!awake.health.problems.some((p) => p.text.startsWith('Lambda concurrency')));
   const asleep = await setup({ concurrency: 20, metrics: { wakerConcurrency: [3, 7, 2] }, run: { state: STATES.ASLEEP, updatedAt: NOW - HOUR } }).handler({ action: 'router' });
   assert.deepEqual(asleep.health.concurrency, { limit: 20, needed: 20, worstCase: 18 });
-  assert.ok(asleep.health.problems.some((p) => p.text.startsWith('Lambda concurrency limit of the account in this region is 20: the router used up to 20 at once')));
+  assert.ok(asleep.health.problems.some((p) => p.text.startsWith('Lambda concurrency limit of the account in this region is 20: the router can need up to 20 at once')));
 });
 
 test('router action answers when CloudWatch, SQS and the table fail', async () => {

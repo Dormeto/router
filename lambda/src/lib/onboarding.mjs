@@ -7,6 +7,8 @@ import { cleanConditions, forwardTargetGroups, listRules, passable, ruleTags, sa
 import { conditionsOf } from './route.mjs';
 
 const WORKLOAD_TAG = 'dormeto:workload';
+// Target groups per Application Load Balancer: not adjustable (the waker target group counts once its rule uses it).
+const TARGET_GROUPS_PER_ALB = 100;
 // A Dormeto rule just before a customer rule, with its conditions and the weighted forward: the customer's rule and its
 // infrastructure as code stay untouched (R4c).
 const SHADOWS_TAG = 'dormeto:shadows';
@@ -198,7 +200,8 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
       if ((g.TargetGroupARNs ?? []).includes(group.TargetGroupArn)) backends.push({ kind: 'asg', id: g.AutoScalingGroupName, tags: tagsOf(g.Tags) });
     }
     for (const cluster of await pages((i) => ecs.listClusters(i), 'clusterArns', { in: 'nextToken', out: 'nextToken' })) {
-      const arns = await pages((i) => ecs.listServices({ ...i, cluster }), 'serviceArns', { in: 'nextToken', out: 'nextToken' });
+      // 100 per page (ECS gives 10 by default): a cluster may run hundreds of services.
+      const arns = await pages((i) => ecs.listServices({ ...i, cluster, maxResults: 100 }), 'serviceArns', { in: 'nextToken', out: 'nextToken' });
       for (const batch of chunks(arns, 10)) {
         const { services = [] } = await ecs.describeServices({ cluster, services: batch, include: ['TAGS'] });
         for (const service of services) {
@@ -252,9 +255,31 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
     return problems;
   }
 
-  // What onboarding would do, and why it cannot.
+  // Quotas (scale design §6): room on the load balancer for the waker target group (100 target groups, not adjustable) and
+  // the shadow rules (its rules quota), and in the region for the waker target group.
+  async function quotaProblems(loadBalancerArn, { wakerExists, shadows, rules }) {
+    const problems = [];
+    const limits = Object.fromEntries(((await elbv2.describeAccountLimits({})).Limits ?? []).map((l) => [l.Name, Number(l.Max)]));
+    const elb = { in: 'Marker', out: 'NextMarker' };
+    if (!wakerExists) {
+      const onBalancer = await pages((i) => elbv2.describeTargetGroups({ ...i, LoadBalancerArn: loadBalancerArn }), 'TargetGroups', elb);
+      if (onBalancer.length >= TARGET_GROUPS_PER_ALB) problems.push(`the load balancer has ${onBalancer.length} target groups, its maximum (not adjustable): no room for the waker target group`);
+    }
+    const ruleMax = limits['rules-per-application-load-balancer'];
+    if (ruleMax && shadows && rules + shadows > ruleMax) {
+      problems.push(`the load balancer has ${rules} rules of the ${ruleMax} it may have: no room for ${shadows} shadow rule${shadows === 1 ? '' : 's'} (rules per Application Load Balancer, adjustable in Service Quotas)`);
+    }
+    const groupMax = limits['target-groups'];
+    if (!wakerExists && groupMax) {
+      const inRegion = await pages((i) => elbv2.describeTargetGroups(i), 'TargetGroups', elb);
+      if (inRegion.length >= groupMax) problems.push(`the region has ${inRegion.length} target groups of the ${groupMax} it may have: no room for the waker target group (target groups per region, adjustable in Service Quotas)`);
+    }
+    return problems;
+  }
+
+  // What onboarding would do, and why it cannot. `found` (onboard) receives the backends and databases it listed.
   // Without an id, the one of the target group (an explicit id: workloads named before 0.20.0, direct use).
-  async function preview({ targetGroupArn, workloadId = targetGroupArn ? workloadIdOf(targetGroupArn) : undefined, name: wanted, settings, databases }) {
+  async function preview({ targetGroupArn, workloadId = targetGroupArn ? workloadIdOf(targetGroupArn) : undefined, name: wanted, settings, databases }, found = {}) {
     const problems = [];
     const name = wakerName(workloadId ?? '');
     const named = checkName(wanted);
@@ -294,15 +319,22 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
     const rank = (r) => (r.priority === 'default' ? Infinity : Number(r.priority));
     result.rules.sort((a, b) => rank(a) - rank(b));
     if (lbs.length && !result.rules.length) problems.push('no rule forwards to the target group');
+    if (result.loadBalancerArn) {
+      problems.push(...await quotaProblems(result.loadBalancerArn, {
+        wakerExists: Boolean(waker?.ours), shadows: plans.filter((p) => p.action === 'shadow').length, rules: rows.filter((r) => !r.rule.IsDefault).length,
+      }));
+    }
 
     const backends = await backendsOf(group);
+    found.backends = backends;
     if (!backends.length) problems.push('no backend: no instance, Auto Scaling group or ECS service feeds the target group');
     for (const b of backends) {
       const tagged = b.tags[WORKLOAD_TAG] ?? null;
       if (tagged && tagged !== workloadId) problems.push(`${KIND_TEXT[b.kind]} ${b.id} belongs to workload ${tagged}`);
       result.backends.push({ kind: b.kind, id: b.id, tagged });
     }
-    for (const db of await databasesOf(databases)) {
+    found.databases = await databasesOf(databases);
+    for (const db of found.databases) {
       const tagged = db.tags[WORKLOAD_TAG] ?? null;
       if (tagged && tagged !== workloadId) problems.push(`${KIND_TEXT[db.kind]} ${db.id} belongs to workload ${tagged}`);
       result.databases.push({ kind: db.kind, id: db.id, tagged });
@@ -328,7 +360,9 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
   }
 
   async function onboard({ targetGroupArn, workloadId = targetGroupArn ? workloadIdOf(targetGroupArn) : undefined, name, settings = {}, databases = [], by }) {
-    const checked = await preview({ workloadId, targetGroupArn, name, settings, databases });
+    // The backends and databases its preview listed: listed once per onboarding.
+    const found = {};
+    const checked = await preview({ workloadId, targetGroupArn, name, settings, databases }, found);
     if (!checked.ok) throw new Error(`cannot onboard ${workloadId}: ${checked.problems.join('; ')}`);
     const steps = [];
     const step = (name, done, detail) => steps.push({ name, status: done ? 'done' : 'skipped', ...(detail ? { detail } : {}) });
@@ -340,7 +374,7 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
     const tagged = [];
     try {
       const group = await targetGroup(targetGroupArn);
-      const untagged = [...(await backendsOf(group)), ...(await databasesOf(databases))].filter((b) => !b.tags[WORKLOAD_TAG]);
+      const untagged = [...found.backends, ...found.databases].filter((b) => !b.tags[WORKLOAD_TAG]);
       for (const b of untagged) {
         changed = true;
         await tag(b, workloadId);

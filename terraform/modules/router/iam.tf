@@ -244,7 +244,7 @@ data "aws_iam_policy_document" "onboarder" {
   }
   statement {
     # Finding the rules and the backends of a target group, whatever their tags.
-    actions   = ["elasticloadbalancing:DescribeTargetGroups", "elasticloadbalancing:DescribeListeners", "elasticloadbalancing:DescribeRules", "elasticloadbalancing:DescribeTags", "elasticloadbalancing:DescribeTargetHealth", "ec2:DescribeInstances", "autoscaling:DescribeAutoScalingGroups", "ecs:ListClusters", "ecs:ListServices", "ecs:DescribeServices", "rds:DescribeDBInstances", "rds:DescribeDBClusters"]
+    actions   = ["elasticloadbalancing:DescribeTargetGroups", "elasticloadbalancing:DescribeListeners", "elasticloadbalancing:DescribeRules", "elasticloadbalancing:DescribeTags", "elasticloadbalancing:DescribeTargetHealth", "elasticloadbalancing:DescribeAccountLimits", "ec2:DescribeInstances", "autoscaling:DescribeAutoScalingGroups", "ecs:ListClusters", "ecs:ListServices", "ecs:DescribeServices", "rds:DescribeDBInstances", "rds:DescribeDBClusters"]
     resources = ["*"]
   }
   statement {

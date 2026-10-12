@@ -68,7 +68,7 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
     ),
     onboarder: policy(
       allow(['dynamodb:GetItem', 'dynamodb:UpdateItem', 'dynamodb:Query', 'dynamodb:Scan', 'dynamodb:DeleteItem'], [tableArn]),
-      allow(['elasticloadbalancing:DescribeTargetGroups', 'elasticloadbalancing:DescribeListeners', 'elasticloadbalancing:DescribeRules', 'elasticloadbalancing:DescribeTags', 'elasticloadbalancing:DescribeTargetHealth', 'ec2:DescribeInstances', 'autoscaling:DescribeAutoScalingGroups', 'ecs:ListClusters', 'ecs:ListServices', 'ecs:DescribeServices', 'rds:DescribeDBInstances', 'rds:DescribeDBClusters'], ['*']),
+      allow(['elasticloadbalancing:DescribeTargetGroups', 'elasticloadbalancing:DescribeListeners', 'elasticloadbalancing:DescribeRules', 'elasticloadbalancing:DescribeTags', 'elasticloadbalancing:DescribeTargetHealth', 'elasticloadbalancing:DescribeAccountLimits', 'ec2:DescribeInstances', 'autoscaling:DescribeAutoScalingGroups', 'ecs:ListClusters', 'ecs:ListServices', 'ecs:DescribeServices', 'rds:DescribeDBInstances', 'rds:DescribeDBClusters'], ['*']),
       allow(['elasticloadbalancing:CreateTargetGroup', 'elasticloadbalancing:ModifyTargetGroupAttributes', 'elasticloadbalancing:DeleteTargetGroup', 'elasticloadbalancing:RegisterTargets', 'elasticloadbalancing:DeregisterTargets'], [arn('elasticloadbalancing', `targetgroup/${p.name}-*/*`)]),
       allow(['elasticloadbalancing:ModifyRule'], [arn('elasticloadbalancing', 'listener-rule/app/*')]),
       allow(['elasticloadbalancing:CreateRule'], [arn('elasticloadbalancing', 'listener/app/*'), arn('elasticloadbalancing', 'listener-rule/app/*')]),

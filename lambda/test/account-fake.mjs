@@ -25,6 +25,7 @@ export function fakeAccount() {
     databases: new Map(), // arn → { kind, id, tags }
     permissions: new Map(), // statement id → { SourceArn }
     fail: {}, // method name → error to throw once
+    limits: {}, // DescribeAccountLimits overrides (name → max)
     calls: [],
   };
   const call = (name) => {
@@ -78,12 +79,22 @@ export function fakeAccount() {
   const referenced = (tg) => [...state.rules.values()].some((r) => r.actions.some((a) => a.TargetGroupArn === tg || a.ForwardConfig?.TargetGroups?.some((g) => g.TargetGroupArn === tg)));
 
   const elbv2 = {
-    async describeTargetGroups({ TargetGroupArns, Names }) {
+    async describeTargetGroups({ TargetGroupArns, Names, LoadBalancerArn } = {}) {
       call('describeTargetGroups');
+      // By load balancer, or every target group of the region (one page here).
+      if (!TargetGroupArns && !Names) {
+        const all = [...state.targetGroups].filter(([a, g]) => !LoadBalancerArn || g.lbs.includes(LoadBalancerArn) || referenced(a));
+        return { TargetGroups: all.map(([a, g]) => ({ TargetGroupArn: a, TargetGroupName: g.name, TargetType: g.type, LoadBalancerArns: [...g.lbs] })) };
+      }
       const wanted = TargetGroupArns ?? [...state.targetGroups].filter(([, g]) => Names.includes(g.name)).map(([a]) => a);
       if (Names && !wanted.length) throw error('TargetGroupNotFoundException', 'One or more target groups not found');
       if (wanted.some((a) => !state.targetGroups.has(a))) throw error('TargetGroupNotFoundException', 'One or more target groups not found');
       return { TargetGroups: wanted.map((a) => { const g = state.targetGroups.get(a); return { TargetGroupArn: a, TargetGroupName: g.name, TargetType: g.type, LoadBalancerArns: [...g.lbs] }; }) };
+    },
+    async describeAccountLimits() {
+      call('describeAccountLimits');
+      const limits = { 'rules-per-application-load-balancer': 100, 'target-groups': 3000, 'application-load-balancers': 50, ...state.limits };
+      return { Limits: Object.entries(limits).map(([Name, Max]) => ({ Name, Max: String(Max) })) };
     },
     async describeListeners({ LoadBalancerArn }) {
       call('describeListeners');
@@ -230,7 +241,14 @@ export function fakeAccount() {
   const clusters = () => [...new Set([...state.services.values()].map((s) => s.cluster))];
   const ecs = {
     async listClusters() { call('listClusters'); return { clusterArns: clusters() }; },
-    async listServices({ cluster }) { call('listServices'); return { serviceArns: [...state.services].filter(([, s]) => s.cluster === cluster).map(([a]) => a) }; },
+    // As ECS: 10 per page unless maxResults asks for up to 100.
+    async listServices({ cluster, maxResults = 10, nextToken }) {
+      call('listServices');
+      const all = [...state.services].filter(([, s]) => s.cluster === cluster).map(([a]) => a);
+      const start = Number(nextToken ?? 0);
+      const end = start + Math.min(maxResults, 100);
+      return { serviceArns: all.slice(start, end), ...(end < all.length ? { nextToken: String(end) } : {}) };
+    },
     async describeServices({ services, include }) {
       call('describeServices');
       return {

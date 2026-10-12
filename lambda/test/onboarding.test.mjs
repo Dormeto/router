@@ -540,6 +540,38 @@ test('drift events read in one batch repair each workload they concern once; a w
   assert.deepEqual(await s.onboarding.repairEvents([deleted]), { workloads: [] });
 });
 
+test('the preview refuses an onboarding its load balancer or region has no room for, with the reason', async () => {
+  // A load balancer at its 100 target groups (not adjustable): no room for the waker target group.
+  const full = setup();
+  for (let i = 0; i < 99; i += 1) full.a.customer.targetGroup(`other-${i}`);
+  assert.ok((await full.onboarding.preview({ targetGroupArn: full.tg })).problems.includes('the load balancer has 100 target groups, its maximum (not adjustable): no room for the waker target group'));
+  // Its rules at their quota: the 2 shadow rules do not fit.
+  const rules = setup();
+  rules.a.state.limits = { 'rules-per-application-load-balancer': 3 };
+  assert.ok((await rules.onboarding.preview({ targetGroupArn: rules.tg })).problems.includes('the load balancer has 2 rules of the 3 it may have: no room for 2 shadow rules (rules per Application Load Balancer, adjustable in Service Quotas)'));
+  // The region at its target groups quota.
+  const region = setup();
+  region.a.state.limits = { 'target-groups': 1 };
+  assert.ok((await region.onboarding.preview({ targetGroupArn: region.tg })).problems.includes('the region has 1 target groups of the 1 it may have: no room for the waker target group (target groups per region, adjustable in Service Quotas)'));
+  // Room everywhere.
+  const room = setup();
+  assert.deepEqual((await room.onboarding.preview({ targetGroupArn: room.tg })).problems, []);
+});
+
+test('onboarding lists the backends of the target group once', async () => {
+  const s = setup({ backend: 'asg' });
+  const before = s.a.state.calls.length;
+  await s.onboarding.onboard({ targetGroupArn: s.tg, by: 'ops' });
+  assert.equal(s.a.state.calls.slice(before).filter((c) => c === 'describeAutoScalingGroups').length, 1);
+});
+
+test('ECS services are listed 100 per page', async () => {
+  const s = setup({ backend: 'ecs' });
+  for (let i = 0; i < 249; i += 1) s.a.customer.service(`svc-${i}`, { targetGroups: [] });
+  await s.onboarding.preview({ targetGroupArn: s.tg });
+  assert.equal(s.a.state.calls.filter((c) => c === 'listServices').length, 3);
+});
+
 test('a second shadow of one rule (two repairs at once) is removed, the first one stays', async () => {
   const s = await onboarded();
   const first = shadowsOf(s.a).find((x) => x.shadows === s.main);

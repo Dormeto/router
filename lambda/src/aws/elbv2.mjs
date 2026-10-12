@@ -1,5 +1,6 @@
 import {
   AddTagsCommand,
+  DescribeAccountLimitsCommand,
   CreateRuleCommand,
   CreateTargetGroupCommand,
   DeleteRuleCommand,
@@ -28,6 +29,8 @@ export function createElbv2(client = new ElasticLoadBalancingV2Client({ retryMod
     describeTargetGroups: (input) => client.send(new DescribeTargetGroupsCommand(input)),
     describeListeners: (input) => client.send(new DescribeListenersCommand(input)),
     describeTags: (input) => client.send(new DescribeTagsCommand(input)),
+    // Onboarding checks the quotas of the load balancer and the region (scale design §6).
+    describeAccountLimits: (input) => client.send(new DescribeAccountLimitsCommand(input)),
     // Onboarding (lib/onboarding.mjs): the waker target group and the rule tags.
     createTargetGroup: (input) => client.send(new CreateTargetGroupCommand(input)),
     modifyTargetGroupAttributes: (input) => client.send(new ModifyTargetGroupAttributesCommand(input)),

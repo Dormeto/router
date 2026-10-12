@@ -112,6 +112,12 @@ instant of its `Workload state changed` event, and an event of a nap or a wake a
 The manager keeps the history from these events and fills a lost one from the next check (the same instant names the
 same transition); the router keeps none.
 
+**What a nap stops (router 0.27.0):** before stopping, a nap describes its backends by what prices them — EC2 instance
+types and OS (an Auto Scaling group at its desired capacity), a Fargate service's task size × desired count, RDS and
+Aurora classes, Aurora Serverless v2 at its minimum capacity — and the event of its end carries them (`stopped`) for the
+manager's savings. A backend it cannot describe is said as unknown; the nap goes on. A Fargate size needs
+`ecs:DescribeTaskDefinition`, in the router's role and DmtRouterBoundary.
+
 **Statistics:** while a workload is not awake, the waker counts ignored requests per reason, deferred requests (browser
 mode) and wakes per trigger in a daily item of the state table (`STATS#<day>`, kept 35 days); the admin dashboard shows
 today and the last 7 days. With `metrics_enabled` on the `router` module, the same events also publish the CloudWatch

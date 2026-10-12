@@ -1,10 +1,11 @@
 import {
-  DescribeServicesCommand, ECSClient, ListClustersCommand, ListServicesCommand, TagResourceCommand, UntagResourceCommand, UpdateServiceCommand,
+  DescribeServicesCommand, DescribeTaskDefinitionCommand, ECSClient, ListClustersCommand, ListServicesCommand, TagResourceCommand, UntagResourceCommand, UpdateServiceCommand,
 } from '@aws-sdk/client-ecs';
 
 export function createEcs(client = new ECSClient({})) {
   return {
     describeServices: (input) => client.send(new DescribeServicesCommand(input)),
+    describeTaskDefinition: (input) => client.send(new DescribeTaskDefinitionCommand(input)),
     updateService: (input) => client.send(new UpdateServiceCommand(input)),
     listClusters: (input) => client.send(new ListClustersCommand(input)),
     listServices: (input) => client.send(new ListServicesCommand(input)),

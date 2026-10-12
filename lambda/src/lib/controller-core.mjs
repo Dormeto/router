@@ -9,6 +9,7 @@ import { describeRules } from './no-wake.mjs';
 import { describeStoredLists } from './list-cache.mjs';
 import { failedSpec, failureError } from './failures.mjs';
 import { createWakeWatch, unhealthyError } from './wake-watch.mjs';
+import { describeStopped } from './stopped.mjs';
 import { revertInstanceTypes } from './capacity.mjs';
 import { STATS_DAYS, totals, workloadSummary } from './summary.mjs';
 import { lastRequestAt } from './metrics.mjs';
@@ -211,6 +212,7 @@ export function createController({
     });
     if (!napping) return { state: 'SKIPPED' };
     log.info('NapStarted', { workloadId });
+    let stopped;
     try {
       await routeTo(cfg, 'waker');
       await sleep(cfg.drainSeconds * 1000);
@@ -229,6 +231,8 @@ export function createController({
         log.info('NapAborted', { workloadId, ...(paused ? { reason: 'paused' } : {}) });
         return { state: STATES.AWAKE, aborted: true };
       }
+      // What the nap stops, for the manager's savings (R9a): described before the stop, never failing the nap.
+      stopped = await describeStopped(clients, backends).catch((err) => [{ kind: 'unknown', backend: 'all', reason: String(err?.message ?? err).slice(0, 200) }]);
       await sleepBackends(clients, backends, { sleep, now, deadline: now() + STOP_TIMEOUT_MS });
       // A fallback instance type is for one wake only (R7a, FinOps): stopped, an instance gets its own type back.
       await revertInstanceTypes(ec2, backends.filter((b) => b.kind === 'instance').map((b) => b.id), log);
@@ -245,7 +249,9 @@ export function createController({
       });
       return { state: STATES.FAILED, error: err.message };
     }
-    const asleep = await store.transition(workloadId, { cond: { state: STATES.NAPPING, pendingWake: false }, set: { state: STATES.ASLEEP, holders: 0 }, remove: ['stopping', 'instanceTypes'] });
+    const asleep = await store.transition(workloadId, {
+      cond: { state: STATES.NAPPING, pendingWake: false }, set: { state: STATES.ASLEEP, holders: 0 }, remove: ['stopping', 'instanceTypes'], event: { stopped },
+    });
     if (asleep) {
       log.info('NapCompleted', { workloadId });
       return { state: STATES.ASLEEP };

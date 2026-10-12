@@ -291,3 +291,10 @@ test('fallback IAM is limited to the instance type, and DeleteTags to named keys
   assert.match(iam, /actions\s*=\s*\["ec2:ModifyInstanceAttribute"\][\s\S]*?variable = "ec2:Attribute\/InstanceType"\s*values\s*=\s*\["false"\]/);
   assert.match(iam, /actions\s*=\s*\["ec2:CreateTags", "ec2:DeleteTags"\][\s\S]*?test\s*=\s*"Null"\s*variable = "aws:TagKeys"\s*values\s*=\s*\["false"\]/);
 });
+
+test('savings (R9a): the controller may read a Fargate task definition\'s size, within the boundary, in the blueprint and Terraform', async () => {
+  const controller = blueprint({ version: '0.27.0' }).roles.find((r) => r.key === 'controller').policy.Statement.flatMap((s) => [].concat(s.Action));
+  assert.ok(controller.includes('ecs:DescribeTaskDefinition'));
+  assert.ok(routerBoundary().Statement.flatMap((s) => [].concat(s.Action)).includes('ecs:DescribeTaskDefinition'));
+  assert.ok((await terraformActions()).controller.includes('ecs:DescribeTaskDefinition'));
+});

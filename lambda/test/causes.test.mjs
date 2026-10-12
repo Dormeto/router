@@ -97,3 +97,12 @@ test('the event says who asked a nap or a wake from the manager, or the pause th
   await idle.deliver(idle.queued[0]);
   assert.ok(idle.changes.every((c) => !('by' in c)));
 });
+
+test('the event of a nap\'s end says what it stopped, for the manager\'s savings (R9a)', async () => {
+  const s = setup({ run: { state: STATES.AWAKE, awakeSince: 1 } });
+  await s.handler({ action: 'check' });
+  await s.deliver(s.queued[0]);
+  const asleep = s.changes.find((c) => c.to === STATES.ASLEEP);
+  assert.deepEqual(asleep.stopped, s.cfg.instanceIds.map(() => ({ kind: 'ec2', type: 't3.medium', count: 1, os: 'Linux' })));
+  assert.ok(!('stopped' in s.store.state.run), 'never in the store');
+});

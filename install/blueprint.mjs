@@ -57,7 +57,8 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
       allow(['elasticloadbalancing:ModifyRule'], [arn('elasticloadbalancing', 'listener-rule/app/*')], tagged),
       // ELB checks it when a rule's actions authenticate with Amazon Cognito (the rule switched with its actions).
       allow(['cognito-idp:DescribeUserPoolClient'], [arn('cognito-idp', 'userpool/*')]),
-      allow(['autoscaling:DescribeAutoScalingGroups', 'autoscaling:DescribeScalingActivities', 'tag:GetResources', 'ecs:DescribeServices', 'application-autoscaling:DescribeScalableTargets', 'rds:DescribeDBInstances', 'rds:DescribeDBClusters'], ['*']),
+      // ecs:DescribeTaskDefinition: a Fargate service's size, at a nap, for the manager's savings (R9a).
+      allow(['autoscaling:DescribeAutoScalingGroups', 'autoscaling:DescribeScalingActivities', 'tag:GetResources', 'ecs:DescribeServices', 'ecs:DescribeTaskDefinition', 'application-autoscaling:DescribeScalableTargets', 'rds:DescribeDBInstances', 'rds:DescribeDBClusters'], ['*']),
       allow(['rds:StartDBInstance', 'rds:StopDBInstance', 'rds:StartDBCluster', 'rds:StopDBCluster'], [arn('rds', 'db:*'), arn('rds', 'cluster:*')], tagged),
       allow(['ecs:UpdateService'], [arn('ecs', 'service/*/*')], tagged),
       allow(['application-autoscaling:RegisterScalableTarget'], [arn('application-autoscaling', 'scalable-target/*')]),
@@ -218,7 +219,7 @@ export function routerBoundary({ p = PLACEHOLDERS } = {}) {
           'elasticloadbalancing:CreateRule', 'elasticloadbalancing:DeleteRule', 'elasticloadbalancing:SetRulePriorities',
           'ec2:DescribeInstances', 'ec2:StartInstances', 'ec2:StopInstances', 'ec2:CreateTags', 'ec2:DeleteTags', 'ec2:ModifyInstanceAttribute',
           'autoscaling:Describe*', 'autoscaling:UpdateAutoScalingGroup', 'autoscaling:SuspendProcesses', 'autoscaling:ResumeProcesses', 'autoscaling:CreateOrUpdateTags', 'autoscaling:DeleteTags',
-          'ecs:ListClusters', 'ecs:ListServices', 'ecs:DescribeServices', 'ecs:UpdateService', 'ecs:TagResource', 'ecs:UntagResource',
+          'ecs:ListClusters', 'ecs:ListServices', 'ecs:DescribeServices', 'ecs:DescribeTaskDefinition', 'ecs:UpdateService', 'ecs:TagResource', 'ecs:UntagResource',
           'application-autoscaling:DescribeScalableTargets', 'application-autoscaling:RegisterScalableTarget',
           'rds:Describe*', 'rds:StartDBInstance', 'rds:StopDBInstance', 'rds:StartDBCluster', 'rds:StopDBCluster', 'rds:AddTagsToResource', 'rds:RemoveTagsFromResource',
           'cloudwatch:GetMetricData', 'tag:GetResources', 's3:GetObject', 'lambda:GetAccountSettings',

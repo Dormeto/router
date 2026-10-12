@@ -190,3 +190,11 @@ test('list and status leave expired pauses out; status gives the pauses and no n
   assert.deepEqual(resumed.pauses, []);
   assert.notEqual(resumed.nap, null);
 });
+
+test('a pause naming a target group is refused by a router whose workload of that id has another one', async () => {
+  const s = setup({ run: { state: STATES.AWAKE } });
+  await assert.rejects(s.handler(pauseEvent({ targetGroupArn: 'arn:aws:elasticloadbalancing:eu-west-1:111122223333:targetgroup/other/999' })),
+    /workload not configured: demo \(its target group is not arn:aws:elasticloadbalancing:eu-west-1:111122223333:targetgroup\/other\/999\)/);
+  assert.deepEqual(s.store.state.pauses, []);
+  assert.equal((await s.handler(pauseEvent({ targetGroupArn: s.cfg.appTargetGroupArn }))).pause.reason, 'incident 42');
+});

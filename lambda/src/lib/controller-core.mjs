@@ -484,7 +484,13 @@ export function createController({
   // napping one gets a pending wake.
   async function pause(event) {
     const workloadId = event.workloadId ?? null;
-    if (workloadId) await config(workloadId);
+    if (workloadId) {
+      // An exclusion names the target group it matched: another workload of the same id (another router) is not it.
+      const cfg = await config(workloadId);
+      if (event.targetGroupArn && cfg.appTargetGroupArn !== event.targetGroupArn) {
+        throw new Error(`workload not configured: ${workloadId} (its target group is not ${event.targetGroupArn})`);
+      }
+    }
     const record = pauseRecord(event);
     await store.putPause(workloadId, record);
     log.info('Paused', { workloadId, ...record });

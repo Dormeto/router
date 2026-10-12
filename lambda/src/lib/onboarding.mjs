@@ -118,7 +118,7 @@ const planText = (p) => ({
   shadowed: 'shadowed', instrumented: 'instrumented', mirror: 'shadowed (conditions to mirror)', move: 'shadowed (shadow to move before it)', shadow: `shadow at ${p.priority}`,
 })[p.action] ?? `instrument in place (${p.reason})`;
 
-export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, store, router, now = Date.now, log }) {
+export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, store, router, now = Date.now, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), log }) {
   const wakerName = (workloadId) => `${router.name}-${workloadId}`;
 
   async function targetGroup(arn) {
@@ -333,7 +333,16 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
 
       const { TargetHealthDescriptions = [] } = await elbv2.describeTargetHealth({ TargetGroupArn: waker.TargetGroupArn });
       const registered = TargetHealthDescriptions.some((d) => d.Target?.Id === router.wakerFunctionArn);
-      if (!registered) await elbv2.registerTargets({ TargetGroupArn: waker.TargetGroupArn, Targets: [{ Id: router.wakerFunctionArn }] });
+      // A new invoke permission takes seconds to be seen by the load balancer: retry the registration meanwhile.
+      for (let attempt = 1; !registered; attempt += 1) {
+        try {
+          await elbv2.registerTargets({ TargetGroupArn: waker.TargetGroupArn, Targets: [{ Id: router.wakerFunctionArn }] });
+          break;
+        } catch (err) {
+          if (attempt >= 10 || !/does not have permission to invoke/.test(err.message ?? '')) throw err;
+          await sleep(3000);
+        }
+      }
       step('register waker', !registered);
 
       if (!(await store.getConfig(workloadId))) {

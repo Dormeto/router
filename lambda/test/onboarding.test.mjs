@@ -24,7 +24,7 @@ function setup({ backend = 'instance' } = {}) {
   const onboarding = createOnboarding({
     elbv2: a.elbv2, ec2: a.ec2, autoscaling: a.autoscaling, ecs: a.ecs, rds: a.rds, lambda: a.lambda, store: a.store,
     router: { name: 'dmt-dev', wakerFunctionName: 'dmt-dev-waker', wakerFunctionArn: WAKER_ARN },
-    now: () => NOW, log: { info: (e, d) => logs.push([e, d]), warn: (e, d) => logs.push([e, d]), error: (e, d) => logs.push([e, d]) },
+    now: () => NOW, sleep: async () => {}, log: { info: (e, d) => logs.push([e, d]), warn: (e, d) => logs.push([e, d]), error: (e, d) => logs.push([e, d]) },
   });
   return { a, tg, main, statics, onboarding, logs };
 }
@@ -420,4 +420,16 @@ test('repair leaves alone a workload being offboarded (its tag removals must not
   delete s.a.state.instances.get('i-0aaa').tags[WORKLOAD];
   assert.deepEqual(await s.onboarding.repair({ workloadId: 'shop', by: 'event' }), { repaired: [], skipped: 'being offboarded' });
   assert.equal(s.a.state.instances.get('i-0aaa').tags[WORKLOAD], undefined);
+});
+
+test('registering the waker is retried while the new invoke permission propagates', async () => {
+  const s = setup();
+  const register = s.a.elbv2.registerTargets;
+  let refusals = 2;
+  s.a.elbv2.registerTargets = async (input) => {
+    if (refusals-- > 0) throw Object.assign(new Error('elasticloadbalancing principal does not have permission to invoke arn:aws:lambda:eu-west-1:111122223333:function:dmt-dev-waker from target group arn:x'), { name: 'AccessDenied' });
+    return register(input);
+  };
+  const result = await s.onboarding.onboard({ workloadId: 'shop', targetGroupArn: s.tg, by: 'ops' });
+  assert.equal(result.steps.find((x) => x.name === 'register waker').status, 'done');
 });

@@ -267,3 +267,15 @@ test('built-in no-wake requests are logged with their reason; invalid rules are 
   await handler(albEvent());
   assert.equal(store.state.run.state, STATES.WAKING, 'an invalid rule never blocks a wake');
 });
+
+test('a controller that cannot be invoked records why (R7a)', async () => {
+  const { handler, store } = setup({
+    run: { state: STATES.ASLEEP },
+    cfg: testConfig({ waitSeconds: 0 }),
+    invoke: async () => { throw Object.assign(new Error('Rate Exceeded.'), { name: 'TooManyRequestsException' }); },
+  });
+  await handler(albEvent());
+  const failure = JSON.parse(store.state.run.failure);
+  assert.deepEqual([failure.kind, failure.step, failure.backend, failure.message], ['throttled', 'wake', 'controller', 'Rate Exceeded.']);
+  assert.equal(store.state.run.consecutiveFailures, 1);
+});

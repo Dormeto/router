@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { failedSpec } from './failures.mjs';
 import { STATES } from './state.mjs';
 import { WAKE_HEADER, acceptsHtml, classify, redirectCount, requestOrigin, requestTarget, response, workloadIdFromEvent } from './http.mjs';
 import { renderJson, renderPage } from './page.mjs';
@@ -62,10 +63,13 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
     } catch (err) {
       await counted;
       log.error('WakeInvokeFailed', { workloadId, wakeId, error: err.message });
+      const failed = failedSpec(err, { step: 'wake', backend: 'controller', wakeId, at: now() });
       return (await store.transition(workloadId, {
         cond: { state: STATES.WAKING, wakeId },
-        set: { state: STATES.FAILED, failedAt: now() },
+        set: { state: STATES.FAILED, failedAt: now(), ...failed.set },
+        increment: failed.increment,
         cause: 'invoke-failed',
+        event: failed.event,
       })) ?? next;
     }
   }

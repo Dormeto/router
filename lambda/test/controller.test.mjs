@@ -55,6 +55,36 @@ test('wake: times out to FAILED and keeps the route on the waker', async () => {
   assert.equal(routeOf(s.elbv2, s.cfg), 'waker');
 });
 
+test('wake: a refused start records why, the backend and the consecutive failures, and says it in the event (R7a)', async () => {
+  const s = setup({ run: { state: STATES.WAKING, wakeId: 'w1', wakeStartedAt: 1, consecutiveFailures: 1 }, instance: 'stopped', target: 'waker', healthy: 0 });
+  const specs = [];
+  const transition = s.store.transition;
+  s.store.transition = async (id, spec) => { specs.push(spec); return transition(id, spec); };
+  s.ec2.startInstances = async () => { throw Object.assign(new Error('You are not authorized to perform this operation.'), { name: 'UnauthorizedOperation' }); };
+  const result = await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' });
+  assert.equal(result.state, STATES.FAILED);
+  const failure = { kind: 'permission', step: 'wake', backend: 'instance:i-0123456789abcdef0', message: 'You are not authorized to perform this operation.', at: s.clock.now() };
+  assert.deepEqual(JSON.parse(s.store.state.run.failure), failure);
+  assert.equal(s.store.state.run.consecutiveFailures, 2);
+  assert.deepEqual(specs.at(-1).event, { wakeId: 'w1', failure });
+});
+
+test('wake: a successful wake clears the failure and gives its duration in the event (R7a)', async () => {
+  const s = setup({ run: { state: STATES.WAKING, wakeId: 'w1', failure: '{"kind":"capacity"}', consecutiveFailures: 2 }, instance: 'stopped', target: 'waker', healthy: 0 });
+  s.store.state.run.wakeStartedAt = s.clock.now() - 40_000;
+  const specs = [];
+  const transition = s.store.transition;
+  s.store.transition = async (id, spec) => { specs.push(spec); return transition(id, spec); };
+  s.ec2.state.onStart.push(() => { s.clock.onSleep(() => { s.elbv2.state.healthy = 1; }); });
+  await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' });
+  assert.equal(s.store.state.run.state, STATES.AWAKE);
+  assert.equal('failure' in s.store.state.run, false);
+  assert.equal('consecutiveFailures' in s.store.state.run, false);
+  const done = specs.at(-1);
+  assert.equal(done.event.wakeId, 'w1');
+  assert.ok(done.event.durationMs >= 40_000);
+});
+
 test('wake: a superseded wakeId does not overwrite the state', async () => {
   const s = setup({ run: { state: STATES.WAKING, wakeId: 'newer' }, instance: 'stopped', target: 'waker' });
   const result = await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'older' });
@@ -900,4 +930,34 @@ test('each check sends the router\'s state to the manager: its workloads as the 
   assert.deepEqual(payload.workloads, workloads.map((w) => ({ ...w, targetGroupArn: s.cfg.appTargetGroupArn })));
   assert.deepEqual([payload.workloads[0].name, payload.counts, typeof payload.durationMs, payload.checkedAt], ['Demo', { AWAKE: 1 }, 'number', new Date(s.clock.now()).toISOString()]);
   assert.ok(payload.health.status);
+});
+
+test('every way to FAILED records why (R7a): a failed nap, a nap or a wake stuck', async () => {
+  const nap = setup({ run: { state: STATES.AWAKE } });
+  nap.ec2.stopInstances = async () => { throw Object.assign(new Error('You are not authorized to perform this operation.'), { name: 'UnauthorizedOperation' }); };
+  await nap.handler({ action: 'nap', workloadId: 'demo' });
+  assert.deepEqual(JSON.parse(nap.store.state.run.failure), { kind: 'permission', step: 'nap', message: 'You are not authorized to perform this operation.', at: nap.clock.now() });
+  assert.equal(nap.store.state.run.consecutiveFailures, 1);
+
+  const napStuck = setup({ run: { state: STATES.NAPPING } });
+  napStuck.store.state.run.updatedAt = napStuck.clock.now() - 16 * 60_000;
+  await napStuck.handler({ action: 'check' });
+  assert.deepEqual(JSON.parse(napStuck.store.state.run.failure), { kind: 'timeout', step: 'nap', message: 'the nap did not finish within 15 minutes (its invocation stopped)', at: napStuck.clock.now() });
+
+  const wakeStuck = setup({ run: { state: STATES.WAKING, wakeId: 'w' } });
+  wakeStuck.store.state.run.wakeStartedAt = wakeStuck.clock.now() - 12 * 60_000;
+  await wakeStuck.handler({ action: 'check' });
+  assert.deepEqual(JSON.parse(wakeStuck.store.state.run.failure), { kind: 'timeout', step: 'wake', message: 'the wake did not finish within 600 s (its invocation stopped)', at: wakeStuck.clock.now() });
+});
+
+test('a recovery to AWAKE clears the failure; a recovery to ASLEEP keeps it (the last wake failed) (R7a)', async () => {
+  const awake = setup({ run: { state: STATES.FAILED, failedAt: 1, failure: '{"kind":"timeout"}', consecutiveFailures: 1 }, instance: 'running', target: 'waker', healthy: 1 });
+  await awake.handler({ action: 'check' });
+  assert.equal(awake.store.state.run.state, STATES.AWAKE);
+  assert.equal('failure' in awake.store.state.run, false);
+  assert.equal('consecutiveFailures' in awake.store.state.run, false);
+  const asleep = setup({ run: { state: STATES.FAILED, failedAt: 1, failure: '{"kind":"timeout"}', consecutiveFailures: 1 }, instance: 'stopped', target: 'waker', healthy: 0 });
+  await asleep.handler({ action: 'check' });
+  assert.equal(asleep.store.state.run.state, STATES.ASLEEP);
+  assert.equal(asleep.store.state.run.failure, '{"kind":"timeout"}');
 });

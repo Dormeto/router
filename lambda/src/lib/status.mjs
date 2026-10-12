@@ -1,6 +1,7 @@
 // Live status of a workload: state, route, backends, targets, nap estimate, statistics, rules, lists. Served by the
 // admin page (waker) and by the controller `status` action (manager).
 import { recommendations } from './advice.mjs';
+import { failureOf } from './summary.mjs';
 import { STATES } from './state.mjs';
 import { conditionsOf, currentTarget, routeOf } from './route.mjs';
 import { resolveRules } from './rules.mjs';
@@ -48,6 +49,8 @@ export function createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging
       awakeSince: iso(run.awakeSince),
       wakeStartedAt: iso(run.wakeStartedAt),
       failedAt: iso(run.failedAt),
+      failure: failureOf(run),
+      consecutiveFailures: run.consecutiveFailures ?? 0,
       wakeCount: run.wakeCount ?? 0,
       holders: run.holders ?? 0,
       pendingWake: run.pendingWake === true,

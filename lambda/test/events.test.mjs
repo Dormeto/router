@@ -100,3 +100,15 @@ test('a publish that hangs holds a transition (a wake) no longer than its budget
   assert.deepEqual(outcome, next);
   assert.ok(log.lines.some(([level, event, data]) => level === 'warn' && event === 'PublishSlow' && data.budgetMs === 20));
 });
+
+test('a transition\'s event fields (the failure, the wake id and duration) go in the state change, never to the store', async () => {
+  const published = [];
+  const specs = [];
+  const store = { transition: async (id, spec) => { specs.push(spec); return { state: spec.set.state }; } };
+  const wrapped = withTransitionEvents(store, { stateChanged: async (c) => { published.push(c); } }, { now: () => Date.UTC(2026, 9, 8, 12) });
+  const failure = { kind: 'capacity', backend: 'rds:dmt-dev-demo-rds', message: 'no capacity', at: 1 };
+  await wrapped.transition('a', { cond: { state: 'WAKING', wakeId: 'w1' }, set: { state: 'FAILED' }, cause: 'wake-failed', event: { wakeId: 'w1', failure } });
+  assert.deepEqual(published[0], { workloadId: 'a', from: 'WAKING', to: 'FAILED', at: '2026-10-08T12:00:00.000Z', cause: 'wake-failed', wakeId: 'w1', failure });
+  assert.equal('event' in specs[0], false);
+  assert.equal('cause' in specs[0], false);
+});

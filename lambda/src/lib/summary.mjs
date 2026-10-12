@@ -3,6 +3,16 @@ export const STATS_DAYS = 7;
 
 const iso = (ms) => (typeof ms === 'number' && ms > 0 ? new Date(ms).toISOString() : null);
 
+// The last failure (R7a), its time as ISO; an unreadable record is none.
+export function failureOf(run) {
+  try {
+    const failure = run?.failure ? JSON.parse(run.failure) : null;
+    return failure ? { ...failure, at: iso(failure.at) } : null;
+  } catch {
+    return null;
+  }
+}
+
 const sum = (counts = {}) => Object.values(counts).reduce((total, n) => total + n, 0);
 
 // 7-day totals of the daily statistics (null when they could not be read).
@@ -23,6 +33,8 @@ export function workloadSummary(cfg, run = {}, host = null, stats7d = null, paus
     awakeSince: iso(run?.awakeSince),
     wakeStartedAt: iso(run?.wakeStartedAt),
     failedAt: iso(run?.failedAt),
+    failure: failureOf(run),
+    consecutiveFailures: run?.consecutiveFailures ?? 0,
     updatedAt: iso(run?.updatedAt),
     pendingWake: run?.pendingWake === true,
     // The kinds of its backends (instance, asg, ecs, then its databases), as the last idle check found them.

@@ -159,21 +159,35 @@ export async function sleepBackends({ ec2, autoscaling, ecs, appscaling, rds }, 
 }
 
 // Companions first, awaited until available (the application needs its database), then the primary backends.
+// A step's error names the backend that failed (R7a: the failure record says which one).
+async function step(backend, run) {
+  try {
+    return await run();
+  } catch (err) {
+    err.backend ??= backend;
+    throw err;
+  }
+}
+
 export async function wakeBackends({ ec2, autoscaling, ecs, appscaling, rds }, records, timing) {
-  if (companions(records).length) await startDatabases({ rds }, companions(records), timing);
-  if (ecsOnly(records).length) await wakeEcs({ ecs, appscaling }, ecsOnly(records));
+  const dbs = companions(records);
+  if (dbs.length) await step(dbs.map((d) => `rds:${d.id}`).join(','), () => startDatabases({ rds }, dbs, timing));
+  const services = ecsOnly(records);
+  if (services.length) await step(services.map((x) => `ecs:${x.id}`).join(','), () => wakeEcs({ ecs, appscaling }, services));
   const { ids, groups } = split(records);
   for (const group of groups) {
     // A group recorded at 0 (found asleep by a reconcile) wakes with dormeto:wake-desired or 1 instance.
     const recorded = group.desired > 0;
     const desired = recorded ? group.desired : (group.wakeDesired ?? 1);
     const min = recorded ? group.min : 1;
-    await autoscaling.updateAutoScalingGroup({
-      AutoScalingGroupName: group.name, MinSize: min, MaxSize: Math.max(group.max ?? desired, desired), DesiredCapacity: desired,
+    await step(`asg:${group.name}`, async () => {
+      await autoscaling.updateAutoScalingGroup({
+        AutoScalingGroupName: group.name, MinSize: min, MaxSize: Math.max(group.max ?? desired, desired), DesiredCapacity: desired,
+      });
+      await autoscaling.resumeProcesses({ AutoScalingGroupName: group.name, ScalingProcesses: SCALING_PROCESSES });
     });
-    await autoscaling.resumeProcesses({ AutoScalingGroupName: group.name, ScalingProcesses: SCALING_PROCESSES });
   }
-  if (ids.length) await startInstances(ec2, ids, timing);
+  if (ids.length) await step(ids.map((id) => `instance:${id}`).join(','), () => startInstances(ec2, ids, timing));
 }
 
 // After a wake done outside Dormeto (a group scaled up by hand): resume scaling and restore the recorded limits,

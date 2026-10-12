@@ -7,6 +7,7 @@ import { healthyCount, waitTargetsReleased } from './instances.mjs';
 import { createStatus } from './status.mjs';
 import { describeRules } from './no-wake.mjs';
 import { describeStoredLists } from './list-cache.mjs';
+import { failedSpec, failureError } from './failures.mjs';
 import { STATS_DAYS, totals, workloadSummary } from './summary.mjs';
 import { lastRequestAt } from './metrics.mjs';
 import { checkScope } from './check-scope.mjs';
@@ -87,9 +88,18 @@ export function createController({
       log.warn('WakeSuperseded', { workloadId, wakeId });
       return { state: 'SUPERSEDED' };
     };
+    // Why it failed (R7a): kept on the run until a successful wake, and said in the event.
     const fail = async (err) => {
-      log.error('WakeFailed', { workloadId, wakeId, error: err.message });
-      await store.transition(workloadId, { cond: { state: STATES.WAKING, wakeId }, set: { state: STATES.FAILED, failedAt: now(), holders: 0 }, cause: 'wake-failed' });
+      const at = now();
+      const failed = failedSpec(err, { step: 'wake', wakeId, at });
+      log.error('WakeFailed', { workloadId, wakeId, error: err.message, kind: failed.event.failure.kind, backend: failed.event.failure.backend });
+      await store.transition(workloadId, {
+        cond: { state: STATES.WAKING, wakeId },
+        set: { state: STATES.FAILED, failedAt: at, holders: 0, ...failed.set },
+        increment: failed.increment,
+        cause: 'wake-failed',
+        event: failed.event,
+      });
       return { state: STATES.FAILED, error: err.message };
     };
     let run;
@@ -115,7 +125,9 @@ export function createController({
       const done = await store.transition(workloadId, {
         cond: { state: STATES.WAKING, wakeId },
         set: { state: STATES.AWAKE, awakeSince: now(), holders: 0 },
-        remove: ['pendingWake', 'napInstances', 'napBackends'],
+        remove: ['pendingWake', 'napInstances', 'napBackends', 'failure', 'consecutiveFailures'],
+        // The wake's duration (R7a, the base of R8's wake times).
+        event: { wakeId, durationMs: now() - (run.wakeStartedAt ?? now()) },
       });
       if (!done) return superseded();
       log.info('WakeCompleted', { workloadId, wakeId });
@@ -183,7 +195,12 @@ export function createController({
       }
     } catch (err) {
       log.error('NapFailed', { workloadId, error: err.message });
-      await store.transition(workloadId, { cond: { state: STATES.NAPPING }, set: { state: STATES.FAILED, failedAt: now(), holders: 0 }, remove: ['stopping'], cause: 'nap-failed' });
+      const at = now();
+      const failed = failedSpec(err, { step: 'nap', at });
+      await store.transition(workloadId, {
+        cond: { state: STATES.NAPPING }, set: { state: STATES.FAILED, failedAt: at, holders: 0, ...failed.set }, increment: failed.increment,
+        remove: ['stopping'], cause: 'nap-failed', event: failed.event,
+      });
       return { state: STATES.FAILED, error: err.message };
     }
     const asleep = await store.transition(workloadId, { cond: { state: STATES.NAPPING, pendingWake: false }, set: { state: STATES.ASLEEP, holders: 0 }, remove: ['stopping'] });
@@ -221,20 +238,26 @@ export function createController({
     const stuckBefore = now() - NAPPING_STUCK_MS;
     if (run.state === STATES.NAPPING && (run.updatedAt ?? 0) < stuckBefore) {
       log.warn('NapStuck', { workloadId });
+      const failed = failedSpec(failureError('timeout', `the nap did not finish within ${NAPPING_STUCK_MS / 60_000} minutes (its invocation stopped)`), { step: 'nap', at: now() });
       return (await store.transition(workloadId, {
         cond: { state: STATES.NAPPING, olderThan: { field: 'updatedAt', ms: stuckBefore } },
-        set: { state: STATES.FAILED, failedAt: now(), holders: 0 },
+        set: { state: STATES.FAILED, failedAt: now(), holders: 0, ...failed.set },
+        increment: failed.increment,
         remove: ['stopping'],
         cause: 'nap-stuck',
+        event: failed.event,
       })) ?? store.getRun(workloadId);
     }
     const wakeStuckBefore = now() - cfg.wakeTimeoutSeconds * 1000 - WAKING_STUCK_GRACE_MS;
     if (run.state === STATES.WAKING && (run.wakeStartedAt ?? 0) < wakeStuckBefore) {
       log.warn('WakeStuck', { workloadId, wakeId: run.wakeId });
+      const failed = failedSpec(failureError('timeout', `the wake did not finish within ${cfg.wakeTimeoutSeconds} s (its invocation stopped)`), { step: 'wake', wakeId: run.wakeId, at: now() });
       return (await store.transition(workloadId, {
         cond: { state: STATES.WAKING, wakeId: run.wakeId },
-        set: { state: STATES.FAILED, failedAt: now(), holders: 0 },
+        set: { state: STATES.FAILED, failedAt: now(), holders: 0, ...failed.set },
+        increment: failed.increment,
         cause: 'wake-stuck',
+        event: failed.event,
       })) ?? store.getRun(workloadId);
     }
     if (![STATES.AWAKE, STATES.ASLEEP, STATES.FAILED].includes(run.state)) return run;
@@ -258,7 +281,7 @@ export function createController({
       else await startCompanions(clients, companions);
       await routeTo(cfg, 'app');
       run = (await store.transition(workloadId, {
-        cond: { state: from }, set: { state: STATES.AWAKE, awakeSince: now() }, remove: ['napBackends', 'napInstances'],
+        cond: { state: from }, set: { state: STATES.AWAKE, awakeSince: now() }, remove: ['napBackends', 'napInstances', 'failure', 'consecutiveFailures'],
         cause: from === STATES.FAILED ? 'recovered' : 'external-start',
       }))
         ?? (await store.getRun(workloadId));

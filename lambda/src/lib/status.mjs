@@ -44,6 +44,7 @@ export function createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging
       targetGroupArn: cfg.appTargetGroupArn,
       source: cfg.source ?? 'terraform',
       state: run.state,
+      stateAt: iso(run.stateAt),
       // Latest drift repairs (R4c), newest first.
       drift,
       updatedAt: iso(run.updatedAt),

@@ -38,6 +38,8 @@ export function workloadSummary(cfg, run = {}, host = null, stats7d = null, paus
     // Written by the Terraform workload module, or onboarded by the manager (only those are offboarded by it).
     source: cfg.source ?? 'terraform',
     state: run?.state ?? 'UNKNOWN',
+    // When the state began (router 0.26.0): the instant of its state change event, so a check names the same change.
+    stateAt: iso(run?.stateAt),
     url: host ? `https://${host}/` : null,
     wakeMode: cfg.wakeMode ?? 'any',
     wakeCount: run?.wakeCount ?? 0,

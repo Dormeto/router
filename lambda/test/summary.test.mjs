@@ -27,3 +27,9 @@ test('a workload awake on fallback instance types says which (R7a), and nothing 
   assert.equal('fallbacks' in workloadSummary(testConfig(), { state: 'AWAKE' }), false, 'absent, to keep check events small');
   assert.equal('fallbacks' in workloadSummary(testConfig(), { state: 'AWAKE', instanceTypes: '{' }), false, 'an unreadable record is none');
 });
+
+test('a workload summary gives when its state began (stateAt, router 0.26.0)', () => {
+  const at = Date.UTC(2026, 9, 8, 12);
+  assert.equal(workloadSummary(testConfig(), { state: 'ASLEEP', stateAt: at }).stateAt, '2026-10-08T12:00:00.000Z');
+  assert.equal(workloadSummary(testConfig(), { state: 'ASLEEP' }).stateAt, null);
+});

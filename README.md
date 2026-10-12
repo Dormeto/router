@@ -107,6 +107,11 @@ wakes, requests wait `failed_retry_seconds`, doubled after each consecutive fail
 workload is back to sleep with its failure. A failed workload whose backends run without a healthy target is stopped
 once its idle window has passed (unless paused), so a failure never keeps paying.
 
+**State history (router 0.26.0):** each state change dates the run (`stateAt`, in summaries and the status) with the
+instant of its `Workload state changed` event, and an event of a nap or a wake asked from the manager says who (`by`).
+The manager keeps the history from these events and fills a lost one from the next check (the same instant names the
+same transition); the router keeps none.
+
 **Statistics:** while a workload is not awake, the waker counts ignored requests per reason, deferred requests (browser
 mode) and wakes per trigger in a daily item of the state table (`STATS#<day>`, kept 35 days); the admin dashboard shows
 today and the last 7 days. With `metrics_enabled` on the `router` module, the same events also publish the CloudWatch

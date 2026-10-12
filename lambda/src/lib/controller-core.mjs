@@ -181,8 +181,9 @@ export function createController({
     return { state: asleep ? STATES.ASLEEP : 'SUPERSEDED' };
   }
 
-  // cause: what asked for it, the idle check or the manager (the state change event says so).
-  async function nap(workloadId, { cause = 'idle' } = {}) {
+  // cause: what asked for it, the idle check or the manager, and by: who, from the manager (the state change event
+  // says both).
+  async function nap(workloadId, { cause = 'idle', by } = {}) {
     const cfg = await config(workloadId);
     // A nap requested before a pause (idle check, manager) is refused when it starts.
     if (await isPaused(workloadId)) {
@@ -206,6 +207,7 @@ export function createController({
       set: { state: STATES.NAPPING, napBackends: JSON.stringify(backends.map(toRecord)) },
       remove: ['pendingWake'],
       cause,
+      ...(by ? { by } : {}),
     });
     if (!napping) return { state: 'SKIPPED' };
     log.info('NapStarted', { workloadId });
@@ -499,6 +501,7 @@ export function createController({
       const wakeId = newId();
       const next = await store.transition(workloadId, {
         cond: { state: run.state }, set: { state: STATES.WAKING, wakeId, wakeStartedAt: now() }, remove: ['failedAt'], increment: ['wakeCount'], cause: kind,
+        ...(by ? { by } : {}),
       });
       if (!next) return { state: (await store.getRun(workloadId))?.state };
       log.info('WakeRequested', { workloadId, wakeId, trigger: { kind, by } });
@@ -771,7 +774,7 @@ export function createController({
       log.warn('NapSkipped', { workloadId, reason });
       return { state: 'SKIPPED', reason };
     }
-    return nap(workloadId, { cause: by ? 'manager' : 'idle' });
+    return nap(workloadId, { cause: by ? 'manager' : 'idle', by });
   }
 
   // A wake a router pause queued: skipped when the workload is gone (offboarded since) or no pause applies any more
@@ -907,7 +910,7 @@ export function createController({
     if (Array.isArray(event?.Records)) return runQueued(event.Records);
     switch (event?.action) {
       case 'wake': return wake(event.workloadId, event.wakeId);
-      case 'nap': return nap(event.workloadId, { cause: event.by ? 'manager' : 'idle' });
+      case 'nap': return nap(event.workloadId, { cause: event.by ? 'manager' : 'idle', by: event.by });
       case 'release': return release(event.workloadId);
       case 'check': return check(event.source);
       case 'ensure-awake': return ensureAwake(event.workloadId);

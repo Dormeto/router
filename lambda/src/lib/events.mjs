@@ -64,14 +64,19 @@ export const PUBLISH_BUDGET_MS = 1000;
 // The store, with every successful state transition published (controller and waker): one place, none missed.
 export function withTransitionEvents(store, publisher, { now = Date.now, log = null, budgetMs = PUBLISH_BUDGET_MS } = {}) {
   return Object.assign(Object.create(store), store, {
-    // spec.cause (what started a wake or a nap, or ended one early) and spec.event (the failure, the wake id and its
-    // duration, R7a) go in the event only, never to the store.
-    async transition(workloadId, { cause, event, ...spec } = {}) {
-      const next = await store.transition(workloadId, spec);
+    // spec.cause (what started a wake or a nap, or ended one early), spec.by (who asked it from the manager, R8) and
+    // spec.event (the failure, the wake id and its duration, R7a) go in the event only, never to the store. A state
+    // change dates the run (stateAt) with the event's instant (R8: a check names the same transition as the event).
+    async transition(workloadId, { cause, by, event, ...spec } = {}) {
       const to = spec?.set?.state;
+      const at = to ? now() : null;
+      const next = await store.transition(workloadId, to ? { ...spec, set: { ...spec.set, stateAt: at } } : spec);
       if (next && to) {
         const from = typeof spec.cond?.state === 'string' ? spec.cond.state : null;
-        const change = { workloadId, from, to, at: new Date(now()).toISOString(), ...(spec.set.wakeId ? { wakeId: spec.set.wakeId } : {}), ...(cause ? { cause } : {}), ...(event ?? {}) };
+        const change = {
+          workloadId, from, to, at: new Date(at).toISOString(), ...(spec.set.wakeId ? { wakeId: spec.set.wakeId } : {}),
+          ...(cause ? { cause } : {}), ...(by ? { by } : {}), ...(event ?? {}),
+        };
         let timer;
         const slow = new Promise((resolve) => { timer = setTimeout(() => resolve('slow'), budgetMs); });
         try {

@@ -67,3 +67,33 @@ test('a nap aborted by a wake asked during its drain says so; a wake started by 
   // The trigger of the request, as the wake counters name it.
   assert.deepEqual(causes(changes), [[STATES.WAKING, 'normal']]);
 });
+
+test('a state change dates the run (stateAt) with its event\'s instant; a write that changes no state does not (R8)', async () => {
+  const s = setup({ run: { state: STATES.AWAKE, awakeSince: 1 } });
+  await s.handler({ action: 'check' });
+  await s.deliver(s.queued[0]);
+  assert.equal(s.store.state.run.state, STATES.ASLEEP);
+  assert.equal(s.store.state.run.stateAt, Date.parse(s.changes.at(-1).at));
+  const before = s.store.state.run.stateAt;
+  s.clock.advance(60_000);
+  await s.wrapped.transition('demo', { cond: { state: STATES.ASLEEP }, set: { holders: 1 } });
+  assert.equal(s.store.state.run.stateAt, before);
+});
+
+test('the event says who asked a nap or a wake from the manager, or the pause that woke it (R8); an idle nap and a request say no one', async () => {
+  const asked = setup({ run: { state: STATES.AWAKE, awakeSince: 1 } });
+  await asked.handler({ action: 'request-nap', workloadId: 'demo', by: 'ops@example.com' });
+  await asked.deliver(asked.queued[0]);
+  assert.equal(asked.changes[0].by, 'ops@example.com');
+  const woken = setup({ run: { state: STATES.ASLEEP }, instance: 'stopped', target: 'waker' });
+  await woken.handler({ action: 'force-wake', workloadId: 'demo', by: 'ops@example.com' });
+  assert.equal(woken.changes[0].by, 'ops@example.com');
+  const paused = setup({ run: { state: STATES.ASLEEP }, instance: 'stopped', target: 'waker' });
+  await paused.handler({ action: 'pause', by: 'ops@example.com', reason: 'freeze' });
+  await paused.deliver(paused.queued[0]);
+  assert.equal(paused.changes[0].by, 'ops@example.com');
+  const idle = setup({ run: { state: STATES.AWAKE, awakeSince: 1 } });
+  await idle.handler({ action: 'check' });
+  await idle.deliver(idle.queued[0]);
+  assert.ok(idle.changes.every((c) => !('by' in c)));
+});

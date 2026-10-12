@@ -101,9 +101,11 @@ message, on the run until a successful wake, in the `FAILED` event to the manage
 attempt. A failed Auto Scaling launch or an ECS task that cannot be placed is seen while the wake waits (every 30 s), not
 at its timeout; no capacity is waited out, as Auto Scaling and ECS keep trying. An EC2 or RDS start refused for capacity
 is tried again within the wake (30 s, 60 s, then every 120 s), and an EC2 instance may fall back to the next type of the
-workload's `fallback_instance_types`, given back its own type after its next nap. Between failed wakes, requests wait
-`failed_retry_seconds`, doubled after each consecutive failure, at most 30 minutes. A failed workload whose backends run
-without a healthy target is stopped once its idle window has passed (unless paused), so a failure never keeps paying.
+workload's `fallback_instance_types`, given back its own type after its next nap (or, if that nap failed, before its
+next start); the controller may change only an instance's type, and only the `dormeto:instance-type` tag. Between failed
+wakes, requests wait `failed_retry_seconds`, doubled after each consecutive failure, at most 30 minutes, also once the
+workload is back to sleep with its failure. A failed workload whose backends run without a healthy target is stopped
+once its idle window has passed (unless paused), so a failure never keeps paying.
 
 **Statistics:** while a workload is not awake, the waker counts ignored requests per reason, deferred requests (browser
 mode) and wakes per trigger in a daily item of the state table (`STATS#<day>`, kept 35 days); the admin dashboard shows

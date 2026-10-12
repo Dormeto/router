@@ -207,3 +207,80 @@ test('check: releases a wake stuck beyond wakeTimeoutSeconds to FAILED', async (
   const [result] = await s.handler({ action: 'check' });
   assert.equal(result.state, STATES.FAILED);
 });
+
+// --- discovery mode (no static instanceIds) ---------------------------------------------------------------------
+
+function discovery({ run, instances, tags, target = 'app' }) {
+  const s = setup({ run, cfg: testConfig({ instanceIds: [] }), target });
+  s.ec2.state.instances = Object.fromEntries(Object.entries(instances).map(([id, v]) => [id, v.state]));
+  s.ec2.state.tags = tags;
+  s.elbv2.state.targets = Object.entries(instances).map(([id, v]) => ({ Id: id, State: v.health }));
+  return s;
+}
+
+test('nap (discovery): stops only the managed instances and records them', async () => {
+  const s = discovery({
+    run: { state: STATES.AWAKE },
+    instances: { 'i-a': { state: 'running', health: 'healthy' }, 'i-x': { state: 'running', health: 'healthy' } },
+    tags: { 'i-a': { 'dormeto:workload': 'demo' } },
+  });
+  const result = await s.handler({ action: 'nap', workloadId: 'demo' });
+  assert.equal(result.state, STATES.ASLEEP);
+  assert.equal(s.ec2.state.instances['i-a'], 'stopped');
+  assert.equal(s.ec2.state.instances['i-x'], 'running', 'untagged target is never stopped');
+  assert.equal(s.store.state.run.napInstances, '["i-a"]');
+});
+
+test('nap (discovery): skipped when no instance is managed', async () => {
+  const s = discovery({
+    run: { state: STATES.AWAKE },
+    instances: { 'i-x': { state: 'running', health: 'healthy' } },
+    tags: {},
+  });
+  const result = await s.handler({ action: 'nap', workloadId: 'demo' });
+  assert.deepEqual(result, { state: 'SKIPPED', reason: 'no-instances' });
+  assert.equal(s.store.state.run.state, STATES.AWAKE);
+  assert.equal(routeOf(s.elbv2, s.cfg), 'app');
+  assert.equal(s.ec2.state.stopped, 0);
+});
+
+test('wake (discovery): starts the instances recorded by the nap', async () => {
+  const s = discovery({
+    run: { state: STATES.WAKING, wakeId: 'w1', napInstances: '["i-a"]' },
+    instances: { 'i-a': { state: 'stopped', health: 'unused' }, 'i-b': { state: 'stopped', health: 'unused' } },
+    tags: { 'i-a': { 'dormeto:workload': 'demo' }, 'i-b': { 'dormeto:workload': 'demo' } },
+    target: 'waker',
+  });
+  s.ec2.state.onStart.push(() => { s.elbv2.state.targets[0].State = 'healthy'; });
+  const result = await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' });
+  assert.equal(result.state, STATES.AWAKE);
+  assert.equal(s.ec2.state.instances['i-a'], 'running');
+  assert.equal(s.ec2.state.instances['i-b'], 'stopped', 'only the napped instances are started');
+  assert.equal('napInstances' in s.store.state.run, false);
+});
+
+test('check (discovery): reconciles on the discovered instances', async () => {
+  const s = discovery({
+    run: { state: STATES.ASLEEP },
+    instances: { 'i-a': { state: 'running', health: 'healthy' } },
+    tags: { 'i-a': { 'dormeto:workload': 'demo' } },
+    target: 'waker',
+  });
+  const [result] = await s.handler({ action: 'check' });
+  assert.equal(result.state, STATES.AWAKE);
+  assert.equal(routeOf(s.elbv2, s.cfg), 'app');
+});
+
+test('check (discovery): no managed instance leaves the state alone and keeps the route consistent', async () => {
+  const s = discovery({ run: { state: STATES.ASLEEP }, instances: {}, tags: {}, target: 'app' });
+  const [result] = await s.handler({ action: 'check' });
+  assert.equal(result.state, STATES.ASLEEP);
+  assert.equal(routeOf(s.elbv2, s.cfg), 'waker');
+});
+
+test('check (discovery): an AWAKE workload without managed instance is not marked ASLEEP', async () => {
+  const s = discovery({ run: { state: STATES.AWAKE, awakeSince: 1 }, instances: {}, tags: {}, target: 'app' });
+  await s.handler({ action: 'check' });
+  assert.notEqual(s.store.state.run.state, STATES.ASLEEP);
+  assert.equal(routeOf(s.elbv2, s.cfg), 'app');
+});

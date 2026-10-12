@@ -1,3 +1,4 @@
+import { createAutoScaling } from './aws/autoscaling.mjs';
 import { createCloudWatch } from './aws/cloudwatch.mjs';
 import { createDynamo } from './aws/dynamo.mjs';
 import { createEc2 } from './aws/ec2.mjs';
@@ -12,6 +13,7 @@ export const handler = createController({
   ec2: createEc2(),
   elbv2: createElbv2(),
   cloudwatch: createCloudWatch(),
+  autoscaling: createAutoScaling(),
   sleep,
   log: logger,
 });

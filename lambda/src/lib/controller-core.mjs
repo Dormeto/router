@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { STATES } from './state.mjs';
 import { setRoute } from './route.mjs';
-import { healthyCount, instanceStates, startInstances, stopInstances } from './instances.mjs';
+import { healthyCount } from './instances.mjs';
 import { requestSum } from './metrics.mjs';
-import { resolveInstances } from './discovery.mjs';
+import { backendKey, backendStatuses, resolveBackends, sleepBackends, toRecord, wakeBackends } from './backends.mjs';
 
 const HEALTH_POLL_MS = 3000;
 const STOP_TIMEOUT_MS = 5 * 60_000;
@@ -14,7 +14,8 @@ const TIMEOUT_MARGIN_MS = 30_000;
 // Held requests last at most waitSeconds: a counter untouched for longer is a leak (killed waker).
 const HOLDERS_STALE_MS = 2 * 60_000;
 
-export function createController({ store, ec2, elbv2, cloudwatch, now = Date.now, sleep, newId = randomUUID, log }) {
+export function createController({ store, ec2, elbv2, cloudwatch, autoscaling, now = Date.now, sleep, newId = randomUUID, log }) {
+  const clients = { ec2, elbv2, autoscaling };
   let budgetEnd = Infinity;
 
   async function config(workloadId) {
@@ -23,10 +24,17 @@ export function createController({ store, ec2, elbv2, cloudwatch, now = Date.now
     return cfg;
   }
 
-  async function managedInstances(cfg) {
-    const { managed, ignored } = await resolveInstances(ec2, elbv2, cfg);
+  async function managedBackends(cfg) {
+    const { backends, ignored } = await resolveBackends(clients, cfg);
     for (const target of ignored) log.info('IgnoredTarget', { workloadId: cfg.workloadId, target: target.id, reason: target.reason });
-    return managed;
+    return backends;
+  }
+
+  // What the nap stopped (napBackends, or napInstances from earlier versions); else what is managed now.
+  async function wakeRecords(run, cfg) {
+    if (run.napBackends) return JSON.parse(run.napBackends);
+    if (run.napInstances) return JSON.parse(run.napInstances).map((id) => ({ kind: 'instance', id }));
+    return managedBackends(cfg);
   }
 
   async function wake(workloadId, wakeId, knownConfig) {
@@ -53,9 +61,7 @@ export function createController({ store, ec2, elbv2, cloudwatch, now = Date.now
     }
     const timing = { sleep, now, deadline: Math.min(now() + cfg.wakeTimeoutSeconds * 1000, budgetEnd) };
     try {
-      // Start what the nap stopped; without that record (wake from a reconciled or failed state), what is managed now.
-      const ids = run.napInstances ? JSON.parse(run.napInstances) : await managedInstances(cfg);
-      await startInstances(ec2, ids, timing);
+      await wakeBackends(clients, await wakeRecords(run, cfg), timing);
       while ((await healthyCount(elbv2, cfg.appTargetGroupArn)) < 1) {
         if (now() >= timing.deadline) throw new Error('wake timeout: no healthy target');  // or Lambda time budget
         await sleep(HEALTH_POLL_MS);
@@ -65,7 +71,7 @@ export function createController({ store, ec2, elbv2, cloudwatch, now = Date.now
       const done = await store.transition(workloadId, {
         cond: { state: STATES.WAKING, wakeId },
         set: { state: STATES.AWAKE, awakeSince: now(), holders: 0 },
-        remove: ['pendingWake', 'napInstances'],
+        remove: ['pendingWake', 'napInstances', 'napBackends'],
       });
       if (!done) return superseded();
       log.info('WakeCompleted', { workloadId, wakeId });
@@ -77,15 +83,15 @@ export function createController({ store, ec2, elbv2, cloudwatch, now = Date.now
 
   async function nap(workloadId) {
     const cfg = await config(workloadId);
-    const ids = await managedInstances(cfg);
-    if (!ids.length) {
+    const backends = await managedBackends(cfg);
+    if (!backends.length) {
       // Diverting traffic to the waker with nothing to stop or start would only break the application.
       log.warn('NapSkipped', { workloadId, reason: 'no-instances' });
       return { state: 'SKIPPED', reason: 'no-instances' };
     }
     const napping = await store.transition(workloadId, {
       cond: { state: STATES.AWAKE },
-      set: { state: STATES.NAPPING, napInstances: JSON.stringify(ids) },
+      set: { state: STATES.NAPPING, napBackends: JSON.stringify(backends.map(toRecord)) },
       remove: ['pendingWake'],
     });
     if (!napping) return { state: 'SKIPPED' };
@@ -105,7 +111,7 @@ export function createController({ store, ec2, elbv2, cloudwatch, now = Date.now
         log.info('NapAborted', { workloadId });
         return { state: STATES.AWAKE, aborted: true };
       }
-      await stopInstances(ec2, ids, { sleep, now, deadline: now() + STOP_TIMEOUT_MS });
+      await sleepBackends(clients, backends, { sleep, now, deadline: now() + STOP_TIMEOUT_MS });
     } catch (err) {
       log.error('NapFailed', { workloadId, error: err.message });
       await store.transition(workloadId, { cond: { state: STATES.NAPPING }, set: { state: STATES.FAILED, failedAt: now(), holders: 0 }, remove: ['stopping'] });
@@ -151,10 +157,10 @@ export function createController({ store, ec2, elbv2, cloudwatch, now = Date.now
     }
     if (![STATES.AWAKE, STATES.ASLEEP, STATES.FAILED].includes(run.state)) return run;
 
-    const ids = await managedInstances(cfg);
-    const states = ids.length ? await instanceStates(ec2, ids) : {};
-    // No managed instance: nothing to infer from EC2 (every() would be vacuously true).
-    const all = (name) => ids.length > 0 && ids.every((id) => states[id] === name);
+    const backends = await managedBackends(cfg);
+    const statuses = backends.length ? await backendStatuses(clients, backends) : {};
+    // No managed backend: nothing to infer (every() would be vacuously true).
+    const all = (name) => backends.length > 0 && backends.every((b) => statuses[backendKey(b)] === name);
     const from = run.state;
     if (from !== STATES.AWAKE && all('running') && (await healthyCount(elbv2, cfg.appTargetGroupArn)) >= 1) {
       log.warn(from === STATES.FAILED ? 'FailedRecovered' : 'ExternalWake', { workloadId });

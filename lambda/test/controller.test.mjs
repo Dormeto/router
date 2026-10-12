@@ -2,19 +2,20 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createController } from '../src/lib/controller-core.mjs';
 import { STATES } from '../src/lib/state.mjs';
-import { fakeClock, fakeCloudWatch, fakeEc2, fakeElbv2, fakeStore, routeOf, silentLog, testConfig } from './fakes.mjs';
+import { asgGroup, fakeAutoScaling, fakeClock, fakeCloudWatch, fakeEc2, fakeElbv2, fakeStore, routeOf, silentLog, testConfig } from './fakes.mjs';
 
-function setup({ run, instance = 'running', target = 'app', healthy = 1, metric = [], cfg = testConfig() } = {}) {
+function setup({ run, instance = 'running', target = 'app', healthy = 1, metric = [], cfg = testConfig(), groups = [] } = {}) {
   const clock = fakeClock();
   const store = fakeStore({ config: cfg, run, clock });
   const ec2 = fakeEc2(cfg.instanceIds, { state: instance });
   const elbv2 = fakeElbv2(cfg, { target, healthy });
   const cloudwatch = fakeCloudWatch(metric);
+  const autoscaling = fakeAutoScaling(groups);
   let ids = 0;
   const handler = createController({
-    store, ec2, elbv2, cloudwatch, now: clock.now, sleep: clock.sleep, newId: () => `wake-${++ids}`, log: silentLog,
+    store, ec2, elbv2, cloudwatch, autoscaling, now: clock.now, sleep: clock.sleep, newId: () => `wake-${++ids}`, log: silentLog,
   });
-  return { handler, store, ec2, elbv2, cloudwatch, clock, cfg };
+  return { handler, store, ec2, elbv2, cloudwatch, autoscaling, clock, cfg };
 }
 
 test('wake: starts the instance, waits for health, switches the route and becomes AWAKE', async () => {
@@ -228,7 +229,7 @@ test('nap (discovery): stops only the managed instances and records them', async
   assert.equal(result.state, STATES.ASLEEP);
   assert.equal(s.ec2.state.instances['i-a'], 'stopped');
   assert.equal(s.ec2.state.instances['i-x'], 'running', 'untagged target is never stopped');
-  assert.equal(s.store.state.run.napInstances, '["i-a"]');
+  assert.deepEqual(JSON.parse(s.store.state.run.napBackends), [{ kind: 'instance', id: 'i-a' }]);
 });
 
 test('nap (discovery): skipped when no instance is managed', async () => {
@@ -321,4 +322,60 @@ test('a configuration read error during wake ends FAILED instead of a stuck WAKI
   const result = await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' });
   assert.equal(result.state, STATES.FAILED);
   assert.equal(s.store.state.run.state, STATES.FAILED);
+});
+
+// --- Auto Scaling group backends -------------------------------------------------------------------------------
+
+const ASG_TAGS = { 'dormeto:workload': 'demo' };
+
+function asgSetup({ run, desired = 1, target = 'app', healthy = 1 }) {
+  const cfg = testConfig({ instanceIds: [] });
+  const s = setup({
+    run, cfg, target, healthy,
+    groups: [asgGroup('asg-demo', { min: desired, max: 3, desired, targetGroups: [cfg.appTargetGroupArn], tags: ASG_TAGS })],
+  });
+  s.elbv2.state.healthy = healthy;
+  return s;
+}
+
+test('nap (asg): records the group sizes, suspends scaling and scales the group to zero', async () => {
+  const s = asgSetup({ run: { state: STATES.AWAKE }, desired: 2 });
+  const result = await s.handler({ action: 'nap', workloadId: 'demo' });
+  assert.equal(result.state, STATES.ASLEEP);
+  assert.deepEqual(JSON.parse(s.store.state.run.napBackends), [{ kind: 'asg', name: 'asg-demo', min: 2, max: 3, desired: 2 }]);
+  const group = s.autoscaling.state.groups[0];
+  assert.equal(group.DesiredCapacity, 0);
+  assert.equal(group.MinSize, 0);
+  assert.ok(s.autoscaling.state.suspended['asg-demo']);
+  assert.equal(routeOf(s.elbv2, s.cfg), 'waker');
+});
+
+test('wake (asg): restores the recorded sizes, resumes scaling and switches the route back', async () => {
+  const s = asgSetup({
+    run: { state: STATES.WAKING, wakeId: 'w1', napBackends: JSON.stringify([{ kind: 'asg', name: 'asg-demo', min: 2, max: 3, desired: 2 }]) },
+    desired: 0, target: 'waker', healthy: 0,
+  });
+  const update = s.autoscaling.updateAutoScalingGroup;
+  s.autoscaling.updateAutoScalingGroup = async (input) => { await update(input); s.elbv2.state.healthy = input.DesiredCapacity; };
+  const result = await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' });
+  assert.equal(result.state, STATES.AWAKE);
+  const group = s.autoscaling.state.groups[0];
+  assert.deepEqual([group.MinSize, group.MaxSize, group.DesiredCapacity], [2, 3, 2]);
+  assert.equal(s.autoscaling.state.resumed.length, 1);
+  assert.equal(routeOf(s.elbv2, s.cfg), 'app');
+  assert.equal('napBackends' in s.store.state.run, false);
+});
+
+test('check (asg): a group scaled up outside Dormeto while asleep is reconciled to AWAKE', async () => {
+  const s = asgSetup({ run: { state: STATES.ASLEEP }, desired: 1, target: 'waker', healthy: 1 });
+  const [result] = await s.handler({ action: 'check' });
+  assert.equal(result.state, STATES.AWAKE);
+  assert.equal(routeOf(s.elbv2, s.cfg), 'app');
+});
+
+test('check (asg): a group scaled to zero outside Dormeto while awake is reconciled to ASLEEP', async () => {
+  const s = asgSetup({ run: { state: STATES.AWAKE, awakeSince: 1 }, desired: 0, target: 'app', healthy: 0 });
+  const [result] = await s.handler({ action: 'check' });
+  assert.equal(result.state, STATES.ASLEEP);
+  assert.equal(routeOf(s.elbv2, s.cfg), 'waker');
 });

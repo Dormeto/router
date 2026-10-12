@@ -237,3 +237,11 @@ test('a failure while tagging the second backend undoes the first tag', async ()
   assert.deepEqual(s.a.state.instances.get('i-0aaa').tags, { Name: 'shop' });
   assert.deepEqual(s.a.state.databases.get(db).tags, {});
 });
+
+test('offboarding never deletes a target group named like the waker but not tagged for the workload', async () => {
+  const s = setup();
+  const lookalike = s.a.customer.targetGroup('dmt-dev-shop');
+  await s.onboarding.offboard({ workloadId: 'shop', by: 'ops' });
+  assert.ok(s.a.state.targetGroups.has(lookalike));
+  await assert.rejects(s.onboarding.onboard({ workloadId: 'shop', targetGroupArn: s.tg, by: 'ops' }), /target group dmt-dev-shop exists and is not the waker of shop/);
+});

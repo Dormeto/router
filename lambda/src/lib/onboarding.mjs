@@ -64,13 +64,19 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
     }
   }
 
+  // The waker target group of the workload, with whether it is tagged as such (a group of the same name that is not is
+  // never touched).
   async function wakerGroup(workloadId) {
+    let group;
     try {
-      return (await elbv2.describeTargetGroups({ Names: [wakerName(workloadId)] })).TargetGroups?.[0] ?? null;
+      group = (await elbv2.describeTargetGroups({ Names: [wakerName(workloadId)] })).TargetGroups?.[0] ?? null;
     } catch (err) {
       if (notFound(err, 'TargetGroupNotFoundException')) return null;
       throw err;
     }
+    if (!group) return null;
+    const { TagDescriptions: [d] = [] } = await elbv2.describeTags({ ResourceArns: [group.TargetGroupArn] });
+    return { ...group, ours: tagsOf(d?.Tags)[WORKLOAD_TAG] === workloadId };
   }
 
   // Rules forwarding to the target group, on its load balancers, with their tags.
@@ -161,6 +167,7 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
     result.loadBalancerArn = lbs[0] ?? null;
 
     const waker = await wakerGroup(workloadId);
+    if (waker && !waker.ours) problems.push(`target group ${waker.TargetGroupName} exists and is not the waker of ${workloadId}`);
     for (const { rule, listener, tags } of await rulesTo(group)) {
       const groups = forwardTargetGroups(rule);
       const entry = { arn: rule.RuleArn, priority: rule.Priority, conditions: conditionsOf(rule) };
@@ -298,7 +305,8 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
       }
     };
     const group = targetGroupArn ? await targetGroup(targetGroupArn) : null;
-    const waker = await wakerGroup(workloadId);
+    const found = await wakerGroup(workloadId);
+    const waker = found?.ours ? found : null;
     await run('restore rules', async () => {
       if (!group) return false;
       let restored = 0;

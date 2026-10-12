@@ -15,6 +15,11 @@ Instances are **discovered** from the application target group: every instance t
 the instances it stopped and the wake starts exactly those. A static `instance_ids` list on the `workload` module is
 still supported.
 
+**Auto Scaling groups** tagged `dormeto:workload=<workload id>` and feeding the application target group are managed as
+a whole: the nap records their sizes, suspends the scaling processes and scales them to 0; the wake restores the sizes
+and resumes the processes. Their instances are never stopped one by one. The `dev` environment has two workloads:
+`demo` (one EC2 instance, `https://dev.dormeto.com/`) and `demo-asg` (an Auto Scaling group, `https://asg.dev.dormeto.com/`).
+
 Design: [vision/docs/specs/2026-10-03-mvp-alb-ec2-design.md](https://github.com/Dormeto/vision/blob/main/docs/specs/2026-10-03-mvp-alb-ec2-design.md).
 
 ## Layout

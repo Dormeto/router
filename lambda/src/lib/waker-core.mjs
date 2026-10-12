@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { STATES } from './state.mjs';
-import { acceptsHtml, classify, redirectCount, requestTarget, response, workloadIdFromEvent } from './http.mjs';
+import { acceptsHtml, classify, redirectCount, requestOrigin, requestTarget, response, workloadIdFromEvent } from './http.mjs';
 import { renderJson, renderPage } from './page.mjs';
 import { ADMIN_PREFIX, parseAdminPath } from './admin.mjs';
 
@@ -14,7 +14,7 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
   const inRouteGrace = (run) => run.state === STATES.AWAKE && (run.awakeSince ?? 0) > now() - ROUTE_GRACE_MS;
   const servable = (run) => run.state === STATES.AWAKE && !inRouteGrace(run);
 
-  async function startWake(workloadId, cond, run) {
+  async function startWake(workloadId, cond, run, trigger) {
     const wakeId = newId();
     const next = await store.transition(workloadId, {
       cond,
@@ -23,7 +23,7 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
       increment: ['wakeCount'],
     });
     if (!next) return (await store.getRun(workloadId)) ?? run;
-    log.info('WakeRequested', { workloadId, wakeId });
+    log.info('WakeRequested', { workloadId, wakeId, trigger });
     try {
       await invokeController({ action: 'wake', workloadId, wakeId });
       return next;
@@ -36,20 +36,20 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
     }
   }
 
-  async function trigger(workloadId, cfg, run, kind) {
+  async function trigger(workloadId, cfg, run, kind, origin) {
     const t = now();
     switch (run.state) {
       case STATES.ASLEEP:
-        return startWake(workloadId, { state: STATES.ASLEEP }, run);
+        return startWake(workloadId, { state: STATES.ASLEEP }, run, origin);
       case STATES.FAILED:
         if ((run.failedAt ?? 0) > t - cfg.failedRetrySeconds * 1000) return run;
-        return startWake(workloadId, { state: STATES.FAILED }, run);
+        return startWake(workloadId, { state: STATES.FAILED }, run, origin);
       case STATES.WAKING:
         if ((run.wakeStartedAt ?? 0) > t - cfg.wakeTimeoutSeconds * 1000 - STUCK_GRACE_MS) return run;
         log.warn('WakeStuck', { workloadId, wakeId: run.wakeId });
-        return startWake(workloadId, { state: STATES.WAKING, wakeId: run.wakeId }, run);
+        return startWake(workloadId, { state: STATES.WAKING, wakeId: run.wakeId }, run, origin);
       case STATES.NAPPING:
-        await store.setPendingWake(workloadId);
+        if (await store.setPendingWake(workloadId)) log.info('PendingWake', { workloadId, trigger: origin });
         return run;
       case STATES.AWAKE:
         // Reaching the waker while awake is expected during the route grace window; later it means drift.
@@ -65,7 +65,7 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
     switch (run.state) {
       case STATES.ASLEEP:
       case STATES.FAILED:
-        return startWake(workloadId, { state: run.state }, run);
+        return startWake(workloadId, { state: run.state }, run, { kind: 'admin' });
       case STATES.NAPPING:
         await store.setPendingWake(workloadId);
         return run;
@@ -132,7 +132,7 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
     }
     const kind = classify(event);
     let run = initial;
-    if (kind !== 'no-wake') run = await trigger(workloadId, cfg, run, kind);
+    if (kind !== 'no-wake') run = await trigger(workloadId, cfg, run, kind, requestOrigin(event, kind));
     if (kind === 'normal' && !servable(run) && run.state !== STATES.FAILED && cfg.waitSeconds > 0) {
       run = await hold(workloadId, cfg, run);
     }

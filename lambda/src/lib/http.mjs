@@ -60,3 +60,15 @@ export function response(statusCode, headers, body = '') {
     body,
   };
 }
+
+// Who triggered a wake: for the logs (scanners and bots are the usual unwanted wakers).
+export function requestOrigin(event, kind) {
+  const forwarded = header(event, 'x-forwarded-for') ?? '';
+  return {
+    kind,
+    method: event.httpMethod,
+    path: String(event.path ?? '').slice(0, 200),
+    userAgent: String(header(event, 'user-agent') ?? '').slice(0, 200),
+    sourceIp: forwarded.split(',')[0].trim(),
+  };
+}

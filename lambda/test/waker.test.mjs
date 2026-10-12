@@ -188,3 +188,21 @@ test('a held request redirects only after the route grace window', async () => {
   assert.equal(res.statusCode, 307);
   assert.ok(clock.now() - start >= 17_000, `redirected after ${clock.now() - start} ms`);
 });
+
+test('logs the request that triggers a wake or a pending wake', async () => {
+  const entries = [];
+  const log = { info: (event, fields) => entries.push([event, fields]), warn() {}, error() {} };
+  const clock = fakeClock();
+  const cfg = testConfig({ waitSeconds: 0 });
+  const store = fakeStore({ config: cfg, run: { state: STATES.ASLEEP }, clock });
+  const handler = createWaker({ store, invokeController: async () => {}, prefix: 'dmt-dev-', now: clock.now, sleep: clock.sleep, newId: () => 'w1', log });
+  await handler(albEvent({ path: '/wp-login.php', headers: { 'user-agent': 'curl/8.4', 'x-forwarded-for': '198.51.100.7, 10.0.0.1' } }));
+  const [event, fields] = entries.find(([e]) => e === 'WakeRequested');
+  assert.equal(event, 'WakeRequested');
+  assert.deepEqual(fields.trigger, { kind: 'normal', method: 'GET', path: '/wp-login.php', userAgent: 'curl/8.4', sourceIp: '198.51.100.7' });
+
+  store.state.run.state = STATES.NAPPING;
+  await handler(albEvent({ path: '/', headers: { 'x-dormeto-probe': '1' } }));
+  const pending = entries.find(([e]) => e === 'PendingWake');
+  assert.equal(pending[1].trigger.kind, 'probe');
+});

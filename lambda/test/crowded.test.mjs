@@ -3,22 +3,29 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createController } from '../src/lib/controller-core.mjs';
-import { crowdedAccount } from './crowded-fake.mjs';
+import { crowdedAccount, withSdkRetries } from './crowded-fake.mjs';
 import { silentLog } from './fakes.mjs';
 import { simClock } from './sim-clock.mjs';
 
 const MINUTE = 60_000;
 const BUDGET_MS = 240_000;
 
-function setup({ workloads = 1500, balancers = 300, latencyMs = 400, lastRequest } = {}) {
+// queues: naps go to the work queue and repairs to the drift queue (routers 0.22.1 and later), recorded in `queued`.
+function setup({ workloads = 1500, balancers = 300, latencyMs = 400, lastRequest, elb, drifted, queues = false, log = silentLog } = {}) {
   const clock = simClock();
-  const account = crowdedAccount({ workloads, balancers, latencyMs, clock, lastRequest });
+  const account = crowdedAccount({ workloads, balancers, latencyMs, clock, lastRequest, elbBucket: elb, drifted });
   const { store, ...aws } = account.clients;
+  const retries = withSdkRetries(aws.elbv2, { now: clock.now, sleep: clock.sleep });
+  aws.elbv2 = retries.client;
+  const queued = { work: [], repair: [] };
+  const repairsInvoked = [];
+  const queueing = queues ? { queueWork: async (m) => { queued.work.push(m); }, queueRepair: async (m) => { queued.repair.push(m); } } : {};
   // The router reports to the manager after each check (its workloads as the list gives them).
   const reports = [];
   const publisher = { enabled: true, checked: async (report) => { reports.push(report); }, stateChanged: async () => {} };
   const handler = createController({
-    store, ...aws, invokeSelf: account.invokeSelf, now: clock.now, sleep: clock.sleep, log: silentLog, publisher,
+    store, ...aws, invokeSelf: account.invokeSelf, invokeOnboarder: async (p) => { repairsInvoked.push(p); }, ...queueing,
+    now: clock.now, sleep: clock.sleep, log, publisher,
     router: { name: 'dmtr-dev', region: 'eu-west-3', checkSchedule: 'rate(5 minutes)' },
   });
   // One check, as the schedule starts it; the next one starts 5 minutes after it.
@@ -31,7 +38,7 @@ function setup({ workloads = 1500, balancers = 300, latencyMs = 400, lastRequest
     clock.advance(Math.max(0, 5 * MINUTE - ms));
     return { result, ms, relisted };
   }
-  return { clock, account, handler, check, reports };
+  return { clock, account, handler, check, reports, retries, queued, repairsInvoked };
 }
 
 test('a crowded check lists each load balancer once, its report to the manager included, stays within its budget, and reaches every workload within a few checks', async () => {
@@ -82,4 +89,41 @@ test('the request metric is not read before the earliest time the workload can b
   await s.check();
   assert.equal(s.account.metricReads.w0000, 2);
   assert.ok(s.account.naps.includes('w0000'));
+});
+
+// Warnings and errors the controller logs, by event.
+function recordingLog() {
+  const events = [];
+  const record = (event) => events.push(event);
+  return { info() {}, warn: record, error: record, events };
+}
+
+test('a crowded check under ELB throttling (200 burst, 50 calls per second, 20 of them taken by the customer\'s tools) fails no call: the SDK\'s adaptive retries slow it down, within its budget', async () => {
+  const log = recordingLog();
+  // A fast API: the listings outrun the 30 calls per second left.
+  const s = setup({ latencyMs: 40, elb: { burst: 200, rate: 50, shared: 20 }, log });
+  const seen = new Set();
+  const durations = [];
+  while (seen.size < 1500 && durations.length < 4) {
+    const { result, ms } = await s.check();
+    for (const r of result) seen.add(r.workloadId);
+    durations.push(ms);
+  }
+  assert.ok(s.account.stats.throttled > 0, 'the bucket never ran dry: nothing was throttled');
+  assert.equal(s.retries.stats.failed, 0, 'an ELB call failed');
+  assert.deepEqual(log.events.filter((e) => e !== 'CheckBudgetReached'), []);
+  assert.equal(seen.size, 1500);
+  for (const ms of durations) assert.ok(ms <= BUDGET_MS + 5_000, `a check took ${ms / 1000} s`);
+});
+
+test('a crowded check of idle and drifted workloads queues every nap and repair: none runs in the check itself', async () => {
+  // 300 workloads idle for 6 hours, the first 10 onboarded by the manager with a rule that lost its waker.
+  const s = setup({ workloads: 300, balancers: 60, latencyMs: 100, drifted: 10, queues: true });
+  const { result, ms } = await s.check();
+  assert.equal(result.length, 300);
+  assert.equal(s.queued.work.length, 300);
+  assert.ok(s.queued.work.every((m) => m.action === 'nap'));
+  assert.deepEqual(s.queued.repair.map((m) => m.workloadId).sort(), s.account.ids.slice(0, 10));
+  assert.deepEqual([s.account.naps, s.repairsInvoked], [[], []]);
+  assert.ok(ms <= BUDGET_MS, `the check took ${ms / 1000} s`);
 });

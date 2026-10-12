@@ -1,10 +1,10 @@
 variable "router" {
   description = "Outputs of the router module."
   type = object({
-    name                = string
-    table_name          = string
-    waker_function_name = string
-    waker_function_arn  = string
+    name               = string
+    table_name         = string
+    waker_function_arn = string
+    waker_permission   = string
   })
 }
 
@@ -13,6 +13,16 @@ variable "workload_id" {
   validation {
     condition     = can(regex("^[a-z0-9-]{1,20}$", var.workload_id))
     error_message = "workload_id must be 1-20 characters of lower-case letters, digits and hyphens (target group name limit)."
+  }
+}
+
+variable "name" {
+  description = "Name shown to people (manager, admin page); never in a resource name. Defaults to workload_id."
+  type        = string
+  default     = null
+  validation {
+    condition     = var.name == null || (length(trimspace(var.name)) > 0 && length(var.name) <= 64)
+    error_message = "name must have 1 to 64 characters."
   }
 }
 

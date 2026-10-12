@@ -72,7 +72,8 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
       allow(['ec2:CreateTags', 'ec2:DeleteTags', 'autoscaling:CreateOrUpdateTags', 'autoscaling:DeleteTags', 'ecs:TagResource', 'ecs:UntagResource', 'rds:AddTagsToResource', 'rds:RemoveTagsFromResource'], [
         arn('ec2', 'instance/*'), arn('autoscaling', 'autoScalingGroup:*:autoScalingGroupName/*'), arn('ecs', 'service/*/*'), arn('rds', 'db:*'), arn('rds', 'cluster:*'),
       ], onboarderTagKeys),
-      allow(['lambda:AddPermission', 'lambda:RemovePermission'], [functionArn('waker')]),
+      // A per-workload invoke permission of a router older than 0.20.0, removed at offboarding.
+      allow(['lambda:RemovePermission'], [functionArn('waker')]),
       allow(['logs:CreateLogStream', 'logs:PutLogEvents'], [logArn('onboarder')]),
     ),
   };
@@ -116,6 +117,12 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
         environment: { ...common, DMT_WAKER_FUNCTION: fn('waker'), DMT_WAKER_FUNCTION_ARN: functionArn('waker') },
       },
     ].map((f) => ({ ...f, roleArn: roleArn(f.key), runtime: 'nodejs24.x', architectures: ['arm64'] })),
+    // The load balancers of the account invoke the waker from the router's waker target groups (<name>-<workload id>):
+    // one statement whatever the number of workloads (a function's resource policy is limited to 20 KB).
+    wakerPermission: {
+      function: fn('waker'), statementId: 'alb-waker', principal: 'elasticloadbalancing.amazonaws.com',
+      sourceArn: `arn:${p.partition}:elasticloadbalancing:${p.region}:${p.account}:targetgroup/${p.name}-*/*`,
+    },
     // Drift repair: CloudTrail events on rules, target groups and workload tags, not caused by the router, to the onboarder.
     eventRule: {
       name: `${p.name}-drift`, pattern: JSON.stringify(driftPattern).replaceAll('${name}', p.name).replaceAll('${partition}', p.partition).replaceAll('${account}', p.account), target: functionArn('onboarder'),
@@ -140,7 +147,7 @@ export function routerBoundary({ p = PLACEHOLDERS } = {}) {
       { Sid: 'RouterQueues', Effect: 'Allow', Action: ['sqs:SendMessage', 'sqs:GetQueueAttributes'], Resource: any('sqs', 'dmtr-*') },
       { Sid: 'RouterFunctions', Effect: 'Allow', Action: ['lambda:InvokeFunction'], Resource: any('lambda', 'function:dmtr-*') },
       // Onboarding lets the load balancer invoke the waker.
-      { Sid: 'WakerPermissions', Effect: 'Allow', Action: ['lambda:AddPermission', 'lambda:RemovePermission'], Resource: any('lambda', 'function:dmtr-*-waker') },
+      { Sid: 'WakerPermissions', Effect: 'Allow', Action: ['lambda:RemovePermission'], Resource: any('lambda', 'function:dmtr-*-waker') },
       { Sid: 'RouterLogs', Effect: 'Allow', Action: ['logs:CreateLogStream', 'logs:PutLogEvents'], Resource: any('logs', 'log-group:/aws/lambda/dmtr-*') },
       {
         Sid: 'Workloads', Effect: 'Allow',

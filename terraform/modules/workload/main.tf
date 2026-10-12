@@ -26,18 +26,10 @@ resource "aws_lb_target_group" "waker" {
   lambda_multi_value_headers_enabled = true
 }
 
-resource "aws_lambda_permission" "alb" {
-  statement_id  = "alb-${var.workload_id}"
-  action        = "lambda:InvokeFunction"
-  function_name = var.router.waker_function_name
-  principal     = "elasticloadbalancing.amazonaws.com"
-  source_arn    = aws_lb_target_group.waker.arn
-}
-
+# The router's permission (alb-waker, router 0.20.0) lets the load balancers invoke the waker from this target group.
 resource "aws_lb_target_group_attachment" "waker" {
   target_group_arn = aws_lb_target_group.waker.arn
   target_id        = var.router.waker_function_arn
-  depends_on       = [aws_lambda_permission.alb]
 }
 
 resource "aws_dynamodb_table_item" "config" {
@@ -49,6 +41,7 @@ resource "aws_dynamodb_table_item" "config" {
     sk = { S = "CFG" }
     config = { S = jsonencode({
       workloadId              = var.workload_id
+      name                    = coalesce(var.name, var.workload_id)
       ruleArns                = local.rule_arns
       ruleArn                 = try(local.rule_arns[0], null)
       appTargetGroupArn       = var.app_target_group_arn

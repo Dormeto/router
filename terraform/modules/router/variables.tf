@@ -1,6 +1,11 @@
 variable "name" {
   description = "Resource name prefix, for example dmt-dev."
   type        = string
+  validation {
+    # Waker target groups are <name>-<16-character workload id>, within the 32 characters of a target group name.
+    condition     = length(var.name) <= 15
+    error_message = "name must have at most 15 characters (waker target groups <name>-<workload id>)."
+  }
 }
 
 variable "lambda_source_dir" {

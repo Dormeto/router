@@ -204,6 +204,16 @@ resource "aws_sqs_queue" "check_failures" {
   sqs_managed_sse_enabled   = true
 }
 
+# The load balancers of the account invoke the waker from the router's waker target groups (<name>-<workload id>): one
+# statement whatever the number of workloads (a function's resource policy is limited to 20 KB). Design section 7.
+resource "aws_lambda_permission" "waker_alb" {
+  statement_id  = "alb-waker"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.waker.function_name
+  principal     = "elasticloadbalancing.amazonaws.com"
+  source_arn    = "${local.arn_prefix}:elasticloadbalancing:${local.region}:${local.account_id}:targetgroup/${var.name}-*/*"
+}
+
 # Drift repair (vision docs/specs/2026-10-05-onboarding-design.md, R4c): CloudTrail events on rules, target groups and the
 # dormeto:workload tags, not caused by the router itself (its roles' sessions), invoke the onboarder (pattern shared with
 # the blueprint).
@@ -211,7 +221,7 @@ resource "aws_cloudwatch_event_rule" "drift" {
   name        = "${var.name}-drift"
   description = "Dormeto: rules, target groups and workload tags changed outside the router"
   event_pattern = replace(replace(replace(file("${path.module}/../../../install/drift-pattern.json"),
-    "$${name}", var.name), "$${partition}", data.aws_partition.current.partition), "$${account}", local.account_id)
+  "$${name}", var.name), "$${partition}", data.aws_partition.current.partition), "$${account}", local.account_id)
 }
 
 resource "aws_cloudwatch_event_target" "drift" {

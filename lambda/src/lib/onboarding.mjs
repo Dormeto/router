@@ -1,6 +1,8 @@
 // Onboarding (R4a): preview, onboard and offboard a workload from its application target group, in the router's account
 // and region. Every step finds what exists before changing anything, so an action can run again; offboarding removes only
 // what onboarding added (tags carry the dormeto:tagged marker), never what the customer set.
+import { createHash } from 'node:crypto';
+import { checkName } from './names.mjs';
 import { cleanConditions, forwardTargetGroups, listRules, passable, ruleTags, sameConditions, shadowGap, unshadowable } from './rules.mjs';
 import { conditionsOf } from './route.mjs';
 
@@ -14,6 +16,10 @@ const MARKER = 'onboarder';
 const GROUP_TAG = 'aws:autoscaling:groupName';
 const ID = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
 const NAME_MAX = 32;
+
+// The workload id of a target group (design section 7): 16 hexadecimal characters of the SHA-256 of its ARN. Unique per
+// router, as required, and across accounts in practice (the ARN carries the partition, region, account, name and id).
+export const workloadIdOf = (targetGroupArn) => createHash('sha256').update(targetGroupArn).digest('hex').slice(0, 16);
 // The workload module's defaults; a workload with databases waits longer for them to start.
 const DEFAULTS = { waitSeconds: 60, idleMinutes: 15, drainSeconds: 30, wakeTimeoutSeconds: 600, failedRetrySeconds: 60, maxHolders: 50, pollSeconds: 3, wakeMode: 'any' };
 const DATABASE_WAKE_TIMEOUT = 1800;
@@ -243,9 +249,12 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
   }
 
   // What onboarding would do, and why it cannot.
-  async function preview({ workloadId, targetGroupArn, settings, databases }) {
+  // Without an id, the one of the target group (an explicit id: workloads named before 0.20.0, direct use).
+  async function preview({ targetGroupArn, workloadId = targetGroupArn ? workloadIdOf(targetGroupArn) : undefined, name: wanted, settings, databases }) {
     const problems = [];
     const name = wakerName(workloadId ?? '');
+    const named = checkName(wanted);
+    if (named.problem) problems.push(named.problem);
     if (!ID.test(workloadId ?? '')) problems.push('workload id: lowercase letters, digits and hyphens, not starting or ending with a hyphen');
     else if (name.length > NAME_MAX) problems.push(`workload id too long: ${name} exceeds the ${NAME_MAX} characters of a target group name`);
     problems.push(...settingsProblems(settings));
@@ -256,7 +265,8 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
     if (owner) problems.push(`the target group is already workload ${owner.workloadId}`);
 
     const group = await targetGroup(targetGroupArn);
-    const result = { workloadId, targetGroupArn, wakerTargetGroupName: name, loadBalancerArn: null, rules: [], backends: [], databases: [] };
+    // The name people see: the one asked for, else the target group's.
+    const result = { workloadId, name: named.name || (group?.TargetGroupName ?? ''), targetGroupArn, wakerTargetGroupName: name, loadBalancerArn: null, rules: [], backends: [], databases: [] };
     if (!group) return { ...result, ok: false, problems: [...problems, 'target group not found'] };
     if (!['instance', 'ip'].includes(group.TargetType)) problems.push(`target type ${group.TargetType} is not supported`);
     const lbs = group.LoadBalancerArns ?? [];
@@ -313,8 +323,8 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
     else await rds.removeTagsFromResource({ ResourceName: b.arn, TagKeys: keys });
   }
 
-  async function onboard({ workloadId, targetGroupArn, settings = {}, databases = [], by }) {
-    const checked = await preview({ workloadId, targetGroupArn, settings, databases });
+  async function onboard({ targetGroupArn, workloadId = targetGroupArn ? workloadIdOf(targetGroupArn) : undefined, name, settings = {}, databases = [], by }) {
+    const checked = await preview({ workloadId, targetGroupArn, name, settings, databases });
     if (!checked.ok) throw new Error(`cannot onboard ${workloadId}: ${checked.problems.join('; ')}`);
     const steps = [];
     const step = (name, done, detail) => steps.push({ name, status: done ? 'done' : 'skipped', ...(detail ? { detail } : {}) });
@@ -344,21 +354,10 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
         step('waker target group', true, waker.TargetGroupName);
       } else step('waker target group', false, waker.TargetGroupName);
 
-      try {
-        changed = true;
-        await lambda.addPermission({
-          FunctionName: router.wakerFunctionName, StatementId: `alb-${workloadId}`, Action: 'lambda:InvokeFunction',
-          Principal: 'elasticloadbalancing.amazonaws.com', SourceArn: waker.TargetGroupArn,
-        });
-        step('invoke permission', true);
-      } catch (err) {
-        if (!notFound(err, 'ResourceConflictException')) throw err;
-        step('invoke permission', false);
-      }
-
+      // The router's own permission (alb-waker) lets the load balancers invoke the waker from its target groups.
       const { TargetHealthDescriptions = [] } = await elbv2.describeTargetHealth({ TargetGroupArn: waker.TargetGroupArn });
       const registered = TargetHealthDescriptions.some((d) => d.Target?.Id === router.wakerFunctionArn);
-      // A new invoke permission takes seconds to be seen by the load balancer: retry the registration meanwhile.
+      // A permission just created (a router just installed) takes seconds to be seen by the load balancer: retry meanwhile.
       for (let attempt = 1; !registered; attempt += 1) {
         try {
           await elbv2.registerTargets({ TargetGroupArn: waker.TargetGroupArn, Targets: [{ Id: router.wakerFunctionArn }] });
@@ -373,7 +372,7 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
       if (!(await store.getConfig(workloadId))) {
         const lb = checked.loadBalancerArn;
         await store.putConfig(workloadId, {
-          workloadId, appTargetGroupArn: targetGroupArn, wakerTargetGroupArn: waker.TargetGroupArn,
+          workloadId, name: checked.name, appTargetGroupArn: targetGroupArn, wakerTargetGroupArn: waker.TargetGroupArn,
           loadBalancerDimension: lb.slice(lb.indexOf('loadbalancer/') + 'loadbalancer/'.length), appTargetGroupDimension: targetGroupArn.split(':').at(-1),
           instanceIds: [], ...DEFAULTS, ...(databases.length ? { wakeTimeoutSeconds: DATABASE_WAKE_TIMEOUT } : {}), ...settings,
           noWakeRules: [], wakeRules: [], admin: { enabled: false, secretHash: '', secretParameter: '' },
@@ -386,7 +385,7 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
       const applied = await applyRules({ ...group, LoadBalancerArns: [checked.loadBalancerArn] }, workloadId, waker.TargetGroupArn, { app: 1, waker: 0 });
       step('instrument rules', applied.length > 0, applied.map((a) => a.detail).join(', '));
       log.info('Onboarded', { workloadId, targetGroupArn, by, steps: steps.filter((s) => s.status === 'done').map((s) => s.name) });
-      return { steps, workload: { workloadId, wakerTargetGroupArn: waker.TargetGroupArn } };
+      return { steps, workload: { workloadId, name: checked.name, wakerTargetGroupArn: waker.TargetGroupArn } };
     } catch (err) {
       if (!fresh || !changed) throw err;
       // Undo: whatever was done is removed, step by step, going on after a failed step.

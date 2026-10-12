@@ -11,6 +11,7 @@ export const totals = (stats) => (stats ? { ignored: sum(stats.total.ignored), d
 export function workloadSummary(cfg, run = {}, host = null, stats7d = null, pauses = []) {
   return {
     workloadId: cfg.workloadId,
+    name: cfg.name ?? cfg.workloadId,
     // Written by the Terraform workload module, or onboarded by the manager (only those are offboarded by it).
     source: cfg.source ?? 'terraform',
     state: run?.state ?? 'UNKNOWN',

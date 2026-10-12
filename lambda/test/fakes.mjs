@@ -46,6 +46,11 @@ export function fakeStore({ config, run, clock }) {
   return {
     state,
     async getConfig(id) { return id === config.workloadId ? structuredClone(config) : null; },
+    async putConfig(id, next) {
+      if (id !== config.workloadId) return;
+      for (const key of Object.keys(config)) delete config[key];
+      Object.assign(config, structuredClone(next));
+    },
     async listConfigs() { return [structuredClone(config)]; },
     async getRun(id) { return id === config.workloadId ? copy() : null; },
     async transition(id, { cond, set = {}, remove = [], increment = [] }) {

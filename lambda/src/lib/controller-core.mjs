@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { STATES } from './state.mjs';
+import { checkName } from './names.mjs';
 import { hostOf, setRoute } from './route.mjs';
 import { resolveRules } from './rules.mjs';
 import { healthyCount, waitTargetsReleased } from './instances.mjs';
@@ -420,6 +421,18 @@ export function createController({
     return results;
   }
 
+  // The name people see (design section 7), for a workload the manager onboarded (Terraform writes the others').
+  async function rename({ workloadId, name, by }) {
+    const cfg = await config(workloadId);
+    if (!cfg.source) throw new Error(`workload ${workloadId} was written by Terraform: set name in its workload module`);
+    const checked = checkName(name);
+    if (!checked.name) throw new Error('name: required');
+    if (checked.problem) throw new Error(checked.problem);
+    await store.putConfig(workloadId, { ...cfg, name: checked.name });
+    log.info('Renamed', { workloadId, name: checked.name, by });
+    return { workloadId, name: checked.name };
+  }
+
   async function ensureAwake(workloadId) {
     const cfg = await config(workloadId);
     const run = await store.getRun(workloadId);
@@ -633,6 +646,7 @@ export function createController({
       case 'pause': return pause(event);
       case 'resume': return resume(event);
       case 'request-nap': return requestNap(event);
+      case 'rename': return rename(event);
       case 'router': return routerInfo();
       default: throw new Error(`unknown action: ${event?.action}`);
     }

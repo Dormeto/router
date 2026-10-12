@@ -67,7 +67,7 @@ export function renderDashboard({ status, base, action }) {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <meta http-equiv="refresh" content="10; url=${escapeHtml(base)}/">
-<title>Dormeto · ${escapeHtml(status.workloadId)}</title>
+<title>Dormeto · ${escapeHtml(status.name ?? status.workloadId)}</title>
 <style>
 :root{color-scheme:light dark;--bg:#f7f7f8;--fg:#1d1d1f;--muted:#6b6b70;--line:#d9d9de;--accent:#5b5bd6}
 @media (prefers-color-scheme:dark){:root{--bg:#141416;--fg:#ececf0;--muted:#9a9aa3;--line:#2c2c31;--accent:#8f8ff0}}
@@ -85,7 +85,7 @@ button{font:inherit;padding:.4rem 1rem;border-radius:.4rem;border:1px solid var(
 </head>
 <body>
 <main>
-<h1>Dormeto · ${escapeHtml(status.workloadId)} <span class="state">${escapeHtml(status.state)}</span></h1>
+<h1>Dormeto · ${escapeHtml(status.name ?? status.workloadId)} <span class="state">${escapeHtml(status.state)}</span></h1>
 ${message ? `<p role="status">${escapeHtml(message)}</p>` : ''}
 <form method="post" action="${escapeHtml(base)}/nap"><button type="submit">Force nap</button></form>
 <form method="post" action="${escapeHtml(base)}/wake"><button type="submit">Force awake</button></form>

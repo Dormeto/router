@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createOnboarding } from '../src/lib/onboarding.mjs';
+import { createOnboarding, workloadIdOf } from '../src/lib/onboarding.mjs';
 import { LB, WAKER_ARN, fakeAccount } from './account-fake.mjs';
 
 const NOW = 1_791_158_400_000;
@@ -100,7 +100,7 @@ test('onboard tags the backend, creates and registers the waker target group, wr
   const s = setup();
   const result = await s.onboarding.onboard({ workloadId: 'shop', targetGroupArn: s.tg, settings: { idleMinutes: 30, wakeMode: 'browser' }, by: 'ops@example.com' });
   assert.deepEqual(result.steps.map((x) => [x.name, x.status]), [
-    ['tag backends', 'done'], ['waker target group', 'done'], ['invoke permission', 'done'], ['register waker', 'done'], ['workload configuration', 'done'], ['instrument rules', 'done'],
+    ['tag backends', 'done'], ['waker target group', 'done'], ['register waker', 'done'], ['workload configuration', 'done'], ['instrument rules', 'done'],
   ]);
   assert.deepEqual(s.a.state.instances.get('i-0aaa').tags, { Name: 'shop', [WORKLOAD]: 'shop', [MARKER]: 'onboarder' });
   const [wakerArn, waker] = [...s.a.state.targetGroups].find(([, g]) => g.name === 'dmt-dev-shop');
@@ -108,7 +108,8 @@ test('onboard tags the backend, creates and registers the waker target group, wr
   assert.deepEqual([waker.type, waker.tags, waker.attributes, waker.targets.map((t) => t.Id)], [
     'lambda', { [WORKLOAD]: 'shop', 'dormeto:router': 'dmt-dev' }, { 'lambda.multi_value_headers.enabled': 'true' }, [WAKER_ARN],
   ]);
-  assert.deepEqual(s.a.state.permissions.get('alb-shop'), { SourceArn: wakerArn });
+  // The router's own permission covers its waker target groups: the waker's policy does not grow with the workloads.
+  assert.equal(s.a.state.permissions.size, 0);
   // The customer's rules stay as their infrastructure as code wrote them; a Dormeto rule just before each.
   for (const rule of [s.main, s.statics]) {
     assert.deepEqual(weights(s.a, rule), [['shop-app', 1]]);
@@ -120,7 +121,7 @@ test('onboard tags the backend, creates and registers the waker target group, wr
   assert.deepEqual(shadowsOf(s.a)[1].conditions, [{ Field: 'host-header', HostHeaderConfig: { Values: ['shop.example.com'] } }]);
   const cfg = await s.a.store.getConfig('shop');
   assert.deepEqual({ ...cfg, onboardedAt: 'x' }, {
-    workloadId: 'shop', appTargetGroupArn: s.tg, wakerTargetGroupArn: wakerArn,
+    workloadId: 'shop', name: 'shop-app', appTargetGroupArn: s.tg, wakerTargetGroupArn: wakerArn,
     loadBalancerDimension: 'app/shop/50dc6c495c0c9188', appTargetGroupDimension: s.tg.split(':').at(-1),
     instanceIds: [], waitSeconds: 60, idleMinutes: 30, drainSeconds: 30, wakeTimeoutSeconds: 600, failedRetrySeconds: 60, maxHolders: 50, pollSeconds: 3,
     noWakeRules: [], wakeMode: 'browser', wakeRules: [], admin: { enabled: false, secretHash: '', secretParameter: '' },
@@ -135,19 +136,19 @@ test('onboard again finds everything in place and changes nothing', async () => 
   await s.onboarding.onboard({ workloadId: 'shop', targetGroupArn: s.tg, by: 'ops' });
   s.a.state.calls.length = 0;
   const again = await s.onboarding.onboard({ workloadId: 'shop', targetGroupArn: s.tg, by: 'ops' });
-  assert.deepEqual(again.steps.map((x) => x.status), ['skipped', 'skipped', 'skipped', 'skipped', 'skipped', 'skipped']);
+  assert.deepEqual(again.steps.map((x) => x.status), ['skipped', 'skipped', 'skipped', 'skipped', 'skipped']);
   assert.ok(!s.a.state.calls.some((c) => ['createTargetGroup', 'createTags', 'modifyRule', 'putConfig', 'addTags'].includes(c)), s.a.state.calls.join(', '));
 });
 
 test('an undo that fails part-way goes on with the other steps, and the next onboard finishes from what is left', async () => {
   const s = setup();
-  s.a.state.fail.addPermission = new Error('Rate exceeded');
+  s.a.state.fail.registerTargets = new Error('Rate exceeded');
   s.a.state.fail.deleteTargetGroup = new Error('Throttling');
   await assert.rejects(s.onboarding.onboard({ workloadId: 'shop', targetGroupArn: s.tg, by: 'ops' }),
     /cannot onboard shop: Rate exceeded \(undo incomplete: waker target group: Throttling\)/);
   assert.deepEqual(s.a.state.instances.get('i-0aaa').tags, { Name: 'shop' }, 'the undo went on after the failed step');
   const second = await s.onboarding.onboard({ workloadId: 'shop', targetGroupArn: s.tg, by: 'ops' });
-  assert.deepEqual(second.steps.map((x) => x.status), ['done', 'skipped', 'done', 'done', 'done', 'done']);
+  assert.deepEqual(second.steps.map((x) => x.status), ['done', 'skipped', 'done', 'done', 'done']);
 });
 
 test('onboard tags the listed databases as companions and waits longer for them', async () => {
@@ -185,6 +186,8 @@ test('offboard restores every rule, removes the waker target group, the permissi
   const s = setup();
   s.a.state.instances.get('i-0aaa').tags.team = 'shop';
   await s.onboarding.onboard({ workloadId: 'shop', targetGroupArn: s.tg, by: 'ops' });
+  // A per-workload permission left by a router older than 0.20.0.
+  await s.a.lambda.addPermission({ FunctionName: 'dmt-dev-waker', StatementId: 'alb-shop', Action: 'lambda:InvokeFunction', Principal: 'elasticloadbalancing.amazonaws.com', SourceArn: 'arn:x' });
   const result = await s.onboarding.offboard({ workloadId: 'shop', by: 'ops' });
   assert.deepEqual(result.steps.map((x) => [x.name, x.status]), [
     ['restore rules', 'done'], ['waker target group', 'done'], ['invoke permission', 'done'], ['untag backends', 'done'], ['workload configuration', 'done'],
@@ -231,11 +234,11 @@ test('offboard again, or of an unknown workload, finds nothing to do', async () 
 test('a failing onboard of a workload that already existed is not undone: the workload stays', async () => {
   const s = setup();
   await s.onboarding.onboard({ workloadId: 'shop', targetGroupArn: s.tg, by: 'ops' });
-  s.a.state.permissions.clear();
-  s.a.state.fail.addPermission = new Error('Rate exceeded');
+  s.a.state.rules.delete(shadowsOf(s.a)[0].arn);
+  s.a.state.fail.createRule = new Error('Rate exceeded');
   await assert.rejects(s.onboarding.onboard({ workloadId: 'shop', targetGroupArn: s.tg, by: 'ops' }), /^Error: Rate exceeded$/);
   assert.notEqual(await s.a.store.getConfig('shop'), null);
-  assert.equal(shadowsOf(s.a).length, 2);
+  assert.equal(shadowsOf(s.a).length, 1);
 });
 
 test('a failure while tagging the second backend undoes the first tag', async () => {
@@ -534,4 +537,42 @@ test('a second shadow of one rule (two repairs at once) is removed, the first on
   const result = await s.onboarding.repair({ workloadId: 'shop', by: 'event' });
   assert.deepEqual(kinds(result), ['shadow removed']);
   assert.deepEqual(shadowsOf(s.a).filter((x) => x.shadows === s.main).map((x) => x.arn), [first.arn]);
+});
+
+// --- R4d: workload identity and names --------------------------------------------------------------------------------
+
+test('a workload id is 16 hexadecimal characters of the SHA-256 of its target group ARN', () => {
+  // printf %s <arn> | shasum -a 256 | cut -c1-16
+  assert.equal(workloadIdOf('arn:aws:elasticloadbalancing:eu-west-1:121014831971:targetgroup/dmt-dev-onb-app/f371b534e0105480'), '7010ea54b5c02245');
+  // Same target group id in another account: another workload id.
+  assert.notEqual(workloadIdOf('arn:aws:elasticloadbalancing:eu-west-1:038606077307:targetgroup/dmt-dev-onb-app/f371b534e0105480'), '7010ea54b5c02245');
+});
+
+test('without an id, preview and onboard derive it from the target group and name the workload after it', async () => {
+  const s = setup();
+  const id = workloadIdOf(s.tg);
+  const preview = await s.onboarding.preview({ targetGroupArn: s.tg });
+  assert.deepEqual([preview.ok, preview.workloadId, preview.name, preview.wakerTargetGroupName], [true, id, 'shop-app', `dmt-dev-${id}`]);
+  const result = await s.onboarding.onboard({ targetGroupArn: s.tg, by: 'ops' });
+  assert.deepEqual([result.workload.workloadId, result.workload.name], [id, 'shop-app']);
+  const cfg = await s.a.store.getConfig(id);
+  assert.deepEqual([cfg.workloadId, cfg.name], [id, 'shop-app']);
+  assert.equal(s.a.state.instances.get('i-0aaa').tags[WORKLOAD], id);
+  // Run again: the same id finds what it created.
+  assert.ok((await s.onboarding.onboard({ targetGroupArn: s.tg, by: 'ops' })).steps.every((x) => x.status === 'skipped'));
+});
+
+test('a name given at onboarding is trimmed and checked: at most 64 characters, no control character', async () => {
+  const s = setup();
+  assert.equal((await s.onboarding.preview({ targetGroupArn: s.tg, name: '  Shop (front)  ' })).name, 'Shop (front)');
+  assert.equal((await s.onboarding.preview({ targetGroupArn: s.tg, name: '   ' })).name, 'shop-app');
+  assert.deepEqual((await s.onboarding.preview({ targetGroupArn: s.tg, name: 'x'.repeat(65) })).problems, ['name: at most 64 characters']);
+  assert.deepEqual((await s.onboarding.preview({ targetGroupArn: s.tg, name: 'a\nb' })).problems, ['name: no control characters']);
+});
+
+test('a derived id already used by another target group is refused', async () => {
+  const s = setup();
+  const id = workloadIdOf(s.tg);
+  s.a.items.set(`${id}/CFG`, { workloadId: id, appTargetGroupArn: 'arn:tg/other', source: 'manager' });
+  assert.deepEqual((await s.onboarding.preview({ targetGroupArn: s.tg })).problems, [`workload ${id} already exists with another target group`]);
 });

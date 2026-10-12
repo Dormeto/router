@@ -282,8 +282,9 @@ data "aws_iam_policy_document" "onboarder" {
       values   = local.onboarder_tag_keys
     }
   }
+  # A per-workload invoke permission of a router older than 0.20.0, removed at offboarding.
   statement {
-    actions   = ["lambda:AddPermission", "lambda:RemovePermission"]
+    actions   = ["lambda:RemovePermission"]
     resources = [aws_lambda_function.waker.arn]
   }
   statement {

@@ -37,3 +37,9 @@ output "onboarder_function_name" {
 output "onboarder_function_arn" {
   value = aws_lambda_function.onboarder.arn
 }
+
+# Workloads depend on it (the router object passed to the workload module): the waker target group is registered once
+# the load balancers may invoke the waker.
+output "waker_permission" {
+  value = aws_lambda_permission.waker_alb.statement_id
+}

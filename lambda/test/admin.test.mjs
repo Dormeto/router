@@ -335,3 +335,9 @@ test('status.json and the dashboard show the warm pool and the recommendations',
   assert.match(page, /asg-pool: running \(min 1, desired 1, max 2\), warm pool Running \(1, reuse on scale-in\)/);
   assert.match(page, /Recommendations<\/th><td>asg-pool: the warm pool keeps running instances/);
 });
+
+test('the dashboard is titled with the workload name', async () => {
+  const { handler } = setup({ run: { state: STATES.AWAKE, awakeSince: 0 }, cfg: testConfig({ name: 'Shop <front>', admin: { enabled: true, secretHash: hashSecret(SECRET) } }) });
+  const res = await handler(albEvent({ path: `${BASE}/` }));
+  assert.match(res.body, /<title>Dormeto · Shop &lt;front&gt;<\/title>/);
+});

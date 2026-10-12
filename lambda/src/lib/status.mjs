@@ -36,6 +36,8 @@ export function createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging
     const nap = pauses.length ? null : napEstimate({ cfg, run, lastRequest, now: t });
     return {
       workloadId,
+      // For people (design section 7); workloads named before 0.20.0 show their id.
+      name: cfg.name ?? workloadId,
       router: { version: version.version ?? 'unknown', build: version.build ?? 'unknown' },
       targetGroupArn: cfg.appTargetGroupArn,
       source: cfg.source ?? 'terraform',

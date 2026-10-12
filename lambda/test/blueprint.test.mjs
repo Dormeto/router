@@ -94,7 +94,7 @@ test('the boundary covers the resources of installed routers only (dmtr-*), neve
   const resources = routerBoundary().Statement.filter((s) => s.Sid !== 'Workloads').flatMap((s) => [].concat(s.Resource));
   assert.ok(resources.length > 0);
   for (const r of resources) assert.match(r, /:(table\/|function:|log-group:\/aws\/lambda\/|)dmtr-/, r);
-  const permissions = routerBoundary().Statement.find((s) => [].concat(s.Action).includes('lambda:AddPermission'));
+  const permissions = routerBoundary().Statement.find((s) => [].concat(s.Action).includes('lambda:RemovePermission'));
   assert.deepEqual([].concat(permissions.Resource), ['arn:${partition}:lambda:*:${account}:function:dmtr-*-waker']);
 });
 
@@ -123,4 +123,17 @@ test('every tag key the onboarder writes is allowed by its tag condition, in the
     assert.ok(terraform.includes(key), `module: ${key}`);
     assert.ok(blueprintKeys.includes(key), `blueprint: ${key}`);
   }
+});
+
+test('one permission lets the load balancers invoke the waker from every waker target group of the router', () => {
+  const b = fill(blueprint({ version: '0.20.0' }), VALUES);
+  assert.deepEqual(b.wakerPermission, {
+    function: 'dmtr-dev-waker', statementId: 'alb-waker', principal: 'elasticloadbalancing.amazonaws.com',
+    sourceArn: 'arn:aws:elasticloadbalancing:eu-west-3:121014831971:targetgroup/dmtr-dev-*/*',
+  });
+  // Onboarding no longer adds one per workload; it still removes one left by an older router.
+  const onboarder = blueprint({ version: 'x' }).roles.find((r) => r.key === 'onboarder').policy.Statement.flatMap((s) => [].concat(s.Action));
+  assert.ok(!onboarder.includes('lambda:AddPermission'));
+  assert.ok(onboarder.includes('lambda:RemovePermission'));
+  assert.ok(!routerBoundary().Statement.flatMap((s) => [].concat(s.Action)).includes('lambda:AddPermission'));
 });

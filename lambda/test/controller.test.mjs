@@ -829,3 +829,25 @@ test('list gives the last scheduled check and the schedule of the router', async
   assert.equal(router.lastScheduledCheckAt, new Date(s.clock.now()).toISOString());
   assert.equal(router.checkSchedule, 'rate(5 minutes)');
 });
+
+// --- R4d: names ------------------------------------------------------------------------------------------------------
+
+test('status and list give the workload name, its id when it has none', async () => {
+  const named = setup({ run: { state: STATES.AWAKE }, cfg: testConfig({ name: 'Demo shop', source: 'manager' }) });
+  assert.equal((await named.handler({ action: 'status', workloadId: 'demo' })).name, 'Demo shop');
+  assert.equal((await named.handler({ action: 'list' })).workloads[0].name, 'Demo shop');
+  const plain = setup({ run: { state: STATES.AWAKE } });
+  assert.equal((await plain.handler({ action: 'status', workloadId: 'demo' })).name, 'demo');
+});
+
+test('rename changes only the name of a workload the manager onboarded', async () => {
+  const s = setup({ run: { state: STATES.AWAKE }, cfg: testConfig({ name: 'Demo shop', source: 'manager' }) });
+  assert.deepEqual(await s.handler({ action: 'rename', workloadId: 'demo', name: '  Shop front ', by: 'ops' }), { workloadId: 'demo', name: 'Shop front' });
+  const cfg = await s.store.getConfig('demo');
+  assert.deepEqual([cfg.name, cfg.appTargetGroupArn], ['Shop front', testConfig().appTargetGroupArn]);
+  await assert.rejects(s.handler({ action: 'rename', workloadId: 'demo', name: 'x'.repeat(65), by: 'ops' }), /name: at most 64 characters/);
+  await assert.rejects(s.handler({ action: 'rename', workloadId: 'demo', name: ' ', by: 'ops' }), /name: required/);
+  await assert.rejects(s.handler({ action: 'rename', workloadId: 'nope', name: 'x', by: 'ops' }), /workload not configured: nope/);
+  const terraform = setup({ run: { state: STATES.AWAKE } });
+  await assert.rejects(terraform.handler({ action: 'rename', workloadId: 'demo', name: 'x', by: 'ops' }), /written by Terraform: set name in its workload module/);
+});

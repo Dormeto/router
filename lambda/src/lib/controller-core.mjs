@@ -408,6 +408,8 @@ export function createController({
     // Only the schedule proves that naps happen on their own: the e2e and operators also call check.
     if (source === 'schedule') {
       await store.recordScheduledCheck(now()).catch((err) => log.warn('CheckRecordFailed', { error: err.message }));
+      // Measured before the work: a check that dies (its timeout lands it in the failure queue) still refreshes it.
+      await storedHealth(now(), { refresh: true });
     }
     await requestListRefresh();
     const pauses = await activePauses();
@@ -422,7 +424,6 @@ export function createController({
         results.push({ workloadId: cfg.workloadId, error: err.message });
       }
     }
-    if (source === 'schedule') await storedHealth(now(), { refresh: true });
     await report(started);
     return results;
   }
@@ -588,10 +589,11 @@ export function createController({
     await store.putHealth?.(measured).catch((err) => log.warn('HealthNotStored', { error: err.message }));
     return measured;
   }
-  // The stored health; measured when there is none, or when refreshing (the scheduled check) and it is 15 minutes old.
+  // The stored health; measured when there is none, when refreshing (the scheduled check) and it is 15 minutes old, or
+  // on read once it is 30 minutes old (the scheduled checks that store it are not running).
   async function storedHealth(t, { refresh = false } = {}) {
     const stored = await store.getHealth?.().catch(() => null);
-    if (stored && !(refresh && t - stored.at >= HEALTH_REFRESH_MS)) return stored;
+    if (stored && t - stored.at < (refresh ? HEALTH_REFRESH_MS : 2 * HEALTH_REFRESH_MS)) return stored;
     return measure(t);
   }
   // Concurrent executions a burst can need: the largest maxHolders, plus the controller and other invocations.

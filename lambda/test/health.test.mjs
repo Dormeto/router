@@ -179,6 +179,22 @@ test('router action reads the health the scheduled check stores: metrics and que
   assert.equal(s.cloudwatch.calls.length, 2);
 });
 
+test('a scheduled check measures the health before its work, so one that dies still does; an old health is measured on read', async () => {
+  const s = setup();
+  await s.handler({ action: 'router' });
+  s.clock.advance(16 * 60_000);
+  // The check dies in its work (a timeout lands it in the failure queue): the health was measured first.
+  const listConfigs = s.store.listConfigs;
+  s.store.listConfigs = async () => { throw new Error('timed out'); };
+  await assert.rejects(s.handler({ action: 'check', source: 'schedule' }), /timed out/);
+  s.store.listConfigs = listConfigs;
+  assert.equal(s.cloudwatch.calls.length, 2);
+  // No scheduled check stored a health for more than 30 minutes: a read measures it.
+  s.clock.advance(31 * 60_000);
+  await s.handler({ action: 'router' });
+  assert.equal(s.cloudwatch.calls.length, 3);
+});
+
 test('router action reports the concurrency limit of the region against the largest maxHolders', async () => {
   const s = setup({ concurrency: 10 });
   const info = await s.handler({ action: 'router' });

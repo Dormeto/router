@@ -58,8 +58,11 @@ export function createPublisher({ events, busArn, router, log }) {
   };
 }
 
+// A transition waits this long at most for its publish: the waker's transitions are on the path of a wake.
+export const PUBLISH_BUDGET_MS = 1000;
+
 // The store, with every successful state transition published (controller and waker): one place, none missed.
-export function withTransitionEvents(store, publisher, { now = Date.now, log = null } = {}) {
+export function withTransitionEvents(store, publisher, { now = Date.now, log = null, budgetMs = PUBLISH_BUDGET_MS } = {}) {
   return Object.assign(Object.create(store), store, {
     async transition(workloadId, spec) {
       const next = await store.transition(workloadId, spec);
@@ -67,10 +70,16 @@ export function withTransitionEvents(store, publisher, { now = Date.now, log = n
       if (next && to) {
         const from = typeof spec.cond?.state === 'string' ? spec.cond.state : null;
         const change = { workloadId, from, to, at: new Date(now()).toISOString(), ...(spec.set.wakeId ? { wakeId: spec.set.wakeId } : {}) };
+        let timer;
+        const slow = new Promise((resolve) => { timer = setTimeout(() => resolve('slow'), budgetMs); });
         try {
-          await publisher.stateChanged(change);
+          // A slower publish goes on, unwaited; the next check sends the state anyway.
+          const outcome = await Promise.race([publisher.stateChanged(change), slow]);
+          if (outcome === 'slow') log?.warn('PublishSlow', { what: 'state', workloadId, budgetMs });
         } catch (err) {
           log?.warn('PublishFailed', { what: 'state', error: err.message });
+        } finally {
+          clearTimeout(timer);
         }
       }
       return next;

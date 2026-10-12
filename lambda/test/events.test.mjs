@@ -90,3 +90,13 @@ test('every successful state transition is published once; a failed transition o
   assert.deepEqual(await failing.transition('a', { cond: { state: 'NAPPING' }, set: { state: 'ASLEEP' } }), { state: 'ASLEEP' });
   assert.equal(wrapped.getRun, store.getRun, 'the other methods are the store\'s');
 });
+
+test('a publish that hangs holds a transition (a wake) no longer than its budget', async () => {
+  const next = { state: 'WAKING' };
+  const store = { transition: async () => next };
+  const log = logs();
+  const wrapped = withTransitionEvents(store, { stateChanged: () => new Promise(() => {}) }, { now: () => 0, log, budgetMs: 20 });
+  const outcome = await Promise.race([wrapped.transition('a', { cond: { state: 'ASLEEP' }, set: { state: 'WAKING' } }), new Promise((r) => setTimeout(() => r('hung'), 500))]);
+  assert.deepEqual(outcome, next);
+  assert.ok(log.lines.some(([level, event, data]) => level === 'warn' && event === 'PublishSlow' && data.budgetMs === 20));
+});

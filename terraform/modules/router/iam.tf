@@ -115,7 +115,7 @@ data "aws_iam_policy_document" "controller" {
     resources = ["${local.arn_prefix}:cognito-idp:${local.region}:${local.account_id}:userpool/*"]
   }
   statement {
-    actions   = ["autoscaling:DescribeAutoScalingGroups", "tag:GetResources", "ecs:DescribeServices", "application-autoscaling:DescribeScalableTargets", "rds:DescribeDBInstances", "rds:DescribeDBClusters"]
+    actions   = ["autoscaling:DescribeAutoScalingGroups", "autoscaling:DescribeScalingActivities", "tag:GetResources", "ecs:DescribeServices", "application-autoscaling:DescribeScalableTargets", "rds:DescribeDBInstances", "rds:DescribeDBClusters"]
     resources = ["*"]
   }
   statement {

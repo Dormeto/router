@@ -961,3 +961,36 @@ test('a recovery to AWAKE clears the failure; a recovery to ASLEEP keeps it (the
   assert.equal(asleep.store.state.run.state, STATES.ASLEEP);
   assert.equal(asleep.store.state.run.failure, '{"kind":"timeout"}');
 });
+
+test('wake (asg): a failed launch ends the wake at once with its kind, not at the timeout (R7a)', async () => {
+  const s = asgSetup({
+    run: { state: STATES.WAKING, wakeId: 'w1', napBackends: JSON.stringify([{ kind: 'asg', name: 'asg-demo', min: 1, max: 3, desired: 1 }]) },
+    desired: 0, target: 'waker', healthy: 0,
+  });
+  s.store.state.run.wakeStartedAt = s.clock.now();
+  s.autoscaling.describeScalingActivities = async () => ({ Activities: [{
+    StartTime: new Date(s.clock.now() + 1000), StatusCode: 'Failed',
+    StatusMessage: 'We currently do not have sufficient t3.micro capacity in the Availability Zone you requested (eu-west-1a).',
+  }] });
+  const started = s.clock.now();
+  const result = await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' });
+  assert.equal(result.state, STATES.FAILED);
+  const failure = JSON.parse(s.store.state.run.failure);
+  assert.deepEqual([failure.kind, failure.backend], ['capacity', 'asg:asg-demo']);
+  assert.ok(s.clock.now() - started < 60_000, 'within a minute, not at the 10-minute timeout');
+});
+
+test('wake: at the timeout, the targets say why (unhealthy) (R7a)', async () => {
+  const s = setup({ run: { state: STATES.WAKING, wakeId: 'w1' }, instance: 'stopped', target: 'waker', healthy: 0 });
+  s.store.state.run.wakeStartedAt = s.clock.now();
+  const describe = s.elbv2.describeTargetHealth;
+  s.elbv2.describeTargetHealth = async (input) => {
+    const out = await describe(input);
+    const described = out.TargetHealthDescriptions?.length ? out.TargetHealthDescriptions : [{ Target: { Id: 'i-0123456789abcdef0' } }];
+    return { TargetHealthDescriptions: described.map((d) => ({ ...d, TargetHealth: d.TargetHealth?.State === 'healthy' ? d.TargetHealth : { State: 'unhealthy', Reason: 'Target.FailedHealthChecks', Description: 'Health checks failed' } })) };
+  };
+  await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' });
+  const failure = JSON.parse(s.store.state.run.failure);
+  assert.equal(failure.kind, 'unhealthy');
+  assert.match(failure.message, /none healthy: Target\.FailedHealthChecks/);
+});

@@ -8,6 +8,7 @@ import { createStatus } from './status.mjs';
 import { describeRules } from './no-wake.mjs';
 import { describeStoredLists } from './list-cache.mjs';
 import { failedSpec, failureError } from './failures.mjs';
+import { createWakeWatch, unhealthyError } from './wake-watch.mjs';
 import { STATS_DAYS, totals, workloadSummary } from './summary.mjs';
 import { lastRequestAt } from './metrics.mjs';
 import { checkScope } from './check-scope.mjs';
@@ -115,9 +116,15 @@ export function createController({
     const wakeDeadline = (run.wakeStartedAt ?? now()) + cfg.wakeTimeoutSeconds * 1000;
     const timing = { sleep, now, deadline: Math.min(wakeDeadline, budgetEnd) };
     try {
-      await wakeBackends(clients, await wakeRecords(run, cfg), timing);
+      const records = await wakeRecords(run, cfg);
+      await wakeBackends(clients, records, timing);
+      // Launch and placement failures end the wake when AWS reports them, not at its timeout (R7a).
+      const watch = createWakeWatch(clients, records, { since: run.wakeStartedAt ?? now(), now });
       while ((await healthyCount(elbv2, cfg.appTargetGroupArn)) < 1) {
-        if (now() >= timing.deadline) throw new Error('wake timeout: no healthy target');  // or Lambda time budget
+        const seen = await watch.check();
+        if (seen) throw seen;
+        if (now() >= wakeDeadline) throw await unhealthyError(elbv2, cfg.appTargetGroupArn);
+        if (now() >= timing.deadline) throw new Error('wake timeout: no healthy target');  // the Lambda time budget
         await sleep(HEALTH_POLL_MS);
       }
       if (!(await current())) return superseded();

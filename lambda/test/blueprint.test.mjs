@@ -257,3 +257,9 @@ test('the forwarder\'s pattern: the ELB calls that change what discovery reads, 
     'arn:aws:sts::121014831971:assumed-role/dmtr-', 'arn:aws:sts::121014831971:assumed-role/dmt-', 'arn:aws:sts::121014831971:assumed-role/DmtCommandRole/',
   ] } }] });
 });
+
+test('the controller may read Auto Scaling activities (a wake sees failed launches, R7a), in the blueprint and the module', async () => {
+  const b = blueprint({ version: '0.25.0' });
+  assert.ok(actionsOf(b.roles.find((r) => r.key === 'controller').policy).includes('autoscaling:DescribeScalingActivities'));
+  assert.ok((await terraformActions()).controller.includes('autoscaling:DescribeScalingActivities'));
+});

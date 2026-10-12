@@ -52,7 +52,7 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
       allow(['elasticloadbalancing:ModifyRule'], [arn('elasticloadbalancing', 'listener-rule/app/*')], tagged),
       // ELB checks it when a rule's actions authenticate with Amazon Cognito (the rule switched with its actions).
       allow(['cognito-idp:DescribeUserPoolClient'], [arn('cognito-idp', 'userpool/*')]),
-      allow(['autoscaling:DescribeAutoScalingGroups', 'tag:GetResources', 'ecs:DescribeServices', 'application-autoscaling:DescribeScalableTargets', 'rds:DescribeDBInstances', 'rds:DescribeDBClusters'], ['*']),
+      allow(['autoscaling:DescribeAutoScalingGroups', 'autoscaling:DescribeScalingActivities', 'tag:GetResources', 'ecs:DescribeServices', 'application-autoscaling:DescribeScalableTargets', 'rds:DescribeDBInstances', 'rds:DescribeDBClusters'], ['*']),
       allow(['rds:StartDBInstance', 'rds:StopDBInstance', 'rds:StartDBCluster', 'rds:StopDBCluster'], [arn('rds', 'db:*'), arn('rds', 'cluster:*')], tagged),
       allow(['ecs:UpdateService'], [arn('ecs', 'service/*/*')], tagged),
       allow(['application-autoscaling:RegisterScalableTarget'], [arn('application-autoscaling', 'scalable-target/*')]),

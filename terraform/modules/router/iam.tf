@@ -40,7 +40,7 @@ data "aws_iam_policy_document" "waker" {
     for_each = var.admin_enabled ? [1] : []
     content {
       sid       = "AdminDashboardRead"
-      actions   = ["ec2:DescribeInstances", "elasticloadbalancing:DescribeRules", "elasticloadbalancing:DescribeTargetHealth", "cloudwatch:GetMetricData", "autoscaling:DescribeAutoScalingGroups", "tag:GetResources", "ecs:DescribeServices", "application-autoscaling:DescribeScalableTargets"]
+      actions   = ["ec2:DescribeInstances", "elasticloadbalancing:DescribeRules", "elasticloadbalancing:DescribeTargetHealth", "cloudwatch:GetMetricData", "autoscaling:DescribeAutoScalingGroups", "tag:GetResources", "ecs:DescribeServices", "application-autoscaling:DescribeScalableTargets", "rds:DescribeDBInstances", "rds:DescribeDBClusters"]
       resources = ["*"]
     }
   }
@@ -86,8 +86,18 @@ data "aws_iam_policy_document" "controller" {
     }
   }
   statement {
-    actions   = ["autoscaling:DescribeAutoScalingGroups", "tag:GetResources", "ecs:DescribeServices", "application-autoscaling:DescribeScalableTargets"]
+    actions   = ["autoscaling:DescribeAutoScalingGroups", "tag:GetResources", "ecs:DescribeServices", "application-autoscaling:DescribeScalableTargets", "rds:DescribeDBInstances", "rds:DescribeDBClusters"]
     resources = ["*"]
+  }
+  statement {
+    actions   = ["rds:StartDBInstance", "rds:StopDBInstance", "rds:StartDBCluster", "rds:StopDBCluster"]
+    resources = ["${local.arn_prefix}:rds:${local.region}:${local.account_id}:db:*", "${local.arn_prefix}:rds:${local.region}:${local.account_id}:cluster:*"]
+    # Only databases onboarded in Dormeto (tagged dormeto:workload).
+    condition {
+      test     = "Null"
+      variable = "aws:ResourceTag/dormeto:workload"
+      values   = ["false"]
+    }
   }
   statement {
     actions   = ["ecs:UpdateService"]

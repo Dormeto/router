@@ -50,6 +50,7 @@ locals {
   domain     = "${var.env}.${var.zone_name}"
   asg_domain = "asg.${local.domain}"
   ecs_domain = "ecs.${local.domain}"
+  rds_domain = "rds.${local.domain}"
 }
 
 variable "admin_dashboard_enabled" {

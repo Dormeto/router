@@ -93,6 +93,25 @@ today and the last 7 days. With `metrics_enabled` on the `router` module, the sa
 metrics `IgnoredRequests`, `DeferredRequests` and `Wakes` (namespace `Dormeto`, dimensions `Router`, `WorkloadId`)
 through the embedded metric format of the log lines: no API call, about 0.30 USD per metric and month.
 
+**Pause** (router management): a router or a workload can be paused, with a reason, its author and an optional
+automatic resume (`until`, at most 366 days ahead). A paused workload, or every workload of a paused router, is never
+napped: the idle check skips it and a nap request is refused (`SKIPPED`, reason `paused`, also when the pause arrives
+during the drain); the reconcile still runs and requests still wake. Pausing wakes the asleep and failed workloads (a
+napping one gets a pending wake) unless `keepAsleep`. Pauses live in the state table (`ROUTER / PAUSE`,
+`WL#<id> / PAUSE`, and `WL#<id> / PAUSE#<exclusion>` for a manager exclusion), never in the configuration item that
+Terraform writes; an expired pause no longer counts and the next idle check deletes it (`PauseExpired`). The manager
+pauses and resumes from its Routers and workload views:
+
+```bash
+aws lambda invoke --function-name dmt-dev-controller --cli-binary-format raw-in-base64-out --payload '{"action":"pause","workloadId":"demo","by":"ops@example.com","reason":"load test","until":"2026-10-06T08:00:00Z"}' /dev/stdout
+aws lambda invoke --function-name dmt-dev-controller --cli-binary-format raw-in-base64-out --payload '{"action":"resume","workloadId":"demo","by":"ops@example.com"}' /dev/stdout
+```
+
+**Health** (`router` action, manager Routers view): the last scheduled idle check (late after three periods: an error,
+workloads do not nap), Lambda errors and throttles of the controller and the waker over 24 hours and the waker's peak
+concurrency, messages waiting in the `check-failures` and `controller-failures` queues, IP lists' last download, failed
+workloads; and the router configuration with its source (`terraform`). Metrics and queues are read at most once a minute.
+
 The `dev` environment has four workloads: `demo` (one EC2 instance, `https://dev.dormeto.com/`), `demo-asg` (an Auto
 Scaling group, `https://asg.dev.dormeto.com/`), `demo-ecs` (an ECS Fargate service in browser wake mode, `https://ecs.dev.dormeto.com/`) and
 `demo-rds` (an ECS Fargate service with a PostgreSQL instance, `https://rds.dev.dormeto.com/`).

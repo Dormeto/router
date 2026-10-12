@@ -77,6 +77,10 @@ resource "aws_lambda_function" "controller" {
       DMT_TG_PREFIX      = "${var.name}-"
       DMT_NO_WAKE_RULES  = jsonencode(local.no_wake_rules)
       DMT_CHECK_SCHEDULE = var.check_schedule
+      # Router health and configuration (manager Routers view): the waker's metrics, the failure queues.
+      DMT_METRICS        = tostring(var.metrics_enabled)
+      DMT_WAKER_FUNCTION = "${var.name}-waker"
+      DMT_FAILURE_QUEUES = jsonencode({ check = aws_sqs_queue.check_failures.url, controller = aws_sqs_queue.controller_failures.url })
     }
   }
 

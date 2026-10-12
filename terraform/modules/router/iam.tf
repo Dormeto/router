@@ -62,8 +62,8 @@ resource "aws_iam_role" "controller" {
 
 data "aws_iam_policy_document" "controller" {
   statement {
-    # Query: daily statistics (manager status and list).
-    actions   = ["dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:Scan", "dynamodb:Query"]
+    # Query: daily statistics (manager status and list). DeleteItem: pause records (resume, automatic resume).
+    actions   = ["dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:Scan", "dynamodb:Query", "dynamodb:DeleteItem"]
     resources = [aws_dynamodb_table.router.arn]
   }
   statement {
@@ -136,6 +136,11 @@ data "aws_iam_policy_document" "controller" {
   statement {
     actions   = ["sqs:SendMessage"]
     resources = [aws_sqs_queue.controller_failures.arn]
+  }
+  statement {
+    # Router health: messages waiting in the failure queues.
+    actions   = ["sqs:GetQueueAttributes"]
+    resources = [aws_sqs_queue.controller_failures.arn, aws_sqs_queue.check_failures.arn]
   }
   statement {
     actions   = ["logs:CreateLogStream", "logs:PutLogEvents"]

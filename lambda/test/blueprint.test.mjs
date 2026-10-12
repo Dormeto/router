@@ -160,12 +160,13 @@ test('the controller and the waker publish to the manager\'s event bus, within t
   assert.ok(PLACEHOLDERS.managerBus);
 });
 
-test('naps and router-pause wakes go to a queue the controller reads 10 at a time; drift events to one the onboarder reads in 60 s batches, 2 at a time', () => {
+test('naps and router-pause wakes go to a queue the controller reads 10 at a time; drift events to one the onboarder reads in 60 s batches, 2 at a time', async () => {
   const b = fill(blueprint({ version: '0.22.0' }), VALUES);
   const sqs = (name) => `arn:aws:sqs:eu-west-3:121014831971:${name}`;
   const queue = (key) => b.queues.find((q) => q.key === key);
   const failures = { queue: sqs('dmtr-dev-controller-failures'), maxReceiveCount: 3 };
-  assert.deepEqual(queue('work'), { key: 'work', name: 'dmtr-dev-work', retentionSeconds: 3600, managedEncryption: true, visibilityTimeoutSeconds: 960, deadLetter: failures });
+  // Kept 4 days: the wakes of a router pause wait their turn however many there are.
+  assert.deepEqual(queue('work'), { key: 'work', name: 'dmtr-dev-work', retentionSeconds: 345_600, managedEncryption: true, visibilityTimeoutSeconds: 960, deadLetter: failures });
   const drift = queue('drift');
   assert.deepEqual({ ...drift, policy: undefined }, { key: 'drift', name: 'dmtr-dev-drift', retentionSeconds: 86_400, managedEncryption: true, visibilityTimeoutSeconds: 360, deadLetter: failures, policy: undefined });
   // Only the router's drift rule sends to the drift queue.
@@ -177,6 +178,8 @@ test('naps and router-pause wakes go to a queue the controller reads 10 at a tim
     { key: 'work', function: 'dmtr-dev-controller', queue: sqs('dmtr-dev-work'), batchSize: 1, maximumBatchingWindowSeconds: 0, maximumConcurrency: 10, reportBatchItemFailures: true },
     { key: 'drift', function: 'dmtr-dev-onboarder', queue: sqs('dmtr-dev-drift'), batchSize: 100, maximumBatchingWindowSeconds: 60, maximumConcurrency: 2, reportBatchItemFailures: true },
   ]);
+  const module = await readFile(new URL('../../terraform/modules/router/main.tf', import.meta.url), 'utf8');
+  assert.match(module.match(/resource "aws_sqs_queue" "work" \{[\s\S]*?\n\}/)[0], /message_retention_seconds\s+=\s+345600/);
   assert.equal(b.functions.find((f) => f.key === 'controller').environment.DMT_WORK_QUEUE, 'https://sqs.eu-west-3.amazonaws.com/121014831971/dmtr-dev-work');
   const statements = (role) => b.roles.find((r) => r.key === role).policy.Statement;
   const allows = (role, action, resource) => statements(role).some((st) => [].concat(st.Action).includes(action) && [].concat(st.Resource).includes(resource));

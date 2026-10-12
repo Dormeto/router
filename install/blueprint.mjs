@@ -103,9 +103,10 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
     table: { name: table, hashKey: 'pk', rangeKey: 'sk', ttlAttribute: 'expiresAt', pointInTimeRecovery: true },
     queues: [
       ...['check-failures', 'controller-failures'].map((key) => ({ key, name: queue(key), retentionSeconds: 1_209_600, managedEncryption: true })),
-      // The work queue (scale design §6): naps and the wakes of a router pause, read by the controller 10 at a time; a
-      // message is refused after 10 minutes anyway, and visible again after the controller's 15 minutes.
-      { key: 'work', name: queue('work'), retentionSeconds: 3600, managedEncryption: true, visibilityTimeoutSeconds: 960, deadLetter: { queue: queueArn('controller-failures'), maxReceiveCount: 3 } },
+      // The work queue (scale design §6): naps and the wakes of a router pause, read by the controller 10 at a time; a nap
+      // is refused after 10 minutes anyway, a wake is kept 4 days (a router pause's wakes wait their turn however many);
+      // visible again after the controller's 15 minutes.
+      { key: 'work', name: queue('work'), retentionSeconds: 345_600, managedEncryption: true, visibilityTimeoutSeconds: 960, deadLetter: { queue: queueArn('controller-failures'), maxReceiveCount: 3 } },
       // Drift events of the router's rule, read by the onboarder in batches.
       {
         key: 'drift', name: queue('drift'), retentionSeconds: 86_400, managedEncryption: true, visibilityTimeoutSeconds: 360, deadLetter: { queue: queueArn('controller-failures'), maxReceiveCount: 3 },

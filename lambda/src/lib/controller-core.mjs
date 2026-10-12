@@ -36,6 +36,8 @@ const CHECK_CONCURRENCY = 8;
 const CHECK_LEASE_MS = 15 * 60_000;
 // A queued nap older than this is dropped: the next check decides again with fresh metrics.
 const NAP_MAX_AGE_MS = 10 * 60_000;
+// A queued nap that waited longer than this reads the requests made since it was asked for.
+const NAP_RECHECK_MS = 60_000;
 // Pauses (router management): automatic resume at most this far ahead, reason length.
 const PAUSE_MAX_MS = 366 * 86_400_000;
 const REASON_MAX = 256;
@@ -642,17 +644,33 @@ export function createController({
   // --- Work queue: naps and the wakes of a router pause ---------------------------------------------------------------
 
   // A nap the check (or the manager) queued: refused when the workload is no longer awake (delivered twice, or napped
-  // since), woke since it was asked for, or when it waited too long (the next check decides again).
+  // since), woke since it was asked for, had requests since (when it waited more than a minute), or when it waited too
+  // long (the next check decides again).
   async function queuedNap({ workloadId, requestedAt }) {
     const run = await store.getRun(workloadId);
-    const reason = run?.state !== STATES.AWAKE ? `not awake (${run?.state ?? 'UNKNOWN'})`
+    let reason = run?.state !== STATES.AWAKE ? `not awake (${run?.state ?? 'UNKNOWN'})`
       : (run.awakeSince ?? 0) > requestedAt ? 'woken since it was requested'
         : now() - requestedAt > NAP_MAX_AGE_MS ? `requested more than ${NAP_MAX_AGE_MS / 60_000} minutes ago` : null;
+    if (!reason && now() - requestedAt > NAP_RECHECK_MS && (await lastRequestAt(cloudwatch, await config(workloadId), requestedAt, now())) !== null) {
+      reason = 'requests since it was requested';
+    }
     if (reason) {
       log.warn('NapSkipped', { workloadId, reason });
       return { state: 'SKIPPED', reason };
     }
     return nap(workloadId);
+  }
+
+  // A wake a router pause queued: skipped when the workload is gone (offboarded since) or no pause applies any more
+  // (resumed before the queue reached it).
+  async function queuedWake({ workloadId, by, kind = 'manager' }) {
+    const reason = !(await store.getConfig(workloadId)) ? 'workload not configured any more'
+      : kind === 'pause' && !(await isPaused(workloadId)) ? 'no pause applies any more' : null;
+    if (reason) {
+      log.warn('WakeSkipped', { workloadId, reason });
+      return { state: 'SKIPPED', reason };
+    }
+    return forceWake(workloadId, by, kind, { inline: true });
   }
 
   // The messages of the work queue, each on its own: a failed one comes back alone (partial batch response).
@@ -662,7 +680,7 @@ export function createController({
       try {
         const message = JSON.parse(record.body);
         if (message.action === 'nap') await queuedNap(message);
-        else if (message.action === 'wake') await forceWake(message.workloadId, message.by, message.kind ?? 'manager', { inline: true });
+        else if (message.action === 'wake') await queuedWake(message);
         else throw new Error(`unknown queued action: ${message.action}`);
       } catch (err) {
         log.error('QueuedWorkFailed', { messageId: record.messageId, error: err.message });

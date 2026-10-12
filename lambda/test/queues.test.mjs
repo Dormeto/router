@@ -8,7 +8,7 @@ import { fakeAppScaling, fakeAutoScaling, fakeClock, fakeCloudWatch, fakeEc2, fa
 
 const MINUTE = 60_000;
 
-function setup({ run, instance = 'running', target = 'app', metric = [0, 0, 0] } = {}) {
+function setup({ run, instance = 'running', target = 'app', metric = [0, 0, 0], timestamps = [] } = {}) {
   const clock = fakeClock();
   const cfg = testConfig();
   const store = fakeStore({ config: cfg, run, clock });
@@ -18,16 +18,17 @@ function setup({ run, instance = 'running', target = 'app', metric = [0, 0, 0] }
   const invocations = [];
   const queued = [];
   const logs = [];
+  const cloudwatch = fakeCloudWatch(metric, timestamps);
   const log = { info: (event, data) => logs.push([event, data]), warn: (event, data) => logs.push([event, data]), error: (event, data) => logs.push([event, data]) };
   const handler = createController({
-    store, ec2, elbv2, cloudwatch: fakeCloudWatch(metric), autoscaling: fakeAutoScaling(), ecs, tagging: fakeTagging(ecs), appscaling: fakeAppScaling(),
+    store, ec2, elbv2, cloudwatch, autoscaling: fakeAutoScaling(), ecs, tagging: fakeTagging(ecs), appscaling: fakeAppScaling(),
     invokeSelf: async (payload) => { invocations.push(payload); }, queueWork: async (message) => { queued.push(message); },
     now: clock.now, sleep: clock.sleep, newId: () => 'w1', log,
     router: { name: 'dmt-dev', version: '0.22.0', build: 'abc', checkSchedule: 'rate(5 minutes)' },
   });
   // The queue delivers messages to the controller (an SQS event source mapping).
   const deliver = (...messages) => handler({ Records: messages.map((m, i) => ({ messageId: `m${i}`, eventSource: 'aws:sqs', body: JSON.stringify(m) })) });
-  return { handler, store, ec2, clock, cfg, invocations, queued, logs, deliver };
+  return { handler, store, ec2, clock, cfg, invocations, queued, logs, deliver, cloudwatch };
 }
 
 const skipped = (logs) => logs.filter(([event]) => event === 'NapSkipped').map(([, data]) => data.reason);
@@ -87,4 +88,35 @@ test('a message the controller cannot run comes back alone (partial batch respon
   ] });
   assert.deepEqual(out, { batchItemFailures: [{ itemIdentifier: 'bad' }] });
   assert.equal(s.store.state.run.state, STATES.ASLEEP);
+});
+
+test('a queued nap waiting more than a minute reads the requests made since it was asked for: one request keeps the workload awake', async () => {
+  const requestedAt = 1_700_000_000_000 - 5 * MINUTE;
+  const s = setup({ run: { state: STATES.AWAKE, awakeSince: 1 }, metric: [2], timestamps: [new Date(requestedAt + 2 * MINUTE)] });
+  await s.deliver({ action: 'nap', workloadId: 'demo', requestedAt });
+  assert.equal(s.store.state.run.state, STATES.AWAKE);
+  assert.deepEqual(skipped(s.logs), ['requests since it was requested']);
+  assert.deepEqual(s.cloudwatch.calls.map((c) => c.StartTime.getTime()), [requestedAt]);
+  // Delivered at once, the check's own read stands: no second read.
+  const prompt = setup({ run: { state: STATES.AWAKE, awakeSince: 1 }, metric: [2], timestamps: [new Date(1_700_000_000_000)] });
+  await prompt.deliver({ action: 'nap', workloadId: 'demo', requestedAt: prompt.clock.now() - 30_000 });
+  assert.equal(prompt.store.state.run.state, STATES.ASLEEP);
+  assert.deepEqual(prompt.cloudwatch.calls, []);
+});
+
+test('a queued pause wake is skipped once no pause applies, or once the workload is gone; it never fails into the dead-letter queue', async () => {
+  const s = setup({ run: { state: STATES.ASLEEP }, instance: 'stopped', target: 'waker' });
+  await s.handler({ action: 'pause', by: 'ops@example.com', reason: 'change freeze' });
+  await s.handler({ action: 'resume', by: 'ops@example.com' });
+  assert.deepEqual(await s.deliver(s.queued[0]), { batchItemFailures: [] });
+  assert.equal(s.store.state.run.state, STATES.ASLEEP);
+  const wakeSkipped = (logs) => logs.filter(([event]) => event === 'WakeSkipped').map(([, data]) => data.reason);
+  assert.deepEqual(wakeSkipped(s.logs), ['no pause applies any more']);
+
+  const gone = setup({ run: { state: STATES.ASLEEP }, instance: 'stopped', target: 'waker' });
+  await gone.handler({ action: 'pause', by: 'ops@example.com', reason: 'change freeze' });
+  // Offboarded since the pause.
+  gone.store.getConfig = async () => null;
+  assert.deepEqual(await gone.deliver(gone.queued[0]), { batchItemFailures: [] });
+  assert.deepEqual(wakeSkipped(gone.logs), ['workload not configured any more']);
 });

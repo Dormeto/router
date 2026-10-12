@@ -97,7 +97,7 @@ resource "aws_lambda_function" "controller" {
 # invocation: minutes long); a message is refused after 10 minutes anyway, and visible again after the controller's 15.
 resource "aws_sqs_queue" "work" {
   name                       = "${var.name}-work"
-  message_retention_seconds  = 3600
+  message_retention_seconds  = 345600
   visibility_timeout_seconds = 960
   sqs_managed_sse_enabled    = true
   redrive_policy             = jsonencode({ deadLetterTargetArn = aws_sqs_queue.controller_failures.arn, maxReceiveCount = 3 })

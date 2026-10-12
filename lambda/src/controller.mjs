@@ -43,6 +43,7 @@ export const handler = createController({
   sleep,
   log: logger,
   sqs: Object.values(queues).some(Boolean) ? createSqs() : null,
+  lambda,
   lists: lists.length ? createListRefresher({ store, lists, download, log: logger }) : null,
   // Manager interface: router identity, router no-wake rules and IP lists in the status, health and configuration.
   router: {

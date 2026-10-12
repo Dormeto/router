@@ -54,7 +54,7 @@ const QUEUES = {
 };
 
 // { status: ok | warning | error, problems: [{ level, text }] }: only a late idle check is an error (no nap happens).
-export function healthOf({ checkSchedule, lastScheduledCheckAt, now, lambda = {}, queues = {}, ipLists = [], failed = 0 }) {
+export function healthOf({ checkSchedule, lastScheduledCheckAt, now, lambda = {}, queues = {}, ipLists = [], failed = 0, concurrency = null }) {
   const problems = [];
   const warn = (text) => problems.push({ level: 'warning', text });
   if (checkLate(checkSchedule, lastScheduledCheckAt, now)) {
@@ -78,6 +78,11 @@ export function healthOf({ checkSchedule, lastScheduledCheckAt, now, lambda = {}
     else if (list.fetchedAt && now - Date.parse(list.fetchedAt) > 2 * (list.refreshHours ?? 24) * HOUR_MS) warn(`IP list ${list.name}: last downloaded ${ago(now - Date.parse(list.fetchedAt))}`);
   }
   if (failed > 0) warn(`${count(failed, 'failed workload')}`);
+  // A region the account barely uses can be limited to 10 concurrent executions: held requests beyond it get errors.
+  if (concurrency?.error) warn(`Lambda concurrency limit unreadable: ${concurrency.error}`);
+  else if (concurrency && concurrency.limit < concurrency.needed) {
+    warn(`Lambda concurrency limit of the account in this region is ${concurrency.limit}, below the ${concurrency.needed} a wake can hold (maxHolders and the router): requests beyond it get errors; request a quota increase`);
+  }
   const status = problems.some((p) => p.level === 'error') ? 'error' : problems.length ? 'warning' : 'ok';
   return { status, problems };
 }

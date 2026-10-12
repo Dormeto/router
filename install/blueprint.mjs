@@ -32,7 +32,7 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
   const policies = {
     controller: policy(
       allow(['dynamodb:GetItem', 'dynamodb:UpdateItem', 'dynamodb:Scan', 'dynamodb:Query', 'dynamodb:DeleteItem'], [tableArn]),
-      allow(['ec2:DescribeInstances', 'elasticloadbalancing:DescribeRules', 'elasticloadbalancing:DescribeTargetHealth', 'elasticloadbalancing:DescribeTargetGroups', 'elasticloadbalancing:DescribeListeners', 'elasticloadbalancing:DescribeTags', 'cloudwatch:GetMetricData'], ['*']),
+      allow(['ec2:DescribeInstances', 'elasticloadbalancing:DescribeRules', 'elasticloadbalancing:DescribeTargetHealth', 'elasticloadbalancing:DescribeTargetGroups', 'elasticloadbalancing:DescribeListeners', 'elasticloadbalancing:DescribeTags', 'cloudwatch:GetMetricData', 'lambda:GetAccountSettings'], ['*']),
       allow(['ec2:StartInstances', 'ec2:StopInstances'], [arn('ec2', 'instance/*')], tagged),
       allow(['elasticloadbalancing:ModifyRule'], [arn('elasticloadbalancing', 'listener-rule/app/*')], tagged),
       allow(['autoscaling:DescribeAutoScalingGroups', 'tag:GetResources', 'ecs:DescribeServices', 'application-autoscaling:DescribeScalableTargets', 'rds:DescribeDBInstances', 'rds:DescribeDBClusters'], ['*']),
@@ -134,7 +134,7 @@ export function routerBoundary({ p = PLACEHOLDERS } = {}) {
           'ecs:ListClusters', 'ecs:ListServices', 'ecs:DescribeServices', 'ecs:UpdateService', 'ecs:TagResource', 'ecs:UntagResource',
           'application-autoscaling:DescribeScalableTargets', 'application-autoscaling:RegisterScalableTarget',
           'rds:Describe*', 'rds:StartDBInstance', 'rds:StopDBInstance', 'rds:StartDBCluster', 'rds:StopDBCluster', 'rds:AddTagsToResource', 'rds:RemoveTagsFromResource',
-          'cloudwatch:GetMetricData', 'tag:GetResources', 's3:GetObject',
+          'cloudwatch:GetMetricData', 'tag:GetResources', 's3:GetObject', 'lambda:GetAccountSettings',
         ],
         Resource: '*',
       },

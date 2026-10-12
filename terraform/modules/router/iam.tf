@@ -67,8 +67,9 @@ data "aws_iam_policy_document" "controller" {
     resources = [aws_dynamodb_table.router.arn]
   }
   statement {
-    # Describes: the rules of a workload are found from its target group (load balancer, listeners, rules, tags).
-    actions   = ["ec2:DescribeInstances", "elasticloadbalancing:DescribeRules", "elasticloadbalancing:DescribeTargetHealth", "elasticloadbalancing:DescribeTargetGroups", "elasticloadbalancing:DescribeListeners", "elasticloadbalancing:DescribeTags", "cloudwatch:GetMetricData"]
+    # Describes: the rules of a workload are found from its target group (load balancer, listeners, rules, tags);
+    # router health: the account's Lambda concurrency limit.
+    actions   = ["ec2:DescribeInstances", "elasticloadbalancing:DescribeRules", "elasticloadbalancing:DescribeTargetHealth", "elasticloadbalancing:DescribeTargetGroups", "elasticloadbalancing:DescribeListeners", "elasticloadbalancing:DescribeTags", "cloudwatch:GetMetricData", "lambda:GetAccountSettings"]
     resources = ["*"]
   }
   statement {

@@ -31,7 +31,7 @@ const REASON_MAX = 256;
 
 export function createController({
   store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, invokeSelf, now = Date.now, sleep, newId = randomUUID, log,
-  lists = null, router = {}, defaultRules = [], ipLists = [], sqs = null,
+  lists = null, router = {}, defaultRules = [], ipLists = [], sqs = null, lambda = null,
 }) {
   const clients = { ec2, elbv2, autoscaling, ecs, tagging, appscaling, rds };
   let budgetEnd = Infinity;
@@ -533,18 +533,23 @@ export function createController({
   // --- Router: identity, configuration with its source, workloads, pauses, health ------------------------------------
 
   const TERRAFORM = 'terraform';
-  let measured = { at: -Infinity, lambda: {}, queues: {} };
+  let measured = { at: -Infinity, lambda: {}, queues: {}, limit: null };
+  // Concurrent executions a burst can need: the largest maxHolders, plus the controller and other invocations.
+  const HEADROOM = 10;
 
   async function routerInfo() {
     const t = now();
     if (t - measured.at >= HEALTH_CACHE_MS) {
-      const [lambda, queues] = await Promise.all([
+      const [metrics, queues, limit] = await Promise.all([
         lambdaMetrics(cloudwatch, router.functions ?? {}, t).catch((err) => ({ error: err.message })),
         queueDepths(sqs, router.queues).catch((err) => ({ error: err.message })),
+        lambda ? lambda.getAccountSettings({}).then((s) => ({ limit: s.AccountLimit?.ConcurrentExecutions })).catch((err) => ({ error: err.message })) : null,
       ]);
-      measured = { at: t, lambda, queues };
+      measured = { at: t, lambda: metrics, queues, limit };
     }
     const configs = await store.listConfigs();
+    const needed = Math.max(0, ...configs.map((c) => c.maxHolders ?? 0)) + HEADROOM;
+    const concurrency = measured.limit && (measured.limit.error ? { error: measured.limit.error } : { limit: measured.limit.limit, needed });
     const runs = await Promise.all(configs.map((cfg) => store.getRun(cfg.workloadId).catch(() => null)));
     let pausesError;
     const pauses = await store.listPauses().then((all) => all.filter((p) => !expired(p))).catch((err) => {
@@ -559,7 +564,7 @@ export function createController({
     const lists = (await describeStoredLists(store, ipLists)).map((l) => ({ ...l, refreshHours: ipLists.find((c) => c.name === l.name)?.refreshHours }));
     const health = healthOf({
       checkSchedule: router.checkSchedule, lastScheduledCheckAt: check?.lastScheduledCheckAt ?? null, now: t,
-      lambda: measured.lambda, queues: measured.queues, ipLists: lists, failed: byState[STATES.FAILED] ?? 0,
+      lambda: measured.lambda, queues: measured.queues, ipLists: lists, failed: byState[STATES.FAILED] ?? 0, concurrency,
     });
     if (pausesError) {
       health.problems.push({ level: 'warning', text: `pauses unreadable: ${pausesError}` });
@@ -587,6 +592,7 @@ export function createController({
         lambda: measured.lambda,
         queues: measured.queues,
         ipLists: lists,
+        concurrency,
       },
     };
   }

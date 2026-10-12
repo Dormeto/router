@@ -99,6 +99,15 @@ test('healthOf: failure queue messages, Lambda errors and throttles, IP lists an
   ]);
 });
 
+test('healthOf: a Lambda concurrency limit below what a burst can hold is a warning', () => {
+  assert.deepEqual(healthOf({ ...healthy, concurrency: { limit: 1000, needed: 60 } }), { status: 'ok', problems: [] });
+  assert.deepEqual(healthOf({ ...healthy, concurrency: { limit: 10, needed: 60 } }).problems, [{
+    level: 'warning',
+    text: 'Lambda concurrency limit of the account in this region is 10, below the 60 a wake can hold (maxHolders and the router): requests beyond it get errors; request a quota increase',
+  }]);
+  assert.deepEqual(healthOf({ ...healthy, concurrency: { error: 'AccessDenied' } }).problems, [{ level: 'warning', text: 'Lambda concurrency limit unreadable: AccessDenied' }]);
+});
+
 test('healthOf: metrics or queues that cannot be read are warnings', () => {
   const health = healthOf({ ...healthy, lambda: { error: 'AccessDenied' }, queues: { error: 'throttled' } });
   assert.deepEqual(health, { status: 'warning', problems: [
@@ -109,7 +118,7 @@ test('healthOf: metrics or queues that cannot be read are warnings', () => {
 
 // --- Controller action -----------------------------------------------------------------------------------------------
 
-function setup({ run = { state: STATES.AWAKE, updatedAt: NOW - HOUR }, metrics = {}, depths = {} } = {}) {
+function setup({ run = { state: STATES.AWAKE, updatedAt: NOW - HOUR }, metrics = {}, depths = {}, concurrency = 1000 } = {}) {
   const clock = fakeClock(NOW);
   const cfg = testConfig();
   const store = fakeStore({ config: cfg, run, clock });
@@ -118,7 +127,8 @@ function setup({ run = { state: STATES.AWAKE, updatedAt: NOW - HOUR }, metrics =
   const sqs = fakeSqs(depths);
   const handler = createController({
     store, ec2: fakeEc2(cfg.instanceIds), elbv2: fakeElbv2(cfg), cloudwatch, autoscaling: fakeAutoScaling(), ecs, tagging: fakeTagging(ecs), appscaling: fakeAppScaling(),
-    sqs, invokeSelf: async () => {}, now: clock.now, sleep: clock.sleep, log: silentLog,
+    sqs, lambda: { getAccountSettings: async () => ({ AccountLimit: { ConcurrentExecutions: concurrency } }) },
+    invokeSelf: async () => {}, now: clock.now, sleep: clock.sleep, log: silentLog,
     router: {
       name: 'dmt-dev', version: '0.16.0', build: 'abc', checkSchedule: 'rate(5 minutes)', metrics: true,
       functions: { controller: 'dmt-dev-controller', waker: 'dmt-dev-waker' }, queues: { check: 'https://q/check', controller: 'https://q/controller' },
@@ -161,6 +171,13 @@ test('router action: metrics and queues are read once a minute, pauses and workl
   s.clock.advance(61_000);
   await s.handler({ action: 'router' });
   assert.equal(s.cloudwatch.calls.length, 2);
+});
+
+test('router action reports the concurrency limit of the region against the largest maxHolders', async () => {
+  const s = setup({ concurrency: 10 });
+  const info = await s.handler({ action: 'router' });
+  assert.deepEqual(info.health.concurrency, { limit: 10, needed: 15 });
+  assert.ok(info.health.problems.some((p) => p.text.startsWith('Lambda concurrency limit of the account in this region is 10')));
 });
 
 test('router action answers when CloudWatch, SQS and the table fail', async () => {

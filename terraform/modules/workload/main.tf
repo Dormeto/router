@@ -26,7 +26,16 @@ resource "aws_lb_target_group" "waker" {
   lambda_multi_value_headers_enabled = true
 }
 
-# The router's permission (alb-waker, router 0.20.0) lets the load balancers invoke the waker from this target group.
+# The router's permission (dormeto-alb, router 0.20.0) lets the load balancers invoke the waker from this target group.
+# The per-workload permission of earlier versions leaves the state only: kept in AWS, an upgrade never leaves a sleeping
+# workload without a permission while the router's propagates (remove it by hand afterwards if wanted).
+removed {
+  from = aws_lambda_permission.alb
+  lifecycle {
+    destroy = false
+  }
+}
+
 resource "aws_lb_target_group_attachment" "waker" {
   target_group_arn = aws_lb_target_group.waker.arn
   target_id        = var.router.waker_function_arn
@@ -41,7 +50,7 @@ resource "aws_dynamodb_table_item" "config" {
     sk = { S = "CFG" }
     config = { S = jsonencode({
       workloadId              = var.workload_id
-      name                    = coalesce(var.name, var.workload_id)
+      name                    = trimspace(coalesce(var.name, var.workload_id))
       ruleArns                = local.rule_arns
       ruleArn                 = try(local.rule_arns[0], null)
       appTargetGroupArn       = var.app_target_group_arn

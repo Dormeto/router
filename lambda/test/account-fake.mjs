@@ -287,7 +287,7 @@ export function fakeAccount() {
     async getConfig(id) { return structuredClone(items.get(`${id}/CFG`) ?? null); },
     async listConfigs() { return [...items].filter(([k]) => k.endsWith('/CFG')).map(([, v]) => structuredClone(v)); },
     async getRun(id) { return structuredClone(items.get(`${id}/RUN`) ?? null); },
-    async putConfig(id, config) { call('putConfig'); items.set(`${id}/CFG`, structuredClone(config)); },
+    async putConfig(id, config, { mustExist = false } = {}) { call('putConfig'); if (mustExist && !items.has(`${id}/CFG`)) return false; items.set(`${id}/CFG`, structuredClone(config)); return true; },
     async initRun(id, at) {
       if (items.has(`${id}/RUN`)) return false;
       items.set(`${id}/RUN`, { state: 'AWAKE', version: 0, awakeSince: at, holders: 0, wakeCount: 0 });

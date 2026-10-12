@@ -201,15 +201,23 @@ export function createStore({ dynamo, table, now = Date.now }) {
       });
     },
 
-    // Onboarding (onboarder): the configuration item the workload module writes, and the initial runtime state.
-    async putConfig(workloadId, config) {
-      await dynamo.updateItem({
-        TableName: table,
-        Key: itemKey(workloadId, 'CFG'),
-        UpdateExpression: 'SET #config = :config',
-        ExpressionAttributeNames: { '#config': 'config' },
-        ExpressionAttributeValues: { ':config': { S: JSON.stringify(config) } },
-      });
+    // Onboarding (onboarder): the configuration item the workload module writes, and the initial runtime state. With
+    // mustExist (a rename), false when the workload is gone: never written back after an offboarding.
+    async putConfig(workloadId, config, { mustExist = false } = {}) {
+      try {
+        await dynamo.updateItem({
+          TableName: table,
+          Key: itemKey(workloadId, 'CFG'),
+          UpdateExpression: 'SET #config = :config',
+          ...(mustExist ? { ConditionExpression: 'attribute_exists(#pk)' } : {}),
+          ExpressionAttributeNames: { '#config': 'config', ...(mustExist ? { '#pk': 'pk' } : {}) },
+          ExpressionAttributeValues: { ':config': { S: JSON.stringify(config) } },
+        });
+        return true;
+      } catch (err) {
+        if (mustExist && err.name === 'ConditionalCheckFailedException') return false;
+        throw err;
+      }
     },
 
     // false when a runtime state exists already (the Lambdas own it).

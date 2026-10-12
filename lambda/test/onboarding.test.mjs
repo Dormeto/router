@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createOnboarding, workloadIdOf } from '../src/lib/onboarding.mjs';
+import { ROUTER_PERMISSION, createOnboarding, workloadIdOf } from '../src/lib/onboarding.mjs';
 import { LB, WAKER_ARN, fakeAccount } from './account-fake.mjs';
 
 const NOW = 1_791_158_400_000;
@@ -575,4 +575,12 @@ test('a derived id already used by another target group is refused', async () =>
   const id = workloadIdOf(s.tg);
   s.a.items.set(`${id}/CFG`, { workloadId: id, appTargetGroupArn: 'arn:tg/other', source: 'manager' });
   assert.deepEqual((await s.onboarding.preview({ targetGroupArn: s.tg })).problems, [`workload ${id} already exists with another target group`]);
+});
+
+test('offboarding never removes the router permission, whatever the workload id (a workload named waker)', async () => {
+  const s = setup();
+  await s.a.lambda.addPermission({ FunctionName: 'dmt-dev-waker', StatementId: ROUTER_PERMISSION, Action: 'lambda:InvokeFunction', Principal: 'elasticloadbalancing.amazonaws.com', SourceArn: 'arn:x/dmt-dev-*/*' });
+  await s.onboarding.onboard({ workloadId: 'waker', targetGroupArn: s.tg, by: 'ops' });
+  await s.onboarding.offboard({ workloadId: 'waker', by: 'ops' });
+  assert.deepEqual([...s.a.state.permissions.keys()], [ROUTER_PERMISSION]);
 });

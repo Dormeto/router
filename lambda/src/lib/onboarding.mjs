@@ -17,6 +17,10 @@ const GROUP_TAG = 'aws:autoscaling:groupName';
 const ID = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
 const NAME_MAX = 32;
 
+// The router's invoke permission (design section 7): the load balancers invoke the waker from its target groups. Named
+// outside the alb-<workload id> statements of routers before 0.20.0, which offboarding removes.
+export const ROUTER_PERMISSION = 'dormeto-alb';
+
 // The workload id of a target group (design section 7): 16 hexadecimal characters of the SHA-256 of its ARN. Unique per
 // router, as required, and across accounts in practice (the ARN carries the partition, region, account, name and id).
 export const workloadIdOf = (targetGroupArn) => createHash('sha256').update(targetGroupArn).digest('hex').slice(0, 16);
@@ -354,7 +358,7 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
         step('waker target group', true, waker.TargetGroupName);
       } else step('waker target group', false, waker.TargetGroupName);
 
-      // The router's own permission (alb-waker) lets the load balancers invoke the waker from its target groups.
+      // The router's own permission (dormeto-alb) lets the load balancers invoke the waker from its target groups.
       const { TargetHealthDescriptions = [] } = await elbv2.describeTargetHealth({ TargetGroupArn: waker.TargetGroupArn });
       const registered = TargetHealthDescriptions.some((d) => d.Target?.Id === router.wakerFunctionArn);
       // A permission just created (a router just installed) takes seconds to be seen by the load balancer: retry meanwhile.

@@ -851,3 +851,11 @@ test('rename changes only the name of a workload the manager onboarded', async (
   const terraform = setup({ run: { state: STATES.AWAKE } });
   await assert.rejects(terraform.handler({ action: 'rename', workloadId: 'demo', name: 'x', by: 'ops' }), /written by Terraform: set name in its workload module/);
 });
+
+test('a rename racing an offboarding never writes the configuration back', async () => {
+  const s = setup({ run: { state: STATES.AWAKE }, cfg: testConfig({ name: 'Demo shop', source: 'manager' }) });
+  const writes = [];
+  s.store.putConfig = async (id, cfg, options) => { writes.push(options); if (options?.mustExist) return false; throw new Error('unconditional write'); };
+  await assert.rejects(s.handler({ action: 'rename', workloadId: 'demo', name: 'Shop front', by: 'ops' }), /workload not configured: demo/);
+  assert.deepEqual(writes, [{ mustExist: true }]);
+});

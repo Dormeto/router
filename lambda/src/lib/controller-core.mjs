@@ -428,7 +428,8 @@ export function createController({
     const checked = checkName(name);
     if (!checked.name) throw new Error('name: required');
     if (checked.problem) throw new Error(checked.problem);
-    await store.putConfig(workloadId, { ...cfg, name: checked.name });
+    // Conditional: a rename racing an offboarding never writes the workload back.
+    if (!(await store.putConfig(workloadId, { ...cfg, name: checked.name }, { mustExist: true }))) throw new Error(`workload not configured: ${workloadId}`);
     log.info('Renamed', { workloadId, name: checked.name, by });
     return { workloadId, name: checked.name };
   }

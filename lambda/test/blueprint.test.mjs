@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { PLACEHOLDERS, blueprint, routerBoundary } from '../../install/blueprint.mjs';
+import { ROUTER_PERMISSION } from '../src/lib/onboarding.mjs';
 
 const IAM_TF = new URL('../../terraform/modules/router/iam.tf', import.meta.url);
 
@@ -128,7 +129,8 @@ test('every tag key the onboarder writes is allowed by its tag condition, in the
 test('one permission lets the load balancers invoke the waker from every waker target group of the router', () => {
   const b = fill(blueprint({ version: '0.20.0' }), VALUES);
   assert.deepEqual(b.wakerPermission, {
-    function: 'dmtr-dev-waker', statementId: 'alb-waker', principal: 'elasticloadbalancing.amazonaws.com',
+    // Outside the alb-<workload id> statements of routers before 0.20.0: no workload id can name it.
+    function: 'dmtr-dev-waker', statementId: ROUTER_PERMISSION, principal: 'elasticloadbalancing.amazonaws.com',
     sourceArn: 'arn:aws:elasticloadbalancing:eu-west-3:121014831971:targetgroup/dmtr-dev-*/*',
   });
   // Onboarding no longer adds one per workload; it still removes one left by an older router.
@@ -136,4 +138,10 @@ test('one permission lets the load balancers invoke the waker from every waker t
   assert.ok(!onboarder.includes('lambda:AddPermission'));
   assert.ok(onboarder.includes('lambda:RemovePermission'));
   assert.ok(!routerBoundary().Statement.flatMap((s) => [].concat(s.Action)).includes('lambda:AddPermission'));
+});
+
+test('the router permission is named outside the per-workload statements, in the module and the blueprint', async () => {
+  assert.equal(ROUTER_PERMISSION, 'dormeto-alb');
+  const module = await readFile(new URL('../../terraform/modules/router/main.tf', import.meta.url), 'utf8');
+  assert.match(module, /statement_id\s+= "dormeto-alb"/);
 });

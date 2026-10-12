@@ -120,7 +120,7 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
     // The load balancers of the account invoke the waker from the router's waker target groups (<name>-<workload id>):
     // one statement whatever the number of workloads (a function's resource policy is limited to 20 KB).
     wakerPermission: {
-      function: fn('waker'), statementId: 'alb-waker', principal: 'elasticloadbalancing.amazonaws.com',
+      function: fn('waker'), statementId: 'dormeto-alb', principal: 'elasticloadbalancing.amazonaws.com',
       sourceArn: `arn:${p.partition}:elasticloadbalancing:${p.region}:${p.account}:targetgroup/${p.name}-*/*`,
     },
     // Drift repair: CloudTrail events on rules, target groups and workload tags, not caused by the router, to the onboarder.

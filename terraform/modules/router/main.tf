@@ -206,12 +206,18 @@ resource "aws_sqs_queue" "check_failures" {
 
 # The load balancers of the account invoke the waker from the router's waker target groups (<name>-<workload id>): one
 # statement whatever the number of workloads (a function's resource policy is limited to 20 KB). Design section 7.
+# Named outside the alb-<workload id> statements of routers before 0.20.0 (which offboarding removes).
 resource "aws_lambda_permission" "waker_alb" {
-  statement_id  = "alb-waker"
+  statement_id  = "dormeto-alb"
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.waker.function_name
   principal     = "elasticloadbalancing.amazonaws.com"
   source_arn    = "${local.arn_prefix}:elasticloadbalancing:${local.region}:${local.account_id}:targetgroup/${var.name}-*/*"
+
+  # A replacement never leaves the waker without a permission.
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 # Drift repair (vision docs/specs/2026-10-05-onboarding-design.md, R4c): CloudTrail events on rules, target groups and the

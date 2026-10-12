@@ -119,8 +119,10 @@ is below the largest `maxHolders` plus 10: held requests beyond it get errors un
 application target group, with their own role (the controller keeps its least privilege). The workload id is derived
 from the target group (16 hexadecimal characters of the SHA-256 of its ARN: `printf %s <arn> | shasum -a 256 | cut -c1-16`);
 people see its name, the target group name unless given at onboarding, changed with the controller's `rename` (the
-`workload` module's `name` for Terraform workloads). One permission per router (`alb-waker`) lets the load balancers
-invoke the waker from its target groups `<router>-*`, so router names have at most 15 characters. Onboarding tags the backends
+`workload` module's `name` for Terraform workloads). One permission per router (`dormeto-alb`) lets the load balancers
+invoke the waker from its target groups `<router>-*`, so router names have at most 15 characters. Upgrading to 0.20:
+the router's permission is created first; the per-workload `alb-<id>` statements of earlier versions stay (offboarding
+removes those of manager workloads; the `workload` module only forgets its own, remove them by hand if wanted). Onboarding tags the backends
 `dormeto:workload` (with the marker `dormeto:tagged = onboarder`), creates and registers the waker target group, writes
 the configuration and covers every rule forwarding to the target group; each step finds what exists first, and a failed
 onboarding of a new workload is undone. Offboarding (the workload awake) removes only what onboarding added: shadows,

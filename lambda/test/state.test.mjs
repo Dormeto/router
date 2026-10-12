@@ -295,3 +295,16 @@ test('store records drift events of a workload, kept 90 days, and lists the newe
   assert.equal(query.Limit, 10);
   assert.deepEqual(query.ExpressionAttributeValues[':prefix'], { S: 'DRIFT#' });
 });
+
+test('store putConfig can require the configuration to exist (false when it does not)', async () => {
+  let fail = false;
+  const dynamo = fakeDynamo({ updateItem: async () => { if (fail) throw Object.assign(new Error('nope'), { name: 'ConditionalCheckFailedException' }); return {}; } });
+  const store = createStore({ dynamo, table: 't' });
+  assert.equal(await store.putConfig('demo', { workloadId: 'demo' }, { mustExist: true }), true);
+  assert.equal(dynamo.calls[0][1].ConditionExpression, 'attribute_exists(#pk)');
+  assert.equal(dynamo.calls[0][1].ExpressionAttributeNames['#pk'], 'pk');
+  fail = true;
+  assert.equal(await store.putConfig('demo', { workloadId: 'demo' }, { mustExist: true }), false);
+  await store.putConfig('demo', { workloadId: 'demo' }).catch(() => {});
+  assert.equal(dynamo.calls[2][1].ConditionExpression, undefined, 'onboarding creates it');
+});

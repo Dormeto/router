@@ -11,8 +11,9 @@ variable "router" {
 variable "workload_id" {
   type = string
   validation {
-    condition     = can(regex("^[a-z0-9-]{1,20}$", var.workload_id))
-    error_message = "workload_id must be 1-20 characters of lower-case letters, digits and hyphens (target group name limit)."
+    # Waker target group <router>-<workload_id> within 32 characters, router names of at most 15.
+    condition     = can(regex("^[a-z0-9-]{1,16}$", var.workload_id))
+    error_message = "workload_id must be 1-16 characters of lower-case letters, digits and hyphens (target group name limit)."
   }
 }
 
@@ -21,8 +22,8 @@ variable "name" {
   type        = string
   default     = null
   validation {
-    condition     = var.name == null || (length(trimspace(var.name)) > 0 && length(var.name) <= 64)
-    error_message = "name must have 1 to 64 characters."
+    condition     = var.name == null || (length(trimspace(var.name)) > 0 && length(trimspace(var.name)) <= 64 && can(regex("^[^\\x00-\\x1f\\x7f]*$", var.name)))
+    error_message = "name must have 1 to 64 characters, without control characters."
   }
 }
 

@@ -8,6 +8,7 @@ import { describeRules } from './no-wake.mjs';
 import { describeStoredLists } from './list-cache.mjs';
 import { STATS_DAYS, totals, workloadSummary } from './summary.mjs';
 import { requestSum } from './metrics.mjs';
+import { healthOf, lambdaMetrics, queueDepths } from './health.mjs';
 import {
   backendKey, backendStatuses, isCompanion, resolveBackends, resumeBackends, sleepBackends, startCompanions, stopCompanions, toRecord, wakeBackends,
 } from './backends.mjs';
@@ -22,13 +23,15 @@ const WAKING_STUCK_GRACE_MS = 60_000;
 const TIMEOUT_MARGIN_MS = 30_000;
 // Held requests last at most waitSeconds: a counter untouched for longer is a leak (killed waker).
 const HOLDERS_STALE_MS = 2 * 60_000;
+// Router health: Lambda metrics and failure queues read at most once a minute (the Routers view polls).
+const HEALTH_CACHE_MS = 60_000;
 // Pauses (router management): automatic resume at most this far ahead, reason length.
 const PAUSE_MAX_MS = 366 * 86_400_000;
 const REASON_MAX = 256;
 
 export function createController({
   store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, invokeSelf, now = Date.now, sleep, newId = randomUUID, log,
-  lists = null, router = {}, defaultRules = [], ipLists = [],
+  lists = null, router = {}, defaultRules = [], ipLists = [], sqs = null,
 }) {
   const clients = { ec2, elbv2, autoscaling, ecs, tagging, appscaling, rds };
   let budgetEnd = Infinity;
@@ -521,6 +524,67 @@ export function createController({
     return { requested: true };
   }
 
+  // --- Router: identity, configuration with its source, workloads, pauses, health ------------------------------------
+
+  const TERRAFORM = 'terraform';
+  let measured = { at: -Infinity, lambda: {}, queues: {} };
+
+  async function routerInfo() {
+    const t = now();
+    if (t - measured.at >= HEALTH_CACHE_MS) {
+      const [lambda, queues] = await Promise.all([
+        lambdaMetrics(cloudwatch, router.functions ?? {}, t).catch((err) => ({ error: err.message })),
+        queueDepths(sqs, router.queues).catch((err) => ({ error: err.message })),
+      ]);
+      measured = { at: t, lambda, queues };
+    }
+    const configs = await store.listConfigs();
+    const runs = await Promise.all(configs.map((cfg) => store.getRun(cfg.workloadId).catch(() => null)));
+    let pausesError;
+    const pauses = await store.listPauses().then((all) => all.filter((p) => !expired(p))).catch((err) => {
+      pausesError = err.message;
+      return [];
+    });
+    const byState = {};
+    for (const run of runs) byState[run?.state ?? 'UNKNOWN'] = (byState[run?.state ?? 'UNKNOWN'] ?? 0) + 1;
+    const routerPaused = pauses.some((p) => p.workloadId === null);
+    const updated = runs.map((run) => run?.updatedAt ?? 0).filter((ms) => ms > 0);
+    const check = await store.getCheck().catch(() => null);
+    const lists = (await describeStoredLists(store, ipLists)).map((l) => ({ ...l, refreshHours: ipLists.find((c) => c.name === l.name)?.refreshHours }));
+    const health = healthOf({
+      checkSchedule: router.checkSchedule, lastScheduledCheckAt: check?.lastScheduledCheckAt ?? null, now: t,
+      lambda: measured.lambda, queues: measured.queues, ipLists: lists, failed: byState[STATES.FAILED] ?? 0,
+    });
+    if (pausesError) {
+      health.problems.push({ level: 'warning', text: `pauses unreadable: ${pausesError}` });
+      if (health.status === 'ok') health.status = 'warning';
+    }
+    return {
+      router: { name: router.name, version: router.version, build: router.build },
+      configuration: {
+        checkSchedule: { value: router.checkSchedule ?? null, source: TERRAFORM },
+        ipLists: { value: ipLists.map(({ name, url, action, refreshHours }) => ({ name, url, action, refreshHours })), source: TERRAFORM },
+        noWakeRules: { value: describeRules([{ level: 'router', rules: defaultRules }]), source: TERRAFORM },
+        metrics: { value: router.metrics ?? null, source: TERRAFORM },
+      },
+      pauses: shownPauses(pauses.filter((p) => p.workloadId === null)),
+      workloads: {
+        total: configs.length,
+        byState,
+        paused: routerPaused ? configs.length : configs.filter((cfg) => pauses.some((p) => p.workloadId === cfg.workloadId)).length,
+        lastActivityAt: updated.length ? iso(Math.max(...updated)) : null,
+      },
+      health: {
+        ...health,
+        checkSchedule: router.checkSchedule ?? null,
+        lastScheduledCheckAt: check?.lastScheduledCheckAt ? iso(check.lastScheduledCheckAt) : null,
+        lambda: measured.lambda,
+        queues: measured.queues,
+        ipLists: lists,
+      },
+    };
+  }
+
   return async function handler(event, context) {
     const remaining = context?.getRemainingTimeInMillis?.();
     budgetEnd = typeof remaining === 'number' ? now() + remaining - TIMEOUT_MARGIN_MS : Infinity;
@@ -536,6 +600,7 @@ export function createController({
       case 'pause': return pause(event);
       case 'resume': return resume(event);
       case 'request-nap': return requestNap(event);
+      case 'router': return routerInfo();
       default: throw new Error(`unknown action: ${event?.action}`);
     }
   };

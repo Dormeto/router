@@ -40,7 +40,7 @@ data "aws_iam_policy_document" "waker" {
     for_each = var.admin_enabled ? [1] : []
     content {
       sid       = "AdminDashboardRead"
-      actions   = ["ec2:DescribeInstances", "elasticloadbalancing:DescribeRules", "elasticloadbalancing:DescribeTargetHealth", "cloudwatch:GetMetricData", "autoscaling:DescribeAutoScalingGroups"]
+      actions   = ["ec2:DescribeInstances", "elasticloadbalancing:DescribeRules", "elasticloadbalancing:DescribeTargetHealth", "cloudwatch:GetMetricData", "autoscaling:DescribeAutoScalingGroups", "tag:GetResources", "ecs:DescribeServices", "application-autoscaling:DescribeScalableTargets"]
       resources = ["*"]
     }
   }
@@ -86,8 +86,22 @@ data "aws_iam_policy_document" "controller" {
     }
   }
   statement {
-    actions   = ["autoscaling:DescribeAutoScalingGroups"]
+    actions   = ["autoscaling:DescribeAutoScalingGroups", "tag:GetResources", "ecs:DescribeServices", "application-autoscaling:DescribeScalableTargets"]
     resources = ["*"]
+  }
+  statement {
+    actions   = ["ecs:UpdateService"]
+    resources = ["${local.arn_prefix}:ecs:${local.region}:${local.account_id}:service/*/*"]
+    # Only services onboarded in Dormeto (tagged dormeto:workload).
+    condition {
+      test     = "Null"
+      variable = "aws:ResourceTag/dormeto:workload"
+      values   = ["false"]
+    }
+  }
+  statement {
+    actions   = ["application-autoscaling:RegisterScalableTarget"]
+    resources = ["${local.arn_prefix}:application-autoscaling:${local.region}:${local.account_id}:scalable-target/*"]
   }
   statement {
     actions   = ["autoscaling:UpdateAutoScalingGroup", "autoscaling:SuspendProcesses", "autoscaling:ResumeProcesses"]

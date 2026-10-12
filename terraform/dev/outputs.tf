@@ -47,6 +47,13 @@ output "workloads" {
       asg_name    = null
       admin_url   = var.admin_dashboard_enabled ? "https://${local.domain}/_dormeto/${random_password.admin[0].result}/" : ""
     }
+    demo-ecs = {
+      url         = "https://${local.ecs_domain}/"
+      rule_arn    = aws_lb_listener_rule.demo_ecs.arn
+      instance_id = null
+      asg_name    = null
+      admin_url   = var.admin_dashboard_enabled ? "https://${local.ecs_domain}/_dormeto/${random_password.admin[0].result}/" : ""
+    }
     demo-asg = {
       url         = "https://${local.asg_domain}/"
       rule_arn    = aws_lb_listener_rule.demo_asg.arn

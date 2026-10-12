@@ -1,6 +1,6 @@
 resource "aws_acm_certificate" "demo" {
   domain_name               = local.domain
-  subject_alternative_names = [local.asg_domain]
+  subject_alternative_names = [local.asg_domain, local.ecs_domain]
   validation_method         = "DNS"
 
   lifecycle {
@@ -39,6 +39,18 @@ resource "aws_route53_record" "demo" {
 resource "aws_route53_record" "demo_asg" {
   zone_id = var.zone_id
   name    = local.asg_domain
+  type    = "A"
+
+  alias {
+    name                   = aws_lb.demo.dns_name
+    zone_id                = aws_lb.demo.zone_id
+    evaluate_target_health = false
+  }
+}
+
+resource "aws_route53_record" "demo_ecs" {
+  zone_id = var.zone_id
+  name    = local.ecs_domain
   type    = "A"
 
   alias {

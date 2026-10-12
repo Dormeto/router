@@ -23,8 +23,15 @@ and resumes the processes. Their instances are never stopped one by one.
 Resource Groups Tagging API) are napped by `desiredCount = 0`, with their Application Auto Scaling target suspended; the
 wake restores both.
 
-The `dev` environment has three workloads: `demo` (one EC2 instance, `https://dev.dormeto.com/`), `demo-asg` (an Auto
-Scaling group, `https://asg.dev.dormeto.com/`) and `demo-ecs` (an ECS Fargate service, `https://ecs.dev.dormeto.com/`).
+**Databases** (RDS DB instances and Aurora DB clusters) tagged `dormeto:workload=<workload id>` are **companions**: the
+nap stops them after the application (without waiting), the wake starts them and waits until they are available before
+starting the application. A wake that outlasts one Lambda invocation continues in a new one (same wake id) until
+`wake_timeout_seconds` (1800 s for workloads with a database). While a workload sleeps, a database restarted by AWS after
+7 days is stopped again. Read replicas and Aurora Serverless v1 are ignored.
+
+The `dev` environment has four workloads: `demo` (one EC2 instance, `https://dev.dormeto.com/`), `demo-asg` (an Auto
+Scaling group, `https://asg.dev.dormeto.com/`), `demo-ecs` (an ECS Fargate service, `https://ecs.dev.dormeto.com/`) and
+`demo-rds` (an ECS Fargate service with a PostgreSQL instance, `https://rds.dev.dormeto.com/`).
 
 Design: [vision/docs/specs/2026-10-03-mvp-alb-ec2-design.md](https://github.com/Dormeto/vision/blob/main/docs/specs/2026-10-03-mvp-alb-ec2-design.md).
 

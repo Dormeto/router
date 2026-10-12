@@ -32,6 +32,20 @@ test('classify detects probes, HEAD, bots and normal requests', () => {
   assert.equal(classify(event({ multiValueHeaders: { 'user-agent': ['UptimeRobot/2.0'] } })), 'no-wake');
 });
 
+test('classify ignores internet scanners', () => {
+  for (const ua of [
+    'Mozilla/5.0 (l9scan/2.0.933323e2330313e29313e22353; +https://leakix.net)',
+    'Mozilla/5.0 zgrab/0.x',
+    'Mozilla/5.0 (compatible; CensysInspect/1.1; +https://about.censys.io/)',
+    'Expanse, a Palo Alto Networks company, searches across the global IPv4 space',
+    'Mozilla/5.0 (compatible; Nmap Scripting Engine; https://nmap.org/book/nse.html)',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Nuclei - Open-source project (github.com/projectdiscovery/nuclei)',
+    'masscan/1.3 (https://github.com/robertdavidgraham/masscan)',
+  ]) assert.equal(classify(event({ multiValueHeaders: { 'user-agent': [ua] } })), 'no-wake', ua);
+  const safari = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1';
+  assert.equal(classify(event({ multiValueHeaders: { 'user-agent': [safari] } })), 'normal');
+});
+
 test('requestTarget rebuilds path and repeated query parameters', () => {
   assert.equal(requestTarget(event({ path: '/a/b' })), '/a/b');
   assert.equal(requestTarget(event({ path: '/s', multiValueQueryStringParameters: { q: ['x%20y'], tag: ['1', '2'], flag: [''] } })),

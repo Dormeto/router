@@ -1,6 +1,8 @@
 import {
   AddTagsCommand,
+  CreateRuleCommand,
   CreateTargetGroupCommand,
+  DeleteRuleCommand,
   DeleteTargetGroupCommand,
   DeregisterTargetsCommand,
   DescribeListenersCommand,
@@ -13,6 +15,7 @@ import {
   ModifyTargetGroupAttributesCommand,
   RegisterTargetsCommand,
   RemoveTagsCommand,
+  SetRulePrioritiesCommand,
 } from '@aws-sdk/client-elastic-load-balancing-v2';
 
 export function createElbv2(client = new ElasticLoadBalancingV2Client({})) {
@@ -32,5 +35,9 @@ export function createElbv2(client = new ElasticLoadBalancingV2Client({})) {
     deregisterTargets: (input) => client.send(new DeregisterTargetsCommand(input)),
     addTags: (input) => client.send(new AddTagsCommand(input)),
     removeTags: (input) => client.send(new RemoveTagsCommand(input)),
+    // Shadow rules (R4c): created before a customer rule, moved before it again, deleted at offboarding.
+    createRule: (input) => client.send(new CreateRuleCommand(input)),
+    deleteRule: (input) => client.send(new DeleteRuleCommand(input)),
+    setRulePriorities: (input) => client.send(new SetRulePrioritiesCommand(input)),
   };
 }

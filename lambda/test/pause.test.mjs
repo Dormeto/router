@@ -208,3 +208,17 @@ test('list and status tell a workload written in Terraform from one onboarded by
   assert.equal((await s.handler({ action: 'list' })).workloads[0].source, 'manager');
   assert.equal((await s.handler({ action: 'status', workloadId: 'demo' })).source, 'manager');
 });
+
+test('status shows a customer rule covered by a shadow as shadowed, with the shadow priority', async () => {
+  const s = setup({ run: { state: STATES.ASLEEP }, target: 'waker', instance: 'stopped' });
+  const appOnly = [{ Type: 'forward', Order: 1, ForwardConfig: { TargetGroups: [{ TargetGroupArn: s.cfg.appTargetGroupArn, Weight: 1 }] } }];
+  const condition = [{ Field: 'host-header', HostHeaderConfig: { Values: ['shop.example.com'] } }];
+  s.elbv2.state.rules.set('arn:rule/customer', { actions: appOnly, conditions: condition, priority: '40', tags: {} });
+  s.elbv2.state.rules.set('arn:rule/shadow', { actions: s.elbv2.state.forward(0, 1), conditions: condition, priority: '39', tags: { 'dormeto:workload': 'demo', 'dormeto:shadows': 'arn:rule/customer' } });
+  const status = await s.handler({ action: 'status', workloadId: 'demo' });
+  assert.deepEqual(status.issues, []);
+  assert.equal(status.route, 'waker');
+  const customer = status.rules.find((r) => r.arn === 'arn:rule/customer');
+  assert.deepEqual([customer.route, customer.shadowedBy], ['shadowed', '39']);
+  assert.equal(status.rules.find((r) => r.arn === 'arn:rule/shadow').route, 'waker');
+});

@@ -64,6 +64,8 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
       allow(['elasticloadbalancing:DescribeTargetGroups', 'elasticloadbalancing:DescribeListeners', 'elasticloadbalancing:DescribeRules', 'elasticloadbalancing:DescribeTags', 'elasticloadbalancing:DescribeTargetHealth', 'ec2:DescribeInstances', 'autoscaling:DescribeAutoScalingGroups', 'ecs:ListClusters', 'ecs:ListServices', 'ecs:DescribeServices', 'rds:DescribeDBInstances', 'rds:DescribeDBClusters'], ['*']),
       allow(['elasticloadbalancing:CreateTargetGroup', 'elasticloadbalancing:ModifyTargetGroupAttributes', 'elasticloadbalancing:DeleteTargetGroup', 'elasticloadbalancing:RegisterTargets', 'elasticloadbalancing:DeregisterTargets'], [arn('elasticloadbalancing', `targetgroup/${p.name}-*/*`)]),
       allow(['elasticloadbalancing:ModifyRule'], [arn('elasticloadbalancing', 'listener-rule/app/*')]),
+      allow(['elasticloadbalancing:CreateRule'], [arn('elasticloadbalancing', 'listener/app/*'), arn('elasticloadbalancing', 'listener-rule/app/*')]),
+      allow(['elasticloadbalancing:DeleteRule', 'elasticloadbalancing:SetRulePriorities'], [arn('elasticloadbalancing', 'listener-rule/app/*')], tagged),
       allow(['elasticloadbalancing:AddTags', 'elasticloadbalancing:RemoveTags'], [arn('elasticloadbalancing', 'listener-rule/app/*'), arn('elasticloadbalancing', `targetgroup/${p.name}-*/*`)], onboarderTagKeys),
       allow(['ec2:CreateTags', 'ec2:DeleteTags', 'autoscaling:CreateOrUpdateTags', 'autoscaling:DeleteTags', 'ecs:TagResource', 'ecs:UntagResource', 'rds:AddTagsToResource', 'rds:RemoveTagsFromResource'], [
         arn('ec2', 'instance/*'), arn('autoscaling', 'autoScalingGroup:*:autoScalingGroupName/*'), arn('ecs', 'service/*/*'), arn('rds', 'db:*'), arn('rds', 'cluster:*'),
@@ -137,6 +139,7 @@ export function routerBoundary({ p = PLACEHOLDERS } = {}) {
         Action: [
           'elasticloadbalancing:Describe*', 'elasticloadbalancing:ModifyRule', 'elasticloadbalancing:CreateTargetGroup', 'elasticloadbalancing:ModifyTargetGroupAttributes',
           'elasticloadbalancing:DeleteTargetGroup', 'elasticloadbalancing:RegisterTargets', 'elasticloadbalancing:DeregisterTargets', 'elasticloadbalancing:AddTags', 'elasticloadbalancing:RemoveTags',
+          'elasticloadbalancing:CreateRule', 'elasticloadbalancing:DeleteRule', 'elasticloadbalancing:SetRulePriorities',
           'ec2:DescribeInstances', 'ec2:StartInstances', 'ec2:StopInstances', 'ec2:CreateTags', 'ec2:DeleteTags',
           'autoscaling:Describe*', 'autoscaling:UpdateAutoScalingGroup', 'autoscaling:SuspendProcesses', 'autoscaling:ResumeProcesses', 'autoscaling:CreateOrUpdateTags', 'autoscaling:DeleteTags',
           'ecs:ListClusters', 'ecs:ListServices', 'ecs:DescribeServices', 'ecs:UpdateService', 'ecs:TagResource', 'ecs:UntagResource',

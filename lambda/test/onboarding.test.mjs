@@ -30,6 +30,9 @@ function setup({ backend = 'instance' } = {}) {
 }
 
 const weights = (a, rule) => a.state.rules.get(rule).actions[0].ForwardConfig.TargetGroups.map((g) => [a.state.targetGroups.get(g.TargetGroupArn)?.name, g.Weight]);
+// Shadow rules of the account: [priority, shadowed rule, tags, weights].
+const shadowsOf = (a) => [...a.state.rules].filter(([, r]) => r.tags['dormeto:shadows']).sort(([, x], [, y]) => Number(x.priority) - Number(y.priority))
+  .map(([arn, r]) => ({ arn, priority: r.priority, shadows: r.tags['dormeto:shadows'], workload: r.tags[WORKLOAD], conditions: r.conditions, weights: weights(a, arn) }));
 
 // --- preview ---------------------------------------------------------------------------------------------------------
 
@@ -40,7 +43,7 @@ test('preview lists the rules to instrument, the backends to tag and the waker t
   assert.deepEqual(preview.problems, []);
   assert.equal(preview.wakerTargetGroupName, 'dmt-dev-shop');
   assert.equal(preview.loadBalancerArn, LB);
-  assert.deepEqual(preview.rules.map((r) => [r.priority, r.conditions, r.action]), [['10', 'host shop.example.com', 'instrument'], ['11', 'host static.example.com', 'instrument']]);
+  assert.deepEqual(preview.rules.map((r) => [r.priority, r.conditions, r.action]), [['10', 'host shop.example.com', 'shadow at 9'], ['11', 'host static.example.com', 'shadow at 8']]);
   assert.deepEqual(preview.backends, [{ kind: 'instance', id: 'i-0aaa', tagged: null }]);
   assert.ok(s.a.state.calls.every((c) => c.startsWith('describe') || c.startsWith('list')), `no change: ${s.a.state.calls.join(', ')}`);
 });
@@ -93,7 +96,7 @@ test('preview refuses a workload id or a target group already onboarded as anoth
 
 // --- onboard ---------------------------------------------------------------------------------------------------------
 
-test('onboard tags the backend, creates and registers the waker target group, writes the workload and instruments every rule with traffic unchanged', async () => {
+test('onboard tags the backend, creates and registers the waker target group, writes the workload and shadows every rule with traffic unchanged', async () => {
   const s = setup();
   const result = await s.onboarding.onboard({ workloadId: 'shop', targetGroupArn: s.tg, settings: { idleMinutes: 30, wakeMode: 'browser' }, by: 'ops@example.com' });
   assert.deepEqual(result.steps.map((x) => [x.name, x.status]), [
@@ -106,11 +109,15 @@ test('onboard tags the backend, creates and registers the waker target group, wr
     'lambda', { [WORKLOAD]: 'shop', 'dormeto:router': 'dmt-dev' }, { 'lambda.multi_value_headers.enabled': 'true' }, [WAKER_ARN],
   ]);
   assert.deepEqual(s.a.state.permissions.get('alb-shop'), { SourceArn: wakerArn });
+  // The customer's rules stay as their infrastructure as code wrote them; a Dormeto rule just before each.
   for (const rule of [s.main, s.statics]) {
-    assert.deepEqual(weights(s.a, rule), [['shop-app', 1], ['dmt-dev-shop', 0]]);
-    assert.equal(s.a.state.rules.get(rule).actions[0].TargetGroupArn, undefined);
-    assert.equal(s.a.state.rules.get(rule).tags[WORKLOAD], 'shop');
+    assert.deepEqual(weights(s.a, rule), [['shop-app', 1]]);
+    assert.deepEqual(s.a.state.rules.get(rule).tags, {});
   }
+  assert.deepEqual(shadowsOf(s.a).map((x) => [x.priority, x.shadows, x.workload, x.weights]), [
+    ['8', s.statics, 'shop', [['shop-app', 1], ['dmt-dev-shop', 0]]], ['9', s.main, 'shop', [['shop-app', 1], ['dmt-dev-shop', 0]]],
+  ]);
+  assert.deepEqual(shadowsOf(s.a)[1].conditions, [{ Field: 'host-header', HostHeaderConfig: { Values: ['shop.example.com'] } }]);
   const cfg = await s.a.store.getConfig('shop');
   assert.deepEqual({ ...cfg, onboardedAt: 'x' }, {
     workloadId: 'shop', appTargetGroupArn: s.tg, wakerTargetGroupArn: wakerArn,
@@ -154,13 +161,14 @@ test('onboard tags the listed databases as companions and waits longer for them'
 
 test('a failure after tagging undoes the onboarding: no waker target group, permission, tag, configuration or rule change left', async () => {
   const s = setup();
-  s.a.state.fail.modifyRule = new Error('Rate exceeded');
+  s.a.state.fail.createRule = new Error('Rate exceeded');
   await assert.rejects(s.onboarding.onboard({ workloadId: 'shop', targetGroupArn: s.tg, by: 'ops' }), /cannot onboard shop: Rate exceeded \(undone\)/);
   assert.deepEqual(s.a.state.instances.get('i-0aaa').tags, { Name: 'shop' });
   assert.ok(![...s.a.state.targetGroups.values()].some((g) => g.name === 'dmt-dev-shop'));
   assert.equal(s.a.state.permissions.size, 0);
   assert.equal(await s.a.store.getConfig('shop'), null);
   for (const rule of [s.main, s.statics]) assert.deepEqual(weights(s.a, rule), [['shop-app', 1]]);
+  assert.deepEqual(shadowsOf(s.a), []);
   assert.ok(s.logs.some(([e]) => e === 'OnboardUndone'));
 });
 
@@ -185,6 +193,7 @@ test('offboard restores every rule, removes the waker target group, the permissi
     assert.deepEqual(weights(s.a, rule), [['shop-app', 1]]);
     assert.equal(s.a.state.rules.get(rule).tags[WORKLOAD], undefined);
   }
+  assert.deepEqual(shadowsOf(s.a), [], 'the shadows are deleted');
   assert.ok(![...s.a.state.targetGroups.values()].some((g) => g.name === 'dmt-dev-shop'));
   assert.equal(s.a.state.permissions.size, 0);
   assert.deepEqual(s.a.state.instances.get('i-0aaa').tags, { Name: 'shop', team: 'shop' });
@@ -226,7 +235,7 @@ test('a failing onboard of a workload that already existed is not undone: the wo
   s.a.state.fail.addPermission = new Error('Rate exceeded');
   await assert.rejects(s.onboarding.onboard({ workloadId: 'shop', targetGroupArn: s.tg, by: 'ops' }), /^Error: Rate exceeded$/);
   assert.notEqual(await s.a.store.getConfig('shop'), null);
-  assert.deepEqual(weights(s.a, s.main), [['shop-app', 1], ['dmt-dev-shop', 0]]);
+  assert.equal(shadowsOf(s.a).length, 2);
 });
 
 test('a failure while tagging the second backend undoes the first tag', async () => {
@@ -252,10 +261,10 @@ test('offboard pauses the workload before anything else, so that no nap starts o
   const s = setup();
   await s.onboarding.onboard({ workloadId: 'shop', targetGroupArn: s.tg, by: 'ops' });
   let pausedFirst = null;
-  const modify = s.a.elbv2.modifyRule;
-  s.a.elbv2.modifyRule = async (input) => {
+  const remove = s.a.elbv2.deleteRule;
+  s.a.elbv2.deleteRule = async (input) => {
     pausedFirst ??= s.a.items.has('shop/PAUSE');
-    return modify(input);
+    return remove(input);
   };
   await s.onboarding.offboard({ workloadId: 'shop', by: 'ops@example.com' });
   assert.equal(pausedFirst, true);
@@ -292,4 +301,35 @@ test('offboard untags what onboarding tagged even when a companion database was 
   const result = await s.onboarding.offboard({ workloadId: 'shop', by: 'ops' });
   assert.equal(result.steps.find((x) => x.name === 'untag backends').status, 'done');
   assert.deepEqual(s.a.state.instances.get('i-0aaa').tags, { Name: 'shop' });
+});
+
+// --- Shadow rules (R4c) -------------------------------------------------------------------------------------------
+
+test('a foreign rule right before a customer rule leaves no slot for its shadow: that rule is instrumented in place', async () => {
+  const s = setup();
+  const other = s.a.customer.targetGroup('blog-app');
+  s.a.customer.rule(9, other, { host: 'blog.example.com' });
+  const preview = await s.onboarding.preview({ workloadId: 'shop', targetGroupArn: s.tg });
+  assert.deepEqual(preview.rules.map((r) => [r.priority, r.action]), [['10', 'instrument in place (no free priority before it)'], ['11', 'instrument in place (no free priority before it)']]);
+  await s.onboarding.onboard({ workloadId: 'shop', targetGroupArn: s.tg, by: 'ops' });
+  assert.deepEqual(shadowsOf(s.a), []);
+  assert.deepEqual(weights(s.a, s.main), [['shop-app', 1], ['dmt-dev-shop', 0]]);
+  assert.equal(s.a.state.rules.get(s.main).tags[WORKLOAD], 'shop');
+  await s.onboarding.offboard({ workloadId: 'shop', by: 'ops' });
+  assert.deepEqual(weights(s.a, s.main), [['shop-app', 1]]);
+});
+
+test('a rule with an action before its forward (authentication) is instrumented in place: a shadow could not copy it', async () => {
+  const s = setup();
+  const auth = { Type: 'authenticate-oidc', Order: 1, AuthenticateOidcConfig: { Issuer: 'https://idp', ClientId: 'x' } };
+  const forward = { Type: 'forward', Order: 2, TargetGroupArn: s.tg, ForwardConfig: { TargetGroups: [{ TargetGroupArn: s.tg, Weight: 1 }] } };
+  s.a.state.rules.get(s.main).actions = [auth, forward];
+  const preview = await s.onboarding.preview({ workloadId: 'shop', targetGroupArn: s.tg });
+  assert.deepEqual(preview.rules.map((r) => [r.priority, r.action]), [['10', 'instrument in place (actions before the forward)'], ['11', 'shadow at 9']]);
+});
+
+test('shadows are found again by onboard, and a shadow placed after its rule since is not counted', async () => {
+  const s = setup();
+  await s.onboarding.onboard({ workloadId: 'shop', targetGroupArn: s.tg, by: 'ops' });
+  assert.equal((await s.onboarding.preview({ workloadId: 'shop', targetGroupArn: s.tg })).rules.every((r) => r.action === 'shadowed'), true);
 });

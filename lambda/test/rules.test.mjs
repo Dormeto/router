@@ -65,3 +65,36 @@ test('never asks the tags of a listener default rule', async () => {
   assert.equal(asked.includes('arn:rule/default'), false);
   assert.match(found.issues[0].reason, /default rule/);
 });
+
+// --- Shadow rules (R4c) -------------------------------------------------------------------------------------------
+
+test('a customer rule covered by a shadow with its conditions just before it is covered, not an issue', async () => {
+  const elbv2 = fakeElbv2(cfg);
+  elbv2.state.rules.set('arn:rule/customer', { actions: appOnly(cfg), conditions: [{ ...host('shop.example.com'), Values: ['shop.example.com'] }], priority: '40', tags: {} });
+  elbv2.state.rules.set('arn:rule/shadow', { actions: elbv2.state.forward(1, 0), conditions: [host('shop.example.com')], priority: '39', tags: { 'dormeto:workload': 'demo', 'dormeto:shadows': 'arn:rule/customer' } });
+  const found = (await resolveRules(elbv2, [cfg])).get('demo');
+  assert.deepEqual(found.issues, []);
+  assert.ok(found.instrumented.some((r) => r.RuleArn === 'arn:rule/shadow'));
+  assert.ok(!found.instrumented.some((r) => r.RuleArn === 'arn:rule/customer'));
+  assert.deepEqual(found.covered, [{ arn: 'arn:rule/customer', by: 'arn:rule/shadow' }]);
+});
+
+test('a shadow with other conditions than its rule, or after it, leaves the rule an issue (to repair)', async () => {
+  for (const [conditions, priority, reason] of [
+    [[host('old.example.com')], '39', 'rule 40 is shadowed by rule 39 with other conditions'],
+    [[host('shop.example.com')], '41', 'rule 40 is shadowed by rule 41 placed after it'],
+  ]) {
+    const elbv2 = fakeElbv2(cfg);
+    elbv2.state.rules.set('arn:rule/customer', { actions: appOnly(cfg), conditions: [host('shop.example.com')], priority: '40', tags: {} });
+    elbv2.state.rules.set('arn:rule/shadow', { actions: elbv2.state.forward(1, 0), conditions, priority, tags: { 'dormeto:workload': 'demo', 'dormeto:shadows': 'arn:rule/customer' } });
+    const found = (await resolveRules(elbv2, [cfg])).get('demo');
+    assert.deepEqual(found.issues.map((i) => [i.arn, i.reason, i.repairable]), [['arn:rule/customer', reason, true]]);
+  }
+});
+
+test('a rule forwarding to the target group without any shadow is an issue the onboarder can repair', async () => {
+  const elbv2 = fakeElbv2(cfg);
+  elbv2.state.rules.set('arn:rule/new', { actions: appOnly(cfg), priority: '19', tags: {} });
+  const [issue] = (await resolveRules(elbv2, [cfg])).get('demo').issues;
+  assert.deepEqual([issue.reason, issue.repairable], ['rule 19 forwards to the target group without the waker (not instrumented)', true]);
+});

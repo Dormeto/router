@@ -55,6 +55,10 @@ export function createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging
       route: routeOf(rules.instrumented, cfg),
       rules: rules.rules.map((rule) => {
         const issue = rules.issues.find((i) => i.arn === rule.RuleArn)?.reason;
+        // A customer rule covered by a Dormeto shadow before it: never reached while the shadow exists.
+        const by = (rules.covered ?? []).find((c) => c.arn === rule.RuleArn)?.by;
+        const shadow = by && rules.rules.find((r) => r.RuleArn === by);
+        if (shadow) return { arn: rule.RuleArn, priority: rule.Priority ?? null, conditions: conditionsOf(rule), route: 'shadowed', shadowedBy: shadow.Priority };
         return { arn: rule.RuleArn, priority: rule.Priority ?? null, conditions: conditionsOf(rule), route: currentTarget(rule.Actions ?? [], cfg), ...(issue ? { issue } : {}) };
       }),
       issues: rules.issues.map((i) => i.reason),

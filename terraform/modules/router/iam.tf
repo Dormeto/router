@@ -235,9 +235,24 @@ data "aws_iam_policy_document" "onboarder" {
     resources = ["${local.arn_prefix}:elasticloadbalancing:${local.region}:${local.account_id}:targetgroup/${var.name}-*/*"]
   }
   statement {
-    # Instrumenting a customer rule (untagged until then) and restoring it at offboarding.
+    # Instrumenting a customer rule in place (untagged until then), restoring it, mirroring a shadow's conditions.
     actions   = ["elasticloadbalancing:ModifyRule"]
     resources = ["${local.arn_prefix}:elasticloadbalancing:${local.region}:${local.account_id}:listener-rule/app/*"]
+  }
+  statement {
+    # Shadow rules: created on the customer's listener (tagged on creation).
+    actions   = ["elasticloadbalancing:CreateRule"]
+    resources = ["${local.arn_prefix}:elasticloadbalancing:${local.region}:${local.account_id}:listener/app/*", "${local.arn_prefix}:elasticloadbalancing:${local.region}:${local.account_id}:listener-rule/app/*"]
+  }
+  statement {
+    # Shadow rules only: moved before their customer rule again, deleted at offboarding.
+    actions   = ["elasticloadbalancing:DeleteRule", "elasticloadbalancing:SetRulePriorities"]
+    resources = ["${local.arn_prefix}:elasticloadbalancing:${local.region}:${local.account_id}:listener-rule/app/*"]
+    condition {
+      test     = "Null"
+      variable = "aws:ResourceTag/dormeto:workload"
+      values   = ["false"]
+    }
   }
   statement {
     actions = ["elasticloadbalancing:AddTags", "elasticloadbalancing:RemoveTags"]

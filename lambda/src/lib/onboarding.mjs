@@ -1,10 +1,13 @@
 // Onboarding (R4a): preview, onboard and offboard a workload from its application target group, in the router's account
 // and region. Every step finds what exists before changing anything, so an action can run again; offboarding removes only
 // what onboarding added (tags carry the dormeto:tagged marker), never what the customer set.
-import { forwardTargetGroups, listRules, ruleTags } from './rules.mjs';
+import { cleanConditions, forwardTargetGroups, listRules, ruleTags, sameConditions } from './rules.mjs';
 import { conditionsOf } from './route.mjs';
 
 const WORKLOAD_TAG = 'dormeto:workload';
+// A Dormeto rule just before a customer rule, with its conditions and the weighted forward: the customer's rule and its
+// infrastructure as code stay untouched (R4c).
+const SHADOWS_TAG = 'dormeto:shadows';
 const ROUTER_TAG = 'dormeto:router';
 const MARKER_TAG = 'dormeto:tagged';
 const MARKER = 'onboarder';
@@ -52,6 +55,56 @@ function instrumentedActions(actions, app, waker, weights) {
   });
 }
 
+// A rule whose only action is a forward (a shadow copies conditions, never other actions such as authentication).
+const forwardOnly = (rule) => (rule.Actions ?? []).length === 1 && rule.Actions[0].Type === 'forward';
+
+// For each customer rule forwarding to the target group (default rules aside): shadowed already, a shadow to create at a
+// free priority before it (rules of the workload in between are fine: they all forward to the same targets; a foreign
+// rule is not), or instrumented in place, with why.
+export function planRules(rows, { targetGroupArn, wakerArn, workloadId }) {
+  const priority = (row) => Number(row.rule.Priority);
+  const ours = (row) => row.tags?.[WORKLOAD_TAG] === workloadId;
+  const sameWorkload = (row) => forwardTargetGroups(row.rule).every((g) => g === targetGroupArn || g === wakerArn) && forwardTargetGroups(row.rule).includes(targetGroupArn);
+  const plans = [];
+  const taken = new Map(rows.filter((r) => !r.rule.IsDefault).map((r) => [priority(r), r]));
+  const customers = rows.filter((r) => !r.rule.IsDefault && !r.tags?.[SHADOWS_TAG] && forwardTargetGroups(r.rule).includes(targetGroupArn));
+  for (const row of customers.sort((a, b) => priority(a) - priority(b))) {
+    const shadow = rows.find((r) => r.tags?.[SHADOWS_TAG] === row.rule.RuleArn && ours(r));
+    const inPlace = wakerArn && forwardTargetGroups(row.rule).includes(wakerArn);
+    if (inPlace) {
+      plans.push({ row, action: 'instrumented' });
+      continue;
+    }
+    if (shadow) {
+      const before = priority(shadow) < priority(row);
+      plans.push({ row, shadow, action: before && sameConditions(shadow.rule.Conditions, row.rule.Conditions) ? 'shadowed' : 'mirror' });
+      continue;
+    }
+    if (!forwardOnly(row.rule)) {
+      plans.push({ row, action: 'in place', reason: 'actions before the forward' });
+      continue;
+    }
+    let slot = null;
+    for (let q = priority(row) - 1; q >= 1; q -= 1) {
+      const occupant = taken.get(q);
+      if (!occupant) {
+        slot = q;
+        break;
+      }
+      if (occupant !== 'planned' && !sameWorkload(occupant) && !ours(occupant)) break;
+    }
+    if (slot === null) plans.push({ row, action: 'in place', reason: 'no free priority before it' });
+    else {
+      taken.set(slot, 'planned');
+      plans.push({ row, action: 'shadow', priority: slot });
+    }
+  }
+  return plans;
+}
+
+const planText = (p) => ({ shadowed: 'shadowed', instrumented: 'instrumented', mirror: 'shadowed (conditions to mirror)', shadow: `shadow at ${p.priority}` })[p.action]
+  ?? `instrument in place (${p.reason})`;
+
 export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, store, router, now = Date.now, log }) {
   const wakerName = (workloadId) => `${router.name}-${workloadId}`;
 
@@ -79,12 +132,17 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
     return { ...group, ours: tagsOf(d?.Tags)[WORKLOAD_TAG] === workloadId };
   }
 
+  // Every rule of the target group's load balancers, with the tags of those forwarding to it (shadows included).
+  async function listenerRows(group) {
+    const rows = [];
+    for (const lb of group.LoadBalancerArns ?? []) rows.push(...(await listRules(elbv2, lb)));
+    const tags = await ruleTags(elbv2, rows.filter(({ rule }) => forwardTargetGroups(rule).includes(group.TargetGroupArn)).map(({ rule }) => rule));
+    return rows.map((row) => ({ ...row, tags: tags.get(row.rule.RuleArn) ?? {} }));
+  }
+
   // Rules forwarding to the target group, on its load balancers, with their tags.
   async function rulesTo(group) {
-    const rows = [];
-    for (const lb of group.LoadBalancerArns ?? []) rows.push(...(await listRules(elbv2, lb)).filter(({ rule }) => forwardTargetGroups(rule).includes(group.TargetGroupArn)));
-    const tags = await ruleTags(elbv2, rows.map(({ rule }) => rule));
-    return rows.map((row) => ({ ...row, tags: tags.get(row.rule.RuleArn) ?? {} }));
+    return (await listenerRows(group)).filter(({ rule }) => forwardTargetGroups(rule).includes(group.TargetGroupArn));
   }
 
   // Backends feeding the target group, whatever their tags: Auto Scaling groups attached to it, ECS services registered with
@@ -173,12 +231,14 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
 
     const waker = await wakerGroup(workloadId);
     if (waker && !waker.ours) problems.push(`target group ${waker.TargetGroupName} exists and is not the waker of ${workloadId}`);
-    for (const { rule, listener, tags } of await rulesTo(group)) {
+    const rows = await listenerRows(group);
+    const plans = planRules(rows, { targetGroupArn, wakerArn: waker?.ours ? waker.TargetGroupArn : null, workloadId });
+    for (const { rule, listener, tags } of rows.filter((r) => forwardTargetGroups(r.rule).includes(targetGroupArn) && !r.tags[SHADOWS_TAG])) {
       const groups = forwardTargetGroups(rule);
       const entry = { arn: rule.RuleArn, priority: rule.Priority, conditions: conditionsOf(rule) };
       if (rule.IsDefault) problems.push(`the listener default action of ${listener.Protocol}:${listener.Port} forwards to the target group (not supported yet)`);
       else if (groups.some((g) => g !== targetGroupArn && g !== waker?.TargetGroupArn)) problems.push(`rule ${rule.Priority} also forwards to other target groups`);
-      else entry.action = waker && groups.includes(waker.TargetGroupArn) && tags[WORKLOAD_TAG] === workloadId ? 'instrumented' : 'instrument';
+      else entry.action = planText(plans.find((p) => p.row.rule.RuleArn === rule.RuleArn));
       result.rules.push(entry);
     }
     if (lbs.length && !result.rules.length) problems.push('no rule forwards to the target group');
@@ -276,18 +336,8 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
         step('workload configuration', true);
       } else step('workload configuration', false);
 
-      let instrumented = 0;
-      for (const { rule, tags } of await rulesTo({ ...group, LoadBalancerArns: [checked.loadBalancerArn] })) {
-        if (!forwardTargetGroups(rule).includes(waker.TargetGroupArn)) {
-          await elbv2.modifyRule({ RuleArn: rule.RuleArn, Actions: instrumentedActions(rule.Actions, targetGroupArn, waker.TargetGroupArn, { app: 1, waker: 0 }) });
-          instrumented += 1;
-        }
-        if (tags[WORKLOAD_TAG] !== workloadId) {
-          await elbv2.addTags({ ResourceArns: [rule.RuleArn], Tags: [{ Key: WORKLOAD_TAG, Value: workloadId }] });
-          instrumented += 1;
-        }
-      }
-      step('instrument rules', instrumented > 0);
+      const applied = await applyRules({ ...group, LoadBalancerArns: [checked.loadBalancerArn] }, workloadId, waker.TargetGroupArn, { app: 1, waker: 0 });
+      step('instrument rules', applied.length > 0, applied.join(', '));
       log.info('Onboarded', { workloadId, targetGroupArn, by, steps: steps.filter((s) => s.status === 'done').map((s) => s.name) });
       return { steps, workload: { workloadId, wakerTargetGroupArn: waker.TargetGroupArn } };
     } catch (err) {
@@ -298,6 +348,38 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
       log.warn('OnboardUndone', { workloadId, error: err.message, failed: failed.map((s) => s.name) });
       throw new Error(`cannot onboard ${workloadId}: ${err.message} (${failed.length ? `undo incomplete: ${failed.map((s) => `${s.name}: ${s.detail}`).join('; ')}` : 'undone'})`);
     }
+  }
+
+  // Shadows to create or mirror, rules to instrument in place: what changed, as text. `weights` follow the workload's
+  // state (a shadow created while it sleeps sends to the waker).
+  async function applyRules(group, workloadId, wakerArn, weights) {
+    const changed = [];
+    const rows = await listenerRows(group);
+    for (const plan of planRules(rows, { targetGroupArn: group.TargetGroupArn, wakerArn, workloadId })) {
+      const { rule } = plan.row;
+      if (plan.action === 'shadow') {
+        changed.push(`shadow of rule ${rule.Priority} at ${plan.priority}`);
+        await elbv2.createRule({
+          ListenerArn: plan.row.listener.ListenerArn, Priority: plan.priority, Conditions: cleanConditions(rule.Conditions),
+          Actions: [{ Type: 'forward', ForwardConfig: {
+            TargetGroups: [{ TargetGroupArn: group.TargetGroupArn, Weight: weights.app }, { TargetGroupArn: wakerArn, Weight: weights.waker }],
+            TargetGroupStickinessConfig: rule.Actions[0].ForwardConfig?.TargetGroupStickinessConfig ?? { Enabled: false },
+          } }],
+          Tags: [{ Key: WORKLOAD_TAG, Value: workloadId }, { Key: SHADOWS_TAG, Value: rule.RuleArn }],
+        });
+      } else if (plan.action === 'mirror') {
+        changed.push(`conditions of the shadow of rule ${rule.Priority}`);
+        await elbv2.modifyRule({ RuleArn: plan.shadow.rule.RuleArn, Conditions: cleanConditions(rule.Conditions) });
+      } else if (plan.action === 'in place') {
+        changed.push(`rule ${rule.Priority} in place`);
+        await elbv2.modifyRule({ RuleArn: rule.RuleArn, Actions: instrumentedActions(rule.Actions, group.TargetGroupArn, wakerArn, weights) });
+        await elbv2.addTags({ ResourceArns: [rule.RuleArn], Tags: [{ Key: WORKLOAD_TAG, Value: workloadId }] });
+      } else if (plan.action === 'instrumented' && plan.row.tags[WORKLOAD_TAG] !== workloadId) {
+        changed.push(`tag of rule ${rule.Priority}`);
+        await elbv2.addTags({ ResourceArns: [rule.RuleArn], Tags: [{ Key: WORKLOAD_TAG, Value: workloadId }] });
+      }
+    }
+    return changed;
   }
 
   // Remove the instrumentation, step by step, each step going on whatever the others did: rules first (traffic stays on
@@ -319,6 +401,12 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
       if (!group) return false;
       let restored = 0;
       for (const { rule, tags } of await rulesTo(group)) {
+        // Shadows go first: traffic falls back to the customer's rules, which forward to the application.
+        if (tags[SHADOWS_TAG] && tags[WORKLOAD_TAG] === workloadId) {
+          await elbv2.deleteRule({ RuleArn: rule.RuleArn });
+          restored += 1;
+          continue;
+        }
         if (waker && forwardTargetGroups(rule).includes(waker.TargetGroupArn)) {
           await elbv2.modifyRule({ RuleArn: rule.RuleArn, Actions: instrumentedActions(rule.Actions, targetGroupArn, null) });
           restored += 1;

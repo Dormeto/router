@@ -3,6 +3,10 @@
 // target groups only and carries dormeto:workload = <workload id>; any other rule forwarding to the target group is an
 // issue (the router cannot switch it, so it must not nap the workload).
 const WORKLOAD_TAG = 'dormeto:workload';
+// A Dormeto rule before a customer rule, with its conditions and the weighted forward (R4c): the customer rule it covers is
+// neither switched nor an issue.
+const SHADOWS_TAG = 'dormeto:shadows';
+const CONFIGS = ['HostHeaderConfig', 'PathPatternConfig', 'HttpHeaderConfig', 'QueryStringConfig', 'HttpRequestMethodConfig', 'SourceIpConfig'];
 const NO_RULE = 'no rule forwards to the target group';
 const DETACHED = 'target group not attached to a load balancer';
 
@@ -18,6 +22,19 @@ async function pages(call, key) {
   } while (marker);
   return items;
 }
+
+// Conditions as CreateRule and ModifyRule take them: DescribeRules adds the legacy Values next to the configuration.
+export function cleanConditions(conditions = []) {
+  return conditions.map((c) => {
+    const copy = structuredClone(c);
+    if (CONFIGS.some((k) => copy[k])) delete copy.Values;
+    return copy;
+  });
+}
+
+const canonical = (value) => (Array.isArray(value) ? value.map(canonical)
+  : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => [k, canonical(v)])) : value);
+export const sameConditions = (a, b) => JSON.stringify(canonical(cleanConditions(a))) === JSON.stringify(canonical(cleanConditions(b)));
 
 // Target groups of the forward actions of a rule, whatever their weight.
 export function forwardTargetGroups(rule) {
@@ -73,13 +90,28 @@ export async function resolveRules(elbv2, cfgs) {
     const rows = matching.get(cfg.workloadId);
     const instrumented = [];
     const issues = [];
+    const covered = [];
+    const tagsOf = (rule) => tags.get(rule.RuleArn) ?? {};
+    const shadows = rows.filter(({ rule }) => tagsOf(rule)[SHADOWS_TAG] && tagsOf(rule)[WORKLOAD_TAG] === cfg.workloadId);
     for (const { rule, listener } of rows) {
-      const reason = issueOf(rule, listener, tags.get(rule.RuleArn) ?? {}, cfg);
-      if (reason) issues.push({ arn: rule.RuleArn, priority: rule.Priority, reason });
+      const shadow = !rule.IsDefault && !tagsOf(rule)[SHADOWS_TAG] && shadows.find((x) => tagsOf(x.rule)[SHADOWS_TAG] === rule.RuleArn);
+      if (shadow) {
+        const before = Number(shadow.rule.Priority) < Number(rule.Priority);
+        if (before && sameConditions(shadow.rule.Conditions, rule.Conditions)) {
+          covered.push({ arn: rule.RuleArn, by: shadow.rule.RuleArn });
+          continue;
+        }
+        const why = before ? 'with other conditions' : 'placed after it';
+        issues.push({ arn: rule.RuleArn, priority: rule.Priority, reason: `rule ${rule.Priority} is shadowed by rule ${shadow.rule.Priority} ${why}`, repairable: true });
+        continue;
+      }
+      const reason = issueOf(rule, listener, tagsOf(rule), cfg);
+      // The onboarder repairs a rule without the waker (it shadows it) or without the workload tag; not the others.
+      if (reason) issues.push({ arn: rule.RuleArn, priority: rule.Priority, reason, repairable: !rule.IsDefault && !reason.includes('other target groups') });
       else instrumented.push(rule);
     }
     if (!(balancers.get(cfg.appTargetGroupArn) ?? []).length) issues.push({ arn: null, priority: null, reason: DETACHED });
     else if (!rows.length) issues.push({ arn: null, priority: null, reason: NO_RULE });
-    return [cfg.workloadId, { rules: rows.map(({ rule }) => rule), instrumented, issues }];
+    return [cfg.workloadId, { rules: rows.map(({ rule }) => rule), instrumented, issues, covered }];
   }));
 }

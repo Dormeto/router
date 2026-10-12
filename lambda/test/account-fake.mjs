@@ -44,8 +44,9 @@ export function fakeAccount() {
     },
     rule(priority, tg, { host, isDefault = false, actions } = {}) {
       const arn = ruleArn(priority === 'default' ? 99999 : priority);
+      // DescribeRules answers the legacy Values next to the condition's configuration.
       state.rules.set(arn, {
-        priority: String(priority), isDefault, conditions: host ? [{ Field: 'host-header', HostHeaderConfig: { Values: [host] } }] : [],
+        priority: String(priority), isDefault, conditions: host ? [{ Field: 'host-header', Values: [host], HostHeaderConfig: { Values: [host] } }] : [],
         actions: actions ?? plain(tg), tags: {},
       });
       return arn;
@@ -123,8 +124,10 @@ export function fakeAccount() {
       g.targets = g.targets.filter((x) => !Targets.some((t) => t.Id === x.Id));
       return {};
     },
-    async modifyRule({ RuleArn, Actions }) {
+    async modifyRule({ RuleArn, Actions, Conditions }) {
       call('modifyRule');
+      if (Conditions) state.rules.get(RuleArn).conditions = structuredClone(Conditions);
+      if (!Actions) return {};
       for (const a of Actions) {
         if (a.TargetGroupArn && (a.ForwardConfig?.TargetGroups?.length ?? 0) > 1) throw error('ValidationError', 'TargetGroupArn with a multi target group ForwardConfig');
         for (const g of a.ForwardConfig?.TargetGroups ?? []) if (!state.targetGroups.has(g.TargetGroupArn)) throw error('TargetGroupNotFoundException');
@@ -137,6 +140,33 @@ export function fakeAccount() {
       }
       return {};
     },
+    async createRule({ ListenerArn, Priority, Conditions, Actions, Tags = [] }) {
+      call('createRule');
+      if (ListenerArn !== LISTENER) throw error('ListenerNotFoundException');
+      if ([...state.rules.values()].some((r) => r.priority === String(Priority))) throw error('PriorityInUseException', `Priority '${Priority}' is currently in use`);
+      for (const c of Conditions) if (c.Values && c.HostHeaderConfig) throw error('ValidationError', 'You cannot both specify Values and HostHeaderConfig');
+      const arn = ruleArn(100000 + (ids += 1));
+      state.rules.set(arn, { priority: String(Priority), isDefault: false, conditions: structuredClone(Conditions), actions: structuredClone(Actions), tags: Object.fromEntries(Tags.map((t) => [t.Key, t.Value])) });
+      for (const g of Actions.flatMap((a) => a.ForwardConfig?.TargetGroups ?? [])) {
+        const tg = state.targetGroups.get(g.TargetGroupArn);
+        if (!tg.lbs.includes(LB)) tg.lbs.push(LB);
+      }
+      return { Rules: [{ RuleArn: arn, Priority: String(Priority) }] };
+    },
+    async deleteRule({ RuleArn }) {
+      call('deleteRule');
+      if (!state.rules.delete(RuleArn)) throw error('RuleNotFoundException');
+      return {};
+    },
+    async setRulePriorities({ RulePriorities }) {
+      call('setRulePriorities');
+      for (const { RuleArn, Priority } of RulePriorities) {
+        if ([...state.rules].some(([a, r]) => a !== RuleArn && r.priority === String(Priority))) throw error('PriorityInUseException');
+        state.rules.get(RuleArn).priority = String(Priority);
+      }
+      return {};
+    },
+    async modifyRuleConditions(arn, conditions) { state.rules.get(arn).conditions = structuredClone(conditions); },
     async addTags({ ResourceArns, Tags }) {
       call('addTags');
       for (const a of ResourceArns) Object.assign(resourceTags(a), Object.fromEntries(Tags.map((t) => [t.Key, t.Value])));

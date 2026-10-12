@@ -9,3 +9,4 @@ crash.log
 .build/
 # Reusable modules: only root modules commit a provider lock file
 terraform/modules/*/.terraform.lock.hcl
+dist/

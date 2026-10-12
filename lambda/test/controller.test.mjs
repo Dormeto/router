@@ -1197,6 +1197,29 @@ test('nap of a Kubernetes workload: the waker switched in, the owner scaled to 0
   ]);
 });
 
+test('a Kubernetes nap does not wait for the targets of its gone pods to drain (the target group\'s deregistration delay, 300 s by default); a target still serving holds it', async () => {
+  // The controller deregisters a pod as it terminates: its target drains for the group's deregistration delay, an IP that
+  // never serves again (read on dev-eks: every nap waited the 2-minute release timeout).
+  const napped = (s, state) => {
+    const describe = s.elbv2.describeTargetHealth;
+    s.elbv2.describeTargetHealth = async (input) => {
+      if (s.k8s.state.owners[0].spec.replicas === 0) s.elbv2.state.targets = s.elbv2.state.targets.map((t) => ({ ...t, State: state }));
+      return describe(input);
+    };
+  };
+  const s = k8sSetup({ state: STATES.AWAKE });
+  napped(s, 'draining');
+  const t0 = s.clock.now();
+  assert.equal((await s.handler({ action: 'nap', workloadId: 'demo' })).state, STATES.ASLEEP);
+  assert.ok(s.clock.now() - t0 < 120_000, `waited ${(s.clock.now() - t0) / 1000} s`);
+
+  const serving = k8sSetup({ state: STATES.AWAKE });
+  napped(serving, 'healthy');
+  const t1 = serving.clock.now();
+  assert.equal((await serving.handler({ action: 'nap', workloadId: 'demo' })).state, STATES.ASLEEP);
+  assert.ok(serving.clock.now() - t1 >= 120_000, 'a target still healthy holds the nap up to the release timeout');
+});
+
 test('wake of a Kubernetes workload: the recorded replicas back, then the app once a target is healthy', async () => {
   const napBackends = JSON.stringify([{ kind: 'k8s', id: 'eks-demo/demo/Deployment/web', cluster: 'eks-demo', namespace: 'demo', owner: { kind: 'Deployment', name: 'web' }, replicas: 2, keda: null }]);
   const s = k8sSetup({ state: STATES.WAKING, wakeId: 'w1', napBackends }, { replicas: 0, pods: 0 });

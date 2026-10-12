@@ -36,11 +36,14 @@ const SERVING = new Set(['healthy', 'initial', 'draining', 'unhealthy']);
 
 // After a nap: until the target group has dropped the stopped backends (ECS tasks deregister after the service reports
 // no running task). Otherwise a wake right after the nap sees the old target healthy and switches the route to an
-// empty target group (ALB 503). Returns false when the deadline is reached first.
-export async function waitTargetsReleased(elbv2, targetGroupArn, { sleep, now, deadline, pollMs = 5000 }) {
+// empty target group (ALB 503). Returns false when the deadline is reached first. draining: false for pods, whose
+// targets the Load Balancer Controller deregisters as they terminate: an IP that never serves again drains for the
+// group's deregistration delay (300 s by default), longer than the wait.
+export async function waitTargetsReleased(elbv2, targetGroupArn, { sleep, now, deadline, pollMs = 5000, draining = true }) {
   for (;;) {
     const { TargetHealthDescriptions = [] } = await elbv2.describeTargetHealth({ TargetGroupArn: targetGroupArn });
-    if (!TargetHealthDescriptions.some((d) => SERVING.has(d.TargetHealth?.State))) return true;
+    const serving = (state) => SERVING.has(state) && (draining || state !== 'draining');
+    if (!TargetHealthDescriptions.some((d) => serving(d.TargetHealth?.State))) return true;
     if (now() >= deadline) return false;
     await sleep(pollMs);
   }

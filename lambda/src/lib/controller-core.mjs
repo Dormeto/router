@@ -249,7 +249,7 @@ export function createController({
       await sleepBackends(clients, backends, { sleep, now, deadline: now() + STOP_TIMEOUT_MS });
       // A fallback instance type is for one wake only (R7a, FinOps): stopped, an instance gets its own type back.
       await revertInstanceTypes(ec2, backends.filter((b) => b.kind === 'instance').map((b) => b.id), log);
-      if (!(await waitTargetsReleased(elbv2, cfg.appTargetGroupArn, { sleep, now, deadline: now() + RELEASE_TIMEOUT_MS }))) {
+      if (!(await waitTargetsReleased(elbv2, cfg.appTargetGroupArn, { sleep, now, deadline: now() + RELEASE_TIMEOUT_MS, draining: !cfg.kubernetes }))) {
         log.warn('TargetsNotReleased', { workloadId });
       }
     } catch (err) {

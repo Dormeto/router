@@ -1,6 +1,6 @@
 // Waker side of the IP reputation lists: one lookup structure per list and container, refreshed when the controller
 // stored a new version (META checked every few minutes).
-import { decodeParts, rangeSet } from './ip-lists.mjs';
+import { FORMAT, unpackList } from './ip-lists.mjs';
 
 const CHECK_MS = 5 * 60_000;
 const ACTIONS = new Set(['defer', 'ignore']);
@@ -43,10 +43,13 @@ export function createListCache({ store, lists, now = Date.now, log, checkMs = C
         Object.assign(current, { meta, checkedAt: now(), error: undefined });
         return current;
       }
+      if (meta.format !== FORMAT) throw new Error(`stored format ${meta.format ?? 'text'}: waiting for the controller to rewrite it`);
+      const started = Date.now();
       const parts = await store.getListParts(list.name, meta.version);
       if (parts.length !== meta.parts) throw new Error(`version ${meta.version}: ${parts.length} of ${meta.parts} parts`);
-      const entry = { version: meta.version, set: rangeSet(decodeParts(parts)), meta, checkedAt: now() };
+      const entry = { version: meta.version, set: unpackList(parts), meta, checkedAt: now() };
       loaded.set(list.name, entry);
+      log.info('ListLoaded', { name: list.name, version: meta.version, ranges: entry.set.size, ms: Date.now() - started });
       return entry;
     } catch (err) {
       log.warn('ListLoadFailed', { name: list.name, error: err.message });

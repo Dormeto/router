@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createListRefresher, downloadText } from '../src/lib/list-refresh.mjs';
-import { decodeParts } from '../src/lib/ip-lists.mjs';
+import { unpackList } from '../src/lib/ip-lists.mjs';
 import { fakeClock, fakeStore, silentLog, testConfig } from './fakes.mjs';
 
 const HOUR = 3_600_000;
@@ -38,7 +38,10 @@ test('refresh stores a filtered, versioned copy and points META to it', async ()
   assert.equal(meta.entries, 2);
   assert.equal(meta.dropped, 1);
   assert.equal(meta.parts, parts[meta.version].length);
-  assert.deepEqual(decodeParts(parts[meta.version]), ['45.130.203.183/32', '142.93.0.0/16']);
+  assert.equal(meta.format, 'ranges-v1');
+  const set = unpackList(parts[meta.version]);
+  assert.ok(set.has('45.130.203.183') && set.has('142.93.0.66'));
+  assert.ok(!set.has('10.1.2.3'), 'reserved ranges dropped');
 });
 
 test('a changed URL makes the list due at once', async () => {
@@ -91,4 +94,12 @@ test('downloadText enforces the status, the size and the timeout', async () => {
   const capture = async (url, init) => { signal = init.signal; return new Response('a'); };
   await downloadText('https://x', { fetch: capture, timeoutMs: 1234 });
   assert.ok(signal instanceof AbortSignal);
+});
+
+test('a list stored in an older format is due again', async () => {
+  const { refresher, store } = setup();
+  await refresher.refresh(['ipsum']);
+  delete store.state.lists.ipsum.meta.format;
+  delete store.state.lists.ipsum.meta.attemptFormat;
+  assert.deepEqual(await refresher.due(), ['ipsum']);
 });

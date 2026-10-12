@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { decodeParts, dropReserved, encodeParts, parseList, rangeSet } from '../src/lib/ip-lists.mjs';
+import { dropReserved, packList, parseList, rangeSet, unpackList } from '../src/lib/ip-lists.mjs';
 
 test('parseList reads the first column of text lists, with comments and separators', () => {
   const text = [
@@ -53,10 +53,21 @@ test('rangeSet handles an empty list and IPv4-only or IPv6-only lists', () => {
   assert.equal(rangeSet(['45.130.203.0/24']).has('2a03:b0c0::1'), false);
 });
 
-test('encodeParts and decodeParts round-trip a large list in chunks', () => {
+test('packList stores merged binary ranges in chunks; unpackList looks them up', () => {
   const entries = Array.from({ length: 50_000 }, (_, i) => `${45 + (i >> 16)}.${(i >> 8) & 255}.${i & 255}.${(i * 7) & 255}/32`);
-  const parts = encodeParts(entries, 20_000);
+  entries.push('2a03:b0c0::/32', '2600:1f1e::/36');
+  const parts = packList(entries, 20_000);
   assert.ok(parts.length > 1, 'split into several parts');
   assert.ok(parts.every((p) => p.length <= 20_000));
-  assert.deepEqual(decodeParts(parts), entries);
+  const set = unpackList(parts);
+  assert.equal(set.size, rangeSet(entries).size);
+  for (const ip of ['45.0.0.0', '45.0.1.7', '45.0.195.85', '2a03:b0c0:1::1', '2600:1f1f::1']) assert.equal(set.has(ip), rangeSet(entries).has(ip), ip);
+  assert.ok(set.has('45.0.1.7'));
+  assert.ok(set.has('2a03:b0c0:ffff::1'));
+  assert.ok(!set.has('2a03:b0c1::1'));
+});
+
+test('unpackList rejects data that is not a range list', async () => {
+  const { gzipSync } = await import('node:zlib');
+  assert.throws(() => unpackList([gzipSync(Buffer.from('45.130.203.183/32\n'))]), /not a Dormeto range list/);
 });

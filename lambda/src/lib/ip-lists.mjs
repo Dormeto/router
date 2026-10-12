@@ -131,40 +131,87 @@ function merge(ranges) {
   return merged;
 }
 
-function contains(ranges, value) {
-  let low = 0;
-  let high = ranges.length - 1;
-  while (low <= high) {
-    const mid = (low + high) >> 1;
-    if (ranges[mid].start <= value) low = mid + 1;
-    else high = mid - 1;
-  }
-  return high >= 0 && value <= ranges[high].end;
+// Stored format (gzip, split into parts): a 16-byte header ("DML1", IPv4 count, IPv6 count, 0), then the merged IPv4
+// ranges as two Uint32 arrays (starts, ends) and the IPv6 ranges as four BigUint64 arrays (start high/low, end
+// high/low), little-endian. The waker wraps typed arrays around it: no parsing on load.
+export const FORMAT = 'ranges-v1';
+const MAGIC = 0x314c4d44; // "DML1"
+const MASK64 = (1n << 64n) - 1n;
+
+function mergeEntries(entries) {
+  const parsed = entries.map(parseCidr).filter(Boolean);
+  return { v4: merge(parsed.filter((r) => r.family === 4)), v6: merge(parsed.filter((r) => r.family === 6)) };
 }
 
-// Lookup structure: merged, sorted IPv4 and IPv6 ranges, binary search per address.
-export function rangeSet(entries) {
-  const parsed = entries.map(parseCidr).filter(Boolean);
-  const v4 = merge(parsed.filter((r) => r.family === 4));
-  const v6 = merge(parsed.filter((r) => r.family === 6));
+function encodeRanges({ v4, v6 }) {
+  const n = v4.length;
+  const m = v6.length;
+  const buffer = new ArrayBuffer(16 + n * 8 + m * 32);
+  new Uint32Array(buffer, 0, 4).set([MAGIC, n, m, 0]);
+  const starts = new Uint32Array(buffer, 16, n);
+  const ends = new Uint32Array(buffer, 16 + n * 4, n);
+  v4.forEach((r, i) => { starts[i] = r.start; ends[i] = r.end; });
+  const wide = new BigUint64Array(buffer, 16 + n * 8, m * 4);
+  v6.forEach((r, i) => {
+    wide[i] = r.start >> 64n;
+    wide[m + i] = r.start & MASK64;
+    wide[2 * m + i] = r.end >> 64n;
+    wide[3 * m + i] = r.end & MASK64;
+  });
+  return Buffer.from(buffer);
+}
+
+// Index of the last start <= value (−1 when none), with compare(i) = sign(start[i] - value).
+function lastAtOrBelow(count, compare) {
+  let low = 0;
+  let high = count - 1;
+  while (low <= high) {
+    const mid = (low + high) >> 1;
+    if (compare(mid) <= 0) low = mid + 1;
+    else high = mid - 1;
+  }
+  return high;
+}
+
+function decodeRanges(data) {
+  // An aligned copy: typed arrays need offsets that are multiples of their element size.
+  const buffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.length);
+  const [magic, n, m] = buffer.byteLength >= 16 ? new Uint32Array(buffer, 0, 4) : [0, 0, 0];
+  if (magic !== MAGIC || buffer.byteLength !== 16 + n * 8 + m * 32) throw new Error('not a Dormeto range list');
+  const starts = new Uint32Array(buffer, 16, n);
+  const ends = new Uint32Array(buffer, 16 + n * 4, n);
+  const wide = new BigUint64Array(buffer, 16 + n * 8, m * 4);
+  const cmp = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
   return {
-    size: v4.length + v6.length,
+    size: n + m,
     has(ip) {
       const family = isIP(ip ?? '');
-      if (family === 4) return contains(v4, v4ToNumber(ip));
-      if (family === 6) return contains(v6, v6ToBigInt(ip));
+      if (family === 4) {
+        const value = v4ToNumber(ip);
+        const i = lastAtOrBelow(n, (k) => cmp(starts[k], value));
+        return i >= 0 && value <= ends[i];
+      }
+      if (family === 6) {
+        const value = v6ToBigInt(ip);
+        const hi = value >> 64n;
+        const lo = value & MASK64;
+        const i = lastAtOrBelow(m, (k) => cmp(wide[k], hi) || cmp(wide[m + k], lo));
+        return i >= 0 && (hi < wide[2 * m + i] || (hi === wide[2 * m + i] && lo <= wide[3 * m + i]));
+      }
       return false;
     },
   };
 }
 
-// Storage: gzip of one entry per line, split into parts that fit a DynamoDB item.
-export function encodeParts(entries, maxBytes = PART_BYTES) {
-  const zipped = gzipSync(Buffer.from(entries.join('\n')), { level: 9 });
+// Lookup structure for a list of entries (same code path as the stored format).
+export const rangeSet = (entries) => decodeRanges(encodeRanges(mergeEntries(entries)));
+
+// Controller: entries → gzip parts that fit a DynamoDB item. Waker: parts → lookup structure.
+export function packList(entries, maxBytes = PART_BYTES) {
+  const zipped = gzipSync(encodeRanges(mergeEntries(entries)), { level: 9 });
   const parts = [];
   for (let at = 0; at < zipped.length; at += maxBytes) parts.push(zipped.subarray(at, at + maxBytes));
-  return parts.length ? parts : [zipped];
+  return parts;
 }
 
-export const decodeParts = (parts) => gunzipSync(Buffer.concat(parts.map((p) => Buffer.from(p)))).toString('utf8')
-  .split('\n').filter(Boolean);
+export const unpackList = (parts) => decodeRanges(gunzipSync(Buffer.concat(parts.map((p) => Buffer.from(p)))));

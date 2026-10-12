@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createListCache, parseLists } from '../src/lib/list-cache.mjs';
-import { encodeParts } from '../src/lib/ip-lists.mjs';
+import { packList } from '../src/lib/ip-lists.mjs';
 import { classify } from '../src/lib/http.mjs';
 import { albEvent, fakeClock, fakeStore, silentLog, testConfig } from './fakes.mjs';
 
@@ -10,8 +10,8 @@ const LISTS = [{ name: 'ipsum', url: 'https://x/ipsum', action: 'defer', refresh
 function storeWith(clock, entries = { ipsum: ['45.130.203.183/32'], bad: ['142.93.0.0/16'] }) {
   const store = fakeStore({ config: testConfig(), run: { state: 'ASLEEP' }, clock });
   for (const [name, list] of Object.entries(entries)) {
-    const parts = encodeParts(list);
-    store.state.lists[name] = { meta: { version: 'v1', parts: parts.length, entries: list.length, fetchedAt: 1_700_000_000_000 }, parts: { v1: parts } };
+    const parts = packList(list);
+    store.state.lists[name] = { meta: { version: 'v1', format: 'ranges-v1', parts: parts.length, entries: list.length, fetchedAt: 1_700_000_000_000 }, parts: { v1: parts } };
   }
   return store;
 }
@@ -42,8 +42,8 @@ test('the cache loads each list once and reloads only a new version', async () =
   clock.advance(6 * 60_000);
   await cache.get();
   assert.equal(partReads, 2, 'same version: parts not read again');
-  const parts = encodeParts(['8.229.112.0/20']);
-  store.state.lists.ipsum = { meta: { version: 'v2', parts: parts.length, entries: 1 }, parts: { v2: parts } };
+  const parts = packList(['8.229.112.0/20']);
+  store.state.lists.ipsum = { meta: { version: 'v2', format: 'ranges-v1', parts: parts.length, entries: 1 }, parts: { v2: parts } };
   clock.advance(6 * 60_000);
   const [ipsum] = await cache.get();
   assert.equal(ipsum.has('8.229.112.122'), true);
@@ -124,4 +124,13 @@ test('waker: requests settled by the filters or an explicit wake do not load the
   store.state.run = { state: 'ASLEEP' };
   await handler(albEvent());
   assert.equal(loads, 1);
+});
+
+test('a list stored in another format is not loaded until the controller rewrites it', async () => {
+  const clock = fakeClock();
+  const store = storeWith(clock, { ipsum: ['45.130.203.183/32'] });
+  store.state.lists.ipsum.meta.format = 'text';
+  const cache = createListCache({ store, lists: LISTS.slice(0, 1), now: clock.now, log: silentLog });
+  assert.deepEqual(await cache.get(), []);
+  assert.match((await cache.describe())[0].error, /format/);
 });

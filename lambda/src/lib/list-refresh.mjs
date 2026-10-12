@@ -1,5 +1,5 @@
 // Controller side of the IP reputation lists: download, filter and store a new version of each due list.
-import { dropReserved, encodeParts, parseList } from './ip-lists.mjs';
+import { FORMAT, dropReserved, packList, parseList } from './ip-lists.mjs';
 
 const HOUR_MS = 3_600_000;
 // A failed download of the same URL is retried at most once an hour.
@@ -25,8 +25,9 @@ export function createListRefresher({ store, lists, download = downloadText, now
     const names = [];
     for (const list of lists) {
       const meta = await store.getListMeta(list.name);
-      const stale = meta?.url !== list.url || now() - (meta?.fetchedAt ?? 0) >= list.refreshHours * HOUR_MS;
-      const retry = meta?.attemptUrl !== list.url || now() - (meta?.lastAttemptAt ?? 0) >= RETRY_MS;
+      const stale = meta?.url !== list.url || meta?.format !== FORMAT || now() - (meta?.fetchedAt ?? 0) >= list.refreshHours * HOUR_MS;
+      // A new URL or a new stored format (router upgrade) is tried at once, a failure again after RETRY_MS.
+      const retry = meta?.attemptUrl !== list.url || meta?.attemptFormat !== FORMAT || now() - (meta?.lastAttemptAt ?? 0) >= RETRY_MS;
       if (stale && retry) names.push(list.name);
     }
     return names;
@@ -34,18 +35,18 @@ export function createListRefresher({ store, lists, download = downloadText, now
 
   async function refreshOne(list) {
     const started = now();
-    await store.setListMeta(list.name, { lastAttemptAt: started, attemptUrl: list.url });
+    await store.setListMeta(list.name, { lastAttemptAt: started, attemptUrl: list.url, attemptFormat: FORMAT });
     try {
       const { entries, invalid } = parseList(await download(list.url));
       const { kept, dropped } = dropReserved(entries);
       if (!kept.length) throw new Error(`no usable entry (${dropped} reserved, ${invalid} invalid)`);
-      const parts = encodeParts(kept);
+      const parts = packList(kept);
       const version = String(started);
       const expiresAt = Math.floor(started / 1000) + PART_TTL_S;
       // Every part of the new version first, then META: readers never see a partial version.
       for (const [index, part] of parts.entries()) await store.putListPart(list.name, version, index, part, expiresAt);
       await store.setListMeta(list.name, {
-        version, parts: parts.length, entries: kept.length, dropped, invalid, url: list.url, fetchedAt: now(),
+        version, format: FORMAT, parts: parts.length, entries: kept.length, dropped, invalid, url: list.url, fetchedAt: now(),
       }, ['error', 'errorAt']);
       log.info('ListRefreshed', { name: list.name, entries: kept.length, dropped, invalid, parts: parts.length });
       return { name: list.name, entries: kept.length, dropped };

@@ -15,6 +15,15 @@ export function failureOf(run) {
   }
 }
 
+// The fallback instance types its instances run on (R7a), until the next nap gives them their own back.
+export function fallbacksOf(run) {
+  try {
+    return Object.entries(run?.instanceTypes ? JSON.parse(run.instanceTypes) : {}).map(([instance, { from, to }]) => ({ instance, from, to }));
+  } catch {
+    return [];
+  }
+}
+
 const sum = (counts = {}) => Object.values(counts).reduce((total, n) => total + n, 0);
 
 // 7-day totals of the daily statistics (null when they could not be read).
@@ -39,6 +48,8 @@ export function workloadSummary(cfg, run = {}, host = null, stats7d = null, paus
     consecutiveFailures: run?.consecutiveFailures ?? 0,
     // When a request may retry a failed wake (R7a: backed off).
     nextAttemptAt: iso(nextAttemptAt(cfg, run)),
+    // Only when some (check events stay small).
+    ...(fallbacksOf(run).length ? { fallbacks: fallbacksOf(run) } : {}),
     updatedAt: iso(run?.updatedAt),
     pendingWake: run?.pendingWake === true,
     // The kinds of its backends (instance, asg, ecs, then its databases), as the last idle check found them.

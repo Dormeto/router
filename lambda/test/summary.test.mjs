@@ -20,3 +20,10 @@ test('a failed workload\'s summary gives its next attempt (R7a)', () => {
   assert.equal(summary.nextAttemptAt, new Date(at + 240_000).toISOString());
   assert.equal(workloadSummary(testConfig(), { state: 'ASLEEP' }).nextAttemptAt, null);
 });
+
+test('a workload awake on fallback instance types says which (R7a), and nothing when on its own types', () => {
+  const run = { state: 'AWAKE', instanceTypes: JSON.stringify({ 'i-1': { from: 't3.medium', to: 't3.large' } }) };
+  assert.deepEqual(workloadSummary(testConfig(), run).fallbacks, [{ instance: 'i-1', from: 't3.medium', to: 't3.large' }]);
+  assert.equal('fallbacks' in workloadSummary(testConfig(), { state: 'AWAKE' }), false, 'absent, to keep check events small');
+  assert.equal('fallbacks' in workloadSummary(testConfig(), { state: 'AWAKE', instanceTypes: '{' }), false, 'an unreadable record is none');
+});

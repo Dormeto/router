@@ -840,6 +840,18 @@ test('status returns the live status of a workload, with router rules, statistic
   assert.deepEqual(status.ipLists.map((l) => [l.name, l.entries, l.url]), [['ipsum', 42, 'https://x']]);
 });
 
+test('status gives a failed workload\'s next attempt and the fallback instance types in use (R7a)', async () => {
+  const failedAt = Date.now() - 10_000;
+  const s = managerSetup({ run: { state: STATES.FAILED, failedAt, consecutiveFailures: 2, failure: JSON.stringify({ kind: 'capacity', step: 'wake', message: 'no capacity', at: failedAt }) } });
+  const status = await s.handler({ action: 'status', workloadId: 'demo' });
+  assert.equal(status.nextAttemptAt, new Date(failedAt + 2 * (s.cfg.failedRetrySeconds ?? 60) * 1000).toISOString());
+  assert.deepEqual(status.fallbacks, []);
+  const awake = managerSetup({ run: { state: STATES.AWAKE, awakeSince: 0, instanceTypes: JSON.stringify({ 'i-1': { from: 't3.medium', to: 't3.large' } }) } });
+  const on = await awake.handler({ action: 'status', workloadId: 'demo' });
+  assert.deepEqual(on.fallbacks, [{ instance: 'i-1', from: 't3.medium', to: 't3.large' }]);
+  assert.equal(on.nextAttemptAt, null);
+});
+
 test('status of an unknown workload is an error', async () => {
   const s = managerSetup({ run: { state: STATES.AWAKE } });
   await assert.rejects(s.handler({ action: 'status', workloadId: 'nope' }), /workload not configured: nope/);

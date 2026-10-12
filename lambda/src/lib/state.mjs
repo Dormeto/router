@@ -201,6 +201,44 @@ export function createStore({ dynamo, table, now = Date.now }) {
       });
     },
 
+    // Onboarding (onboarder): the configuration item the workload module writes, and the initial runtime state.
+    async putConfig(workloadId, config) {
+      await dynamo.updateItem({
+        TableName: table,
+        Key: itemKey(workloadId, 'CFG'),
+        UpdateExpression: 'SET #config = :config',
+        ExpressionAttributeNames: { '#config': 'config' },
+        ExpressionAttributeValues: { ':config': { S: JSON.stringify(config) } },
+      });
+    },
+
+    // false when a runtime state exists already (the Lambdas own it).
+    async initRun(workloadId, at) {
+      const out = await update({
+        TableName: table,
+        Key: itemKey(workloadId, 'RUN'),
+        UpdateExpression: 'SET #state = :awake, #version = :zero, #awakeSince = :at, #holders = :zero, #wakeCount = :zero',
+        ConditionExpression: 'attribute_not_exists(#pk)',
+        ExpressionAttributeNames: { '#pk': 'pk', '#state': 'state', '#version': 'version', '#awakeSince': 'awakeSince', '#holders': 'holders', '#wakeCount': 'wakeCount' },
+        ExpressionAttributeValues: { ':awake': { S: STATES.AWAKE }, ':zero': { N: '0' }, ':at': { N: String(at) } },
+      });
+      return out !== null;
+    },
+
+    // Offboarding: configuration, runtime state and pauses; the daily statistics expire by their TTL.
+    async deleteWorkload(workloadId) {
+      const { Items = [] } = await dynamo.query({
+        TableName: table,
+        KeyConditionExpression: '#pk = :pk',
+        ExpressionAttributeNames: { '#pk': 'pk' },
+        ExpressionAttributeValues: { ':pk': { S: `WL#${workloadId}` } },
+        ConsistentRead: true,
+      });
+      for (const item of Items.filter((i) => !i.sk.S.startsWith('STATS#'))) {
+        await dynamo.deleteItem({ TableName: table, Key: { pk: item.pk, sk: item.sk } });
+      }
+    },
+
     // Pauses (router management): one JSON attribute, and its time for a deletion that must not remove a newer pause.
     async putPause(workloadId, pause) {
       await dynamo.updateItem({

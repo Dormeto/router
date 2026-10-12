@@ -248,3 +248,36 @@ test('store deletes a pause, only if it is still the same one when its time is g
   assert.equal(conditional.ConditionExpression, '#at = :at');
   assert.deepEqual(conditional.ExpressionAttributeValues, { ':at': { N: '42' } });
 });
+
+// --- Onboarding --------------------------------------------------------------------------------------------------------
+
+test('store writes a workload configuration and its initial runtime state only once', async () => {
+  const dynamo = fakeDynamo({
+    updateItem: async ({ ConditionExpression }) => {
+      if (ConditionExpression) throw Object.assign(new Error('exists'), { name: 'ConditionalCheckFailedException' });
+      return {};
+    },
+  });
+  const store = createStore({ dynamo, table: 't' });
+  await store.putConfig('shop', { workloadId: 'shop', idleMinutes: 15 });
+  assert.equal(await store.initRun('shop', 42), false);
+  const [[, cfg], [, run]] = dynamo.calls;
+  assert.deepEqual(cfg.Key, { pk: { S: 'WL#shop' }, sk: { S: 'CFG' } });
+  assert.equal(cfg.UpdateExpression, 'SET #config = :config');
+  assert.deepEqual(JSON.parse(cfg.ExpressionAttributeValues[':config'].S), { workloadId: 'shop', idleMinutes: 15 });
+  assert.deepEqual(run.Key, { pk: { S: 'WL#shop' }, sk: { S: 'RUN' } });
+  assert.equal(run.ConditionExpression, 'attribute_not_exists(#pk)');
+  assert.equal(run.UpdateExpression, 'SET #state = :awake, #version = :zero, #awakeSince = :at, #holders = :zero, #wakeCount = :zero');
+  assert.deepEqual(run.ExpressionAttributeValues[':at'], { N: '42' });
+});
+
+test('store deletes every item of a workload but its statistics (they expire)', async () => {
+  const dynamo = fakeDynamo({
+    query: async () => ({ Items: ['CFG', 'RUN', 'PAUSE', 'PAUSE#x1', 'STATS#2026-10-05'].map((sk) => ({ pk: { S: 'WL#shop' }, sk: { S: sk } })) }),
+    deleteItem: async () => ({}),
+  });
+  await createStore({ dynamo, table: 't' }).deleteWorkload('shop');
+  const deleted = dynamo.calls.filter(([name]) => name === 'deleteItem').map(([, input]) => input.Key.sk.S);
+  assert.deepEqual(deleted, ['CFG', 'RUN', 'PAUSE', 'PAUSE#x1']);
+  assert.deepEqual(dynamo.calls[0][1].ExpressionAttributeValues, { ':pk': { S: 'WL#shop' } });
+});

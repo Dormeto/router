@@ -36,6 +36,25 @@ function issueOf(rule, listener, tags, cfg) {
   return null;
 }
 
+// Every rule of every listener of a load balancer: [{ rule, listener }].
+export async function listRules(elbv2, loadBalancerArn) {
+  const rows = [];
+  for (const listener of await pages((i) => elbv2.describeListeners({ ...i, LoadBalancerArn: loadBalancerArn }), 'Listeners')) {
+    for (const rule of await pages((i) => elbv2.describeRules({ ...i, ListenerArn: listener.ListenerArn }), 'Rules')) rows.push({ rule, listener });
+  }
+  return rows;
+}
+
+// Tags of rules (never default rules: their reason never depends on tags, and a default rule may not accept tags).
+export async function ruleTags(elbv2, rules) {
+  const tags = new Map();
+  for (const batch of chunks([...new Set(rules.filter((rule) => !rule.IsDefault).map((rule) => rule.RuleArn))], 20)) {
+    const { TagDescriptions = [] } = await elbv2.describeTags({ ResourceArns: batch });
+    for (const d of TagDescriptions) tags.set(d.ResourceArn, Object.fromEntries((d.Tags ?? []).map((t) => [t.Key, t.Value])));
+  }
+  return tags;
+}
+
 // Workload id → { rules, instrumented, issues: [{ arn, priority, reason }] }. One listing per load balancer, whatever the
 // number of workloads (the workload list resolves them all at once).
 export async function resolveRules(elbv2, cfgs) {
@@ -45,22 +64,11 @@ export async function resolveRules(elbv2, cfgs) {
     for (const g of TargetGroups) balancers.set(g.TargetGroupArn, g.LoadBalancerArns ?? []);
   }
   const listed = new Map();
-  for (const lb of new Set([...balancers.values()].flat())) {
-    const rows = [];
-    for (const listener of await pages((i) => elbv2.describeListeners({ ...i, LoadBalancerArn: lb }), 'Listeners')) {
-      for (const rule of await pages((i) => elbv2.describeRules({ ...i, ListenerArn: listener.ListenerArn }), 'Rules')) rows.push({ rule, listener });
-    }
-    listed.set(lb, rows);
-  }
+  for (const lb of new Set([...balancers.values()].flat())) listed.set(lb, await listRules(elbv2, lb));
   const matching = new Map(cfgs.map((cfg) => [cfg.workloadId, (balancers.get(cfg.appTargetGroupArn) ?? [])
     .flatMap((lb) => listed.get(lb) ?? [])
     .filter(({ rule }) => forwardTargetGroups(rule).includes(cfg.appTargetGroupArn))]));
-  const tags = new Map();
-  // Default rules are left out: their reason never depends on tags (and a default rule may not accept tags).
-  for (const batch of chunks([...new Set([...matching.values()].flat().filter(({ rule }) => !rule.IsDefault).map(({ rule }) => rule.RuleArn))], 20)) {
-    const { TagDescriptions = [] } = await elbv2.describeTags({ ResourceArns: batch });
-    for (const d of TagDescriptions) tags.set(d.ResourceArn, Object.fromEntries((d.Tags ?? []).map((t) => [t.Key, t.Value])));
-  }
+  const tags = await ruleTags(elbv2, [...matching.values()].flat().map(({ rule }) => rule));
   return new Map(cfgs.map((cfg) => {
     const rows = matching.get(cfg.workloadId);
     const instrumented = [];

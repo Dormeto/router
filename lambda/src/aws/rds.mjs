@@ -1,7 +1,9 @@
 import {
+  AddTagsToResourceCommand,
   DescribeDBClustersCommand,
   DescribeDBInstancesCommand,
   RDSClient,
+  RemoveTagsFromResourceCommand,
   StartDBClusterCommand,
   StartDBInstanceCommand,
   StopDBClusterCommand,
@@ -16,5 +18,7 @@ export function createRds(client = new RDSClient({})) {
     stopDBInstance: (input) => client.send(new StopDBInstanceCommand(input)),
     startDBCluster: (input) => client.send(new StartDBClusterCommand(input)),
     stopDBCluster: (input) => client.send(new StopDBClusterCommand(input)),
+    addTagsToResource: (input) => client.send(new AddTagsToResourceCommand(input)),
+    removeTagsFromResource: (input) => client.send(new RemoveTagsFromResourceCommand(input)),
   };
 }

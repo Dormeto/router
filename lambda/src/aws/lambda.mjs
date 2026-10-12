@@ -1,4 +1,4 @@
-import { InvokeCommand, LambdaClient } from '@aws-sdk/client-lambda';
+import { AddPermissionCommand, InvokeCommand, LambdaClient, RemovePermissionCommand } from '@aws-sdk/client-lambda';
 
 export function createLambda(client = new LambdaClient({})) {
   return {
@@ -7,5 +7,8 @@ export function createLambda(client = new LambdaClient({})) {
       InvocationType: 'Event',
       Payload: Buffer.from(JSON.stringify(payload)),
     })),
+    // Onboarding: the load balancer may invoke the waker for the workload's target group.
+    addPermission: (input) => client.send(new AddPermissionCommand(input)),
+    removePermission: (input) => client.send(new RemovePermissionCommand(input)),
   };
 }

@@ -6,6 +6,6 @@
   "engines": { "node": ">=24" },
   "scripts": {
     "test": "node --test \"lambda/test/*.test.mjs\"",
-    "check": "node --check lambda/src/waker.mjs && node --check lambda/src/controller.mjs"
+    "check": "node --check lambda/src/waker.mjs && node --check lambda/src/controller.mjs && node --check lambda/src/onboarder.mjs"
   }
 }

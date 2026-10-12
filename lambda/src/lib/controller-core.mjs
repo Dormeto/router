@@ -3,6 +3,7 @@ import { STATES } from './state.mjs';
 import { checkName } from './names.mjs';
 import { currentTarget, hostOf, setRoute } from './route.mjs';
 import { dormetoTargetGroup, routeIngress } from './kube-route.mjs';
+import { checkRights } from './kube-access.mjs';
 import { resolveRules } from './rules.mjs';
 import { healthyCount, waitTargetsReleased } from './instances.mjs';
 import { createStatus } from './status.mjs';
@@ -935,6 +936,20 @@ export function createController({
     };
   }
 
+  // Whether the router reaches a cluster and may do what Kubernetes workloads need (vision
+  // docs/specs/2026-10-11-kubernetes-design.md, section 4), in a namespace.
+  async function clusterCheck({ cluster, namespace = 'default' }) {
+    try {
+      const missing = await checkRights(await kubernetesOf(cluster), namespace);
+      return { cluster, reachable: true, allowed: missing.length === 0, missing };
+    } catch (err) {
+      if (err?.status === 401 || err?.status === 403) {
+        return { cluster, reachable: true, allowed: false, missing: [], reason: `the cluster does not know the router's role (no access entry, or not mapped in aws-auth): ${err.message}` };
+      }
+      return { cluster, reachable: false, allowed: false, missing: [], reason: err.message };
+    }
+  }
+
   return async function handler(event, context) {
     const remaining = context?.getRemainingTimeInMillis?.();
     budgetEnd = typeof remaining === 'number' ? now() + remaining - TIMEOUT_MARGIN_MS : Infinity;
@@ -954,6 +969,7 @@ export function createController({
       case 'request-nap': return requestNap(event);
       case 'rename': return rename(event);
       case 'router': return routerInfo();
+      case 'clusterCheck': return clusterCheck(event);
       default: throw new Error(`unknown action: ${event?.action}`);
     }
   };

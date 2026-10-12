@@ -180,6 +180,19 @@ test('rulesReview asks what the caller may do in a namespace', async (t) => {
   assert.deepEqual(JSON.parse(api.seen[0].body), { apiVersion: 'authorization.k8s.io/v1', kind: 'SelfSubjectRulesReview', spec: { namespace: 'demo' } });
 });
 
+test('accessReview asks whether the caller may do one thing, whatever authorizer grants it', async (t) => {
+  const api = await apiServer((req, body, res) => json(res, 201, { kind: 'SelfSubjectAccessReview', status: { allowed: JSON.parse(body).spec.resourceAttributes.verb === 'get' } }));
+  t.after(api.close);
+  const k8s = createKubernetes({ endpoint: api.endpoint, ca, token: 't' });
+  assert.equal(await k8s.accessReview({ namespace: 'demo', verb: 'get', group: 'apps', resource: 'deployments', subresource: 'scale' }), true);
+  assert.equal(await k8s.accessReview({ verb: 'delete', group: 'networking.k8s.io', resource: 'ingresses' }), false);
+  assert.equal(api.seen[0].url, '/apis/authorization.k8s.io/v1/selfsubjectaccessreviews');
+  assert.deepEqual(JSON.parse(api.seen[0].body), {
+    apiVersion: 'authorization.k8s.io/v1', kind: 'SelfSubjectAccessReview',
+    spec: { resourceAttributes: { namespace: 'demo', verb: 'get', group: 'apps', resource: 'deployments', subresource: 'scale' } },
+  });
+});
+
 test('impersonation sends the user and one header per group', async (t) => {
   const api = await apiServer((req, body, res) => json(res, 200, { groups: req.headersDistinct['impersonate-group'] }));
   t.after(api.close);

@@ -5,6 +5,7 @@ import { currentTarget } from '../src/lib/route.mjs';
 import { STATES } from '../src/lib/state.mjs';
 import { asgGroup, ecsService, fakeAppScaling, fakeEcs, fakeKubernetes, fakeRds, fakeRdsTagging, fakeTagging, fakeAutoScaling, fakeClock, fakeCloudWatch, fakeEc2, fakeElbv2, fakeStore, k8sConfig, k8sCustomerIngress, k8sGroupedConfig, k8sNode, k8sOwner, k8sPod, routeOf, silentLog, testConfig } from './fakes.mjs';
 import { dormetoIngress, weightsOf } from '../src/lib/kube-route.mjs';
+import { ROUTER_RULES } from '../src/lib/kube-access.mjs';
 
 function setup({ run, instance = 'running', target = 'app', healthy = 1, metric = [], metricAt = [], cfg = testConfig(), groups = [], services = [], databases, k8s } = {}) {
   const clock = fakeClock();
@@ -1351,4 +1352,39 @@ test('a Kubernetes wake whose pods never get a node fails at its deadline as cap
   assert.deepEqual([failure.kind, failure.backend], ['capacity', 'k8s:eks-demo/demo/Deployment/web']);
   assert.equal(failure.message, 'pod web-5d9c-a1: FailedScheduling: 0/1 nodes are available: 1 Insufficient cpu.');
   assert.ok(s.clock.now() - s.start >= 300_000, 'the Kubernetes wake timeout (5 minutes)');
+});
+
+test('clusterCheck: whether the router reaches a cluster and may do what Kubernetes workloads need, with what is missing', async () => {
+  const k8s = fakeKubernetes();
+  k8s.state.review = { resourceRules: ROUTER_RULES.filter((r) => !r.resources.includes('nodes')).map((r) => ({ apiGroups: [r.group], resources: r.resources, verbs: r.verbs })), incomplete: false };
+  const s = setup({ run: { state: STATES.AWAKE }, k8s });
+  assert.deepEqual(await s.handler({ action: 'clusterCheck', cluster: 'eks-demo', namespace: 'demo' }), { cluster: 'eks-demo', reachable: true, allowed: false, missing: ['get nodes'] });
+  assert.deepEqual(k8s.state.calls.at(-1), ['REVIEW', 'demo']);
+  k8s.state.review.resourceRules.push({ apiGroups: [''], resources: ['nodes'], verbs: ['get'] });
+  assert.deepEqual(await s.handler({ action: 'clusterCheck', cluster: 'eks-demo' }), { cluster: 'eks-demo', reachable: true, allowed: true, missing: [] });
+  assert.deepEqual(k8s.state.calls.at(-1), ['REVIEW', 'default']);
+});
+
+test('clusterCheck: a cluster without the router\'s access entry, or one it cannot reach, says so', async () => {
+  const k8s = fakeKubernetes();
+  const s = setup({ run: { state: STATES.AWAKE }, k8s });
+  k8s.state.reviewError = Object.assign(new Error('Unauthorized'), { name: 'KubernetesError', status: 401, reason: 'Unauthorized' });
+  assert.deepEqual(await s.handler({ action: 'clusterCheck', cluster: 'eks-demo' }), {
+    cluster: 'eks-demo', reachable: true, allowed: false, missing: [], reason: 'the cluster does not know the router\'s role (no access entry, or not mapped in aws-auth): Unauthorized',
+  });
+  k8s.state.reviewError = Object.assign(new Error('GET /apis: no connection within 3000 ms'), { name: 'KubernetesError', status: 0, reason: 'Timeout' });
+  assert.deepEqual(await s.handler({ action: 'clusterCheck', cluster: 'eks-demo' }), {
+    cluster: 'eks-demo', reachable: false, allowed: false, missing: [], reason: 'GET /apis: no connection within 3000 ms',
+  });
+});
+
+test('clusterCheck: rights an EKS access policy gives (a review that cannot list them) are asked one by one', async () => {
+  const k8s = fakeKubernetes();
+  k8s.state.review = { resourceRules: [{ apiGroups: ['authorization.k8s.io'], resources: ['selfsubjectrulesreviews'], verbs: ['create'] }], incomplete: true };
+  k8s.state.allow = ({ verb, resource }) => !(verb === 'get' && resource === 'nodes');
+  const s = setup({ run: { state: STATES.AWAKE }, k8s });
+  assert.deepEqual(await s.handler({ action: 'clusterCheck', cluster: 'eks-demo', namespace: 'demo' }), { cluster: 'eks-demo', reachable: true, allowed: false, missing: ['get nodes'] });
+  const asked = k8s.state.calls.filter(([what]) => what === 'ACCESS').map(([, a]) => a);
+  assert.deepEqual(asked.find((a) => a.resource === 'deployments' && a.subresource === 'scale' && a.verb === 'patch'), { namespace: 'demo', verb: 'patch', group: 'apps', resource: 'deployments', subresource: 'scale' });
+  assert.equal(asked.find((a) => a.resource === 'nodes').namespace, undefined, 'nodes belong to no namespace');
 });

@@ -590,6 +590,17 @@ export function fakeKubernetes({ owners = [], pods = [], nodes = [], scaledObjec
       }
       throw new Error(`unexpected call PATCH ${path}`);
     },
+    // SelfSubjectRulesReview: state.review ({ resourceRules, incomplete }), or state.reviewError thrown.
+    async rulesReview(namespace) {
+      state.calls.push(['REVIEW', namespace]);
+      if (state.reviewError) throw state.reviewError;
+      return structuredClone(state.review ?? { resourceRules: [], nonResourceRules: [], incomplete: false });
+    },
+    // SelfSubjectAccessReview: state.allow(attributes), false without it.
+    async accessReview(attributes) {
+      state.calls.push(['ACCESS', attributes]);
+      return Boolean(state.allow?.(attributes));
+    },
     async create(path, body) {
       state.calls.push(['POST', path, body]);
       const { namespace } = ingressAt(path);

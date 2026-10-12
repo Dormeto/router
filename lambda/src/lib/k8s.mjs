@@ -132,10 +132,15 @@ export function createKubernetes({ endpoint, ca, token, cert, key, impersonate, 
       : Promise.reject(new Error(`unknown patch type ${type}`))),
     create: (path, body) => call('POST', path, { query: { fieldManager: FIELD_MANAGER }, body }),
     remove: (path) => call('DELETE', path),
-    // What the caller may do in the namespace (the spec's section 4 check).
+    // What the caller may do in the namespace (the spec's section 4 check): RBAC's rules only, incomplete otherwise.
     rulesReview: async (namespace) => (await call('POST', '/apis/authorization.k8s.io/v1/selfsubjectrulesreviews', {
       body: { apiVersion: 'authorization.k8s.io/v1', kind: 'SelfSubjectRulesReview', spec: { namespace } },
     }))?.status,
+    // Whether the caller may do one thing ({ namespace?, verb, group, resource, subresource? }), whatever authorizer
+    // grants it (EKS access policies included).
+    accessReview: async (resourceAttributes) => (await call('POST', '/apis/authorization.k8s.io/v1/selfsubjectaccessreviews', {
+      body: { apiVersion: 'authorization.k8s.io/v1', kind: 'SelfSubjectAccessReview', spec: { resourceAttributes } },
+    }))?.status?.allowed === true,
   };
 }
 

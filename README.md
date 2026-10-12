@@ -112,6 +112,27 @@ workloads do not nap), Lambda errors and throttles of the controller and the wak
 concurrency, messages waiting in the `check-failures` and `controller-failures` queues, IP lists' last download, failed
 workloads; and the router configuration with its source (`terraform`). Metrics and queues are read at most once a minute.
 
+Health also warns when the account's Lambda concurrency limit in the region (10 in a region the account barely uses)
+is below the largest `maxHolders` plus 10: held requests beyond it get errors until a quota increase.
+
+**Onboarding** (`<router>-onboarder`, invoked by the manager): `preview`, `onboard` and `offboard` a workload from its
+application target group, with their own role (the controller keeps its least privilege). Onboarding tags the backends
+`dormeto:workload` (with the marker `dormeto:tagged = onboarder`), creates and registers the waker target group, writes
+the configuration and instruments every rule forwarding to the target group (weighted forward, traffic unchanged); each
+step finds what exists first, and a failed onboarding of a new workload is undone. Offboarding (the workload awake)
+removes only what onboarding added: rules back to a plain forward, waker target group, permission, the tags carrying the
+marker, the configuration. A workload written by the `workload` module is refused (remove the module instead).
+
+```bash
+aws lambda invoke --function-name dmt-dev-onboarder --cli-binary-format raw-in-base64-out --payload '{"action":"preview","workloadId":"onb","targetGroupArn":"<arn>"}' /dev/stdout
+```
+
+**Installed by the manager:** `npm run package` writes `dist/router-<version>.zip`, `dist/blueprint-<version>.json`
+(every resource and IAM policy of a router, placeholders filled by the installer) and `dist/router-boundary.json`
+(`DmtRouterBoundary`). The manager installs, upgrades and removes routers from them by API calls (no Terraform or
+CloudFormation); `lambda/test/blueprint.test.mjs` keeps the blueprint's IAM actions equal to this module's.
+`terraform/dev-paris` is a customer-style application in eu-west-3 used to test that path (about 18 USD a month).
+
 The `dev` environment has four workloads: `demo` (one EC2 instance, `https://dev.dormeto.com/`), `demo-asg` (an Auto
 Scaling group, `https://asg.dev.dormeto.com/`), `demo-ecs` (an ECS Fargate service in browser wake mode, `https://ecs.dev.dormeto.com/`) and
 `demo-rds` (an ECS Fargate service with a PostgreSQL instance, `https://rds.dev.dormeto.com/`).

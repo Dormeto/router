@@ -35,6 +35,9 @@ const s3 = lists.some((l) => parseS3Url(l.url)) ? createS3() : null;
 const download = (url) => downloadText(url, { getObject: s3?.getObject });
 // Failure queues of the router (router health): { check, controller } queue URLs.
 const queues = JSON.parse(process.env.DMT_FAILURE_QUEUES || '{}');
+// The work queue (routers 0.22.0 and later): naps and the wakes of a router pause, read 10 at a time.
+const workQueue = process.env.DMT_WORK_QUEUE;
+const sqs = Object.values(queues).some(Boolean) || workQueue ? createSqs() : null;
 
 export const handler = createController({
   store,
@@ -50,7 +53,8 @@ export const handler = createController({
   invokeSelf: (payload) => lambda.invokeAsync(process.env.AWS_LAMBDA_FUNCTION_NAME, payload),
   sleep,
   log: logger,
-  sqs: Object.values(queues).some(Boolean) ? createSqs() : null,
+  sqs,
+  queueWork: workQueue ? (message) => sqs.sendMessage({ QueueUrl: workQueue, MessageBody: JSON.stringify(message) }) : null,
   lambda,
   publisher,
   // Drift repair of the workloads the manager onboarded (R4c).

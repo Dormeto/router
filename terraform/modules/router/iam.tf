@@ -142,8 +142,14 @@ data "aws_iam_policy_document" "controller" {
     resources = ["${local.arn_prefix}:lambda:${local.region}:${local.account_id}:function:${var.name}-controller", "${local.arn_prefix}:lambda:${local.region}:${local.account_id}:function:${var.name}-onboarder"]
   }
   statement {
+    # Failed invocations, and the work queue (naps and the wakes of a router pause).
     actions   = ["sqs:SendMessage"]
-    resources = [aws_sqs_queue.controller_failures.arn]
+    resources = [aws_sqs_queue.controller_failures.arn, aws_sqs_queue.work.arn]
+  }
+  statement {
+    # The controller reads the work queue (event source mapping).
+    actions   = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes", "sqs:ChangeMessageVisibility"]
+    resources = [aws_sqs_queue.work.arn]
   }
   statement {
     # Router health: messages waiting in the failure queues.
@@ -298,6 +304,11 @@ data "aws_iam_policy_document" "onboarder" {
   statement {
     actions   = ["lambda:RemovePermission"]
     resources = [aws_lambda_function.waker.arn]
+  }
+  statement {
+    # The onboarder reads the drift queue (event source mapping).
+    actions   = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes", "sqs:ChangeMessageVisibility"]
+    resources = [aws_sqs_queue.drift.arn]
   }
   statement {
     actions   = ["logs:CreateLogStream", "logs:PutLogEvents"]

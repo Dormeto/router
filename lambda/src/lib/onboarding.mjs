@@ -609,5 +609,23 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
     return { workloads };
   }
 
-  return { preview, onboard, offboard, repair, repairAll };
+  // Drift events read from the router's queue in a batch (scale design §6): each workload they concern repaired once,
+  // however many events name it; a workload offboarded since has no configuration left, so nothing is repaired.
+  async function repairEvents(details) {
+    const names = [...new Set(details.map((d) => d?.eventName ?? 'unknown'))].join(',');
+    const by = `event:${names}`;
+    const workloads = [];
+    for (const cfg of (await store.listConfigs()).filter((c) => c.source && details.some((d) => concerns(c, d)))) {
+      try {
+        const { repaired } = await repair({ workloadId: cfg.workloadId, by });
+        workloads.push({ workloadId: cfg.workloadId, repaired: repaired.map((e) => e.kind) });
+      } catch (err) {
+        log.error('RepairFailed', { workloadId: cfg.workloadId, by, error: err.message });
+        workloads.push({ workloadId: cfg.workloadId, error: err.message });
+      }
+    }
+    return { workloads };
+  }
+
+  return { preview, onboard, offboard, repair, repairAll, repairEvents };
 }

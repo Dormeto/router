@@ -85,10 +85,34 @@ resource "aws_lambda_function" "controller" {
       DMT_ONBOARDER = "${var.name}-onboarder"
       # The manager's event bus (scale design §3): empty, the router publishes nothing.
       DMT_MANAGER_BUS = var.manager_event_bus_arn == null ? "" : var.manager_event_bus_arn
+      # The work queue (scale design §6): naps and the wakes of a router pause.
+      DMT_WORK_QUEUE = aws_sqs_queue.work.url
     }
   }
 
   depends_on = [aws_cloudwatch_log_group.controller, aws_iam_role_policy.controller]
+}
+
+# The work queue (scale design §6): naps and the wakes of a router pause, read by the controller 10 at a time (one per
+# invocation: minutes long); a message is refused after 10 minutes anyway, and visible again after the controller's 15.
+resource "aws_sqs_queue" "work" {
+  name                       = "${var.name}-work"
+  message_retention_seconds  = 3600
+  visibility_timeout_seconds = 960
+  sqs_managed_sse_enabled    = true
+  redrive_policy             = jsonencode({ deadLetterTargetArn = aws_sqs_queue.controller_failures.arn, maxReceiveCount = 3 })
+}
+
+resource "aws_lambda_event_source_mapping" "work" {
+  event_source_arn                   = aws_sqs_queue.work.arn
+  function_name                      = aws_lambda_function.controller.arn
+  batch_size                         = 1
+  maximum_batching_window_in_seconds = 0
+  function_response_types            = ["ReportBatchItemFailures"]
+  scaling_config {
+    maximum_concurrency = 10
+  }
+  depends_on = [aws_iam_role_policy.controller]
 }
 
 # Retries would duplicate wakes and naps: every controller action is driven by state instead.
@@ -233,15 +257,50 @@ resource "aws_cloudwatch_event_rule" "drift" {
   "$${name}", var.name), "$${partition}", data.aws_partition.current.partition), "$${account}", local.account_id)
 }
 
-resource "aws_cloudwatch_event_target" "drift" {
-  rule = aws_cloudwatch_event_rule.drift.name
-  arn  = aws_lambda_function.onboarder.arn
+# Drift events go to a queue the onboarder reads in batches (60 seconds, 2 at a time): each workload repaired once per
+# batch, whatever the number of events (scale design §6).
+resource "aws_sqs_queue" "drift" {
+  name                       = "${var.name}-drift"
+  message_retention_seconds  = 86400
+  visibility_timeout_seconds = 360
+  sqs_managed_sse_enabled    = true
+  redrive_policy             = jsonencode({ deadLetterTargetArn = aws_sqs_queue.controller_failures.arn, maxReceiveCount = 3 })
 }
 
-resource "aws_lambda_permission" "drift" {
-  statement_id  = "drift-events"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.onboarder.function_name
-  principal     = "events.amazonaws.com"
-  source_arn    = aws_cloudwatch_event_rule.drift.arn
+data "aws_iam_policy_document" "drift_queue" {
+  statement {
+    actions   = ["sqs:SendMessage"]
+    resources = [aws_sqs_queue.drift.arn]
+    principals {
+      type        = "Service"
+      identifiers = ["events.amazonaws.com"]
+    }
+    condition {
+      test     = "ArnEquals"
+      variable = "aws:SourceArn"
+      values   = [aws_cloudwatch_event_rule.drift.arn]
+    }
+  }
+}
+
+resource "aws_sqs_queue_policy" "drift" {
+  queue_url = aws_sqs_queue.drift.id
+  policy    = data.aws_iam_policy_document.drift_queue.json
+}
+
+resource "aws_cloudwatch_event_target" "drift" {
+  rule = aws_cloudwatch_event_rule.drift.name
+  arn  = aws_sqs_queue.drift.arn
+}
+
+resource "aws_lambda_event_source_mapping" "drift" {
+  event_source_arn                   = aws_sqs_queue.drift.arn
+  function_name                      = aws_lambda_function.onboarder.arn
+  batch_size                         = 100
+  maximum_batching_window_in_seconds = 60
+  function_response_types            = ["ReportBatchItemFailures"]
+  scaling_config {
+    maximum_concurrency = 2
+  }
+  depends_on = [aws_iam_role_policy.onboarder]
 }

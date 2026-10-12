@@ -27,7 +27,14 @@ const onboarding = createOnboarding({
 });
 
 export async function handler(event) {
-  // CloudTrail events forwarded by the router's EventBridge rule (drift of what onboarding added).
+  // CloudTrail events of the router's drift rule, read from its queue in batches (each workload repaired once per batch);
+  // a failing repair is retried by the next check, never by the queue.
+  if (Array.isArray(event?.Records)) {
+    const details = event.Records.map((r) => { try { return JSON.parse(r.body).detail ?? null; } catch { return null; } }).filter(Boolean);
+    if (details.length) await onboarding.repairEvents(details);
+    return { batchItemFailures: [] };
+  }
+  // One event at a time (routers before 0.22.0: the rule targets the onboarder).
   if (event?.['detail-type'] === 'AWS API Call via CloudTrail') return onboarding.repairAll({ by: `event:${event.detail?.eventName ?? 'unknown'}`, detail: event.detail ?? {} });
   switch (event?.action) {
     case 'preview': return onboarding.preview(event);

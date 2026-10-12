@@ -15,3 +15,19 @@ test('every call of the lib modules on an AWS port exists in its SDK adapter', a
     for (const method of used) assert.match(adapter, new RegExp(`\\b${method}:`), `${port}.${method} is used by a lib module but missing from aws/${port}.mjs`);
   }
 });
+
+test('every call of the entry points on an AWS port exists in its SDK adapter too', async () => {
+  const entries = (await Promise.all(['controller.mjs', 'waker.mjs', 'onboarder.mjs'].map((f) => readFile(`${SRC}${f}`, 'utf8')))).join('\n');
+  for (const port of PORTS) {
+    const used = new Set([...entries.matchAll(new RegExp(`\\b${port}\\??\\.(\\w+)\\(`, 'g'))].map((m) => m[1]));
+    const adapter = await readFile(`${SRC}aws/${port}.mjs`, 'utf8');
+    for (const method of used) assert.match(adapter, new RegExp(`\\b${method}:`), `${port}.${method} is used by an entry point but missing from aws/${port}.mjs`);
+  }
+  // The controller queues its naps and the wakes of a router pause.
+  assert.match(entries, /\bsqs\.sendMessage\(/);
+});
+
+test('the ELB clients retry adaptively: they slow down under throttling instead of failing (scale design §6)', async () => {
+  const adapter = await readFile(`${SRC}aws/elbv2.mjs`, 'utf8');
+  assert.match(adapter, /new ElasticLoadBalancingV2Client\(\{[^}]*retryMode: 'adaptive'[^}]*maxAttempts: \d+/);
+});

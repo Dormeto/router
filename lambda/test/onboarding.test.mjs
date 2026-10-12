@@ -527,6 +527,19 @@ test('repairAll repairs only the workloads the event concerns, and one failing w
   assert.deepEqual(all.workloads.map((w) => [w.workloadId, w.error ?? 'ok']).sort(), [['blog', 'ok'], ['broken', 'Throttling'], ['shop', 'ok']]);
 });
 
+test('drift events read in one batch repair each workload they concern once; a workload offboarded since is left alone', async () => {
+  const s = await onboarded();
+  const shadow = shadowsOf(s.a)[0];
+  s.a.state.rules.delete(shadow.arn);
+  const deleted = { eventName: 'DeleteRule', requestParameters: { ruleArn: shadow.arn } };
+  // Several events about the same load balancer within the batch window.
+  const result = await s.onboarding.repairEvents([deleted, deleted, { eventName: 'ModifyRule', requestParameters: { ruleArn: s.main } }]);
+  assert.deepEqual(result, { workloads: [{ workloadId: 'shop', repaired: ['shadow created'] }] });
+  // Offboarded since the events: its configuration is gone, nothing to repair.
+  s.a.items.delete('shop/CFG');
+  assert.deepEqual(await s.onboarding.repairEvents([deleted]), { workloads: [] });
+});
+
 test('a second shadow of one rule (two repairs at once) is removed, the first one stays', async () => {
   const s = await onboarded();
   const first = shadowsOf(s.a).find((x) => x.shadows === s.main);

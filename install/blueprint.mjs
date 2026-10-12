@@ -50,7 +50,8 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
       allow(['application-autoscaling:RegisterScalableTarget'], [arn('application-autoscaling', 'scalable-target/*')]),
       allow(['autoscaling:UpdateAutoScalingGroup', 'autoscaling:SuspendProcesses', 'autoscaling:ResumeProcesses'], [arn('autoscaling', 'autoScalingGroup:*:autoScalingGroupName/*')], tagged),
       allow(['lambda:InvokeFunction'], [functionArn('controller'), functionArn('onboarder')]),
-      allow(['sqs:SendMessage'], [queueArn('controller-failures')]),
+      allow(['sqs:SendMessage'], [queueArn('controller-failures'), queueArn('work')]),
+      allow(['sqs:ReceiveMessage', 'sqs:DeleteMessage', 'sqs:GetQueueAttributes', 'sqs:ChangeMessageVisibility'], [queueArn('work')]),
       allow(['sqs:GetQueueAttributes'], [queueArn('controller-failures'), queueArn('check-failures')]),
       allow(['events:PutEvents'], [p.managerBus]),
       allow(['logs:CreateLogStream', 'logs:PutLogEvents'], [logArn('controller')]),
@@ -78,6 +79,7 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
       ], onboarderTagKeys),
       // A per-workload invoke permission of a router older than 0.20.0, removed at offboarding.
       allow(['lambda:RemovePermission'], [functionArn('waker')]),
+      allow(['sqs:ReceiveMessage', 'sqs:DeleteMessage', 'sqs:GetQueueAttributes', 'sqs:ChangeMessageVisibility'], [queueArn('drift')]),
       allow(['logs:CreateLogStream', 'logs:PutLogEvents'], [logArn('onboarder')]),
     ),
   };
@@ -99,7 +101,17 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
       key: role, path: ROLE_PATH, name: roleName(role), trust: role === 'scheduler' ? schedulerTrust : lambdaTrust, policyName: role, policy: policies[role],
     })),
     table: { name: table, hashKey: 'pk', rangeKey: 'sk', ttlAttribute: 'expiresAt', pointInTimeRecovery: true },
-    queues: ['check-failures', 'controller-failures'].map((key) => ({ key, name: queue(key), retentionSeconds: 1_209_600, managedEncryption: true })),
+    queues: [
+      ...['check-failures', 'controller-failures'].map((key) => ({ key, name: queue(key), retentionSeconds: 1_209_600, managedEncryption: true })),
+      // The work queue (scale design §6): naps and the wakes of a router pause, read by the controller 10 at a time; a
+      // message is refused after 10 minutes anyway, and visible again after the controller's 15 minutes.
+      { key: 'work', name: queue('work'), retentionSeconds: 3600, managedEncryption: true, visibilityTimeoutSeconds: 960, deadLetter: { queue: queueArn('controller-failures'), maxReceiveCount: 3 } },
+      // Drift events of the router's rule, read by the onboarder in batches.
+      {
+        key: 'drift', name: queue('drift'), retentionSeconds: 86_400, managedEncryption: true, visibilityTimeoutSeconds: 360, deadLetter: { queue: queueArn('controller-failures'), maxReceiveCount: 3 },
+        policy: policy({ Effect: 'Allow', Principal: { Service: 'events.amazonaws.com' }, Action: 'sqs:SendMessage', Resource: queueArn('drift'), Condition: { ArnEquals: { 'aws:SourceArn': arn('events', `rule/${p.name}-drift`) } } }),
+      },
+    ],
     logGroups: ['controller', 'waker', 'onboarder'].map((role) => ({ name: logGroup(role), retentionDays: logRetentionDays })),
     functions: [
       {
@@ -107,7 +119,7 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
         environment: {
           ...common, DMT_IP_LISTS: p.ipLists, DMT_NO_WAKE_RULES: p.noWakeRules, DMT_CHECK_SCHEDULE: p.checkSchedule, DMT_METRICS: p.metrics,
           DMT_WAKER_FUNCTION: fn('waker'), DMT_FAILURE_QUEUES: `{"check":"${queueUrl('check-failures')}","controller":"${queueUrl('controller-failures')}"}`,
-          DMT_ONBOARDER: fn('onboarder'), DMT_MANAGER_BUS: p.managerBus,
+          DMT_ONBOARDER: fn('onboarder'), DMT_MANAGER_BUS: p.managerBus, DMT_WORK_QUEUE: queueUrl('work'),
         },
         // Retries would duplicate wakes and naps; stale events are dropped; failures land in a queue.
         asyncInvoke: { maximumRetryAttempts: 0, maximumEventAgeInSeconds: 120, onFailure: queueArn('controller-failures') },
@@ -127,11 +139,18 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
       function: fn('waker'), statementId: 'dormeto-alb', principal: 'elasticloadbalancing.amazonaws.com',
       sourceArn: `arn:${p.partition}:elasticloadbalancing:${p.region}:${p.account}:targetgroup/${p.name}-*/*`,
     },
-    // Drift repair: CloudTrail events on rules, target groups and workload tags, not caused by the router, to the onboarder.
+    // Drift repair: CloudTrail events on rules, target groups and workload tags, not caused by the router, to the onboarder
+    // through its queue (read in batches).
     eventRule: {
-      name: `${p.name}-drift`, pattern: JSON.stringify(driftPattern).replaceAll('${name}', p.name).replaceAll('${partition}', p.partition).replaceAll('${account}', p.account), target: functionArn('onboarder'),
+      name: `${p.name}-drift`, pattern: JSON.stringify(driftPattern).replaceAll('${name}', p.name).replaceAll('${partition}', p.partition).replaceAll('${account}', p.account), target: queueArn('drift'),
       description: 'Dormeto: rules, target groups and workload tags changed outside the router',
     },
+    // The queues' readers: the controller runs naps and wakes 10 at a time (one each per invocation: minutes long); the
+    // onboarder repairs the drift events of 60 seconds at once, 2 batches at a time.
+    eventSourceMappings: [
+      { key: 'work', function: fn('controller'), queue: queueArn('work'), batchSize: 1, maximumBatchingWindowSeconds: 0, maximumConcurrency: 10, reportBatchItemFailures: true },
+      { key: 'drift', function: fn('onboarder'), queue: queueArn('drift'), batchSize: 100, maximumBatchingWindowSeconds: 60, maximumConcurrency: 2, reportBatchItemFailures: true },
+    ],
     schedule: {
       name: `${p.name}-check`, expression: p.checkSchedule, target: functionArn('controller'), roleArn: roleArn('scheduler'),
       input: '{"action":"check","source":"schedule"}', deadLetter: queueArn('check-failures'), maximumRetryAttempts: 0,
@@ -148,7 +167,7 @@ export function routerBoundary({ p = PLACEHOLDERS } = {}) {
     Version: '2012-10-17',
     Statement: [
       { Sid: 'RouterTables', Effect: 'Allow', Action: ['dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:UpdateItem', 'dynamodb:DeleteItem', 'dynamodb:Query', 'dynamodb:Scan'], Resource: any('dynamodb', 'table/dmtr-*') },
-      { Sid: 'RouterQueues', Effect: 'Allow', Action: ['sqs:SendMessage', 'sqs:GetQueueAttributes'], Resource: any('sqs', 'dmtr-*') },
+      { Sid: 'RouterQueues', Effect: 'Allow', Action: ['sqs:SendMessage', 'sqs:GetQueueAttributes', 'sqs:ReceiveMessage', 'sqs:DeleteMessage', 'sqs:ChangeMessageVisibility'], Resource: any('sqs', 'dmtr-*') },
       { Sid: 'RouterFunctions', Effect: 'Allow', Action: ['lambda:InvokeFunction'], Resource: any('lambda', 'function:dmtr-*') },
       // Onboarding lets the load balancer invoke the waker.
       { Sid: 'WakerPermissions', Effect: 'Allow', Action: ['lambda:RemovePermission'], Resource: any('lambda', 'function:dmtr-*-waker') },

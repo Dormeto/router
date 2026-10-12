@@ -34,6 +34,8 @@ const HEALTH_REFRESH_MS = 15 * 60_000;
 const CHECK_BUDGET_MS = 240_000;
 const CHECK_CONCURRENCY = 8;
 const CHECK_LEASE_MS = 15 * 60_000;
+// A queued nap older than this is dropped: the next check decides again with fresh metrics.
+const NAP_MAX_AGE_MS = 10 * 60_000;
 // Pauses (router management): automatic resume at most this far ahead, reason length.
 const PAUSE_MAX_MS = 366 * 86_400_000;
 const REASON_MAX = 256;
@@ -41,6 +43,8 @@ const REASON_MAX = 256;
 export function createController({
   store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, invokeSelf, now = Date.now, sleep, newId = randomUUID, log,
   lists = null, router = {}, defaultRules = [], ipLists = [], sqs = null, lambda = null, invokeOnboarder = null,
+  // The router's work queue (scale design §6): naps and the wakes of a router pause, run at most 10 at a time.
+  queueWork = null,
   publisher = { enabled: false, checked: async () => {}, stateChanged: async () => {} },
 }) {
   const clients = { ec2, elbv2, autoscaling, ecs, tagging, appscaling, rds };
@@ -308,7 +312,12 @@ export function createController({
       await store.transition(cfg.workloadId, { cond: { state: STATES.AWAKE }, set: { idleNotBefore } });
       return { state: run.state, idleNotBefore };
     }
-    // A nap lasts minutes: run it in its own invocation so that the check (and the other workloads) are not delayed.
+    // A nap lasts minutes: queued (at most 10 at a time), else run in its own invocation, never delaying the check.
+    if (queueWork) {
+      await queueWork({ action: 'nap', workloadId: cfg.workloadId, requestedAt: t });
+      log.info('NapRequested', { workloadId: cfg.workloadId });
+      return { state: run.state, nap: 'queued' };
+    }
     if (invokeSelf) {
       await invokeSelf({ action: 'nap', workloadId: cfg.workloadId });
       log.info('NapRequested', { workloadId: cfg.workloadId });
@@ -382,7 +391,8 @@ export function createController({
   }
 
   // Operator request from the manager: no retry delay; the wake itself runs in its own invocation.
-  async function forceWake(workloadId, by, kind = 'manager') {
+  // inline (the work queue): the wake runs in this invocation instead of one of its own.
+  async function forceWake(workloadId, by, kind = 'manager', { inline = false } = {}) {
     await config(workloadId);
     const run = await store.getRun(workloadId);
     if (run?.state === STATES.ASLEEP || run?.state === STATES.FAILED) {
@@ -393,6 +403,7 @@ export function createController({
       if (!next) return { state: (await store.getRun(workloadId))?.state };
       log.info('WakeRequested', { workloadId, wakeId, trigger: { kind, by } });
       await count(workloadId, `wake:${kind}`);
+      if (inline) return wake(workloadId, wakeId);
       await invokeSelf({ action: 'wake', workloadId, wakeId });
       return { state: STATES.WAKING };
     }
@@ -589,6 +600,13 @@ export function createController({
       const ids = workloadId ? [workloadId] : (await store.listConfigs()).map((c) => c.workloadId);
       for (const id of ids) {
         try {
+          // A router pause queues the wakes of its asleep workloads (it may have hundreds): run 10 at a time.
+          const state = !workloadId && queueWork ? (await store.getRun(id))?.state : null;
+          if (state === STATES.ASLEEP || state === STATES.FAILED) {
+            await queueWork({ action: 'wake', workloadId: id, by: record.by, kind: 'pause' });
+            woken.push(id);
+            continue;
+          }
           const result = await forceWake(id, record.by, 'pause');
           if (result.state === STATES.WAKING || result.pendingWake) woken.push(id);
         } catch (err) {
@@ -615,9 +633,43 @@ export function createController({
     if (run?.state !== STATES.AWAKE) return { requested: false, reason: `not awake (${run?.state ?? 'UNKNOWN'})` };
     const [first] = await pausesFor(workloadId);
     if (first) return { requested: false, reason: pauseText(first) };
-    await invokeSelf({ action: 'nap', workloadId });
+    if (queueWork) await queueWork({ action: 'nap', workloadId, requestedAt: now(), by });
+    else await invokeSelf({ action: 'nap', workloadId });
     log.info('NapRequested', { workloadId, trigger: { kind: 'manager', by } });
     return { requested: true };
+  }
+
+  // --- Work queue: naps and the wakes of a router pause ---------------------------------------------------------------
+
+  // A nap the check (or the manager) queued: refused when the workload is no longer awake (delivered twice, or napped
+  // since), woke since it was asked for, or when it waited too long (the next check decides again).
+  async function queuedNap({ workloadId, requestedAt }) {
+    const run = await store.getRun(workloadId);
+    const reason = run?.state !== STATES.AWAKE ? `not awake (${run?.state ?? 'UNKNOWN'})`
+      : (run.awakeSince ?? 0) > requestedAt ? 'woken since it was requested'
+        : now() - requestedAt > NAP_MAX_AGE_MS ? `requested more than ${NAP_MAX_AGE_MS / 60_000} minutes ago` : null;
+    if (reason) {
+      log.warn('NapSkipped', { workloadId, reason });
+      return { state: 'SKIPPED', reason };
+    }
+    return nap(workloadId);
+  }
+
+  // The messages of the work queue, each on its own: a failed one comes back alone (partial batch response).
+  async function runQueued(records) {
+    const batchItemFailures = [];
+    for (const record of records) {
+      try {
+        const message = JSON.parse(record.body);
+        if (message.action === 'nap') await queuedNap(message);
+        else if (message.action === 'wake') await forceWake(message.workloadId, message.by, message.kind ?? 'manager', { inline: true });
+        else throw new Error(`unknown queued action: ${message.action}`);
+      } catch (err) {
+        log.error('QueuedWorkFailed', { messageId: record.messageId, error: err.message });
+        batchItemFailures.push({ itemIdentifier: record.messageId });
+      }
+    }
+    return { batchItemFailures };
   }
 
   // --- Router: identity, configuration with its source, workloads, pauses, health ------------------------------------
@@ -640,16 +692,18 @@ export function createController({
     if (stored && t - stored.at < (refresh ? HEALTH_REFRESH_MS : 2 * HEALTH_REFRESH_MS)) return stored;
     return measure(t);
   }
-  // Concurrent executions a burst can need: the largest maxHolders, plus the controller and other invocations.
-  const HEADROOM = 10;
+  // Concurrent executions the router can need at once besides held requests: its queued naps and wakes (the work queue's
+  // 10), drift repairs (2) and the check.
+  const HEADROOM = 10 + 2 + 1;
 
   async function routerInfo() {
     const t = now();
     const measured = await storedHealth(t);
     const configs = await store.listConfigs();
-    const needed = Math.max(0, ...configs.map((c) => c.maxHolders ?? 0)) + HEADROOM;
-    const concurrency = measured.limit && (measured.limit.error ? { error: measured.limit.error } : { limit: measured.limit.limit, needed });
     const runs = await Promise.all(configs.map((cfg) => store.getRun(cfg.workloadId).catch(() => null)));
+    // Requests are held while a workload wakes: up to maxHolders for each workload that is not awake.
+    const needed = configs.reduce((n, c, i) => n + (runs[i]?.state === STATES.AWAKE ? 0 : c.maxHolders ?? 0), 0) + HEADROOM;
+    const concurrency = measured.limit && (measured.limit.error ? { error: measured.limit.error } : { limit: measured.limit.limit, needed });
     let pausesError;
     const pauses = await store.listPauses().then((all) => all.filter((p) => !expired(p))).catch((err) => {
       pausesError = err.message;
@@ -708,6 +762,7 @@ export function createController({
   return async function handler(event, context) {
     const remaining = context?.getRemainingTimeInMillis?.();
     budgetEnd = typeof remaining === 'number' ? now() + remaining - TIMEOUT_MARGIN_MS : Infinity;
+    if (Array.isArray(event?.Records)) return runQueued(event.Records);
     switch (event?.action) {
       case 'wake': return wake(event.workloadId, event.wakeId);
       case 'nap': return nap(event.workloadId);

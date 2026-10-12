@@ -62,7 +62,7 @@ test('the blueprint names every resource after the router, with IAM roles per re
   ]);
   assert.equal(b.schedule.roleArn, 'arn:aws:iam::121014831971:role/dormeto/router/dmtr-dev-eu-west-3-scheduler');
   assert.equal(b.table.name, 'dmtr-dev-router');
-  assert.deepEqual(b.queues.map((q) => q.name), ['dmtr-dev-check-failures', 'dmtr-dev-controller-failures']);
+  assert.deepEqual(b.queues.map((q) => q.name), ['dmtr-dev-check-failures', 'dmtr-dev-controller-failures', 'dmtr-dev-work', 'dmtr-dev-drift']);
   assert.deepEqual(b.logGroups.map((l) => l.name), ['/aws/lambda/dmtr-dev-controller', '/aws/lambda/dmtr-dev-waker', '/aws/lambda/dmtr-dev-onboarder']);
   assert.equal(b.schedule.target, 'arn:aws:lambda:eu-west-3:121014831971:function:dmtr-dev-controller');
   assert.deepEqual(b.tags, { 'dormeto:router': 'dmtr-dev' });
@@ -101,10 +101,10 @@ test('the boundary covers the resources of installed routers only (dmtr-*), neve
   assert.deepEqual([].concat(permissions.Resource), ['arn:${partition}:lambda:*:${account}:function:dmtr-*-waker']);
 });
 
-test('the blueprint routes drift events to the onboarder, ignoring the router\'s own calls', () => {
-  const b = fill(blueprint({ version: '0.19.0' }), VALUES);
+test('the blueprint routes drift events to the onboarder\'s queue, ignoring the router\'s own calls', () => {
+  const b = fill(blueprint({ version: '0.22.0' }), VALUES);
   assert.equal(b.eventRule.name, 'dmtr-dev-drift');
-  assert.equal(b.eventRule.target, 'arn:aws:lambda:eu-west-3:121014831971:function:dmtr-dev-onboarder');
+  assert.equal(b.eventRule.target, 'arn:aws:sqs:eu-west-3:121014831971:dmtr-dev-drift');
   const pattern = JSON.parse(b.eventRule.pattern);
   assert.deepEqual(pattern['detail-type'], ['AWS API Call via CloudTrail']);
   // Every caller has an ARN (IAM users and root have no session issuer); failed calls changed nothing.
@@ -158,4 +158,30 @@ test('the controller and the waker publish to the manager\'s event bus, within t
   const bus = routerBoundary().Statement.find((st) => [].concat(st.Action).includes('events:PutEvents'));
   assert.deepEqual([].concat(bus.Resource), ['arn:${partition}:events:*:*:event-bus/dmt-*-manager']);
   assert.ok(PLACEHOLDERS.managerBus);
+});
+
+test('naps and router-pause wakes go to a queue the controller reads 10 at a time; drift events to one the onboarder reads in 60 s batches, 2 at a time', () => {
+  const b = fill(blueprint({ version: '0.22.0' }), VALUES);
+  const sqs = (name) => `arn:aws:sqs:eu-west-3:121014831971:${name}`;
+  const queue = (key) => b.queues.find((q) => q.key === key);
+  const failures = { queue: sqs('dmtr-dev-controller-failures'), maxReceiveCount: 3 };
+  assert.deepEqual(queue('work'), { key: 'work', name: 'dmtr-dev-work', retentionSeconds: 3600, managedEncryption: true, visibilityTimeoutSeconds: 960, deadLetter: failures });
+  const drift = queue('drift');
+  assert.deepEqual({ ...drift, policy: undefined }, { key: 'drift', name: 'dmtr-dev-drift', retentionSeconds: 86_400, managedEncryption: true, visibilityTimeoutSeconds: 360, deadLetter: failures, policy: undefined });
+  // Only the router's drift rule sends to the drift queue.
+  assert.deepEqual(drift.policy.Statement, [{
+    Effect: 'Allow', Principal: { Service: 'events.amazonaws.com' }, Action: 'sqs:SendMessage', Resource: sqs('dmtr-dev-drift'),
+    Condition: { ArnEquals: { 'aws:SourceArn': 'arn:aws:events:eu-west-3:121014831971:rule/dmtr-dev-drift' } },
+  }]);
+  assert.deepEqual(b.eventSourceMappings, [
+    { key: 'work', function: 'dmtr-dev-controller', queue: sqs('dmtr-dev-work'), batchSize: 1, maximumBatchingWindowSeconds: 0, maximumConcurrency: 10, reportBatchItemFailures: true },
+    { key: 'drift', function: 'dmtr-dev-onboarder', queue: sqs('dmtr-dev-drift'), batchSize: 100, maximumBatchingWindowSeconds: 60, maximumConcurrency: 2, reportBatchItemFailures: true },
+  ]);
+  assert.equal(b.functions.find((f) => f.key === 'controller').environment.DMT_WORK_QUEUE, 'https://sqs.eu-west-3.amazonaws.com/121014831971/dmtr-dev-work');
+  const statements = (role) => b.roles.find((r) => r.key === role).policy.Statement;
+  const allows = (role, action, resource) => statements(role).some((st) => [].concat(st.Action).includes(action) && [].concat(st.Resource).includes(resource));
+  assert.ok(allows('controller', 'sqs:SendMessage', sqs('dmtr-dev-work')));
+  for (const [role, key] of [['controller', 'work'], ['onboarder', 'drift']]) {
+    for (const action of ['sqs:ReceiveMessage', 'sqs:DeleteMessage', 'sqs:GetQueueAttributes', 'sqs:ChangeMessageVisibility']) assert.ok(allows(role, action, sqs(`dmtr-dev-${key}`)), `${role} ${action} on ${key}`);
+  }
 });

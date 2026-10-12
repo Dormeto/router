@@ -81,7 +81,7 @@ export function healthOf({ checkSchedule, lastScheduledCheckAt, now, lambda = {}
   // A region the account barely uses can be limited to 10 concurrent executions: held requests beyond it get errors.
   if (concurrency?.error) warn(`Lambda concurrency limit unreadable: ${concurrency.error}`);
   else if (concurrency && concurrency.limit < concurrency.needed) {
-    warn(`Lambda concurrency limit of the account in this region is ${concurrency.limit}, below the ${concurrency.needed} a wake can hold (maxHolders and the router): requests beyond it get errors; request a quota increase`);
+    warn(`Lambda concurrency limit of the account in this region is ${concurrency.limit}, below the ${concurrency.needed} the router can need at once (requests held while its workloads wake, its queued naps and wakes, drift repairs): requests beyond it get errors; request a quota of at least ${concurrency.needed}`);
   }
   const status = problems.some((p) => p.level === 'error') ? 'error' : problems.length ? 'warning' : 'ok';
   return { status, problems };

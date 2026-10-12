@@ -18,7 +18,8 @@ import {
   SetRulePrioritiesCommand,
 } from '@aws-sdk/client-elastic-load-balancing-v2';
 
-export function createElbv2(client = new ElasticLoadBalancingV2Client({})) {
+// Adaptive retries (scale design §6): under throttling, a crowded account's calls slow down instead of failing.
+export function createElbv2(client = new ElasticLoadBalancingV2Client({ retryMode: 'adaptive', maxAttempts: 8 })) {
   return {
     describeRules: (input) => client.send(new DescribeRulesCommand(input)),
     modifyRule: (input) => client.send(new ModifyRuleCommand(input)),

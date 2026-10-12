@@ -33,7 +33,9 @@ variable "load_balancer_arn_suffix" {
 }
 
 variable "instance_ids" {
-  type = list(string)
+  description = "Static list of instances. Empty (default): instances are discovered from the app target group (tag dormeto:workload=<workload_id>)."
+  type        = list(string)
+  default     = []
 }
 
 variable "wait_seconds" {

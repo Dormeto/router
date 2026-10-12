@@ -14,7 +14,6 @@ module "demo_workload" {
   app_target_group_arn        = aws_lb_target_group.app.arn
   app_target_group_arn_suffix = aws_lb_target_group.app.arn_suffix
   load_balancer_arn_suffix    = aws_lb.demo.arn_suffix
-  instance_ids                = [aws_instance.demo.id]
   wait_seconds                = var.wait_seconds
   idle_minutes                = var.idle_minutes
   admin_enabled               = var.admin_dashboard_enabled

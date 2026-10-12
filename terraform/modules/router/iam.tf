@@ -215,7 +215,7 @@ resource "aws_iam_role" "onboarder" {
 
 locals {
   # The only tag keys the onboarder may add or remove on customer resources and on its waker target groups.
-  onboarder_tag_keys = ["dormeto:workload", "dormeto:tagged", "dormeto:router"]
+  onboarder_tag_keys = ["dormeto:workload", "dormeto:tagged", "dormeto:router", "dormeto:shadows"]
 }
 
 data "aws_iam_policy_document" "onboarder" {

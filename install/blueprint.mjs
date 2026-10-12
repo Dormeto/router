@@ -29,7 +29,7 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
   const logGroup = (role) => `/aws/lambda/${fn(role)}`;
   const logArn = (role) => `${arn('logs', `log-group:${logGroup(role)}`)}:*`;
   const tagged = { Null: { 'aws:ResourceTag/dormeto:workload': 'false' } };
-  const onboarderTagKeys = { 'ForAllValues:StringEquals': { 'aws:TagKeys': ['dormeto:workload', 'dormeto:tagged', 'dormeto:router'] } };
+  const onboarderTagKeys = { 'ForAllValues:StringEquals': { 'aws:TagKeys': ['dormeto:workload', 'dormeto:tagged', 'dormeto:router', 'dormeto:shadows'] } };
   const allow = (Action, Resource, Condition) => ({ Effect: 'Allow', Action, Resource, ...(Condition ? { Condition } : {}) });
   const policy = (...Statement) => ({ Version: '2012-10-17', Statement });
   const tags = { 'dormeto:router': p.name };

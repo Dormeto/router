@@ -107,3 +107,16 @@ test('the blueprint routes drift events to the onboarder, ignoring the router\'s
   for (const branch of pattern.$or) assert.deepEqual(branch.detail.userIdentity.sessionContext.sessionIssuer.userName, [{ 'anything-but': { prefix: 'dmtr-dev-' } }]);
   assert.equal(b.functions[0].environment.DMT_ONBOARDER, 'dmtr-dev-onboarder');
 });
+
+test('every tag key the onboarder writes is allowed by its tag condition, in the module and the blueprint', async () => {
+  const code = await readFile(new URL('../src/lib/onboarding.mjs', import.meta.url), 'utf8');
+  const written = [...new Set([...code.matchAll(/'(dormeto:[a-z]+)'/g)].map((m) => m[1]))].sort();
+  assert.ok(written.includes('dormeto:shadows'), written.join(', '));
+  const terraform = (await readFile(IAM_TF, 'utf8')).match(/onboarder_tag_keys = \[([^\]]*)\]/)[1].match(/"([^"]+)"/g).map((k) => k.slice(1, -1)).sort();
+  const onboarder = blueprint({ version: 'x' }).roles.find((r) => r.key === 'onboarder').policy.Statement;
+  const blueprintKeys = onboarder.find((s) => s.Condition?.['ForAllValues:StringEquals']).Condition['ForAllValues:StringEquals']['aws:TagKeys'].slice().sort();
+  for (const key of written) {
+    assert.ok(terraform.includes(key), `module: ${key}`);
+    assert.ok(blueprintKeys.includes(key), `blueprint: ${key}`);
+  }
+});

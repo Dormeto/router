@@ -81,8 +81,13 @@ variable "wake_timeout_seconds" {
 }
 
 variable "failed_retry_seconds" {
-  type    = number
-  default = 60
+  description = "After a failed wake, how long requests wait before they try again (router 0.25.0: doubled after each failure in a row, at most 30 minutes); a wake from the manager does not wait."
+  type        = number
+  default     = 60
+  validation {
+    condition     = var.failed_retry_seconds >= 10 && var.failed_retry_seconds <= 600 && floor(var.failed_retry_seconds) == var.failed_retry_seconds
+    error_message = "failed_retry_seconds must be a whole number from 10 to 600."
+  }
 }
 
 variable "max_holders" {

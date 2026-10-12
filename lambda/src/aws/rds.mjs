@@ -9,8 +9,9 @@ import {
   StopDBClusterCommand,
   StopDBInstanceCommand,
 } from '@aws-sdk/client-rds';
+import { BOUNDED } from './bounded.mjs';
 
-export function createRds(client = new RDSClient({})) {
+export function createRds(client = new RDSClient({ requestHandler: BOUNDED })) {
   return {
     describeDBInstances: (input) => client.send(new DescribeDBInstancesCommand(input)),
     describeDBClusters: (input) => client.send(new DescribeDBClustersCommand(input)),

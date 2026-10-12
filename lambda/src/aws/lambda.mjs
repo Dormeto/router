@@ -1,6 +1,7 @@
 import { AddPermissionCommand, GetAccountSettingsCommand, InvokeCommand, LambdaClient, RemovePermissionCommand } from '@aws-sdk/client-lambda';
+import { BOUNDED } from './bounded.mjs';
 
-export function createLambda(client = new LambdaClient({})) {
+export function createLambda(client = new LambdaClient({ requestHandler: BOUNDED })) {
   return {
     invokeAsync: (functionName, payload) => client.send(new InvokeCommand({
       FunctionName: functionName,

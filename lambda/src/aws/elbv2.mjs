@@ -18,9 +18,10 @@ import {
   RemoveTagsCommand,
   SetRulePrioritiesCommand,
 } from '@aws-sdk/client-elastic-load-balancing-v2';
+import { BOUNDED } from './bounded.mjs';
 
 // Adaptive retries (scale design §6): under throttling, a crowded account's calls slow down instead of failing.
-export function createElbv2(client = new ElasticLoadBalancingV2Client({ retryMode: 'adaptive', maxAttempts: 8 })) {
+export function createElbv2(client = new ElasticLoadBalancingV2Client({ retryMode: 'adaptive', maxAttempts: 8, requestHandler: BOUNDED })) {
   return {
     describeRules: (input) => client.send(new DescribeRulesCommand(input)),
     modifyRule: (input) => client.send(new ModifyRuleCommand(input)),

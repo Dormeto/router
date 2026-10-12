@@ -1,6 +1,7 @@
 import { CreateTagsCommand, DeleteTagsCommand, DescribeInstancesCommand, EC2Client, ModifyInstanceAttributeCommand, StartInstancesCommand, StopInstancesCommand } from '@aws-sdk/client-ec2';
+import { BOUNDED } from './bounded.mjs';
 
-export function createEc2(client = new EC2Client({})) {
+export function createEc2(client = new EC2Client({ requestHandler: BOUNDED })) {
   return {
     describeInstances: (input) => client.send(new DescribeInstancesCommand(input)),
     startInstances: (input) => client.send(new StartInstancesCommand(input)),

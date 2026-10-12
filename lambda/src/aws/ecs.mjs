@@ -1,8 +1,9 @@
 import {
   DescribeServicesCommand, DescribeTaskDefinitionCommand, ECSClient, ListClustersCommand, ListServicesCommand, TagResourceCommand, UntagResourceCommand, UpdateServiceCommand,
 } from '@aws-sdk/client-ecs';
+import { BOUNDED } from './bounded.mjs';
 
-export function createEcs(client = new ECSClient({})) {
+export function createEcs(client = new ECSClient({ requestHandler: BOUNDED })) {
   return {
     describeServices: (input) => client.send(new DescribeServicesCommand(input)),
     describeTaskDefinition: (input) => client.send(new DescribeTaskDefinitionCommand(input)),

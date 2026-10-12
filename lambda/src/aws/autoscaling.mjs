@@ -8,8 +8,9 @@ import {
   SuspendProcessesCommand,
   UpdateAutoScalingGroupCommand,
 } from '@aws-sdk/client-auto-scaling';
+import { BOUNDED } from './bounded.mjs';
 
-export function createAutoScaling(client = new AutoScalingClient({})) {
+export function createAutoScaling(client = new AutoScalingClient({ requestHandler: BOUNDED })) {
   return {
     describeAutoScalingGroups: (input) => client.send(new DescribeAutoScalingGroupsCommand(input)),
     // A wake's failed launches (R7a).

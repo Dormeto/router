@@ -1,7 +1,8 @@
 import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { BOUNDED } from './bounded.mjs';
 
 // followRegionRedirects: the bucket of a list may be in another region than the router.
-export function createS3(client = new S3Client({ followRegionRedirects: true })) {
+export function createS3(client = new S3Client({ followRegionRedirects: true, requestHandler: BOUNDED })) {
   return {
     getObject: async ({ bucket, key, signal }) => (await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }), { abortSignal: signal })).Body,
     // A conditional GET (the manager's lists, R6b): the object and its ETag, or { notModified: true } while it is the one

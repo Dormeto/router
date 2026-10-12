@@ -9,14 +9,19 @@ import { createRds } from './aws/rds.mjs';
 import { createElbv2 } from './aws/elbv2.mjs';
 import { createTagging } from './aws/tagging.mjs';
 import { createController } from './lib/controller-core.mjs';
+import { createListRefresher } from './lib/list-refresh.mjs';
+import { parseLists } from './lib/list-cache.mjs';
 import { logger } from './lib/log.mjs';
 import { createStore } from './lib/state.mjs';
 import { sleep } from './lib/time.mjs';
 
 const lambda = createLambda();
+const store = createStore({ dynamo: createDynamo(), table: process.env.DMT_TABLE });
+// IP reputation lists of the router (Terraform ip_lists).
+const lists = parseLists(process.env.DMT_IP_LISTS, (error) => logger.error('IpListsUnreadable', { error }));
 
 export const handler = createController({
-  store: createStore({ dynamo: createDynamo(), table: process.env.DMT_TABLE }),
+  store,
   ec2: createEc2(),
   elbv2: createElbv2(),
   cloudwatch: createCloudWatch(),
@@ -29,4 +34,5 @@ export const handler = createController({
   invokeSelf: (payload) => lambda.invokeAsync(process.env.AWS_LAMBDA_FUNCTION_NAME, payload),
   sleep,
   log: logger,
+  lists: lists.length ? createListRefresher({ store, lists, log: logger }) : null,
 });

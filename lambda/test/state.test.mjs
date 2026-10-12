@@ -135,7 +135,7 @@ test('store getStats queries the day range and adds the counters up', async () =
   const dynamo = fakeDynamo({
     query: async () => ({
       Items: [
-        { sk: { S: 'STATS#2026-10-04' }, 'ignored:HEAD': { N: '2' }, 'wake:probe': { N: '1' }, deferred: { N: '3' }, expiresAt: { N: '1' } },
+        { sk: { S: 'STATS#2026-10-04' }, 'ignored:HEAD': { N: '2' }, 'wake:probe': { N: '1' }, deferred: { N: '3' }, 'deferred:list ipsum': { N: '1' }, expiresAt: { N: '1' } },
         { sk: { S: 'STATS#2026-10-01' }, 'ignored:HEAD': { N: '5' }, 'ignored:rule office': { N: '4' }, 'wake:normal': { N: '2' } },
       ],
     }),
@@ -148,7 +148,33 @@ test('store getStats queries the day range and adds the counters up', async () =
   assert.deepEqual(stats, {
     days: 7,
     since: '2026-09-28',
-    today: { ignored: { HEAD: 2 }, deferred: 3, wakes: { probe: 1 } },
-    total: { ignored: { HEAD: 7, 'rule office': 4 }, deferred: 3, wakes: { probe: 1, normal: 2 } },
+    today: { ignored: { HEAD: 2 }, deferred: { 'browser mode': 3, 'list ipsum': 1 }, wakes: { probe: 1 } },
+    total: { ignored: { HEAD: 7, 'rule office': 4 }, deferred: { 'browser mode': 3, 'list ipsum': 1 }, wakes: { probe: 1, normal: 2 } },
   });
+});
+
+test('store list metadata and versioned parts use the LIST#<name> partition', async () => {
+  const pages = [
+    { Items: [{ sk: { S: 'PART#v1#0000' }, data: { B: Buffer.from('a') } }], LastEvaluatedKey: { pk: { S: 'x' } } },
+    { Items: [{ sk: { S: 'PART#v1#0001' }, data: { B: Buffer.from('b') } }] },
+  ];
+  const dynamo = fakeDynamo({
+    getItem: async () => ({ Item: { version: { S: 'v1' }, parts: { N: '2' }, url: { S: 'https://x' } } }),
+    updateItem: async () => ({}),
+    query: async () => pages.shift(),
+  });
+  const store = createStore({ dynamo, table: 't' });
+  assert.deepEqual(await store.getListMeta('ipsum'), { version: 'v1', parts: 2, url: 'https://x' });
+  await store.setListMeta('ipsum', { version: 'v2', entries: 10 }, ['error']);
+  await store.putListPart('ipsum', 'v2', 1, Buffer.from('zz'), 99);
+  const parts = await store.getListParts('ipsum', 'v1');
+  assert.deepEqual(parts.map((p) => Buffer.from(p).toString()), ['a', 'b']);
+  const [[, get], [, meta], [, part], [, query]] = dynamo.calls;
+  assert.deepEqual(get.Key, { pk: { S: 'LIST#ipsum' }, sk: { S: 'META' } });
+  assert.equal(meta.UpdateExpression, 'SET #f0 = :f0, #f1 = :f1 REMOVE #r0');
+  assert.deepEqual(meta.ExpressionAttributeNames, { '#f0': 'version', '#f1': 'entries', '#r0': 'error' });
+  assert.deepEqual(part.Key, { pk: { S: 'LIST#ipsum' }, sk: { S: 'PART#v2#0001' } });
+  assert.deepEqual(part.ExpressionAttributeValues[':data'], { B: Buffer.from('zz') });
+  assert.equal(query.KeyConditionExpression, '#pk = :pk AND begins_with(#sk, :prefix)');
+  assert.deepEqual(query.ExpressionAttributeValues[':prefix'], { S: 'PART#v1#' });
 });

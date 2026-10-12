@@ -51,6 +51,28 @@ get the waiter page at once (or JSON naming the wake header), so scanners that d
 workload; a request arriving during a wake is held as usual. The filters (no-wake rules, `HEAD`, bots, scanner paths)
 apply to the probe too.
 
+**IP reputation lists** (`ip_lists` on the `router` module): lists of networks (scanners, cloud ranges) downloaded by
+the controller (daily by default) and used by the waker for every workload. `action = "defer"` (default) handles a
+listed source as in browser mode: it gets the waiter page and only the page's probe wakes, so a real visitor loses about
+one round trip while a scanner that does not run JavaScript never wakes the workload; `action = "ignore"` never wakes.
+The `x-dormeto-wake: 1` header and wake rules override the lists. Formats: JSON (every address or CIDR string, for
+example AWS `ip-ranges.json`) or text (first column of each line: ipsum, FireHOL, Spamhaus, CSV). Private and reserved
+ranges are dropped at download. Behind a CDN or proxy the source address is the proxy's: do not use cloud range lists
+there.
+
+```hcl
+ip_lists = [
+  { name = "ipsum", url = "https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt" },
+  { name = "aws", url = "https://ip-ranges.amazonaws.com/ip-ranges.json" },
+]
+```
+
+**Statistics:** while a workload is not awake, the waker counts ignored requests per reason, deferred requests (browser
+mode) and wakes per trigger in a daily item of the state table (`STATS#<day>`, kept 35 days); the admin dashboard shows
+today and the last 7 days. With `metrics_enabled` on the `router` module, the same events also publish the CloudWatch
+metrics `IgnoredRequests`, `DeferredRequests` and `Wakes` (namespace `Dormeto`, dimensions `Router`, `WorkloadId`)
+through the embedded metric format of the log lines: no API call, about 0.30 USD per metric and month.
+
 The `dev` environment has four workloads: `demo` (one EC2 instance, `https://dev.dormeto.com/`), `demo-asg` (an Auto
 Scaling group, `https://asg.dev.dormeto.com/`), `demo-ecs` (an ECS Fargate service in browser wake mode, `https://ecs.dev.dormeto.com/`) and
 `demo-rds` (an ECS Fargate service with a PostgreSQL instance, `https://rds.dev.dormeto.com/`).

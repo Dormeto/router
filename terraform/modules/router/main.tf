@@ -30,6 +30,7 @@ locals {
   # Identifies the exact deployed code: first 12 hex characters of the Lambda zip SHA-256.
   build = substr(data.archive_file.lambda.output_sha256, 0, 12)
   # camelCase JSON for the Lambdas; unset conditions stay null or empty (ignored).
+  ip_lists = jsonencode([for l in var.ip_lists : { name = l.name, url = l.url, action = l.action, refreshHours = l.refresh_hours }])
   no_wake_rules = [for r in var.no_wake_rules : {
     name             = r.name
     sourceIps        = r.source_ips
@@ -69,9 +70,10 @@ resource "aws_lambda_function" "controller" {
 
   environment {
     variables = {
-      DMT_TABLE   = aws_dynamodb_table.router.name
-      DMT_VERSION = var.router_version
-      DMT_BUILD   = local.build
+      DMT_TABLE    = aws_dynamodb_table.router.name
+      DMT_VERSION  = var.router_version
+      DMT_BUILD    = local.build
+      DMT_IP_LISTS = local.ip_lists
     }
   }
 
@@ -122,6 +124,7 @@ resource "aws_lambda_function" "waker" {
       # Router default no-wake rules, for every workload.
       DMT_NO_WAKE_RULES = jsonencode(local.no_wake_rules)
       DMT_METRICS       = tostring(var.metrics_enabled)
+      DMT_IP_LISTS      = local.ip_lists
     }
   }
 

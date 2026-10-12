@@ -543,3 +543,35 @@ test('check (rds): an external wake of the application starts the database', asy
   assert.equal(result.state, STATES.AWAKE, 'the application decides: primaries running and healthy');
   assert.deepEqual(s.rds.state.calls, [['start', 'appdb']]);
 });
+
+// --- IP reputation lists --------------------------------------------------------------------------------------------
+
+function listsSetup(dueNames) {
+  const calls = [];
+  const lists = {
+    async due() { return dueNames; },
+    async refresh(names) { calls.push(names); return names.map((name) => ({ name, entries: 1 })); },
+  };
+  const s = setup({ run: { state: STATES.AWAKE, awakeSince: 0 } });
+  const handler = createController({
+    store: s.store, ec2: s.ec2, elbv2: s.elbv2, cloudwatch: s.cloudwatch, autoscaling: s.autoscaling, ecs: s.ecs,
+    appscaling: s.appscaling, invokeSelf: async (payload) => { s.invocations.push(payload); }, now: s.clock.now,
+    sleep: s.clock.sleep, log: silentLog, lists,
+  });
+  return { ...s, handler, calls };
+}
+
+test('check requests an asynchronous refresh of the due lists only', async () => {
+  const due = listsSetup(['ipsum']);
+  await due.handler({ action: 'check' });
+  assert.deepEqual(due.invocations.filter((i) => i.action === 'refresh-lists'), [{ action: 'refresh-lists', names: ['ipsum'] }]);
+  const fresh = listsSetup([]);
+  await fresh.handler({ action: 'check' });
+  assert.equal(fresh.invocations.filter((i) => i.action === 'refresh-lists').length, 0);
+});
+
+test('refresh-lists refreshes the requested lists', async () => {
+  const s = listsSetup([]);
+  assert.deepEqual(await s.handler({ action: 'refresh-lists', names: ['ipsum'] }), [{ name: 'ipsum', entries: 1 }]);
+  assert.deepEqual(s.calls, [['ipsum']]);
+});

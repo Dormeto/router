@@ -6,6 +6,13 @@ module "router" {
   router_version        = jsondecode(file("${path.module}/../../package.json")).version
   admin_enabled         = var.admin_dashboard_enabled
   metrics_enabled       = true
+  # Sources of the unwanted wakes seen in dev (see vision docs/plans/2026-10-04-ip-reputation-lists.md).
+  ip_lists = [
+    { name = "ipsum", url = "https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt" },
+    { name = "aws", url = "https://ip-ranges.amazonaws.com/ip-ranges.json" },
+    { name = "gcp", url = "https://www.gstatic.com/ipranges/cloud.json" },
+    { name = "digitalocean", url = "https://digitalocean.com/geo/google.csv" },
+  ]
   # Lets dormeto-e2e check that a matching request (and its waiter probe) never wakes a workload.
   no_wake_rules = [{ name = "e2e-no-wake", headers = [{ name = "x-dormeto-e2e", value = "no-wake" }] }]
 }

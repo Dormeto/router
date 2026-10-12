@@ -35,7 +35,7 @@ test('wakes are counted per trigger, deferred requests in browser mode too', asy
   const { handler, store } = setup({ cfg: { wakeMode: 'browser' } });
   await handler(albEvent());
   await handler(albEvent({ headers: { 'x-dormeto-probe': '1', accept: '*/*' } }));
-  assert.deepEqual(store.state.stats, { deferred: 1, 'wake:probe': 1 });
+  assert.deepEqual(store.state.stats, { 'deferred:browser mode': 1, 'wake:probe': 1 });
 });
 
 test('the pending wake of a nap is counted once', async () => {

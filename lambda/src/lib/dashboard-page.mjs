@@ -36,10 +36,13 @@ function statsRows(stats) {
   const period = `(today · ${stats.days} days)`;
   return [
     row(`Ignored requests ${period}`, pairs(stats.today.ignored, stats.total.ignored)),
-    row(`Deferred requests ${period}`, `${stats.today.deferred} · ${stats.total.deferred}`),
+    row(`Deferred requests ${period}`, pairs(stats.today.deferred, stats.total.deferred)),
     row(`Wakes by trigger ${period}`, pairs(stats.today.wakes, stats.total.wakes)),
   ].join('\n');
 }
+
+// ipsum (defer): 109695 entries, 2026-10-04T10:00:00.000Z
+const listText = (l) => `${l.name} (${l.action}): ${l.error ? l.error : `${l.entries} entries, ${l.fetchedAt}`}`;
 
 const row = (label, value) => `<tr><th scope="row">${escapeHtml(label)}</th><td>${escapeHtml(value ?? '—')}</td></tr>`;
 
@@ -101,6 +104,7 @@ ${statsRows(status.stats)}
 ${row('Wake mode', status.wakeMode === 'browser'
     ? `browser: the waiter page probe, the x-dormeto-wake header or a wake rule wakes${(status.wakeRules ?? []).length ? ` (${status.wakeRules.map(ruleText).join('; ')})` : ''}`
     : 'any: every request that passes the filters wakes')}
+${status.ipLists?.length ? row('IP lists', status.ipLists.map(listText).join('; ')) : ''}
 ${row('No-wake rules', (status.noWakeRules ?? []).map(ruleText).join('; ') || 'none (built-in filters only)')}
 ${row('Settings', Object.entries(status.settings).map(([k, v]) => `${k}=${v}`).join(', '))}
 </table>

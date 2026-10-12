@@ -25,7 +25,8 @@ resource "aws_iam_role" "waker" {
 
 data "aws_iam_policy_document" "waker" {
   statement {
-    actions   = ["dynamodb:GetItem", "dynamodb:UpdateItem"]
+    # Query: IP list parts and, for the admin dashboard, statistics.
+    actions   = ["dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:Query"]
     resources = [aws_dynamodb_table.router.arn]
   }
   statement {
@@ -42,14 +43,6 @@ data "aws_iam_policy_document" "waker" {
       sid       = "AdminDashboardRead"
       actions   = ["ec2:DescribeInstances", "elasticloadbalancing:DescribeRules", "elasticloadbalancing:DescribeTargetHealth", "cloudwatch:GetMetricData", "autoscaling:DescribeAutoScalingGroups", "tag:GetResources", "ecs:DescribeServices", "application-autoscaling:DescribeScalableTargets", "rds:DescribeDBInstances", "rds:DescribeDBClusters"]
       resources = ["*"]
-    }
-  }
-  dynamic "statement" {
-    for_each = var.admin_enabled ? [1] : []
-    content {
-      sid       = "AdminDashboardStats"
-      actions   = ["dynamodb:Query"]
-      resources = [aws_dynamodb_table.router.arn]
     }
   }
 }

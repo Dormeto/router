@@ -42,22 +42,27 @@ export function clientIp(event) {
 
 export const WAKE_HEADER = 'x-dormeto-wake';
 
-// { kind: 'no-wake', reason } | { kind: 'probe' } | { kind: 'normal', trigger?, deferred? }.
-// Filters first (no-wake rules, HEAD, bots, scanner paths), then the waiter probe: a client they match never wakes the
-// workload through the waiter page's probe either. In browser mode, a normal request wakes only with the wake header or
-// a wake rule (trigger); otherwise it is deferred to the page's probe.
-export function classify(event, rules = [], { browserMode = false, wakeRules = [] } = {}) {
+// { kind: 'no-wake', reason } | { kind: 'probe' } | { kind: 'normal', trigger?, deferred?, reason? }. In order:
+// - filters (no-wake rules, HEAD, bots, scanner paths): never wake, the waiter probe included;
+// - explicit wakes (the wake header, wake rules): wake in both modes, whatever the IP lists say;
+// - IP lists: `ignore` never wakes; `defer` is browser mode for the listed sources (only the waiter probe wakes);
+// - the waiter probe wakes; in browser mode, other requests are deferred to it.
+export function classify(event, rules = [], { browserMode = false, wakeRules = [], lists = [] } = {}) {
   const rule = rules.find((r) => r.matches(event));
   if (rule) return { kind: 'no-wake', reason: `rule ${rule.name}` };
   if (event.httpMethod === 'HEAD') return { kind: 'no-wake', reason: 'HEAD' };
   if (BOT_PATTERN.test(header(event, 'user-agent') ?? '')) return { kind: 'no-wake', reason: 'bot user agent' };
   if (SCANNER_PATH.test(event.path ?? '')) return { kind: 'no-wake', reason: 'scanner path' };
-  if (header(event, 'x-dormeto-probe') === '1') return { kind: 'probe' };
-  if (!browserMode) return { kind: 'normal' };
   if (header(event, WAKE_HEADER) === '1') return { kind: 'normal', trigger: 'header' };
   const wakeRule = wakeRules.find((r) => r.matches(event));
   if (wakeRule) return { kind: 'normal', trigger: `rule ${wakeRule.name}` };
-  return { kind: 'normal', deferred: true };
+  const ip = lists.length ? clientIp(event) : '';
+  const listed = ip ? lists.find((l) => l.has(ip)) : undefined;
+  if (listed?.action === 'ignore') return { kind: 'no-wake', reason: `list ${listed.name}` };
+  if (header(event, 'x-dormeto-probe') === '1') return { kind: 'probe' };
+  if (listed) return { kind: 'normal', deferred: true, reason: `list ${listed.name}` };
+  if (browserMode) return { kind: 'normal', deferred: true, reason: 'browser mode' };
+  return { kind: 'normal' };
 }
 
 export function requestTarget(event) {

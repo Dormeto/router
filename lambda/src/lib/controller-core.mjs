@@ -18,7 +18,7 @@ const TIMEOUT_MARGIN_MS = 30_000;
 // Held requests last at most waitSeconds: a counter untouched for longer is a leak (killed waker).
 const HOLDERS_STALE_MS = 2 * 60_000;
 
-export function createController({ store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, invokeSelf, now = Date.now, sleep, newId = randomUUID, log }) {
+export function createController({ store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, invokeSelf, now = Date.now, sleep, newId = randomUUID, log, lists = null }) {
   const clients = { ec2, elbv2, autoscaling, ecs, tagging, appscaling, rds };
   let budgetEnd = Infinity;
 
@@ -237,7 +237,21 @@ export function createController({ store, ec2, elbv2, cloudwatch, autoscaling, e
     return nap(cfg.workloadId);
   }
 
+  // IP reputation lists: downloads run in their own invocation, never delaying the workload checks.
+  async function requestListRefresh() {
+    if (!lists || !invokeSelf) return;
+    try {
+      const names = await lists.due();
+      if (!names.length) return;
+      await invokeSelf({ action: 'refresh-lists', names });
+      log.info('ListRefreshRequested', { names });
+    } catch (err) {
+      log.error('ListRefreshCheckFailed', { error: err.message });
+    }
+  }
+
   async function check() {
+    await requestListRefresh();
     const results = [];
     for (const cfg of await store.listConfigs()) {
       try {
@@ -268,6 +282,7 @@ export function createController({ store, ec2, elbv2, cloudwatch, autoscaling, e
       case 'nap': return nap(event.workloadId);
       case 'check': return check();
       case 'ensure-awake': return ensureAwake(event.workloadId);
+      case 'refresh-lists': return lists ? lists.refresh(event.names ?? []) : [];
       default: throw new Error(`unknown action: ${event?.action}`);
     }
   };

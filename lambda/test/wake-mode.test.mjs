@@ -20,13 +20,13 @@ test('classify: filters apply before the waiter probe, in both modes', () => {
 test('classify: browser mode wakes on the probe, the wake header or a wake rule only', () => {
   const wakeRules = compileRules([{ name: 'api', pathPrefixes: ['/api/'] }], { level: 'wake' });
   const noWake = compileRules([{ name: 'office', headers: [{ name: 'x-office', value: '1' }] }]);
-  assert.deepEqual(classify(albEvent(), [], browser({ wakeRules })), { kind: 'normal', deferred: true });
+  assert.deepEqual(classify(albEvent(), [], browser({ wakeRules })), { kind: 'normal', deferred: true, reason: 'browser mode' });
   assert.deepEqual(classify(albEvent({ headers: PROBE }), [], browser()), { kind: 'probe' });
   assert.deepEqual(classify(albEvent({ headers: { 'x-dormeto-wake': '1' } }), [], browser()), { kind: 'normal', trigger: 'header' });
   assert.deepEqual(classify(albEvent({ path: '/api/orders' }), [], browser({ wakeRules })), { kind: 'normal', trigger: 'rule api' });
   assert.deepEqual(classify(albEvent({ path: '/api/orders', headers: { 'x-office': '1' } }), noWake, browser({ wakeRules })),
     { kind: 'no-wake', reason: 'rule office' }, 'no-wake rules win over wake rules');
-  assert.deepEqual(classify(albEvent({ headers: { 'x-dormeto-wake': '1' } })), { kind: 'normal' }, 'any mode ignores the header');
+  assert.deepEqual(classify(albEvent({ headers: { 'x-dormeto-wake': '1' } })), { kind: 'normal', trigger: 'header' }, 'explicit in any mode too');
 });
 
 test('the waiter page probes at once, then every pollSeconds', () => {

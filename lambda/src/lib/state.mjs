@@ -7,23 +7,26 @@ export const STATES = Object.freeze({
 });
 
 const itemKey = (workloadId, sk) => ({ pk: { S: `WL#${workloadId}` }, sk: { S: sk } });
+const listKey = (name, sk) => ({ pk: { S: `LIST#${name}` }, sk: { S: sk } });
 
 const DAY_MS = 86_400_000;
 const STATS_TTL_DAYS = 35;
 const utcDay = (ms) => new Date(ms).toISOString().slice(0, 10);
 
-// Daily statistics item → { ignored: { reason: n }, deferred: n, wakes: { trigger: n } }, added into `into`.
+// Daily statistics item → { ignored: { reason: n }, deferred: { reason: n }, wakes: { trigger: n } }, added into `into`.
 function addStats(into, item) {
   for (const [name, attr] of Object.entries(item)) {
     if (!('N' in attr) || name === 'expiresAt') continue;
     const n = Number(attr.N);
-    if (name === 'deferred') into.deferred += n;
+    // `deferred` (router 0.8.0) counted browser-mode deferrals only.
+    if (name === 'deferred') into.deferred['browser mode'] = (into.deferred['browser mode'] ?? 0) + n;
+    else if (name.startsWith('deferred:')) into.deferred[name.slice(9)] = (into.deferred[name.slice(9)] ?? 0) + n;
     else if (name.startsWith('ignored:')) into.ignored[name.slice(8)] = (into.ignored[name.slice(8)] ?? 0) + n;
     else if (name.startsWith('wake:')) into.wakes[name.slice(5)] = (into.wakes[name.slice(5)] ?? 0) + n;
   }
   return into;
 }
-const emptyStats = () => ({ ignored: {}, deferred: 0, wakes: {} });
+const emptyStats = () => ({ ignored: {}, deferred: {}, wakes: {} });
 
 export function toValue(value) {
   if (typeof value === 'string') return { S: value };
@@ -151,7 +154,7 @@ export function createStore({ dynamo, table, now = Date.now }) {
       return update(buildTransition({ table, workloadId, now: now(), ...change }));
     },
 
-    // Daily counter (`ignored:<reason>`, `deferred`, `wake:<trigger>`) in the WL#<id> / STATS#<yyyy-mm-dd> item.
+    // Daily counter (`ignored:<reason>`, `deferred:<reason>`, `wake:<trigger>`) in the WL#<id> / STATS#<yyyy-mm-dd> item.
     async count(workloadId, counter) {
       const t = now();
       const expires = (Math.floor(t / DAY_MS) + 1) * (DAY_MS / 1000) + STATS_TTL_DAYS * 86_400;
@@ -182,6 +185,57 @@ export function createStore({ dynamo, table, now = Date.now }) {
         if (item.sk?.S === `STATS#${today}`) addStats(todayStats, item);
       }
       return { days, since, today: todayStats, total };
+    },
+
+    // IP reputation lists: LIST#<name> / META and LIST#<name> / PART#<version>#<nnnn> (gzip chunks).
+    async getListMeta(name) {
+      const { Item } = await dynamo.getItem({ TableName: table, Key: listKey(name, 'META'), ConsistentRead: true });
+      return Item ? fromItem(Item) : null;
+    },
+
+    async setListMeta(name, set, remove = []) {
+      const fields = Object.entries(set);
+      const names = {};
+      const values = {};
+      fields.forEach(([field, value], i) => { names[`#f${i}`] = field; values[`:f${i}`] = toValue(value); });
+      remove.forEach((field, i) => { names[`#r${i}`] = field; });
+      const clauses = [];
+      if (fields.length) clauses.push(`SET ${fields.map((_, i) => `#f${i} = :f${i}`).join(', ')}`);
+      if (remove.length) clauses.push(`REMOVE ${remove.map((_, i) => `#r${i}`).join(', ')}`);
+      await dynamo.updateItem({
+        TableName: table,
+        Key: listKey(name, 'META'),
+        UpdateExpression: clauses.join(' '),
+        ExpressionAttributeNames: names,
+        ...(fields.length ? { ExpressionAttributeValues: values } : {}),
+      });
+    },
+
+    async putListPart(name, version, index, data, expiresAt) {
+      await dynamo.updateItem({
+        TableName: table,
+        Key: listKey(name, `PART#${version}#${String(index).padStart(4, '0')}`),
+        UpdateExpression: 'SET #data = :data, #exp = :exp',
+        ExpressionAttributeNames: { '#data': 'data', '#exp': 'expiresAt' },
+        ExpressionAttributeValues: { ':data': { B: data }, ':exp': { N: String(expiresAt) } },
+      });
+    },
+
+    async getListParts(name, version) {
+      const parts = [];
+      let ExclusiveStartKey;
+      do {
+        const page = await dynamo.query({
+          TableName: table,
+          KeyConditionExpression: '#pk = :pk AND begins_with(#sk, :prefix)',
+          ExpressionAttributeNames: { '#pk': 'pk', '#sk': 'sk' },
+          ExpressionAttributeValues: { ':pk': { S: `LIST#${name}` }, ':prefix': { S: `PART#${version}#` } },
+          ExclusiveStartKey,
+        });
+        for (const item of page.Items ?? []) parts.push(item.data.B);
+        ExclusiveStartKey = page.LastEvaluatedKey;
+      } while (ExclusiveStartKey);
+      return parts;
     },
 
     async setPendingWake(workloadId) {

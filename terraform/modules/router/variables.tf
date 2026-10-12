@@ -81,3 +81,22 @@ variable "metrics_enabled" {
   type        = bool
   default     = false
 }
+
+variable "ip_lists" {
+  description = "IP reputation lists downloaded by the controller (refresh_hours) and used by the waker for every workload. action defer: a listed source only wakes through the waiter page probe (browser mode for it); ignore: never wakes. The x-dormeto-wake header and wake rules override the lists. Formats: JSON (every address or CIDR string) or text (first column). Behind a CDN or proxy the source is the proxy: do not use cloud range lists there."
+  type = list(object({
+    name          = string
+    url           = string
+    action        = optional(string, "defer")
+    refresh_hours = optional(number, 24)
+  }))
+  default = []
+  validation {
+    condition     = alltrue([for l in var.ip_lists : can(regex("^[A-Za-z0-9._-]{1,64}$", l.name))]) && length(distinct([for l in var.ip_lists : l.name])) == length(var.ip_lists)
+    error_message = "ip_lists names must be unique, 1-64 characters among letters, digits, '.', '_' and '-'."
+  }
+  validation {
+    condition     = alltrue([for l in var.ip_lists : can(regex("^https?://", l.url)) && contains(["defer", "ignore"], l.action) && l.refresh_hours >= 1])
+    error_message = "Each ip_lists entry needs an http(s) url, action defer or ignore, and refresh_hours of at least 1."
+  }
+}

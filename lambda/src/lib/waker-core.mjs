@@ -13,7 +13,7 @@ const ROUTE_GRACE_MS = 15_000;
 // Days of statistics on the admin dashboard.
 const STATS_DAYS = 7;
 
-export function createWaker({ store, invokeController, prefix, now = Date.now, sleep, newId = randomUUID, log, getAdmin, defaultRules = [] }) {
+export function createWaker({ store, invokeController, prefix, now = Date.now, sleep, newId = randomUUID, log, getAdmin, defaultRules = [], listCache = null }) {
   const inRouteGrace = (run) => run.state === STATES.AWAKE && (run.awakeSince ?? 0) > now() - ROUTE_GRACE_MS;
   const servable = (run) => run.state === STATES.AWAKE && !inRouteGrace(run);
 
@@ -168,11 +168,14 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
         noWakeRules: describeRules([{ level: 'router', rules: defaultRules }, { level: 'workload', rules: cfg.noWakeRules }]),
         wakeRules: describeRules([{ level: 'wake', rules: cfg.wakeRules }]),
         loadStats: () => store.getStats(workloadId, STATS_DAYS),
+        loadLists: listCache ? () => listCache.describe() : null,
       });
     }
     const { kind, reason, trigger: by, deferred } = classify(event, noWakeRules(cfg), {
       browserMode: cfg.wakeMode === 'browser',
       wakeRules: rulesFor('wake', cfg.wakeRules),
+      // An awake workload does not need them: requests reach the waker only during the route switch.
+      lists: listCache && initial.state !== STATES.AWAKE ? await listCache.get() : [],
     });
     let run = initial;
     const origin = () => requestOrigin(event, by ?? kind);
@@ -185,8 +188,8 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
       // Awake: drift repair as in any mode. A deferred request (browser mode) waits for the waiter page's probe.
       run = await trigger(workloadId, cfg, run, kind, origin());
     } else if ([STATES.ASLEEP, STATES.FAILED].includes(run.state)) {
-      log.info('WakeDeferred', { workloadId, trigger: origin() });
-      await count(workloadId, 'deferred');
+      log.info('WakeDeferred', { workloadId, reason, trigger: origin() });
+      await count(workloadId, `deferred:${reason}`);
     }
     // A deferred request is held only behind a wake already in progress.
     const holdable = !deferred || run.state === STATES.WAKING;

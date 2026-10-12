@@ -3,6 +3,7 @@ import { createLambda } from './aws/lambda.mjs';
 import { createLogger } from './lib/log.mjs';
 import { memoizeAsync } from './lib/memo.mjs';
 import { parseRules } from './lib/no-wake.mjs';
+import { createListCache, parseLists } from './lib/list-cache.mjs';
 import { createStore } from './lib/state.mjs';
 import { sleep } from './lib/time.mjs';
 import { createWaker } from './lib/waker-core.mjs';
@@ -40,8 +41,12 @@ const getAdmin = memoizeAsync(() => Promise.all([
   version: { version: process.env.DMT_VERSION, build: process.env.DMT_BUILD },
 })));
 
+const store = createStore({ dynamo: createDynamo(), table: process.env.DMT_TABLE });
+// IP reputation lists of the router (Terraform ip_lists), downloaded by the controller.
+const lists = parseLists(process.env.DMT_IP_LISTS, (error) => logger.error('IpListsUnreadable', { error }));
+
 export const handler = createWaker({
-  store: createStore({ dynamo: createDynamo(), table: process.env.DMT_TABLE }),
+  store,
   invokeController,
   prefix: process.env.DMT_TG_PREFIX,
   sleep,
@@ -49,4 +54,5 @@ export const handler = createWaker({
   getAdmin,
   // Router defaults for every workload (Terraform router module no_wake_rules).
   defaultRules: parseRules(process.env.DMT_NO_WAKE_RULES, (error) => logger.error('NoWakeRulesUnreadable', { error })),
+  listCache: lists.length ? createListCache({ store, lists, log: logger }) : null,
 });

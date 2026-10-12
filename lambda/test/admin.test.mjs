@@ -10,7 +10,7 @@ const SECRET = 'Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4z';
 const BASE = `/_dormeto/${SECRET}`;
 const adminConfig = (enabled = true) => testConfig({ admin: { enabled, secretHash: hashSecret(SECRET) } });
 
-function setup({ run, cfg = adminConfig(), metric = [], timestamps = [], defaultRules } = {}) {
+function setup({ run, cfg = adminConfig(), metric = [], timestamps = [], defaultRules, listCache } = {}) {
   const clock = fakeClock();
   const store = fakeStore({ config: cfg, run, clock });
   const ec2 = fakeEc2(cfg.instanceIds, { state: run.state === STATES.AWAKE ? 'running' : 'stopped' });
@@ -25,7 +25,7 @@ function setup({ run, cfg = adminConfig(), metric = [], timestamps = [], default
   const admin = createAdmin({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, invokeController, now: clock.now, log: silentLog, version: { version: '0.3.0', build: 'abc123def456' } });
   const handler = createWaker({
     store, invokeController, prefix: 'dmt-dev-', now: clock.now, sleep: clock.sleep,
-    newId: () => 'wake-1', log: silentLog, getAdmin: async () => admin, defaultRules,
+    newId: () => 'wake-1', log: silentLog, getAdmin: async () => admin, defaultRules, listCache,
   });
   return { handler, store, clock, invocations, cloudwatch, ec2, elbv2, autoscaling, ecs };
 }
@@ -288,13 +288,13 @@ test('the wake mode defaults to any', async () => {
 
 test('status.json and the dashboard show the statistics of the last 7 days', async () => {
   const { handler, store } = setup({ run: { state: STATES.AWAKE } });
-  store.state.stats = { 'ignored:HEAD': 2, 'ignored:rule office': 1, deferred: 3, 'wake:probe': 4 };
+  store.state.stats = { 'ignored:HEAD': 2, 'ignored:rule office': 1, 'deferred:browser mode': 3, 'wake:probe': 4 };
   const status = JSON.parse((await handler(albEvent({ path: `${BASE}/status.json`, headers: { accept: 'application/json' } }))).body);
   assert.equal(status.stats.days, 7);
-  assert.deepEqual(status.stats.total, { ignored: { HEAD: 2, 'rule office': 1 }, deferred: 3, wakes: { probe: 4 } });
+  assert.deepEqual(status.stats.total, { ignored: { HEAD: 2, 'rule office': 1 }, deferred: { 'browser mode': 3 }, wakes: { probe: 4 } });
   const page = (await handler(albEvent({ path: `${BASE}/` }))).body;
   assert.match(page, /Ignored requests \(today · 7 days\)<\/th><td>HEAD 2 · 2, rule office 1 · 1/);
-  assert.match(page, /Deferred requests \(today · 7 days\)<\/th><td>3 · 3/);
+  assert.match(page, /Deferred requests \(today · 7 days\)<\/th><td>browser mode 3 · 3/);
   assert.match(page, /Wakes by trigger \(today · 7 days\)<\/th><td>probe 4 · 4/);
 });
 
@@ -304,4 +304,19 @@ test('statistics that cannot be read do not break the status', async () => {
   const status = JSON.parse((await handler(albEvent({ path: `${BASE}/status.json`, headers: { accept: 'application/json' } }))).body);
   assert.equal(status.state, STATES.AWAKE);
   assert.deepEqual(status.stats, { error: 'AccessDenied' });
+});
+
+test('status.json and the dashboard show the IP lists', async () => {
+  const listCache = {
+    get: async () => [],
+    describe: async () => [
+      { name: 'ipsum', action: 'defer', entries: 109695, dropped: 0, fetchedAt: '2026-10-04T10:00:00.000Z' },
+      { name: 'cloud', action: 'defer', entries: 0, dropped: 0, fetchedAt: null, error: 'not downloaded yet' },
+    ],
+  };
+  const { handler } = setup({ run: { state: STATES.AWAKE }, listCache });
+  const status = JSON.parse((await handler(albEvent({ path: `${BASE}/status.json`, headers: { accept: 'application/json' } }))).body);
+  assert.deepEqual(status.ipLists.map((l) => [l.name, l.entries]), [['ipsum', 109695], ['cloud', 0]]);
+  const page = (await handler(albEvent({ path: `${BASE}/` }))).body;
+  assert.match(page, /IP lists<\/th><td>ipsum \(defer\): 109695 entries, 2026-10-04T10:00:00.000Z; cloud \(defer\): not downloaded yet/);
 });

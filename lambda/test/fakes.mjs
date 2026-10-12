@@ -28,6 +28,7 @@ export function fakeClock(start = 1_700_000_000_000) {
   const hooks = [];
   return {
     now: () => t,
+    advance: (ms) => { t += ms; },
     onSleep: (fn) => hooks.push(fn),
     async sleep(ms) {
       t += ms;
@@ -38,7 +39,8 @@ export function fakeClock(start = 1_700_000_000_000) {
 }
 
 export function fakeStore({ config, run, clock }) {
-  const state = { run: structuredClone(run), stats: {} };
+  const state = { run: structuredClone(run), stats: {}, lists: {} };
+  const list = (name) => (state.lists[name] ??= { meta: null, parts: {} });
   const copy = () => structuredClone(state.run);
   return {
     state,
@@ -60,10 +62,18 @@ export function fakeStore({ config, run, clock }) {
       return true;
     },
     async count(id, counter) { state.stats[counter] = (state.stats[counter] ?? 0) + 1; },
+    async getListMeta(name) { return structuredClone(state.lists[name]?.meta ?? null); },
+    async setListMeta(name, set, remove = []) {
+      const l = list(name);
+      l.meta = { ...(l.meta ?? {}), ...set };
+      for (const field of remove) delete l.meta[field];
+    },
+    async putListPart(name, version, index, data) { (list(name).parts[version] ??= [])[index] = Buffer.from(data); },
+    async getListParts(name, version) { return [...(state.lists[name]?.parts[version] ?? [])]; },
     async getStats(id, days) {
-      const stats = { ignored: {}, deferred: 0, wakes: {} };
+      const stats = { ignored: {}, deferred: {}, wakes: {} };
       for (const [name, n] of Object.entries(state.stats)) {
-        if (name === 'deferred') stats.deferred += n;
+        if (name.startsWith('deferred:')) stats.deferred[name.slice(9)] = n;
         else if (name.startsWith('ignored:')) stats.ignored[name.slice(8)] = n;
         else if (name.startsWith('wake:')) stats.wakes[name.slice(5)] = n;
       }

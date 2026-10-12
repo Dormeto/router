@@ -37,6 +37,7 @@ export function createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging
     return {
       workloadId,
       router: { version: version.version ?? 'unknown', build: version.build ?? 'unknown' },
+      targetGroupArn: cfg.appTargetGroupArn,
       state: run.state,
       updatedAt: iso(run.updatedAt),
       awakeSince: iso(run.awakeSince),

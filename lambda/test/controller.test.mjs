@@ -782,6 +782,7 @@ test('status returns the live status of a workload, with router rules, statistic
   assert.equal(status.state, STATES.AWAKE);
   assert.equal(status.route, 'app');
   assert.deepEqual(status.router, { version: '0.11.0', build: 'abc' });
+  assert.equal(status.targetGroupArn, s.cfg.appTargetGroupArn, 'what the manager excludes from the workload view');
   assert.deepEqual(status.noWakeRules.map((r) => [r.name, r.level]), [['e2e', 'router']]);
   assert.deepEqual(status.stats.total.ignored, { HEAD: 2 });
   assert.deepEqual(status.ipLists.map((l) => [l.name, l.entries, l.url]), [['ipsum', 42, 'https://x']]);

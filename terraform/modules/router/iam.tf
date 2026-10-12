@@ -206,3 +206,78 @@ resource "aws_iam_role_policy" "scheduler" {
   role   = aws_iam_role.scheduler.id
   policy = data.aws_iam_policy_document.scheduler.json
 }
+
+resource "aws_iam_role" "onboarder" {
+  name               = "${var.name}-onboarder"
+  assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
+}
+
+locals {
+  # The only tag keys the onboarder may add or remove on customer resources and on its waker target groups.
+  onboarder_tag_keys = ["dormeto:workload", "dormeto:tagged", "dormeto:router"]
+}
+
+data "aws_iam_policy_document" "onboarder" {
+  statement {
+    # Workload configuration, runtime state and pauses (offboarding deletes them).
+    actions   = ["dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:Query", "dynamodb:Scan", "dynamodb:DeleteItem"]
+    resources = [aws_dynamodb_table.router.arn]
+  }
+  statement {
+    # Finding the rules and the backends of a target group, whatever their tags.
+    actions   = ["elasticloadbalancing:DescribeTargetGroups", "elasticloadbalancing:DescribeListeners", "elasticloadbalancing:DescribeRules", "elasticloadbalancing:DescribeTags", "elasticloadbalancing:DescribeTargetHealth", "ec2:DescribeInstances", "autoscaling:DescribeAutoScalingGroups", "ecs:ListClusters", "ecs:ListServices", "ecs:DescribeServices", "rds:DescribeDBInstances", "rds:DescribeDBClusters"]
+    resources = ["*"]
+  }
+  statement {
+    # Waker target groups only (named after the router).
+    actions   = ["elasticloadbalancing:CreateTargetGroup", "elasticloadbalancing:ModifyTargetGroupAttributes", "elasticloadbalancing:DeleteTargetGroup", "elasticloadbalancing:RegisterTargets", "elasticloadbalancing:DeregisterTargets"]
+    resources = ["${local.arn_prefix}:elasticloadbalancing:${local.region}:${local.account_id}:targetgroup/${var.name}-*/*"]
+  }
+  statement {
+    # Instrumenting a customer rule (untagged until then) and restoring it at offboarding.
+    actions   = ["elasticloadbalancing:ModifyRule"]
+    resources = ["${local.arn_prefix}:elasticloadbalancing:${local.region}:${local.account_id}:listener-rule/app/*"]
+  }
+  statement {
+    actions = ["elasticloadbalancing:AddTags", "elasticloadbalancing:RemoveTags"]
+    resources = [
+      "${local.arn_prefix}:elasticloadbalancing:${local.region}:${local.account_id}:listener-rule/app/*",
+      "${local.arn_prefix}:elasticloadbalancing:${local.region}:${local.account_id}:targetgroup/${var.name}-*/*",
+    ]
+    condition {
+      test     = "ForAllValues:StringEquals"
+      variable = "aws:TagKeys"
+      values   = local.onboarder_tag_keys
+    }
+  }
+  statement {
+    # Backends: the workload tag and the onboarder marker only.
+    actions = ["ec2:CreateTags", "ec2:DeleteTags", "autoscaling:CreateOrUpdateTags", "autoscaling:DeleteTags", "ecs:TagResource", "ecs:UntagResource", "rds:AddTagsToResource", "rds:RemoveTagsFromResource"]
+    resources = [
+      "${local.arn_prefix}:ec2:${local.region}:${local.account_id}:instance/*",
+      "${local.arn_prefix}:autoscaling:${local.region}:${local.account_id}:autoScalingGroup:*:autoScalingGroupName/*",
+      "${local.arn_prefix}:ecs:${local.region}:${local.account_id}:service/*/*",
+      "${local.arn_prefix}:rds:${local.region}:${local.account_id}:db:*",
+      "${local.arn_prefix}:rds:${local.region}:${local.account_id}:cluster:*",
+    ]
+    condition {
+      test     = "ForAllValues:StringEquals"
+      variable = "aws:TagKeys"
+      values   = local.onboarder_tag_keys
+    }
+  }
+  statement {
+    actions   = ["lambda:AddPermission", "lambda:RemovePermission"]
+    resources = [aws_lambda_function.waker.arn]
+  }
+  statement {
+    actions   = ["logs:CreateLogStream", "logs:PutLogEvents"]
+    resources = ["${aws_cloudwatch_log_group.onboarder.arn}:*"]
+  }
+}
+
+resource "aws_iam_role_policy" "onboarder" {
+  name   = "onboarder"
+  role   = aws_iam_role.onboarder.id
+  policy = data.aws_iam_policy_document.onboarder.json
+}

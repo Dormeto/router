@@ -138,6 +138,39 @@ resource "aws_lambda_function" "waker" {
   depends_on = [aws_cloudwatch_log_group.waker, aws_iam_role_policy.waker]
 }
 
+resource "aws_cloudwatch_log_group" "onboarder" {
+  name              = "/aws/lambda/${var.name}-onboarder"
+  retention_in_days = var.log_retention_days
+}
+
+# Onboards and offboards workloads for the manager (vision docs/specs/2026-10-05-onboarding-design.md), with its own role:
+# the controller keeps its least privilege.
+resource "aws_lambda_function" "onboarder" {
+  function_name    = "${var.name}-onboarder"
+  role             = aws_iam_role.onboarder.arn
+  runtime          = "nodejs24.x"
+  architectures    = ["arm64"]
+  handler          = "onboarder.handler"
+  filename         = data.archive_file.lambda.output_path
+  source_code_hash = data.archive_file.lambda.output_base64sha256
+  # Finding the backends lists every Auto Scaling group and ECS service of the region.
+  timeout     = 300
+  memory_size = 256
+
+  environment {
+    variables = {
+      DMT_TABLE              = aws_dynamodb_table.router.name
+      DMT_TG_PREFIX          = "${var.name}-"
+      DMT_VERSION            = var.router_version
+      DMT_BUILD              = local.build
+      DMT_WAKER_FUNCTION     = aws_lambda_function.waker.function_name
+      DMT_WAKER_FUNCTION_ARN = aws_lambda_function.waker.arn
+    }
+  }
+
+  depends_on = [aws_cloudwatch_log_group.onboarder, aws_iam_role_policy.onboarder]
+}
+
 resource "aws_scheduler_schedule" "check" {
   name                = "${var.name}-check"
   schedule_expression = var.check_schedule

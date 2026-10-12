@@ -29,3 +29,11 @@ output "controller_function_arn" {
 output "controller_failures_queue_url" {
   value = aws_sqs_queue.controller_failures.url
 }
+
+output "onboarder_function_name" {
+  value = aws_lambda_function.onboarder.function_name
+}
+
+output "onboarder_function_arn" {
+  value = aws_lambda_function.onboarder.arn
+}

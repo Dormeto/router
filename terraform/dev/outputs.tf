@@ -63,3 +63,8 @@ output "workloads" {
     }
   }
 }
+
+output "onb_target_group_arn" {
+  description = "Target group of the customer-style workload onb (onboarded by the manager)."
+  value       = aws_lb_target_group.onb.arn
+}

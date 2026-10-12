@@ -4,6 +4,7 @@ const HOUR_MS = 3_600_000;
 const DAY_MS = 24 * HOUR_MS;
 
 const ago = (ms) => (ms < 2 * HOUR_MS ? `${Math.round(ms / 60_000)} minutes ago` : `${Math.floor(ms / HOUR_MS)} hours ago`);
+const CONCURRENCY_SHARE = 0.8;
 const count = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 
 // Errors and throttles of the controller and the waker over 24 hours, and the waker's peak concurrency.
@@ -78,10 +79,11 @@ export function healthOf({ checkSchedule, lastScheduledCheckAt, now, lambda = {}
     else if (list.fetchedAt && now - Date.parse(list.fetchedAt) > 2 * (list.refreshHours ?? 24) * HOUR_MS) warn(`IP list ${list.name}: last downloaded ${ago(now - Date.parse(list.fetchedAt))}`);
   }
   if (failed > 0) warn(`${count(failed, 'failed workload')}`);
-  // A region the account barely uses can be limited to 10 concurrent executions: held requests beyond it get errors.
+  // A region the account barely uses can be limited to 10 concurrent executions: held requests beyond it get errors. The
+  // limit is shared by every function of the account: a warning once the router uses more than 80% of it.
   if (concurrency?.error) warn(`Lambda concurrency limit unreadable: ${concurrency.error}`);
-  else if (concurrency && concurrency.limit < concurrency.needed) {
-    warn(`Lambda concurrency limit of the account in this region is ${concurrency.limit}, below the ${concurrency.needed} the router can need at once (requests held while its workloads wake, its queued naps and wakes, drift repairs): requests beyond it get errors; request a quota of at least ${concurrency.needed}`);
+  else if (concurrency && concurrency.needed > CONCURRENCY_SHARE * concurrency.limit) {
+    warn(`Lambda concurrency limit of the account in this region is ${concurrency.limit}: the router used up to ${concurrency.needed} at once in 24 hours (its waker's peak, plus its queued naps and wakes, drift repairs and the check), more than ${CONCURRENCY_SHARE * 100}% of it; requests beyond the limit get errors: request a higher quota`);
   }
   const status = problems.some((p) => p.level === 'error') ? 'error' : problems.length ? 'warning' : 'ok';
   return { status, problems };

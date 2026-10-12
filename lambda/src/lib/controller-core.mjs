@@ -718,15 +718,18 @@ export function createController({
   // Concurrent executions the router can need at once besides held requests: its queued naps and wakes (the work queue's
   // 10), drift repairs (2) and the check.
   const HEADROOM = 10 + 2 + 1;
+  // The account's Lambda concurrency is shared by every function of the region: the router's need is what its waker used
+  // (24-hour peak) plus the headroom; the worst case (every workload not awake woken at once, each holding up to its
+  // maxHolders) is information only.
 
   async function routerInfo() {
     const t = now();
     const measured = await storedHealth(t);
     const configs = await store.listConfigs();
     const runs = await Promise.all(configs.map((cfg) => store.getRun(cfg.workloadId).catch(() => null)));
-    // Requests are held while a workload wakes: up to maxHolders for each workload that is not awake.
-    const needed = configs.reduce((n, c, i) => n + (runs[i]?.state === STATES.AWAKE ? 0 : c.maxHolders ?? 0), 0) + HEADROOM;
-    const concurrency = measured.limit && (measured.limit.error ? { error: measured.limit.error } : { limit: measured.limit.limit, needed });
+    const needed = (measured.lambda?.waker?.peakConcurrency ?? 0) + HEADROOM;
+    const worstCase = configs.reduce((n, c, i) => n + (runs[i]?.state === STATES.AWAKE ? 0 : c.maxHolders ?? 0), 0) + HEADROOM;
+    const concurrency = measured.limit && (measured.limit.error ? { error: measured.limit.error } : { limit: measured.limit.limit, needed, worstCase });
     let pausesError;
     const pauses = await store.listPauses().then((all) => all.filter((p) => !expired(p))).catch((err) => {
       pausesError = err.message;

@@ -144,3 +144,18 @@ test('a shadow whose rule is gone, takes other target groups or acts before its 
   assert.deepEqual(splitFound.orphans.map((o) => o.reason), ['rule 39 shadows rule 40, which forwards to other target groups']);
   assert.deepEqual(splitFound.issues.map((i) => [i.reason, i.repairable]), [['rule 40 also forwards to other target groups', false]]);
 });
+
+test('a target group deleted since the workload was onboarded fails no other workload: its batch is described one by one', async () => {
+  const other = testConfig({ workloadId: 'shop', ruleArn: 'arn:rule/shop', appTargetGroupArn: 'arn:tg/shop-app', wakerTargetGroupArn: 'arn:tg/shop-waker' });
+  const elbv2 = fakeElbv2(cfg);
+  elbv2.state.rules.set('arn:rule/shop', { actions: [{ Type: 'forward', Order: 1, ForwardConfig: { TargetGroups: [{ TargetGroupArn: other.appTargetGroupArn, Weight: 1 }, { TargetGroupArn: other.wakerTargetGroupArn, Weight: 0 }] } }], priority: '40', conditions: [host('shop.example.com')], tags: { 'dormeto:workload': 'shop' } });
+  // AWS fails the whole call when one of the target groups is gone.
+  const describe = elbv2.describeTargetGroups.bind(elbv2);
+  elbv2.describeTargetGroups = async (input) => {
+    if (input.TargetGroupArns.includes(cfg.appTargetGroupArn)) throw Object.assign(new Error(`One or more target groups not found`), { name: 'TargetGroupNotFoundException' });
+    return describe(input);
+  };
+  const found = await resolveRules(elbv2, [cfg, other]);
+  assert.deepEqual(found.get('shop').instrumented.map((r) => r.RuleArn), ['arn:rule/shop']);
+  assert.deepEqual(found.get('demo').issues.map((i) => i.reason), ['target group not attached to a load balancer']);
+});

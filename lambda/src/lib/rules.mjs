@@ -128,11 +128,23 @@ export async function ruleTags(elbv2, rules) {
 
 // Workload id → { rules, instrumented, issues: [{ arn, priority, reason, repairable }], covered: [{ arn, by }], orphans }.
 // One listing per load balancer, whatever the number of workloads (the workload list resolves them all at once).
+// The target groups of a batch; one deleted fails the whole call: the batch is then described one by one, leaving it out
+// (its workload has no load balancer).
+async function describeGroups(elbv2, batch) {
+  try {
+    return (await elbv2.describeTargetGroups({ TargetGroupArns: batch })).TargetGroups ?? [];
+  } catch (err) {
+    if (err.name !== 'TargetGroupNotFoundException') throw err;
+    const groups = [];
+    if (batch.length > 1) for (const arn of batch) groups.push(...(await describeGroups(elbv2, [arn])));
+    return groups;
+  }
+}
+
 export async function resolveRules(elbv2, cfgs) {
   const balancers = new Map();
   await each(chunks([...new Set(cfgs.map((c) => c.appTargetGroupArn))], 20), LISTINGS, async (batch) => {
-    const { TargetGroups = [] } = await elbv2.describeTargetGroups({ TargetGroupArns: batch });
-    for (const g of TargetGroups) balancers.set(g.TargetGroupArn, g.LoadBalancerArns ?? []);
+    for (const g of await describeGroups(elbv2, batch)) balancers.set(g.TargetGroupArn, g.LoadBalancerArns ?? []);
   });
   const listed = new Map();
   await each([...new Set([...balancers.values()].flat())], LISTINGS, async (lb) => { listed.set(lb, await listRules(elbv2, lb)); });

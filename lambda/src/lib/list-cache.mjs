@@ -74,6 +74,7 @@ export function createListCache({ store, lists, now = Date.now, log, checkMs = C
       return (await loadAll()).map(({ list, entry }) => ({
         name: list.name,
         action: list.action,
+        url: list.url,
         entries: entry.set ? entry.meta?.entries ?? 0 : 0,
         dropped: entry.meta?.dropped ?? 0,
         fetchedAt: entry.meta?.fetchedAt ? new Date(entry.meta.fetchedAt).toISOString() : null,
@@ -90,6 +91,7 @@ export async function describeStoredLists(store, lists) {
     return {
       name: list.name,
       action: list.action,
+      url: list.url,
       entries: meta?.version ? meta.entries ?? 0 : 0,
       dropped: meta?.dropped ?? 0,
       fetchedAt: meta?.fetchedAt ? new Date(meta.fetchedAt).toISOString() : null,

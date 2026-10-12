@@ -626,7 +626,7 @@ test('status returns the live status of a workload, with router rules, statistic
   assert.deepEqual(status.router, { version: '0.11.0', build: 'abc' });
   assert.deepEqual(status.noWakeRules.map((r) => [r.name, r.level]), [['e2e', 'router']]);
   assert.deepEqual(status.stats.total.ignored, { HEAD: 2 });
-  assert.deepEqual(status.ipLists.map((l) => [l.name, l.entries]), [['ipsum', 42]]);
+  assert.deepEqual(status.ipLists.map((l) => [l.name, l.entries, l.url]), [['ipsum', 42, 'https://x']]);
 });
 
 test('status of an unknown workload is an error', async () => {

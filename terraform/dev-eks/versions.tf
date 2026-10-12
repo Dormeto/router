@@ -13,6 +13,11 @@ terraform {
       source  = "hashicorp/archive"
       version = "~> 2.8"
     }
+    # The eks-access module's provider; its manifests are not used here (apply_manifest = false).
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 2.38"
+    }
   }
 
   backend "s3" {

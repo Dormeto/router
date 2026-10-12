@@ -1,0 +1,4 @@
+apiVersion: v2
+name: dormeto-access
+description: The rights of the group dormeto:router, as Dormeto publishes them (kubernetes/dormeto-router.yaml), applied as given (dev-eks).
+version: 0.1.0

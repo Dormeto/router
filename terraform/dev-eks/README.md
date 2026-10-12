@@ -17,6 +17,10 @@ onboards them; `dormeto-e2e` runs its acceptance.
   destroyed after.
 - **Access:** the user's SSO role has cluster admin through an access entry (`admin_role_arn`):
   `aws eks update-kubeconfig --name eks-demo --region eu-west-1 --profile kloudy-dormeto-prd`.
+- **Dormeto's access** (`dormeto.tf`), as a customer whose router is written in Terraform adds it: the roles of `dmt-dev`
+  (`router/terraform/dev`, the router of this account and region) in the group `dormeto:router` and `DmtDiscoveryRole`
+  with the view policy (module `eks-access`), and that group's rights as Dormeto publishes them
+  (`kubernetes/dormeto-router.yaml`, through a local chart). `-var dormeto_router=null` leaves them out.
 
 **Needs** the AWS CLI and kubectl on the caller's PATH: before the charts, the root waits until every API server
 enforces the caller's admin access (EKS takes some seconds, each API server on its own); its destroy-time waits use the

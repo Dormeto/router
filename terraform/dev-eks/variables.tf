@@ -59,3 +59,9 @@ variable "spike" {
   type        = bool
   default     = false
 }
+
+variable "dormeto_router" {
+  description = "The Terraform router (router/terraform/dev) whose roles get access entries in the group dormeto:router, with DmtDiscoveryRole's and the group's rights; null: none (a router the manager installs makes its own entries)."
+  type        = string
+  default     = "dmt-dev"
+}

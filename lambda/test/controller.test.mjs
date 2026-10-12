@@ -1388,3 +1388,54 @@ test('clusterCheck: rights an EKS access policy gives (a review that cannot list
   assert.deepEqual(asked.find((a) => a.resource === 'deployments' && a.subresource === 'scale' && a.verb === 'patch'), { namespace: 'demo', verb: 'patch', group: 'apps', resource: 'deployments', subresource: 'scale' });
   assert.equal(asked.find((a) => a.resource === 'nodes').namespace, undefined, 'nodes belong to no namespace');
 });
+
+// Drift (vision docs/specs/2026-10-11-kubernetes-design.md, section 8): Kubernetes changes do not reach CloudTrail, the
+// check sees them.
+const drift = (s) => (s.store.state.drift ?? []).map((e) => [e.kind, e.detail]);
+
+test('GitOps resetting the replicas while asleep: the check marks the workload awake and reports the drift, no visitor\'s wake counted (review focus 3)', async () => {
+  const napBackends = JSON.stringify([{ kind: 'k8s', id: 'eks-demo/demo/Deployment/web', cluster: 'eks-demo', namespace: 'demo', owner: { kind: 'Deployment', name: 'web' }, replicas: 2, keda: null }]);
+  const s = k8sSetup({ state: STATES.ASLEEP, napBackends, wakeCount: 4 });
+  s.elbv2.state.healthy = 2;
+  await s.handler({ action: 'check' });
+  assert.equal(s.store.state.run.state, STATES.AWAKE);
+  assert.equal(s.store.state.run.wakeCount, 4);
+  assert.deepEqual(drift(s), [['replicas set while asleep', 'Deployment demo/web runs 2 replicas, set outside Dormeto (a GitOps tool resetting spec.replicas?)']]);
+});
+
+test('Dormeto\'s Ingress deleted: the check reports it and applies it again', async () => {
+  const s = groupedSetup({ state: STATES.AWAKE, awakeSince: s0() });
+  s.k8s.state.ingresses = s.k8s.state.ingresses.filter((i) => i.metadata.name !== 'dormeto-demo');
+  s.elbv2.state.rules.delete('arn:rule/dormeto');
+  await s.handler({ action: 'check' });
+  assert.deepEqual(drift(s), [['Dormeto Ingress re-applied', 'Dormeto\'s Ingress demo/dormeto-demo is missing']]);
+  const ours = s.k8s.state.ingresses.find((i) => i.metadata.name === 'dormeto-demo');
+  assert.equal(JSON.parse(ours.metadata.annotations[`${ALB}actions.dormeto`]).forwardConfig.targetGroups[0].weight, 1);
+});
+
+test('a target group annotation the customer changed: the check reports it and copies it again into Dormeto\'s Ingress', async () => {
+  const s = groupedSetup({ state: STATES.AWAKE, awakeSince: s0() });
+  s.k8s.state.ingresses.find((i) => i.metadata.name === 'web').metadata.annotations[`${ALB}healthcheck-path`] = '/ready';
+  await s.handler({ action: 'check' });
+  assert.deepEqual(drift(s), [['Dormeto Ingress re-applied', `Dormeto's Ingress demo/dormeto-demo differs: ${ALB}healthcheck-path`]]);
+  assert.equal(s.k8s.state.ingresses.find((i) => i.metadata.name === 'dormeto-demo').metadata.annotations[`${ALB}healthcheck-path`], '/ready');
+  // Applied: the next check finds nothing.
+  await s.handler({ action: 'check' });
+  assert.equal(drift(s).length, 1);
+});
+
+test('a patched lone Ingress reverted (GitOps): the check reports it and patches it again', async () => {
+  const cfg = k8sConfig({ switch: 'patched-ingress', owner: { kind: 'Deployment', name: 'web' }, ingress: { name: 'web', ruleIndex: 1, service: { name: 'web', port: { number: 80 } } } });
+  const lone = k8sCustomerIngress();
+  delete lone.metadata.annotations[`${ALB}group.name`];
+  const k8s = fakeKubernetes({ owners: [k8sOwner('web', { replicas: 2 })], pods: [k8sPod('web-1', { ip: '10.0.1.1' })], ingresses: [lone] });
+  const s = setup({ run: { state: STATES.AWAKE, awakeSince: s0() }, cfg, k8s });
+  s.elbv2.state.rules.get(cfg.ruleArn).tags = {};
+  s.elbv2.state.targets = [{ Id: '10.0.1.1', State: 'healthy' }];
+  await s.handler({ action: 'check' });
+  assert.deepEqual(drift(s), [['Ingress patch re-applied', 'the actions annotation of Ingress demo/web is missing (reverted?)']]);
+  const web = k8s.state.ingresses[0];
+  assert.equal(web.spec.rules[1].http.paths[0].backend.service.name, 'dormeto');
+  assert.ok(web.metadata.annotations[`${ALB}actions.dormeto`]);
+});
+const s0 = () => fakeClock().now() - 60_000;

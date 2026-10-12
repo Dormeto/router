@@ -104,6 +104,46 @@ function differs(existing, desired) {
     || (desired.spec.ingressClassName !== undefined && desired.spec.ingressClassName !== existing.spec?.ingressClassName);
 }
 
+// The parts of Dormeto's Ingress that are not what they should be, the weights aside (the route's).
+function changedParts(existing, desired) {
+  const labels = existing.metadata?.labels ?? {};
+  const ours = (annotations) => Object.fromEntries(Object.entries(annotations ?? {}).filter(([key]) => (key.startsWith(ALB) || key === CLASS) && key !== ACTION));
+  const [have, want] = [ours(existing.metadata?.annotations), ours(desired.metadata.annotations)];
+  return [
+    ...(Object.entries(desired.metadata.labels).some(([key, value]) => labels[key] !== value) ? ['labels'] : []),
+    ...[...new Set([...Object.keys(want), ...Object.keys(have)])].sort().filter((key) => have[key] !== want[key]),
+    ...(same(existing.spec?.rules, desired.spec.rules) ? [] : ['rules']),
+    ...(desired.spec.ingressClassName !== undefined && desired.spec.ingressClassName !== existing.spec?.ingressClassName ? ['ingressClassName'] : []),
+  ];
+}
+
+// What changed in the objects that switch a workload, the weights aside (vision docs/specs/2026-10-11-kubernetes-design.md,
+// section 8): Dormeto's Ingress missing or no longer what it should be (the customer's target group annotations, rule or
+// group changed since), or the patch of the customer's lone Ingress reverted. None when the customer's Ingress cannot be
+// read or no longer leads to the Service (the rules' issues say so).
+export async function ingressDrift(ports, cfg, target) {
+  const { cluster, namespace, ingress } = cfg.kubernetes;
+  const k8s = await ports.kubernetesOf(cluster);
+  const customer = await getOrNull(k8s, ingressPath(namespace, ingress.name));
+  if (!customer) return [];
+  const ref = { namespace, name: ingress.name };
+  if (cfg.kubernetes.switch === 'patched-ingress') {
+    if (customer.metadata?.annotations?.[ACTION] === undefined) return [`the actions annotation of ${where(ref)} is missing (reverted?)`];
+    const paths = customer.spec?.rules?.[ingress.ruleIndex]?.http?.paths ?? [];
+    return paths.some((p) => leadsTo(p.backend, ingress.service)) ? [`rule ${ingress.ruleIndex} of ${where(ref)} leads to Service ${ingress.service.name} again (reverted?)`] : [];
+  }
+  let desired;
+  try {
+    desired = dormetoIngress(cfg, weightsOf(target), customer);
+  } catch {
+    return [];
+  }
+  const existing = await getOrNull(k8s, ingressPath(namespace, desired.metadata.name));
+  if (!existing) return [`Dormeto's Ingress ${namespace}/${desired.metadata.name} is missing`];
+  const changed = changedParts(existing, desired);
+  return changed.length ? [`Dormeto's Ingress ${namespace}/${desired.metadata.name} differs: ${changed.join(', ')}`] : [];
+}
+
 // The controller's latest warnings on the Ingress, the reason of a switch it did not apply.
 async function latestEvents(ports, cfg, ref) {
   try {

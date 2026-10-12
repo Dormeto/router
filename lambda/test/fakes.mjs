@@ -85,6 +85,7 @@ export function fakeStore({ config, run, clock }) {
     },
     async getPauses(workloadId) { return structuredClone(state.pauses.filter((p) => p.workloadId === workloadId)); },
     async listDrift(id, limit = 10) { return structuredClone((state.drift ?? []).filter((e) => e.workloadId === id).slice(-limit).reverse()); },
+    async putDrift(id, event) { (state.drift ??= []).push({ workloadId: id, ...structuredClone(event) }); },
     async listPauses() { return structuredClone(state.pauses); },
     async deletePause(workloadId, { exclusionId, at } = {}) {
       const found = state.pauses.find(samePause(workloadId, exclusionId));

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { STATES } from './state.mjs';
 import { checkName } from './names.mjs';
 import { currentTarget, hostOf, setRoute } from './route.mjs';
-import { dormetoTargetGroup, routeIngress } from './kube-route.mjs';
+import { dormetoTargetGroup, ingressDrift, routeIngress } from './kube-route.mjs';
 import { checkRights } from './kube-access.mjs';
 import { resolveRules } from './rules.mjs';
 import { healthyCount, waitTargetsReleased } from './instances.mjs';
@@ -303,6 +303,13 @@ export function createController({
     return serving === cfg.appTargetGroupArn ? [] : [serving.split(':').at(-1)];
   };
 
+  // A drift event the check found (R4c's drift events; the onboarder records its own repairs).
+  async function recordDrift(workloadId, kind, detail) {
+    log.warn('DriftFound', { workloadId, kind, detail });
+    await store.putDrift?.(workloadId, { at: new Date(now()).toISOString(), by: 'check', kind, detail })
+      .catch((err) => log.warn('DriftUnrecorded', { workloadId, error: err.message }));
+  }
+
   // ctx (an idle check): its rules snapshot (what it compares; anything it changes is read again) and its clients.
   async function reconcile(cfg, ctx = null) {
     const { workloadId } = cfg;
@@ -350,6 +357,10 @@ export function createController({
     const from = run.state;
     if (from !== STATES.AWAKE && all('running') && (await healthyCount(elbv2, cfg.appTargetGroupArn)) >= 1) {
       log.warn(from === STATES.FAILED ? 'FailedRecovered' : 'ExternalWake', { workloadId });
+      // GitOps resetting replicas behind the waker's back (section 8 of the Kubernetes design): drift, not a visitor's wake.
+      for (const b of from === STATES.ASLEEP ? primaries.filter((p) => p.kind === 'k8s') : []) {
+        await recordDrift(workloadId, 'replicas set while asleep', `${b.owner.kind} ${b.namespace}/${b.owner.name} runs ${b.replicas} replicas, set outside Dormeto (a GitOps tool resetting spec.replicas?)`);
+      }
       if (run.napBackends) await resumeBackends(clients, JSON.parse(run.napBackends));
       else await startCompanions(clients, companions);
       await routeTo(cfg, 'app');
@@ -377,6 +388,15 @@ export function createController({
     // A FAILED workload stays behind the waker, so that requests retry the wake.
     const expected = run.state === STATES.AWAKE ? 'app' : [STATES.ASLEEP, STATES.FAILED].includes(run.state) ? 'waker' : null;
     if (expected) {
+      // Kubernetes changes do not reach CloudTrail: the check sees what drifted in the switching Ingress; the route repair
+      // below applies it again.
+      if (kubeRouted(cfg)) {
+        const changed = await ingressDrift({ kubernetesOf }, cfg, expected).catch((err) => {
+          log.warn('IngressDriftUnread', { workloadId, error: err.message });
+          return [];
+        });
+        for (const reason of changed) await recordDrift(workloadId, cfg.kubernetes.switch === 'ingress' ? 'Dormeto Ingress re-applied' : 'Ingress patch re-applied', reason);
+      }
       let found = ctx?.rules?.get(workloadId) ?? (await rulesFor(cfg));
       // A workload the manager onboarded: the onboarder re-applies what drifted (a shadow deleted, a new customer rule) and
       // removes the orphan shadows; a failure is retried at the next check, never stopping this one.

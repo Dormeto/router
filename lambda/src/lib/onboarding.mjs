@@ -75,35 +75,48 @@ export function planRules(rows, { targetGroupArn, wakerArn, workloadId }) {
       plans.push({ row, action: 'instrumented' });
       continue;
     }
+    // A free priority before the rule: the rules of the workload in between forward to the same targets, a foreign one
+    // stops the search.
+    const slotBefore = () => {
+      for (let q = priority(row) - 1; q >= 1; q -= 1) {
+        const occupant = taken.get(q);
+        if (!occupant) return q;
+        if (occupant !== 'planned' && !sameWorkload(occupant) && !ours(occupant)) return null;
+      }
+      return null;
+    };
     if (shadow) {
-      const before = priority(shadow) < priority(row);
-      plans.push({ row, shadow, action: before && sameConditions(shadow.rule.Conditions, row.rule.Conditions) ? 'shadowed' : 'mirror' });
+      const same = sameConditions(shadow.rule.Conditions, row.rule.Conditions);
+      if (priority(shadow) < priority(row)) {
+        plans.push({ row, shadow, action: same ? 'shadowed' : 'mirror' });
+        continue;
+      }
+      const slot = slotBefore();
+      if (slot !== null) taken.set(slot, 'planned');
+      plans.push({ row, shadow, action: 'move', priority: slot, mirror: !same });
       continue;
     }
     if (!forwardOnly(row.rule)) {
       plans.push({ row, action: 'in place', reason: 'actions before the forward' });
       continue;
     }
-    let slot = null;
-    for (let q = priority(row) - 1; q >= 1; q -= 1) {
-      const occupant = taken.get(q);
-      if (!occupant) {
-        slot = q;
-        break;
-      }
-      if (occupant !== 'planned' && !sameWorkload(occupant) && !ours(occupant)) break;
-    }
+    const slot = slotBefore();
     if (slot === null) plans.push({ row, action: 'in place', reason: 'no free priority before it' });
     else {
       taken.set(slot, 'planned');
       plans.push({ row, action: 'shadow', priority: slot });
     }
   }
+  // Shadows of rules gone (deleted, or no longer forwarding to the target group).
+  for (const row of rows.filter((r) => r.tags?.[SHADOWS_TAG] && ours(r) && !customers.some((c) => c.rule.RuleArn === r.tags[SHADOWS_TAG]))) {
+    plans.push({ row, action: 'orphan' });
+  }
   return plans;
 }
 
-const planText = (p) => ({ shadowed: 'shadowed', instrumented: 'instrumented', mirror: 'shadowed (conditions to mirror)', shadow: `shadow at ${p.priority}` })[p.action]
-  ?? `instrument in place (${p.reason})`;
+const planText = (p) => ({
+  shadowed: 'shadowed', instrumented: 'instrumented', mirror: 'shadowed (conditions to mirror)', move: 'shadowed (shadow to move before it)', shadow: `shadow at ${p.priority}`,
+})[p.action] ?? `instrument in place (${p.reason})`;
 
 export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, store, router, now = Date.now, log }) {
   const wakerName = (workloadId) => `${router.name}-${workloadId}`;
@@ -337,7 +350,7 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
       } else step('workload configuration', false);
 
       const applied = await applyRules({ ...group, LoadBalancerArns: [checked.loadBalancerArn] }, workloadId, waker.TargetGroupArn, { app: 1, waker: 0 });
-      step('instrument rules', applied.length > 0, applied.join(', '));
+      step('instrument rules', applied.length > 0, applied.map((a) => a.detail).join(', '));
       log.info('Onboarded', { workloadId, targetGroupArn, by, steps: steps.filter((s) => s.status === 'done').map((s) => s.name) });
       return { steps, workload: { workloadId, wakerTargetGroupArn: waker.TargetGroupArn } };
     } catch (err) {
@@ -350,15 +363,16 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
     }
   }
 
-  // Shadows to create or mirror, rules to instrument in place: what changed, as text. `weights` follow the workload's
-  // state (a shadow created while it sleeps sends to the waker).
+  // Shadows to create, mirror, move or remove, rules to instrument in place: what changed, as { kind, detail }. `weights`
+  // follow the workload's state (a shadow created while it sleeps sends to the waker).
   async function applyRules(group, workloadId, wakerArn, weights) {
     const changed = [];
+    const change = (kind, detail) => changed.push({ kind, detail });
     const rows = await listenerRows(group);
     for (const plan of planRules(rows, { targetGroupArn: group.TargetGroupArn, wakerArn, workloadId })) {
       const { rule } = plan.row;
       if (plan.action === 'shadow') {
-        changed.push(`shadow of rule ${rule.Priority} at ${plan.priority}`);
+        change('shadow created', `shadow of rule ${rule.Priority} at ${plan.priority}`);
         await elbv2.createRule({
           ListenerArn: plan.row.listener.ListenerArn, Priority: plan.priority, Conditions: cleanConditions(rule.Conditions),
           Actions: [{ Type: 'forward', ForwardConfig: {
@@ -367,19 +381,79 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
           } }],
           Tags: [{ Key: WORKLOAD_TAG, Value: workloadId }, { Key: SHADOWS_TAG, Value: rule.RuleArn }],
         });
-      } else if (plan.action === 'mirror') {
-        changed.push(`conditions of the shadow of rule ${rule.Priority}`);
+      } else if (plan.action === 'mirror' || (plan.action === 'move' && plan.mirror)) {
+        change('shadow conditions mirrored', `shadow of rule ${rule.Priority}: ${conditionsOf(rule)}`);
         await elbv2.modifyRule({ RuleArn: plan.shadow.rule.RuleArn, Conditions: cleanConditions(rule.Conditions) });
+      }
+      if (plan.action === 'move') {
+        if (plan.priority === null) throw new Error(`no free priority before rule ${rule.Priority} for its shadow`);
+        change('shadow moved', `shadow of rule ${rule.Priority} from ${plan.shadow.rule.Priority} to ${plan.priority}`);
+        await elbv2.setRulePriorities({ RulePriorities: [{ RuleArn: plan.shadow.rule.RuleArn, Priority: plan.priority }] });
+      } else if (plan.action === 'orphan') {
+        change('shadow removed', `shadow at ${rule.Priority}: its rule is gone`);
+        await elbv2.deleteRule({ RuleArn: rule.RuleArn });
       } else if (plan.action === 'in place') {
-        changed.push(`rule ${rule.Priority} in place`);
+        change('rule instrumented in place', `rule ${rule.Priority} (${plan.reason})`);
         await elbv2.modifyRule({ RuleArn: rule.RuleArn, Actions: instrumentedActions(rule.Actions, group.TargetGroupArn, wakerArn, weights) });
         await elbv2.addTags({ ResourceArns: [rule.RuleArn], Tags: [{ Key: WORKLOAD_TAG, Value: workloadId }] });
       } else if (plan.action === 'instrumented' && plan.row.tags[WORKLOAD_TAG] !== workloadId) {
-        changed.push(`tag of rule ${rule.Priority}`);
+        change('rule tag restored', `rule ${rule.Priority}`);
         await elbv2.addTags({ ResourceArns: [rule.RuleArn], Tags: [{ Key: WORKLOAD_TAG, Value: workloadId }] });
       }
     }
     return changed;
+  }
+
+  // Current tags of a backend recorded at onboarding, null when it is gone.
+  async function currentTags(b) {
+    try {
+      if (b.kind === 'instance') {
+        const { Reservations = [] } = await ec2.describeInstances({ InstanceIds: [b.id] });
+        const instance = Reservations.flatMap((r) => r.Instances ?? [])[0];
+        return instance ? tagsOf(instance.Tags) : null;
+      }
+      if (b.kind === 'asg') {
+        const { AutoScalingGroups: [g] = [] } = await autoscaling.describeAutoScalingGroups({ AutoScalingGroupNames: [b.id] });
+        return g ? tagsOf(g.Tags) : null;
+      }
+      if (b.kind === 'ecs') {
+        const cluster = b.id.split(':service/')[1]?.split('/')[0];
+        const { services: [svc] = [] } = await ecs.describeServices({ cluster, services: [b.id], include: ['TAGS'] });
+        return svc ? tagsOf(svc.tags, 'key', 'value') : null;
+      }
+      const [db] = await databasesOf([{ kind: b.kind, id: b.id }], { skipMissing: true });
+      return db ? db.tags : null;
+    } catch (err) {
+      if (notFound(err, 'InvalidInstanceID.NotFound', 'ServiceNotFoundException', 'ClusterNotFoundException')) return null;
+      throw err;
+    }
+  }
+
+  // Re-apply what drifted (R4c): rules and shadows, backend tags, the waker target group; each repair is a drift event.
+  async function repair({ workloadId, by = 'check' }) {
+    const cfg = await store.getConfig(workloadId);
+    if (!cfg?.source) return { repaired: [], skipped: 'not onboarded by the manager' };
+    if ((await store.getPauses(workloadId)).some((p) => p.reason === 'offboarding')) return { repaired: [], skipped: 'being offboarded' };
+    const run = await store.getRun(workloadId);
+    const events = [];
+    for (const b of cfg.tagged ?? []) {
+      const tags = await currentTags(b);
+      if (tags && tags[WORKLOAD_TAG] !== workloadId) {
+        await tag(b, workloadId);
+        events.push({ kind: 'backend tag restored', detail: `${KIND_TEXT[b.kind]} ${b.id}` });
+      }
+    }
+    const waker = await wakerGroup(workloadId);
+    const group = await targetGroup(cfg.appTargetGroupArn);
+    if (waker?.ours && group) {
+      // Asleep, failed or between: the instrumentation sends to the waker; awake, to the application.
+      const weights = run?.state === 'AWAKE' ? { app: 1, waker: 0 } : { app: 0, waker: 1 };
+      events.push(...await applyRules(group, workloadId, waker.TargetGroupArn, weights));
+    }
+    const at = new Date(now()).toISOString();
+    for (const e of events) await store.putDrift(workloadId, { at, by, ...e });
+    if (events.length) log.warn('DriftRepaired', { workloadId, by, repaired: events.map((e) => `${e.kind}: ${e.detail}`) });
+    return { repaired: events };
   }
 
   // Remove the instrumentation, step by step, each step going on whatever the others did: rules first (traffic stays on
@@ -474,5 +548,15 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
     return { steps };
   }
 
-  return { preview, onboard, offboard };
+  // A CloudTrail event (EventBridge) on rules, target groups or tags: repair every workload the manager onboarded.
+  async function repairAll({ by }) {
+    const workloads = [];
+    for (const cfg of (await store.listConfigs()).filter((c) => c.source)) {
+      const { repaired } = await repair({ workloadId: cfg.workloadId, by });
+      workloads.push({ workloadId: cfg.workloadId, repaired: repaired.map((e) => e.kind) });
+    }
+    return { workloads };
+  }
+
+  return { preview, onboard, offboard, repair, repairAll };
 }

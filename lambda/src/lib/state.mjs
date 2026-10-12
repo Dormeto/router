@@ -239,6 +239,30 @@ export function createStore({ dynamo, table, now = Date.now }) {
       }
     },
 
+    // Drift events (R4c): what the onboarder repaired, kept 90 days (WL#<id> / DRIFT#<at>#<n>).
+    async putDrift(workloadId, event) {
+      const expires = Math.floor(Date.parse(event.at) / 1000) + 90 * 86_400;
+      await dynamo.updateItem({
+        TableName: table,
+        Key: itemKey(workloadId, `DRIFT#${event.at}#${Math.random().toString(36).slice(2, 8)}`),
+        UpdateExpression: 'SET #event = :event, #exp = :exp',
+        ExpressionAttributeNames: { '#event': 'event', '#exp': 'expiresAt' },
+        ExpressionAttributeValues: { ':event': { S: JSON.stringify(event) }, ':exp': { N: String(expires) } },
+      });
+    },
+
+    async listDrift(workloadId, limit = 10) {
+      const { Items = [] } = await dynamo.query({
+        TableName: table,
+        KeyConditionExpression: '#pk = :pk AND begins_with(#sk, :prefix)',
+        ExpressionAttributeNames: { '#pk': 'pk', '#sk': 'sk' },
+        ExpressionAttributeValues: { ':pk': { S: `WL#${workloadId}` }, ':prefix': { S: 'DRIFT#' } },
+        ScanIndexForward: false,
+        Limit: limit,
+      });
+      return Items.map((item) => JSON.parse(item.event.S));
+    },
+
     // Pauses (router management): one JSON attribute, and its time for a deletion that must not remove a newer pause.
     async putPause(workloadId, pause) {
       await dynamo.updateItem({

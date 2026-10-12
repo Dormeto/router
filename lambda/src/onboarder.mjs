@@ -27,10 +27,13 @@ const onboarding = createOnboarding({
 });
 
 export async function handler(event) {
+  // CloudTrail events forwarded by the router's EventBridge rule (drift of what onboarding added).
+  if (event?.['detail-type'] === 'AWS API Call via CloudTrail') return onboarding.repairAll({ by: `event:${event.detail?.eventName ?? 'unknown'}` });
   switch (event?.action) {
     case 'preview': return onboarding.preview(event);
     case 'onboard': return onboarding.onboard(event);
     case 'offboard': return onboarding.offboard(event);
+    case 'repair': return onboarding.repair(event);
     default: throw new Error(`unknown action: ${event?.action}`);
   }
 }

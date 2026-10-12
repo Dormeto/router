@@ -285,6 +285,8 @@ export function fakeAccount() {
       return true;
     },
     async deleteWorkload(id) { call('deleteWorkload'); for (const k of [...items.keys()]) if (k.startsWith(`${id}/`)) items.delete(k); },
+    async putDrift(id, event) { call('putDrift'); items.set(`${id}/DRIFT#${event.at}#${items.size}`, structuredClone(event)); },
+    async listDrift(id) { return [...items].filter(([k]) => k.startsWith(`${id}/DRIFT#`)).map(([, v]) => structuredClone(v)).reverse(); },
     async putPause(id, pause) { call('putPause'); items.set(`${id}/PAUSE${pause.exclusionId ? `#${pause.exclusionId}` : ''}`, structuredClone(pause)); },
     async getPauses(id) { return [...items].filter(([k]) => k.startsWith(`${id}/PAUSE`)).map(([, v]) => structuredClone(v)); },
   };

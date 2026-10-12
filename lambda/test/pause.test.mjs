@@ -222,3 +222,33 @@ test('status shows a customer rule covered by a shadow as shadowed, with the sha
   assert.deepEqual([customer.route, customer.shadowedBy], ['shadowed', '39']);
   assert.equal(status.rules.find((r) => r.arn === 'arn:rule/shadow').route, 'waker');
 });
+
+test('the idle check asks the onboarder to repair a manager workload with a repairable rule issue, never a Terraform one', async () => {
+  for (const source of ['manager', undefined]) {
+    const s = setup({ run: { state: STATES.AWAKE, awakeSince: 1 } });
+    const repairs = [];
+    const handler = createController({
+      store: s.store, ec2: fakeEc2(s.cfg.instanceIds), elbv2: s.elbv2, cloudwatch: fakeCloudWatch([1]), autoscaling: fakeAutoScaling(), ecs: fakeEcs(), tagging: fakeTagging(fakeEcs()), appscaling: fakeAppScaling(),
+      invokeSelf: async () => {}, invokeOnboarder: async (payload) => { repairs.push(payload); }, now: s.clock.now, sleep: s.clock.sleep, log: { info() {}, warn() {}, error() {} },
+    });
+    s.store.getConfig = async () => ({ ...s.cfg, ...(source ? { source } : {}) });
+    s.store.listConfigs = async () => [{ ...s.cfg, ...(source ? { source } : {}) }];
+    const appOnly = [{ Type: 'forward', Order: 1, ForwardConfig: { TargetGroups: [{ TargetGroupArn: s.cfg.appTargetGroupArn, Weight: 1 }] } }];
+    s.elbv2.state.rules.set('arn:rule/new', { actions: appOnly, priority: '30', tags: {} });
+    await handler({ action: 'check' });
+    assert.deepEqual(repairs, source ? [{ action: 'repair', workloadId: 'demo', by: 'check' }] : [], String(source));
+  }
+});
+
+test('status lists the latest drift repairs, and the router health counts those of the last 24 hours', async () => {
+  const s = setup({ run: { state: STATES.AWAKE } });
+  s.store.state.drift = [
+    { workloadId: 'demo', at: new Date(s.clock.now() - 30 * HOUR).toISOString(), kind: 'backend tag restored', by: 'event' },
+    { workloadId: 'demo', at: new Date(s.clock.now() - HOUR).toISOString(), kind: 'shadow created', by: 'check' },
+  ];
+  const status = await s.handler({ action: 'status', workloadId: 'demo' });
+  assert.deepEqual(status.drift.map((e) => e.kind), ['shadow created', 'backend tag restored']);
+  const info = await s.handler({ action: 'router' });
+  assert.equal(info.health.drift24h, 1);
+  assert.ok(info.health.problems.some((p) => p.text === '1 drift repair in 24 hours: infrastructure as code changed what onboarding added (see the workloads)'));
+});

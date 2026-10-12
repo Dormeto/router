@@ -281,3 +281,17 @@ test('store deletes every item of a workload but its statistics (they expire)', 
   assert.deepEqual(deleted, ['CFG', 'RUN', 'PAUSE', 'PAUSE#x1']);
   assert.deepEqual(dynamo.calls[0][1].ExpressionAttributeValues, { ':pk': { S: 'WL#shop' } });
 });
+
+test('store records drift events of a workload, kept 90 days, and lists the newest first', async () => {
+  const dynamo = fakeDynamo({ updateItem: async () => ({}), query: async () => ({ Items: [{ event: { S: '{"kind":"shadow created"}' } }] }) });
+  const store = createStore({ dynamo, table: 't', now: () => 1_000_000 });
+  await store.putDrift('shop', { at: '2026-10-05T12:00:00.000Z', kind: 'shadow created', by: 'event' });
+  assert.deepEqual(await store.listDrift('shop', 10), [{ kind: 'shadow created' }]);
+  const [[, put], [, query]] = dynamo.calls;
+  assert.equal(put.Key.pk.S, 'WL#shop');
+  assert.match(put.Key.sk.S, /^DRIFT#2026-10-05T12:00:00.000Z#/);
+  assert.deepEqual(put.ExpressionAttributeValues[':exp'], { N: String(Math.floor(Date.parse('2026-10-05T12:00:00.000Z') / 1000) + 90 * 86400) });
+  assert.equal(query.ScanIndexForward, false);
+  assert.equal(query.Limit, 10);
+  assert.deepEqual(query.ExpressionAttributeValues[':prefix'], { S: 'DRIFT#' });
+});

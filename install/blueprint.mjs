@@ -4,6 +4,8 @@
 // Terraform module (terraform/modules/router) stays the definition for development; test/blueprint.test.mjs keeps the
 // two IAM definitions equal.
 
+import driftPattern from './drift-pattern.json' with { type: 'json' };
+
 export const PLACEHOLDERS = {
   name: '${name}', region: '${region}', account: '${account}', partition: '${partition}', build: '${build}',
   checkSchedule: '${checkSchedule}', ipLists: '${ipLists}', noWakeRules: '${noWakeRules}', metrics: '${metrics}',
@@ -45,7 +47,7 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
       allow(['ecs:UpdateService'], [arn('ecs', 'service/*/*')], tagged),
       allow(['application-autoscaling:RegisterScalableTarget'], [arn('application-autoscaling', 'scalable-target/*')]),
       allow(['autoscaling:UpdateAutoScalingGroup', 'autoscaling:SuspendProcesses', 'autoscaling:ResumeProcesses'], [arn('autoscaling', 'autoScalingGroup:*:autoScalingGroupName/*')], tagged),
-      allow(['lambda:InvokeFunction'], [functionArn('controller')]),
+      allow(['lambda:InvokeFunction'], [functionArn('controller'), functionArn('onboarder')]),
       allow(['sqs:SendMessage'], [queueArn('controller-failures')]),
       allow(['sqs:GetQueueAttributes'], [queueArn('controller-failures'), queueArn('check-failures')]),
       allow(['logs:CreateLogStream', 'logs:PutLogEvents'], [logArn('controller')]),
@@ -100,6 +102,7 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
         environment: {
           ...common, DMT_IP_LISTS: p.ipLists, DMT_NO_WAKE_RULES: p.noWakeRules, DMT_CHECK_SCHEDULE: p.checkSchedule, DMT_METRICS: p.metrics,
           DMT_WAKER_FUNCTION: fn('waker'), DMT_FAILURE_QUEUES: `{"check":"${queueUrl('check-failures')}","controller":"${queueUrl('controller-failures')}"}`,
+          DMT_ONBOARDER: fn('onboarder'),
         },
         // Retries would duplicate wakes and naps; stale events are dropped; failures land in a queue.
         asyncInvoke: { maximumRetryAttempts: 0, maximumEventAgeInSeconds: 120, onFailure: queueArn('controller-failures') },
@@ -113,6 +116,11 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
         environment: { ...common, DMT_WAKER_FUNCTION: fn('waker'), DMT_WAKER_FUNCTION_ARN: functionArn('waker') },
       },
     ].map((f) => ({ ...f, roleArn: roleArn(f.key), runtime: 'nodejs24.x', architectures: ['arm64'] })),
+    // Drift repair: CloudTrail events on rules, target groups and workload tags, not caused by the router, to the onboarder.
+    eventRule: {
+      name: `${p.name}-drift`, pattern: JSON.stringify(driftPattern).replaceAll('${name}', p.name), target: functionArn('onboarder'),
+      description: 'Dormeto: rules, target groups and workload tags changed outside the router',
+    },
     schedule: {
       name: `${p.name}-check`, expression: p.checkSchedule, target: functionArn('controller'), roleArn: roleArn('scheduler'),
       input: '{"action":"check","source":"schedule"}', deadLetter: queueArn('check-failures'), maximumRetryAttempts: 0,

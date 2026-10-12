@@ -31,7 +31,7 @@ const REASON_MAX = 256;
 
 export function createController({
   store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, invokeSelf, now = Date.now, sleep, newId = randomUUID, log,
-  lists = null, router = {}, defaultRules = [], ipLists = [], sqs = null, lambda = null,
+  lists = null, router = {}, defaultRules = [], ipLists = [], sqs = null, lambda = null, invokeOnboarder = null,
 }) {
   const clients = { ec2, elbv2, autoscaling, ecs, tagging, appscaling, rds };
   let budgetEnd = Infinity;
@@ -242,6 +242,11 @@ export function createController({
     const expected = run.state === STATES.AWAKE ? 'app' : [STATES.ASLEEP, STATES.FAILED].includes(run.state) ? 'waker' : null;
     if (expected) {
       const found = await rulesFor(cfg);
+      // A workload the manager onboarded: the onboarder re-applies what drifted (a shadow deleted, a new customer rule).
+      if (cfg.source && invokeOnboarder && found.issues.some((i) => i.repairable)) {
+        await invokeOnboarder({ action: 'repair', workloadId, by: 'check' });
+        log.info('RepairRequested', { workloadId, issues: reasons(found.issues.filter((i) => i.repairable)) });
+      }
       // A rule the router cannot switch sends requests to the stopped backend: wake the workload (it is not napped again
       // until the rule is instrumented or removed). A target group without any rule has no such rule: no wake.
       const ruleIssues = found.issues.filter((i) => i.arn);
@@ -334,6 +339,7 @@ export function createController({
     const run = await store.getRun(workloadId);
     return status(workloadId, cfg, run ?? {}, {
       pauses: await pausesFor(workloadId),
+      drift: store.listDrift ? await store.listDrift(workloadId, 10).catch(() => []) : [],
       noWakeRules: describeRules([{ level: 'router', rules: defaultRules }, { level: 'workload', rules: cfg.noWakeRules }]),
       wakeRules: describeRules([{ level: 'wake', rules: cfg.wakeRules }]),
       loadStats: () => store.getStats(workloadId, STATS_DAYS),
@@ -570,6 +576,14 @@ export function createController({
       health.problems.push({ level: 'warning', text: `pauses unreadable: ${pausesError}` });
       if (health.status === 'ok') health.status = 'warning';
     }
+    // Repairs of the last 24 hours (R4c): the customer's infrastructure as code keeps changing what onboarding added.
+    const dayAgo = iso(t - 86_400_000);
+    const drift24h = (await Promise.all(configs.map((c) => (store.listDrift ? store.listDrift(c.workloadId, 50).catch(() => []) : []))))
+      .flat().filter((e) => e.at >= dayAgo).length;
+    if (drift24h) {
+      health.problems.push({ level: 'warning', text: `${drift24h} drift repair${drift24h === 1 ? '' : 's'} in 24 hours: infrastructure as code changed what onboarding added (see the workloads)` });
+      if (health.status === 'ok') health.status = 'warning';
+    }
     return {
       router: { name: router.name, version: router.version, build: router.build },
       configuration: {
@@ -593,6 +607,7 @@ export function createController({
         queues: measured.queues,
         ipLists: lists,
         concurrency,
+        drift24h,
       },
     };
   }

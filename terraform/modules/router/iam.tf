@@ -130,9 +130,9 @@ data "aws_iam_policy_document" "controller" {
     }
   }
   statement {
-    # The scheduled check fans naps out to the controller itself.
+    # The scheduled check fans naps out to the controller itself, and asks the onboarder to repair drift.
     actions   = ["lambda:InvokeFunction"]
-    resources = ["${local.arn_prefix}:lambda:${local.region}:${local.account_id}:function:${var.name}-controller"]
+    resources = ["${local.arn_prefix}:lambda:${local.region}:${local.account_id}:function:${var.name}-controller", "${local.arn_prefix}:lambda:${local.region}:${local.account_id}:function:${var.name}-onboarder"]
   }
   statement {
     actions   = ["sqs:SendMessage"]

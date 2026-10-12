@@ -44,6 +44,8 @@ export const handler = createController({
   log: logger,
   sqs: Object.values(queues).some(Boolean) ? createSqs() : null,
   lambda,
+  // Drift repair of the workloads the manager onboarded (R4c).
+  invokeOnboarder: process.env.DMT_ONBOARDER ? (payload) => lambda.invokeAsync(process.env.DMT_ONBOARDER, payload) : null,
   lists: lists.length ? createListRefresher({ store, lists, download, log: logger }) : null,
   // Manager interface: router identity, router no-wake rules and IP lists in the status, health and configuration.
   router: {

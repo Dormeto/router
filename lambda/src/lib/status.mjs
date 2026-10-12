@@ -21,7 +21,7 @@ const iso = (ms) => (typeof ms === 'number' && ms > 0 ? new Date(ms).toISOString
 export function createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, now = Date.now, version = {} }) {
   const clients = { ec2, elbv2, autoscaling, ecs, tagging, appscaling, rds };
   // Extras that depend on the caller: router rules, wake rules, statistics and IP lists loaders.
-  return async function status(workloadId, cfg, run, { pauses = [], noWakeRules = [], wakeRules = [], loadStats = null, loadLists = null } = {}) {
+  return async function status(workloadId, cfg, run, { pauses = [], drift = [], noWakeRules = [], wakeRules = [], loadStats = null, loadLists = null } = {}) {
     const t = now();
     const resolved = await resolveBackends(clients, cfg);
     const instanceIds = resolved.backends.filter((b) => b.kind === 'instance').map((b) => b.id);
@@ -40,6 +40,8 @@ export function createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging
       targetGroupArn: cfg.appTargetGroupArn,
       source: cfg.source ?? 'terraform',
       state: run.state,
+      // Latest drift repairs (R4c), newest first.
+      drift,
       updatedAt: iso(run.updatedAt),
       awakeSince: iso(run.awakeSince),
       wakeStartedAt: iso(run.wakeStartedAt),

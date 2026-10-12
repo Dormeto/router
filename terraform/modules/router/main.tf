@@ -81,6 +81,8 @@ resource "aws_lambda_function" "controller" {
       DMT_METRICS        = tostring(var.metrics_enabled)
       DMT_WAKER_FUNCTION = "${var.name}-waker"
       DMT_FAILURE_QUEUES = jsonencode({ check = aws_sqs_queue.check_failures.url, controller = aws_sqs_queue.controller_failures.url })
+      # Drift repair of the workloads the manager onboarded, requested by the idle check.
+      DMT_ONBOARDER = "${var.name}-onboarder"
     }
   }
 
@@ -200,4 +202,25 @@ resource "aws_sqs_queue" "check_failures" {
   name                      = "${var.name}-check-failures"
   message_retention_seconds = 1209600
   sqs_managed_sse_enabled   = true
+}
+
+# Drift repair (vision docs/specs/2026-10-05-onboarding-design.md, R4c): CloudTrail events on rules, target groups and the
+# dormeto:workload tags, not caused by the router itself, invoke the onboarder (pattern shared with the blueprint).
+resource "aws_cloudwatch_event_rule" "drift" {
+  name          = "${var.name}-drift"
+  description   = "Dormeto: rules, target groups and workload tags changed outside the router"
+  event_pattern = replace(file("${path.module}/../../../install/drift-pattern.json"), "$${name}", var.name)
+}
+
+resource "aws_cloudwatch_event_target" "drift" {
+  rule = aws_cloudwatch_event_rule.drift.name
+  arn  = aws_lambda_function.onboarder.arn
+}
+
+resource "aws_lambda_permission" "drift" {
+  statement_id  = "drift-events"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.onboarder.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.drift.arn
 }

@@ -97,3 +97,13 @@ test('the boundary covers the resources of installed routers only (dmtr-*), neve
   const permissions = routerBoundary().Statement.find((s) => [].concat(s.Action).includes('lambda:AddPermission'));
   assert.deepEqual([].concat(permissions.Resource), ['arn:${partition}:lambda:*:${account}:function:dmtr-*-waker']);
 });
+
+test('the blueprint routes drift events to the onboarder, ignoring the router\'s own calls', () => {
+  const b = fill(blueprint({ version: '0.19.0' }), VALUES);
+  assert.equal(b.eventRule.name, 'dmtr-dev-drift');
+  assert.equal(b.eventRule.target, 'arn:aws:lambda:eu-west-3:121014831971:function:dmtr-dev-onboarder');
+  const pattern = JSON.parse(b.eventRule.pattern);
+  assert.deepEqual(pattern['detail-type'], ['AWS API Call via CloudTrail']);
+  for (const branch of pattern.$or) assert.deepEqual(branch.detail.userIdentity.sessionContext.sessionIssuer.userName, [{ 'anything-but': { prefix: 'dmtr-dev-' } }]);
+  assert.equal(b.functions[0].environment.DMT_ONBOARDER, 'dmtr-dev-onboarder');
+});

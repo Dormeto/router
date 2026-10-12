@@ -333,3 +333,91 @@ test('shadows are found again by onboard, and a shadow placed after its rule sin
   await s.onboarding.onboard({ workloadId: 'shop', targetGroupArn: s.tg, by: 'ops' });
   assert.equal((await s.onboarding.preview({ workloadId: 'shop', targetGroupArn: s.tg })).rules.every((r) => r.action === 'shadowed'), true);
 });
+
+// --- Repair (R4c) -------------------------------------------------------------------------------------------------
+
+const onboarded = async () => {
+  const s = setup();
+  await s.onboarding.onboard({ workloadId: 'shop', targetGroupArn: s.tg, by: 'ops' });
+  s.a.state.calls.length = 0;
+  return s;
+};
+const kinds = (result) => result.repaired.map((e) => e.kind);
+
+test('repair finds nothing to do on an intact workload', async () => {
+  const s = await onboarded();
+  assert.deepEqual((await s.onboarding.repair({ workloadId: 'shop', by: 'check' })).repaired, []);
+  assert.ok(!s.a.state.calls.some((c) => /^(create|modify|delete|set|add|remove)/.test(c)), s.a.state.calls.join(', '));
+});
+
+test('repair recreates a shadow deleted by hand, and records the drift', async () => {
+  const s = await onboarded();
+  const [shadow] = shadowsOf(s.a).filter((x) => x.shadows === s.main);
+  s.a.state.rules.delete(shadow.arn);
+  const result = await s.onboarding.repair({ workloadId: 'shop', by: 'event' });
+  assert.deepEqual(kinds(result), ['shadow created']);
+  assert.equal(shadowsOf(s.a).filter((x) => x.shadows === s.main).length, 1);
+  assert.deepEqual((await s.a.store.listDrift('shop')).map((e) => [e.kind, e.by]), [['shadow created', 'event']]);
+});
+
+test('repair mirrors conditions the customer changed, and moves a shadow placed after its rule', async () => {
+  const s = await onboarded();
+  await s.a.elbv2.modifyRuleConditions(s.main, [{ Field: 'host-header', Values: ['www.example.com'], HostHeaderConfig: { Values: ['www.example.com'] } }]);
+  const statics = shadowsOf(s.a).find((x) => x.shadows === s.statics);
+  s.a.state.rules.get(statics.arn).priority = '12';
+  const result = await s.onboarding.repair({ workloadId: 'shop', by: 'event' });
+  assert.deepEqual(kinds(result).sort(), ['shadow conditions mirrored', 'shadow moved']);
+  const main = shadowsOf(s.a).find((x) => x.shadows === s.main);
+  assert.deepEqual(main.conditions, [{ Field: 'host-header', HostHeaderConfig: { Values: ['www.example.com'] } }]);
+  assert.ok(Number(shadowsOf(s.a).find((x) => x.shadows === s.statics).priority) < 11);
+});
+
+test('repair deletes the shadow of a customer rule deleted since, and shadows a new customer rule', async () => {
+  const s = await onboarded();
+  s.a.state.rules.delete(s.statics);
+  const added = s.a.customer.rule(20, s.tg, { host: 'api.example.com' });
+  const result = await s.onboarding.repair({ workloadId: 'shop', by: 'event' });
+  assert.deepEqual(kinds(result).sort(), ['shadow created', 'shadow removed']);
+  assert.deepEqual(shadowsOf(s.a).map((x) => x.shadows).sort(), [added, s.main].sort());
+});
+
+test('a shadow created while the workload sleeps sends to the waker', async () => {
+  const s = await onboarded();
+  s.a.items.get('shop/RUN').state = 'ASLEEP';
+  const added = s.a.customer.rule(20, s.tg, { host: 'api.example.com' });
+  await s.onboarding.repair({ workloadId: 'shop', by: 'check' });
+  assert.deepEqual(shadowsOf(s.a).find((x) => x.shadows === added).weights, [['shop-app', 0], ['dmt-dev-shop', 1]]);
+});
+
+test('repair restores a backend tag the customer removed', async () => {
+  const s = await onboarded();
+  delete s.a.state.instances.get('i-0aaa').tags[WORKLOAD];
+  const result = await s.onboarding.repair({ workloadId: 'shop', by: 'event' });
+  assert.deepEqual(kinds(result), ['backend tag restored']);
+  assert.equal(s.a.state.instances.get('i-0aaa').tags[WORKLOAD], 'shop');
+});
+
+test('repair leaves alone a workload written in Terraform', async () => {
+  const s = await onboarded();
+  delete s.a.items.get('shop/CFG').source;
+  s.a.state.rules.clear();
+  assert.deepEqual(await s.onboarding.repair({ workloadId: 'shop', by: 'check' }), { repaired: [], skipped: 'not onboarded by the manager' });
+});
+
+test('a CloudTrail event repairs every workload the manager onboarded, never one written in Terraform', async () => {
+  const s = await onboarded();
+  s.a.items.set('legacy/CFG', { workloadId: 'legacy', appTargetGroupArn: 'arn:tg/legacy' });
+  const [shadow] = shadowsOf(s.a);
+  s.a.state.rules.delete(shadow.arn);
+  const result = await s.onboarding.repairAll({ by: 'event:DeleteRule' });
+  assert.deepEqual(result, { workloads: [{ workloadId: 'shop', repaired: ['shadow created'] }] });
+  assert.deepEqual((await s.a.store.listDrift('shop')).map((e) => e.by), ['event:DeleteRule']);
+});
+
+test('repair leaves alone a workload being offboarded (its tag removals must not be undone)', async () => {
+  const s = await onboarded();
+  await s.a.store.putPause('shop', { by: 'ops', at: 1, reason: 'offboarding', keepAsleep: true });
+  delete s.a.state.instances.get('i-0aaa').tags[WORKLOAD];
+  assert.deepEqual(await s.onboarding.repair({ workloadId: 'shop', by: 'event' }), { repaired: [], skipped: 'being offboarded' });
+  assert.equal(s.a.state.instances.get('i-0aaa').tags[WORKLOAD], undefined);
+});

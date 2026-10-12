@@ -1,0 +1,44 @@
+{
+  "detail-type": ["AWS API Call via CloudTrail"],
+  "$or": [
+    {
+      "source": ["aws.elasticloadbalancing"],
+      "detail": {
+        "eventName": ["ModifyRule", "CreateRule", "DeleteRule", "SetRulePriorities", "DeleteTargetGroup"],
+        "userIdentity": { "sessionContext": { "sessionIssuer": { "userName": [{ "anything-but": { "prefix": "${name}-" } }] } } }
+      }
+    },
+    {
+      "source": ["aws.elasticloadbalancing"],
+      "detail": {
+        "eventName": ["RemoveTags"],
+        "requestParameters": { "tagKeys": ["dormeto:workload"] },
+        "userIdentity": { "sessionContext": { "sessionIssuer": { "userName": [{ "anything-but": { "prefix": "${name}-" } }] } } }
+      }
+    },
+    {
+      "source": ["aws.ec2"],
+      "detail": {
+        "eventName": ["DeleteTags"],
+        "requestParameters": { "tagSet": { "items": { "key": ["dormeto:workload"] } } },
+        "userIdentity": { "sessionContext": { "sessionIssuer": { "userName": [{ "anything-but": { "prefix": "${name}-" } }] } } }
+      }
+    },
+    {
+      "source": ["aws.autoscaling"],
+      "detail": {
+        "eventName": ["DeleteTags"],
+        "requestParameters": { "tags": { "key": ["dormeto:workload"] } },
+        "userIdentity": { "sessionContext": { "sessionIssuer": { "userName": [{ "anything-but": { "prefix": "${name}-" } }] } } }
+      }
+    },
+    {
+      "source": ["aws.ecs", "aws.rds"],
+      "detail": {
+        "eventName": ["UntagResource", "RemoveTagsFromResource"],
+        "requestParameters": { "tagKeys": ["dormeto:workload"] },
+        "userIdentity": { "sessionContext": { "sessionIssuer": { "userName": [{ "anything-but": { "prefix": "${name}-" } }] } } }
+      }
+    }
+  ]
+}

@@ -4,6 +4,12 @@ resource "aws_ecs_cluster" "demo" {
   name = local.name
 }
 
+# demo-ecs runs on Fargate Spot (the manager's R9.5 prices it at Spot prices); demo-rds stays on the Fargate launch type.
+resource "aws_ecs_cluster_capacity_providers" "demo" {
+  cluster_name       = aws_ecs_cluster.demo.name
+  capacity_providers = ["FARGATE", "FARGATE_SPOT"]
+}
+
 resource "aws_cloudwatch_log_group" "demo_ecs" {
   name              = "/ecs/${local.name}-demo-ecs"
   retention_in_days = 14
@@ -86,9 +92,15 @@ resource "aws_ecs_service" "demo" {
   cluster                           = aws_ecs_cluster.demo.id
   task_definition                   = aws_ecs_task_definition.demo.arn
   desired_count                     = 1
-  launch_type                       = "FARGATE"
   health_check_grace_period_seconds = 30
   propagate_tags                    = "SERVICE"
+  # Moving from the launch type to a capacity provider strategy needs a new deployment.
+  force_new_deployment = true
+
+  capacity_provider_strategy {
+    capacity_provider = "FARGATE_SPOT"
+    weight            = 1
+  }
 
   network_configuration {
     subnets          = aws_subnet.public[*].id
@@ -110,7 +122,7 @@ resource "aws_ecs_service" "demo" {
   }
 
   # The target group must be attached to the load balancer before the service registers tasks in it.
-  depends_on = [aws_lb_listener_rule.demo_ecs]
+  depends_on = [aws_lb_listener_rule.demo_ecs, aws_ecs_cluster_capacity_providers.demo]
 }
 
 resource "aws_lb_listener_rule" "demo_ecs" {

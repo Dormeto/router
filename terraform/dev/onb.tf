@@ -70,11 +70,7 @@ resource "aws_lb_listener_rule" "onb" {
     type             = "forward"
     target_group_arn = aws_lb_target_group.onb.arn
   }
-
-  lifecycle {
-    # Onboarding instruments the rule (weighted forward with the waker, tag): ignored until R4c.
-    ignore_changes = [action, tags]
-  }
+  # No ignore_changes: onboarding adds a shadow rule before this one and never changes it (R4c).
 }
 
 resource "aws_acm_certificate" "onb" {

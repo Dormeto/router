@@ -47,6 +47,8 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
       allow(['ec2:DescribeInstances', 'elasticloadbalancing:DescribeRules', 'elasticloadbalancing:DescribeTargetHealth', 'elasticloadbalancing:DescribeTargetGroups', 'elasticloadbalancing:DescribeListeners', 'elasticloadbalancing:DescribeTags', 'cloudwatch:GetMetricData', 'lambda:GetAccountSettings'], ['*']),
       allow(['ec2:StartInstances', 'ec2:StopInstances'], [arn('ec2', 'instance/*')], tagged),
       allow(['elasticloadbalancing:ModifyRule'], [arn('elasticloadbalancing', 'listener-rule/app/*')], tagged),
+      // ELB checks it when a rule's actions authenticate with Amazon Cognito (the rule switched with its actions).
+      allow(['cognito-idp:DescribeUserPoolClient'], [arn('cognito-idp', 'userpool/*')]),
       allow(['autoscaling:DescribeAutoScalingGroups', 'tag:GetResources', 'ecs:DescribeServices', 'application-autoscaling:DescribeScalableTargets', 'rds:DescribeDBInstances', 'rds:DescribeDBClusters'], ['*']),
       allow(['rds:StartDBInstance', 'rds:StopDBInstance', 'rds:StartDBCluster', 'rds:StopDBCluster'], [arn('rds', 'db:*'), arn('rds', 'cluster:*')], tagged),
       allow(['ecs:UpdateService'], [arn('ecs', 'service/*/*')], tagged),
@@ -74,6 +76,7 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
       allow(['elasticloadbalancing:DescribeTargetGroups', 'elasticloadbalancing:DescribeListeners', 'elasticloadbalancing:DescribeRules', 'elasticloadbalancing:DescribeTags', 'elasticloadbalancing:DescribeTargetHealth', 'elasticloadbalancing:DescribeAccountLimits', 'ec2:DescribeInstances', 'autoscaling:DescribeAutoScalingGroups', 'ecs:ListClusters', 'ecs:ListServices', 'ecs:DescribeServices', 'rds:DescribeDBInstances', 'rds:DescribeDBClusters'], ['*']),
       allow(['elasticloadbalancing:CreateTargetGroup', 'elasticloadbalancing:ModifyTargetGroupAttributes', 'elasticloadbalancing:DeleteTargetGroup', 'elasticloadbalancing:RegisterTargets', 'elasticloadbalancing:DeregisterTargets'], [arn('elasticloadbalancing', `targetgroup/${p.name}-*/*`)]),
       allow(['elasticloadbalancing:ModifyRule'], [arn('elasticloadbalancing', 'listener-rule/app/*')]),
+      allow(['cognito-idp:DescribeUserPoolClient'], [arn('cognito-idp', 'userpool/*')]),
       allow(['elasticloadbalancing:CreateRule'], [arn('elasticloadbalancing', 'listener/app/*'), arn('elasticloadbalancing', 'listener-rule/app/*')]),
       allow(['elasticloadbalancing:DeleteRule', 'elasticloadbalancing:SetRulePriorities'], [arn('elasticloadbalancing', 'listener-rule/app/*')], tagged),
       allow(['elasticloadbalancing:AddTags', 'elasticloadbalancing:RemoveTags'], [arn('elasticloadbalancing', 'listener-rule/app/*'), arn('elasticloadbalancing', `targetgroup/${p.name}-*/*`)], onboarderTagKeys),
@@ -207,6 +210,8 @@ export function routerBoundary({ p = PLACEHOLDERS } = {}) {
           'application-autoscaling:DescribeScalableTargets', 'application-autoscaling:RegisterScalableTarget',
           'rds:Describe*', 'rds:StartDBInstance', 'rds:StopDBInstance', 'rds:StartDBCluster', 'rds:StopDBCluster', 'rds:AddTagsToResource', 'rds:RemoveTagsFromResource',
           'cloudwatch:GetMetricData', 'tag:GetResources', 's3:GetObject', 'lambda:GetAccountSettings',
+          // A rule that authenticates with Amazon Cognito: ELB checks that whoever changes it may read its user pool client.
+          'cognito-idp:DescribeUserPoolClient',
         ],
         Resource: '*',
       },

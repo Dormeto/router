@@ -93,6 +93,14 @@ test('every action of every router role is allowed by the permissions boundary',
   assert.ok(!allowed.some((a) => a.startsWith('iam:') || a.startsWith('organizations:') || a === '*'), 'no IAM, Organizations or wildcard');
 });
 
+test('the roles that change rules with their actions may read the Cognito user pool clients of their account and region (ELB checks it for an authenticate-cognito action)', () => {
+  const b = fill(blueprint({ version: '0.18.0' }), VALUES);
+  for (const key of ['controller', 'onboarder']) {
+    const statement = b.roles.find((r) => r.key === key).policy.Statement.find((s) => [].concat(s.Action).includes('cognito-idp:DescribeUserPoolClient'));
+    assert.deepEqual(statement?.Resource, ['arn:aws:cognito-idp:eu-west-3:121014831971:userpool/*'], key);
+  }
+});
+
 test('the boundary covers the resources of installed routers only (dmtr-*), never a router written in Terraform or the manager', () => {
   // Workloads are the customer's resources; the manager's bus is the manager's.
   const resources = routerBoundary().Statement.filter((s) => s.Sid !== 'Workloads' && s.Sid !== 'ManagerBus').flatMap((s) => [].concat(s.Resource));

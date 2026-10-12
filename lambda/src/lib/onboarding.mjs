@@ -67,6 +67,14 @@ function instrumentedActions(actions, app, waker, weights) {
   });
 }
 
+// ELB changes a rule that authenticates with Amazon Cognito only for a caller that may read its user pool client: the
+// router's roles may since 0.23.1, and the account's DmtRouterBoundary once the access module or script of a release that
+// installs it is applied again there.
+const COGNITO_REFUSED = /not authorized to perform 'describeUserPoolClient'/i;
+const cognitoText = (rule) => `rule ${rule.Priority} authenticates with Amazon Cognito: ELB changes it only for whoever may read its user pool `
+  + 'client (cognito-idp:DescribeUserPoolClient), which this account\'s DmtRouterBoundary does not allow yet; apply the access module or the AWS '
+  + 'CLI script of the manager\'s release again in this account, then onboard again';
+
 // For each customer rule forwarding to the target group (default rules aside), per listener: shadowed already, a shadow
 // to create, mirror or move, instrumented in place (with why), or refused; and the shadows to remove. A shadow passes over
 // only what `passable` allows (rules.mjs): anything else between it and its rule would see its requests taken.
@@ -464,7 +472,9 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
         await elbv2.deleteRule({ RuleArn: rule.RuleArn });
       } else if (plan.action === 'in place') {
         change('rule instrumented in place', `rule ${rule.Priority} (${plan.reason})`);
-        await elbv2.modifyRule({ RuleArn: rule.RuleArn, Actions: instrumentedActions(rule.Actions, group.TargetGroupArn, wakerArn, weights) });
+        await elbv2.modifyRule({ RuleArn: rule.RuleArn, Actions: instrumentedActions(rule.Actions, group.TargetGroupArn, wakerArn, weights) }).catch((err) => {
+          throw COGNITO_REFUSED.test(err.message ?? '') ? new Error(cognitoText(rule)) : err;
+        });
         await elbv2.addTags({ ResourceArns: [rule.RuleArn], Tags: [{ Key: WORKLOAD_TAG, Value: workloadId }] });
       } else if (plan.action === 'instrumented' && plan.row.tags[WORKLOAD_TAG] !== workloadId) {
         change('rule tag restored', `rule ${rule.Priority}`);

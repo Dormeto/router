@@ -134,7 +134,9 @@ forward, tags `dormeto:workload` and `dormeto:shadows = <rule ARN>`), so the cus
 code stay untouched. A shadow only passes over the workload's own rules and rules no request of the customer rule can
 match (other literal host headers): never an authentication, a redirect or another target group that could take those
 requests. A rule with an action before its forward or a rewrite, or with no free priority, is instrumented in place; a
-rule forwarding to other target groups too (blue/green) is left alone (an issue). **Drift:** CloudTrail events on rules,
+rule forwarding to other target groups too (blue/green) is left alone (an issue). ELB changes a rule that authenticates
+with Amazon Cognito only for whoever may read its user pool client: the controller and the onboarder may, on the user
+pools of their account and region (0.23.1; installed routers need the `DmtRouterBoundary` of that release). **Drift:** CloudTrail events on rules,
 target groups and `dormeto:workload` tags (any caller but the router's roles, successful calls only) invoke the
 onboarder, which repairs the workloads they concern; the idle check asks for a repair when it finds one to make. Each
 repair is a drift event (90 days) in the workload status and the router health.

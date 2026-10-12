@@ -334,6 +334,18 @@ test('a rule with an action before its forward (authentication) is instrumented 
   assert.deepEqual(preview.rules.map((r) => [r.priority, r.action]), [['10', 'instrument in place (actions before the forward)'], ['11', 'instrument in place (no free priority before it)']]);
 });
 
+test('a rule that authenticates with Amazon Cognito, refused for want of reading its user pool client, says what to apply again', async () => {
+  const s = setup();
+  const auth = { Type: 'authenticate-cognito', Order: 1, AuthenticateCognitoConfig: { UserPoolArn: 'arn:aws:cognito-idp:eu-west-1:111122223333:userpool/eu-west-1_abc', UserPoolClientId: 'client', UserPoolDomain: 'login' } };
+  const forward = { Type: 'forward', Order: 2, TargetGroupArn: s.tg, ForwardConfig: { TargetGroups: [{ TargetGroupArn: s.tg, Weight: 1 }] } };
+  s.a.state.rules.get(s.main).actions = [auth, forward];
+  // ELB's answer when the caller's policies or its permissions boundary lack cognito-idp:DescribeUserPoolClient.
+  s.a.state.fail.modifyRule = Object.assign(new Error("User is not authorized to perform 'describeUserPoolClient'"), { name: 'InvalidLoadBalancerActionException' });
+  await assert.rejects(s.onboarding.onboard({ workloadId: 'shop', targetGroupArn: s.tg, by: 'ops' }),
+    /cannot onboard shop: rule 10 authenticates with Amazon Cognito: .*cognito-idp:DescribeUserPoolClient.*DmtRouterBoundary.*access module or the AWS CLI script.* \(undone\)$/);
+  assert.deepEqual(s.a.state.rules.get(s.main).actions, [auth, forward]);
+});
+
 test('a shadow passes over a foreign rule no request of its rule can match (another host)', async () => {
   const s = setup();
   const other = s.a.customer.targetGroup('blog-app');

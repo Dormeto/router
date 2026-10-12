@@ -99,6 +99,11 @@ data "aws_iam_policy_document" "controller" {
     }
   }
   statement {
+    # ELB checks it when a rule's actions authenticate with Amazon Cognito (the rule switched with its actions).
+    actions   = ["cognito-idp:DescribeUserPoolClient"]
+    resources = ["${local.arn_prefix}:cognito-idp:${local.region}:${local.account_id}:userpool/*"]
+  }
+  statement {
     actions   = ["autoscaling:DescribeAutoScalingGroups", "tag:GetResources", "ecs:DescribeServices", "application-autoscaling:DescribeScalableTargets", "rds:DescribeDBInstances", "rds:DescribeDBClusters"]
     resources = ["*"]
   }
@@ -256,6 +261,11 @@ data "aws_iam_policy_document" "onboarder" {
     # Instrumenting a customer rule in place (untagged until then), restoring it, mirroring a shadow's conditions.
     actions   = ["elasticloadbalancing:ModifyRule"]
     resources = ["${local.arn_prefix}:elasticloadbalancing:${local.region}:${local.account_id}:listener-rule/app/*"]
+  }
+  statement {
+    # A rule that authenticates with Amazon Cognito: ELB checks that whoever changes it may read its user pool client.
+    actions   = ["cognito-idp:DescribeUserPoolClient"]
+    resources = ["${local.arn_prefix}:cognito-idp:${local.region}:${local.account_id}:userpool/*"]
   }
   statement {
     # Shadow rules: created on the customer's listener (tagged on creation).

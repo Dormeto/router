@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createPublisher, withTransitionEvents } from '../src/lib/events.mjs';
 
 const BUS = 'arn:aws:events:eu-west-1:121014831971:event-bus/dmt-dev-manager';
-const ROUTER = { name: 'dmtr-dev', version: '0.21.0', build: 'abc', checkSchedule: 'rate(5 minutes)' };
+const ROUTER = { name: 'dmtr-dev', region: 'eu-west-3', version: '0.21.0', build: 'abc', checkSchedule: 'rate(5 minutes)' };
 
 function fakeEvents({ fail = null } = {}) {
   const calls = [];
@@ -68,7 +68,8 @@ test('a state change is one entry; a failed publish is logged, never thrown', as
     await createPublisher({ events, busArn: BUS, router: ROUTER, log }).stateChanged({ workloadId: 'a', from: 'ASLEEP', to: 'WAKING', at: '2026-10-05T12:00:00.000Z', wakeId: 'w1' });
     const [entry] = events.calls[0].input.Entries;
     assert.equal(entry.DetailType, 'Workload state changed');
-    assert.deepEqual(JSON.parse(entry.Detail), { router: 'dmtr-dev', workloadId: 'a', from: 'ASLEEP', to: 'WAKING', at: '2026-10-05T12:00:00.000Z', wakeId: 'w1' });
+    // The router's region travels in the event: the envelope carries the bus's region.
+    assert.deepEqual(JSON.parse(entry.Detail), { router: 'dmtr-dev', region: 'eu-west-3', workloadId: 'a', from: 'ASLEEP', to: 'WAKING', at: '2026-10-05T12:00:00.000Z', wakeId: 'w1' });
     assert.equal(log.lines.some(([level, event]) => level === 'warn' && event === 'PublishFailed'), fail !== null, String(fail));
   }
 });

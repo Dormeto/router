@@ -50,8 +50,10 @@ export function createPublisher({ events, busArn, router, log }) {
       }
       await send(chunks.map((part, index) => entry('Router checked', { ...base, chunk: { index, total: chunks.length }, workloads: part })), 'checked');
     },
+    // The router's region travels in the detail: publishing to the manager's bus in another region stamps the envelope
+    // with that region (the envelope's account stays the router's).
     async stateChanged(change) {
-      await send([entry('Workload state changed', { router: router.name, ...change })], 'state');
+      await send([entry('Workload state changed', { router: router.name, region: router.region, ...change })], 'state');
     },
   };
 }

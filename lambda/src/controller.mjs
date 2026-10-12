@@ -25,7 +25,7 @@ const routerName = (process.env.DMT_TG_PREFIX ?? '').replace(/-$/, '');
 // The router's state and state changes to the manager's event bus (scale design §3), when the router has one.
 const publisher = createPublisher({
   events: createEvents(), busArn: process.env.DMT_MANAGER_BUS, log: logger,
-  router: { name: routerName, version: process.env.DMT_VERSION, build: process.env.DMT_BUILD, checkSchedule: process.env.DMT_CHECK_SCHEDULE },
+  router: { region: process.env.AWS_REGION, name: routerName, version: process.env.DMT_VERSION, build: process.env.DMT_BUILD, checkSchedule: process.env.DMT_CHECK_SCHEDULE },
 });
 const store = withTransitionEvents(createStore({ dynamo: createDynamo(), table: process.env.DMT_TABLE }), publisher, { log: logger });
 // IP reputation lists of the router (Terraform ip_lists).

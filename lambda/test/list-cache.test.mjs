@@ -103,3 +103,25 @@ test('waker: a listed source is deferred in any mode, its probe wakes, an awake 
   await handler(albEvent({ headers: listed }));
   assert.equal(loads, before, 'no list lookup while awake');
 });
+
+test('waker: requests settled by the filters or an explicit wake do not load the lists', async () => {
+  const { createWaker } = await import('../src/lib/waker-core.mjs');
+  const clock = fakeClock();
+  const store = storeWith(clock);
+  store.state.run = { state: 'ASLEEP' };
+  let loads = 0;
+  const listCache = { get: async () => { loads += 1; return []; }, describe: async () => [] };
+  const handler = createWaker({
+    store, invokeController: async () => {}, prefix: 'dmt-dev-', now: clock.now, sleep: clock.sleep, newId: () => 'w1',
+    log: silentLog, listCache,
+  });
+  await handler(albEvent({ method: 'HEAD' }));
+  await handler(albEvent({ headers: { 'user-agent': 'Googlebot/2.1' } }));
+  await handler(albEvent({ path: '/.env' }));
+  assert.equal(loads, 0);
+  await handler(albEvent({ headers: { 'x-dormeto-wake': '1', accept: 'application/json' } }));
+  assert.equal(loads, 0);
+  store.state.run = { state: 'ASLEEP' };
+  await handler(albEvent());
+  assert.equal(loads, 1);
+});

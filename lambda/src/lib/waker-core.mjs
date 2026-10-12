@@ -171,12 +171,15 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
         loadLists: listCache ? () => listCache.describe() : null,
       });
     }
-    const { kind, reason, trigger: by, deferred } = classify(event, noWakeRules(cfg), {
-      browserMode: cfg.wakeMode === 'browser',
-      wakeRules: rulesFor('wake', cfg.wakeRules),
-      // An awake workload does not need them: requests reach the waker only during the route switch.
-      lists: listCache && initial.state !== STATES.AWAKE ? await listCache.get() : [],
-    });
+    const options = { browserMode: cfg.wakeMode === 'browser', wakeRules: rulesFor('wake', cfg.wakeRules) };
+    let classified = classify(event, noWakeRules(cfg), options);
+    // IP lists only matter for requests that the filters and explicit wakes did not settle, and not while awake
+    // (requests reach the waker then only during the route switch): no list load for the others.
+    if (listCache && initial.state !== STATES.AWAKE && classified.kind !== 'no-wake' && !classified.trigger) {
+      const lists = await listCache.get();
+      if (lists.length) classified = classify(event, noWakeRules(cfg), { ...options, lists });
+    }
+    const { kind, reason, trigger: by, deferred } = classified;
     let run = initial;
     const origin = () => requestOrigin(event, by ?? kind);
     if (kind === 'no-wake') {

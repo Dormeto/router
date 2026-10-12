@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { STATES } from './state.mjs';
-import { hostOf, rulesOf, setRoute } from './route.mjs';
+import { describeRulesOf, hostOf, rulesOf, setRoute } from './route.mjs';
 import { healthyCount, waitTargetsReleased } from './instances.mjs';
 import { createStatus } from './status.mjs';
 import { describeRules } from './no-wake.mjs';
@@ -80,7 +80,7 @@ export function createController({
         await sleep(HEALTH_POLL_MS);
       }
       if (!(await current())) return superseded();
-      await setRoute(elbv2, cfg, 'app');
+      await routeTo(cfg, 'app');
       const done = await store.transition(workloadId, {
         cond: { state: STATES.WAKING, wakeId },
         set: { state: STATES.AWAKE, awakeSince: now(), holders: 0 },
@@ -116,12 +116,12 @@ export function createController({
     if (!napping) return { state: 'SKIPPED' };
     log.info('NapStarted', { workloadId });
     try {
-      await setRoute(elbv2, cfg, 'waker');
+      await routeTo(cfg, 'waker');
       await sleep(cfg.drainSeconds * 1000);
       // Commit point: after this transition the instances are stopped even if a request arrives.
       const committed = await store.transition(workloadId, { cond: { state: STATES.NAPPING, pendingWake: false }, set: { stopping: true } });
       if (!committed) {
-        await setRoute(elbv2, cfg, 'app');
+        await routeTo(cfg, 'app');
         await store.transition(workloadId, {
           cond: { state: STATES.NAPPING },
           set: { state: STATES.AWAKE, awakeSince: now() },
@@ -155,6 +155,9 @@ export function createController({
     log.info('WakeRequested', { workloadId, wakeId, reason: 'pendingWake' });
     return wake(workloadId, wakeId, cfg);
   }
+
+  // Every rule of the workload to the target; a rule deleted by hand is reported (and only blocks a switch to the waker).
+  const routeTo = (cfg, target) => setRoute(elbv2, cfg, target, { onMissing: (rules) => log.warn('RuleMissing', { workloadId: cfg.workloadId, rules }) });
 
   async function reconcile(cfg) {
     const { workloadId } = cfg;
@@ -191,14 +194,14 @@ export function createController({
       log.warn(from === STATES.FAILED ? 'FailedRecovered' : 'ExternalWake', { workloadId });
       if (run.napBackends) await resumeBackends(clients, JSON.parse(run.napBackends));
       else await startCompanions(clients, companions);
-      await setRoute(elbv2, cfg, 'app');
+      await routeTo(cfg, 'app');
       run = (await store.transition(workloadId, {
         cond: { state: from }, set: { state: STATES.AWAKE, awakeSince: now() }, remove: ['napBackends', 'napInstances'],
       }))
         ?? (await store.getRun(workloadId));
     } else if (from !== STATES.ASLEEP && all('stopped')) {
       log.warn(from === STATES.FAILED ? 'FailedRecovered' : 'ExternalStop', { workloadId });
-      await setRoute(elbv2, cfg, 'waker');
+      await routeTo(cfg, 'waker');
       await stopCompanions(clients, companions);
       run = (await store.transition(workloadId, { cond: { state: from }, set: { state: STATES.ASLEEP, holders: 0 } }))
         ?? (await store.getRun(workloadId));
@@ -215,7 +218,7 @@ export function createController({
     const expected = run.state === STATES.AWAKE ? 'app' : [STATES.ASLEEP, STATES.FAILED].includes(run.state) ? 'waker' : null;
     if (expected) {
       // Every rule of the workload: a rule switched back alone (mixed route) is repaired too.
-      const repaired = await setRoute(elbv2, cfg, expected);
+      const repaired = await routeTo(cfg, expected);
       if (repaired.length) log.warn('RouteRepaired', { workloadId, route: expected, rules: repaired });
     }
 
@@ -257,11 +260,14 @@ export function createController({
     const arns = configs.flatMap(rulesOf);
     if (now() - hosts.at < 5 * 60_000 && arns.every((a) => hosts.byRule.has(a))) return hosts.byRule;
     const found = [];
+    const gone = [];
     for (let i = 0; i < arns.length; i += 20) {
-      const { Rules = [] } = await elbv2.describeRules({ RuleArns: arns.slice(i, i + 20) }).catch(() => ({}));
-      found.push(...Rules);
+      const { rules, missing } = await describeRulesOf(elbv2, arns.slice(i, i + 20)).catch(() => ({ rules: [], missing: [] }));
+      found.push(...rules);
+      gone.push(...missing);
     }
-    hosts.byRule = new Map(found.map((r) => [r.RuleArn, hostOf(r)]));
+    // A deleted rule is cached too (no host), so that it does not make every list call describe the rules again.
+    hosts.byRule = new Map([...found.map((r) => [r.RuleArn, hostOf(r)]), ...gone.map((arn) => [arn, null])]);
     hosts.at = now();
     return hosts.byRule;
   }
@@ -368,7 +374,7 @@ export function createController({
     const run = await store.getRun(workloadId);
     if (run?.state !== STATES.AWAKE) return { state: run?.state };
     if ((await healthyCount(elbv2, cfg.appTargetGroupArn)) < 1) return { state: run.state, healthy: 0 };
-    const repaired = await setRoute(elbv2, cfg, 'app');
+    const repaired = await routeTo(cfg, 'app');
     if (repaired.length) log.warn('RouteRepaired', { workloadId, route: 'app', rules: repaired });
     return { state: run.state, changed: repaired.length > 0 };
   }

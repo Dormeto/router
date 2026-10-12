@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createController } from '../src/lib/controller-core.mjs';
+import { currentTarget } from '../src/lib/route.mjs';
 import { STATES } from '../src/lib/state.mjs';
 import { asgGroup, ecsService, fakeAppScaling, fakeEcs, fakeRds, fakeRdsTagging, fakeTagging, fakeAutoScaling, fakeClock, fakeCloudWatch, fakeEc2, fakeElbv2, fakeStore, routeOf, silentLog, testConfig } from './fakes.mjs';
 
@@ -238,6 +239,25 @@ test('status still answers when a rule of the workload was deleted', async () =>
   const status = await s.handler({ action: 'status', workloadId: 'demo' });
   assert.equal(status.route, 'unknown');
   assert.deepEqual(status.rules[1], { arn: 'arn:rule/static', priority: null, conditions: 'rule not found', route: 'unknown' });
+});
+
+test('a wake completes when a rule of the workload was deleted, and the rules that remain serve the application', async () => {
+  const s = setup({ run: { state: STATES.WAKING, wakeId: 'w1' }, instance: 'stopped', target: 'waker', cfg: TWO_RULES });
+  const warnings = [];
+  s.log.warn = (event, data) => warnings.push([event, data]);
+  s.elbv2.state.rules.delete('arn:rule/static');
+  const result = await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' });
+  assert.equal(result.state, STATES.AWAKE);
+  assert.equal(currentTarget(s.elbv2.state.rules.get('arn:rule/main'), s.cfg), 'app');
+  assert.deepEqual(warnings.find(([e]) => e === 'RuleMissing'), ['RuleMissing', { workloadId: 'demo', rules: ['arn:rule/static'] }]);
+});
+
+test('list keeps the URLs of the other workloads when a rule was deleted', async () => {
+  const s = setup({ run: { state: STATES.AWAKE }, cfg: TWO_RULES });
+  s.elbv2.state.conditions = new Map([['arn:rule/main', [host('asg.example.com')]]]);
+  s.elbv2.state.rules.delete('arn:rule/static');
+  const { workloads } = await s.handler({ action: 'list' });
+  assert.equal(workloads[0].url, 'https://asg.example.com/');
 });
 
 test('list gives the URL of the first rule with a host condition', async () => {

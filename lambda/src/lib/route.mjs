@@ -62,20 +62,48 @@ export function routeOf(rules, cfg) {
   return targets.every((t) => t === targets[0]) ? targets[0] : 'mixed';
 }
 
-// Switches every rule of the workload to the target; returns the rules it changed (none when already there). All the
-// rules are read first: a missing rule fails before any change.
-export async function setRoute(elbv2, cfg, target) {
+// Rules by ARN, and the ARNs that no longer exist. ELBv2 fails the whole DescribeRules call when one rule is missing:
+// then each rule is described on its own to tell which one is gone. Other errors are thrown.
+export async function describeRulesOf(elbv2, arns) {
+  if (!arns.length) return { rules: [], missing: [] };
+  try {
+    const { Rules = [] } = await elbv2.describeRules({ RuleArns: arns });
+    return { rules: Rules, missing: arns.filter((a) => !Rules.some((r) => r.RuleArn === a)) };
+  } catch (err) {
+    if (err?.name !== 'RuleNotFoundException') throw err;
+  }
+  const rules = [];
+  const missing = [];
+  for (const arn of arns) {
+    try {
+      rules.push(...((await elbv2.describeRules({ RuleArns: [arn] })).Rules ?? []));
+    } catch (err) {
+      if (err?.name !== 'RuleNotFoundException') throw err;
+      missing.push(arn);
+    }
+  }
+  return { rules, missing };
+}
+
+// Switches every rule of the workload to the target; returns the rules it changed (none when already there).
+// Towards the waker, a missing rule fails before any change (a stopped backend must never be left behind a rule).
+// Towards the application, the rules that remain are switched and the missing ones reported (onMissing): a running
+// backend must not stay behind the waiter page because one rule was deleted.
+export async function setRoute(elbv2, cfg, target, { onMissing = () => {} } = {}) {
   if (!TARGETS.has(target)) throw new Error(`invalid target: ${target}`);
   const arns = rulesOf(cfg);
-  const { Rules = [] } = await elbv2.describeRules({ RuleArns: arns });
-  const byArn = new Map(Rules.map((r) => [r.RuleArn, r]));
-  const missing = arns.find((arn) => !byArn.has(arn));
-  if (missing) throw new Error(`rule not found: ${missing}`);
+  if (!arns.length) throw new Error(`no rule configured for ${cfg.workloadId}`);
+  const { rules, missing } = await describeRulesOf(elbv2, arns);
+  if (missing.length) {
+    if (target === 'waker' || missing.length === arns.length) throw new Error(`rule not found: ${missing.join(', ')}`);
+    onMissing(missing);
+  }
+  const byArn = new Map(rules.map((r) => [r.RuleArn, r]));
   const weights = target === 'app'
     ? { [cfg.appTargetGroupArn]: 1, [cfg.wakerTargetGroupArn]: 0 }
     : { [cfg.appTargetGroupArn]: 0, [cfg.wakerTargetGroupArn]: 1 };
   const changed = [];
-  for (const arn of arns) {
+  for (const arn of arns.filter((a) => byArn.has(a))) {
     const rule = byArn.get(arn);
     if (currentTarget(rule.Actions, cfg) === target) continue;
     await elbv2.modifyRule({ RuleArn: arn, Actions: withWeights(rule.Actions, weights) });

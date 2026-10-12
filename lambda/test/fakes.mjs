@@ -116,6 +116,8 @@ export function fakeElbv2(cfg, { target = 'app', healthy = 1 } = {}) {
   return {
     state,
     async describeRules({ RuleArns }) {
+      // Like ELBv2: one unknown rule fails the whole call.
+      if (RuleArns.some((a) => !state.rules.has(a))) throw Object.assign(new Error('One or more rules not found'), { name: 'RuleNotFoundException' });
       return {
         Rules: RuleArns.filter((a) => state.rules.has(a)).map((a) => ({
           RuleArn: a, Actions: structuredClone(state.rules.get(a)), ...(state.conditions?.has(a) ? { Conditions: state.conditions.get(a), Priority: state.priorities?.get(a) } : {}),

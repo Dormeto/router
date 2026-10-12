@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { currentTarget, routeOf, rulesOf, setRoute, withWeights } from '../src/lib/route.mjs';
+import { currentTarget, describeRulesOf, routeOf, rulesOf, setRoute, withWeights } from '../src/lib/route.mjs';
 
 const cfg = { ruleArn: 'rule', appTargetGroupArn: 'app-tg', wakerTargetGroupArn: 'waker-tg' };
 
@@ -72,7 +72,9 @@ function fakeRules(byArn) {
     state,
     async describeRules({ RuleArns }) {
       state.describeCalls += 1;
-      return { Rules: RuleArns.filter((a) => state.rules.has(a)).map((a) => ({ RuleArn: a, Actions: structuredClone(state.rules.get(a)) })) };
+      // Like ELBv2: one unknown rule fails the whole call.
+      if (RuleArns.some((a) => !state.rules.has(a))) throw Object.assign(new Error('One or more rules not found'), { name: 'RuleNotFoundException' });
+      return { Rules: RuleArns.map((a) => ({ RuleArn: a, Actions: structuredClone(state.rules.get(a)) })) };
     },
     async modifyRule({ RuleArn, Actions }) {
       state.modified.push(RuleArn);
@@ -106,8 +108,24 @@ test('setRoute switches every rule with one DescribeRules call, and only the rul
   assert.deepEqual(await setRoute(elbv2, multi, 'app'), []);
 });
 
-test('setRoute changes nothing when one rule of the workload is missing', async () => {
+test('setRoute to the waker changes nothing when one rule of the workload is missing', async () => {
   const elbv2 = fakeRules({ r1: [forward(1, 0)] });
   await assert.rejects(setRoute(elbv2, multi, 'waker'), /rule not found: r2/);
   assert.deepEqual(elbv2.state.modified, []);
+});
+
+test('setRoute to the application switches the rules that remain and reports the missing one', async () => {
+  const elbv2 = fakeRules({ r1: [forward(0, 1)] });
+  const missing = [];
+  assert.deepEqual(await setRoute(elbv2, multi, 'app', { onMissing: (arns) => missing.push(...arns) }), ['r1']);
+  assert.deepEqual(missing, ['r2']);
+  assert.equal(currentTarget(elbv2.state.rules.get('r1'), multi), 'app');
+});
+
+test('describeRulesOf falls back to one call per rule when one is missing, and rethrows other errors', async () => {
+  const elbv2 = fakeRules({ r1: [forward(1, 0)] });
+  const { rules, missing } = await describeRulesOf(elbv2, ['r1', 'r2']);
+  assert.deepEqual([rules.map((r) => r.RuleArn), missing], [['r1'], ['r2']]);
+  const broken = { async describeRules() { throw Object.assign(new Error('Rate exceeded'), { name: 'ThrottlingException' }); } };
+  await assert.rejects(describeRulesOf(broken, ['r1']), /Rate exceeded/);
 });

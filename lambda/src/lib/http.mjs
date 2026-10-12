@@ -1,6 +1,6 @@
 export const BOT_PATTERN = /bot|crawl|spider|slurp|monitor|uptime|pingdom|ELB-HealthChecker/i;
 
-const REASONS = { 200: 'OK', 307: 'Temporary Redirect', 503: 'Service Unavailable' };
+const REASONS = { 200: 'OK', 303: 'See Other', 307: 'Temporary Redirect', 404: 'Not Found', 405: 'Method Not Allowed', 503: 'Service Unavailable' };
 
 export function headerValues(event, name) {
   const key = name.toLowerCase();

@@ -124,13 +124,13 @@ export function fakeEc2(ids, { state = 'running' } = {}) {
   };
 }
 
-export function fakeCloudWatch(values = []) {
+export function fakeCloudWatch(values = [], timestamps = []) {
   const calls = [];
   return {
     calls,
     async getMetricData(input) {
       calls.push(input);
-      return { MetricDataResults: [{ Id: 'requests', Values: values }] };
+      return { MetricDataResults: [{ Id: 'requests', Values: values, Timestamps: timestamps }] };
     },
   };
 }

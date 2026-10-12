@@ -2,12 +2,13 @@ import { randomUUID } from 'node:crypto';
 import { STATES } from './state.mjs';
 import { acceptsHtml, classify, redirectCount, requestTarget, response, workloadIdFromEvent } from './http.mjs';
 import { renderJson, renderPage } from './page.mjs';
+import { parseAdminPath } from './admin.mjs';
 
 const POLL_MS = 1000;
 const STUCK_GRACE_MS = 60_000;
 const MAX_REDIRECTS = 2;
 
-export function createWaker({ store, invokeController, prefix, now = Date.now, sleep, newId = randomUUID, log }) {
+export function createWaker({ store, invokeController, prefix, now = Date.now, sleep, newId = randomUUID, log, getAdmin }) {
   async function startWake(workloadId, cond, run) {
     const wakeId = newId();
     const next = await store.transition(workloadId, {
@@ -47,6 +48,20 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
         return run;
       case STATES.AWAKE:
         await invokeController({ action: 'ensure-awake', workloadId });
+        return run;
+      default:
+        return run;
+    }
+  }
+
+  // Operator request from the admin dashboard: no retry delay, no hold.
+  async function forceWake(workloadId, run) {
+    switch (run.state) {
+      case STATES.ASLEEP:
+      case STATES.FAILED:
+        return startWake(workloadId, { state: run.state }, run);
+      case STATES.NAPPING:
+        await store.setPendingWake(workloadId);
         return run;
       default:
         return run;
@@ -95,6 +110,14 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
     if (!cfg || !initial) {
       log.error('WorkloadNotConfigured', { workloadId });
       return waiter(event, 10, STATES.FAILED);
+    }
+    const admin = getAdmin ? parseAdminPath(event.path, cfg) : null;
+    if (admin) {
+      const handle = await getAdmin();
+      return handle({
+        event, workloadId, cfg, run: initial, base: admin.base, route: admin.route,
+        forceWake: (run) => forceWake(workloadId, run),
+      });
     }
     const kind = classify(event);
     let run = initial;

@@ -87,6 +87,14 @@ ip_lists = [
 ]
 ```
 
+**The manager's lists** (`ip_lists_catalog` on the `router` module, router 0.24.0): with a manager, the lists are
+downloaded once by its list function, checked (a version that lost more than half its entries is refused) and published
+to its bucket with a manifest each. Set `ip_lists_catalog` to the manager's output of the same name
+(`s3://<bucket>/catalog.json`): the waker reads the catalog and the manifests every 5 minutes with conditional GETs, and a
+list's data only when its version changes, checked against the manifest's SHA-256; nothing goes to the router table, and
+the idle check plays no part. A list of `ip_lists` with the same name wins. Routers installed by the manager get the
+catalog without any setting, and a change of the manager's `ip_lists` reaches them within 5 minutes.
+
 **Statistics:** while a workload is not awake, the waker counts ignored requests per reason, deferred requests (browser
 mode) and wakes per trigger in a daily item of the state table (`STATS#<day>`, kept 35 days); the admin dashboard shows
 today and the last 7 days. With `metrics_enabled` on the `router` module, the same events also publish the CloudWatch

@@ -49,6 +49,9 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
       allow(['dynamodb:GetItem', 'dynamodb:UpdateItem', 'dynamodb:Scan', 'dynamodb:Query', 'dynamodb:DeleteItem'], [tableArn]),
       allow(['ec2:DescribeInstances', 'elasticloadbalancing:DescribeRules', 'elasticloadbalancing:DescribeTargetHealth', 'elasticloadbalancing:DescribeTargetGroups', 'elasticloadbalancing:DescribeListeners', 'elasticloadbalancing:DescribeTags', 'cloudwatch:GetMetricData', 'lambda:GetAccountSettings'], ['*']),
       allow(['ec2:StartInstances', 'ec2:StopInstances'], [arn('ec2', 'instance/*')], tagged),
+      // Fallback instance types (R7a): a stopped instance's type, and the tag keeping its own type until the next stop.
+      allow(['ec2:ModifyInstanceAttribute'], [arn('ec2', 'instance/*')], tagged),
+      allow(['ec2:CreateTags', 'ec2:DeleteTags'], [arn('ec2', 'instance/*')], { ...tagged, 'ForAllValues:StringEquals': { 'aws:TagKeys': ['dormeto:instance-type'] } }),
       allow(['elasticloadbalancing:ModifyRule'], [arn('elasticloadbalancing', 'listener-rule/app/*')], tagged),
       // ELB checks it when a rule's actions authenticate with Amazon Cognito (the rule switched with its actions).
       allow(['cognito-idp:DescribeUserPoolClient'], [arn('cognito-idp', 'userpool/*')]),
@@ -211,7 +214,7 @@ export function routerBoundary({ p = PLACEHOLDERS } = {}) {
           'elasticloadbalancing:Describe*', 'elasticloadbalancing:ModifyRule', 'elasticloadbalancing:CreateTargetGroup', 'elasticloadbalancing:ModifyTargetGroupAttributes',
           'elasticloadbalancing:DeleteTargetGroup', 'elasticloadbalancing:RegisterTargets', 'elasticloadbalancing:DeregisterTargets', 'elasticloadbalancing:AddTags', 'elasticloadbalancing:RemoveTags',
           'elasticloadbalancing:CreateRule', 'elasticloadbalancing:DeleteRule', 'elasticloadbalancing:SetRulePriorities',
-          'ec2:DescribeInstances', 'ec2:StartInstances', 'ec2:StopInstances', 'ec2:CreateTags', 'ec2:DeleteTags',
+          'ec2:DescribeInstances', 'ec2:StartInstances', 'ec2:StopInstances', 'ec2:CreateTags', 'ec2:DeleteTags', 'ec2:ModifyInstanceAttribute',
           'autoscaling:Describe*', 'autoscaling:UpdateAutoScalingGroup', 'autoscaling:SuspendProcesses', 'autoscaling:ResumeProcesses', 'autoscaling:CreateOrUpdateTags', 'autoscaling:DeleteTags',
           'ecs:ListClusters', 'ecs:ListServices', 'ecs:DescribeServices', 'ecs:UpdateService', 'ecs:TagResource', 'ecs:UntagResource',
           'application-autoscaling:DescribeScalableTargets', 'application-autoscaling:RegisterScalableTarget',

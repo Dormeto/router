@@ -198,8 +198,8 @@ export const routeOf = (elbv2, cfg) => aggregateRoute([...elbv2.state.rules]
   .filter(([, r]) => r.actions.some((a) => a.ForwardConfig?.TargetGroups?.some((tg) => tg.TargetGroupArn === cfg.appTargetGroupArn)))
   .map(([RuleArn, r]) => ({ RuleArn, Actions: r.actions })), cfg);
 
-export function fakeEc2(ids, { state = 'running' } = {}) {
-  const s = { instances: Object.fromEntries(ids.map((id) => [id, state])), tags: {}, started: 0, stopped: 0, onStart: [], onStop: [] };
+export function fakeEc2(ids, { state = 'running', type = 't3.medium' } = {}) {
+  const s = { instances: Object.fromEntries(ids.map((id) => [id, state])), types: Object.fromEntries(ids.map((id) => [id, type])), tags: {}, started: 0, stopped: 0, onStart: [], onStop: [], modified: [] };
   return {
     state: s,
     async describeInstances({ InstanceIds }) {
@@ -207,6 +207,7 @@ export function fakeEc2(ids, { state = 'running' } = {}) {
         Reservations: [{
           Instances: InstanceIds.map((id) => ({
             InstanceId: id,
+            InstanceType: s.types[id],
             State: { Name: s.instances[id] },
             Tags: Object.entries(s.tags[id] ?? {}).map(([Key, Value]) => ({ Key, Value })),
           })),
@@ -223,6 +224,21 @@ export function fakeEc2(ids, { state = 'running' } = {}) {
       s.stopped += 1;
       for (const id of InstanceIds) s.instances[id] = 'stopped';
       for (const hook of s.onStop) await hook();
+      return {};
+    },
+    // A stopped instance only, as EC2 allows (R7a: fallback instance types).
+    async modifyInstanceAttribute({ InstanceId, InstanceType }) {
+      if (s.instances[InstanceId] !== 'stopped') throw Object.assign(new Error(`The instance '${InstanceId}' is not in the 'stopped' state.`), { name: 'IncorrectInstanceState' });
+      s.modified.push([InstanceId, InstanceType.Value]);
+      s.types[InstanceId] = InstanceType.Value;
+      return {};
+    },
+    async createTags({ Resources, Tags }) {
+      for (const id of Resources) s.tags[id] = { ...(s.tags[id] ?? {}), ...Object.fromEntries(Tags.map((t) => [t.Key, t.Value])) };
+      return {};
+    },
+    async deleteTags({ Resources, Tags }) {
+      for (const id of Resources) for (const t of Tags) delete s.tags[id]?.[t.Key];
       return {};
     },
   };

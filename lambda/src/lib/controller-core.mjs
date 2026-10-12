@@ -9,6 +9,7 @@ import { describeRules } from './no-wake.mjs';
 import { describeStoredLists } from './list-cache.mjs';
 import { failedSpec, failureError } from './failures.mjs';
 import { createWakeWatch, unhealthyError } from './wake-watch.mjs';
+import { revertInstanceTypes } from './capacity.mjs';
 import { STATS_DAYS, totals, workloadSummary } from './summary.mjs';
 import { lastRequestAt } from './metrics.mjs';
 import { checkScope } from './check-scope.mjs';
@@ -114,16 +115,24 @@ export function createController({
     }
     // The wake deadline counts from the wake start (RUN), not from this invocation: a wake can span invocations.
     const wakeDeadline = (run.wakeStartedAt ?? now()) + cfg.wakeTimeoutSeconds * 1000;
-    const timing = { sleep, now, deadline: Math.min(wakeDeadline, budgetEnd) };
+    const timing = { sleep, now, deadline: Math.min(wakeDeadline, budgetEnd), wakeDeadline };
+    // Instance types a capacity error made this wake fall back to (R7a), given back after the next stop.
+    const fallbacks = {};
     try {
       const records = await wakeRecords(run, cfg);
-      await wakeBackends(clients, records, timing);
+      await wakeBackends(clients, records, timing, {
+        fallbackTypes: cfg.fallbackInstanceTypes ?? [],
+        onFallback: (id, change) => {
+          fallbacks[id] = change;
+          log.warn('InstanceTypeFallback', { workloadId, wakeId, instance: id, ...change });
+        },
+      });
       // Launch and placement failures end the wake when AWS reports them, not at its timeout (R7a).
       const watch = createWakeWatch(clients, records, { since: run.wakeStartedAt ?? now(), now });
       while ((await healthyCount(elbv2, cfg.appTargetGroupArn)) < 1) {
         const seen = await watch.check();
         if (seen) throw seen;
-        if (now() >= wakeDeadline) throw await unhealthyError(elbv2, cfg.appTargetGroupArn);
+        if (now() >= wakeDeadline) throw watch.capacity ?? await unhealthyError(elbv2, cfg.appTargetGroupArn);
         if (now() >= timing.deadline) throw new Error('wake timeout: no healthy target');  // the Lambda time budget
         await sleep(HEALTH_POLL_MS);
       }
@@ -131,10 +140,10 @@ export function createController({
       await routeTo(cfg, 'app');
       const done = await store.transition(workloadId, {
         cond: { state: STATES.WAKING, wakeId },
-        set: { state: STATES.AWAKE, awakeSince: now(), holders: 0 },
+        set: { state: STATES.AWAKE, awakeSince: now(), holders: 0, ...(Object.keys(fallbacks).length ? { instanceTypes: JSON.stringify(fallbacks) } : {}) },
         remove: ['pendingWake', 'napInstances', 'napBackends', 'failure', 'consecutiveFailures'],
-        // The wake's duration (R7a, the base of R8's wake times).
-        event: { wakeId, durationMs: now() - (run.wakeStartedAt ?? now()) },
+        // The wake's duration (R7a, the base of R8's wake times), and the instance types it fell back to.
+        event: { wakeId, durationMs: now() - (run.wakeStartedAt ?? now()), ...(Object.keys(fallbacks).length ? { fallbacks } : {}) },
       });
       if (!done) return superseded();
       log.info('WakeCompleted', { workloadId, wakeId });
@@ -197,6 +206,8 @@ export function createController({
         return { state: STATES.AWAKE, aborted: true };
       }
       await sleepBackends(clients, backends, { sleep, now, deadline: now() + STOP_TIMEOUT_MS });
+      // A fallback instance type is for one wake only (R7a, FinOps): stopped, an instance gets its own type back.
+      await revertInstanceTypes(ec2, backends.filter((b) => b.kind === 'instance').map((b) => b.id), log);
       if (!(await waitTargetsReleased(elbv2, cfg.appTargetGroupArn, { sleep, now, deadline: now() + RELEASE_TIMEOUT_MS }))) {
         log.warn('TargetsNotReleased', { workloadId });
       }
@@ -210,7 +221,7 @@ export function createController({
       });
       return { state: STATES.FAILED, error: err.message };
     }
-    const asleep = await store.transition(workloadId, { cond: { state: STATES.NAPPING, pendingWake: false }, set: { state: STATES.ASLEEP, holders: 0 }, remove: ['stopping'] });
+    const asleep = await store.transition(workloadId, { cond: { state: STATES.NAPPING, pendingWake: false }, set: { state: STATES.ASLEEP, holders: 0 }, remove: ['stopping', 'instanceTypes'] });
     if (asleep) {
       log.info('NapCompleted', { workloadId });
       return { state: STATES.ASLEEP };

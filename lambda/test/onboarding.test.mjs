@@ -654,3 +654,14 @@ test('offboarding never removes the router permission, whatever the workload id 
   await s.onboarding.offboard({ workloadId: 'waker', by: 'ops' });
   assert.deepEqual([...s.a.state.permissions.keys()], [ROUTER_PERMISSION]);
 });
+
+test('settings: fallback instance types (at most 5 type names) and the failed retry delay (10 to 600 s) (R7a)', async () => {
+  const s = setup();
+  const ok = await s.onboarding.preview({ workloadId: 'shop', targetGroupArn: s.tg, settings: { fallbackInstanceTypes: ['t3a.medium', 'm5.large'], failedRetrySeconds: 120 } });
+  assert.deepEqual(ok.problems, []);
+  const bad = await s.onboarding.preview({ workloadId: 'shop', targetGroupArn: s.tg, settings: { fallbackInstanceTypes: ['t3a.medium', 'not a type', 'a', 'b', 'c', 'd'], failedRetrySeconds: 5 } });
+  assert.deepEqual(bad.problems.filter((p) => p.startsWith('settings')), [
+    'settings: fallbackInstanceTypes must be at most 5 EC2 instance types (for example t3a.medium)',
+    'settings: failedRetrySeconds must be an integer from 10 to 600',
+  ]);
+});

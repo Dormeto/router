@@ -194,3 +194,13 @@ variable "wake_rules" {
     error_message = "Each wake_rules header needs either value or pattern."
   }
 }
+
+variable "fallback_instance_types" {
+  description = "EC2 instance types an instance of the workload may fall back to when AWS has no capacity for its own at a wake, in order (for example [\"t3a.medium\", \"m5.large\"]); the instance gets its own type back after its next nap. Needs ec2:ModifyInstanceAttribute in the router's role and DmtRouterBoundary (router 0.25.0, manager 0.5.0). Empty: capacity errors are only retried."
+  type        = list(string)
+  default     = []
+  validation {
+    condition     = length(var.fallback_instance_types) <= 5 && alltrue([for t in var.fallback_instance_types : can(regex("^[a-z][a-z0-9-]*[0-9][a-z0-9-]*\\.[a-z0-9]+$", t))])
+    error_message = "fallback_instance_types: at most 5 EC2 instance types, for example t3a.medium."
+  }
+}

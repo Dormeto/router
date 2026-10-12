@@ -100,6 +100,31 @@ data "aws_iam_policy_document" "controller" {
     }
   }
   statement {
+    # Fallback instance types (R7a): a stopped instance's type.
+    actions   = ["ec2:ModifyInstanceAttribute"]
+    resources = ["${local.arn_prefix}:ec2:${local.region}:${local.account_id}:instance/*"]
+    condition {
+      test     = "Null"
+      variable = "aws:ResourceTag/dormeto:workload"
+      values   = ["false"]
+    }
+  }
+  statement {
+    # The tag keeping an instance's own type until its next stop.
+    actions   = ["ec2:CreateTags", "ec2:DeleteTags"]
+    resources = ["${local.arn_prefix}:ec2:${local.region}:${local.account_id}:instance/*"]
+    condition {
+      test     = "Null"
+      variable = "aws:ResourceTag/dormeto:workload"
+      values   = ["false"]
+    }
+    condition {
+      test     = "ForAllValues:StringEquals"
+      variable = "aws:TagKeys"
+      values   = ["dormeto:instance-type"]
+    }
+  }
+  statement {
     actions   = ["elasticloadbalancing:ModifyRule"]
     resources = ["${local.arn_prefix}:elasticloadbalancing:${local.region}:${local.account_id}:listener-rule/app/*"]
     # Only rules onboarded in Dormeto (tagged dormeto:workload).

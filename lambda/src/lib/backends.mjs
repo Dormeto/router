@@ -1,6 +1,7 @@
 // Backends of a workload: standalone EC2 instances and EC2 Auto Scaling groups feeding the app target group.
 // Instances of a group are never managed one by one: the group would replace a stopped instance.
-import { instanceStates, startInstances, stopInstances } from './instances.mjs';
+import { retryCapacity, startWithCapacity } from './capacity.mjs';
+import { instanceStates, stopInstances } from './instances.mjs';
 import { discoverEcsServices, ecsRecord, ecsStatuses, resumeEcs, sleepEcs, wakeEcs } from './ecs.mjs';
 import { discoverDatabases, isCompanion, rdsStatuses, startDatabases, stopDatabases } from './rds.mjs';
 
@@ -169,9 +170,11 @@ async function step(backend, run) {
   }
 }
 
-export async function wakeBackends({ ec2, autoscaling, ecs, appscaling, rds }, records, timing) {
+// options.fallbackTypes: the workload's fallback instance types; options.onFallback(id, { from, to }) (R7a).
+export async function wakeBackends({ ec2, autoscaling, ecs, appscaling, rds }, records, timing, options = {}) {
   const dbs = companions(records);
-  if (dbs.length) await step(dbs.map((d) => `rds:${d.id}`).join(','), () => startDatabases({ rds }, dbs, timing));
+  // A database start refused for capacity is tried again within the deadline (R7a).
+  if (dbs.length) await step(dbs.map((d) => `rds:${d.id}`).join(','), () => retryCapacity(() => startDatabases({ rds }, dbs, timing), timing));
   const services = ecsOnly(records);
   if (services.length) await step(services.map((x) => `ecs:${x.id}`).join(','), () => wakeEcs({ ecs, appscaling }, services));
   const { ids, groups } = split(records);
@@ -187,7 +190,7 @@ export async function wakeBackends({ ec2, autoscaling, ecs, appscaling, rds }, r
       await autoscaling.resumeProcesses({ AutoScalingGroupName: group.name, ScalingProcesses: SCALING_PROCESSES });
     });
   }
-  if (ids.length) await step(ids.map((id) => `instance:${id}`).join(','), () => startInstances(ec2, ids, timing));
+  if (ids.length) await step(ids.map((id) => `instance:${id}`).join(','), () => startWithCapacity(ec2, ids, timing, options));
 }
 
 // After a wake done outside Dormeto (a group scaled up by hand): resume scaling and restore the recorded limits,

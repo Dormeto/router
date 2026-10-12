@@ -63,6 +63,7 @@ resource "aws_dynamodb_table_item" "config" {
       drainSeconds            = var.drain_seconds
       wakeTimeoutSeconds      = var.wake_timeout_seconds
       failedRetrySeconds      = var.failed_retry_seconds
+      fallbackInstanceTypes   = var.fallback_instance_types
       maxHolders              = var.max_holders
       pollSeconds             = var.poll_seconds
       noWakeRules             = local.no_wake_rules

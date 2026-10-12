@@ -30,23 +30,25 @@ export function createWakeWatch({ autoscaling, ecs }, records, { since, now, eve
     return Object.assign(failureError(kind === 'unknown' ? 'configuration' : kind, `ECS service: ${event.message}`), { backend: `ecs:${service.id}` });
   }
 
-  return {
-    // The first failure seen, as an error the wake fails with; null meanwhile (or between two reads).
+  const watch = {
+    // No capacity: Auto Scaling and ECS keep trying on their own, so the wake waits for its deadline and fails with it.
+    capacity: null,
+    // The first failure seen that will not fix itself, as an error the wake fails with; null meanwhile.
     async check() {
       if (!groups.length && !services.length) return null;
       if (now() - last < everyMs) return null;
       last = now();
-      for (const group of groups) {
-        const error = await groupFailure(group).catch(() => null);
-        if (error) return error;
-      }
-      for (const service of services) {
-        const error = await serviceFailure(service).catch(() => null);
-        if (error) return error;
+      const seen = [];
+      for (const group of groups) seen.push(await groupFailure(group).catch(() => null));
+      for (const service of services) seen.push(await serviceFailure(service).catch(() => null));
+      for (const error of seen.filter(Boolean)) {
+        if (error.kind !== 'capacity') return error;
+        watch.capacity = error;
       }
       return null;
     },
   };
+  return watch;
 }
 
 // At the deadline: why no target is healthy (unhealthy, with the targets' reason), or that none is registered.

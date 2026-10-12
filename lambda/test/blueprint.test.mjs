@@ -263,3 +263,17 @@ test('the controller may read Auto Scaling activities (a wake sees failed launch
   assert.ok(actionsOf(b.roles.find((r) => r.key === 'controller').policy).includes('autoscaling:DescribeScalingActivities'));
   assert.ok((await terraformActions()).controller.includes('autoscaling:DescribeScalingActivities'));
 });
+
+test('fallback instance types (R7a): the controller may change a workload instance\'s type and its dormeto:instance-type tag only, within the boundary', async () => {
+  const b = fill(blueprint({ version: '0.25.0' }), VALUES);
+  const statements = b.roles.find((r) => r.key === 'controller').policy.Statement;
+  const modify = statements.find((s) => [].concat(s.Action).includes('ec2:ModifyInstanceAttribute'));
+  assert.deepEqual(modify.Resource, ['arn:aws:ec2:eu-west-3:121014831971:instance/*']);
+  assert.deepEqual(modify.Condition, { Null: { 'aws:ResourceTag/dormeto:workload': 'false' } });
+  const tags = statements.find((s) => [].concat(s.Action).includes('ec2:CreateTags'));
+  assert.deepEqual([].concat(tags.Action).sort(), ['ec2:CreateTags', 'ec2:DeleteTags']);
+  assert.deepEqual(tags.Condition['ForAllValues:StringEquals'], { 'aws:TagKeys': ['dormeto:instance-type'] });
+  assert.ok(routerBoundary().Statement.find((s) => s.Sid === 'Workloads').Action.includes('ec2:ModifyInstanceAttribute'));
+  const terraform = await terraformActions();
+  for (const action of ['ec2:ModifyInstanceAttribute', 'ec2:CreateTags', 'ec2:DeleteTags']) assert.ok(terraform.controller.includes(action), action);
+});

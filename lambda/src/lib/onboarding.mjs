@@ -31,7 +31,12 @@ const DEFAULTS = { waitSeconds: 60, idleMinutes: 15, drainSeconds: 30, wakeTimeo
 const DATABASE_WAKE_TIMEOUT = 1800;
 const SETTINGS = {
   waitSeconds: [5, 120], idleMinutes: [5, 1440], drainSeconds: [0, 300], wakeTimeoutSeconds: [60, 3600], maxHolders: [1, 500],
+  // Between failed wakes (R7a: doubled after each consecutive failure, at most 30 minutes).
+  failedRetrySeconds: [10, 600],
 };
+// EC2 instance type names (family, generation, options, size), at most 5 (R7a: fallback instance types).
+const INSTANCE_TYPE = /^[a-z][a-z0-9-]*\d[a-z0-9-]*\.[a-z0-9]+$/;
+const FALLBACK_TYPES_MAX = 5;
 const KIND_TEXT = { instance: 'instance', asg: 'Auto Scaling group', ecs: 'ECS service', 'rds-instance': 'RDS instance', 'rds-cluster': 'RDS cluster' };
 
 const tagsOf = (list = [], key = 'Key', value = 'Value') => Object.fromEntries(list.map((t) => [t[key], t[value]]));
@@ -255,6 +260,10 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
     for (const [key, value] of Object.entries(settings)) {
       if (key === 'wakeMode') {
         if (!['any', 'browser'].includes(value)) problems.push('settings: wakeMode must be any or browser');
+      } else if (key === 'fallbackInstanceTypes') {
+        if (!Array.isArray(value) || value.length > FALLBACK_TYPES_MAX || !value.every((t) => typeof t === 'string' && INSTANCE_TYPE.test(t))) {
+          problems.push(`settings: fallbackInstanceTypes must be at most ${FALLBACK_TYPES_MAX} EC2 instance types (for example t3a.medium)`);
+        }
       } else if (SETTINGS[key]) {
         const [min, max] = SETTINGS[key];
         if (!Number.isInteger(value) || value < min || value > max) problems.push(`settings: ${key} must be an integer from ${min} to ${max}`);

@@ -962,7 +962,7 @@ test('a recovery to AWAKE clears the failure; a recovery to ASLEEP keeps it (the
   assert.equal(asleep.store.state.run.failure, '{"kind":"timeout"}');
 });
 
-test('wake (asg): a failed launch ends the wake at once with its kind, not at the timeout (R7a)', async () => {
+test('wake (asg): a failed launch that will not fix itself ends the wake at once with its kind, not at the timeout (R7a)', async () => {
   const s = asgSetup({
     run: { state: STATES.WAKING, wakeId: 'w1', napBackends: JSON.stringify([{ kind: 'asg', name: 'asg-demo', min: 1, max: 3, desired: 1 }]) },
     desired: 0, target: 'waker', healthy: 0,
@@ -970,13 +970,13 @@ test('wake (asg): a failed launch ends the wake at once with its kind, not at th
   s.store.state.run.wakeStartedAt = s.clock.now();
   s.autoscaling.describeScalingActivities = async () => ({ Activities: [{
     StartTime: new Date(s.clock.now() + 1000), StatusCode: 'Failed',
-    StatusMessage: 'We currently do not have sufficient t3.micro capacity in the Availability Zone you requested (eu-west-1a).',
+    StatusMessage: 'The specified launch template, with template ID lt-0123456789, does not exist.',
   }] });
   const started = s.clock.now();
   const result = await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' });
   assert.equal(result.state, STATES.FAILED);
   const failure = JSON.parse(s.store.state.run.failure);
-  assert.deepEqual([failure.kind, failure.backend], ['capacity', 'asg:asg-demo']);
+  assert.deepEqual([failure.kind, failure.backend], ['configuration', 'asg:asg-demo']);
   assert.ok(s.clock.now() - started < 60_000, 'within a minute, not at the 10-minute timeout');
 });
 
@@ -993,4 +993,106 @@ test('wake: at the timeout, the targets say why (unhealthy) (R7a)', async () => 
   const failure = JSON.parse(s.store.state.run.failure);
   assert.equal(failure.kind, 'unhealthy');
   assert.match(failure.message, /none healthy: Target\.FailedHealthChecks/);
+});
+
+// --- Capacity reactions (R7a) ---------------------------------------------------------------------------------------
+
+const capacityError = (type = 't3.medium') => Object.assign(new Error(`We currently do not have sufficient ${type} capacity in the Availability Zone you requested (eu-west-1b).`), { name: 'InsufficientInstanceCapacity' });
+
+test('wake: a capacity error of an EC2 start is tried again within the deadline, and wakes when capacity comes back', async () => {
+  const s = setup({ run: { state: STATES.WAKING, wakeId: 'w1' }, instance: 'stopped', target: 'waker', healthy: 0 });
+  s.store.state.run.wakeStartedAt = s.clock.now();
+  const start = s.ec2.startInstances;
+  let attempts = 0;
+  s.ec2.startInstances = async (input) => {
+    attempts += 1;
+    if (attempts < 3) throw capacityError();
+    s.clock.onSleep(() => { s.elbv2.state.healthy = 1; });
+    return start(input);
+  };
+  const result = await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' });
+  assert.equal(result.state, STATES.AWAKE);
+  assert.equal(attempts, 3);
+});
+
+test('wake: capacity until the deadline fails as capacity, with the AWS message', async () => {
+  const s = setup({ run: { state: STATES.WAKING, wakeId: 'w1' }, instance: 'stopped', target: 'waker', healthy: 0 });
+  s.store.state.run.wakeStartedAt = s.clock.now();
+  let attempts = 0;
+  s.ec2.startInstances = async () => { attempts += 1; throw capacityError(); };
+  await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' });
+  const failure = JSON.parse(s.store.state.run.failure);
+  assert.equal(failure.kind, 'capacity');
+  assert.match(failure.message, /sufficient t3\.medium capacity/);
+  assert.ok(attempts > 3 && attempts < 10, `${attempts} attempts in 10 minutes (30 s, 60 s, then every 120 s)`);
+});
+
+test('wake: an instance falls back to the next type of its list, and gets its own type back after the nap (FinOps)', async () => {
+  const cfg = testConfig({ fallbackInstanceTypes: ['t3a.medium', 'm5.large'] });
+  const s = setup({ run: { state: STATES.WAKING, wakeId: 'w1' }, cfg, instance: 'stopped', target: 'waker', healthy: 0 });
+  s.store.state.run.wakeStartedAt = s.clock.now();
+  const id = cfg.instanceIds[0];
+  const start = s.ec2.startInstances;
+  s.ec2.startInstances = async (input) => {
+    if (s.ec2.state.types[id] === 't3.medium') throw capacityError('t3.medium');
+    s.clock.onSleep(() => { s.elbv2.state.healthy = 1; });
+    return start(input);
+  };
+  const result = await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' });
+  assert.equal(result.state, STATES.AWAKE);
+  assert.equal(s.ec2.state.types[id], 't3a.medium');
+  assert.equal(s.ec2.state.tags[id]['dormeto:instance-type'], 't3.medium');
+  assert.deepEqual(JSON.parse(s.store.state.run.instanceTypes), { [id]: { from: 't3.medium', to: 't3a.medium' } });
+  s.ec2.startInstances = start;
+  s.elbv2.state.healthy = 1;
+  await s.handler({ action: 'nap', workloadId: 'demo' });
+  assert.equal(s.store.state.run.state, STATES.ASLEEP);
+  assert.equal(s.ec2.state.types[id], 't3.medium', 'its own type back after the stop');
+  assert.equal('dormeto:instance-type' in s.ec2.state.tags[id], false);
+  assert.equal('instanceTypes' in s.store.state.run, false);
+});
+
+test('wake: a fallback the boundary refuses fails as permission, naming the access module', async () => {
+  const cfg = testConfig({ fallbackInstanceTypes: ['t3a.medium'] });
+  const s = setup({ run: { state: STATES.WAKING, wakeId: 'w1' }, cfg, instance: 'stopped', target: 'waker', healthy: 0 });
+  s.store.state.run.wakeStartedAt = s.clock.now();
+  s.ec2.startInstances = async () => { throw capacityError(); };
+  s.ec2.modifyInstanceAttribute = async () => { throw Object.assign(new Error('You are not authorized to perform this operation.'), { name: 'UnauthorizedOperation' }); };
+  await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' });
+  const failure = JSON.parse(s.store.state.run.failure);
+  assert.equal(failure.kind, 'permission');
+  assert.match(failure.message, /instance type fallback refused.*apply the access module/);
+});
+
+test('wake (rds): a capacity error of the database start is tried again within the deadline', async () => {
+  const cfg = testConfig({ wakeTimeoutSeconds: 1800 });
+  const s = setup({ run: { state: STATES.WAKING, wakeId: 'w1', napBackends: JSON.stringify([{ kind: 'rds-instance', id: 'db1' }, { kind: 'instance', id: cfg.instanceIds[0] }]) }, cfg, instance: 'stopped', target: 'waker', healthy: 0, databases: { instances: { db1: { status: 'stopped' } } } });
+  s.store.state.run.wakeStartedAt = s.clock.now();
+  const startDb = s.rds.startDBInstance;
+  let attempts = 0;
+  s.rds.startDBInstance = async (input) => {
+    attempts += 1;
+    if (attempts < 2) throw Object.assign(new Error('no capacity for your instance class db.t4g.micro in AZ eu-west-1b'), { name: 'InsufficientDBInstanceCapacity' });
+    return startDb(input);
+  };
+  s.ec2.state.onStart.push(() => { s.clock.onSleep(() => { s.elbv2.state.healthy = 1; }); });
+  const rdsState = s.rds.state;
+  s.clock.onSleep(() => { for (const db of Object.values(rdsState.instances)) if (db.status === 'starting') db.status = 'available'; });
+  const result = await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' });
+  assert.equal(result.state, STATES.AWAKE);
+  assert.equal(attempts, 2);
+});
+
+test('wake (asg): no capacity reported by Auto Scaling is waited out (it keeps trying), failing as capacity at the deadline', async () => {
+  const s = asgSetup({
+    run: { state: STATES.WAKING, wakeId: 'w1', napBackends: JSON.stringify([{ kind: 'asg', name: 'asg-demo', min: 1, max: 3, desired: 1 }]) },
+    desired: 0, target: 'waker', healthy: 0,
+  });
+  s.store.state.run.wakeStartedAt = s.clock.now();
+  s.autoscaling.describeScalingActivities = async () => ({ Activities: [{ StartTime: new Date(s.clock.now()), StatusCode: 'Failed', StatusMessage: 'We currently do not have sufficient t3.micro capacity in the Availability Zone you requested (eu-west-1a).' }] });
+  const started = s.clock.now();
+  await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' });
+  const failure = JSON.parse(s.store.state.run.failure);
+  assert.deepEqual([failure.kind, failure.backend], ['capacity', 'asg:asg-demo']);
+  assert.ok(s.clock.now() - started >= 600_000, 'waited until the deadline');
 });

@@ -17,14 +17,16 @@ function clients({ activities = [], events = [], targets = [] } = {}) {
 const ASG = { kind: 'asg', name: 'dmt-dev-demo-asg' };
 const ECS = { kind: 'ecs', id: 'arn:aws:ecs:eu-west-1:1:service/dmt-dev/demo', cluster: 'arn:aws:ecs:eu-west-1:1:cluster/dmt-dev' };
 
-test('a failed Auto Scaling launch since the wake started ends the wake with its kind; an older one is ignored', async () => {
+test('a failed Auto Scaling launch since the wake started is noted (capacity) or ends the wake; an older one is ignored', async () => {
   let now = SINCE + 40_000;
   const c = clients({ activities: [
     { StartTime: at(-600), StatusCode: 'Failed', StatusMessage: 'an older launch failure' },
     { StartTime: at(5), StatusCode: 'Failed', StatusMessage: 'We currently do not have sufficient t3.micro capacity in the Availability Zone you requested (eu-west-1a).' },
   ] });
   const watch = createWakeWatch(c, [ASG], { since: SINCE, now: () => now });
-  const error = await watch.check();
+  // No capacity: Auto Scaling keeps trying, so the wake goes on, the failure noted for its deadline (R7a).
+  assert.equal(await watch.check(), null);
+  const error = watch.capacity;
   assert.equal(error.kind, 'capacity');
   assert.equal(error.backend, 'asg:dmt-dev-demo-asg');
   assert.match(error.message, /^Auto Scaling group dmt-dev-demo-asg: We currently do not have sufficient t3\.micro capacity/);
@@ -38,8 +40,8 @@ test('an ECS event saying a task cannot be placed ends the wake; a steady or sta
     { createdAt: at(20), message: '(service demo) was unable to place a task because no container instance met all of its requirements.' },
     { createdAt: at(3), message: '(service demo) has started 1 tasks: (task abc).' },
   ] }), [ECS], { since: SINCE, now });
-  const error = await failing.check();
-  assert.deepEqual([error.kind, error.backend], ['capacity', 'ecs:arn:aws:ecs:eu-west-1:1:service/dmt-dev/demo']);
+  assert.equal(await failing.check(), null, 'ECS keeps trying to place it');
+  assert.deepEqual([failing.capacity.kind, failing.capacity.backend], ['capacity', 'ecs:arn:aws:ecs:eu-west-1:1:service/dmt-dev/demo']);
   const fine = createWakeWatch(clients({ events: [{ createdAt: at(30), message: '(service demo) has reached a steady state.' }] }), [ECS], { since: SINCE, now });
   assert.equal(await fine.check(), null);
 });

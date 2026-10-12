@@ -19,7 +19,7 @@ function setup({ run, cfg = adminConfig(), metric = [], timestamps = [] } = {}) 
   const invocations = [];
   const invokeController = async (payload) => { invocations.push(payload); };
   const autoscaling = fakeAutoScaling();
-  const admin = createAdmin({ ec2, elbv2, cloudwatch, autoscaling, invokeController, now: clock.now, log: silentLog });
+  const admin = createAdmin({ ec2, elbv2, cloudwatch, autoscaling, invokeController, now: clock.now, log: silentLog, version: { version: '0.3.0', build: 'abc123def456' } });
   const handler = createWaker({
     store, invokeController, prefix: 'dmt-dev-', now: clock.now, sleep: clock.sleep,
     newId: () => 'wake-1', log: silentLog, getAdmin: async () => admin,
@@ -206,4 +206,12 @@ test('status.json lists every backend with its status, including Auto Scaling gr
   assert.deepEqual(status.instances, [{ id: 'i-a', state: 'running' }]);
   const html = await handler(albEvent({ path: `${BASE}/` }));
   assert.match(html.body, /asg-demo: running \(min 1, desired 1, max 2\)/);
+});
+
+test('status.json and the dashboard show the router version and build', async () => {
+  const { handler } = setup({ run: { state: STATES.AWAKE } });
+  const status = JSON.parse((await handler(albEvent({ path: `${BASE}/status.json` }))).body);
+  assert.deepEqual(status.router, { version: '0.3.0', build: 'abc123def456' });
+  const html = (await handler(albEvent({ path: `${BASE}/` }))).body;
+  assert.match(html, /Router 0\.3\.0 \(build abc123def456\)/);
 });

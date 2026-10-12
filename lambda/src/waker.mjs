@@ -23,6 +23,7 @@ const getAdmin = memoizeAsync(() => Promise.all([
   autoscaling: createAutoScaling(),
   invokeController,
   log: logger,
+  version: { version: process.env.DMT_VERSION, build: process.env.DMT_BUILD },
 })));
 
 export const handler = createWaker({

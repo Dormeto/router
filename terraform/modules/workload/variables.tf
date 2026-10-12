@@ -82,6 +82,12 @@ variable "admin_enabled" {
   default     = false
 }
 
+variable "admin_secret_parameter" {
+  description = "Name of the SSM SecureString parameter holding the admin secret, recorded in the workload configuration so that operators and tools (dormeto-e2e) can retrieve it with AWS credentials. The Lambdas only use the hash."
+  type        = string
+  default     = null
+}
+
 variable "admin_secret" {
   description = "Secret path segment of the admin dashboard (24-64 alphanumeric characters)."
   type        = string

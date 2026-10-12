@@ -30,3 +30,9 @@ variable "admin_enabled" {
   type        = bool
   default     = false
 }
+
+variable "router_version" {
+  description = "Router version (package.json), exposed to the Lambdas as DMT_VERSION; DMT_BUILD is the code hash."
+  type        = string
+  default     = "0.0.0"
+}

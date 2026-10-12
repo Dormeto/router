@@ -40,7 +40,7 @@ export function napEstimate({ cfg, run, lastRequest, now }) {
 
 const iso = (ms) => (typeof ms === 'number' && ms > 0 ? new Date(ms).toISOString() : null);
 
-export function createAdmin({ ec2, elbv2, cloudwatch, autoscaling, invokeController, now = Date.now, log }) {
+export function createAdmin({ ec2, elbv2, cloudwatch, autoscaling, invokeController, now = Date.now, log, version = {} }) {
   const clients = { ec2, elbv2, autoscaling };
   async function status(workloadId, cfg, run) {
     const t = now();
@@ -56,6 +56,7 @@ export function createAdmin({ ec2, elbv2, cloudwatch, autoscaling, invokeControl
     const nap = napEstimate({ cfg, run, lastRequest, now: t });
     return {
       workloadId,
+      router: { version: version.version ?? 'unknown', build: version.build ?? 'unknown' },
       state: run.state,
       updatedAt: iso(run.updatedAt),
       awakeSince: iso(run.awakeSince),

@@ -144,4 +144,5 @@ module "demo_asg_workload" {
   idle_minutes                = var.idle_minutes
   admin_enabled               = var.admin_dashboard_enabled
   admin_secret                = var.admin_dashboard_enabled ? random_password.admin[0].result : null
+  admin_secret_parameter      = var.admin_dashboard_enabled ? aws_ssm_parameter.admin_secret[0].name : null
 }

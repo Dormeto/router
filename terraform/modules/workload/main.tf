@@ -43,6 +43,8 @@ resource "aws_dynamodb_table_item" "config" {
       admin = {
         enabled    = var.admin_enabled && var.admin_secret != null
         secretHash = var.admin_enabled && var.admin_secret != null ? sha256(var.admin_secret) : ""
+        # Where operators retrieve the secret (with ssm:GetParameter): never the secret itself.
+        secretParameter = var.admin_enabled && var.admin_secret_parameter != null ? var.admin_secret_parameter : ""
       }
     }) }
   })

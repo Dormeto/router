@@ -125,6 +125,15 @@ resource "random_password" "admin" {
   special = false
 }
 
+# Retrievable by operators and dormeto-e2e with AWS credentials (ssm:GetParameter + KMS decrypt).
+resource "aws_ssm_parameter" "admin_secret" {
+  count       = var.admin_dashboard_enabled ? 1 : 0
+  name        = "/${local.name}/admin-secret"
+  description = "Secret path segment of the Dormeto admin dashboards (/_dormeto/<secret>/)"
+  type        = "SecureString"
+  value       = random_password.admin[0].result
+}
+
 # Admin dashboard: same Lambda, reached through the waker target group in every state (awake or asleep).
 # The rule matches the whole /_dormeto/ prefix: the secret is never stored in the ALB configuration (readable
 # with elasticloadbalancing:DescribeRules and in CloudTrail), only as a SHA-256 hash in the workload config.

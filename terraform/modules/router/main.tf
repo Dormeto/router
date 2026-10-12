@@ -21,6 +21,11 @@ resource "aws_dynamodb_table" "router" {
   }
 }
 
+locals {
+  # Identifies the exact deployed code: first 12 hex characters of the Lambda zip SHA-256.
+  build = substr(data.archive_file.lambda.output_sha256, 0, 12)
+}
+
 data "archive_file" "lambda" {
   type        = "zip"
   source_dir  = var.lambda_source_dir
@@ -50,7 +55,9 @@ resource "aws_lambda_function" "controller" {
 
   environment {
     variables = {
-      DMT_TABLE = aws_dynamodb_table.router.name
+      DMT_TABLE   = aws_dynamodb_table.router.name
+      DMT_VERSION = var.router_version
+      DMT_BUILD   = local.build
     }
   }
 
@@ -96,6 +103,8 @@ resource "aws_lambda_function" "waker" {
       DMT_TABLE      = aws_dynamodb_table.router.name
       DMT_CONTROLLER = aws_lambda_function.controller.function_name
       DMT_TG_PREFIX  = "${var.name}-"
+      DMT_VERSION    = var.router_version
+      DMT_BUILD      = local.build
     }
   }
 

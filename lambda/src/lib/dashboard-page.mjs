@@ -65,7 +65,7 @@ ${status.ignoredTargets?.length ? row('Ignored targets', status.ignoredTargets.m
 ${row('Target health', list(status.targets))}
 ${row('Settings', Object.entries(status.settings).map(([k, v]) => `${k}=${v}`).join(', '))}
 </table>
-<p class="note">Refreshes every 10 s. JSON: <a href="${escapeHtml(base)}/status.json">status.json</a></p>
+<p class="note">Router ${escapeHtml(status.router?.version ?? 'unknown')} (build ${escapeHtml(status.router?.build ?? 'unknown')}). Refreshes every 10 s. JSON: <a href="${escapeHtml(base)}/status.json">status.json</a></p>
 </main>
 </body>
 </html>`;

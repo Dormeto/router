@@ -116,3 +116,35 @@ resource "aws_lb_listener_rule" "demo" {
     ignore_changes = [action]
   }
 }
+
+resource "random_password" "admin" {
+  count   = var.admin_dashboard_enabled ? 1 : 0
+  length  = 32
+  special = false
+}
+
+# Admin dashboard: same Lambda, reached through the waker target group in every state (awake or asleep).
+resource "aws_lb_listener_rule" "admin" {
+  count        = var.admin_dashboard_enabled ? 1 : 0
+  listener_arn = aws_lb_listener.https.arn
+  priority     = 5
+
+  condition {
+    host_header {
+      values = [local.domain]
+    }
+  }
+
+  condition {
+    path_pattern {
+      values = ["/_dormeto/${random_password.admin[0].result}", "/_dormeto/${random_password.admin[0].result}/*"]
+    }
+  }
+
+  action {
+    type             = "forward"
+    target_group_arn = module.demo_workload.waker_target_group_arn
+  }
+
+  tags = { "dormeto:workload" = "demo", "dormeto:role" = "admin" }
+}

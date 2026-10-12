@@ -24,3 +24,9 @@ variable "log_retention_days" {
   type    = number
   default = 14
 }
+
+variable "admin_enabled" {
+  description = "Grant the waker the read-only permissions of the admin dashboard."
+  type        = bool
+  default     = false
+}

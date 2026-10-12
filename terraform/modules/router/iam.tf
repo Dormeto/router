@@ -36,6 +36,14 @@ data "aws_iam_policy_document" "waker" {
     actions   = ["logs:CreateLogStream", "logs:PutLogEvents"]
     resources = ["${aws_cloudwatch_log_group.waker.arn}:*"]
   }
+  dynamic "statement" {
+    for_each = var.admin_enabled ? [1] : []
+    content {
+      sid       = "AdminDashboardRead"
+      actions   = ["ec2:DescribeInstances", "elasticloadbalancing:DescribeRules", "elasticloadbalancing:DescribeTargetHealth", "cloudwatch:GetMetricData"]
+      resources = ["*"]
+    }
+  }
 }
 
 resource "aws_iam_role_policy" "waker" {

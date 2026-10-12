@@ -72,3 +72,20 @@ variable "poll_seconds" {
   type    = number
   default = 3
 }
+
+variable "admin_enabled" {
+  description = "Feature flag of the admin dashboard behind /_dormeto/<admin_secret>/."
+  type        = bool
+  default     = false
+}
+
+variable "admin_secret" {
+  description = "Secret path segment of the admin dashboard (24-64 alphanumeric characters)."
+  type        = string
+  default     = null
+  sensitive   = true
+  validation {
+    condition     = var.admin_secret == null || can(regex("^[A-Za-z0-9]{24,64}$", var.admin_secret))
+    error_message = "admin_secret must be 24-64 alphanumeric characters."
+  }
+}

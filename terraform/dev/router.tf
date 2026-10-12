@@ -3,6 +3,7 @@ module "router" {
   name                  = local.name
   lambda_source_dir     = "${path.module}/../../lambda/src"
   waker_timeout_seconds = var.wait_seconds + 10
+  admin_enabled         = var.admin_dashboard_enabled
 }
 
 module "demo_workload" {
@@ -16,4 +17,6 @@ module "demo_workload" {
   instance_ids                = [aws_instance.demo.id]
   wait_seconds                = var.wait_seconds
   idle_minutes                = var.idle_minutes
+  admin_enabled               = var.admin_dashboard_enabled
+  admin_secret                = var.admin_dashboard_enabled ? random_password.admin[0].result : null
 }

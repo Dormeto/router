@@ -46,3 +46,16 @@ aws lambda invoke --cli-read-timeout 900 --function-name dmt-dev-controller --cl
 aws lambda invoke --cli-read-timeout 900 --function-name dmt-dev-controller --cli-binary-format raw-in-base64-out --payload '{"action":"check"}' /dev/stdout
 aws dynamodb get-item --table-name dmt-dev-router --key '{"pk":{"S":"WL#demo"},"sk":{"S":"RUN"}}'
 ```
+
+## Admin dashboard (feature flag)
+
+With `admin_dashboard_enabled = true` (default in `dev`), the waker Lambda also serves a lightweight dashboard behind a
+secret URL: state, time before nap, underlying resources (route, instance, target health), force nap and force awake.
+
+```bash
+terraform -chdir=terraform/dev output -raw admin_url          # open it in a browser
+curl -sS "$(terraform -chdir=terraform/dev output -raw admin_url)status.json"
+terraform -chdir=terraform/dev apply -replace='random_password.admin[0]'   # rotate the secret
+```
+
+The secret URL is the only protection: never share it. Disable the flag with `-var admin_dashboard_enabled=false`.

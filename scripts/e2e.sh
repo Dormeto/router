@@ -99,6 +99,31 @@ controller '{"action":"check"}'
 wait_for_app 120
 pass "external start reconciled"
 
+echo "== 6b. Admin dashboard (feature flag admin_dashboard_enabled)"
+ADMIN_URL=$($TF output -raw admin_url)
+if [ -z "$ADMIN_URL" ]; then
+  echo "skipped: admin dashboard disabled"
+else
+  admin_json() { curl -sS "${ADMIN_URL}status.json" | python3 -c "import json,sys; print(json.load(sys.stdin)$1)"; }
+  wait_state() {
+    local deadline=$((SECONDS + 300))
+    until [ "$(run_attr state)" = "$1" ]; do
+      [ $SECONDS -lt $deadline ] || fail "state did not become $1"
+      sleep 5
+    done
+  }
+  [ "$(admin_json "['state']")" = "AWAKE" ] || fail "admin status is not AWAKE"
+  [ "$(admin_json "['route']")" = "app" ] || fail "admin route is not app while awake"
+  [ "$(admin_json "['instances'][0]['state']")" = "running" ] || fail "admin does not report the running instance"
+  curl -sS "${URL}_dormeto/not-the-secret/status.json" | grep -q '"workloadId"' && fail "dashboard reachable with a wrong secret"
+  [ "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${ADMIN_URL}nap")" = "303" ] || fail "force nap rejected"
+  wait_state ASLEEP
+  [ "$(admin_json "['route']")" = "waker" ] || fail "admin route is not waker while asleep"
+  [ "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${ADMIN_URL}wake")" = "303" ] || fail "force awake rejected"
+  wait_state AWAKE
+  wait_for_app 120
+  pass "admin dashboard: status, wrong secret rejected, force nap, force awake"
+fi
 echo "== 7. Waker invocations while awake (last 2 minutes, after reconcile)"
 sleep 120
 for _ in $(seq 1 50); do curl -sS -o /dev/null "$URL"; done

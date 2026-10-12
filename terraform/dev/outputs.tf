@@ -25,3 +25,9 @@ output "waker_function_name" {
 output "controller_function_name" {
   value = module.router.controller_function_name
 }
+
+output "admin_url" {
+  description = "Secret URL of the admin dashboard (empty when the feature flag is off)."
+  value       = var.admin_dashboard_enabled ? "https://${local.domain}/_dormeto/${random_password.admin[0].result}/" : ""
+  sensitive   = true
+}

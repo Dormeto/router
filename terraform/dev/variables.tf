@@ -48,3 +48,9 @@ locals {
   name   = "dmt-${var.env}"
   domain = "${var.env}.${var.zone_name}"
 }
+
+variable "admin_dashboard_enabled" {
+  description = "Feature flag: lightweight admin dashboard behind a secret URL on the demo domain."
+  type        = bool
+  default     = true
+}

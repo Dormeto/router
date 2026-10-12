@@ -40,6 +40,10 @@ resource "aws_dynamodb_table_item" "config" {
       failedRetrySeconds      = var.failed_retry_seconds
       maxHolders              = var.max_holders
       pollSeconds             = var.poll_seconds
+      admin = {
+        enabled    = var.admin_enabled && var.admin_secret != null
+        secretHash = var.admin_enabled && var.admin_secret != null ? sha256(var.admin_secret) : ""
+      }
     }) }
   })
 }

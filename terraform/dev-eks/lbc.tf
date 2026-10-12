@@ -33,7 +33,7 @@ resource "helm_release" "lbc" {
     tolerations    = [{ key = "CriticalAddonsOnly", operator = "Exists" }]
   })]
 
-  depends_on = [module.lbc_pod_identity]
+  depends_on = [module.lbc_pod_identity, terraform_data.admin_access]
 }
 
 # On destroy, after the demos: wait until the controller has deleted its load balancers and target groups (they would

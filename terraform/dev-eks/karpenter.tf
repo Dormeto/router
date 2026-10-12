@@ -28,6 +28,8 @@ resource "helm_release" "karpenter" {
     }
     controller = { resources = { requests = { cpu = "100m", memory = "256Mi" }, limits = { memory = "512Mi" } } }
   })]
+
+  depends_on = [terraform_data.admin_access]
 }
 
 # On destroy, after the NodePool is gone: wait until Karpenter's instances are terminated (they would keep billing and

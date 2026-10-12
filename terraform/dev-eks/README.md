@@ -18,6 +18,10 @@ onboards them; `dormeto-e2e` runs its acceptance.
 - **Access:** the user's SSO role has cluster admin through an access entry (`admin_role_arn`):
   `aws eks update-kubeconfig --name eks-demo --region eu-west-1 --profile kloudy-dormeto-prd`.
 
+**Needs** the AWS CLI and kubectl on the caller's PATH: before the charts, the root waits until every API server
+enforces the caller's admin access (EKS takes some seconds, each API server on its own); its destroy-time waits use the
+AWS CLI too.
+
 ```
 tfenv exec init
 tfenv exec plan -out dev-eks.tfplan        # read it

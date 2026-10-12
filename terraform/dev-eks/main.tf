@@ -100,3 +100,29 @@ module "eks" {
 
   node_security_group_tags = { "karpenter.sh/discovery" = var.name }
 }
+
+# EKS enforces a new access policy some seconds after associating it, each API server on its own (the first apply's
+# charts were refused 3 and 29 seconds after it): the charts install once the caller may create CRDs, five answers in a
+# row.
+resource "terraform_data" "admin_access" {
+  input = { cluster = module.eks.cluster_name, associations = keys(module.eks.access_policy_associations) }
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      kubeconfig=$(mktemp)
+      trap 'rm -f "$kubeconfig"' EXIT
+      aws eks update-kubeconfig --name ${self.input.cluster} --region ${var.region} --profile ${var.aws_profile} \
+        --kubeconfig "$kubeconfig" >/dev/null
+      ok=0
+      for i in $(seq 150); do
+        if [ "$(kubectl --kubeconfig "$kubeconfig" auth can-i create customresourcedefinitions.apiextensions.k8s.io 2>/dev/null)" = "yes" ]; then
+          ok=$((ok + 1)); [ "$ok" -ge 5 ] && exit 0
+        else
+          ok=0
+        fi
+        sleep 2
+      done
+      echo "the cluster still refuses the caller's admin access after 5 minutes" >&2; exit 1
+    EOT
+  }
+}

@@ -39,8 +39,9 @@ variable "instance_ids" {
 }
 
 variable "wait_seconds" {
-  type    = number
-  default = 20
+  description = "Maximum time the waker holds a request before the waiter page. 35 s covers a wake (~13 s) plus the 15 s route grace window."
+  type        = number
+  default     = 35
 }
 
 variable "idle_minutes" {

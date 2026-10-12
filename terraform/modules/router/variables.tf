@@ -11,7 +11,7 @@ variable "lambda_source_dir" {
 variable "waker_timeout_seconds" {
   description = "Waker Lambda timeout. Must exceed the largest workload waitSeconds by at least 5 seconds."
   type        = number
-  default     = 30
+  default     = 45
 }
 
 variable "check_schedule" {

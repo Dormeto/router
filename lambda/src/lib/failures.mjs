@@ -54,8 +54,11 @@ export const failureError = (kind, message) => Object.assign(new Error(message),
 const RETRY_MAX_MS = 30 * 60_000;
 export const retryDelayMs = (cfg, run) => Math.min((cfg.failedRetrySeconds ?? 60) * 1000 * 2 ** (Math.max(1, run?.consecutiveFailures ?? 1) - 1), RETRY_MAX_MS);
 
-// When a request may retry a failed wake (ms), or null when the workload has not failed.
-export const nextAttemptAt = (cfg, run) => (run?.state === 'FAILED' ? (run.failedAt ?? 0) + retryDelayMs(cfg, run) : null);
+// When a request may retry a failed wake (ms), or null when the workload has not failed. A failed workload back to
+// ASLEEP (released after its idle window, or found stopped at a check) keeps its failure until a successful wake, and
+// backs off as well: otherwise a waiting page left open would start it again at once, every time.
+export const nextAttemptAt = (cfg, run) => (run?.state === 'FAILED' || (run?.state === 'ASLEEP' && run.failure)
+  ? (run.failedAt ?? 0) + retryDelayMs(cfg, run) : null);
 
 // The kind of the run's last failure, or null.
 export function failureKind(run) {

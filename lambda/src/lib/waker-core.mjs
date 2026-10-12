@@ -78,6 +78,8 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
     const t = now();
     switch (run.state) {
       case STATES.ASLEEP:
+        // Asleep after a failure: backed off as FAILED is (review C1).
+        if ((nextAttemptAt(cfg, run) ?? 0) > t) return run;
         return startWake(workloadId, { state: STATES.ASLEEP }, run, origin);
       case STATES.FAILED:
         // Backed off (R7a): each consecutive failure doubles the wait, at most 30 minutes.
@@ -155,7 +157,8 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
     if (run.state !== STATES.AWAKE) {
       // Browser mode: API clients learn how to wake the workload.
       const hint = cfg.wakeMode === 'browser' && [STATES.ASLEEP, STATES.FAILED].includes(run.state) ? WAKE_HEADER : undefined;
-      const failed = run.state === STATES.FAILED ? { kind: failureKind(run), retryAt: nextAttemptAt(cfg, run) } : null;
+      const retryAt = nextAttemptAt(cfg, run);
+      const failed = retryAt !== null ? { kind: failureKind(run), retryAt } : null;
       return waiter(event, cfg.pollSeconds, run.state, hint, failed);
     }
     if (inRouteGrace(run)) return waiter(event, cfg.pollSeconds, STATES.AWAKE);

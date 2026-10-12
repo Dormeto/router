@@ -100,7 +100,8 @@ data "aws_iam_policy_document" "controller" {
     }
   }
   statement {
-    # Fallback instance types (R7a): a stopped instance's type.
+    # Fallback instance types (R7a): a stopped instance's type only (one attribute per call: never its user data,
+    # groups or role).
     actions   = ["ec2:ModifyInstanceAttribute"]
     resources = ["${local.arn_prefix}:ec2:${local.region}:${local.account_id}:instance/*"]
     condition {
@@ -108,14 +109,25 @@ data "aws_iam_policy_document" "controller" {
       variable = "aws:ResourceTag/dormeto:workload"
       values   = ["false"]
     }
+    condition {
+      test     = "Null"
+      variable = "ec2:Attribute/InstanceType"
+      values   = ["false"]
+    }
   }
   statement {
-    # The tag keeping an instance's own type until its next stop.
+    # The tag keeping an instance's own type until its next stop; named keys only (DeleteTags without keys removes
+    # every tag, and ForAllValues holds then).
     actions   = ["ec2:CreateTags", "ec2:DeleteTags"]
     resources = ["${local.arn_prefix}:ec2:${local.region}:${local.account_id}:instance/*"]
     condition {
       test     = "Null"
       variable = "aws:ResourceTag/dormeto:workload"
+      values   = ["false"]
+    }
+    condition {
+      test     = "Null"
+      variable = "aws:TagKeys"
       values   = ["false"]
     }
     condition {

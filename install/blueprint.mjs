@@ -49,9 +49,11 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
       allow(['dynamodb:GetItem', 'dynamodb:UpdateItem', 'dynamodb:Scan', 'dynamodb:Query', 'dynamodb:DeleteItem'], [tableArn]),
       allow(['ec2:DescribeInstances', 'elasticloadbalancing:DescribeRules', 'elasticloadbalancing:DescribeTargetHealth', 'elasticloadbalancing:DescribeTargetGroups', 'elasticloadbalancing:DescribeListeners', 'elasticloadbalancing:DescribeTags', 'cloudwatch:GetMetricData', 'lambda:GetAccountSettings'], ['*']),
       allow(['ec2:StartInstances', 'ec2:StopInstances'], [arn('ec2', 'instance/*')], tagged),
-      // Fallback instance types (R7a): a stopped instance's type, and the tag keeping its own type until the next stop.
-      allow(['ec2:ModifyInstanceAttribute'], [arn('ec2', 'instance/*')], tagged),
-      allow(['ec2:CreateTags', 'ec2:DeleteTags'], [arn('ec2', 'instance/*')], { ...tagged, 'ForAllValues:StringEquals': { 'aws:TagKeys': ['dormeto:instance-type'] } }),
+      // Fallback instance types (R7a): a stopped instance's type only (one attribute per call: never its user data, groups
+      // or role), and the tag keeping its own type until the next stop (named keys only: DeleteTags without keys removes
+      // every tag, and ForAllValues holds then).
+      allow(['ec2:ModifyInstanceAttribute'], [arn('ec2', 'instance/*')], { Null: { ...tagged.Null, 'ec2:Attribute/InstanceType': 'false' } }),
+      allow(['ec2:CreateTags', 'ec2:DeleteTags'], [arn('ec2', 'instance/*')], { Null: { ...tagged.Null, 'aws:TagKeys': 'false' }, 'ForAllValues:StringEquals': { 'aws:TagKeys': ['dormeto:instance-type'] } }),
       allow(['elasticloadbalancing:ModifyRule'], [arn('elasticloadbalancing', 'listener-rule/app/*')], tagged),
       // ELB checks it when a rule's actions authenticate with Amazon Cognito (the rule switched with its actions).
       allow(['cognito-idp:DescribeUserPoolClient'], [arn('cognito-idp', 'userpool/*')]),

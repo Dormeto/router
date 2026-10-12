@@ -51,7 +51,10 @@ async function fallBack(ec2, id, fallbackTypes) {
 }
 
 // EC2 starts: with fallback types, each instance on its own, changing type on a capacity error; onFallback(id, change).
-export async function startWithCapacity(ec2, ids, timing, { fallbackTypes = [], onFallback = () => {} } = {}) {
+// An instance still on a fallback type (its nap failed after the stop, review I1) gets its own type back first: each
+// wake tries the instance's own type before any fallback.
+export async function startWithCapacity(ec2, ids, timing, { fallbackTypes = [], onFallback = () => {}, log } = {}) {
+  await revertInstanceTypes(ec2, ids, log);
   if (!fallbackTypes.length) return retryCapacity(() => startInstances(ec2, ids, timing), timing);
   for (const id of ids) {
     await retryCapacity(async () => {

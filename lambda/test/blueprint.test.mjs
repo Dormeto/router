@@ -269,11 +269,25 @@ test('fallback instance types (R7a): the controller may change a workload instan
   const statements = b.roles.find((r) => r.key === 'controller').policy.Statement;
   const modify = statements.find((s) => [].concat(s.Action).includes('ec2:ModifyInstanceAttribute'));
   assert.deepEqual(modify.Resource, ['arn:aws:ec2:eu-west-3:121014831971:instance/*']);
-  assert.deepEqual(modify.Condition, { Null: { 'aws:ResourceTag/dormeto:workload': 'false' } });
+  assert.equal(modify.Condition.Null['aws:ResourceTag/dormeto:workload'], 'false');
   const tags = statements.find((s) => [].concat(s.Action).includes('ec2:CreateTags'));
   assert.deepEqual([].concat(tags.Action).sort(), ['ec2:CreateTags', 'ec2:DeleteTags']);
   assert.deepEqual(tags.Condition['ForAllValues:StringEquals'], { 'aws:TagKeys': ['dormeto:instance-type'] });
   assert.ok(routerBoundary().Statement.find((s) => s.Sid === 'Workloads').Action.includes('ec2:ModifyInstanceAttribute'));
   const terraform = await terraformActions();
   for (const action of ['ec2:ModifyInstanceAttribute', 'ec2:CreateTags', 'ec2:DeleteTags']) assert.ok(terraform.controller.includes(action), action);
+});
+
+test('fallback IAM is limited to the instance type, and DeleteTags to named keys (review I2, I3), in the blueprint and Terraform', async () => {
+  const b = fill(blueprint({ version: '0.25.0' }), VALUES);
+  const statements = b.roles.find((r) => r.key === 'controller').policy.Statement;
+  const modify = statements.find((s) => [].concat(s.Action).includes('ec2:ModifyInstanceAttribute'));
+  // One attribute per call (EC2): only calls that change the type, never UserData, groups or the role.
+  assert.deepEqual(modify.Condition, { Null: { 'aws:ResourceTag/dormeto:workload': 'false', 'ec2:Attribute/InstanceType': 'false' } });
+  const tags = statements.find((s) => [].concat(s.Action).includes('ec2:DeleteTags'));
+  // ForAllValues holds when no key is given: DeleteTags without Tags would remove every tag.
+  assert.deepEqual(tags.Condition.Null, { 'aws:ResourceTag/dormeto:workload': 'false', 'aws:TagKeys': 'false' });
+  const iam = await readFile(new URL('../../terraform/modules/router/iam.tf', import.meta.url), 'utf8');
+  assert.match(iam, /actions\s*=\s*\["ec2:ModifyInstanceAttribute"\][\s\S]*?variable = "ec2:Attribute\/InstanceType"\s*values\s*=\s*\["false"\]/);
+  assert.match(iam, /actions\s*=\s*\["ec2:CreateTags", "ec2:DeleteTags"\][\s\S]*?test\s*=\s*"Null"\s*variable = "aws:TagKeys"\s*values\s*=\s*\["false"\]/);
 });

@@ -122,6 +122,7 @@ export function createController({
       const records = await wakeRecords(run, cfg);
       await wakeBackends(clients, records, timing, {
         fallbackTypes: cfg.fallbackInstanceTypes ?? [],
+        log,
         onFallback: (id, change) => {
           fallbacks[id] = change;
           log.warn('InstanceTypeFallback', { workloadId, wakeId, instance: id, ...change });

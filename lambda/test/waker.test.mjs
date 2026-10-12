@@ -301,3 +301,20 @@ test('FAILED: the waiting page says why and when the next attempt is (R7a)', asy
   assert.equal(headerOf(res, 'x-dormeto-retry-at'), new Date(s.clock.now() + 90_000).toISOString());
   assert.match(res.body, /AWS has no capacity for this application right now: the start is retried, next attempt in 2 minutes/);
 });
+
+test('ASLEEP after a failure (released, or back to ASLEEP at a check): requests back off too, and the page says why (review C1)', async () => {
+  const failure = JSON.stringify({ kind: 'capacity', step: 'wake', message: 'no capacity', at: 0 });
+  const within = setup({ run: { state: STATES.ASLEEP, consecutiveFailures: 2, failure }, cfg: testConfig({ waitSeconds: 0 }) });
+  within.store.state.run.failedAt = within.clock.now() - 30_000;
+  const res = await within.handler(albEvent({ headers: { accept: 'text/html' } }));
+  assert.equal(within.invocations.length, 0, 'not woken within the backoff');
+  assert.equal(headerOf(res, 'x-dormeto-failure'), 'capacity');
+  assert.equal(headerOf(res, 'x-dormeto-retry-at'), new Date(within.clock.now() + 90_000).toISOString());
+  const after = setup({ run: { state: STATES.ASLEEP, consecutiveFailures: 2, failure }, cfg: testConfig({ waitSeconds: 0 }) });
+  after.store.state.run.failedAt = after.clock.now() - 121_000;
+  await after.handler(albEvent());
+  assert.equal(after.invocations.length, 1, 'woken after it');
+  const clean = setup({ run: { state: STATES.ASLEEP }, cfg: testConfig({ waitSeconds: 0 }) });
+  await clean.handler(albEvent());
+  assert.equal(clean.invocations.length, 1, 'an ASLEEP workload without failure wakes at once');
+});

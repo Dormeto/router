@@ -1065,6 +1065,27 @@ test('wake: an instance falls back to the next type of its list, and gets its ow
   assert.equal('instanceTypes' in s.store.state.run, false);
 });
 
+test('wake: an instance left on a fallback type (its nap failed after the stop) starts on its own type (review I1)', async () => {
+  const cfg = testConfig({ fallbackInstanceTypes: ['t3a.medium'] });
+  const s = setup({ run: { state: STATES.WAKING, wakeId: 'w1' }, cfg, instance: 'stopped', target: 'waker', healthy: 0 });
+  s.store.state.run.wakeStartedAt = s.clock.now();
+  const id = cfg.instanceIds[0];
+  s.ec2.state.types[id] = 't3a.medium';
+  s.ec2.state.tags[id] = { 'dormeto:instance-type': 't3.medium' };
+  const start = s.ec2.startInstances;
+  let startedOn = null;
+  s.ec2.startInstances = async (input) => {
+    startedOn = s.ec2.state.types[id];
+    s.clock.onSleep(() => { s.elbv2.state.healthy = 1; });
+    return start(input);
+  };
+  const result = await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' });
+  assert.equal(result.state, STATES.AWAKE);
+  assert.equal(startedOn, 't3.medium', 'its own type first');
+  assert.equal('dormeto:instance-type' in s.ec2.state.tags[id], false);
+  assert.equal('instanceTypes' in s.store.state.run, false);
+});
+
 test('wake: a fallback the boundary refuses fails as permission, naming the access module', async () => {
   const cfg = testConfig({ fallbackInstanceTypes: ['t3a.medium'] });
   const s = setup({ run: { state: STATES.WAKING, wakeId: 'w1' }, cfg, instance: 'stopped', target: 'waker', healthy: 0 });

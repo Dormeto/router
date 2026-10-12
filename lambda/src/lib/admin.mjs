@@ -1,15 +1,9 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { recommendations } from './advice.mjs';
-import { STATES } from './state.mjs';
-import { currentTarget } from './route.mjs';
-import { instanceStates } from './instances.mjs';
-import { backendKey, backendStatuses, resolveBackends } from './backends.mjs';
-import { lastRequestAt } from './metrics.mjs';
+import { createStatus, napEstimate } from './status.mjs';
 import { response } from './http.mjs';
 import { renderDashboard } from './dashboard-page.mjs';
 
 export const ADMIN_PREFIX = '/_dormeto/';
-const CHECK_PERIOD_MS = 5 * 60_000;
 const ACTIONS = new Set(['nap', 'wake']);
 const SECURITY_HEADERS = {
   'cache-control': 'no-store',
@@ -18,6 +12,8 @@ const SECURITY_HEADERS = {
   'x-content-type-options': 'nosniff',
   'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
 };
+
+export { napEstimate };
 
 export const hashSecret = (secret) => createHash('sha256').update(secret).digest('hex');
 
@@ -33,70 +29,8 @@ export function parseAdminPath(path, cfg) {
   return { base: `${ADMIN_PREFIX}${secret}`, route: slash === -1 ? '' : rest.slice(slash + 1) };
 }
 
-export function napEstimate({ cfg, run, lastRequest, now }) {
-  if (run.state !== STATES.AWAKE) return null;
-  const eligibleAt = Math.max(run.awakeSince ?? 0, lastRequest ?? 0) + cfg.idleMinutes * 60_000;
-  return { eligibleAt, latestAt: eligibleAt + CHECK_PERIOD_MS, inSeconds: Math.max(0, Math.ceil((eligibleAt - now) / 1000)) };
-}
-
-const iso = (ms) => (typeof ms === 'number' && ms > 0 ? new Date(ms).toISOString() : null);
-
 export function createAdmin({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, invokeController, now = Date.now, log, version = {} }) {
-  const clients = { ec2, elbv2, autoscaling, ecs, tagging, appscaling, rds };
-  async function status(workloadId, cfg, run, noWakeRules = [], wakeRules = [], loadStats = null, loadLists = null) {
-    const t = now();
-    const resolved = await resolveBackends(clients, cfg);
-    const instanceIds = resolved.backends.filter((b) => b.kind === 'instance').map((b) => b.id);
-    const [statuses, instances, health, rules, lastRequest] = await Promise.all([
-      resolved.backends.length ? backendStatuses(clients, resolved.backends) : {},
-      instanceIds.length ? instanceStates(ec2, instanceIds) : {},
-      elbv2.describeTargetHealth({ TargetGroupArn: cfg.appTargetGroupArn }),
-      elbv2.describeRules({ RuleArns: [cfg.ruleArn] }),
-      lastRequestAt(cloudwatch, cfg, t - cfg.idleMinutes * 60_000, t),
-    ]);
-    const nap = napEstimate({ cfg, run, lastRequest, now: t });
-    return {
-      workloadId,
-      router: { version: version.version ?? 'unknown', build: version.build ?? 'unknown' },
-      state: run.state,
-      updatedAt: iso(run.updatedAt),
-      awakeSince: iso(run.awakeSince),
-      wakeStartedAt: iso(run.wakeStartedAt),
-      failedAt: iso(run.failedAt),
-      wakeCount: run.wakeCount ?? 0,
-      holders: run.holders ?? 0,
-      pendingWake: run.pendingWake === true,
-      lastRequestAt: iso(lastRequest),
-      nap: nap && { eligibleAt: iso(nap.eligibleAt), latestAt: iso(nap.latestAt), inSeconds: nap.inSeconds },
-      route: currentTarget(rules.Rules?.[0]?.Actions ?? [], cfg),
-      discovery: resolved.mode,
-      instances: instanceIds.map((id) => ({ id, state: instances[id] ?? 'unknown' })),
-      backends: resolved.backends.map((b) => {
-        const status = statuses[backendKey(b)];
-        if (b.kind === 'asg') return { kind: 'asg', id: b.name, status, min: b.min, max: b.max, desired: b.desired, warmPool: b.warmPool };
-        if (b.kind === 'ecs') return { kind: 'ecs', id: b.id, status, desired: b.desired, scalable: b.scalable };
-        if (b.kind.startsWith('rds-')) return { kind: b.kind, id: b.id, status, companion: true };
-        return { kind: 'instance', id: b.id, status };
-      }),
-      ignoredTargets: resolved.ignored,
-      recommendations: recommendations(resolved.backends),
-      targets: (health.TargetHealthDescriptions ?? []).map((d) => ({ id: d.Target?.Id, state: d.TargetHealth?.State })),
-      settings: {
-        waitSeconds: cfg.waitSeconds,
-        idleMinutes: cfg.idleMinutes,
-        drainSeconds: cfg.drainSeconds,
-        wakeTimeoutSeconds: cfg.wakeTimeoutSeconds,
-        maxHolders: cfg.maxHolders,
-      },
-      // Requests that reached the waker while the workload was not awake: an unreadable table never breaks the status.
-      stats: loadStats ? await loadStats().catch((err) => ({ error: err.message })) : null,
-      ipLists: loadLists ? await loadLists().catch((err) => [{ error: err.message }]) : [],
-      wakeMode: cfg.wakeMode ?? 'any',
-      wakeRules,
-      noWakeRules,
-    };
-  }
-
+  const status = createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, now, version });
   const notAllowed = (allow) => response(405, { ...SECURITY_HEADERS, allow, 'content-type': 'text/plain' }, 'Method not allowed');
 
   return async function handle({ event, workloadId, cfg, run, base, route, forceWake, noWakeRules, wakeRules, loadStats, loadLists }) {
@@ -106,13 +40,13 @@ export function createAdmin({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging,
       if (!read) return notAllowed('GET, HEAD');
       if (method === 'HEAD') return response(200, { ...SECURITY_HEADERS, 'content-type': 'text/html; charset=utf-8' });
       const action = event.multiValueQueryStringParameters?.action?.[0];
-      const body = renderDashboard({ status: await status(workloadId, cfg, run, noWakeRules, wakeRules, loadStats, loadLists), base, action: ACTIONS.has(action) ? action : undefined });
+      const body = renderDashboard({ status: await status(workloadId, cfg, run, { noWakeRules, wakeRules, loadStats, loadLists }), base, action: ACTIONS.has(action) ? action : undefined });
       return response(200, { ...SECURITY_HEADERS, 'content-type': 'text/html; charset=utf-8' }, body);
     }
     if (route === 'status.json') {
       if (!read) return notAllowed('GET, HEAD');
       if (method === 'HEAD') return response(200, { ...SECURITY_HEADERS, 'content-type': 'application/json' });
-      return response(200, { ...SECURITY_HEADERS, 'content-type': 'application/json' }, JSON.stringify(await status(workloadId, cfg, run, noWakeRules, wakeRules, loadStats, loadLists)));
+      return response(200, { ...SECURITY_HEADERS, 'content-type': 'application/json' }, JSON.stringify(await status(workloadId, cfg, run, { noWakeRules, wakeRules, loadStats, loadLists })));
     }
     if (ACTIONS.has(route)) {
       if (method !== 'POST') return notAllowed('POST');

@@ -78,6 +78,16 @@ data "aws_iam_policy_document" "controller" {
   statement {
     actions   = ["elasticloadbalancing:ModifyRule"]
     resources = ["${local.arn_prefix}:elasticloadbalancing:${local.region}:${local.account_id}:listener-rule/app/*"]
+    # Only rules onboarded in Dormeto (tagged dormeto:workload).
+    condition {
+      test     = "Null"
+      variable = "aws:ResourceTag/dormeto:workload"
+      values   = ["false"]
+    }
+  }
+  statement {
+    actions   = ["sqs:SendMessage"]
+    resources = [aws_sqs_queue.controller_failures.arn]
   }
   statement {
     actions   = ["logs:CreateLogStream", "logs:PutLogEvents"]
@@ -102,6 +112,11 @@ data "aws_iam_policy_document" "scheduler_assume" {
       test     = "StringEquals"
       variable = "aws:SourceAccount"
       values   = [local.account_id]
+    }
+    condition {
+      test     = "ArnEquals"
+      variable = "aws:SourceArn"
+      values   = ["${local.arn_prefix}:scheduler:${local.region}:${local.account_id}:schedule/default/${var.name}-check"]
     }
   }
 }

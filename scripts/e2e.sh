@@ -36,10 +36,12 @@ wait_for_app() {
     sleep 3
   done
 }
+# Portable (GNU and BSD): ISO-8601 UTC timestamp N minutes ago.
+minutes_ago() { python3 -c "import datetime as d,sys; print((d.datetime.now(d.UTC)-d.timedelta(minutes=int(sys.argv[1]))).strftime('%Y-%m-%dT%H:%M:%SZ'))" "$1"; }
 waker_invocations() {
   aws cloudwatch get-metric-statistics --namespace AWS/Lambda --metric-name Invocations \
     --dimensions Name=FunctionName,Value="$WAKER" --statistics Sum --period 60 \
-    --start-time "$(date -u -v-"${1}"M +%Y-%m-%dT%H:%M:%SZ)" --end-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --start-time "$(minutes_ago "$1")" --end-time "$(minutes_ago 0)" \
     --query 'sum(Datapoints[].Sum)' --output text
 }
 
@@ -104,7 +106,9 @@ ADMIN_URL=$($TF output -raw admin_url)
 if [ -z "$ADMIN_URL" ]; then
   echo "skipped: admin dashboard disabled"
 else
-  admin_json() { curl -sS "${ADMIN_URL}status.json" | python3 -c "import json,sys; print(json.load(sys.stdin)$1)"; }
+  # The secret URL is passed to curl on stdin (-K -), never on the command line (visible in ps and shell history).
+  admin_curl() { local path=$1; shift; printf 'url = "%s%s"\n' "$ADMIN_URL" "$path" | curl -sS -K - "$@"; }
+  admin_json() { admin_curl status.json | python3 -c "import json,sys; print(json.load(sys.stdin)$1)"; }
   wait_state() {
     local deadline=$((SECONDS + 300))
     until [ "$(run_attr state)" = "$1" ]; do
@@ -116,10 +120,10 @@ else
   [ "$(admin_json "['route']")" = "app" ] || fail "admin route is not app while awake"
   [ "$(admin_json "['instances'][0]['state']")" = "running" ] || fail "admin does not report the running instance"
   curl -sS "${URL}_dormeto/not-the-secret/status.json" | grep -q '"workloadId"' && fail "dashboard reachable with a wrong secret"
-  [ "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${ADMIN_URL}nap")" = "303" ] || fail "force nap rejected"
+  [ "$(admin_curl nap -o /dev/null -w '%{http_code}' -X POST)" = "303" ] || fail "force nap rejected"
   wait_state ASLEEP
   [ "$(admin_json "['route']")" = "waker" ] || fail "admin route is not waker while asleep"
-  [ "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${ADMIN_URL}wake")" = "303" ] || fail "force awake rejected"
+  [ "$(admin_curl wake -o /dev/null -w '%{http_code}' -X POST)" = "303" ] || fail "force awake rejected"
   wait_state AWAKE
   wait_for_app 120
   pass "admin dashboard: status, wrong secret rejected, force nap, force awake"

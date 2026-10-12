@@ -63,6 +63,21 @@ resource "aws_lambda_function_event_invoke_config" "controller" {
   maximum_retry_attempts = 0
   # A throttled async event is re-queued for up to 6 hours by default: drop stale wake/nap events instead.
   maximum_event_age_in_seconds = 120
+
+  # Failed or dropped wake/nap events land in a queue instead of only in the logs.
+  destination_config {
+    on_failure {
+      destination = aws_sqs_queue.controller_failures.arn
+    }
+  }
+
+  depends_on = [aws_iam_role_policy.controller]
+}
+
+resource "aws_sqs_queue" "controller_failures" {
+  name                      = "${var.name}-controller-failures"
+  message_retention_seconds = 1209600
+  sqs_managed_sse_enabled   = true
 }
 
 resource "aws_lambda_function" "waker" {

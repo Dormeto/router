@@ -31,3 +31,7 @@ output "admin_url" {
   value       = var.admin_dashboard_enabled ? "https://${local.domain}/_dormeto/${random_password.admin[0].result}/" : ""
   sensitive   = true
 }
+
+output "controller_failures_queue_url" {
+  value = module.router.controller_failures_queue_url
+}

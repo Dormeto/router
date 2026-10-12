@@ -25,3 +25,7 @@ output "controller_function_name" {
 output "controller_function_arn" {
   value = aws_lambda_function.controller.arn
 }
+
+output "controller_failures_queue_url" {
+  value = aws_sqs_queue.controller_failures.url
+}

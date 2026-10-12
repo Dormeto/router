@@ -158,3 +158,23 @@ test('one list failing does not stop the others', async () => {
   await publisher.run();
   assert.deepEqual(json(bucket, 'status.json').lists.map((l) => [l.name, l.error ?? null]), [['bad', 'HTTP 500'], ['ipsum', null]]);
 });
+
+test('review I2: a new URL that fails keeps the current version\'s URL in the status, is retried after an hour, and its smaller list is accepted', async () => {
+  const many = Array.from({ length: 10 }, (_, i) => `45.130.203.${i + 1}`).join('\n');
+  const { bucket, publisher, clock, state, downloads } = setup({ sources: { 'https://x/ipsum': many } });
+  await publisher.run();
+  bucket.objects.set('catalog.json', { body: Buffer.from(JSON.stringify({ lists: [{ name: 'ipsum', url: 'https://y/ipsum', action: 'defer', refreshHours: 24 }] })) });
+  state.sources['https://y/ipsum'] = new Error('HTTP 503');
+  clock.advance(HOUR);
+  await publisher.run();
+  const [failed] = json(bucket, 'status.json').lists;
+  assert.equal(failed.url, 'https://x/ipsum', 'the URL of the version still published');
+  assert.equal(failed.attemptUrl, 'https://y/ipsum');
+  assert.equal(failed.error, 'HTTP 503');
+  state.sources['https://y/ipsum'] = '1.2.3.4\n';
+  clock.advance(HOUR);
+  await publisher.run();
+  assert.deepEqual(downloads, ['https://x/ipsum', 'https://y/ipsum', 'https://y/ipsum'], 'retried after an hour, not at the refresh period');
+  const [line] = json(bucket, 'status.json').lists;
+  assert.deepEqual([line.url, line.entries, line.error], ['https://y/ipsum', 1, undefined], 'a new URL is not compared with the old one\'s entries');
+});

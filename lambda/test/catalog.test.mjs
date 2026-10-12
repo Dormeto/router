@@ -141,3 +141,41 @@ test('a list of the router\'s own (Terraform ip_lists) wins over the catalog\'s 
   assert.deepEqual((await catalog.get()).map((l) => l.name), ['ipsum']);
   assert.deepEqual((await catalog.describe()).lists.map((l) => l.name), ['ipsum']);
 });
+
+test('review C1: a list pending, then published, describes without error (the controller never loads data)', async () => {
+  const { catalog, s3, clock } = setup();
+  const data = s3.objects.get('aws/v1.bin');
+  const manifest = s3.objects.get('aws/manifest.json');
+  s3.objects.delete('aws/manifest.json');
+  assert.equal((await catalog.describe()).lists.find((l) => l.name === 'aws').pending, true);
+  s3.objects.set('aws/manifest.json', manifest);
+  s3.objects.set('aws/v1.bin', data);
+  clock.advance(6 * MIN);
+  const aws = (await catalog.describe()).lists.find((l) => l.name === 'aws');
+  assert.equal(aws.error, undefined);
+  assert.equal(aws.pending, undefined);
+});
+
+test('review C1: a transient manifest error clears at the next check', async () => {
+  const { catalog, s3, clock } = setup();
+  s3.failures.set('ipsum/manifest.json', 'SlowDown');
+  assert.equal((await catalog.describe()).lists.find((l) => l.name === 'ipsum').error, 'S3 SlowDown');
+  s3.failures.delete('ipsum/manifest.json');
+  clock.advance(6 * MIN);
+  assert.equal((await catalog.describe()).lists.find((l) => l.name === 'ipsum').error, undefined);
+});
+
+test('review I1: refused data is not read again before the next check, then is', async () => {
+  const { catalog, s3, clock } = setup();
+  await catalog.get();
+  publish(s3, 'ipsum', ['8.229.112.0/20'], 'v2', { sha256: 'f'.repeat(64) });
+  clock.advance(6 * MIN);
+  await catalog.get();
+  const reads = () => s3.calls.filter((c) => c.key === 'ipsum/v2.bin').length;
+  assert.equal(reads(), 1);
+  for (let i = 0; i < 10; i++) await catalog.get();
+  assert.equal(reads(), 1, 'within the 5 minutes: not read again on every request');
+  clock.advance(6 * MIN);
+  await catalog.get();
+  assert.equal(reads(), 2, 'at the next check: tried again');
+});

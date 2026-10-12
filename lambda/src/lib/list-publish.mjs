@@ -34,7 +34,8 @@ export function createListPublisher({ s3, bucket, prefix = '', download, now = D
   };
 
   async function refresh(list, line, t) {
-    const attempt = { name: list.name, url: list.url, refreshHours: list.refreshHours, lastAttemptAt: iso(t), attemptUrl: list.url };
+    // url stays the URL of the version published (a failed attempt of a new URL leaves it): attemptUrl says what was tried.
+    const attempt = { name: list.name, refreshHours: list.refreshHours, lastAttemptAt: iso(t), attemptUrl: list.url };
     try {
       const { entries, invalid } = parseList(await download(list.url));
       const { kept, dropped } = dropReserved(entries);
@@ -53,10 +54,10 @@ export function createListPublisher({ s3, bucket, prefix = '', download, now = D
       await s3.putObject({ bucket, key: key(dataKey), body: data, contentType: 'application/octet-stream' });
       await putJson(`${list.name}/manifest.json`, manifest);
       log.info('ListPublished', { name: list.name, entries: kept.length, dropped, invalid, bytes: data.length });
-      return { ...attempt, version, format: FORMAT, entries: kept.length, dropped, invalid, fetchedAt: iso(t), writtenAt: iso(t), key: dataKey };
+      return { ...attempt, url: list.url, version, format: FORMAT, entries: kept.length, dropped, invalid, fetchedAt: iso(t), writtenAt: iso(t), key: dataKey };
     } catch (err) {
       log.error('ListNotPublished', { name: list.name, url: list.url, error: err.message });
-      return { ...line, ...attempt, error: err.message, errorAt: iso(t) };
+      return { url: list.url, ...line, ...attempt, error: err.message, errorAt: iso(t) };
     }
   }
 

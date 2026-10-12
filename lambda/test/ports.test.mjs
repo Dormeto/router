@@ -43,3 +43,9 @@ test('the ELB clients retry adaptively: they slow down under throttling instead 
   const adapter = await readFile(`${SRC}aws/elbv2.mjs`, 'utf8');
   assert.match(adapter, /new ElasticLoadBalancingV2Client\(\{[^}]*retryMode: 'adaptive'[^}]*maxAttempts: \d+/);
 });
+
+test('review: the waker loads the S3 client only when the router has a catalog (its cold start is on the path of a wake)', async () => {
+  const waker = await readFile(`${SRC}waker.mjs`, 'utf8');
+  assert.doesNotMatch(waker, /^import .* from '\.\/aws\/s3\.mjs';$/m);
+  assert.match(waker, /import\('\.\/aws\/s3\.mjs'\)/);
+});

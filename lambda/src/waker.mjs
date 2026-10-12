@@ -1,5 +1,4 @@
 import { createDynamo } from './aws/dynamo.mjs';
-import { createS3 } from './aws/s3.mjs';
 import { createCatalog } from './lib/catalog.mjs';
 import { createEvents } from './aws/events.mjs';
 import { createLambda } from './aws/lambda.mjs';
@@ -54,8 +53,10 @@ const store = withTransitionEvents(createStore({ dynamo: createDynamo(), table: 
 // IP reputation lists of the router (Terraform ip_lists), downloaded by the controller.
 const lists = parseLists(process.env.DMT_IP_LISTS, (error) => logger.error('IpListsUnreadable', { error }));
 // The manager's lists (R6b): its catalog, manifests and data, read from its bucket; the router's own lists win on a name.
+// The S3 client loads on the first read (a cold start of a router without a catalog never pays for it).
+const getS3 = memoizeAsync(() => import('./aws/s3.mjs').then(({ createS3 }) => createS3()));
 const catalog = process.env.DMT_IP_LISTS_CATALOG
-  ? createCatalog({ s3: createS3(), url: process.env.DMT_IP_LISTS_CATALOG, own: lists.map((l) => l.name), log: logger })
+  ? createCatalog({ s3: { getObjectIf: async (input) => (await getS3()).getObjectIf(input) }, url: process.env.DMT_IP_LISTS_CATALOG, own: lists.map((l) => l.name), log: logger })
   : null;
 
 export const handler = createWaker({

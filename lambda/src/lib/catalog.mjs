@@ -50,19 +50,20 @@ export function createCatalog({ s3, url, own = [], now = Date.now, log, checkMs 
     }
   }
 
+  // manifestError: the last manifest read (cleared by any read that answers, 200 or 304); dataError: the last load of the
+  // data, for the version that failed (tried again at the next check, not at every request).
   async function readManifest(entry) {
-    const state = lists.get(entry.name) ?? { manifestEtag: null, manifest: null, version: null, set: null, error: null, pending: false };
+    const state = lists.get(entry.name) ?? { manifestEtag: null, manifest: null, version: null, set: null, manifestError: null, dataError: null, failed: null, pending: false };
     lists.set(entry.name, state);
     try {
       const out = await read(`${where.prefix}${entry.name}/manifest.json`, state.manifestEtag);
       if (!out.notModified) Object.assign(state, { manifest: JSON.parse(out.body.toString('utf8')), manifestEtag: out.etag });
-      Object.assign(state, { pending: false });
-      if (state.version === state.manifest?.version) state.error = null;
+      Object.assign(state, { pending: false, manifestError: null, failed: null });
     } catch (err) {
       // Without s3:ListBucket (the routers' roles have none), a missing object answers AccessDenied: in the bucket whose
       // catalog was just read, that is a list not published yet.
       const pending = err.name === 'NoSuchKey' || (err.name === 'AccessDenied' && !catalog.error);
-      Object.assign(state, { pending, error: pending ? 'not published by the manager yet' : s3Error(err) });
+      Object.assign(state, { pending, manifestError: pending ? 'not published by the manager yet' : s3Error(err) });
     }
     return state;
   }
@@ -70,7 +71,7 @@ export function createCatalog({ s3, url, own = [], now = Date.now, log, checkMs 
   // The list's data for the manifest's version: its size, SHA-256 and format checked before it replaces the loaded one.
   async function loadData(entry, state) {
     const m = state.manifest;
-    if (!m?.version || state.version === m.version) return;
+    if (!m?.version || state.version === m.version || state.failed === m.version) return;
     try {
       if (m.format !== FORMAT) throw new Error(`format ${m.format}, this router reads ${FORMAT}`);
       const out = await read(`${where.prefix}${m.key ?? `${entry.name}/${m.version}.bin`}`, null);
@@ -78,11 +79,11 @@ export function createCatalog({ s3, url, own = [], now = Date.now, log, checkMs 
       if (data.length !== m.bytes) throw new Error(`${data.length} bytes, the manifest says ${m.bytes}`);
       if (createHash('sha256').update(data).digest('hex') !== m.sha256) throw new Error('SHA-256 differs from the manifest');
       const started = Date.now();
-      Object.assign(state, { set: unpackList([data]), version: m.version, error: null });
+      Object.assign(state, { set: unpackList([data]), version: m.version, dataError: null });
       log.info('ListLoaded', { name: entry.name, version: m.version, ranges: state.set.size, ms: Date.now() - started, source: 'manager' });
     } catch (err) {
-      state.error = `version ${m.version}: ${err.name === 'Error' ? err.message : s3Error(err)}`;
-      log.warn('ListLoadFailed', { name: entry.name, error: state.error, source: 'manager' });
+      Object.assign(state, { failed: m.version, dataError: `version ${m.version}: ${err.name === 'Error' ? err.message : s3Error(err)}` });
+      log.warn('ListLoadFailed', { name: entry.name, error: state.dataError, source: 'manager' });
     }
   }
 
@@ -122,7 +123,7 @@ export function createCatalog({ s3, url, own = [], now = Date.now, log, checkMs 
             entries: m?.entries ?? 0,
             ...(m ? { dropped: m.dropped ?? 0, version: m.version, fetchedAt: m.fetchedAt } : {}),
             ...(state.pending ? { pending: true } : {}),
-            ...(state.error ? { error: state.error } : {}),
+            ...(state.manifestError ?? state.dataError ? { error: state.manifestError ?? state.dataError } : {}),
           };
         }),
       };

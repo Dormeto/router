@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { STATES } from './state.mjs';
-import { describeRulesOf, hostOf, rulesOf, setRoute } from './route.mjs';
+import { hostOf, setRoute } from './route.mjs';
+import { resolveRules } from './rules.mjs';
 import { healthyCount, waitTargetsReleased } from './instances.mjs';
 import { createStatus } from './status.mjs';
 import { describeRules } from './no-wake.mjs';
@@ -108,6 +109,12 @@ export function createController({
       log.warn('NapSkipped', { workloadId, reason: 'no-instances' });
       return { state: 'SKIPPED', reason: 'no-instances' };
     }
+    // A rule the router cannot switch would send traffic to the stopped backend: no nap until it is fixed.
+    const { issues } = await rulesFor(cfg);
+    if (issues.length) {
+      log.warn('NapSkipped', { workloadId, reason: 'rules not instrumented', issues: reasons(issues) });
+      return { state: 'SKIPPED', reason: 'rules not instrumented', issues: reasons(issues) };
+    }
     const napping = await store.transition(workloadId, {
       cond: { state: STATES.AWAKE },
       set: { state: STATES.NAPPING, napBackends: JSON.stringify(backends.map(toRecord)) },
@@ -156,8 +163,11 @@ export function createController({
     return wake(workloadId, wakeId, cfg);
   }
 
-  // Every rule of the workload to the target; a rule deleted by hand is reported (and only blocks a switch to the waker).
-  const routeTo = (cfg, target) => setRoute(elbv2, cfg, target, { onMissing: (rules) => log.warn('RuleMissing', { workloadId: cfg.workloadId, rules }) });
+  // Rules found from the workload's target group, and the switch of its instrumented rules (issues are logged, and only
+  // block a switch to the waker).
+  const rulesFor = async (cfg) => (await resolveRules(elbv2, [cfg])).get(cfg.workloadId);
+  const reasons = (issues) => issues.map((i) => i.reason);
+  const routeTo = (cfg, target, found) => setRoute(elbv2, cfg, target, { found, onIssues: (issues) => log.warn('RuleIssues', { workloadId: cfg.workloadId, issues: reasons(issues) }) });
 
   async function reconcile(cfg) {
     const { workloadId } = cfg;
@@ -217,9 +227,21 @@ export function createController({
     // A FAILED workload stays behind the waker, so that requests retry the wake.
     const expected = run.state === STATES.AWAKE ? 'app' : [STATES.ASLEEP, STATES.FAILED].includes(run.state) ? 'waker' : null;
     if (expected) {
-      // Every rule of the workload: a rule switched back alone (mixed route) is repaired too.
-      const repaired = await routeTo(cfg, expected);
-      if (repaired.length) log.warn('RouteRepaired', { workloadId, route: expected, rules: repaired });
+      const found = await rulesFor(cfg);
+      if (expected === 'waker' && found.issues.length) {
+        // A rule the router cannot switch sends requests to the stopped backend: wake the workload (it is not napped
+        // again until the rule is instrumented or removed).
+        if (run.state === STATES.ASLEEP) {
+          log.warn('WokenForRuleIssues', { workloadId, issues: reasons(found.issues) });
+          await forceWake(workloadId, 'dormeto', 'rule-issues');
+          return (await store.getRun(workloadId)) ?? run;
+        }
+        log.warn('RuleIssues', { workloadId, issues: reasons(found.issues) });
+      } else {
+        // Every instrumented rule: a rule switched back alone (mixed route) is repaired too.
+        const repaired = await routeTo(cfg, expected, found);
+        if (repaired.length) log.warn('RouteRepaired', { workloadId, route: expected, rules: repaired });
+      }
     }
 
     if ((run.holders ?? 0) > 0 && (run.updatedAt ?? 0) < now() - HOLDERS_STALE_MS) {
@@ -254,35 +276,26 @@ export function createController({
   // --- Manager interface: list, status, force-wake ------------------------------------------------------------------
 
   const status = createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, now, version: router });
-  // Host conditions of the workload rules, for their URL: one DescribeRules call, cached (rules rarely change).
-  const hosts = { at: 0, byRule: new Map() };
-  async function ruleHosts(configs) {
-    const arns = configs.flatMap(rulesOf);
-    if (now() - hosts.at < 5 * 60_000 && arns.every((a) => hosts.byRule.has(a))) return hosts.byRule;
-    const found = [];
-    const gone = [];
-    for (let i = 0; i < arns.length; i += 20) {
-      const { rules, missing } = await describeRulesOf(elbv2, arns.slice(i, i + 20)).catch(() => ({ rules: [], missing: [] }));
-      found.push(...rules);
-      gone.push(...missing);
-    }
-    // A deleted rule is cached too (no host), so that it does not make every list call describe the rules again.
-    hosts.byRule = new Map([...found.map((r) => [r.RuleArn, hostOf(r)]), ...gone.map((arn) => [arn, null])]);
+  const hosts = { at: 0, byWorkload: new Map() };
+  // Host of each workload: the first of its rules (found from its target group) with a host condition; one listing per
+  // load balancer for all workloads, cached five minutes.
+  async function workloadHosts(configs) {
+    if (now() - hosts.at < 5 * 60_000 && configs.every((c) => hosts.byWorkload.has(c.workloadId))) return hosts.byWorkload;
+    const found = await resolveRules(elbv2, configs).catch(() => new Map());
+    hosts.byWorkload = new Map(configs.map((c) => [c.workloadId, (found.get(c.workloadId)?.rules ?? []).map(hostOf).find(Boolean) ?? null]));
     hosts.at = now();
-    return hosts.byRule;
+    return hosts.byWorkload;
   }
-  // The workload URL: the host of its first rule that has one.
-  const hostFor = (cfg, byRule) => rulesOf(cfg).map((arn) => byRule.get(arn)).find(Boolean) ?? null;
 
   async function list() {
     const configs = await store.listConfigs();
-    const byRule = await ruleHosts(configs);
+    const byWorkload = await workloadHosts(configs);
     const workloads = await Promise.all(configs.map(async (cfg) => {
       const [run, stats] = await Promise.all([
         store.getRun(cfg.workloadId),
         store.getStats(cfg.workloadId, STATS_DAYS).catch(() => null),
       ]);
-      return workloadSummary(cfg, run, hostFor(cfg, byRule), totals(stats));
+      return workloadSummary(cfg, run, byWorkload.get(cfg.workloadId), totals(stats));
     }));
     const health = await store.getCheck().catch(() => null);
     return {
@@ -314,7 +327,7 @@ export function createController({
   }
 
   // Operator request from the manager: no retry delay; the wake itself runs in its own invocation.
-  async function forceWake(workloadId, by) {
+  async function forceWake(workloadId, by, kind = 'manager') {
     await config(workloadId);
     const run = await store.getRun(workloadId);
     if (run?.state === STATES.ASLEEP || run?.state === STATES.FAILED) {
@@ -323,8 +336,8 @@ export function createController({
         cond: { state: run.state }, set: { state: STATES.WAKING, wakeId, wakeStartedAt: now() }, remove: ['failedAt'], increment: ['wakeCount'],
       });
       if (!next) return { state: (await store.getRun(workloadId))?.state };
-      log.info('WakeRequested', { workloadId, wakeId, trigger: { kind: 'manager', by } });
-      await count(workloadId, 'wake:manager');
+      log.info('WakeRequested', { workloadId, wakeId, trigger: { kind, by } });
+      await count(workloadId, `wake:${kind}`);
       await invokeSelf({ action: 'wake', workloadId, wakeId });
       return { state: STATES.WAKING };
     }

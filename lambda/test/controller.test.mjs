@@ -186,9 +186,17 @@ test('ensure-awake switches the route back when the workload is awake and health
   assert.equal(routeOf(s.elbv2, s.cfg), 'app');
 });
 
-// --- Several rules per workload -------------------------------------------------------------------------------------
+// --- Several rules per workload, found from the target group --------------------------------------------------------
 
 const TWO_RULES = testConfig({ ruleArns: ['arn:rule/main', 'arn:rule/static'] });
+const host = (h) => ({ Field: 'host-header', HostHeaderConfig: { Values: [h] } });
+const path = (p) => ({ Field: 'path-pattern', PathPatternConfig: { Values: [p] } });
+const appOnly = (c) => [{ Type: 'forward', Order: 1, ForwardConfig: { TargetGroups: [{ TargetGroupArn: c.appTargetGroupArn, Weight: 1 }] } }];
+const recordWarnings = (s) => {
+  const warnings = [];
+  s.log.warn = (event, data) => warnings.push([event, data]);
+  return warnings;
+};
 
 test('nap and wake switch every rule of a workload with several rules', async () => {
   const s = setup({ run: { state: STATES.AWAKE, awakeSince: 0 }, cfg: TWO_RULES });
@@ -202,6 +210,25 @@ test('nap and wake switch every rule of a workload with several rules', async ()
   assert.equal(routeOf(s.elbv2, s.cfg), 'app');
 });
 
+test('a rule added to the target group is switched with the others, without any configuration change', async () => {
+  const s = setup({ run: { state: STATES.AWAKE, awakeSince: 0 }, cfg: testConfig() });
+  s.elbv2.state.rules.set('arn:rule/added', { actions: s.elbv2.state.forward(1, 0), priority: '15', tags: { 'dormeto:workload': 'demo' } });
+  await s.handler({ action: 'nap', workloadId: 'demo' });
+  assert.equal(currentTarget(s.elbv2.state.rules.get('arn:rule/added').actions, s.cfg), 'waker');
+});
+
+test('a nap is refused while a rule forwarding to the target group is not instrumented; the backend keeps running', async () => {
+  const s = setup({ run: { state: STATES.AWAKE, awakeSince: 0 }, cfg: TWO_RULES });
+  const warnings = recordWarnings(s);
+  s.elbv2.state.rules.set('arn:rule/new', { actions: appOnly(s.cfg), priority: '19', tags: {} });
+  const result = await s.handler({ action: 'nap', workloadId: 'demo' });
+  assert.deepEqual([result.state, result.reason], ['SKIPPED', 'rules not instrumented']);
+  assert.equal(s.store.state.run.state, STATES.AWAKE);
+  assert.equal(s.ec2.state.stopped, 0);
+  assert.equal(s.elbv2.state.modifyCount, 0);
+  assert.deepEqual(warnings.find(([e]) => e === 'NapSkipped')[1].issues, ['rule 19 forwards to the target group without the waker (not instrumented)']);
+});
+
 test('a nap failing on the second rule is not a success, and the next check repairs the route', async () => {
   const s = setup({ run: { state: STATES.AWAKE, awakeSince: 0 }, cfg: TWO_RULES });
   s.elbv2.state.failOn = 'arn:rule/static';
@@ -211,69 +238,64 @@ test('a nap failing on the second rule is not a success, and the next check repa
   assert.equal(routeOf(s.elbv2, s.cfg), 'mixed');
   s.elbv2.state.failOn = null;
   await s.handler({ action: 'check' });
-  assert.notEqual(routeOf(s.elbv2, s.cfg), 'mixed');
+  assert.equal(routeOf(s.elbv2, s.cfg), 'app');
 });
 
-const host = (h) => ({ Field: 'host-header', HostHeaderConfig: { Values: [h] } });
-const path = (p) => ({ Field: 'path-pattern', PathPatternConfig: { Values: [p] } });
-const toWaker = (actions, cfg) => actions.map((a) => ({
-  ...a, ForwardConfig: { ...a.ForwardConfig, TargetGroups: a.ForwardConfig.TargetGroups.map((tg) => ({ ...tg, Weight: tg.TargetGroupArn === cfg.wakerTargetGroupArn ? 1 : 0 })) },
-}));
+test('a wake completes with a rule it cannot switch: the instrumented rules serve the application, the issue is logged', async () => {
+  const s = setup({ run: { state: STATES.WAKING, wakeId: 'w1' }, instance: 'stopped', target: 'waker', cfg: TWO_RULES });
+  const warnings = recordWarnings(s);
+  s.elbv2.state.rules.set('arn:rule/new', { actions: appOnly(s.cfg), priority: '19', tags: {} });
+  const result = await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' });
+  assert.equal(result.state, STATES.AWAKE);
+  assert.equal(currentTarget(s.elbv2.state.rules.get('arn:rule/static').actions, s.cfg), 'app');
+  assert.deepEqual(warnings.find(([e]) => e === 'RuleIssues')[1], { workloadId: 'demo', issues: ['rule 19 forwards to the target group without the waker (not instrumented)'] });
+});
 
-test('status reports every rule with its route, and the route of the workload over all of them', async () => {
+test('check wakes an asleep workload when a rule forwarding to its target group cannot be switched', async () => {
+  const s = setup({ run: { state: STATES.ASLEEP }, instance: 'stopped', target: 'waker', cfg: TWO_RULES });
+  const warnings = recordWarnings(s);
+  s.elbv2.state.rules.set('arn:rule/new', { actions: appOnly(s.cfg), priority: '19', tags: {} });
+  await s.handler({ action: 'check' });
+  assert.equal(s.store.state.run.state, STATES.WAKING);
+  assert.ok(s.invocations.some((i) => i.action === 'wake' && i.workloadId === 'demo'));
+  assert.ok(warnings.some(([e]) => e === 'WokenForRuleIssues'));
+});
+
+test('status reports the rules found from the target group, their route, and the issues', async () => {
   const s = setup({ run: { state: STATES.AWAKE }, cfg: TWO_RULES });
-  s.elbv2.state.conditions = new Map([['arn:rule/main', [host('asg.example.com')]], ['arn:rule/static', [host('asg.example.com'), path('/static/*')]]]);
-  s.elbv2.state.priorities = new Map([['arn:rule/main', '20'], ['arn:rule/static', '19']]);
-  s.elbv2.state.rules.set('arn:rule/static', toWaker(s.elbv2.state.rules.get('arn:rule/static'), s.cfg));
+  s.elbv2.state.rules.get('arn:rule/main').conditions = [host('asg.example.com')];
+  s.elbv2.state.rules.get('arn:rule/main').priority = '20';
+  Object.assign(s.elbv2.state.rules.get('arn:rule/static'), { conditions: [host('asg.example.com'), path('/static/*')], priority: '19', actions: s.elbv2.state.forward(0, 1) });
+  s.elbv2.state.rules.set('arn:rule/new', { actions: appOnly(s.cfg), priority: '30', conditions: [path('/new/*')], tags: {} });
   const status = await s.handler({ action: 'status', workloadId: 'demo' });
   assert.equal(status.route, 'mixed');
   assert.deepEqual(status.rules, [
     { arn: 'arn:rule/main', priority: '20', conditions: 'host asg.example.com', route: 'app' },
     { arn: 'arn:rule/static', priority: '19', conditions: 'host asg.example.com, path /static/*', route: 'waker' },
+    { arn: 'arn:rule/new', priority: '30', conditions: 'path /new/*', route: 'app', issue: 'rule 30 forwards to the target group without the waker (not instrumented)' },
   ]);
+  assert.deepEqual(status.issues, ['rule 30 forwards to the target group without the waker (not instrumented)']);
 });
 
-test('status still answers when a rule of the workload was deleted', async () => {
+test('status answers for a target group without any rule', async () => {
   const s = setup({ run: { state: STATES.AWAKE }, cfg: TWO_RULES });
-  s.elbv2.state.rules.delete('arn:rule/static');
+  s.elbv2.state.rules.clear();
   const status = await s.handler({ action: 'status', workloadId: 'demo' });
-  assert.equal(status.route, 'unknown');
-  assert.deepEqual(status.rules[1], { arn: 'arn:rule/static', priority: null, conditions: 'rule not found', route: 'unknown' });
-});
-
-test('a wake completes when a rule of the workload was deleted, and the rules that remain serve the application', async () => {
-  const s = setup({ run: { state: STATES.WAKING, wakeId: 'w1' }, instance: 'stopped', target: 'waker', cfg: TWO_RULES });
-  const warnings = [];
-  s.log.warn = (event, data) => warnings.push([event, data]);
-  s.elbv2.state.rules.delete('arn:rule/static');
-  const result = await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' });
-  assert.equal(result.state, STATES.AWAKE);
-  assert.equal(currentTarget(s.elbv2.state.rules.get('arn:rule/main'), s.cfg), 'app');
-  assert.deepEqual(warnings.find(([e]) => e === 'RuleMissing'), ['RuleMissing', { workloadId: 'demo', rules: ['arn:rule/static'] }]);
-});
-
-test('list keeps the URLs of the other workloads when a rule was deleted', async () => {
-  const s = setup({ run: { state: STATES.AWAKE }, cfg: TWO_RULES });
-  s.elbv2.state.conditions = new Map([['arn:rule/main', [host('asg.example.com')]]]);
-  s.elbv2.state.rules.delete('arn:rule/static');
-  const { workloads } = await s.handler({ action: 'list' });
-  assert.equal(workloads[0].url, 'https://asg.example.com/');
+  assert.deepEqual([status.route, status.rules, status.issues], ['unknown', [], ['no rule forwards to the target group']]);
 });
 
 test('list gives the URL of the first rule with a host condition', async () => {
   const s = setup({ run: { state: STATES.AWAKE }, cfg: TWO_RULES });
-  s.elbv2.state.conditions = new Map([['arn:rule/main', [path('/api/*')]], ['arn:rule/static', [host('asg.example.com'), path('/static/*')]]]);
+  s.elbv2.state.rules.get('arn:rule/main').conditions = [path('/api/*')];
+  s.elbv2.state.rules.get('arn:rule/static').conditions = [host('asg.example.com'), path('/static/*')];
   const { workloads } = await s.handler({ action: 'list' });
   assert.equal(workloads[0].url, 'https://asg.example.com/');
 });
 
 test('check repairs one rule switched back by hand while the workload sleeps, and reports which', async () => {
   const s = setup({ run: { state: STATES.ASLEEP }, instance: 'stopped', target: 'waker', cfg: TWO_RULES });
-  const warnings = [];
-  s.log.warn = (event, data) => warnings.push([event, data]);
-  s.elbv2.state.rules.set('arn:rule/static', s.elbv2.state.rules.get('arn:rule/static').map((a) => ({
-    ...a, ForwardConfig: { ...a.ForwardConfig, TargetGroups: a.ForwardConfig.TargetGroups.map((tg) => ({ ...tg, Weight: tg.TargetGroupArn === s.cfg.appTargetGroupArn ? 1 : 0 })) },
-  })));
+  const warnings = recordWarnings(s);
+  s.elbv2.state.rules.get('arn:rule/static').actions = s.elbv2.state.forward(1, 0);
   assert.equal(routeOf(s.elbv2, s.cfg), 'mixed');
   await s.handler({ action: 'check' });
   assert.equal(routeOf(s.elbv2, s.cfg), 'waker');

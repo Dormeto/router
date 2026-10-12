@@ -43,7 +43,7 @@ data "aws_iam_policy_document" "waker" {
     for_each = var.admin_enabled ? [1] : []
     content {
       sid       = "AdminDashboardRead"
-      actions   = ["ec2:DescribeInstances", "elasticloadbalancing:DescribeRules", "elasticloadbalancing:DescribeTargetHealth", "cloudwatch:GetMetricData", "autoscaling:DescribeAutoScalingGroups", "tag:GetResources", "ecs:DescribeServices", "application-autoscaling:DescribeScalableTargets", "rds:DescribeDBInstances", "rds:DescribeDBClusters"]
+      actions   = ["ec2:DescribeInstances", "elasticloadbalancing:DescribeRules", "elasticloadbalancing:DescribeTargetHealth", "elasticloadbalancing:DescribeTargetGroups", "elasticloadbalancing:DescribeListeners", "elasticloadbalancing:DescribeTags", "cloudwatch:GetMetricData", "autoscaling:DescribeAutoScalingGroups", "tag:GetResources", "ecs:DescribeServices", "application-autoscaling:DescribeScalableTargets", "rds:DescribeDBInstances", "rds:DescribeDBClusters"]
       resources = ["*"]
     }
   }
@@ -67,7 +67,8 @@ data "aws_iam_policy_document" "controller" {
     resources = [aws_dynamodb_table.router.arn]
   }
   statement {
-    actions   = ["ec2:DescribeInstances", "elasticloadbalancing:DescribeRules", "elasticloadbalancing:DescribeTargetHealth", "cloudwatch:GetMetricData"]
+    # Describes: the rules of a workload are found from its target group (load balancer, listeners, rules, tags).
+    actions   = ["ec2:DescribeInstances", "elasticloadbalancing:DescribeRules", "elasticloadbalancing:DescribeTargetHealth", "elasticloadbalancing:DescribeTargetGroups", "elasticloadbalancing:DescribeListeners", "elasticloadbalancing:DescribeTags", "cloudwatch:GetMetricData"]
     resources = ["*"]
   }
   statement {

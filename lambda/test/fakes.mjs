@@ -92,11 +92,12 @@ export function fakeStore({ config, run, clock }) {
   };
 }
 
-// Load balancer with the rules of the workload (cfg.ruleArns, or cfg.ruleArn): state.rules holds each rule's actions,
-// state.actions is the first rule's (single-rule tests). state.failOn makes ModifyRule fail for that rule.
+// A load balancer with one HTTPS listener, like ELBv2: the workload's rules (cfg.ruleArns, or cfg.ruleArn) are
+// instrumented and tagged; tests add or change rules in state.rules (arn → { actions, conditions, priority, tags,
+// isDefault }). An unknown ARN fails DescribeRules({ RuleArns }); state.failOn makes ModifyRule fail for that rule.
+export const FAKE_LB = 'arn:aws:elasticloadbalancing:eu-west-1:111122223333:loadbalancer/app/dmt-dev-demo/aaa';
 export function fakeElbv2(cfg, { target = 'app', healthy = 1 } = {}) {
-  const [app, waker] = target === 'app' ? [1, 0] : [0, 1];
-  const actions = () => [{
+  const forward = (app, waker) => [{
     Type: 'forward',
     Order: 1,
     ForwardConfig: {
@@ -104,30 +105,48 @@ export function fakeElbv2(cfg, { target = 'app', healthy = 1 } = {}) {
       TargetGroupStickinessConfig: { Enabled: false },
     },
   }];
+  const [app, waker] = target === 'app' ? [1, 0] : [0, 1];
   const arns = cfg.ruleArns?.length ? cfg.ruleArns : [cfg.ruleArn];
   const state = {
     healthy,
     modifyCount: 0,
     failOn: null,
-    rules: new Map(arns.map((arn) => [arn, actions()])),
-    get actions() { return this.rules.get(arns[0]); },
-    set actions(value) { this.rules.set(arns[0], value); },
+    calls: { targetGroups: 0, listeners: 0, rules: 0, tags: 0 },
+    rules: new Map(arns.map((arn, i) => [arn, { actions: forward(app, waker), conditions: [], priority: String(10 + i), tags: { 'dormeto:workload': cfg.workloadId } }])),
+    forward,
+    get actions() { return this.rules.get(arns[0])?.actions; },
+    set actions(value) { this.rules.get(arns[0]).actions = value; },
   };
+  const toRule = ([RuleArn, r]) => ({ RuleArn, Priority: r.isDefault ? 'default' : r.priority, IsDefault: Boolean(r.isDefault), Conditions: r.conditions ?? [], Actions: structuredClone(r.actions) });
   return {
     state,
-    async describeRules({ RuleArns }) {
-      // Like ELBv2: one unknown rule fails the whole call.
-      if (RuleArns.some((a) => !state.rules.has(a))) throw Object.assign(new Error('One or more rules not found'), { name: 'RuleNotFoundException' });
-      return {
-        Rules: RuleArns.filter((a) => state.rules.has(a)).map((a) => ({
-          RuleArn: a, Actions: structuredClone(state.rules.get(a)), ...(state.conditions?.has(a) ? { Conditions: state.conditions.get(a), Priority: state.priorities?.get(a) } : {}),
-        })),
-      };
+    async describeTargetGroups({ TargetGroupArns }) {
+      state.calls.targetGroups += 1;
+      return { TargetGroups: TargetGroupArns.map((a) => ({ TargetGroupArn: a, LoadBalancerArns: state.detached ? [] : [FAKE_LB] })) };
+    },
+    async describeListeners({ LoadBalancerArn }) {
+      state.calls.listeners += 1;
+      return { Listeners: LoadBalancerArn === FAKE_LB ? [{ ListenerArn: `${FAKE_LB}/listener-443`, Protocol: 'HTTPS', Port: 443 }] : [] };
+    },
+    async describeRules({ ListenerArn, RuleArns, Marker }) {
+      state.calls.rules += 1;
+      if (RuleArns) {
+        if (RuleArns.some((a) => !state.rules.has(a))) throw Object.assign(new Error('One or more rules not found'), { name: 'RuleNotFoundException' });
+        return { Rules: RuleArns.map((a) => toRule([a, state.rules.get(a)])) };
+      }
+      // Pages of two rules, to exercise the pagination.
+      const all = [...state.rules].map(toRule);
+      const start = Number(Marker ?? 0);
+      return { Rules: ListenerArn.startsWith(FAKE_LB) ? all.slice(start, start + 2) : [], NextMarker: start + 2 < all.length ? String(start + 2) : undefined };
+    },
+    async describeTags({ ResourceArns }) {
+      state.calls.tags += 1;
+      return { TagDescriptions: ResourceArns.map((a) => ({ ResourceArn: a, Tags: Object.entries(state.rules.get(a)?.tags ?? {}).map(([Key, Value]) => ({ Key, Value })) })) };
     },
     async modifyRule({ RuleArn, Actions }) {
       if (state.failOn === RuleArn) throw new Error(`ModifyRule failed for ${RuleArn}`);
       state.modifyCount += 1;
-      state.rules.set(RuleArn ?? arns[0], structuredClone(Actions));
+      state.rules.get(RuleArn).actions = structuredClone(Actions);
       return {};
     },
     async describeTargetHealth() {
@@ -141,7 +160,10 @@ export function fakeElbv2(cfg, { target = 'app', healthy = 1 } = {}) {
 }
 
 // Route over every rule of the workload (app, waker, mixed, unknown).
-export const routeOf = (elbv2, cfg) => aggregateRoute([...elbv2.state.rules].map(([RuleArn, Actions]) => ({ RuleArn, Actions })), cfg);
+// Route over the workload's rules: those that forward to its application target group (app, waker, mixed, unknown).
+export const routeOf = (elbv2, cfg) => aggregateRoute([...elbv2.state.rules]
+  .filter(([, r]) => r.actions.some((a) => a.ForwardConfig?.TargetGroups?.some((tg) => tg.TargetGroupArn === cfg.appTargetGroupArn)))
+  .map(([RuleArn, r]) => ({ RuleArn, Actions: r.actions })), cfg);
 
 export function fakeEc2(ids, { state = 'running' } = {}) {
   const s = { instances: Object.fromEntries(ids.map((id) => [id, state])), tags: {}, started: 0, stopped: 0, onStart: [], onStop: [] };

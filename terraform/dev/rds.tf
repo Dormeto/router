@@ -149,7 +149,6 @@ module "demo_rds_workload" {
   source                      = "../modules/workload"
   router                      = module.router
   workload_id                 = "demo-rds"
-  rule_arn                    = aws_lb_listener_rule.demo_rds.arn
   app_target_group_arn        = aws_lb_target_group.rds_app.arn
   app_target_group_arn_suffix = aws_lb_target_group.rds_app.arn_suffix
   load_balancer_arn_suffix    = aws_lb.demo.arn_suffix

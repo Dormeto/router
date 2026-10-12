@@ -24,7 +24,6 @@ module "demo_workload" {
   router                      = module.router
   workload_id                 = "demo"
   no_wake_rules               = [{ name = "uptime-monitor", user_agent_pattern = "^dormeto-uptime/" }]
-  rule_arn                    = aws_lb_listener_rule.demo.arn
   app_target_group_arn        = aws_lb_target_group.app.arn
   app_target_group_arn_suffix = aws_lb_target_group.app.arn_suffix
   load_balancer_arn_suffix    = aws_lb.demo.arn_suffix

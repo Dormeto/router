@@ -2,7 +2,7 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { STATES } from './state.mjs';
 import { currentTarget } from './route.mjs';
 import { instanceStates } from './instances.mjs';
-import { resolveInstances } from './discovery.mjs';
+import { backendKey, backendStatuses, resolveBackends } from './backends.mjs';
 import { lastRequestAt } from './metrics.mjs';
 import { response } from './http.mjs';
 import { renderDashboard } from './dashboard-page.mjs';
@@ -40,12 +40,15 @@ export function napEstimate({ cfg, run, lastRequest, now }) {
 
 const iso = (ms) => (typeof ms === 'number' && ms > 0 ? new Date(ms).toISOString() : null);
 
-export function createAdmin({ ec2, elbv2, cloudwatch, invokeController, now = Date.now, log }) {
+export function createAdmin({ ec2, elbv2, cloudwatch, autoscaling, invokeController, now = Date.now, log }) {
+  const clients = { ec2, elbv2, autoscaling };
   async function status(workloadId, cfg, run) {
     const t = now();
-    const resolved = await resolveInstances(ec2, elbv2, cfg);
-    const [instances, health, rules, lastRequest] = await Promise.all([
-      resolved.managed.length ? instanceStates(ec2, resolved.managed) : {},
+    const resolved = await resolveBackends(clients, cfg);
+    const instanceIds = resolved.backends.filter((b) => b.kind === 'instance').map((b) => b.id);
+    const [statuses, instances, health, rules, lastRequest] = await Promise.all([
+      resolved.backends.length ? backendStatuses(clients, resolved.backends) : {},
+      instanceIds.length ? instanceStates(ec2, instanceIds) : {},
       elbv2.describeTargetHealth({ TargetGroupArn: cfg.appTargetGroupArn }),
       elbv2.describeRules({ RuleArns: [cfg.ruleArn] }),
       lastRequestAt(cloudwatch, cfg, t - cfg.idleMinutes * 60_000, t),
@@ -65,7 +68,10 @@ export function createAdmin({ ec2, elbv2, cloudwatch, invokeController, now = Da
       nap: nap && { eligibleAt: iso(nap.eligibleAt), latestAt: iso(nap.latestAt), inSeconds: nap.inSeconds },
       route: currentTarget(rules.Rules?.[0]?.Actions ?? [], cfg),
       discovery: resolved.mode,
-      instances: resolved.managed.map((id) => ({ id, state: instances[id] ?? 'unknown' })),
+      instances: instanceIds.map((id) => ({ id, state: instances[id] ?? 'unknown' })),
+      backends: resolved.backends.map((b) => (b.kind === 'asg'
+        ? { kind: 'asg', id: b.name, status: statuses[backendKey(b)], min: b.min, max: b.max, desired: b.desired, warmPool: b.warmPool }
+        : { kind: 'instance', id: b.id, status: statuses[backendKey(b)] })),
       ignoredTargets: resolved.ignored,
       targets: (health.TargetHealthDescriptions ?? []).map((d) => ({ id: d.Target?.Id, state: d.TargetHealth?.State })),
       settings: {

@@ -4,7 +4,7 @@ import { createAdmin, hashSecret, napEstimate, parseAdminPath } from '../src/lib
 import { lastRequestAt } from '../src/lib/metrics.mjs';
 import { createWaker } from '../src/lib/waker-core.mjs';
 import { STATES } from '../src/lib/state.mjs';
-import { albEvent, fakeClock, fakeCloudWatch, fakeEc2, fakeElbv2, fakeStore, silentLog, testConfig } from './fakes.mjs';
+import { albEvent, asgGroup, fakeAutoScaling, fakeClock, fakeCloudWatch, fakeEc2, fakeElbv2, fakeStore, silentLog, testConfig } from './fakes.mjs';
 
 const SECRET = 'Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4z';
 const BASE = `/_dormeto/${SECRET}`;
@@ -18,12 +18,13 @@ function setup({ run, cfg = adminConfig(), metric = [], timestamps = [] } = {}) 
   const cloudwatch = fakeCloudWatch(metric, timestamps);
   const invocations = [];
   const invokeController = async (payload) => { invocations.push(payload); };
-  const admin = createAdmin({ ec2, elbv2, cloudwatch, invokeController, now: clock.now, log: silentLog });
+  const autoscaling = fakeAutoScaling();
+  const admin = createAdmin({ ec2, elbv2, cloudwatch, autoscaling, invokeController, now: clock.now, log: silentLog });
   const handler = createWaker({
     store, invokeController, prefix: 'dmt-dev-', now: clock.now, sleep: clock.sleep,
     newId: () => 'wake-1', log: silentLog, getAdmin: async () => admin,
   });
-  return { handler, store, clock, invocations, cloudwatch, ec2, elbv2 };
+  return { handler, store, clock, invocations, cloudwatch, ec2, elbv2, autoscaling };
 }
 
 const headerOf = (res, name) => res.multiValueHeaders[name]?.[0];
@@ -187,4 +188,22 @@ test('HEAD is accepted on the dashboard routes without a body', async () => {
     assert.equal(res.statusCode, 200, path);
     assert.equal(res.body, '');
   }
+});
+
+test('status.json lists every backend with its status, including Auto Scaling groups', async () => {
+  const cfg = testConfig({ instanceIds: [], admin: { enabled: true, secretHash: hashSecret(SECRET) } });
+  const { handler, ec2, elbv2, autoscaling } = setup({ run: { state: STATES.AWAKE }, cfg });
+  ec2.state.instances = { 'i-a': 'running' };
+  ec2.state.tags = { 'i-a': { 'dormeto:workload': 'demo' } };
+  elbv2.state.targets = [{ Id: 'i-a', State: 'healthy' }];
+  autoscaling.state.groups = [asgGroup('asg-demo', { min: 1, max: 2, desired: 1, targetGroups: [cfg.appTargetGroupArn], tags: { 'dormeto:workload': 'demo' } })];
+  const res = await handler(albEvent({ path: `${BASE}/status.json` }));
+  const status = JSON.parse(res.body);
+  assert.deepEqual(status.backends, [
+    { kind: 'instance', id: 'i-a', status: 'running' },
+    { kind: 'asg', id: 'asg-demo', status: 'running', min: 1, max: 2, desired: 1, warmPool: false },
+  ]);
+  assert.deepEqual(status.instances, [{ id: 'i-a', state: 'running' }]);
+  const html = await handler(albEvent({ path: `${BASE}/` }));
+  assert.match(html.body, /asg-demo: running \(min 1, desired 1, max 2\)/);
 });

@@ -3,6 +3,10 @@ const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g,
 
 const ACTION_MESSAGES = { nap: 'Nap requested.', wake: 'Wake requested.' };
 
+const backendText = (b) => (b.kind === 'asg'
+  ? `${b.id}: ${b.status} (min ${b.min}, desired ${b.desired}, max ${b.max})${b.warmPool ? ', warm pool' : ''}`
+  : `${b.id}: ${b.status}`);
+
 const row = (label, value) => `<tr><th scope="row">${escapeHtml(label)}</th><td>${escapeHtml(value ?? '—')}</td></tr>`;
 
 function napText(nap) {
@@ -56,7 +60,7 @@ ${row('Wake count', status.wakeCount)}
 ${row('Held requests', status.holders)}
 ${row('Pending wake', status.pendingWake ? 'yes' : 'no')}
 ${row('Route', status.route)}
-${row(`Instances (${status.discovery ?? 'static'})`, list(status.instances))}
+${row(`Backends (${status.discovery ?? 'static'})`, (status.backends ?? []).map(backendText).join(', ') || '—')}
 ${status.ignoredTargets?.length ? row('Ignored targets', status.ignoredTargets.map((t) => `${t.id}: ${t.reason}`).join(', ')) : ''}
 ${row('Target health', list(status.targets))}
 ${row('Settings', Object.entries(status.settings).map(([k, v]) => `${k}=${v}`).join(', '))}

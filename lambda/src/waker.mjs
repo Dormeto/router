@@ -15,10 +15,12 @@ const getAdmin = memoizeAsync(() => Promise.all([
   import('./aws/ec2.mjs'),
   import('./aws/elbv2.mjs'),
   import('./aws/cloudwatch.mjs'),
-]).then(([{ createAdmin }, { createEc2 }, { createElbv2 }, { createCloudWatch }]) => createAdmin({
+  import('./aws/autoscaling.mjs'),
+]).then(([{ createAdmin }, { createEc2 }, { createElbv2 }, { createCloudWatch }, { createAutoScaling }]) => createAdmin({
   ec2: createEc2(),
   elbv2: createElbv2(),
   cloudwatch: createCloudWatch(),
+  autoscaling: createAutoScaling(),
   invokeController,
   log: logger,
 })));

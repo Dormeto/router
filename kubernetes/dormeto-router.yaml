@@ -51,8 +51,9 @@ subjects:
     kind: Group
     name: dormeto:router
 ---
-# RBAC cannot select by label: this policy keeps the group's create and delete to Dormeto's own Ingresses (Kubernetes 1.30
-# and later; before, the router may create and delete any Ingress).
+# RBAC cannot select by label: this policy keeps the group's create and delete to Dormeto's own Ingresses, and its changes
+# from adding or removing their label (which would let it delete a customer's Ingress), Kubernetes 1.30 and later; before,
+# the router may create and delete any Ingress.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -65,14 +66,21 @@ spec:
     resourceRules:
       - apiGroups: ["networking.k8s.io"]
         apiVersions: ["v1"]
-        operations: ["CREATE", "DELETE"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
         resources: ["ingresses"]
   matchConditions:
     - name: dormeto-router
       expression: "'dormeto:router' in request.userInfo.groups"
+  variables:
+    - name: before
+      expression: "oldObject != null && has(oldObject.metadata.labels) && 'dormeto.com/managed' in oldObject.metadata.labels ? oldObject.metadata.labels['dormeto.com/managed'] : ''"
+    - name: after
+      expression: "object != null && has(object.metadata.labels) && 'dormeto.com/managed' in object.metadata.labels ? object.metadata.labels['dormeto.com/managed'] : ''"
   validations:
-    - expression: "request.operation == 'CREATE' ? (has(object.metadata.labels) && object.metadata.labels.exists(k, k == 'dormeto.com/managed' && object.metadata.labels[k] == 'true')) : (has(oldObject.metadata.labels) && oldObject.metadata.labels.exists(k, k == 'dormeto.com/managed' && oldObject.metadata.labels[k] == 'true'))"
+    - expression: "request.operation == 'UPDATE' || (request.operation == 'CREATE' ? variables.after : variables.before) == 'true'"
       message: "Dormeto creates and deletes only its own Ingresses (label dormeto.com/managed: \"true\")"
+    - expression: "request.operation != 'UPDATE' || variables.before == variables.after"
+      message: "Dormeto never adds nor removes its label dormeto.com/managed on an Ingress"
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

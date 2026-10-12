@@ -30,10 +30,11 @@ test('the ClusterRole grants exactly the rights the router checks, nothing more 
   assert.doesNotMatch(role, /secrets|"\*"/);
 });
 
-test('the admission policy refuses the group\'s create and delete of an Ingress without the dormeto.com/managed label', async () => {
+test('the admission policy refuses the group\'s create and delete of an Ingress without the dormeto.com/managed label, and its changes of that label', async () => {
   const [, , policy, binding] = await documents();
   assert.match(policy, /apiVersion: admissionregistration\.k8s\.io\/v1\n/);
-  assert.match(policy, /operations: \["CREATE", "DELETE"\]/);
+  assert.match(policy, /operations: \["CREATE", "UPDATE", "DELETE"\]/);
+  assert.match(policy, /expression: "request\.operation != 'UPDATE' \|\| variables\.before == variables\.after"/);
   assert.match(policy, /resources: \["ingresses"\]/);
   assert.match(policy, /expression: "'dormeto:router' in request\.userInfo\.groups"/);
   assert.match(policy, /dormeto\.com\/managed/);

@@ -24,6 +24,7 @@ function setup({ ingress = k8sCustomerIngress(), stuck = false, scaledObjects = 
   const customerRule = a.customer.rule(2, tg, { host: 'web.example.com', path: '/*' });
   const k8s = fakeKubernetes({ owners: [k8sOwner('web', { replicas: 2 })], pods: [k8sPod('web-1', { ip: '10.0.1.1' })], ingresses: [ingress], scaledObjects });
   k8s.state.review = { resourceRules: ROUTER_RULES.map((r) => ({ apiGroups: [r.group], resources: r.resources, verbs: r.verbs })), incomplete: false };
+  let lagging = null;
   k8s.state.onIngress = (object, before) => {
     if (stuck) return;
     // Dormeto's Ingress deleted: the controller removes its rule, and the waker target group leaves the load balancer.
@@ -36,7 +37,19 @@ function setup({ ingress = k8sCustomerIngress(), stuck = false, scaledObjects = 
     }
     if (!object) return;
     const action = object.metadata.annotations?.[`${ALB}actions.dormeto`];
-    if (!action) return;
+    if (!action) {
+      // The customer's Ingress restored: the controller forwards its rule to the application alone again, and the waker
+      // target group leaves the load balancer, a few seconds later (at the router's next wait).
+      const rule = a.state.rules.get(customerRule);
+      const wakerArn = rule.actions[0].ForwardConfig.TargetGroups[1]?.TargetGroupArn;
+      if (!object.metadata.name.startsWith('dormeto-') && wakerArn) {
+        lagging = () => {
+          rule.actions = forward([[tg, 1]]);
+          a.state.targetGroups.get(wakerArn).lbs = [];
+        };
+      }
+      return;
+    }
     const [app, waker] = JSON.parse(action).forwardConfig.targetGroups;
     const wakerTg = a.state.targetGroups.get(waker.targetGroupARN);
     if (wakerTg && !wakerTg.lbs.includes(LB)) wakerTg.lbs.push(LB);
@@ -50,7 +63,7 @@ function setup({ ingress = k8sCustomerIngress(), stuck = false, scaledObjects = 
   const onboarding = createOnboarding({
     elbv2: a.elbv2, ec2: a.ec2, autoscaling: a.autoscaling, ecs: a.ecs, rds: a.rds, lambda: a.lambda, store: a.store, kubernetesOf: async () => k8s,
     router: { name: 'dmt-dev', wakerFunctionName: 'dmt-dev-waker', wakerFunctionArn: WAKER_ARN },
-    now: clock.now, sleep: clock.sleep, log: { info() {}, warn() {}, error() {} },
+    now: clock.now, sleep: async (ms) => { lagging?.(); lagging = null; return clock.sleep(ms); }, log: { info() {}, warn() {}, error() {} },
   });
   return { a, tg, ours, customerRule, k8s, onboarding, id: workloadIdOf(tg) };
 }
@@ -180,12 +193,15 @@ test('offboarding an asleep grouped Ingress workload gives its replicas back and
   assert.equal(await s.a.store.getConfig(s.id), null);
 });
 
-test('offboarding an asleep lone Ingress workload gives the Ingress back exactly as it was', async () => {
+test('offboarding an asleep lone Ingress workload gives the Ingress back exactly as it was, and never changes the controller\'s rule', async () => {
   const lone = k8sCustomerIngress();
   delete lone.metadata.annotations[`${ALB}group.name`];
   const s = setup({ ingress: structuredClone(lone) });
   await asleep(s, { ...grouped(), switch: 'patched-ingress', ingress: { name: 'web', ruleIndex: 1, service: { name: 'web', port: { number: 80 } } } });
+  const before = s.a.state.calls.length;
   await s.onboarding.offboard({ workloadId: s.id, by: 'alice' });
+  // The rule is the controller's (decision 4): the restored Ingress is the whole restore, the controller follows it.
+  assert.deepEqual(s.a.state.calls.slice(before).filter((c) => ['modifyRule', 'removeTags', 'deleteRule'].includes(c)), []);
   const { resourceVersion, ...metadata } = s.k8s.state.ingresses[0].metadata;
   assert.deepEqual({ ...s.k8s.state.ingresses[0], metadata }, lone);
   assert.equal(s.k8s.state.owners[0].spec.replicas, 2);

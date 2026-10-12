@@ -34,9 +34,22 @@ const finished = (pod) => pod.status?.phase === 'Succeeded' || pod.status?.phase
 const ready = (pod) => !pod.metadata?.deletionTimestamp && pod.status?.phase === 'Running'
   && (pod.status.conditions ?? []).some((c) => c.type === 'Ready' && c.status === 'True');
 
-// The owner's pods still there (finished ones are gone for good).
-const livePods = async (k8s, ref, object) => (await k8s.list(`/api/v1/namespaces/${ref.namespace}/pods`, { labelSelector: labelSelector(object.spec?.selector) }))
-  .filter((pod) => !finished(pod));
+const controllerOf = (object) => (object.metadata?.ownerReferences ?? []).find((r) => r.controller);
+
+// The owner's pods still there (finished ones are gone for good): those it controls, a Deployment through its ReplicaSets.
+// Its selector may match another owner's pods (a canary selecting the same labels): never waited for, foreign behind
+// the target group.
+async function livePods(k8s, ref, object) {
+  const query = { labelSelector: labelSelector(object.spec?.selector) };
+  const [pods, sets] = await Promise.all([
+    k8s.list(`/api/v1/namespaces/${ref.namespace}/pods`, query),
+    ref.owner.kind === 'Deployment' ? k8s.list(`/apis/apps/v1/namespaces/${ref.namespace}/replicasets`, query) : [],
+  ]);
+  const parents = new Set(ref.owner.kind === 'Deployment'
+    ? sets.filter((rs) => controllerOf(rs)?.kind === 'Deployment' && controllerOf(rs).name === ref.owner.name).map((rs) => `ReplicaSet/${rs.metadata.name}`)
+    : [`${ref.owner.kind}/${ref.owner.name}`]);
+  return pods.filter((pod) => !finished(pod) && parents.has(`${controllerOf(pod)?.kind}/${controllerOf(pod)?.name}`));
+}
 
 // The owner, or null when it does not exist.
 async function ownerOf(k8s, ref) {

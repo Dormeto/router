@@ -1329,7 +1329,7 @@ function pendingWake() {
   const napBackends = JSON.stringify([{ kind: 'k8s', id: 'eks-demo/demo/Deployment/web', cluster: 'eks-demo', namespace: 'demo', owner: { kind: 'Deployment', name: 'web' }, replicas: 1, keda: null }]);
   const k8s = fakeKubernetes({
     owners: [k8sOwner('web', { replicas: 0 })],
-    pods: [k8sPod('web-5d9c-a1', { labels: { app: 'web' }, phase: 'Pending', ready: false })],
+    pods: [k8sPod('web-5d9c-a1', { labels: { app: 'web' }, phase: 'Pending', ready: false, owner: { kind: 'ReplicaSet', name: 'web-5d4f8' } })],
     events: [{ involvedObject: { kind: 'Pod', name: 'web-5d9c-a1' }, type: 'Warning', reason: 'FailedScheduling', message: '0/1 nodes are available: 1 Insufficient cpu.', lastTimestamp: new Date(start + 5_000).toISOString() }],
   });
   const s = setup({ run: { state: STATES.WAKING, wakeId: 'w1', wakeStartedAt: start, napBackends }, cfg: k8sConfig({ switch: 'rule' }), k8s, target: 'waker', healthy: 0 });

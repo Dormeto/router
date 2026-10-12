@@ -173,7 +173,7 @@ supposed to be applied (`kubectl apply -f`, or by the module with the `kubernete
 the rights the router checks (read Deployments, StatefulSets, ReplicaSets, Pods, Services, Events, Ingresses, HPAs and
 ScaledObjects; get Nodes; scale Deployments and StatefulSets; patch ScaledObjects; create, patch and delete Ingresses),
 its binding, and a ValidatingAdmissionPolicy (Kubernetes 1.30 or later) refusing the group's create and delete of an
-Ingress without the `dormeto.com/managed` label. A cluster on `aws-auth` only (`CONFIG_MAP`) needs the roles mapped by
+Ingress without the `dormeto.com/managed` label, and any change of the group adding or removing that label. A cluster on `aws-auth` only (`CONFIG_MAP`) needs the roles mapped by
 hand or a switch to `API_AND_CONFIG_MAP`. The controller's `clusterCheck` action asks the cluster what the router may do
 (`SelfSubjectRulesReview`, then a `SelfSubjectAccessReview` per right an incomplete review does not list) and names
 what is missing; the onboarding refuses a workload until nothing is.

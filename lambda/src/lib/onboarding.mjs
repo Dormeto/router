@@ -686,7 +686,8 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
       });
     }
     await run('restore rules', async () => {
-      if (!group) return false;
+      // An Ingress switch's rules are the controller's (never changed: decision 4); restoring the Ingress was the restore.
+      if (!group || ingressSwitched) return false;
       let restored = 0;
       for (const { rule, tags } of await rulesTo(group)) {
         // Shadows go first: traffic falls back to the customer's rules, which forward to the application.

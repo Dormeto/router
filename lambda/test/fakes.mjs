@@ -509,6 +509,13 @@ export function fakeKubernetes({ owners = [], pods = [], nodes = [], scaledObjec
   };
   const labelsOf = (owner) => Object.entries(owner.spec.selector.matchLabels).map(([k, v]) => `${k}=${v}`).join(',');
   const podsOf = (namespace, selector) => state.pods.filter((p) => p.metadata.namespace === namespace && selects(selector, p.metadata.labels));
+  // Each Deployment's ReplicaSet (<deployment>-5d4f8); an owner's controller terminates only its own pods.
+  const replicaSetsOf = (namespace, selector) => state.owners.filter((o) => o.kind === 'Deployment' && o.metadata.namespace === namespace && selects(selector, o.spec.selector.matchLabels))
+    .map((o) => ({ metadata: { name: `${o.metadata.name}-5d4f8`, namespace, labels: o.spec.selector.matchLabels, ownerReferences: [{ apiVersion: 'apps/v1', kind: 'Deployment', name: o.metadata.name, controller: true }] } }));
+  const controls = (owner, pod) => {
+    const ref = (pod.metadata.ownerReferences ?? []).find((r) => r.controller);
+    return owner.kind === 'Deployment' ? ref?.kind === 'ReplicaSet' && ref.name === `${owner.metadata.name}-5d4f8` : ref?.kind === owner.kind && ref.name === owner.metadata.name;
+  };
   return {
     state,
     async get(path) {
@@ -550,6 +557,8 @@ export function fakeKubernetes({ owners = [], pods = [], nodes = [], scaledObjec
         return structuredClone(state.events.filter((e) => (e.metadata?.namespace ?? events[1]) === events[1]
           && Object.entries(wanted).every(([key, value]) => e[key.split('.')[0]]?.[key.split('.')[1]] === value)));
       }
+      const sets = /^\/apis\/apps\/v1\/namespaces\/([^/]+)\/replicasets$/.exec(path);
+      if (sets) return structuredClone(replicaSetsOf(sets[1], query.labelSelector));
       const scaled = /^\/apis\/keda\.sh\/v1alpha1\/namespaces\/([^/]+)\/scaledobjects$/.exec(path);
       if (scaled) {
         if (!keda) throw notFound('the server could not find the requested resource');
@@ -565,7 +574,7 @@ export function fakeKubernetes({ owners = [], pods = [], nodes = [], scaledObjec
         if (!scale || type !== 'merge') throw new Error(`unexpected call PATCH ${path}`);
         owner.spec.replicas = body.spec.replicas;
         if (owner.spec.replicas === 0) {
-          for (const pod of podsOf(owner.metadata.namespace, labelsOf(owner))) {
+          for (const pod of podsOf(owner.metadata.namespace, labelsOf(owner)).filter((p) => controls(owner, p))) {
             pod.metadata.deletionTimestamp = '2026-10-11T10:00:00Z';
             state.stopping.set(pod, stopAfter);
           }
@@ -630,11 +639,12 @@ export const k8sOwner = (name, { kind = 'Deployment', namespace = 'demo', replic
   kind, metadata: { name, namespace }, spec: { replicas, selector: { matchLabels: labels } },
 });
 
+// A pod and its controller: by default a ReplicaSet of the Deployment its name starts with (<deployment>-5d4f8).
 export const k8sPod = (name, {
   namespace = 'demo', labels = { app: name.replace(/-[^-]+$/, '') }, ip, node = 'ip-10-0-1-1.eu-west-1.compute.internal', phase = 'Running', ready = true,
-  requests = { cpu: '250m', memory: '512Mi' }, init, annotations = {}, fargate = false,
+  requests = { cpu: '250m', memory: '512Mi' }, init, annotations = {}, fargate = false, owner = { kind: 'ReplicaSet', name: `${name.replace(/-[^-]+$/, '')}-5d4f8` },
 } = {}) => ({
-  metadata: { name, namespace, labels, annotations },
+  metadata: { name, namespace, labels, annotations, ...(owner ? { ownerReferences: [{ apiVersion: 'apps/v1', kind: owner.kind, name: owner.name, controller: true }] } : {}) },
   spec: {
     nodeName: node, schedulerName: fargate ? 'fargate-scheduler' : 'default-scheduler',
     containers: [{ name: 'app', resources: requests ? { requests } : {} }],

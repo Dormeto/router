@@ -35,7 +35,7 @@ test('the backend of a Kubernetes workload: its owner and replicas, read in the 
 
 test('a StatefulSet is read under its own resource, and the node autoscaler found by discovery is kept for the savings', async () => {
   const cfg = k8sConfig({ owner: { kind: 'StatefulSet', name: 'cache' }, autoscaler: 'cluster-autoscaler' });
-  const { ports } = setup({ cfg, owners: [k8sOwner('cache', { kind: 'StatefulSet', replicas: 1 })], pods: [k8sPod('cache-0', { ip: '10.0.2.1' })] });
+  const { ports } = setup({ cfg, owners: [k8sOwner('cache', { kind: 'StatefulSet', replicas: 1 })], pods: [k8sPod('cache-0', { ip: '10.0.2.1', owner: { kind: 'StatefulSet', name: 'cache' } })] });
   const { backends: [backend] } = await k8sBackend(ports, cfg);
   assert.equal(backend.id, 'eks-demo/demo/StatefulSet/cache');
   assert.equal(backend.replicas, 1);
@@ -67,6 +67,19 @@ test('refused when the target group\'s pods are not the owner\'s: never a scale 
   // Targets still draining after a rollout are not counted.
   const draining = setup({ targets: [{ Id: '10.0.1.1', State: 'healthy' }, { Id: '10.0.7.7', State: 'draining' }] });
   assert.equal((await k8sBackend(draining.ports, draining.cfg)).backends.length, 1);
+});
+
+// Selectors are not ownership: a canary Deployment selecting app=web too, created after onboarding.
+test('pods of another owner whose selector matches them are not the owner\'s: foreign behind the target group, never waited for at a nap (review focus 1)', async () => {
+  const owners = [k8sOwner('web', { replicas: 2 }), k8sOwner('web-canary', { labels: { app: 'web' } })];
+  const pods = [k8sPod('web-1', { ip: '10.0.1.1' }), k8sPod('web-canary-1', { ip: '10.0.1.9', labels: { app: 'web' } })];
+  const both = setup({ owners, pods });
+  assert.deepEqual(await k8sBackend(both.ports, both.cfg), { backends: [], ignored: [{ id: ID, reason: 'targets 10.0.1.9 of the target group are not pods of Deployment demo/web' }] });
+  const one = setup({ owners, pods, targets: [{ Id: '10.0.1.1', State: 'healthy' }] });
+  const [backend] = (await k8sBackend(one.ports, one.cfg)).backends;
+  await sleepK8s(one.ports, backend, timing(fakeClock(), 30_000));
+  assert.deepEqual(one.k8s.state.pods.map((p) => p.metadata.name), ['web-canary-1']);
+  assert.equal(await k8sStatus(one.ports, backend), 'stopped');
 });
 
 test('an owner that no longer exists is ignored with the reason; instance targets (a NodePort Service) are not compared with pods', async () => {

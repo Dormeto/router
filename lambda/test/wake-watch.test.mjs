@@ -72,7 +72,7 @@ const podEvent = (pod, reason, message, s, type = 'Warning') => ({ involvedObjec
 function kubeWatch(events) {
   const k8s = fakeKubernetes({
     owners: [k8sOwner('web', { replicas: 2 }), k8sOwner('web-api', { replicas: 1 })],
-    pods: [k8sPod('web-5d9c-a1', { labels: { app: 'web' }, phase: 'Pending', ready: false }), k8sPod('web-api-77f-b2', { labels: { app: 'web-api' } })],
+    pods: [k8sPod('web-5d9c-a1', { labels: { app: 'web' }, phase: 'Pending', ready: false, owner: { kind: 'ReplicaSet', name: 'web-5d4f8' } }), k8sPod('web-api-77f-b2', { labels: { app: 'web-api' }, owner: { kind: 'ReplicaSet', name: 'web-api-5d4f8' } })],
     events,
   });
   return createWakeWatch({ kubernetesOf: async () => k8s }, [K8S], { since: SINCE, now: () => SINCE + 40_000 });

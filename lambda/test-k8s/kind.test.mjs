@@ -66,6 +66,7 @@ test('Dormeto\'s Ingress is created, switched and removed by the group', async (
   assert.equal(ours.metadata.labels['dormeto.com/managed'], 'true');
   assert.equal(ours.metadata.annotations['alb.ingress.kubernetes.io/healthcheck-path'], '/health');
   assert.equal(JSON.parse(ours.metadata.annotations['alb.ingress.kubernetes.io/actions.dormeto']).forwardConfig.targetGroups[1].weight, 1);
+  await assert.rejects(router.patch(ingressPath(NAMESPACE, 'dormeto-kindtest'), { metadata: { labels: { 'dormeto.com/managed': null } } }), /Dormeto never adds nor removes its label/);
   await router.remove(ingressPath(NAMESPACE, 'dormeto-kindtest'));
   await until(async () => (await admin.get(ingressPath(NAMESPACE, 'dormeto-kindtest')).catch((err) => (err.status === 404 ? null : Promise.reject(err)))) === null, 30_000);
 });
@@ -74,6 +75,9 @@ test('the admission policy refuses the group\'s create and delete of an Ingress 
   const stranger = { apiVersion: 'networking.k8s.io/v1', kind: 'Ingress', metadata: { name: 'stranger', namespace: NAMESPACE }, spec: { rules: [{ host: 'x.test', http: { paths: [{ path: '/', pathType: 'Prefix', backend: { service: { name: 'web', port: { number: 80 } } } }] } }] } };
   await assert.rejects(router.create(ingressPath(NAMESPACE), stranger), /Dormeto creates and deletes only its own Ingresses/);
   await assert.rejects(router.remove(ingressPath(NAMESPACE, 'web')), /Dormeto creates and deletes only its own Ingresses/);
+  // Nor by labelling a customer's Ingress first (then deleting it): the group never adds nor removes the label.
+  await assert.rejects(router.patch(ingressPath(NAMESPACE, 'web'), { metadata: { labels: { 'dormeto.com/managed': 'true' } } }), /Dormeto never adds nor removes its label/);
+  assert.equal((await admin.get(ingressPath(NAMESPACE, 'web'))).metadata.labels?.['dormeto.com/managed'], undefined);
 
   const cfg = config('web', { switch: 'patched-ingress', ingress: { name: 'solo', ruleIndex: 0, service: { name: 'web', port: { number: 80 } } } });
   const before = await admin.get(ingressPath(NAMESPACE, 'solo'));

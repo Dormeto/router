@@ -17,8 +17,14 @@ still supported.
 
 **Auto Scaling groups** tagged `dormeto:workload=<workload id>` and feeding the application target group are managed as
 a whole: the nap records their sizes, suspends the scaling processes and scales them to 0; the wake restores the sizes
-and resumes the processes. Their instances are never stopped one by one. The `dev` environment has two workloads:
-`demo` (one EC2 instance, `https://dev.dormeto.com/`) and `demo-asg` (an Auto Scaling group, `https://asg.dev.dormeto.com/`).
+and resumes the processes. Their instances are never stopped one by one.
+
+**ECS services** tagged `dormeto:workload=<workload id>` and feeding the application target group (found with the
+Resource Groups Tagging API) are napped by `desiredCount = 0`, with their Application Auto Scaling target suspended; the
+wake restores both.
+
+The `dev` environment has three workloads: `demo` (one EC2 instance, `https://dev.dormeto.com/`), `demo-asg` (an Auto
+Scaling group, `https://asg.dev.dormeto.com/`) and `demo-ecs` (an ECS Fargate service, `https://ecs.dev.dormeto.com/`).
 
 Design: [vision/docs/specs/2026-10-03-mvp-alb-ec2-design.md](https://github.com/Dormeto/vision/blob/main/docs/specs/2026-10-03-mvp-alb-ec2-design.md).
 

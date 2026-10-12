@@ -92,7 +92,7 @@ test('nap: a failure while stopping ends FAILED so that requests retry the wake'
 });
 
 test('check: naps an idle workload', async () => {
-  const s = setup({ run: { state: STATES.AWAKE, awakeSince: 0 }, metric: [0, 0, 0] });
+  const s = setup({ run: { state: STATES.AWAKE, awakeSince: 1 }, metric: [0, 0, 0] });
   const [result] = await s.handler({ action: 'check' });
   assert.equal(result.workloadId, 'demo');
   assert.equal(result.state, STATES.ASLEEP);
@@ -101,10 +101,19 @@ test('check: naps an idle workload', async () => {
 });
 
 test('check: keeps a workload with requests awake', async () => {
-  const s = setup({ run: { state: STATES.AWAKE, awakeSince: 0 }, metric: [0, 4] });
+  const s = setup({ run: { state: STATES.AWAKE, awakeSince: 1 }, metric: [0, 4] });
   const [result] = await s.handler({ action: 'check' });
   assert.deepEqual(result, { workloadId: 'demo', state: STATES.AWAKE, requests: 4 });
   assert.equal(s.ec2.state.stopped, 0);
+});
+
+test('check: starts the idle window on the first check after deployment instead of napping', async () => {
+  const s = setup({ run: { state: STATES.AWAKE, awakeSince: 0 }, metric: [0, 0, 0] });
+  const [result] = await s.handler({ action: 'check' });
+  assert.deepEqual(result, { workloadId: 'demo', state: STATES.AWAKE });
+  assert.equal(s.store.state.run.awakeSince, s.clock.now());
+  assert.equal(s.ec2.state.stopped, 0);
+  assert.equal(s.cloudwatch.calls.length, 0);
 });
 
 test('check: does not query metrics before idleMinutes of awake time', async () => {

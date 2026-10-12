@@ -124,6 +124,11 @@ export function createController({ store, ec2, elbv2, cloudwatch, now = Date.now
   async function checkOne(cfg) {
     const run = await reconcile(cfg);
     if (!run || run.state !== STATES.AWAKE) return { state: run?.state ?? 'UNKNOWN' };
+    if (!run.awakeSince) {
+      // First check after deployment: the idle window starts now, not at the epoch.
+      await store.transition(cfg.workloadId, { cond: { state: STATES.AWAKE }, set: { awakeSince: now() } });
+      return { state: run.state };
+    }
     const t = now();
     const idleMs = cfg.idleMinutes * 60_000;
     if ((run.awakeSince ?? 0) > t - idleMs) return { state: run.state };

@@ -17,6 +17,8 @@ module "router" {
   ]
   # Lets dormeto-e2e check that a matching request (and its waiter probe) never wakes a workload.
   no_wake_rules = [{ name = "e2e-no-wake", headers = [{ name = "x-dormeto-e2e", value = "no-wake" }] }]
+  # The dev manager's event bus (manager platform output event_bus_arn): the router reports its state there.
+  manager_event_bus_arn = "arn:aws:events:eu-west-1:121014831971:event-bus/dmt-dev-manager"
 }
 
 module "demo_workload" {

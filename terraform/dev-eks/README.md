@@ -33,6 +33,10 @@ tfenv exec plan -out dev-eks.tfplan        # read it
 tfenv exec apply dev-eks.tfplan            # the user's go-ahead
 ```
 
+From the vision repository, `dormeto-e2e cluster start` (`--lone-ingress`, `--target-group-binding`) and `dormeto-e2e
+cluster stop` run the same plans and apply them once you confirm; `stop` refuses while routers still nap workloads of
+the cluster, and checks what is left after the destroy.
+
 **Destroy** (`tfenv exec plan -destroy -out dev-eks.tfplan`, then apply): the demos go first; the root then waits for
 the controller to delete its load balancers and target groups, and for Karpenter's instances to be terminated, before
 removing them (they would keep billing and block the VPC's deletion). Then `dormeto-e2e cluster check --name eks-demo

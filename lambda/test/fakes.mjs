@@ -62,6 +62,8 @@ export function fakeStore({ config, run, clock }) {
       return true;
     },
     async count(id, counter) { state.stats[counter] = (state.stats[counter] ?? 0) + 1; },
+    async recordScheduledCheck(at) { state.check = { ...(state.check ?? {}), lastScheduledCheckAt: at }; },
+    async getCheck() { return structuredClone(state.check ?? null); },
     async getListMeta(name) { return structuredClone(state.lists[name]?.meta ?? null); },
     async setListMeta(name, set, remove = []) {
       const l = list(name);

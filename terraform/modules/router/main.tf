@@ -70,12 +70,13 @@ resource "aws_lambda_function" "controller" {
 
   environment {
     variables = {
-      DMT_TABLE         = aws_dynamodb_table.router.name
-      DMT_VERSION       = var.router_version
-      DMT_BUILD         = local.build
-      DMT_IP_LISTS      = local.ip_lists
-      DMT_TG_PREFIX     = "${var.name}-"
-      DMT_NO_WAKE_RULES = jsonencode(local.no_wake_rules)
+      DMT_TABLE          = aws_dynamodb_table.router.name
+      DMT_VERSION        = var.router_version
+      DMT_BUILD          = local.build
+      DMT_IP_LISTS       = local.ip_lists
+      DMT_TG_PREFIX      = "${var.name}-"
+      DMT_NO_WAKE_RULES  = jsonencode(local.no_wake_rules)
+      DMT_CHECK_SCHEDULE = var.check_schedule
     }
   }
 
@@ -144,7 +145,8 @@ resource "aws_scheduler_schedule" "check" {
   target {
     arn      = aws_lambda_function.controller.arn
     role_arn = aws_iam_role.scheduler.arn
-    input    = jsonencode({ action = "check" })
+    # source = schedule: the controller records the scheduled checks (health of the automatic naps).
+    input = jsonencode({ action = "check", source = "schedule" })
 
     retry_policy {
       maximum_retry_attempts = 0

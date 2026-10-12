@@ -584,7 +584,7 @@ function managerSetup({ run, defaultRules = [], lists = [] }) {
     store: s.store, ec2: s.ec2, elbv2: s.elbv2, cloudwatch: s.cloudwatch, autoscaling: s.autoscaling, ecs: s.ecs,
     appscaling: s.appscaling, invokeSelf: async (payload) => { s.invocations.push(payload); }, now: s.clock.now,
     sleep: s.clock.sleep, newId: () => 'w-manager', log: silentLog,
-    router: { name: 'dmt-dev', version: '0.11.0', build: 'abc' }, defaultRules, ipLists: lists,
+    router: { name: 'dmt-dev', version: '0.11.0', build: 'abc', checkSchedule: 'rate(5 minutes)' }, defaultRules, ipLists: lists,
   });
   return { ...s, handler };
 }
@@ -592,7 +592,7 @@ function managerSetup({ run, defaultRules = [], lists = [] }) {
 test('list returns the router and its workloads from the state table', async () => {
   const s = managerSetup({ run: { state: STATES.ASLEEP, wakeCount: 3, updatedAt: 1_700_000_000_000 } });
   const result = await s.handler({ action: 'list' });
-  assert.deepEqual(result.router, { name: 'dmt-dev', version: '0.11.0', build: 'abc' });
+  assert.deepEqual(result.router, { name: 'dmt-dev', version: '0.11.0', build: 'abc', checkSchedule: 'rate(5 minutes)', lastScheduledCheckAt: null });
   const [workload] = result.workloads;
   assert.equal(workload.workloadId, 'demo');
   assert.equal(workload.state, STATES.ASLEEP);
@@ -657,4 +657,22 @@ test('discover runs the discovery with the controller clients', async () => {
   const result = await s.handler({ action: 'discover' });
   assert.deepEqual(result.candidates, []);
   assert.match(result.generatedAt, /^\d{4}-\d\d-\d\dT/);
+});
+
+// --- Scheduled check health -----------------------------------------------------------------------------------------
+
+test('a scheduled check records its time; other checks do not hide a broken scheduler', async () => {
+  const s = managerSetup({ run: { state: STATES.ASLEEP } });
+  await s.handler({ action: 'check' });
+  assert.equal(s.store.state.check?.lastScheduledCheckAt, undefined);
+  await s.handler({ action: 'check', source: 'schedule' });
+  assert.equal(s.store.state.check.lastScheduledCheckAt, s.clock.now());
+});
+
+test('list gives the last scheduled check and the schedule of the router', async () => {
+  const s = managerSetup({ run: { state: STATES.ASLEEP } });
+  await s.handler({ action: 'check', source: 'schedule' });
+  const { router } = await s.handler({ action: 'list' });
+  assert.equal(router.lastScheduledCheckAt, new Date(s.clock.now()).toISOString());
+  assert.equal(router.checkSchedule, 'rate(5 minutes)');
 });

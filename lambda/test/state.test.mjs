@@ -178,3 +178,14 @@ test('store list metadata and versioned parts use the LIST#<name> partition', as
   assert.equal(query.KeyConditionExpression, '#pk = :pk AND begins_with(#sk, :prefix)');
   assert.deepEqual(query.ExpressionAttributeValues[':prefix'], { S: 'PART#v1#' });
 });
+
+test('store records the last scheduled check in the ROUTER / CHECK item', async () => {
+  const dynamo = fakeDynamo({ updateItem: async () => ({}), getItem: async () => ({ Item: { lastScheduledCheckAt: { N: '42' } } }) });
+  const store = createStore({ dynamo, table: 't' });
+  await store.recordScheduledCheck(42);
+  assert.deepEqual(await store.getCheck(), { lastScheduledCheckAt: 42 });
+  const [[, update], [, get]] = dynamo.calls;
+  assert.deepEqual(update.Key, { pk: { S: 'ROUTER' }, sk: { S: 'CHECK' } });
+  assert.equal(update.UpdateExpression, 'SET #at = :at');
+  assert.deepEqual(get.Key, { pk: { S: 'ROUTER' }, sk: { S: 'CHECK' } });
+});

@@ -187,6 +187,22 @@ export function createStore({ dynamo, table, now = Date.now }) {
       return { days, since, today: todayStats, total };
     },
 
+    // Health of the idle check: the last check started by the schedule (manual checks do not count).
+    async recordScheduledCheck(at) {
+      await dynamo.updateItem({
+        TableName: table,
+        Key: { pk: { S: 'ROUTER' }, sk: { S: 'CHECK' } },
+        UpdateExpression: 'SET #at = :at',
+        ExpressionAttributeNames: { '#at': 'lastScheduledCheckAt' },
+        ExpressionAttributeValues: { ':at': { N: String(at) } },
+      });
+    },
+
+    async getCheck() {
+      const { Item } = await dynamo.getItem({ TableName: table, Key: { pk: { S: 'ROUTER' }, sk: { S: 'CHECK' } }, ConsistentRead: true });
+      return Item ? fromItem(Item) : null;
+    },
+
     // IP reputation lists: LIST#<name> / META and LIST#<name> / PART#<version>#<nnnn> (gzip chunks).
     async getListMeta(name) {
       const { Item } = await dynamo.getItem({ TableName: table, Key: listKey(name, 'META'), ConsistentRead: true });

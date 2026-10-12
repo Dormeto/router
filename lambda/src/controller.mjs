@@ -37,7 +37,10 @@ export const handler = createController({
   log: logger,
   lists: lists.length ? createListRefresher({ store, lists, log: logger }) : null,
   // Manager interface: router identity, router no-wake rules and IP lists in the status.
-  router: { name: (process.env.DMT_TG_PREFIX ?? '').replace(/-$/, ''), version: process.env.DMT_VERSION, build: process.env.DMT_BUILD },
+  router: {
+    name: (process.env.DMT_TG_PREFIX ?? '').replace(/-$/, ''), version: process.env.DMT_VERSION, build: process.env.DMT_BUILD,
+    checkSchedule: process.env.DMT_CHECK_SCHEDULE,
+  },
   defaultRules: parseRules(process.env.DMT_NO_WAKE_RULES, (error) => logger.error('NoWakeRulesUnreadable', { error })),
   ipLists: lists,
 });

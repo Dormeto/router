@@ -269,7 +269,14 @@ export function createController({
       ]);
       return workloadSummary(cfg, run, byRule.get(cfg.ruleArn), totals(stats));
     }));
-    return { router: { name: router.name, version: router.version, build: router.build }, workloads };
+    const health = await store.getCheck().catch(() => null);
+    return {
+      router: {
+        name: router.name, version: router.version, build: router.build, checkSchedule: router.checkSchedule ?? null,
+        lastScheduledCheckAt: health?.lastScheduledCheckAt ? new Date(health.lastScheduledCheckAt).toISOString() : null,
+      },
+      workloads,
+    };
   }
 
   async function workloadStatus(workloadId) {
@@ -329,7 +336,11 @@ export function createController({
     }
   }
 
-  async function check() {
+  async function check(source) {
+    // Only the schedule proves that naps happen on their own: the e2e and operators also call check.
+    if (source === 'schedule') {
+      await store.recordScheduledCheck(now()).catch((err) => log.warn('CheckRecordFailed', { error: err.message }));
+    }
     await requestListRefresh();
     const results = [];
     for (const cfg of await store.listConfigs()) {
@@ -359,7 +370,7 @@ export function createController({
     switch (event?.action) {
       case 'wake': return wake(event.workloadId, event.wakeId);
       case 'nap': return nap(event.workloadId);
-      case 'check': return check();
+      case 'check': return check(event.source);
       case 'ensure-awake': return ensureAwake(event.workloadId);
       case 'refresh-lists': return lists ? lists.refresh(event.names ?? []) : [];
       case 'list': return list();

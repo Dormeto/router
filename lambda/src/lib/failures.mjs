@@ -38,11 +38,13 @@ export function classify(error) {
 }
 
 // What a transition to FAILED adds (R7a): the failure on the run (until a successful wake), one more consecutive failure,
-// and the failure in the state change event. step: wake or nap; backend: the one that failed, when known.
+// and the failure in the state change event, its time ISO as the change's. step: wake or nap; backend: the one that
+// failed, when known.
 export function failedSpec(error, { step, backend = error?.backend, wakeId, at }) {
   const { kind, message } = classify(error);
   const failure = { kind, step, ...(backend ? { backend } : {}), message, at };
-  return { set: { failure: JSON.stringify(failure) }, increment: ['consecutiveFailures'], event: { ...(wakeId ? { wakeId } : {}), failure } };
+  const event = { ...(wakeId ? { wakeId } : {}), failure: { ...failure, at: new Date(at).toISOString() } };
+  return { set: { failure: JSON.stringify(failure) }, increment: ['consecutiveFailures'], event };
 }
 
 // An error of the router's own, of a given kind.

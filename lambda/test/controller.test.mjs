@@ -66,7 +66,8 @@ test('wake: a refused start records why, the backend and the consecutive failure
   const failure = { kind: 'permission', step: 'wake', backend: 'instance:i-0123456789abcdef0', message: 'You are not authorized to perform this operation.', at: s.clock.now() };
   assert.deepEqual(JSON.parse(s.store.state.run.failure), failure);
   assert.equal(s.store.state.run.consecutiveFailures, 2);
-  assert.deepEqual(specs.at(-1).event, { wakeId: 'w1', failure });
+  // The event's time is ISO, as the change's and the summary's (the manager reads only ISO times).
+  assert.deepEqual(specs.at(-1).event, { wakeId: 'w1', failure: { ...failure, at: new Date(s.clock.now()).toISOString() } });
 });
 
 test('wake: a successful wake clears the failure and gives its duration in the event (R7a)', async () => {

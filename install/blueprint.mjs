@@ -165,7 +165,7 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
     // reads to the manager's bus.
     forwarder: {
       role: {
-        name: `${p.name}-forwarder`, path: ROLE_PATH, tags,
+        name: `${p.name}-forwarder`, path: ROLE_PATH, tags, policyName: 'forwarder',
         trust: { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Principal: { Service: 'events.amazonaws.com' }, Action: 'sts:AssumeRole', Condition: { StringEquals: { 'aws:SourceAccount': p.account } } }] },
         policy: policy(allow(['events:PutEvents'], [p.managerBus])),
       },

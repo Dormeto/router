@@ -200,6 +200,7 @@ test('the forwarder: a role of the account under the routers\' path, trusted by 
   assert.deepEqual([role.path, role.name], ['/dormeto/router/', 'dmtr-dev-forwarder']);
   assert.deepEqual(role.trust, { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Principal: { Service: 'events.amazonaws.com' }, Action: 'sts:AssumeRole', Condition: { StringEquals: { 'aws:SourceAccount': '121014831971' } } }] });
   assert.deepEqual(role.policy.Statement, [{ Effect: 'Allow', Action: ['events:PutEvents'], Resource: [VALUES.managerBus] }]);
+  assert.equal(role.policyName, 'forwarder');
   assert.deepEqual(role.tags, { 'dormeto:router': 'dmtr-dev' });
   assert.equal(rule.name, 'dmtr-dev-discovery');
   assert.equal(rule.targetBus, VALUES.managerBus);

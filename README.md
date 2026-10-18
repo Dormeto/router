@@ -11,6 +11,9 @@
 Data plane of [Dormeto](https://dormeto.com) ("nap" in Esperanto): it puts idle web workloads to
 sleep and wakes them just-in-time on the next request.
 
+**[Supported scenarios](docs/scenarios/README.md):** EC2 instances, Auto Scaling groups, ECS services, RDS and Aurora
+databases, Kubernetes on EKS, each with its diagram, services, measured wake time, behavior and limits.
+
 This MVP manages one EC2 instance behind an ALB:
 
 - `waker` Lambda: ALB target used only while the workload naps. It wakes the workload once, holds the request up to
@@ -48,7 +51,8 @@ wake restores both.
 **Databases** (RDS DB instances and Aurora DB clusters) tagged `dormeto:workload=<workload id>` are **companions**: the
 nap stops them after the application (without waiting), the wake starts them and waits until they are available before
 starting the application. A wake that outlasts one Lambda invocation continues in a new one (same wake id) until
-`wake_timeout_seconds` (1800 s for workloads with a database). While a workload sleeps, a database restarted by AWS after
+`wake_timeout_seconds` (1800 s for workloads with a database onboarded by the manager; the `workload` module's default
+stays 600 s, set it there). While a workload sleeps, a database restarted by AWS after
 7 days is stopped again. Read replicas and Aurora Serverless v1 are ignored.
 
 **No-wake requests** get the waiter page without waking the workload: `HEAD`, bot and scanner user agents, well-known
@@ -216,8 +220,9 @@ workloads do not nap), Lambda errors and throttles of the controller and the wak
 concurrency, messages waiting in the `check-failures` and `controller-failures` queues, IP lists' last download, failed
 workloads; and the router configuration with its source (`terraform`). Metrics and queues are read at most once a minute.
 
-Health also warns when the account's Lambda concurrency limit in the region (10 in a region the account barely uses)
-is below the largest `maxHolders` plus 10: held requests beyond it get errors until a quota increase.
+Health also warns when the router can need more than 80% of the account's Lambda concurrency limit in the region (10 in
+a region the account barely uses): its waker's 24-hour peak plus its queued naps and wakes, drift repairs and the check.
+Requests beyond the limit get errors until a quota increase.
 
 **Onboarding** (`<router>-onboarder`, invoked by the manager): `preview`, `onboard` and `offboard` a workload from its
 application target group, with their own role (the controller keeps its least privilege). The workload id is derived
@@ -275,6 +280,7 @@ Design: `docs/specs/2026-10-03-mvp-alb-ec2-design.md` in the Dormeto/vision repo
 
 | Path | Content |
 |---|---|
+| `docs/scenarios` | The supported scenarios: diagrams, services, wake times, behavior, limits |
 | `lambda/src` | Lambda code (Node.js 24, no bundled dependency) |
 | `lambda/test` | Unit tests (`node --test`) |
 | `terraform/modules/router` | DynamoDB table, Lambdas, IAM, idle check schedule |

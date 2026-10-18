@@ -37,6 +37,8 @@ export function workloadSummary(cfg, run = {}, host = null, stats7d = null, paus
     targetGroupArn: cfg.appTargetGroupArn,
     // Written by the Terraform workload module, or onboarded by the manager (only those are offboarded by it).
     source: cfg.source ?? 'terraform',
+    // Dormeto's own labels (tags design, section 3): the manager groups and grants access by them.
+    tags: cfg.tags ?? {},
     state: run?.state ?? 'UNKNOWN',
     // When the state began (router 0.26.0): the instant of its state change event, so a check names the same change.
     stateAt: iso(run?.stateAt),

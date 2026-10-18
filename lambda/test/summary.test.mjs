@@ -33,3 +33,8 @@ test('a workload summary gives when its state began (stateAt, router 0.26.0)', (
   assert.equal(workloadSummary(testConfig(), { state: 'ASLEEP', stateAt: at }).stateAt, '2026-10-08T12:00:00.000Z');
   assert.equal(workloadSummary(testConfig(), { state: 'ASLEEP' }).stateAt, null);
 });
+
+test('a workload summary carries the tags ({} without)', () => {
+  assert.deepEqual(workloadSummary(testConfig({ tags: { team: 'payments', env: 'staging' } })).tags, { team: 'payments', env: 'staging' });
+  assert.deepEqual(workloadSummary(testConfig()).tags, {});
+});

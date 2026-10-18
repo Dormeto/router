@@ -63,6 +63,7 @@ export const PUBLISH_BUDGET_MS = 1000;
 
 // The store, with every successful state transition published (controller and waker): one place, none missed.
 export function withTransitionEvents(store, publisher, { now = Date.now, log = null, budgetMs = PUBLISH_BUDGET_MS } = {}) {
+  const tagged = async (workloadId, change) => ({ ...change, tags: (await store.getConfig?.(workloadId).catch(() => null))?.tags ?? {} });
   return Object.assign(Object.create(store), store, {
     // spec.cause (what started a wake or a nap, or ended one early), spec.by (who asked it from the manager, R8) and
     // spec.event (the failure, the wake id and its duration, R7a) go in the event only, never to the store. A state
@@ -80,8 +81,9 @@ export function withTransitionEvents(store, publisher, { now = Date.now, log = n
         let timer;
         const slow = new Promise((resolve) => { timer = setTimeout(() => resolve('slow'), budgetMs); });
         try {
-          // A slower publish goes on, unwaited; the next check sends the state anyway.
-          const outcome = await Promise.race([publisher.stateChanged(change), slow]);
+          // A slower publish goes on, unwaited; the next check sends the state anyway. The workload's tags (access
+          // control by tag) are read inside the budget: an unreadable configuration sends none.
+          const outcome = await Promise.race([tagged(workloadId, change).then((c) => publisher.stateChanged(c)), slow]);
           if (outcome === 'slow') log?.warn('PublishSlow', { what: 'state', workloadId, budgetMs });
         } catch (err) {
           log?.warn('PublishFailed', { what: 'state', error: err.message });

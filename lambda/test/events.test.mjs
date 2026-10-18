@@ -80,7 +80,7 @@ test('every successful state transition is published once; a failed transition o
   const store = { transition: async () => next, getRun: async () => null };
   const wrapped = withTransitionEvents(store, { stateChanged: async (c) => { published.push(c); } }, { now: () => Date.UTC(2026, 9, 5, 12) });
   assert.deepEqual(await wrapped.transition('a', { cond: { state: 'ASLEEP' }, set: { state: 'WAKING', wakeId: 'w1' } }), next);
-  assert.deepEqual(published, [{ workloadId: 'a', from: 'ASLEEP', to: 'WAKING', at: '2026-10-05T12:00:00.000Z', wakeId: 'w1' }]);
+  assert.deepEqual(published, [{ workloadId: 'a', from: 'ASLEEP', to: 'WAKING', at: '2026-10-05T12:00:00.000Z', wakeId: 'w1', tags: {} }]);
   await wrapped.transition('a', { cond: { state: 'WAKING' }, set: { holders: 2 } });
   next = null;
   await wrapped.transition('a', { cond: { state: 'ASLEEP' }, set: { state: 'WAKING' } });
@@ -108,7 +108,18 @@ test('a transition\'s event fields (the failure, the wake id and duration) go in
   const wrapped = withTransitionEvents(store, { stateChanged: async (c) => { published.push(c); } }, { now: () => Date.UTC(2026, 9, 8, 12) });
   const failure = { kind: 'capacity', backend: 'rds:dmt-dev-demo-rds', message: 'no capacity', at: 1 };
   await wrapped.transition('a', { cond: { state: 'WAKING', wakeId: 'w1' }, set: { state: 'FAILED' }, cause: 'wake-failed', event: { wakeId: 'w1', failure } });
-  assert.deepEqual(published[0], { workloadId: 'a', from: 'WAKING', to: 'FAILED', at: '2026-10-08T12:00:00.000Z', cause: 'wake-failed', wakeId: 'w1', failure });
+  assert.deepEqual(published[0], { workloadId: 'a', from: 'WAKING', to: 'FAILED', at: '2026-10-08T12:00:00.000Z', cause: 'wake-failed', wakeId: 'w1', failure, tags: {} });
   assert.equal('event' in specs[0], false);
   assert.equal('cause' in specs[0], false);
+});
+
+test('a state change carries the workload\'s tags ({} without), for the manager\'s access control', async () => {
+  const published = [];
+  const store = { transition: async (id, spec) => ({ state: spec.set.state }), getConfig: async (id) => (id === 'a' ? { tags: { team: 'payments' } } : id === 'c' ? null : {}) };
+  const wrapped = withTransitionEvents(store, { stateChanged: async (c) => { published.push(c); } }, { now: () => 0 });
+  for (const id of ['a', 'b', 'c']) await wrapped.transition(id, { cond: { state: 'ASLEEP' }, set: { state: 'WAKING' } });
+  assert.deepEqual(published.map((c) => c.tags), [{ team: 'payments' }, {}, {}]);
+  const broken = withTransitionEvents({ ...store, getConfig: async () => { throw new Error('boom'); } }, { stateChanged: async (c) => { published.push(c); } }, { now: () => 0 });
+  await broken.transition('a', { cond: { state: 'ASLEEP' }, set: { state: 'WAKING' } });
+  assert.deepEqual(published.at(-1).tags, {}, 'an unreadable configuration never holds the event back');
 });

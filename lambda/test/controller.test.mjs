@@ -1467,3 +1467,10 @@ test('a patched lone Ingress reverted (GitOps): the check reports it and patches
   assert.ok(web.metadata.annotations[`${ALB}actions.dormeto`]);
 });
 const s0 = () => fakeClock().now() - 60_000;
+
+test('the list gives each workload\'s tags ({} without)', async () => {
+  const tagged = setup({ run: { state: STATES.AWAKE }, cfg: testConfig({ tags: { team: 'payments' } }) });
+  assert.deepEqual((await tagged.handler({ action: 'list' })).workloads[0].tags, { team: 'payments' });
+  const plain = setup({ run: { state: STATES.AWAKE } });
+  assert.deepEqual((await plain.handler({ action: 'list' })).workloads[0].tags, {});
+});

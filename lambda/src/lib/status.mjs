@@ -45,6 +45,8 @@ export function createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging
       // Where the application's requests go: Dormeto's own target group for a grouped Ingress (its rule is first).
       servingTargetGroupArn: rules.switchTargetGroup ?? cfg.appTargetGroupArn,
       source: cfg.source ?? 'terraform',
+      // Dormeto's own labels (tags design, section 3), as the summary gives them.
+      tags: cfg.tags ?? {},
       state: run.state,
       stateAt: iso(run.stateAt),
       // Latest drift repairs (R4c), newest first.

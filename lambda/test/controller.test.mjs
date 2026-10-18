@@ -1502,3 +1502,10 @@ test('a tag racing an offboarding never writes the configuration back', async ()
   await assert.rejects(s.handler({ action: 'tag', workloadId: 'demo', tags: { team: 'x' }, by: 'ops' }), /workload not configured: demo/);
   assert.deepEqual(writes, [{ mustExist: true }]);
 });
+
+test('the status gives the workload\'s tags ({} without), for the manager when its router stopped reporting', async () => {
+  const tagged = setup({ run: { state: STATES.AWAKE }, cfg: testConfig({ tags: { team: 'payments' } }) });
+  assert.deepEqual((await tagged.handler({ action: 'status', workloadId: 'demo' })).tags, { team: 'payments' });
+  const plain = setup({ run: { state: STATES.AWAKE } });
+  assert.deepEqual((await plain.handler({ action: 'status', workloadId: 'demo' })).tags, {});
+});

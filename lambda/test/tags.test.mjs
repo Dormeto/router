@@ -36,3 +36,11 @@ test('tags must be an object of strings', () => {
   assert.match(tagsProblem([]), /tags: an object/);
   assert.match(tagsProblem({ a: 1 }), /tag "a": value must be a string/);
 });
+
+test('lengths count characters (code points), as Terraform does, not UTF-16 units', () => {
+  const astral = '\u{20000}';
+  assert.equal(tagsProblem({ [astral.repeat(128)]: 'x' }), null);
+  assert.match(tagsProblem({ [astral.repeat(129)]: 'x' }), /key of 1 to 128 characters/);
+  assert.equal(tagsProblem({ team: astral.repeat(256) }), null);
+  assert.match(tagsProblem({ team: astral.repeat(257) }), /value of at most 256 characters/);
+});

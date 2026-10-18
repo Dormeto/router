@@ -372,6 +372,7 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
     const named = checkName(wanted);
     if (named.problem) problems.push(named.problem);
     // Dormeto's own labels (tags design, section 3), checked like the workload module's.
+    // The result's tags are {} when invalid (ok is false then).
     const tagsFault = tagsProblem(tags);
     if (tagsFault) problems.push(tagsFault);
     if (!ID.test(workloadId ?? '')) problems.push('workload id: lowercase letters, digits and hyphens, not starting or ending with a hyphen');

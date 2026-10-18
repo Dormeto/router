@@ -51,6 +51,7 @@ resource "aws_dynamodb_table_item" "config" {
     config = { S = jsonencode({
       workloadId              = var.workload_id
       name                    = trimspace(coalesce(var.name, var.workload_id))
+      tags                    = var.tags
       ruleArns                = local.rule_arns
       ruleArn                 = try(local.rule_arns[0], null)
       appTargetGroupArn       = var.app_target_group_arn

@@ -52,3 +52,70 @@ run "fallback_instance_types_must_be_instance_types" {
   }
   expect_failures = [var.fallback_instance_types]
 }
+
+run "tags_are_written_to_the_config_and_default_to_none" {
+  command = apply
+  variables {
+    tags = { team = "payments", "cost center" = "é 日本_.:/=+-@" }
+  }
+  assert {
+    condition     = jsondecode(jsondecode(aws_dynamodb_table_item.config.item).config.S).tags == { team = "payments", "cost center" = "é 日本_.:/=+-@" }
+    error_message = "the tags are in the config"
+  }
+}
+
+run "no_tags_is_an_empty_object" {
+  command = apply
+  assert {
+    condition     = jsondecode(jsondecode(aws_dynamodb_table_item.config.item).config.S).tags == {}
+    error_message = "tags default to {}"
+  }
+}
+
+run "more_than_50_tags_refused" {
+  command = plan
+  variables {
+    tags = { for i in range(51) : "k${i}" => "v" }
+  }
+  expect_failures = [var.tags]
+}
+
+run "an_empty_key_is_refused" {
+  command = plan
+  variables {
+    tags = { "" = "v" }
+  }
+  expect_failures = [var.tags]
+}
+
+run "a_key_of_129_characters_is_refused" {
+  command = plan
+  variables {
+    tags = { (join("", [for i in range(129) : "k"])) = "v" }
+  }
+  expect_failures = [var.tags]
+}
+
+run "a_value_of_257_characters_is_refused" {
+  command = plan
+  variables {
+    tags = { team = join("", [for i in range(257) : "v"]) }
+  }
+  expect_failures = [var.tags]
+}
+
+run "a_comma_in_a_value_is_refused" {
+  command = plan
+  variables {
+    tags = { team = "a,b" }
+  }
+  expect_failures = [var.tags]
+}
+
+run "the_reserved_prefix_is_refused_in_any_case" {
+  command = plan
+  variables {
+    tags = { "Dormeto:x" = "1" }
+  }
+  expect_failures = [var.tags]
+}

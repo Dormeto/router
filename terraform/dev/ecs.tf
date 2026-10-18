@@ -185,6 +185,7 @@ module "demo_ecs_workload" {
   source      = "../modules/workload"
   router      = module.router
   workload_id = "demo-ecs"
+  tags        = { team = "search", env = "dev" }
   # Scanners that do not run JavaScript never wake it; API paths wake it directly.
   wake_mode                   = "browser"
   wake_rules                  = [{ name = "api", path_prefixes = ["/api/"] }]

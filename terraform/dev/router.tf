@@ -23,6 +23,7 @@ module "demo_workload" {
   source                      = "../modules/workload"
   router                      = module.router
   workload_id                 = "demo"
+  tags                        = { team = "payments", env = "dev" }
   no_wake_rules               = [{ name = "uptime-monitor", user_agent_pattern = "^dormeto-uptime/" }]
   app_target_group_arn        = aws_lb_target_group.app.arn
   app_target_group_arn_suffix = aws_lb_target_group.app.arn_suffix

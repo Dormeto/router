@@ -243,8 +243,9 @@ never AWS tags: the manager groups workloads and grants access by them. At most 
 characters and a value of at most 256, in letters, digits, spaces and `_ . : / = + - @`; keys are case-sensitive and the
 prefix `dormeto:` is reserved. Terraform workloads set them with the `workload` module's `tags` (`map(string)`, default
 `{}`); the onboarder's `preview` and `onboard` take `tags`; the controller's `tag` action replaces the tags of a workload
-the manager onboarded (a Terraform workload is refused, like `rename`). Summaries, the `list` action and the state change
-events carry `tags` (`{}` without).
+the manager onboarded (a Terraform workload is refused, like `rename`). Summaries, the `list` action, the workload's
+`status` and the state change events carry `tags` (`{}` without): the manager reads them from `status` when the router
+has stopped reporting.
 
 ```bash
 aws lambda invoke --function-name dmt-dev-controller --cli-binary-format raw-in-base64-out --payload '{"action":"tag","workloadId":"demo","tags":{"team":"payments","env":"staging"},"by":"ops@example.com"}' /dev/stdout

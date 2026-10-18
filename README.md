@@ -238,6 +238,18 @@ onboarding of a new workload is undone. Offboarding (the workload awake) removes
 rules back to a plain forward, waker target group, permission, the tags carrying the marker, the configuration. A
 workload written by the `workload` module is refused (remove the module instead).
 
+**Workload tags (router 0.30.0):** Dormeto's own labels on a workload, key and value (`team = payments`, `env = staging`),
+never AWS tags: the manager groups workloads and grants access by them. At most 50 per workload; a key of 1 to 128
+characters and a value of at most 256, in letters, digits, spaces and `_ . : / = + - @`; keys are case-sensitive and the
+prefix `dormeto:` is reserved. Terraform workloads set them with the `workload` module's `tags` (`map(string)`, default
+`{}`); the onboarder's `preview` and `onboard` take `tags`; the controller's `tag` action replaces the tags of a workload
+the manager onboarded (a Terraform workload is refused, like `rename`). Summaries, the `list` action and the state change
+events carry `tags` (`{}` without).
+
+```bash
+aws lambda invoke --function-name dmt-dev-controller --cli-binary-format raw-in-base64-out --payload '{"action":"tag","workloadId":"demo","tags":{"team":"payments","env":"staging"},"by":"ops@example.com"}' /dev/stdout
+```
+
 **Shadow rules:** a customer rule is covered by a Dormeto rule just before it on its listener (same conditions, weighted
 forward, tags `dormeto:workload` and `dormeto:shadows = <rule ARN>`), so the customer's rule and its infrastructure as
 code stay untouched. A shadow only passes over the workload's own rules and rules no request of the customer rule can

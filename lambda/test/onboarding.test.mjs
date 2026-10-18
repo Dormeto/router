@@ -121,7 +121,7 @@ test('onboard tags the backend, creates and registers the waker target group, wr
   assert.deepEqual(shadowsOf(s.a)[1].conditions, [{ Field: 'host-header', HostHeaderConfig: { Values: ['shop.example.com'] } }]);
   const cfg = await s.a.store.getConfig('shop');
   assert.deepEqual({ ...cfg, onboardedAt: 'x' }, {
-    workloadId: 'shop', name: 'shop-app', appTargetGroupArn: s.tg, wakerTargetGroupArn: wakerArn,
+    workloadId: 'shop', name: 'shop-app', tags: {}, appTargetGroupArn: s.tg, wakerTargetGroupArn: wakerArn,
     loadBalancerDimension: 'app/shop/50dc6c495c0c9188', appTargetGroupDimension: s.tg.split(':').at(-1),
     instanceIds: [], waitSeconds: 60, idleMinutes: 30, drainSeconds: 30, wakeTimeoutSeconds: 600, failedRetrySeconds: 60, maxHolders: 50, pollSeconds: 3,
     noWakeRules: [], wakeMode: 'browser', wakeRules: [], admin: { enabled: false, secretHash: '', secretParameter: '' },
@@ -664,4 +664,28 @@ test('settings: fallback instance types (at most 5 type names) and the failed re
     'settings: fallbackInstanceTypes must be at most 5 EC2 instance types (for example t3a.medium)',
     'settings: failedRetrySeconds must be an integer from 10 to 600',
   ]);
+});
+
+test('tags given at onboarding are echoed by the preview and written to the configuration; bad tags fail both before any change', async () => {
+  const s = setup();
+  const tags = { team: 'payments', env: 'staging' };
+  const preview = await s.onboarding.preview({ targetGroupArn: s.tg, tags });
+  assert.deepEqual([preview.ok, preview.tags], [true, tags]);
+  assert.deepEqual((await s.onboarding.preview({ targetGroupArn: s.tg })).tags, {});
+  const id = workloadIdOf(s.tg);
+  await s.onboarding.onboard({ targetGroupArn: s.tg, tags, by: 'ops' });
+  assert.deepEqual((await s.a.store.getConfig(id)).tags, tags);
+
+  const bad = setup();
+  const refused = await bad.onboarding.preview({ targetGroupArn: bad.tg, tags: { 'Dormeto:x': '1' } });
+  assert.deepEqual([refused.ok, refused.problems], [false, ['tag "Dormeto:x": the dormeto: prefix is reserved']]);
+  await assert.rejects(bad.onboarding.onboard({ targetGroupArn: bad.tg, tags: { team: 'a,b' }, by: 'ops' }), /cannot onboard .*: tag "team": value characters/);
+  assert.equal(await bad.a.store.getConfig(workloadIdOf(bad.tg)), null);
+  assert.equal(bad.a.state.instances.get('i-0aaa').tags[WORKLOAD], undefined, 'nothing was changed');
+});
+
+test('an onboarding without tags writes an empty object', async () => {
+  const s = setup();
+  await s.onboarding.onboard({ targetGroupArn: s.tg, by: 'ops' });
+  assert.deepEqual((await s.a.store.getConfig(workloadIdOf(s.tg))).tags, {});
 });

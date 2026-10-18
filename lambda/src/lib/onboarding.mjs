@@ -3,6 +3,7 @@
 // what onboarding added (tags carry the dormeto:tagged marker), never what the customer set.
 import { createHash } from 'node:crypto';
 import { checkName } from './names.mjs';
+import { tagsProblem } from './tags.mjs';
 import { cleanConditions, forwardTargetGroups, listRules, passable, ruleTags, sameConditions, shadowGap, unshadowable } from './rules.mjs';
 import { conditionsOf } from './route.mjs';
 import { k8sBackend, wakeK8s } from './kubernetes.mjs';
@@ -365,11 +366,14 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
 
   // What onboarding would do, and why it cannot. `found` (onboard) receives the backends and databases it listed.
   // Without an id, the one of the target group (an explicit id: workloads named before 0.20.0, direct use).
-  async function preview({ targetGroupArn, workloadId = targetGroupArn ? workloadIdOf(targetGroupArn) : undefined, name: wanted, settings, databases, kubernetes }, found = {}) {
+  async function preview({ targetGroupArn, workloadId = targetGroupArn ? workloadIdOf(targetGroupArn) : undefined, name: wanted, settings, databases, kubernetes, tags = {} }, found = {}) {
     const problems = [];
     const name = wakerName(workloadId ?? '');
     const named = checkName(wanted);
     if (named.problem) problems.push(named.problem);
+    // Dormeto's own labels (tags design, section 3), checked like the workload module's.
+    const tagsFault = tagsProblem(tags);
+    if (tagsFault) problems.push(tagsFault);
     if (!ID.test(workloadId ?? '')) problems.push('workload id: lowercase letters, digits and hyphens, not starting or ending with a hyphen');
     else if (name.length > NAME_MAX) problems.push(`workload id too long: ${name} exceeds the ${NAME_MAX} characters of a target group name`);
     problems.push(...settingsProblems(settings));
@@ -381,7 +385,7 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
 
     const group = await targetGroup(targetGroupArn);
     // The name people see: the one asked for, else the target group's.
-    const result = { workloadId, name: named.name || (group?.TargetGroupName ?? ''), targetGroupArn, wakerTargetGroupName: name, loadBalancerArn: null, rules: [], backends: [], databases: [] };
+    const result = { workloadId, name: named.name || (group?.TargetGroupName ?? ''), tags: tagsFault ? {} : tags, targetGroupArn, wakerTargetGroupName: name, loadBalancerArn: null, rules: [], backends: [], databases: [] };
     if (!group) return { ...result, ok: false, problems: [...problems, 'target group not found'] };
     if (!['instance', 'ip'].includes(group.TargetType)) problems.push(`target type ${group.TargetType} is not supported`);
     const lbs = group.LoadBalancerArns ?? [];
@@ -460,10 +464,10 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
     else await rds.removeTagsFromResource({ ResourceName: b.arn, TagKeys: keys });
   }
 
-  async function onboard({ targetGroupArn, workloadId = targetGroupArn ? workloadIdOf(targetGroupArn) : undefined, name, settings = {}, databases = [], kubernetes, by }) {
+  async function onboard({ targetGroupArn, workloadId = targetGroupArn ? workloadIdOf(targetGroupArn) : undefined, name, settings = {}, databases = [], kubernetes, tags = {}, by }) {
     // The backends and databases its preview listed: listed once per onboarding.
     const found = {};
-    const checked = await preview({ workloadId, targetGroupArn, name, settings, databases, kubernetes }, found);
+    const checked = await preview({ workloadId, targetGroupArn, name, settings, databases, kubernetes, tags }, found);
     if (!checked.ok) throw new Error(`cannot onboard ${workloadId}: ${checked.problems.join('; ')}`);
     const steps = [];
     const step = (name, done, detail) => steps.push({ name, status: done ? 'done' : 'skipped', ...(detail ? { detail } : {}) });
@@ -511,7 +515,7 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
       if (!(await store.getConfig(workloadId))) {
         const lb = checked.loadBalancerArn;
         await store.putConfig(workloadId, {
-          workloadId, name: checked.name, appTargetGroupArn: targetGroupArn, wakerTargetGroupArn: waker.TargetGroupArn,
+          workloadId, name: checked.name, tags: checked.tags, appTargetGroupArn: targetGroupArn, wakerTargetGroupArn: waker.TargetGroupArn,
           loadBalancerDimension: lb.slice(lb.indexOf('loadbalancer/') + 'loadbalancer/'.length), appTargetGroupDimension: targetGroupArn.split(':').at(-1),
           instanceIds: [], ...DEFAULTS, ...(kubernetes ? { wakeTimeoutSeconds: KUBERNETES_WAKE_TIMEOUT } : {}), ...(databases.length ? { wakeTimeoutSeconds: DATABASE_WAKE_TIMEOUT } : {}), ...settings,
           noWakeRules: [], wakeRules: [], admin: { enabled: false, secretHash: '', secretParameter: '' },

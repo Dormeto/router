@@ -1474,3 +1474,31 @@ test('the list gives each workload\'s tags ({} without)', async () => {
   const plain = setup({ run: { state: STATES.AWAKE } });
   assert.deepEqual((await plain.handler({ action: 'list' })).workloads[0].tags, {});
 });
+
+test('tag replaces the tags of a workload the manager onboarded', async () => {
+  const s = setup({ run: { state: STATES.AWAKE }, cfg: testConfig({ name: 'Demo shop', source: 'manager', tags: { team: 'old' } }) });
+  assert.deepEqual(await s.handler({ action: 'tag', workloadId: 'demo', tags: { team: 'payments', env: 'staging' }, by: 'ops' }), { workloadId: 'demo', tags: { team: 'payments', env: 'staging' } });
+  const cfg = await s.store.getConfig('demo');
+  assert.deepEqual([cfg.tags, cfg.name, cfg.appTargetGroupArn], [{ team: 'payments', env: 'staging' }, 'Demo shop', testConfig().appTargetGroupArn]);
+  assert.deepEqual(await s.handler({ action: 'tag', workloadId: 'demo', tags: {}, by: 'ops' }), { workloadId: 'demo', tags: {} });
+  assert.deepEqual((await s.store.getConfig('demo')).tags, {});
+});
+
+test('tag refuses bad tags, a Terraform workload and an unknown one, changing nothing', async () => {
+  const s = setup({ run: { state: STATES.AWAKE }, cfg: testConfig({ source: 'manager', tags: { team: 'kept' } }) });
+  await assert.rejects(s.handler({ action: 'tag', workloadId: 'demo', tags: { 'dormeto:x': '1' }, by: 'ops' }), /tag "dormeto:x": the dormeto: prefix is reserved/);
+  await assert.rejects(s.handler({ action: 'tag', workloadId: 'demo', tags: { team: 'a,b' }, by: 'ops' }), /tag "team": value characters/);
+  await assert.rejects(s.handler({ action: 'tag', workloadId: 'demo', by: 'ops' }), /tags: an object/);
+  assert.deepEqual((await s.store.getConfig('demo')).tags, { team: 'kept' });
+  await assert.rejects(s.handler({ action: 'tag', workloadId: 'nope', tags: {}, by: 'ops' }), /workload not configured: nope/);
+  const terraform = setup({ run: { state: STATES.AWAKE } });
+  await assert.rejects(terraform.handler({ action: 'tag', workloadId: 'demo', tags: { team: 'x' }, by: 'ops' }), /workload demo was written by Terraform: set tags in its workload module/);
+});
+
+test('a tag racing an offboarding never writes the configuration back', async () => {
+  const s = setup({ run: { state: STATES.AWAKE }, cfg: testConfig({ source: 'manager' }) });
+  const writes = [];
+  s.store.putConfig = async (id, cfg, options) => { writes.push(options); if (options?.mustExist) return false; throw new Error('unconditional write'); };
+  await assert.rejects(s.handler({ action: 'tag', workloadId: 'demo', tags: { team: 'x' }, by: 'ops' }), /workload not configured: demo/);
+  assert.deepEqual(writes, [{ mustExist: true }]);
+});

@@ -13,6 +13,7 @@ import { failedSpec, failureError } from './failures.mjs';
 import { createWakeWatch, unhealthyError } from './wake-watch.mjs';
 import { describeStopped } from './stopped.mjs';
 import { revertInstanceTypes } from './capacity.mjs';
+import { tagsProblem } from './tags.mjs';
 import { STATS_DAYS, totals, workloadSummary } from './summary.mjs';
 import { lastRequestAt } from './metrics.mjs';
 import { checkScope } from './check-scope.mjs';
@@ -678,6 +679,18 @@ export function createController({
     return { workloadId, name: checked.name };
   }
 
+  // The workload's tags (tags design, section 3), replaced whole, for a workload the manager onboarded.
+  async function tag({ workloadId, tags, by }) {
+    const cfg = await config(workloadId);
+    if (!cfg.source) throw new Error(`workload ${workloadId} was written by Terraform: set tags in its workload module`);
+    const problem = tagsProblem(tags);
+    if (problem) throw new Error(problem);
+    // Conditional: a tag racing an offboarding never writes the workload back.
+    if (!(await store.putConfig(workloadId, { ...cfg, tags }, { mustExist: true }))) throw new Error(`workload not configured: ${workloadId}`);
+    log.info('Tagged', { workloadId, tags, by });
+    return { workloadId, tags };
+  }
+
   async function ensureAwake(workloadId) {
     const cfg = await config(workloadId);
     const run = await store.getRun(workloadId);
@@ -988,6 +1001,7 @@ export function createController({
       case 'resume': return resume(event);
       case 'request-nap': return requestNap(event);
       case 'rename': return rename(event);
+      case 'tag': return tag(event);
       case 'router': return routerInfo();
       case 'clusterCheck': return clusterCheck(event);
       default: throw new Error(`unknown action: ${event?.action}`);

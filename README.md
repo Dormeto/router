@@ -215,6 +215,63 @@ aws lambda invoke --function-name dmt-dev-controller --cli-binary-format raw-in-
 aws lambda invoke --function-name dmt-dev-controller --cli-binary-format raw-in-base64-out --payload '{"action":"resume","workloadId":"demo","by":"ops@example.com"}' /dev/stdout
 ```
 
+**Schedules (router 0.31.0):** weekly awake and nap windows per workload, and a maximum nap. A schedule is an
+operational record like a pause, stored in the state table (`WL#<id> / SCHEDULE`), set by the manager (dashboard, API,
+CLI) for any workload whatever wrote its configuration; the `workload` Terraform module does not carry it. The
+controller's `schedule` action validates and writes it (`{problems}` and nothing written when invalid, else the stored
+schedule, `next` and `maintenanceDue`), `clear-schedule` removes it, and `status` answers `schedule` (null without),
+`next` (the next 5 events within 8 days: `awake-start`, `awake-end`, `nap-start`, `nap-end`, with their window) and
+`maintenanceDue` (ISO, when `maxNapDays` applies and the workload is asleep). The summary carries `scheduled: true`.
+
+```json
+{
+  "timeZone": "Europe/Paris",
+  "windows": [
+    { "kind": "awake", "days": ["mon", "tue", "wed", "thu", "fri"], "start": "08:30", "end": "19:00" },
+    { "kind": "nap",   "days": ["mon", "tue", "wed", "thu", "fri"], "start": "20:00", "end": "07:00", "wake": "header" },
+    { "kind": "nap",   "days": ["sat"], "start": "00:00", "end": "00:00", "wake": "never" }
+  ],
+  "exceptions": ["2026-12-25", "2027-01-01"],
+  "maxNapDays": 7
+}
+```
+
+```bash
+aws lambda invoke --function-name dmt-dev-controller --cli-binary-format raw-in-base64-out --payload '{"action":"schedule","workloadId":"demo","by":"ops@example.com","schedule":{"timeZone":"Europe/Paris","maxNapDays":7}}' /dev/stdout
+aws lambda invoke --function-name dmt-dev-controller --cli-binary-format raw-in-base64-out --payload '{"action":"clear-schedule","workloadId":"demo","by":"ops@example.com"}' /dev/stdout
+```
+
+- **Fields:** `timeZone` is an IANA name (offsets such as `+01:00` are refused), stored in its canonical form, and required
+  with windows. At most 20 `windows`: `kind` `awake` or `nap`, `days` (a set of `mon` to `sun`, the day the window
+  starts), `start` and `end` as `HH:MM` with minutes a multiple of 5. An `end` at or before the `start` ends the next day,
+  and `start` equal to `end` lasts 24 hours. A nap window's `wake` is `never` (the default) or `header`. An awake and a
+  nap window may not overlap anywhere in the week (refused, naming both); two windows of one kind may, and their union
+  counts. At most 100 `exceptions` (local dates `YYYY-MM-DD`): a window that starts on one does not apply. `maxNapDays`
+  is 1 to 60. A schedule holds windows, `maxNapDays`, or both. Unknown fields are refused; `by` and `at` in a submitted
+  schedule are ignored (the router stores who and when itself). Times are local wall times: a start in a skipped hour
+  applies at the first valid minute after it, a start in a repeated hour at its first occurrence.
+- **The check applies it** on the clock's 5-minute marks: the `check_schedule` of the `router` module is
+  `cron(0/5 * * * ? *)` (not `rate(5 minutes)`), so 08:45 is met at the 08:45 check, within its latency. Each occurrence
+  of a window is applied once (the run item records the last one, `scheduleApplied`), so a missed check or a deploy
+  mid-window cannot apply it twice. An awake occurrence wakes an asleep or failed workload as the manager's Wake does
+  (cause `schedule`, counted `wake:schedule`) and gives a napping one its pending wake; a nap occurrence naps an awake
+  workload (cause `schedule`). A schedule saved in the middle of a window applies at the next check, whose active
+  occurrence is not yet applied, and back-to-back windows of one kind are separate occurrences (a manual nap at 11:00 is woken at 12:00
+  by an awake window starting then). While an awake window is active there is no idle nap; a manager's Nap inside it
+  stays until the window's next occurrence. A nap is skipped when an awake window starts within 30 minutes (the idle
+  nap, and a nap occurrence within 30 minutes of its start).
+- **Pauses win:** a keep-awake pause (no `keepAsleep`) wins over a nap window, a `keepAsleep` pause over an awake window
+  and over the maintenance wake. A hold by a pause postpones the occurrence: it is not recorded, so it applies when the
+  hold ends if the window is still active.
+- **The waker in a nap window:** a request that would wake gets the waiter page instead (nothing starts, nothing is
+  held), unless the window's `wake` is `header` and the request carries `x-dormeto-wake: 1`. No-wake rules still apply
+  first. The page tells when the nap ends, and the JSON body has `napUntil` (`{at, local, timeZone}`); the response also
+  carries `x-dormeto-nap-until`. Refused requests count as `ignored:schedule`. The manager's Wake still wakes (cause
+  `manager`).
+- **Maximum nap:** an asleep workload that has slept more than `maxNapDays` (from its run item's `stateAt`) is woken
+  for maintenance (cause `maintenance`, counted `wake:maintenance`, never as traffic) and napped again by the idle
+  check when no traffic comes. A workload asleep since before router 0.26.0 counts from its next state change.
+
 **Health** (`router` action, manager Routers view): the last scheduled idle check (late after three periods: an error,
 workloads do not nap), Lambda errors and throttles of the controller and the waker over 24 hours and the waker's peak
 concurrency, messages waiting in the `check-failures` and `controller-failures` queues, IP lists' last download, failed

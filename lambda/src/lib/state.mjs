@@ -109,7 +109,7 @@ export function buildTransition({ table, workloadId, cond, set = {}, remove = []
   };
 }
 
-export function createStore({ dynamo, table, now = Date.now }) {
+export function createStore({ dynamo, table, now = Date.now, log = null }) {
   async function update(input) {
     try {
       const out = await dynamo.updateItem(input);
@@ -149,8 +149,16 @@ export function createStore({ dynamo, table, now = Date.now }) {
           ExclusiveStartKey,
         });
         for (const item of page.Items ?? []) {
-          if (item.sk?.S === 'SCHEDULE') schedules.set(item.pk.S.slice(3), JSON.parse(item.schedule.S));
-          else configs.push(JSON.parse(item.config.S));
+          if (item.sk?.S !== 'SCHEDULE') configs.push(JSON.parse(item.config.S));
+          else {
+            // A schedule that cannot be read never stops the listing: its workload is listed without one.
+            const workloadId = item.pk.S.slice(3);
+            try {
+              schedules.set(workloadId, JSON.parse(item.schedule.S));
+            } catch (err) {
+              log?.warn('ScheduleSkipped', { workloadId, error: err.message });
+            }
+          }
         }
         ExclusiveStartKey = page.LastEvaluatedKey;
       } while (ExclusiveStartKey);

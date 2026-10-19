@@ -34,11 +34,13 @@ function setup({ run, schedule, queue = true }) {
   const ecs = fakeEcs();
   const queued = [];
   const invocations = [];
+  const logs = [];
+  const log = { info: (event, data) => logs.push([event, data]), warn: (event, data) => logs.push([event, data]), error: (event, data) => logs.push([event, data]) };
   let ids = 0;
   const handler = createController({
     store: wrapped, ec2, elbv2, cloudwatch, autoscaling: fakeAutoScaling(), ecs, tagging: fakeTagging(ecs), appscaling: fakeAppScaling(),
     invokeSelf: async (payload) => { invocations.push(payload); }, ...(queue ? { queueWork: async (m) => { queued.push(m); } } : {}),
-    now: clock.now, sleep: clock.sleep, newId: () => `w${++ids}`, log: silentLog, router: { name: 'dmt-dev' },
+    now: clock.now, sleep: clock.sleep, newId: () => `w${++ids}`, log, router: { name: 'dmt-dev' },
   });
   // The check the schedule starts at that Paris time (later than the clock).
   async function checkAt(local) {
@@ -49,9 +51,10 @@ function setup({ run, schedule, queue = true }) {
   const deliver = (m) => handler({ Records: [{ messageId: 'm', eventSource: 'aws:sqs', body: JSON.stringify(m) }] });
   const wakes = () => invocations.filter((i) => i.action === 'wake').length;
   const causes = () => changes.map((c) => [c.to, c.cause ?? null]);
+  const logged = (name) => logs.filter(([event]) => event === name).map(([, data]) => data);
   // Asleep again (a wake that failed and was released, say): only the state matters to the schedule.
   const putAsleep = () => { store.state.run.state = STATES.ASLEEP; };
-  return { handler, store, wrapped, clock, cloudwatch, changes, queued, invocations, checkAt, deliver, wakes, causes, putAsleep };
+  return { handler, store, wrapped, clock, cloudwatch, changes, queued, invocations, checkAt, deliver, wakes, causes, putAsleep, logged };
 }
 
 test('an awake window wakes an asleep workload at its start, once per occurrence: not again later in it, again at the next one', async () => {
@@ -89,13 +92,25 @@ test('a check that first runs inside the window (after a deploy, or once the lea
   assert.equal(s.wakes(), 1);
 });
 
-test('at an awake window\'s start a napping workload gets its pending wake and a failed one is woken', async () => {
+test('at an awake window\'s start a napping workload gets its pending wake, recorded once the nap settled, and a failed one is woken', async () => {
   const napping = setup({ run: { state: STATES.NAPPING, updatedAt: at('19T07:58') }, schedule: stored({ windows: [OFFICE] }) });
   const [result] = await napping.checkAt('19T08:00');
   assert.equal(result.schedule, 'pending wake');
   assert.equal(napping.store.state.run.pendingWake, true);
-  assert.equal(napping.store.state.run.scheduleApplied, occurrence(0, '19T08:00'));
   assert.equal(napping.store.state.stats['wake:schedule'], 1);
+  // Not written while it naps: the stuck nap's detection reads updatedAt.
+  assert.equal(napping.store.state.run.scheduleApplied, undefined);
+  assert.equal(napping.store.state.run.updatedAt, at('19T07:58'));
+  // Still napping at the next check: its pending wake is already set, nothing more to say or count.
+  const [again] = await napping.checkAt('19T08:01');
+  assert.equal(again.schedule, undefined);
+  assert.equal(napping.store.state.stats['wake:schedule'], 1);
+  // The pending wake ended the nap awake: the next check records the occurrence, with nothing to do.
+  Object.assign(napping.store.state.run, { state: STATES.AWAKE, awakeSince: at('19T08:02'), pendingWake: false });
+  await napping.checkAt('19T08:05');
+  assert.equal(napping.store.state.run.scheduleApplied, occurrence(0, '19T08:00'));
+  assert.deepEqual(napping.logged('ScheduleApplied').map((d) => d.action), ['none']);
+  assert.equal(napping.wakes(), 0);
   const failed = setup({ run: { state: STATES.FAILED, failedAt: at('19T06:00') }, schedule: stored({ windows: [OFFICE] }) });
   await failed.checkAt('19T08:00');
   assert.equal(failed.wakes(), 1);
@@ -128,7 +143,7 @@ test('a nap window naps an awake workload at its start, cause schedule, once, ev
   const s = setup({ run: { state: STATES.AWAKE, awakeSince: 1 }, schedule: stored({ windows: [OFFICE, NIGHT] }) });
   const [result] = await s.checkAt('19T20:00');
   // Idle as well: the check does not ask for a second nap.
-  assert.deepEqual(s.queued, [{ action: 'nap', workloadId: 'demo', requestedAt: at('19T20:00'), cause: 'schedule' }]);
+  assert.deepEqual(s.queued, [{ action: 'nap', workloadId: 'demo', requestedAt: at('19T20:00'), cause: 'schedule', until: at('20T07:00') }]);
   assert.deepEqual(result, { workloadId: 'demo', state: STATES.AWAKE, schedule: 'nap' });
   assert.equal(s.store.state.run.scheduleApplied, occurrence(1, '19T20:00'));
   // Delivered 2 minutes later, after requests: napped all the same (the window does not wait for idleness).
@@ -150,7 +165,7 @@ test('a pause wins over a nap window at once: a paused workload stays awake, and
   assert.equal(s.store.state.run.scheduleApplied, undefined);
   await s.handler({ action: 'resume', workloadId: 'demo', by: 'ci@example.com' });
   await s.checkAt('19T21:00');
-  assert.deepEqual(s.queued, [{ action: 'nap', workloadId: 'demo', requestedAt: at('19T21:00'), cause: 'schedule' }]);
+  assert.deepEqual(s.queued, [{ action: 'nap', workloadId: 'demo', requestedAt: at('19T21:00'), cause: 'schedule', until: at('20T07:00') }]);
 });
 
 test('without the work queue, the scheduled nap runs in its own invocation, with its cause', async () => {
@@ -178,6 +193,10 @@ test('maxNapDays wakes a workload asleep longer, cause maintenance, at the first
   assert.equal(s.wakes(), 1);
   assert.deepEqual(result, { workloadId: 'demo', state: STATES.WAKING, schedule: 'maintenance' });
   assert.deepEqual(s.causes(), [[STATES.WAKING, 'maintenance']]);
+  assert.deepEqual(s.store.state.stats, { 'wake:maintenance': 1 });
+  // Waking, it is not woken again at the next check.
+  await s.checkAt('19T10:10');
+  assert.equal(s.wakes(), 1);
   assert.deepEqual(s.store.state.stats, { 'wake:maintenance': 1 });
 });
 
@@ -227,9 +246,6 @@ test('pauses that cannot be read hold the scheduled wakes until a check reads th
   assert.equal(s.wakes(), 1);
 });
 
-// With 400 ms a call, the time the loop takes for its first chunk of 25 workloads (measured: 30 workloads need 12 s).
-const ONE_CHUNK_MS = 10_000;
-
 test('a crowded router wakes a scheduled workload that its check reaches in a later chunk at the first check: the schedules come before the loop', async () => {
   const clock = simClock(at('19T08:00'));
   const account = crowdedAccount({ workloads: 30, balancers: 6, latencyMs: 400, clock });
@@ -239,10 +255,10 @@ test('a crowded router wakes a scheduled workload that its check reaches in a la
   account.runs.get(last).state = STATES.ASLEEP;
   const invoked = [];
   const handler = createController({ store, ...aws, invokeSelf: async (e) => { invoked.push(e); }, now: clock.now, sleep: clock.sleep, log: silentLog });
-  // An invocation with time for one chunk of 25 workloads (30 s are kept for the end).
-  const results = await clock.until(handler({ action: 'check' }, { getRemainingTimeInMillis: () => 30_000 + ONE_CHUNK_MS }));
-  assert.ok(results.length > 0 && results.length <= 25, `${results.length} workloads checked`);
-  assert.ok(!results.some((r) => r.workloadId === last), 'the loop reached it');
+  // An invocation with no time left for the loop (30 s are kept for the end): it reaches no workload.
+  const results = await clock.until(handler({ action: 'check' }, { getRemainingTimeInMillis: () => 30_000 }));
+  // The check's results still say what the schedule did.
+  assert.deepEqual(results, [{ workloadId: last, schedule: 'wake' }]);
   assert.deepEqual(invoked.filter((e) => e.action === 'wake').map((e) => e.workloadId), [last]);
   assert.equal(account.runs.get(last).state, STATES.WAKING);
   assert.equal(account.runs.get(last).scheduleApplied, occurrence(0, '19T08:00'));
@@ -272,4 +288,76 @@ test('a schedule the router cannot read (a time zone Intl refuses) is logged and
   assert.equal(skipped[0][1].workloadId, bad);
   assert.match(skipped[0][1].error, /Mars\/Olympus/);
   assert.deepEqual(logged.filter(([event]) => event !== 'ScheduleSkipped'), []);
+});
+
+test('a scheduled nap waits in the work queue as long as its window lasts: 11 minutes late it naps, after the window it is dropped', async () => {
+  const late = setup({ run: { state: STATES.AWAKE, awakeSince: 1 }, schedule: stored({ windows: [OFFICE, NIGHT] }) });
+  await late.checkAt('19T20:00');
+  late.clock.advance(11 * MINUTE);
+  await late.deliver(late.queued[0]);
+  assert.equal(late.store.state.run.state, STATES.ASLEEP);
+  assert.deepEqual(late.causes()[0], [STATES.NAPPING, 'schedule']);
+
+  const ended = setup({ run: { state: STATES.AWAKE, awakeSince: 1 }, schedule: stored({ windows: [OFFICE, NIGHT] }) });
+  await ended.checkAt('19T20:00');
+  ended.clock.advance(at('20T07:00') - ended.clock.now());
+  await ended.deliver(ended.queued[0]);
+  assert.equal(ended.store.state.run.state, STATES.AWAKE);
+  assert.deepEqual(ended.logged('NapSkipped'), [{ workloadId: 'demo', reason: 'the nap window ended' }]);
+});
+
+test('a nap window that finds the workload waking leaves its occurrence for the next check, which naps it once awake', async () => {
+  const s = setup({ run: { state: STATES.WAKING, wakeId: 'traffic', wakeStartedAt: at('19T19:59') }, schedule: stored({ windows: [OFFICE, NIGHT] }) });
+  await s.checkAt('19T20:00');
+  assert.deepEqual(s.queued, []);
+  assert.equal(s.store.state.run.scheduleApplied, undefined);
+  Object.assign(s.store.state.run, { state: STATES.AWAKE, awakeSince: at('19T20:01') });
+  await s.checkAt('19T20:05');
+  assert.deepEqual(s.queued, [{ action: 'nap', workloadId: 'demo', requestedAt: at('19T20:05'), cause: 'schedule', until: at('20T07:00') }]);
+  assert.equal(s.store.state.run.scheduleApplied, occurrence(1, '19T20:00'));
+});
+
+test('a wake by a request between the schedule\'s read and its wake is not taken for the schedule\'s: the next check records the occurrence', async () => {
+  const s = setup({ run: { state: STATES.ASLEEP }, schedule: stored({ windows: [OFFICE] }) });
+  const { getRun } = s.wrapped;
+  let reads = 0;
+  // The waker starts a wake right after the schedule pass read the run (its first read of the check).
+  s.wrapped.getRun = async (id) => {
+    const run = await getRun(id);
+    if ((reads += 1) === 1) Object.assign(s.store.state.run, { state: STATES.WAKING, wakeId: 'traffic', wakeStartedAt: s.clock.now() });
+    return run;
+  };
+  const [result] = await s.checkAt('19T08:00');
+  assert.deepEqual(result, { workloadId: 'demo', state: STATES.WAKING });
+  assert.equal(s.store.state.run.scheduleApplied, undefined);
+  assert.equal(s.store.state.run.wakeId, 'traffic');
+  assert.deepEqual([s.wakes(), s.store.state.stats, s.logged('ScheduleApplied')], [0, {}, []]);
+  s.wrapped.getRun = getRun;
+  await s.checkAt('19T08:05');
+  assert.equal(s.store.state.run.scheduleApplied, occurrence(0, '19T08:00'));
+  assert.deepEqual(s.logged('ScheduleApplied').map((d) => d.action), ['none']);
+});
+
+test('an occurrence is recorded and logged only once written: a run that changed since the read (a manager\'s nap) is left for the next check', async () => {
+  const s = setup({ run: { state: STATES.AWAKE, awakeSince: 1 }, schedule: stored({ windows: [OFFICE] }) });
+  const { getRun } = s.wrapped;
+  let reads = 0;
+  s.wrapped.getRun = async (id) => {
+    const run = await getRun(id);
+    if ((reads += 1) === 1) Object.assign(s.store.state.run, { state: STATES.NAPPING });
+    return run;
+  };
+  await s.checkAt('19T08:00');
+  assert.equal(s.store.state.run.scheduleApplied, undefined);
+  assert.deepEqual(s.logged('ScheduleApplied'), []);
+});
+
+test('a nap window first applied within 30 minutes of an awake start is skipped too', async () => {
+  const morning = { kind: 'awake', days: WEEKDAYS, start: '07:30', end: '18:00' };
+  const night = { kind: 'nap', days: WEEKDAYS, start: '20:00', end: '07:30' };
+  const s = setup({ run: { state: STATES.AWAKE, awakeSince: 1 }, schedule: stored({ windows: [morning, night] }) });
+  // The first check inside Monday's night, on Tuesday at 07:10 (a deploy, or the schedule set then).
+  await s.checkAt('20T07:10');
+  assert.deepEqual(s.queued, []);
+  assert.equal(s.store.state.run.scheduleApplied, occurrence(1, '19T20:00'));
 });

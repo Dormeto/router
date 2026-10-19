@@ -377,3 +377,20 @@ test('one scan lists the configurations and the schedules; listConfigs keeps ans
   assert.match(dynamo.calls[0][1].FilterExpression, /IN/);
   assert.deepEqual((await store.listConfigs()).map((c) => c.workloadId), ['a', 'b']);
 });
+
+test('a schedule item that cannot be read is logged and skipped: the scan goes on, the workload listed without one', async () => {
+  const items = [
+    { pk: { S: 'WL#a' }, sk: { S: 'CFG' }, config: { S: '{"workloadId":"a"}' } },
+    { pk: { S: 'WL#a' }, sk: { S: 'SCHEDULE' }, schedule: { S: '{"maxNapDays":' } },
+    { pk: { S: 'WL#b' }, sk: { S: 'CFG' }, config: { S: '{"workloadId":"b"}' } },
+    { pk: { S: 'WL#b' }, sk: { S: 'SCHEDULE' }, schedule: { S: '{"maxNapDays":3}' } },
+  ];
+  const logged = [];
+  const log = { info() {}, warn: (event, data) => logged.push([event, data]), error() {} };
+  const store = createStore({ dynamo: fakeDynamo({ scan: async () => ({ Items: items }) }), table: 't', log });
+  const { configs, schedules } = await store.listWorkloads();
+  assert.deepEqual(configs.map((c) => c.workloadId), ['a', 'b']);
+  assert.deepEqual([...schedules], [['b', { maxNapDays: 3 }]]);
+  assert.deepEqual(logged.map(([event, data]) => [event, data.workloadId]), [['ScheduleSkipped', 'a']]);
+  assert.match(logged[0][1].error, /JSON/);
+});

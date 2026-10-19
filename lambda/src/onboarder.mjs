@@ -24,7 +24,7 @@ const onboarding = createOnboarding({
   rds: createRds(),
   lambda: createLambda(),
   kubernetesOf: kubernetesConnector({ eks, region: process.env.AWS_REGION }),
-  store: createStore({ dynamo: createDynamo(), table: process.env.DMT_TABLE }),
+  store: createStore({ dynamo: createDynamo(), table: process.env.DMT_TABLE, log: logger }),
   router: {
     name: (process.env.DMT_TG_PREFIX ?? '').replace(/-$/, ''),
     wakerFunctionName: process.env.DMT_WAKER_FUNCTION,

@@ -30,7 +30,7 @@ const publisher = createPublisher({
   events: createEvents(), busArn: process.env.DMT_MANAGER_BUS, log: logger,
   router: { region: process.env.AWS_REGION, name: routerName, version: process.env.DMT_VERSION, build: process.env.DMT_BUILD, checkSchedule: process.env.DMT_CHECK_SCHEDULE },
 });
-const store = withTransitionEvents(createStore({ dynamo: createDynamo(), table: process.env.DMT_TABLE }), publisher, { log: logger });
+const store = withTransitionEvents(createStore({ dynamo: createDynamo(), table: process.env.DMT_TABLE, log: logger }), publisher, { log: logger });
 // IP reputation lists of the router (Terraform ip_lists).
 const lists = parseLists(process.env.DMT_IP_LISTS, (error) => logger.error('IpListsUnreadable', { error }));
 // Lists given as s3:// URIs are read with the S3 API (controller role: s3:GetObject on their objects).

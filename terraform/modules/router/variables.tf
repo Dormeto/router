@@ -20,9 +20,9 @@ variable "waker_timeout_seconds" {
 }
 
 variable "check_schedule" {
-  description = "EventBridge Scheduler expression of the idle check."
+  description = "EventBridge Scheduler expression of the check (idle naps and schedules). On the clock's 5-minute marks, so schedule times, multiples of 5 minutes, are met."
   type        = string
-  default     = "rate(5 minutes)"
+  default     = "cron(0/5 * * * ? *)"
 }
 
 variable "log_retention_days" {

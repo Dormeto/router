@@ -22,8 +22,10 @@ export function failureMessage(failure, retryInMs) {
   return failure === 'capacity' ? `${text}, next attempt in ${inText(retryInMs)}.` : `${text} Next attempt in ${inText(retryInMs)}.`;
 }
 
-export function renderPage({ state, pollSeconds, failure, retryInMs }) {
-  const message = state === 'FAILED' ? failureMessage(failure, retryInMs) : MESSAGES[state] ?? MESSAGES.WAKING;
+export const napMessage = (napUntil) => `Napping on schedule until ${napUntil.local} (${napUntil.timeZone}).`;
+
+export function renderPage({ state, pollSeconds, failure, retryInMs, napUntil }) {
+  const message = napUntil ? napMessage(napUntil) : state === 'FAILED' ? failureMessage(failure, retryInMs) : MESSAGES[state] ?? MESSAGES.WAKING;
   const seconds = Number(pollSeconds);
   return `<!doctype html>
 <html lang="en">
@@ -65,6 +67,8 @@ p{color:var(--muted)}
       const r = await fetch(location.href, { cache: 'no-store', credentials: 'same-origin', redirect: 'manual', headers: { 'x-dormeto-probe': '1' } });
       const state = r.type === 'opaqueredirect' ? null : r.headers.get('x-dormeto-state');
       if (!state) { location.reload(); return; }
+      // Still napping on schedule: the page keeps saying so.
+      if (r.headers.get('x-dormeto-nap-until')) { setTimeout(probe, pollMs); return; }
       const failure = r.headers.get('x-dormeto-failure');
       const retryAt = r.headers.get('x-dormeto-retry-at');
       if (state === 'FAILED' && failure) {
@@ -87,6 +91,7 @@ p{color:var(--muted)}
 }
 
 // wakeHeader: in browser mode, tells API clients how to wake the workload.
-export const renderJson = ({ state, pollSeconds, wakeHeader }) => JSON.stringify({
-  status: String(state).toLowerCase(), retryAfter: pollSeconds, ...(wakeHeader ? { wakeHeader } : {}),
+// napUntil: { at, local, timeZone }, while a nap window keeps the workload asleep.
+export const renderJson = ({ state, pollSeconds, wakeHeader, napUntil }) => JSON.stringify({
+  status: String(state).toLowerCase(), retryAfter: pollSeconds, ...(wakeHeader ? { wakeHeader } : {}), ...(napUntil ? { napUntil } : {}),
 });

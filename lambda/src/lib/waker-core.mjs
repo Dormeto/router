@@ -6,6 +6,7 @@ import { renderJson, renderPage } from './page.mjs';
 import { ADMIN_PREFIX, parseAdminPath } from './admin.mjs';
 import { compileRules, describeRules } from './no-wake.mjs';
 import { STATS_DAYS } from './summary.mjs';
+import { localTime, occurrenceAt } from './schedule.mjs';
 
 const POLL_MS = 1000;
 const STUCK_GRACE_MS = 60_000;
@@ -139,8 +140,10 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
   }
 
   // failed: { kind, retryAt } of a failed workload (R7a): the page says why and when the next attempt is.
-  function waiter(event, pollSeconds, state, wakeHeader, failed = null) {
+  // napUntil: { at, local, timeZone } of the nap window that keeps the workload asleep.
+  function waiter(event, pollSeconds, state, wakeHeader, failed = null, napUntil = null) {
     const headers = {
+      ...(napUntil ? { 'x-dormeto-nap-until': napUntil.at } : {}),
       'cache-control': 'no-store', 'retry-after': String(pollSeconds), 'x-dormeto-state': state,
       ...(failed?.kind ? { 'x-dormeto-failure': failed.kind } : {}),
       ...(failed?.retryAt ? { 'x-dormeto-retry-at': new Date(failed.retryAt).toISOString() } : {}),
@@ -148,18 +151,37 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
     if (event.httpMethod === 'HEAD') return response(503, headers);
     if (acceptsHtml(event)) {
       const retryInMs = failed?.retryAt ? Math.max(0, failed.retryAt - now()) : undefined;
-      return response(503, { ...headers, 'content-type': 'text/html; charset=utf-8' }, renderPage({ state, pollSeconds, failure: failed?.kind, retryInMs }));
+      return response(503, { ...headers, 'content-type': 'text/html; charset=utf-8' }, renderPage({ state, pollSeconds, failure: failed?.kind, retryInMs, napUntil }));
     }
-    return response(503, { ...headers, 'content-type': 'application/json' }, renderJson({ state, pollSeconds, wakeHeader }));
+    return response(503, { ...headers, 'content-type': 'application/json' }, renderJson({ state, pollSeconds, wakeHeader, napUntil }));
   }
 
-  function answer(event, cfg, run) {
+  // The nap window active now for a workload that is not awake, or null. A bad stored schedule counts as none.
+  async function napWindow(workloadId, run) {
+    if (![STATES.ASLEEP, STATES.NAPPING, STATES.FAILED].includes(run.state)) return null;
+    try {
+      const schedule = await store.getSchedule(workloadId);
+      if (!schedule) return null;
+      const t = now();
+      const occurrence = occurrenceAt(schedule, t);
+      if (occurrence?.kind !== 'nap') return null;
+      return {
+        wake: occurrence.wake ?? 'never',
+        until: { at: new Date(occurrence.end).toISOString(), local: localTime(occurrence.end, schedule.timeZone), timeZone: schedule.timeZone },
+      };
+    } catch (err) {
+      log.warn('ScheduleSkipped', { workloadId, error: err.message });
+      return null;
+    }
+  }
+
+  function answer(event, cfg, run, napUntil = null) {
     if (run.state !== STATES.AWAKE) {
       // Browser mode: API clients learn how to wake the workload.
       const hint = cfg.wakeMode === 'browser' && [STATES.ASLEEP, STATES.FAILED].includes(run.state) ? WAKE_HEADER : undefined;
       const retryAt = nextAttemptAt(cfg, run);
       const failed = retryAt !== null ? { kind: failureKind(run), retryAt } : null;
-      return waiter(event, cfg.pollSeconds, run.state, hint, failed);
+      return waiter(event, cfg.pollSeconds, run.state, hint, failed, napUntil);
     }
     if (inRouteGrace(run)) return waiter(event, cfg.pollSeconds, STATES.AWAKE);
     const count = redirectCount(event);
@@ -205,7 +227,13 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
     const { kind, reason, trigger: by, deferred } = classified;
     let run = initial;
     const origin = () => requestOrigin(event, by ?? kind);
-    if (kind === 'no-wake') {
+    // Inside a nap window nothing wakes on traffic, except the wake header when the window allows it.
+    const nap = kind === 'no-wake' ? null : await napWindow(workloadId, run);
+    const napBlocks = !!nap && !(nap.wake === 'header' && by === 'header');
+    if (napBlocks) {
+      log.info('WakeIgnored', { workloadId, reason: 'nap window', trigger: origin() });
+      await count(workloadId, 'ignored:schedule');
+    } else if (kind === 'no-wake') {
       if (run.state !== STATES.AWAKE) {
         log.info('WakeIgnored', { workloadId, reason, trigger: origin() });
         await count(workloadId, `ignored:${reason}`);
@@ -219,9 +247,9 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
     }
     // A deferred request is held only behind a wake already in progress.
     const holdable = !deferred || run.state === STATES.WAKING;
-    if (kind === 'normal' && holdable && !servable(run) && run.state !== STATES.FAILED && cfg.waitSeconds > 0) {
+    if (!napBlocks && kind === 'normal' && holdable && !servable(run) && run.state !== STATES.FAILED && cfg.waitSeconds > 0) {
       run = await hold(workloadId, cfg, run);
     }
-    return answer(event, cfg, run);
+    return answer(event, cfg, run, napBlocks ? nap.until : null);
   };
 }

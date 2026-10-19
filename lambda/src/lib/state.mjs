@@ -132,20 +132,51 @@ export function createStore({ dynamo, table, now = Date.now }) {
     },
 
     async listConfigs() {
+      return (await this.listWorkloads()).configs;
+    },
+
+    // The configurations and the schedules (id → schedule) in one scan: the check reads both without a second pass.
+    async listWorkloads() {
       const configs = [];
+      const schedules = new Map();
       let ExclusiveStartKey;
       do {
         const page = await dynamo.scan({
           TableName: table,
-          FilterExpression: '#sk = :cfg',
+          FilterExpression: '#sk IN (:cfg, :schedule)',
           ExpressionAttributeNames: { '#sk': 'sk' },
-          ExpressionAttributeValues: { ':cfg': { S: 'CFG' } },
+          ExpressionAttributeValues: { ':cfg': { S: 'CFG' }, ':schedule': { S: 'SCHEDULE' } },
           ExclusiveStartKey,
         });
-        for (const item of page.Items ?? []) configs.push(JSON.parse(item.config.S));
+        for (const item of page.Items ?? []) {
+          if (item.sk?.S === 'SCHEDULE') schedules.set(item.pk.S.slice(3), JSON.parse(item.schedule.S));
+          else configs.push(JSON.parse(item.config.S));
+        }
         ExclusiveStartKey = page.LastEvaluatedKey;
       } while (ExclusiveStartKey);
-      return configs;
+      return { configs, schedules };
+    },
+
+    // The workload's schedule (R12), beside its configuration: `{...schedule, by, at}`.
+    async getSchedule(workloadId) {
+      const item = await get(workloadId, 'SCHEDULE');
+      return item ? JSON.parse(item.schedule.S) : null;
+    },
+
+    async putSchedule(workloadId, schedule) {
+      await dynamo.updateItem({
+        TableName: table,
+        Key: itemKey(workloadId, 'SCHEDULE'),
+        UpdateExpression: 'SET #schedule = :schedule',
+        ExpressionAttributeNames: { '#schedule': 'schedule' },
+        ExpressionAttributeValues: { ':schedule': { S: JSON.stringify(schedule) } },
+      });
+    },
+
+    // True when there was one.
+    async deleteSchedule(workloadId) {
+      const { Attributes } = await dynamo.deleteItem({ TableName: table, Key: itemKey(workloadId, 'SCHEDULE'), ReturnValues: 'ALL_OLD' });
+      return Boolean(Attributes);
     },
 
     async getRun(workloadId) {

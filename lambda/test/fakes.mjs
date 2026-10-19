@@ -39,7 +39,7 @@ export function fakeClock(start = 1_700_000_000_000) {
 }
 
 export function fakeStore({ config, run, clock }) {
-  const state = { run: structuredClone(run), stats: {}, lists: {}, pauses: [] };
+  const state = { run: structuredClone(run), stats: {}, lists: {}, pauses: [], schedules: {} };
   const samePause = (workloadId, exclusionId) => (p) => p.workloadId === workloadId && (p.exclusionId ?? null) === (exclusionId ?? null);
   const list = (name) => (state.lists[name] ??= { meta: null, parts: {} });
   const copy = () => structuredClone(state.run);
@@ -53,6 +53,12 @@ export function fakeStore({ config, run, clock }) {
       return true;
     },
     async listConfigs() { return [structuredClone(config)]; },
+    async listWorkloads() {
+      return { configs: await this.listConfigs(), schedules: new Map(Object.entries(state.schedules).map(([id, v]) => [id, structuredClone(v)])) };
+    },
+    async getSchedule(id) { return structuredClone(state.schedules[id] ?? null); },
+    async putSchedule(id, schedule) { state.schedules[id] = structuredClone(schedule); },
+    async deleteSchedule(id) { const had = id in state.schedules; delete state.schedules[id]; return had; },
     async getRun(id) { return id === config.workloadId ? copy() : null; },
     async transition(id, { cond, set = {}, remove = [], increment = [] }) {
       if (id !== config.workloadId || !matches(state.run, cond)) return null;

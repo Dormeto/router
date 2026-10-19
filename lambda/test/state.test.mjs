@@ -344,3 +344,36 @@ test('store putConfig can require the configuration to exist (false when it does
   await store.putConfig('demo', { workloadId: 'demo' }).catch(() => {});
   assert.equal(dynamo.calls[2][1].ConditionExpression, undefined, 'onboarding creates it');
 });
+
+test('store schedules: written beside the workload, read, deleted (true only when one was there)', async () => {
+  let stored = null;
+  const dynamo = fakeDynamo({
+    updateItem: async (input) => { stored = input; return {}; },
+    getItem: async () => (stored ? { Item: { schedule: stored.ExpressionAttributeValues[':schedule'] } } : {}),
+    deleteItem: async () => ({ Attributes: { schedule: { S: '{}' } } }),
+  });
+  const store = createStore({ dynamo, table: 't' });
+  await store.putSchedule('demo', { maxNapDays: 7, by: 'me', at: 5 });
+  assert.deepEqual(stored.Key, { pk: { S: 'WL#demo' }, sk: { S: 'SCHEDULE' } });
+  assert.deepEqual(await store.getSchedule('demo'), { maxNapDays: 7, by: 'me', at: 5 });
+  assert.equal(await store.deleteSchedule('demo'), true);
+  assert.equal(dynamo.calls.at(-1)[1].ReturnValues, 'ALL_OLD');
+  const none = createStore({ dynamo: fakeDynamo({ deleteItem: async () => ({}), getItem: async () => ({}) }), table: 't' });
+  assert.equal(await none.deleteSchedule('demo'), false);
+  assert.equal(await none.getSchedule('demo'), null);
+});
+
+test('one scan lists the configurations and the schedules; listConfigs keeps answering the configurations only', async () => {
+  const items = [
+    { pk: { S: 'WL#a' }, sk: { S: 'CFG' }, config: { S: '{"workloadId":"a"}' } },
+    { pk: { S: 'WL#a' }, sk: { S: 'SCHEDULE' }, schedule: { S: '{"maxNapDays":3}' } },
+    { pk: { S: 'WL#b' }, sk: { S: 'CFG' }, config: { S: '{"workloadId":"b"}' } },
+  ];
+  const dynamo = fakeDynamo({ scan: async () => ({ Items: items }) });
+  const store = createStore({ dynamo, table: 't' });
+  const { configs, schedules } = await store.listWorkloads();
+  assert.deepEqual(configs.map((c) => c.workloadId), ['a', 'b']);
+  assert.deepEqual([...schedules], [['a', { maxNapDays: 3 }]]);
+  assert.match(dynamo.calls[0][1].FilterExpression, /IN/);
+  assert.deepEqual((await store.listConfigs()).map((c) => c.workloadId), ['a', 'b']);
+});

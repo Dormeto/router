@@ -62,6 +62,7 @@ export function crowdedAccount({ workloads = 1500, balancers = 300, latencyMs = 
 
   const store = {
     async listConfigs() { return structuredClone(configs); },
+    async listWorkloads() { return { configs: structuredClone(configs), schedules: new Map() }; },
     async getConfig(id) { return structuredClone(configs[index.get(id)] ?? null); },
     async getRun(id) { return structuredClone(runs.get(id) ?? null); },
     async transition(id, { cond, set = {}, remove = [], increment = [] }) {

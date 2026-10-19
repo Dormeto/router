@@ -38,3 +38,8 @@ test('a workload summary carries the tags ({} without)', () => {
   assert.deepEqual(workloadSummary(testConfig({ tags: { team: 'payments', env: 'staging' } })).tags, { team: 'payments', env: 'staging' });
   assert.deepEqual(workloadSummary(testConfig()).tags, {});
 });
+
+test('a workload summary says scheduled only when it has a schedule', () => {
+  assert.equal(workloadSummary(testConfig(), { state: 'AWAKE' }, null, null, [], true).scheduled, true);
+  assert.equal('scheduled' in workloadSummary(testConfig(), { state: 'AWAKE' }), false);
+});

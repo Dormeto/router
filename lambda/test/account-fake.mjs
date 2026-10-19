@@ -304,6 +304,7 @@ export function fakeAccount() {
   const store = {
     async getConfig(id) { return structuredClone(items.get(`${id}/CFG`) ?? null); },
     async listConfigs() { return [...items].filter(([k]) => k.endsWith('/CFG')).map(([, v]) => structuredClone(v)); },
+    async listWorkloads() { return { configs: await store.listConfigs(), schedules: new Map() }; },
     async getRun(id) { return structuredClone(items.get(`${id}/RUN`) ?? null); },
     async putConfig(id, config, { mustExist = false } = {}) { call('putConfig'); if (mustExist && !items.has(`${id}/CFG`)) return false; items.set(`${id}/CFG`, structuredClone(config)); return true; },
     async initRun(id, at) {

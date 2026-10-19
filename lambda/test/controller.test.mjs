@@ -1509,3 +1509,76 @@ test('the status gives the workload\'s tags ({} without), for the manager when i
   const plain = setup({ run: { state: STATES.AWAKE } });
   assert.deepEqual((await plain.handler({ action: 'status', workloadId: 'demo' })).tags, {});
 });
+
+// --- R12: schedules ---------------------------------------------------------------------------------------------------
+
+const weekly = () => ({
+  timeZone: 'europe/paris',
+  windows: [{ kind: 'awake', days: ['mon', 'tue', 'wed', 'thu', 'fri'], start: '08:30', end: '19:00' }],
+  maxNapDays: 7,
+});
+
+test('schedule: invalid answers the problems and writes nothing', async () => {
+  const s = setup({ run: { state: STATES.AWAKE } });
+  const bad = { ...weekly(), maxNapDays: 99 };
+  const result = await s.handler({ action: 'schedule', workloadId: 'demo', schedule: bad, by: 'me' });
+  assert.ok(result.problems.some((p) => /maxNapDays/.test(p)));
+  assert.equal('schedule' in result, false);
+  assert.deepEqual(s.store.state.schedules, {});
+});
+
+test('schedule: valid is stored with who and when, its zone canonical, and answers the next events', async () => {
+  const s = setup({ run: { state: STATES.AWAKE } });
+  const result = await s.handler({ action: 'schedule', workloadId: 'demo', schedule: weekly(), by: 'me' });
+  assert.equal(result.problems, undefined);
+  assert.equal(result.schedule.timeZone, 'Europe/Paris');
+  assert.equal(result.schedule.by, 'me');
+  assert.equal(result.schedule.at, new Date(s.clock.now()).toISOString());
+  assert.equal(result.next.length, 5);
+  assert.deepEqual(Object.keys(result.next[0]), ['at', 'kind', 'window']);
+  assert.equal(result.maintenanceDue, null, 'awake: no maintenance due');
+  assert.deepEqual(s.store.state.schedules.demo, { ...weekly(), timeZone: 'Europe/Paris', by: 'me', at: s.clock.now() });
+});
+
+test('schedule: the maintenance time is the asleep time plus maxNapDays', async () => {
+  const stateAt = Date.UTC(2026, 9, 1);
+  const s = setup({ run: { state: STATES.ASLEEP, stateAt } });
+  const result = await s.handler({ action: 'schedule', workloadId: 'demo', schedule: weekly(), by: 'me' });
+  assert.equal(result.maintenanceDue, new Date(stateAt + 7 * 86_400_000).toISOString());
+});
+
+test('schedule and clear-schedule: an unknown workload is not configured', async () => {
+  const s = setup({ run: { state: STATES.AWAKE } });
+  await assert.rejects(s.handler({ action: 'schedule', workloadId: 'nope', schedule: weekly(), by: 'me' }), /^Error: workload not configured: nope/);
+  await assert.rejects(s.handler({ action: 'clear-schedule', workloadId: 'nope', by: 'me' }), /^Error: workload not configured: nope/);
+});
+
+test('clear-schedule: true when one was there, then false', async () => {
+  const s = setup({ run: { state: STATES.AWAKE } });
+  await s.handler({ action: 'schedule', workloadId: 'demo', schedule: weekly(), by: 'me' });
+  assert.deepEqual(await s.handler({ action: 'clear-schedule', workloadId: 'demo', by: 'me' }), { cleared: true });
+  assert.deepEqual(await s.handler({ action: 'clear-schedule', workloadId: 'demo', by: 'me' }), { cleared: false });
+});
+
+test('status gives the schedule, its next events and the maintenance time; null and empty without one', async () => {
+  const stateAt = Date.UTC(2026, 9, 1);
+  const s = setup({ run: { state: STATES.ASLEEP, stateAt } });
+  const none = await s.handler({ action: 'status', workloadId: 'demo' });
+  assert.equal(none.schedule, null);
+  assert.deepEqual(none.next, []);
+  assert.equal(none.maintenanceDue, null);
+  await s.handler({ action: 'schedule', workloadId: 'demo', schedule: weekly(), by: 'me' });
+  const status = await s.handler({ action: 'status', workloadId: 'demo' });
+  assert.equal(status.schedule.timeZone, 'Europe/Paris');
+  assert.equal(status.schedule.by, 'me');
+  assert.equal(typeof status.schedule.at, 'string');
+  assert.equal(status.next.length, 5);
+  assert.equal(status.maintenanceDue, new Date(stateAt + 7 * 86_400_000).toISOString());
+});
+
+test('list marks the workloads that have a schedule', async () => {
+  const s = setup({ run: { state: STATES.AWAKE } });
+  assert.equal('scheduled' in (await s.handler({ action: 'list' })).workloads[0], false);
+  await s.handler({ action: 'schedule', workloadId: 'demo', schedule: weekly(), by: 'me' });
+  assert.equal((await s.handler({ action: 'list' })).workloads[0].scheduled, true);
+});

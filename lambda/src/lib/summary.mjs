@@ -29,7 +29,7 @@ const sum = (counts = {}) => Object.values(counts).reduce((total, n) => total + 
 // 7-day totals of the daily statistics (null when they could not be read).
 export const totals = (stats) => (stats ? { ignored: sum(stats.total.ignored), deferred: sum(stats.total.deferred), wakes: sum(stats.total.wakes) } : null);
 
-export function workloadSummary(cfg, run = {}, host = null, stats7d = null, pauses = []) {
+export function workloadSummary(cfg, run = {}, host = null, stats7d = null, pauses = [], scheduled = false) {
   return {
     workloadId: cfg.workloadId,
     name: cfg.name ?? cfg.workloadId,
@@ -59,6 +59,8 @@ export function workloadSummary(cfg, run = {}, host = null, stats7d = null, paus
     // The kinds of its backends (instance, asg, ecs, k8s, then its databases), as the last idle check found them.
     backends: run?.backendKinds ? run.backendKinds.split(',') : [],
     pauses,
+    // Only when the workload has a schedule (R12).
+    ...(scheduled ? { scheduled: true } : {}),
     stats7d,
     settings: {
       waitSeconds: cfg.waitSeconds,

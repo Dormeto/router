@@ -14,6 +14,7 @@ import { createWakeWatch, unhealthyError } from './wake-watch.mjs';
 import { describeStopped } from './stopped.mjs';
 import { revertInstanceTypes } from './capacity.mjs';
 import { tagsProblem } from './tags.mjs';
+import { maintenanceDue, nextEvents, normalizeSchedule, scheduleProblems } from './schedule.mjs';
 import { STATS_DAYS, totals, workloadSummary } from './summary.mjs';
 import { lastRequestAt } from './metrics.mjs';
 import { checkScope } from './check-scope.mjs';
@@ -495,7 +496,7 @@ export function createController({
   }
 
   async function list({ cachedHosts = false } = {}) {
-    const configs = await store.listConfigs();
+    const { configs, schedules } = await store.listWorkloads();
     const byWorkload = await workloadHosts(configs, { cachedOnly: cachedHosts });
     let pausesError;
     const pauses = await store.listPauses().catch((err) => {
@@ -510,7 +511,7 @@ export function createController({
         store.getStats(cfg.workloadId, STATS_DAYS).catch(() => null),
       ]);
       const own = pauses.filter((p) => p.workloadId === cfg.workloadId);
-      return workloadSummary(cfg, run, byWorkload.get(cfg.workloadId), totals(stats), shownPauses([...own, ...routerPauses]));
+      return workloadSummary(cfg, run, byWorkload.get(cfg.workloadId), totals(stats), shownPauses([...own, ...routerPauses]), schedules.has(cfg.workloadId));
     }));
     const health = await store.getCheck().catch(() => null);
     return {
@@ -526,14 +527,44 @@ export function createController({
   async function workloadStatus(workloadId) {
     const cfg = await config(workloadId);
     const run = await store.getRun(workloadId);
-    return status(workloadId, cfg, run ?? {}, {
+    const schedule = await store.getSchedule(workloadId);
+    return { ...await status(workloadId, cfg, run ?? {}, {
       pauses: await pausesFor(workloadId),
       drift: store.listDrift ? await store.listDrift(workloadId, 10).catch(() => []) : [],
       noWakeRules: describeRules([{ level: 'router', rules: defaultRules }, { level: 'workload', rules: cfg.noWakeRules }]),
       wakeRules: describeRules([{ level: 'wake', rules: cfg.wakeRules }]),
       loadStats: () => store.getStats(workloadId, STATS_DAYS),
       loadLists: async () => [...await describeStoredLists(store, ipLists), ...(catalog ? (await catalog.describe()).lists : [])],
-    });
+    }), ...scheduleView(schedule, run) };
+  }
+
+  // --- Schedules (R12): stored beside the workload, applied by the check ---------------------------------------------
+
+  // What people read: the schedule (its `at` as ISO; null when none), the next events and the maintenance wake.
+  function scheduleView(schedule, run) {
+    const due = schedule && run?.state === STATES.ASLEEP && run.stateAt ? maintenanceDue(schedule, run.stateAt) : null;
+    return {
+      schedule: schedule && { ...schedule, at: new Date(schedule.at).toISOString() },
+      next: nextEvents(schedule, now()),
+      maintenanceDue: due === null ? null : new Date(due).toISOString(),
+    };
+  }
+
+  async function setSchedule({ workloadId, schedule, by }) {
+    await config(workloadId);
+    const problems = scheduleProblems(schedule);
+    if (problems.length) return { problems };
+    const stored = { ...normalizeSchedule(schedule), by, at: now() };
+    await store.putSchedule(workloadId, stored);
+    log.info('Scheduled', { workloadId, by });
+    return scheduleView(stored, await store.getRun(workloadId));
+  }
+
+  async function clearSchedule({ workloadId, by }) {
+    await config(workloadId);
+    const cleared = await store.deleteSchedule(workloadId);
+    log.info('ScheduleCleared', { workloadId, by, cleared });
+    return { cleared };
   }
 
   async function count(workloadId, counter) {
@@ -1002,6 +1033,8 @@ export function createController({
       case 'request-nap': return requestNap(event);
       case 'rename': return rename(event);
       case 'tag': return tag(event);
+      case 'schedule': return setSchedule(event);
+      case 'clear-schedule': return clearSchedule(event);
       case 'router': return routerInfo();
       case 'clusterCheck': return clusterCheck(event);
       default: throw new Error(`unknown action: ${event?.action}`);

@@ -14,7 +14,7 @@ import { createWakeWatch, unhealthyError } from './wake-watch.mjs';
 import { describeStopped } from './stopped.mjs';
 import { revertInstanceTypes } from './capacity.mjs';
 import { tagsProblem } from './tags.mjs';
-import { maintenanceDue, nextEvents, normalizeSchedule, scheduleProblems } from './schedule.mjs';
+import { awakeStartWithin, CLOSE_START_MS, maintenanceDue, nextEvents, normalizeSchedule, occurrenceAt, scheduleProblems } from './schedule.mjs';
 import { STATS_DAYS, totals, workloadSummary } from './summary.mjs';
 import { lastRequestAt } from './metrics.mjs';
 import { checkScope } from './check-scope.mjs';
@@ -453,6 +453,8 @@ export function createController({
     }
     if (paused) return { state: run.state, paused: true };
     const t = now();
+    const kept = scheduleKeeps(cfg.workloadId, ctx, t);
+    if (kept) return { state: run.state, ...kept };
     const idleMs = cfg.idleMinutes * 60_000;
     if ((run.awakeSince ?? 0) > t - idleMs) return { state: run.state };
     // The request metric is read once the workload can be idle: not before its last request plus the idle window.
@@ -463,18 +465,121 @@ export function createController({
       await store.transition(cfg.workloadId, { cond: { state: STATES.AWAKE }, set: { idleNotBefore } });
       return { state: run.state, idleNotBefore };
     }
-    // A nap lasts minutes: queued (at most 10 at a time), else run in its own invocation, never delaying the check.
+    const asked = await napSoon(cfg.workloadId, t);
+    return asked ? { state: run.state, nap: asked } : nap(cfg.workloadId);
+  }
+
+  // A nap lasts minutes: queued (at most 10 at a time), else run in its own invocation, never delaying the check; null
+  // when the router has neither (the caller naps inline). A scheduled nap says its cause (an idle nap's goes without).
+  async function napSoon(workloadId, t, cause = null) {
+    const said = cause ? { cause } : {};
     if (queueWork) {
-      await queueWork({ action: 'nap', workloadId: cfg.workloadId, requestedAt: t });
-      log.info('NapRequested', { workloadId: cfg.workloadId });
-      return { state: run.state, nap: 'queued' };
+      await queueWork({ action: 'nap', workloadId, requestedAt: t, ...said });
+      log.info('NapRequested', { workloadId, ...said });
+      return 'queued';
     }
     if (invokeSelf) {
-      await invokeSelf({ action: 'nap', workloadId: cfg.workloadId });
-      log.info('NapRequested', { workloadId: cfg.workloadId });
-      return { state: run.state, nap: 'requested' };
+      await invokeSelf({ action: 'nap', workloadId, ...said });
+      log.info('NapRequested', { workloadId, ...said });
+      return 'requested';
     }
-    return nap(cfg.workloadId);
+    return null;
+  }
+
+  // --- Schedules applied by the check (R12 design, section 4) --------------------------------------------------------
+
+  // Before the check's per-workload loop, every scheduled workload whatever the loop's budget, so a crowded router still
+  // meets the times: 8 at a time, one run read each, no AWS call but the wakes and naps it asks for. holdOf(workloadId):
+  // { paused, keepAsleep }. Answers each workload's outcome (what it did, or what held it) and the schedules the router
+  // can read: one it cannot (a time zone Intl refuses) is logged and the workload behaves as if it had none.
+  async function applySchedules(configs, schedules, holdOf, t) {
+    const due = [];
+    const readable = new Map();
+    for (const { workloadId } of configs) {
+      const schedule = schedules.get(workloadId);
+      if (!schedule) continue;
+      try {
+        const occurrence = occurrenceAt(schedule, t);
+        // A nap window's occurrence is skipped when an awake window starts within 30 minutes of its start.
+        const closeStart = occurrence?.kind === 'nap' && awakeStartWithin(schedule, occurrence.start, CLOSE_START_MS);
+        readable.set(workloadId, schedule);
+        due.push({ workloadId, schedule, occurrence, closeStart });
+      } catch (err) {
+        log.warn('ScheduleSkipped', { workloadId, error: err.message });
+      }
+    }
+    const applied = new Map();
+    let i = 0;
+    await Promise.all(Array.from({ length: Math.min(CHECK_CONCURRENCY, due.length) }, async () => {
+      while (i < due.length) {
+        const item = due[i++];
+        try {
+          const outcome = await applySchedule(item, holdOf(item.workloadId), t);
+          if (outcome) applied.set(item.workloadId, outcome);
+        } catch (err) {
+          log.error('ScheduleFailed', { workloadId: item.workloadId, error: err.message });
+        }
+      }
+    }));
+    return { applied, readable };
+  }
+
+  // The occurrence active now, applied once: the run records the last applied one, so a late check, a deploy inside a
+  // window or two checks in it apply it once. Then the maintenance wake of a workload asleep longer than maxNapDays. A
+  // pause holds the window's nap and a keepAsleep pause the wakes: held, the occurrence stays unapplied and applies once
+  // the pause is gone. Answers what it did or what held it, else null.
+  async function applySchedule({ workloadId, schedule, occurrence, closeStart }, hold, t) {
+    if (!occurrence && !schedule.maxNapDays) return null;
+    const run = await store.getRun(workloadId);
+    if (!run) return null;
+    const pending = occurrence && run.scheduleApplied !== occurrence.id ? occurrence : null;
+    const applied = (action) => log.info('ScheduleApplied', { workloadId, occurrence: pending.id, kind: pending.kind, action });
+    const record = async (action) => {
+      applied(action);
+      await store.transition(workloadId, { cond: { state: run.state }, set: { scheduleApplied: pending.id } });
+    };
+    const asleep = run.state === STATES.ASLEEP || run.state === STATES.FAILED;
+    if (pending?.kind === 'awake' && (asleep || run.state === STATES.NAPPING)) {
+      if (hold.keepAsleep) return 'held by a keepAsleep pause';
+      if (run.state === STATES.NAPPING) {
+        await forceWake(workloadId, undefined, 'schedule');
+        await record('pending wake');
+        return 'pending wake';
+      }
+      // Woken as the manager's Wake does, the occurrence recorded with the wake.
+      const woken = await forceWake(workloadId, undefined, 'schedule', { set: { scheduleApplied: pending.id } });
+      if (woken.state !== STATES.WAKING) return null;
+      applied('wake');
+      return 'wake';
+    }
+    if (pending?.kind === 'nap' && run.state === STATES.AWAKE && !closeStart) {
+      if (hold.paused) return 'held by a pause';
+      if (!(await napSoon(workloadId, t, 'schedule'))) await nap(workloadId, { cause: 'schedule' });
+      await record('nap');
+      return 'nap';
+    }
+    // Nothing to do (the workload is already as the window wants it, or the nap window comes just before an awake one).
+    if (pending) await record(closeStart ? 'skipped: an awake window starts within 30 minutes' : 'none');
+    const due = run.state === STATES.ASLEEP ? maintenanceDue(schedule, run.stateAt) : null;
+    if (due === null || due > t) return null;
+    if (hold.keepAsleep) return 'held by a keepAsleep pause';
+    const woken = await forceWake(workloadId, undefined, 'maintenance');
+    return woken.state === STATES.WAKING ? 'maintenance' : null;
+  }
+
+  // Why a schedule keeps a workload from its idle nap now, else null: the nap the check's schedule pass just asked for
+  // (not asked twice), an awake window active or starting within 30 minutes. A schedule it cannot read counts as none.
+  function scheduleKeeps(workloadId, ctx, t) {
+    const schedule = ctx?.schedules?.get(workloadId);
+    if (!schedule) return null;
+    if (ctx.applied?.get(workloadId) === 'nap') return {};
+    try {
+      if (occurrenceAt(schedule, t)?.kind === 'awake') return { kept: 'awake window' };
+      if (awakeStartWithin(schedule, t, CLOSE_START_MS)) return { kept: 'awake window within 30 minutes' };
+    } catch (err) {
+      log.warn('ScheduleSkipped', { workloadId, error: err.message });
+    }
+    return null;
   }
 
   // --- Manager interface: list, status, force-wake ------------------------------------------------------------------
@@ -577,13 +682,14 @@ export function createController({
 
   // Operator request from the manager: no retry delay; the wake itself runs in its own invocation.
   // inline (the work queue): the wake runs in this invocation instead of one of its own.
-  async function forceWake(workloadId, by, kind = 'manager', { inline = false } = {}) {
+  // set: more of the run written with the wake (the schedule occurrence it applies).
+  async function forceWake(workloadId, by, kind = 'manager', { inline = false, set = {} } = {}) {
     await config(workloadId);
     const run = await store.getRun(workloadId);
     if (run?.state === STATES.ASLEEP || run?.state === STATES.FAILED) {
       const wakeId = newId();
       const next = await store.transition(workloadId, {
-        cond: { state: run.state }, set: { state: STATES.WAKING, wakeId, wakeStartedAt: now() }, remove: ['failedAt'], increment: ['wakeCount'], cause: kind,
+        cond: { state: run.state }, set: { ...set, state: STATES.WAKING, wakeId, wakeStartedAt: now() }, remove: ['failedAt'], increment: ['wakeCount'], cause: kind,
         ...(by ? { by } : {}),
       });
       if (!next) return { state: (await store.getRun(workloadId))?.state };
@@ -634,7 +740,11 @@ export function createController({
       const pauses = await activePauses();
       // Pauses that cannot be read stop every nap of this check (the reconcile still runs).
       const paused = (workloadId) => pauses === null || pauses.some((p) => p.workloadId === null || p.workloadId === workloadId);
-      const configs = (await store.listConfigs()).sort((a, b) => a.workloadId.localeCompare(b.workloadId));
+      const listed = await store.listWorkloads();
+      const configs = listed.configs.sort((a, b) => a.workloadId.localeCompare(b.workloadId));
+      // The schedules first, whatever the budget; pauses that cannot be read hold every scheduled nap and wake too.
+      const keptAsleep = (workloadId) => pauses === null || pauses.some((p) => p.keepAsleep && (p.workloadId === null || p.workloadId === workloadId));
+      const { applied, readable } = await applySchedules(configs, listed.schedules, (id) => ({ paused: paused(id), keepAsleep: keptAsleep(id) }), now());
       // Starting after the workload where the previous check stopped (its time budget), so every workload gets its turn.
       const cursor = (await store.getCheck?.().catch(() => null))?.cursor;
       const from = cursor ? configs.findIndex((c) => c.workloadId > cursor) : 0;
@@ -642,7 +752,7 @@ export function createController({
       // The rules of the workloads, a chunk at a time in the check's order, each load balancer listed once (the listing
       // cache); backends found by tag once. A chunk is not started when its listing would end past the budget.
       const listing = { balancers: new Map(), listed: new Map(), tags: new Map() };
-      const ctx = { rules: new Map(), scope: checkScope(clients) };
+      const ctx = { rules: new Map(), scope: checkScope(clients), schedules: readable, applied };
       const deadline = Math.min(started + CHECK_BUDGET_MS, budgetEnd);
       const results = [];
       let next = 0;
@@ -665,7 +775,8 @@ export function createController({
             const cfg = chunk[i++];
             next += 1;
             try {
-              results.push({ workloadId: cfg.workloadId, ...(await checkOne(cfg, paused(cfg.workloadId), ctx)) });
+              const outcome = applied.has(cfg.workloadId) ? { schedule: applied.get(cfg.workloadId) } : {};
+              results.push({ workloadId: cfg.workloadId, ...(await checkOne(cfg, paused(cfg.workloadId), ctx)), ...outcome });
             } catch (err) {
               log.error('CheckFailed', { workloadId: cfg.workloadId, error: err.message });
               results.push({ workloadId: cfg.workloadId, error: err.message });
@@ -855,14 +966,15 @@ export function createController({
   // --- Work queue: naps and the wakes of a router pause ---------------------------------------------------------------
 
   // A nap the check (or the manager) queued: refused when the workload is no longer awake (delivered twice, or napped
-  // since), woke since it was asked for, had requests since (when it waited more than a minute), or when it waited too
-  // long (the next check decides again).
-  async function queuedNap({ workloadId, requestedAt, by }) {
+  // since), woke since it was asked for, had requests since (when it waited more than a minute; not for a nap window's,
+  // which naps whatever its traffic), or when it waited too long (the next check decides again).
+  async function queuedNap({ workloadId, requestedAt, by, cause }) {
+    const scheduled = cause === 'schedule';
     const run = await store.getRun(workloadId);
     let reason = run?.state !== STATES.AWAKE ? `not awake (${run?.state ?? 'UNKNOWN'})`
       : (run.awakeSince ?? 0) > requestedAt ? 'woken since it was requested'
         : now() - requestedAt > NAP_MAX_AGE_MS ? `requested more than ${NAP_MAX_AGE_MS / 60_000} minutes ago` : null;
-    const recheck = !reason && now() - requestedAt > NAP_RECHECK_MS ? await config(workloadId) : null;
+    const recheck = !reason && !scheduled && now() - requestedAt > NAP_RECHECK_MS ? await config(workloadId) : null;
     if (recheck && (await lastRequestAt(cloudwatch, recheck, requestedAt, now(), recheck.kubernetes ? await otherRequestGroups(recheck) : [])) !== null) {
       reason = 'requests since it was requested';
     }
@@ -870,7 +982,7 @@ export function createController({
       log.warn('NapSkipped', { workloadId, reason });
       return { state: 'SKIPPED', reason };
     }
-    return nap(workloadId, { cause: by ? 'manager' : 'idle', by });
+    return nap(workloadId, { cause: scheduled ? 'schedule' : by ? 'manager' : 'idle', by });
   }
 
   // A wake a router pause queued: skipped when the workload is gone (offboarded since) or no pause applies any more
@@ -1020,7 +1132,7 @@ export function createController({
     if (Array.isArray(event?.Records)) return runQueued(event.Records);
     switch (event?.action) {
       case 'wake': return wake(event.workloadId, event.wakeId);
-      case 'nap': return nap(event.workloadId, { cause: event.by ? 'manager' : 'idle', by: event.by });
+      case 'nap': return nap(event.workloadId, { cause: event.cause === 'schedule' ? 'schedule' : event.by ? 'manager' : 'idle', by: event.by });
       case 'release': return release(event.workloadId);
       case 'check': return check(event.source);
       case 'ensure-awake': return ensureAwake(event.workloadId);

@@ -1586,10 +1586,16 @@ test('status survives a corrupt schedule or one the runtime refuses: no schedule
   assert.deepEqual(bad.next, []);
   assert.equal(bad.maintenanceDue, null);
   assert.equal(logs.filter((l) => l.event === 'ScheduleSkipped').length, 1);
-  s.store.getSchedule = async () => { throw new Error('corrupt item'); };
+  s.store.getSchedule = async () => JSON.parse('{not json');
   const corrupt = await s.handler({ action: 'status', workloadId: 'demo' });
   assert.equal(corrupt.schedule, null);
   assert.equal(logs.filter((l) => l.event === 'ScheduleSkipped').length, 2);
+});
+
+test('status fails on a failed schedule read (a store error), not "no schedule"', async () => {
+  const s = setup({ run: { state: STATES.ASLEEP, stateAt: Date.UTC(2026, 9, 1) } });
+  s.store.getSchedule = async () => { throw new Error('ProvisionedThroughputExceededException'); };
+  await assert.rejects(() => s.handler({ action: 'status', workloadId: 'demo' }), /ProvisionedThroughput/);
 });
 
 test('list marks the workloads that have a schedule', async () => {

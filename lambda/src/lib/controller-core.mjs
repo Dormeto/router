@@ -634,11 +634,13 @@ export function createController({
   async function workloadStatus(workloadId) {
     const cfg = await config(workloadId);
     const run = await store.getRun(workloadId);
-    // A corrupt schedule, or a zone this runtime refuses, never breaks the status.
+    // An unreadable schedule (the stored JSON does not parse, or a zone this runtime refuses) never breaks the status; a
+    // failed read (a store error) does, as any read error would.
     let view;
     try {
       view = scheduleView(await store.getSchedule(workloadId), run);
     } catch (err) {
+      if (!(err instanceof SyntaxError || err instanceof RangeError)) throw err;
       log.warn('ScheduleSkipped', { workloadId, error: err.message });
       view = { schedule: null, next: [], maintenanceDue: null };
     }

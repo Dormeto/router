@@ -13,11 +13,16 @@ const HORIZON_DAYS = 8;
 const DAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
 const LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 const WAKES = ['never', 'header'];
+// The fields of a schedule and of a window; `by` and `at` (who set it, when) are accepted and ignored, so a schedule
+// read back can be sent again as it is.
+const FIELDS = ['timeZone', 'windows', 'exceptions', 'maxNapDays', 'by', 'at'];
+const WINDOW_FIELDS = ['kind', 'days', 'start', 'end', 'wake'];
 const HHMM = /^([01]\d|2[0-3]):([0-5]\d)$/;
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
 
 const absent = (value) => value === undefined || value === null;
 const isObject = (value) => !!value && typeof value === 'object' && !Array.isArray(value);
+const defined = (object) => Object.fromEntries(Object.entries(object).filter(([, value]) => !absent(value)));
 const iso = (ms) => new Date(ms).toISOString();
 const pad = (n) => String(n).padStart(2, '0');
 
@@ -34,21 +39,29 @@ function isDate(text) {
   return Number.isFinite(ms) && iso(ms).startsWith(text);
 }
 
-// The name Intl resolves a time zone to (Europe/Paris for europe/paris), or null when it refuses it.
+// The name Intl resolves a time zone to (Europe/Paris for europe/paris), or null when it refuses it. Intl also takes UTC
+// offsets (+01:00, −05:00), resolved with a leading sign: not zone names, and Go's time.LoadLocation (the CLI) refuses
+// them.
 function canonicalZone(timeZone) {
   if (typeof timeZone !== 'string') return null;
   try {
-    return new Intl.DateTimeFormat('en-US', { timeZone }).resolvedOptions().timeZone;
+    const name = new Intl.DateTimeFormat('en-US', { timeZone }).resolvedOptions().timeZone;
+    return /^[+-]/.test(name) ? null : name;
   } catch {
     return null;
   }
 }
 
-// The schedule with its time zone in canonical form, so the router and the dashboard read the same name. Validate
-// first: an invalid zone is left as it is.
+// The schedule as stored: its own fields only (no by or at, no null one, each exception date once), its time zone in
+// canonical form so the router and the dashboard read the same name. Validate first.
 export function normalizeSchedule(s) {
-  const timeZone = canonicalZone(s?.timeZone);
-  return timeZone ? { ...s, timeZone } : s;
+  if (!isObject(s)) return s;
+  return defined({
+    timeZone: canonicalZone(s.timeZone) ?? s.timeZone,
+    windows: s.windows?.map((w) => defined({ kind: w.kind, days: w.days, start: w.start, end: w.end, wake: w.wake })),
+    exceptions: s.exceptions && [...new Set(s.exceptions)],
+    maxNapDays: s.maxNapDays,
+  });
 }
 
 // Local days are numbered from 1970-01-01, a Thursday; weekdays from 0 (mon).
@@ -152,20 +165,24 @@ export function occurrenceAt(s, t) {
   };
 }
 
-// The next `count` window starts and ends after t, within `horizonDays`; at one instant, an end comes first.
+// The next `count` window starts and ends after t, within `horizonDays`; at one instant, an end comes first. Windows of
+// one kind count as their union, as in occurrenceAt: an end that another occurrence of that kind holds (including one
+// starting then) is not an end, while each start stays (a new occurrence); identical events are the lowest window's.
 export function nextEvents(s, t, { count = 5, horizonDays = HORIZON_DAYS } = {}) {
   const plan = prepare(s);
   if (!plan) return [];
   const last = t + horizonDays * DAY;
+  const occurrences = [];
+  for (let day = localDay(t, plan.timeZone) - 1; day <= localDay(last, plan.timeZone); day++) occurrences.push(...occurrencesOn(plan, day));
+  const held = (kind, at) => occurrences.some((o) => o.kind === kind && o.start <= at && at < o.end);
   const edges = [];
-  for (let day = localDay(t, plan.timeZone) - 1; day <= localDay(last, plan.timeZone); day++) {
-    for (const o of occurrencesOn(plan, day)) {
-      if (o.start > t && o.start <= last) edges.push({ at: o.start, kind: `${o.kind}-start`, window: o.window });
-      if (o.end > t && o.end <= last) edges.push({ at: o.end, kind: `${o.kind}-end`, window: o.window });
-    }
+  for (const o of occurrences) {
+    if (o.start > t && o.start <= last) edges.push({ at: o.start, kind: `${o.kind}-start`, window: o.window });
+    if (o.end > t && o.end <= last && !held(o.kind, o.end)) edges.push({ at: o.end, kind: `${o.kind}-end`, window: o.window });
   }
   const rank = (e) => (e.kind.endsWith('-end') ? 0 : 1);
   return edges.sort((a, b) => a.at - b.at || rank(a) - rank(b) || a.window - b.window)
+    .filter((e, i, sorted) => i === 0 || e.at !== sorted[i - 1].at || e.kind !== sorted[i - 1].kind)
     .slice(0, count).map((e) => ({ ...e, at: iso(e.at) }));
 }
 
@@ -206,6 +223,9 @@ function windowProblems(w, field) {
   }
   return problems;
 }
+
+// Own keys, so a parsed __proto__ or constructor key is caught too.
+const unknownFields = (object, fields, prefix) => Object.keys(object).filter((k) => !fields.includes(k)).map((k) => `${prefix}${k}: unknown field`);
 
 // A window's occurrences in minutes of the local week (mon 00:00 = 0), each [from, to) with to up to a day past the
 // week's end. Wall time, so the comparison holds whatever the clock changes.
@@ -261,12 +281,16 @@ export function scheduleProblems(s) {
   else if (absent(timeZone) && listed.length) problems.push('timeZone: required with windows');
   if (!absent(windows) && !Array.isArray(windows)) problems.push('windows: a list');
   else if (listed.length > WINDOWS_MAX) problems.push(`windows: at most ${WINDOWS_MAX}`);
-  else problems.push(...listed.flatMap((w, i) => windowProblems(w, `windows[${i}]`)), ...overlapProblems(listed));
+  else {
+    problems.push(...listed.flatMap((w, i) => [
+      ...windowProblems(w, `windows[${i}]`), ...(isObject(w) ? unknownFields(w, WINDOW_FIELDS, `windows[${i}].`) : []),
+    ]), ...overlapProblems(listed));
+  }
   if (!absent(exceptions) && !Array.isArray(exceptions)) problems.push('exceptions: a list');
   else if (exceptions?.length > EXCEPTIONS_MAX) problems.push(`exceptions: at most ${EXCEPTIONS_MAX}`);
   else (exceptions ?? []).forEach((d, i) => !isDate(d) && problems.push(`exceptions[${i}]: a date YYYY-MM-DD`));
   if (!absent(maxNapDays) && !(Number.isInteger(maxNapDays) && maxNapDays >= 1 && maxNapDays <= NAP_DAYS_MAX)) {
     problems.push(`maxNapDays: a whole number from 1 to ${NAP_DAYS_MAX}`);
   }
-  return problems;
+  return [...problems, ...unknownFields(s, FIELDS, '')];
 }

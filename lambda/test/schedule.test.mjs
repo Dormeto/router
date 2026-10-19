@@ -15,6 +15,8 @@ const awake = (days, start, end) => ({ kind: 'awake', days, start, end });
 const nap = (days, start, end, wake) => ({ kind: 'nap', days, start, end, ...(wake ? { wake } : {}) });
 const paris = (windows, more = {}) => ({ timeZone: 'Europe/Paris', windows, ...more });
 const newYork = (windows) => ({ timeZone: 'America/New_York', windows });
+const lordHowe = (windows) => ({ timeZone: 'Australia/Lord_Howe', windows });
+const sydney = (windows) => ({ timeZone: 'Australia/Sydney', windows });
 
 // The design's example (section 3).
 const EXAMPLE = paris([
@@ -26,6 +28,8 @@ test('valid schedules have no problems', () => {
     EXAMPLE,
     { maxNapDays: 7 },
     { timeZone: 'UTC', maxNapDays: 60 },
+    { timeZone: 'Etc/GMT+1', maxNapDays: 7 },
+    { maxNapDays: 7, by: 'alice@example.com', at: 1792915200000 },
     { timeZone: 'Europe/Paris', windows: [], maxNapDays: 1 },
     paris([awake(['mon'], '08:00', '19:00'), nap(['mon'], '19:00', '08:00')]),
     paris([awake(['mon'], '08:00', '12:00'), awake(['mon'], '10:00', '18:00')]),
@@ -43,6 +47,14 @@ const PROBLEMS = [
   ['nothing to apply', { timeZone: 'Europe/Paris', windows: [], exceptions: ['2026-12-25'] }, 'schedule: windows or maxNapDays required'],
   ['an unknown time zone', { timeZone: 'Mars/Olympus', maxNapDays: 7 }, 'timeZone: an IANA time zone name, such as Europe/Paris'],
   ['a time zone not a string', { timeZone: 1, maxNapDays: 7 }, 'timeZone: an IANA time zone name, such as Europe/Paris'],
+  ['an offset, not a zone name', { timeZone: '+01:00', maxNapDays: 7 }, 'timeZone: an IANA time zone name, such as Europe/Paris'],
+  ['a negative offset', { timeZone: '-05:30', maxNapDays: 7 }, 'timeZone: an IANA time zone name, such as Europe/Paris'],
+  ['an offset with a minus sign', { timeZone: '−05:00', maxNapDays: 7 }, 'timeZone: an IANA time zone name, such as Europe/Paris'],
+  ['an unknown field', { maxNapDays: 7, foo: 1 }, 'foo: unknown field'],
+  ['a parsed __proto__ key', JSON.parse('{"maxNapDays": 7, "__proto__": {"x": 1}}'), '__proto__: unknown field'],
+  ['an unknown window field', paris([{ ...nap(['mon'], '20:00', '07:00'), wakeup: 'never' }]), 'windows[0].wakeup: unknown field'],
+  ['a parsed constructor key in a window', paris([JSON.parse('{"kind": "awake", "days": ["mon"], "start": "08:00", "end": "09:00", "constructor": 1}')]),
+    'windows[0].constructor: unknown field'],
   ['windows without a time zone', { windows: [awake(['mon'], '08:00', '19:00')] }, 'timeZone: required with windows'],
   ['windows not a list', paris({}), 'windows: a list'],
   ['21 windows', paris(Array.from({ length: 21 }, () => awake(['mon'], '08:00', '09:00'))), 'windows: at most 20'],
@@ -83,13 +95,34 @@ for (const [name, s, problem] of PROBLEMS) {
 }
 
 test('every problem is reported, each naming its field', () => {
-  assert.deepEqual(scheduleProblems(paris([awake(['mon'], '8', '9'), { kind: 'nap', days: [], start: '20:00', end: '07:00', wake: 'x' }], { maxNapDays: 0 })), [
+  const windows = [awake(['mon'], '8', '9'), { kind: 'nap', days: [], start: '20:00', end: '07:00', wake: 'x', note: 'y' }];
+  assert.deepEqual(scheduleProblems(paris(windows, { maxNapDays: 0, extra: true })), [
     'windows[0].start: HH:MM, minutes a multiple of 5',
     'windows[0].end: HH:MM, minutes a multiple of 5',
     'windows[1].days: one or more of mon, tue, wed, thu, fri, sat, sun, each once',
     'windows[1].wake: never or header',
+    'windows[1].note: unknown field',
     'maxNapDays: a whole number from 1 to 60',
+    'extra: unknown field',
   ]);
+});
+
+test('an unknown field does not hide an overlap', () => {
+  assert.deepEqual(scheduleProblems(paris([awake(['mon'], '08:00', '19:00'), { ...nap(['mon'], '18:00', '20:00'), note: 'x' }])), [
+    'windows[1].note: unknown field',
+    'windows[1]: the nap window overlaps the awake window windows[0] (mon 18:00–19:00)',
+  ]);
+});
+
+test('a normalized schedule keeps only its fields: no by or at, no null field, each exception date once', () => {
+  const stored = {
+    timeZone: 'europe/paris', windows: [{ ...nap(['mon'], '20:00', '07:00'), wake: null }, awake(['tue'], '08:00', '19:00')],
+    exceptions: ['2026-12-25', '2026-12-25', '2027-01-01'], maxNapDays: null, by: 'alice@example.com', at: 1792915200000,
+  };
+  assert.deepEqual(normalizeSchedule(stored), {
+    timeZone: 'Europe/Paris', windows: [nap(['mon'], '20:00', '07:00'), awake(['tue'], '08:00', '19:00')], exceptions: ['2026-12-25', '2027-01-01'],
+  });
+  assert.deepEqual(normalizeSchedule(JSON.parse('{"maxNapDays": 7, "__proto__": {"x": 1}}')), { maxNapDays: 7 });
 });
 
 test('a time zone Intl accepts in another case is valid and stored in its canonical form', () => {
@@ -154,6 +187,23 @@ const OCCURRENCES = [
     napAt(1, '2026-10-23T22:00:00.000Z', '2026-10-24T22:00:00.000Z', 'never')],
   ['same-kind windows touching the same day: the union ends with the later one', paris([awake(['mon'], '08:00', '12:00'), awake(['mon'], '12:00', '18:00')]),
     '2026-10-19T10:00:00+02:00', awakeAt(0, '2026-10-19T06:00:00.000Z', '2026-10-19T16:00:00.000Z')],
+  ['Lord Howe 2026-10-04: a 02:15 start (skipped half hour) applies at 02:30', lordHowe([awake(['sun'], '02:15', '04:00')]), '2026-10-04T02:30:00+11:00',
+    awakeAt(0, '2026-10-03T15:30:00.000Z', '2026-10-03T17:00:00.000Z')],
+  ['Lord Howe 2026-10-04: not at 01:59', lordHowe([awake(['sun'], '02:15', '04:00')]), '2026-10-04T01:59:00+10:30', null],
+  ['Lord Howe 2027-04-04: a 01:45 start (repeated half hour) applies at its first instance', lordHowe([awake(['sun'], '01:45', '03:00')]),
+    '2027-04-04T01:45:00+11:00', awakeAt(0, '2027-04-03T14:45:00.000Z', '2027-04-03T16:30:00.000Z')],
+  ['Lord Howe 2027-04-04: still active at the second 01:45', lordHowe([awake(['sun'], '01:45', '03:00')]), '2027-04-04T01:45:00+10:30',
+    awakeAt(0, '2027-04-03T14:45:00.000Z', '2027-04-03T16:30:00.000Z')],
+  ['Sydney 2027-04-04: a Saturday night across the April change, at the first 02:30', sydney([nap(['sat'], '22:00', '07:00')]), '2027-04-04T02:30:00+11:00',
+    napAt(0, '2027-04-03T11:00:00.000Z', '2027-04-03T21:00:00.000Z')],
+  ['Sydney 2027-04-04: the same night at 06:55 AEST', sydney([nap(['sat'], '22:00', '07:00')]), '2027-04-04T06:55:00+10:00',
+    napAt(0, '2027-04-03T11:00:00.000Z', '2027-04-03T21:00:00.000Z')],
+  ['Sydney 2027-04-04: not at 07:00 AEST', sydney([nap(['sat'], '22:00', '07:00')]), '2027-04-04T07:00:00+10:00', null],
+  ['a Sunday night read on Monday morning', paris([nap(['sun'], '22:00', '07:00')]), '2026-10-26T06:00:00+01:00',
+    napAt(0, '2026-10-25T21:00:00.000Z', '2026-10-26T06:00:00.000Z')],
+  ['a Sunday night read on Monday morning, Monday an exception', paris([nap(['sun'], '22:00', '07:00')], { exceptions: ['2026-10-26'] }), '2026-10-26T06:00:00+01:00',
+    napAt(0, '2026-10-25T21:00:00.000Z', '2026-10-26T06:00:00.000Z')],
+  ['a Sunday night read on Monday morning, Sunday an exception', paris([nap(['sun'], '22:00', '07:00')], { exceptions: ['2026-10-25'] }), '2026-10-26T06:00:00+01:00', null],
 ];
 for (const [name, s, at, expected] of OCCURRENCES) {
   test(`occurrence: ${name}`, () => assert.deepEqual(shown(occurrenceAt(s, t(at))), expected));
@@ -196,8 +246,56 @@ test('next events: an end comes before a start at the same instant; exceptions r
   assert.deepEqual(nextEvents(null, t('2026-10-19T18:00:00+02:00')), []);
 });
 
+test('next events follow the union of same-kind windows: the design\'s weekday night runs into the whole Saturday', () => {
+  const events = nextEvents(EXAMPLE, t('2026-10-23T19:30:00+02:00'));
+  assert.deepEqual(events, [
+    { at: '2026-10-23T18:00:00.000Z', kind: 'nap-start', window: 1 },
+    { at: '2026-10-23T22:00:00.000Z', kind: 'nap-start', window: 2 },
+    { at: '2026-10-24T22:00:00.000Z', kind: 'nap-end', window: 2 },
+    { at: '2026-10-26T07:30:00.000Z', kind: 'awake-start', window: 0 },
+    { at: '2026-10-26T18:00:00.000Z', kind: 'awake-end', window: 0 },
+  ]);
+  // The nap ends when the occurrence active on Friday night says it does (the waiter page's napUntil).
+  assert.equal(iso(occurrenceAt(EXAMPLE, t('2026-10-23T21:00:00+02:00')).end), events[2].at);
+});
+
+const UNIONS = [
+  ['overlapping: the earlier end, inside the later window, is dropped', paris([awake(['mon'], '08:00', '12:00'), awake(['mon'], '10:00', '18:00')]), [
+    { at: '2026-10-19T06:00:00.000Z', kind: 'awake-start', window: 0 },
+    { at: '2026-10-19T08:00:00.000Z', kind: 'awake-start', window: 1 },
+    { at: '2026-10-19T16:00:00.000Z', kind: 'awake-end', window: 1 },
+  ]],
+  ['contained: the inner end is dropped', paris([awake(['mon'], '08:00', '18:00'), awake(['mon'], '10:00', '12:00')]), [
+    { at: '2026-10-19T06:00:00.000Z', kind: 'awake-start', window: 0 },
+    { at: '2026-10-19T08:00:00.000Z', kind: 'awake-start', window: 1 },
+    { at: '2026-10-19T16:00:00.000Z', kind: 'awake-end', window: 0 },
+  ]],
+  ['identical: one start and one end, from the lowest window', paris([awake(['mon'], '08:00', '09:00'), awake(['mon'], '08:00', '09:00'), awake(['mon'], '08:00', '09:00')]), [
+    { at: '2026-10-19T06:00:00.000Z', kind: 'awake-start', window: 0 },
+    { at: '2026-10-19T07:00:00.000Z', kind: 'awake-end', window: 0 },
+  ]],
+  ['touching: the end where the next one starts is dropped, that start is kept', paris([awake(['mon'], '08:00', '12:00'), awake(['mon'], '12:00', '18:00')]), [
+    { at: '2026-10-19T06:00:00.000Z', kind: 'awake-start', window: 0 },
+    { at: '2026-10-19T10:00:00.000Z', kind: 'awake-start', window: 1 },
+    { at: '2026-10-19T16:00:00.000Z', kind: 'awake-end', window: 1 },
+  ]],
+  ['touching across midnight', paris([nap(['mon'], '20:00', '00:00'), nap(['tue'], '00:00', '07:00')]), [
+    { at: '2026-10-19T18:00:00.000Z', kind: 'nap-start', window: 0 },
+    { at: '2026-10-19T22:00:00.000Z', kind: 'nap-start', window: 1 },
+    { at: '2026-10-20T05:00:00.000Z', kind: 'nap-end', window: 1 },
+  ]],
+  ['a window on an exception date does not extend the union', paris([nap(['mon'], '20:00', '07:00'), nap(['tue'], '00:00', '00:00')], { exceptions: ['2026-10-20'] }), [
+    { at: '2026-10-19T18:00:00.000Z', kind: 'nap-start', window: 0 },
+    { at: '2026-10-20T05:00:00.000Z', kind: 'nap-end', window: 0 },
+  ]],
+];
+for (const [name, s, expected] of UNIONS) {
+  test(`next events, same-kind windows ${name}`, () => assert.deepEqual(nextEvents(s, t('2026-10-19T07:00:00+02:00'), { horizonDays: 2 }), expected));
+}
+
 test('next events: 20 windows on every day over 8 days stay fast', () => {
-  const s = paris(Array.from({ length: 20 }, (_, i) => awake(['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'], `${String(i).padStart(2, '0')}:05`, '23:55')));
+  const hour = (i) => String(i).padStart(2, '0');
+  const s = paris(Array.from({ length: 20 }, (_, i) => awake(['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'], `${hour(i)}:05`, `${hour(i)}:55`)));
   const begin = performance.now();
   const events = nextEvents(s, t('2026-11-02T00:00:00+01:00'), { count: 1000 });
   assert.equal(events.length, 20 * 8 * 2);

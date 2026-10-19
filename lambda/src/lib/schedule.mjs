@@ -58,7 +58,7 @@ export function normalizeSchedule(s) {
   if (!isObject(s)) return s;
   return defined({
     timeZone: canonicalZone(s.timeZone) ?? s.timeZone,
-    windows: s.windows?.map((w) => defined({ kind: w.kind, days: w.days, start: w.start, end: w.end, wake: w.wake })),
+    windows: (s.windows ?? []).map((w) => defined({ kind: w.kind, days: w.days, start: w.start, end: w.end, wake: w.wake })),
     exceptions: s.exceptions && [...new Set(s.exceptions)],
     maxNapDays: s.maxNapDays,
   });

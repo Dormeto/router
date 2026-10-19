@@ -45,7 +45,8 @@ export async function queueDepths(sqs, queues) {
 export function checkLate(schedule, lastScheduledCheckAt, now) {
   if (!lastScheduledCheckAt) return true;
   const rate = /rate\((\d+) (minute|minutes|hour|hours)\)/.exec(schedule ?? '');
-  const periodMs = rate ? Number(rate[1]) * (rate[2].startsWith('hour') ? HOUR_MS : 60_000) : 5 * 60_000;
+  const cron = /^cron\(0\/(\d+) \* \* \* \? \*\)$/.exec(schedule ?? '');
+  const periodMs = rate ? Number(rate[1]) * (rate[2].startsWith('hour') ? HOUR_MS : 60_000) : cron ? Number(cron[1]) * 60_000 : 5 * 60_000;
   return now - lastScheduledCheckAt > 3 * periodMs;
 }
 

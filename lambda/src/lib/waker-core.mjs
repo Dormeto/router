@@ -175,10 +175,12 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
     }
   }
 
-  function answer(event, cfg, run, napUntil = null) {
+  function answer(event, cfg, run, napUntil = null, napWake = null) {
     if (run.state !== STATES.AWAKE) {
       // Browser mode: API clients learn how to wake the workload.
-      const hint = cfg.wakeMode === 'browser' && [STATES.ASLEEP, STATES.FAILED].includes(run.state) ? WAKE_HEADER : undefined;
+      // Not inside a nap window that ignores the header (wake: never).
+      const headerWorks = !napUntil || napWake === 'header';
+      const hint = cfg.wakeMode === 'browser' && headerWorks && [STATES.ASLEEP, STATES.FAILED].includes(run.state) ? WAKE_HEADER : undefined;
       const retryAt = nextAttemptAt(cfg, run);
       const failed = retryAt !== null ? { kind: failureKind(run), retryAt } : null;
       return waiter(event, cfg.pollSeconds, run.state, hint, failed, napUntil);
@@ -250,6 +252,6 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
     if (!napBlocks && kind === 'normal' && holdable && !servable(run) && run.state !== STATES.FAILED && cfg.waitSeconds > 0) {
       run = await hold(workloadId, cfg, run);
     }
-    return answer(event, cfg, run, napBlocks ? nap.until : null);
+    return answer(event, cfg, run, napBlocks ? nap.until : null, napBlocks ? nap.wake : null);
   };
 }

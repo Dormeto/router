@@ -1576,6 +1576,22 @@ test('status gives the schedule, its next events and the maintenance time; null 
   assert.equal(status.maintenanceDue, new Date(stateAt + 7 * 86_400_000).toISOString());
 });
 
+test('status survives a corrupt schedule or one the runtime refuses: no schedule, logged', async () => {
+  const s = setup({ run: { state: STATES.ASLEEP, stateAt: Date.UTC(2026, 9, 1) } });
+  const logs = [];
+  s.log.warn = (event, fields) => logs.push({ event, ...fields });
+  s.store.state.schedules.demo = { timeZone: 'Nowhere/Land', windows: [{ kind: 'nap', days: ['mon'], start: '20:00', end: '07:00' }], by: 'me', at: s.clock.now() };
+  const bad = await s.handler({ action: 'status', workloadId: 'demo' });
+  assert.equal(bad.schedule, null);
+  assert.deepEqual(bad.next, []);
+  assert.equal(bad.maintenanceDue, null);
+  assert.equal(logs.filter((l) => l.event === 'ScheduleSkipped').length, 1);
+  s.store.getSchedule = async () => { throw new Error('corrupt item'); };
+  const corrupt = await s.handler({ action: 'status', workloadId: 'demo' });
+  assert.equal(corrupt.schedule, null);
+  assert.equal(logs.filter((l) => l.event === 'ScheduleSkipped').length, 2);
+});
+
 test('list marks the workloads that have a schedule', async () => {
   const s = setup({ run: { state: STATES.AWAKE } });
   assert.equal('scheduled' in (await s.handler({ action: 'list' })).workloads[0], false);

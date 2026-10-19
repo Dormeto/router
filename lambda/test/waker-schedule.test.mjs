@@ -105,3 +105,12 @@ test('a bad stored schedule behaves as none and is logged once per request', asy
   assert.equal(invocations.length, 1);
   assert.deepEqual(logs.filter((l) => l.event === 'ScheduleSkipped').length, 1);
 });
+
+test('browser mode: the JSON advertises the wake header only outside a nap window or in a header window', async () => {
+  const browser = testConfig({ waitSeconds: 0, wakeMode: 'browser' });
+  const hint = async (schedule, now = NOW) => JSON.parse((await setup({ schedule, cfg: browser, now }).handler(albEvent({ headers: json }))).body).wakeHeader;
+  assert.equal(await hint(night()), undefined, 'never window: no hint');
+  assert.ok(await hint(night('header')), 'header window: hint');
+  assert.ok(await hint(null), 'no schedule: hint');
+  assert.ok(await hint(night(), Date.parse('2026-10-20T10:00:00+02:00')), 'outside the window: hint');
+});

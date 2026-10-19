@@ -58,6 +58,8 @@ test('checkLate: three periods of the schedule without a scheduled check, or non
   assert.equal(checkLate('rate(1 hour)', NOW - 2 * HOUR, NOW), false);
   assert.equal(checkLate(undefined, NOW - 16 * 60_000, NOW), true, 'five minutes by default');
   assert.equal(checkLate('rate(5 minutes)', null, NOW), true);
+  assert.equal(checkLate('cron(0/15 * * * ? *)', NOW - 40 * 60_000, NOW), false, 'cron(0/N …) is N minutes');
+  assert.equal(checkLate('cron(0/15 * * * ? *)', NOW - 50 * 60_000, NOW), true);
 });
 
 const healthy = {

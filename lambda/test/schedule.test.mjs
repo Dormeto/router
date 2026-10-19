@@ -122,7 +122,7 @@ test('a normalized schedule keeps only its fields: no by or at, no null field, e
   assert.deepEqual(normalizeSchedule(stored), {
     timeZone: 'Europe/Paris', windows: [nap(['mon'], '20:00', '07:00'), awake(['tue'], '08:00', '19:00')], exceptions: ['2026-12-25', '2027-01-01'],
   });
-  assert.deepEqual(normalizeSchedule(JSON.parse('{"maxNapDays": 7, "__proto__": {"x": 1}}')), { maxNapDays: 7 });
+  assert.deepEqual(normalizeSchedule(JSON.parse('{"maxNapDays": 7, "__proto__": {"x": 1}}')), { windows: [], maxNapDays: 7 });
 });
 
 test('a time zone Intl accepts in another case is valid and stored in its canonical form', () => {
@@ -130,7 +130,7 @@ test('a time zone Intl accepts in another case is valid and stored in its canoni
   assert.deepEqual(scheduleProblems(s), []);
   assert.deepEqual(normalizeSchedule(s), { ...s, timeZone: 'Europe/Paris' });
   assert.equal(s.timeZone, 'europe/paris');
-  assert.deepEqual(normalizeSchedule({ maxNapDays: 7 }), { maxNapDays: 7 });
+  assert.deepEqual(normalizeSchedule({ maxNapDays: 7 }), { windows: [], maxNapDays: 7 });
   assert.equal(occurrenceAt(s, t('2026-10-19T10:00:00+02:00')).start, t('2026-10-19T08:00:00+02:00'));
 });
 

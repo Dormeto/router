@@ -634,7 +634,14 @@ export function createController({
   async function workloadStatus(workloadId) {
     const cfg = await config(workloadId);
     const run = await store.getRun(workloadId);
-    const schedule = await store.getSchedule(workloadId);
+    // A corrupt schedule, or a zone this runtime refuses, never breaks the status.
+    let view;
+    try {
+      view = scheduleView(await store.getSchedule(workloadId), run);
+    } catch (err) {
+      log.warn('ScheduleSkipped', { workloadId, error: err.message });
+      view = { schedule: null, next: [], maintenanceDue: null };
+    }
     return { ...await status(workloadId, cfg, run ?? {}, {
       pauses: await pausesFor(workloadId),
       drift: store.listDrift ? await store.listDrift(workloadId, 10).catch(() => []) : [],
@@ -642,7 +649,7 @@ export function createController({
       wakeRules: describeRules([{ level: 'wake', rules: cfg.wakeRules }]),
       loadStats: () => store.getStats(workloadId, STATS_DAYS),
       loadLists: async () => [...await describeStoredLists(store, ipLists), ...(catalog ? (await catalog.describe()).lists : [])],
-    }), ...scheduleView(schedule, run) };
+    }), ...view };
   }
 
   // --- Schedules (R12): stored beside the workload, applied by the check ---------------------------------------------

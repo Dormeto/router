@@ -1101,6 +1101,39 @@ test('wake: a fallback the boundary refuses fails as permission, naming the acce
   assert.match(failure.message, /instance type fallback refused.*apply the access module/);
 });
 
+test('wake: a hibernated instance never falls back to another type: tried again on its own type, failing at the deadline with why (hibernation)', async () => {
+  const cfg = testConfig({ fallbackInstanceTypes: ['t3a.medium', 'm5.large'] });
+  const s = setup({ run: { state: STATES.WAKING, wakeId: 'w1' }, cfg, instance: 'stopped', target: 'waker', healthy: 0 });
+  s.store.state.run.wakeStartedAt = s.clock.now();
+  const id = cfg.instanceIds[0];
+  s.ec2.state.configured[id] = true;
+  s.ec2.state.reasons[id] = 'Client.UserInitiatedHibernate';
+  let attempts = 0;
+  s.ec2.startInstances = async () => { attempts += 1; throw capacityError('t3.medium'); };
+  await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' });
+  const failure = JSON.parse(s.store.state.run.failure);
+  assert.equal(failure.kind, 'capacity');
+  assert.match(failure.message, /sufficient t3\.medium capacity.* \(hibernated: AWS does not allow its type to change\)$/);
+  assert.deepEqual(s.ec2.state.modified, [], 'AWS refuses any change of a hibernated instance');
+  assert.equal(s.ec2.state.tags[id]?.['dormeto:instance-type'], undefined);
+  assert.ok(attempts > 3 && attempts < 10, `${attempts} attempts on its own type until the deadline`);
+});
+
+test('wake: a hibernated instance is never modified, even tagged with its own type (AWS refuses any change of it)', async () => {
+  const cfg = testConfig({ fallbackInstanceTypes: ['t3a.medium'] });
+  const s = setup({ run: { state: STATES.WAKING, wakeId: 'w1' }, cfg, instance: 'stopped', target: 'waker', healthy: 0 });
+  s.store.state.run.wakeStartedAt = s.clock.now();
+  const id = cfg.instanceIds[0];
+  s.ec2.state.types[id] = 't3a.medium';
+  s.ec2.state.tags[id] = { 'dormeto:instance-type': 't3.medium' };
+  s.ec2.state.configured[id] = true;
+  s.ec2.state.reasons[id] = 'Client.UserInitiatedHibernate';
+  s.ec2.state.onStart.push(() => { s.clock.onSleep(() => { s.elbv2.state.healthy = 1; }); });
+  const result = await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' });
+  assert.equal(result.state, STATES.AWAKE);
+  assert.deepEqual(s.ec2.state.modified, []);
+});
+
 test('wake (rds): a capacity error of the database start is tried again within the deadline', async () => {
   const cfg = testConfig({ wakeTimeoutSeconds: 1800 });
   const s = setup({ run: { state: STATES.WAKING, wakeId: 'w1', napBackends: JSON.stringify([{ kind: 'rds-instance', id: 'db1' }, { kind: 'instance', id: cfg.instanceIds[0] }]) }, cfg, instance: 'stopped', target: 'waker', healthy: 0, databases: { instances: { db1: { status: 'stopped' } } } });

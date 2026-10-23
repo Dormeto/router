@@ -151,7 +151,8 @@ export const toRecord = (backend) => {
 };
 
 // Primary backends first (waited), then the companions (databases: stopped without waiting, it takes minutes).
-export async function sleepBackends({ ec2, autoscaling, ecs, appscaling, rds, kubernetesOf }, backends, timing) {
+// options: { hibernate, onHibernated, log } of the instance stop (lib/instances.mjs).
+export async function sleepBackends({ ec2, autoscaling, ecs, appscaling, rds, kubernetesOf }, backends, timing, options = {}) {
   if (ecsOnly(backends).length) await sleepEcs({ ecs, appscaling }, ecsOnly(backends), timing);
   for (const b of k8sOnly(backends)) await sleepK8s({ kubernetesOf }, b, timing);
   const { ids, groups } = split(backends);
@@ -159,7 +160,7 @@ export async function sleepBackends({ ec2, autoscaling, ecs, appscaling, rds, ku
     await autoscaling.suspendProcesses({ AutoScalingGroupName: group.name, ScalingProcesses: SCALING_PROCESSES });
     await autoscaling.updateAutoScalingGroup({ AutoScalingGroupName: group.name, MinSize: 0, DesiredCapacity: 0 });
   }
-  if (ids.length) await stopInstances(ec2, ids, timing);
+  if (ids.length) await stopInstances(ec2, ids, timing, options);
   const names = groups.map((g) => g.name);
   for (;;) {
     const described = await describeGroups(autoscaling, names);

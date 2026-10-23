@@ -212,8 +212,14 @@ export const routeOf = (elbv2, cfg) => aggregateRoute([...elbv2.state.rules]
   .filter(([, r]) => r.actions.some((a) => a.ForwardConfig?.TargetGroups?.some((tg) => tg.TargetGroupArn === cfg.appTargetGroupArn)))
   .map(([RuleArn, r]) => ({ RuleArn, Actions: r.actions })), cfg);
 
+// Hibernation: configured[id] true for an instance launched with it; reasons[id] its StateReason.Code (a stop sets it,
+// a start clears it); stops: each StopInstances input, refused ones included; refuseHibernation: the error of a call
+// with Hibernate; slowStops: ids a stop leaves `stopping`.
 export function fakeEc2(ids, { state = 'running', type = 't3.medium' } = {}) {
-  const s = { instances: Object.fromEntries(ids.map((id) => [id, state])), types: Object.fromEntries(ids.map((id) => [id, type])), tags: {}, started: 0, stopped: 0, onStart: [], onStop: [], modified: [] };
+  const s = {
+    instances: Object.fromEntries(ids.map((id) => [id, state])), types: Object.fromEntries(ids.map((id) => [id, type])), tags: {}, started: 0, stopped: 0, onStart: [], onStop: [], modified: [],
+    configured: {}, reasons: {}, stops: [], refuseHibernation: null, slowStops: [],
+  };
   return {
     state: s,
     async describeInstances({ InstanceIds }) {
@@ -223,6 +229,8 @@ export function fakeEc2(ids, { state = 'running', type = 't3.medium' } = {}) {
             InstanceId: id,
             InstanceType: s.types[id],
             State: { Name: s.instances[id] },
+            ...(s.reasons[id] ? { StateReason: { Code: s.reasons[id] } } : {}),
+            HibernationOptions: { Configured: s.configured[id] === true },
             Tags: Object.entries(s.tags[id] ?? {}).map(([Key, Value]) => ({ Key, Value })),
           })),
         }],
@@ -230,13 +238,21 @@ export function fakeEc2(ids, { state = 'running', type = 't3.medium' } = {}) {
     },
     async startInstances({ InstanceIds }) {
       s.started += 1;
-      for (const id of InstanceIds) s.instances[id] = 'running';
+      for (const id of InstanceIds) {
+        s.instances[id] = 'running';
+        delete s.reasons[id];
+      }
       for (const hook of s.onStart) await hook();
       return {};
     },
-    async stopInstances({ InstanceIds }) {
+    async stopInstances(input) {
+      s.stops.push(structuredClone(input));
+      if (input.Hibernate && s.refuseHibernation) throw s.refuseHibernation;
       s.stopped += 1;
-      for (const id of InstanceIds) s.instances[id] = 'stopped';
+      for (const id of input.InstanceIds) {
+        s.instances[id] = s.slowStops.includes(id) ? 'stopping' : 'stopped';
+        s.reasons[id] = input.Hibernate ? 'Client.UserInitiatedHibernate' : 'Client.UserInitiatedShutdown';
+      }
       for (const hook of s.onStop) await hook();
       return {};
     },

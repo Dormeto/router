@@ -85,6 +85,19 @@ test('sleep records sizes, suspends scaling, scales the group to zero and stops 
   assert.equal(c.ec2.state.instances['i-a'], 'stopped');
 });
 
+test('sleep passes the hibernation options to the instance stop, its records unchanged', async () => {
+  const c = clients({ states: { 'i-a': 'running' } });
+  c.ec2.state.configured = { 'i-a': true };
+  const clock = fakeClock();
+  const recorded = [];
+  const records = await sleepBackends(c, [{ kind: 'instance', id: 'i-a' }], { sleep: clock.sleep, now: clock.now, deadline: clock.now() + 300_000 }, {
+    hibernate: true, onHibernated: (ids) => recorded.push(ids),
+  });
+  assert.deepEqual(records, [{ kind: 'instance', id: 'i-a' }]);
+  assert.deepEqual(c.ec2.state.stops, [{ InstanceIds: ['i-a'], Hibernate: true }]);
+  assert.deepEqual(recorded, [['i-a']]);
+});
+
 test('wake restores the recorded sizes then resumes scaling', async () => {
   const c = clients({ states: { 'i-a': 'stopped' } });
   c.autoscaling.state.groups = [asgGroup('asg-demo', { min: 0, max: 3, desired: 0 })];

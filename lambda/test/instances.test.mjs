@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { healthyCount, instanceStates, startInstances, stopInstances } from '../src/lib/instances.mjs';
+import { healthyCount, instanceDetails, instanceStates, startInstances, stopInstances } from '../src/lib/instances.mjs';
 import { lastRequestAt } from '../src/lib/metrics.mjs';
+import { fakeClock, fakeEc2 } from './fakes.mjs';
 
 function clock() {
   let t = 0;
@@ -43,6 +44,117 @@ test('stopInstances stops running instances and waits until stopped', async () =
   const ec2 = ec2With({ a: 'running', b: 'stopped' }, { a: ['running', 'stopping', 'stopped'] });
   await stopInstances(ec2, ['a', 'b'], { ...c, deadline: 60_000 });
   assert.deepEqual(ec2.calls, [['stop', ['a']]]);
+});
+
+// --- Hibernation -----------------------------------------------------------------------------------------------------
+
+const HIBERNATE = 'Client.UserInitiatedHibernate';
+const logOf = () => {
+  const entries = [];
+  const entry = (level) => (event, fields) => entries.push([level, event, fields]);
+  return { entries, info: entry('info'), warn: entry('warn'), error: entry('error') };
+};
+const timingOf = (clock, ms = 300_000) => ({ sleep: clock.sleep, now: clock.now, deadline: clock.now() + ms });
+
+test('stopInstances without hibernate: one plain call, even for instances launched with hibernation', async () => {
+  const ec2 = fakeEc2(['a', 'b']);
+  ec2.state.configured = { a: true, b: true };
+  const result = await stopInstances(ec2, ['a', 'b'], timingOf(fakeClock()));
+  assert.deepEqual(ec2.state.stops, [{ InstanceIds: ['a', 'b'] }]);
+  assert.deepEqual(result, { hibernated: [], refused: [] });
+});
+
+test('stopInstances with hibernate: a running instance launched with it on its own type is hibernated, the others stopped', async () => {
+  const ec2 = fakeEc2(['a', 'b', 'c', 'd']);
+  ec2.state.configured = { a: true, c: true, d: true };
+  ec2.state.instances.c = 'pending';
+  ec2.state.tags.d = { 'dormeto:instance-type': 't3.medium' };
+  const recorded = [];
+  const onHibernated = async (ids) => { await new Promise((resolve) => setImmediate(resolve)); recorded.push(ids); };
+  const result = await stopInstances(ec2, ['a', 'b', 'c', 'd'], timingOf(fakeClock()), { hibernate: true, onHibernated });
+  assert.deepEqual(ec2.state.stops, [{ InstanceIds: ['a'], Hibernate: true }, { InstanceIds: ['b', 'c', 'd'] }]);
+  assert.deepEqual(result, { hibernated: ['a'], refused: [] });
+  assert.deepEqual(recorded, [['a']], 'called once with the hibernated ids, and awaited');
+  assert.deepEqual(Object.values(ec2.state.instances), ['stopped', 'stopped', 'stopped', 'stopped']);
+});
+
+test('stopInstances: a hibernation AWS refuses stops every instance of the call plainly, none left running (review 3)', async () => {
+  const ec2 = fakeEc2(['a', 'b', 'c']);
+  ec2.state.configured = { a: true, b: true };
+  ec2.state.refuseHibernation = Object.assign(new Error('Instance i-b cannot be hibernated within 2 minutes of launch.'), { name: 'UnsupportedOperation' });
+  const log = logOf();
+  const recorded = [];
+  const result = await stopInstances(ec2, ['a', 'b', 'c'], timingOf(fakeClock()), { hibernate: true, onHibernated: (ids) => recorded.push(ids), log });
+  assert.deepEqual(ec2.state.stops, [{ InstanceIds: ['a', 'b'], Hibernate: true }, { InstanceIds: ['a', 'b', 'c'] }]);
+  assert.deepEqual(result, { hibernated: [], refused: ['a', 'b'] });
+  assert.deepEqual(recorded, [], 'nothing hibernated, nothing recorded');
+  assert.deepEqual(log.entries, [['warn', 'HibernationRefused', { instances: ['a', 'b'], error: 'Instance i-b cannot be hibernated within 2 minutes of launch.' }]]);
+  assert.deepEqual(Object.values(ec2.state.instances), ['stopped', 'stopped', 'stopped']);
+});
+
+test('stopInstances: an accepted hibernation still stopping at the deadline completes the stop; a plain stop still stopping fails as today', async () => {
+  const ec2 = fakeEc2(['a']);
+  ec2.state.configured = { a: true };
+  ec2.state.slowStops = ['a'];
+  const log = logOf();
+  const clock = fakeClock();
+  const result = await stopInstances(ec2, ['a'], timingOf(clock), { hibernate: true, log });
+  assert.deepEqual(result, { hibernated: ['a'], refused: [] });
+  assert.deepEqual(log.entries, [['info', 'HibernationOngoing', { instances: ['a'] }]]);
+  assert.ok(clock.now() >= 1_700_000_300_000, 'waited until the deadline');
+
+  const plain = fakeEc2(['b']);
+  plain.state.slowStops = ['b'];
+  await assert.rejects(stopInstances(plain, ['b'], timingOf(fakeClock()), { hibernate: true }), /timeout waiting for instances/);
+  const mixed = fakeEc2(['a', 'b']);
+  mixed.state.configured = { a: true };
+  mixed.state.slowStops = ['a', 'b'];
+  await assert.rejects(stopInstances(mixed, ['a', 'b'], timingOf(fakeClock()), { hibernate: true }), /timeout waiting for instances/);
+});
+
+test('stopInstances: a failing record of the hibernation is logged and never fails the stop', async () => {
+  const ec2 = fakeEc2(['a']);
+  ec2.state.configured = { a: true };
+  const log = logOf();
+  const result = await stopInstances(ec2, ['a'], timingOf(fakeClock()), { hibernate: true, log, onHibernated: async () => { throw new Error('throttled'); } });
+  assert.deepEqual(result, { hibernated: ['a'], refused: [] });
+  assert.deepEqual(log.entries, [['error', 'HibernatedNotRecorded', { instances: ['a'], error: 'throttled' }]]);
+  assert.equal(ec2.state.instances.a, 'stopped');
+});
+
+test('instanceDetails reads the state, HibernationOptions.Configured, the hibernate state reason and the fallback type tag', async () => {
+  const ec2 = fakeEc2(['a', 'b', 'c', 'd', 'e']);
+  ec2.state.configured = { a: true, b: true, c: true };
+  Object.assign(ec2.state.instances, { b: 'stopped', c: 'stopping', d: 'stopped' });
+  Object.assign(ec2.state.reasons, { b: HIBERNATE, c: HIBERNATE, d: 'Client.UserInitiatedShutdown' });
+  ec2.state.tags.e = { 'dormeto:instance-type': 't3.medium' };
+  const details = await instanceDetails(ec2, ['a', 'b', 'c', 'd', 'e']);
+  assert.deepEqual(Object.fromEntries(details), {
+    a: { state: 'running', configured: true, hibernated: false, fallbackType: false },
+    b: { state: 'stopped', configured: true, hibernated: true, fallbackType: false },
+    c: { state: 'stopping', configured: true, hibernated: true, fallbackType: false },
+    d: { state: 'stopped', configured: false, hibernated: false, fallbackType: false },
+    e: { state: 'running', configured: false, hibernated: false, fallbackType: true },
+  });
+  const none = await instanceDetails({ describeInstances: async () => ({ Reservations: [] }) }, ['x']);
+  assert.equal(none.has('x'), false, 'an instance AWS does not return is absent');
+});
+
+test('startInstances: a wake right after a nap waits for a hibernation still stopping, then starts it (review 4)', async () => {
+  const ec2 = fakeEc2(['a'], { state: 'stopping' });
+  ec2.state.configured = { a: true };
+  ec2.state.reasons = { a: HIBERNATE };
+  const start = ec2.startInstances;
+  ec2.startInstances = async (input) => {
+    if (input.InstanceIds.some((id) => ec2.state.instances[id] !== 'stopped')) throw Object.assign(new Error('not stopped'), { name: 'IncorrectInstanceState' });
+    return start(input);
+  };
+  const clock = fakeClock();
+  const begin = clock.now();
+  clock.onSleep((t) => { if (t - begin >= 60_000) ec2.state.instances.a = 'stopped'; });
+  await startInstances(ec2, ['a'], timingOf(clock, 600_000));
+  assert.equal(ec2.state.instances.a, 'running');
+  assert.ok(clock.now() - begin >= 60_000, 'waited for the hibernation to end');
 });
 
 test('healthyCount counts healthy targets only', async () => {

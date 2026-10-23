@@ -18,15 +18,28 @@ export function settingsUrlOf(catalogUrl) {
 }
 
 // s3.getObjectIf({ bucket, key, etag }) → { notModified: true } | { body: Buffer, etag }: the S3 port of lib/catalog.mjs.
-export function createManagerSettings({ s3, url, store, now = Date.now, log, checkMs = CHECK_MS }) {
+// catalogUrl: the catalog the router reads, which proves an AccessDenied on settings.json means "missing".
+export function createManagerSettings({ s3, url, catalogUrl = null, store, now = Date.now, log, checkMs = CHECK_MS }) {
   const where = parseUrl(url);
+  const catalog = parseUrl(catalogUrl);
   const initial = { hibernate: true, etag: null, readAt: null, error: null };
+
+  const catalogReads = async () => {
+    if (!catalog) return false;
+    try {
+      await s3.getObjectIf({ bucket: catalog.bucket, key: catalog.key, etag: null });
+      return true;
+    } catch {
+      return false;
+    }
+  };
 
   async function refresh() {
     if (!where) return;
     const stored = await store.getManagerSettings();
     // Due from the last attempt, success or failure: a failing S3 is tried again every 5 minutes, not at every check.
-    if (stored?.readAt != null && now() - stored.readAt < checkMs) return;
+    // A minute early: readAt is taken mid-check, so a due read is not skipped by the next check and delayed by a whole period.
+    if (stored?.readAt != null && now() - stored.readAt < checkMs - 60_000) return;
     const last = stored ?? initial;
     const at = now();
     let next;
@@ -41,8 +54,10 @@ export function createManagerSettings({ s3, url, store, now = Date.now, log, che
         }
       }
     } catch (err) {
-      // Without s3:ListBucket (the routers' roles have none), a missing object answers AccessDenied: never set.
-      if (err.name === 'NoSuchKey' || err.name === 'AccessDenied') next = { hibernate: true, etag: null, readAt: at, error: null };
+      // Without s3:ListBucket (the routers' roles have none), a missing object answers AccessDenied: never set, but only
+      // in a bucket whose catalog the router reads (as lib/catalog.mjs).
+      const neverSet = err.name === 'NoSuchKey' || (err.name === 'AccessDenied' && await catalogReads());
+      if (neverSet) next = { hibernate: true, etag: null, readAt: at, error: null };
       else {
         next = { ...last, readAt: at, error: `S3 ${err.name}` };
         log.warn('ManagerSettingsUnreadable', { url, error: next.error });

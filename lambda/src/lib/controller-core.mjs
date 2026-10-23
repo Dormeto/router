@@ -1119,9 +1119,7 @@ export function createController({
     return {
       router: { name: router.name, version: router.version, build: router.build },
       settings: { hibernate: routerSettings?.hibernate ?? null, by: routerSettings?.by ?? null, at: routerSettings ? iso(routerSettings.at) : null },
-      managerSettings: managerSettings
-        ? { url: managerSettings.url, hibernate: manager?.hibernate ?? null, readAt: manager?.readAt ? iso(manager.readAt) : null, error: manager?.error ?? null }
-        : null,
+      managerSettings: { url: managerSettings?.url ?? null, hibernate: manager?.hibernate ?? null, readAt: manager?.readAt ? iso(manager.readAt) : null, error: manager?.error ?? null },
       configuration: {
         checkSchedule: { value: router.checkSchedule ?? null, source: TERRAFORM },
         ipLists: { value: ipLists.map(({ name, url, action, refreshHours }) => ({ name, url, action, refreshHours })), source: TERRAFORM },

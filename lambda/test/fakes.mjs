@@ -86,7 +86,7 @@ export function fakeStore({ config, run, clock }) {
     async getHealth() { return structuredClone(state.health ?? null); },
     async putHealth(health) { state.health = structuredClone(health); },
     async getRouterSettings() { return structuredClone(state.routerSettings ?? null); },
-    async putRouterSettings(item) { if ('hibernate' in item) state.routerSettings = structuredClone(item); else delete state.routerSettings; },
+    async putRouterSettings(item) { if (typeof item.hibernate === 'boolean') state.routerSettings = structuredClone(item); else delete state.routerSettings; },
     async getManagerSettings() { return structuredClone(state.managerSettings ?? null); },
     async putManagerSettings(item) { state.managerSettings = structuredClone(item); },
     // Pauses: { workloadId (null for the router), by, at, reason, until?, keepAsleep, exclusionId? }.

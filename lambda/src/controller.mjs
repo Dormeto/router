@@ -41,7 +41,8 @@ const catalog = process.env.DMT_IP_LISTS_CATALOG
   ? createCatalog({ s3, url: process.env.DMT_IP_LISTS_CATALOG, own: lists.map((l) => l.name), log: logger })
   : null;
 // The manager's global settings: settings.json beside the catalog (hibernation design §3).
-const managerSettings = catalog ? createManagerSettings({ s3, url: settingsUrlOf(process.env.DMT_IP_LISTS_CATALOG), store, log: logger }) : null;
+// Without a catalog its url is null: nothing is read.
+const managerSettings = createManagerSettings({ s3, url: settingsUrlOf(process.env.DMT_IP_LISTS_CATALOG), catalogUrl: process.env.DMT_IP_LISTS_CATALOG, store, log: logger });
 const download = (url) => downloadText(url, { getObject: s3?.getObject });
 // Failure queues of the router (router health): { check, controller } queue URLs.
 const queues = JSON.parse(process.env.DMT_FAILURE_QUEUES || '{}');

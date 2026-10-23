@@ -4,6 +4,7 @@ import { createManagerSettings, settingsUrlOf } from '../src/lib/manager-setting
 import { fakeClock, fakeStore, silentLog, testConfig } from './fakes.mjs';
 
 const URL = 's3://dmt-dev-manager-ip-lists-1/settings.json';
+const CATALOG = 's3://dmt-dev-manager-ip-lists-1/catalog.json';
 const MIN = 60_000;
 
 // The manager's bucket as in catalog.test.mjs: objects with their ETag, 304 on the current one, failures by name.
@@ -30,7 +31,7 @@ function setup({ url = URL } = {}) {
   const clock = fakeClock();
   const s3 = fakeS3();
   const store = fakeStore({ config: testConfig(), run: { state: 'AWAKE' }, clock });
-  const make = () => createManagerSettings({ s3, url, store, now: clock.now, log: silentLog });
+  const make = () => createManagerSettings({ s3, url, catalogUrl: CATALOG, store, now: clock.now, log: silentLog });
   return { clock, s3, store, make, settings: make() };
 }
 
@@ -54,10 +55,10 @@ test('a second refresh within 5 minutes reads nothing; after 5 minutes it sends 
   const s = setup();
   s.s3.put('settings.json', { workloads: { hibernate: false } });
   await s.settings.refresh();
-  s.clock.advance(4 * MIN);
+  s.clock.advance(3 * MIN);
   await s.settings.refresh();
   assert.equal(s.s3.calls.length, 1);
-  s.clock.advance(MIN);
+  s.clock.advance(MIN + 30_000);
   await s.settings.refresh();
   assert.equal(s.s3.calls.length, 2);
   assert.equal(s.s3.calls[1].etag, '"e1"');
@@ -68,7 +69,7 @@ test('a second refresh within 5 minutes reads nothing; after 5 minutes it sends 
 test('NoSuchKey and AccessDenied mean never set: true, no error', async () => {
   for (const name of [null, 'AccessDenied']) {
     const s = setup();
-    if (name) s.s3.failures.set('settings.json', name);
+    if (name) { s.s3.put('catalog.json', { lists: [] }); s.s3.failures.set('settings.json', name); }
     await s.settings.refresh();
     assert.deepEqual(await s.settings.current(), { hibernate: true, readAt: s.clock.now(), error: null }, String(name));
   }
@@ -129,4 +130,36 @@ test('current() is null before anything was read from the table; url null: nothi
   await none.settings.refresh();
   assert.equal(none.s3.calls.length, 0);
   assert.equal(await none.settings.current(), null);
+});
+
+test('a read due after 4 minutes: each 5-minute check reads, whatever the time of the last one inside it', async () => {
+  const s = setup();
+  s.s3.put('settings.json', { workloads: { hibernate: true } });
+  await s.settings.refresh();
+  s.clock.advance(4 * MIN + 30_000);
+  await s.settings.refresh();
+  assert.equal(s.s3.calls.length, 2);
+});
+
+test('AccessDenied is never set only when the catalog reads; else the last value stays with the error; NoSuchKey after false is true', async () => {
+  const s = setup();
+  s.s3.put('settings.json', { workloads: { hibernate: false } });
+  await s.settings.refresh();
+  s.clock.advance(5 * MIN);
+  s.s3.failures.set('settings.json', 'AccessDenied');
+  s.s3.failures.set('catalog.json', 'AccessDenied');
+  await s.settings.refresh();
+  assert.deepEqual(await s.settings.current(), { hibernate: false, readAt: s.clock.now(), error: 'S3 AccessDenied' });
+  s.clock.advance(5 * MIN);
+  s.s3.failures.delete('catalog.json');
+  s.s3.put('catalog.json', { lists: [] });
+  await s.settings.refresh();
+  assert.deepEqual(await s.settings.current(), { hibernate: true, readAt: s.clock.now(), error: null });
+  const t = setup();
+  t.s3.put('settings.json', { workloads: { hibernate: false } });
+  await t.settings.refresh();
+  t.clock.advance(5 * MIN);
+  t.s3.objects.delete('settings.json');
+  await t.settings.refresh();
+  assert.deepEqual(await t.settings.current(), { hibernate: true, readAt: t.clock.now(), error: null });
 });

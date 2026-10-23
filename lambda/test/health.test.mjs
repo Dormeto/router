@@ -264,7 +264,7 @@ test('router action: the router\'s settings record and the manager\'s global set
   await none.store.recordScheduledCheck(NOW - 60_000);
   const bare = await none.handler({ action: 'router' });
   assert.deepEqual(bare.settings, { hibernate: null, by: null, at: null });
-  assert.equal(bare.managerSettings, null);
+  assert.deepEqual(bare.managerSettings, { url: null, hibernate: null, readAt: null, error: null });
   const managerSettings = { url: 's3://dmt-dev-manager-ip-lists-1/settings.json', refresh: async () => {}, current: async () => ({ hibernate: false, readAt: NOW - 120_000, error: null }) };
   const s = setup({ managerSettings });
   await s.store.recordScheduledCheck(NOW - 60_000);

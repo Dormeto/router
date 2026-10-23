@@ -415,6 +415,9 @@ test('router settings and the manager settings copy are ROUTER items; no hiberna
   assert.ok(items.has('ROUTER/SETTINGS'));
   await store.putRouterSettings({ by: 'ana', at: 6 });
   assert.equal(await store.getRouterSettings(), null);
+  await store.putRouterSettings({ hibernate: true, by: 'ana', at: 7 });
+  await store.putRouterSettings({ hibernate: null, by: 'ana', at: 8 });
+  assert.equal(await store.getRouterSettings(), null);
   const copy = { hibernate: true, etag: '"e1"', readAt: 7, error: null };
   await store.putManagerSettings(copy);
   assert.deepEqual(await store.getManagerSettings(), copy);

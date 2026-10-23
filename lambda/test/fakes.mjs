@@ -75,6 +75,9 @@ export function fakeStore({ config, run, clock }) {
       state.run.backendKinds = kinds;
       return true;
     },
+    async setHibernated(id, { ids, at }) {
+      if (id === config.workloadId && state.run) state.run.hibernated = JSON.stringify({ ids, at });
+    },
     async setPendingWake() {
       if (state.run.state !== STATES.NAPPING || state.run.pendingWake === true) return false;
       state.run.pendingWake = true;

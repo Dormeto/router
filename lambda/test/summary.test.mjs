@@ -43,3 +43,11 @@ test('a workload summary says scheduled only when it has a schedule', () => {
   assert.equal(workloadSummary(testConfig(), { state: 'AWAKE' }, null, null, [], true).scheduled, true);
   assert.equal('scheduled' in workloadSummary(testConfig(), { state: 'AWAKE' }), false);
 });
+
+test('a workload summary says hibernated while asleep hibernated (hibernation), and nothing otherwise', () => {
+  const hibernated = JSON.stringify({ ids: ['i-0123456789abcdef0'], at: 1 });
+  assert.equal(workloadSummary(testConfig(), { state: 'ASLEEP', hibernated }).hibernated, true);
+  assert.equal('hibernated' in workloadSummary(testConfig(), { state: 'ASLEEP' }), false);
+  assert.equal('hibernated' in workloadSummary(testConfig(), { state: 'FAILED', hibernated }), false, 'a failed wake: not asleep');
+  assert.equal('hibernated' in workloadSummary(testConfig()), false);
+});

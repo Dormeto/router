@@ -111,6 +111,17 @@ test('store backend kinds are set on an existing run, its version untouched', as
   assert.deepEqual(input.ExpressionAttributeValues, { ':kinds': { S: 'asg,rds-instance' } });
 });
 
+test('store hibernated: what a nap hibernated, written on the run at once whatever its state, its version untouched', async () => {
+  const dynamo = fakeDynamo({ updateItem: async () => ({}) });
+  await createStore({ dynamo, table: 't' }).setHibernated('demo', { ids: ['i-0123456789abcdef0'], at: 5 });
+  const [[, input]] = dynamo.calls;
+  assert.deepEqual(input.Key, { pk: { S: 'WL#demo' }, sk: { S: 'RUN' } });
+  assert.equal(input.UpdateExpression, 'SET #hibernated = :hibernated');
+  assert.equal(input.ConditionExpression, undefined);
+  assert.deepEqual(input.ExpressionAttributeNames, { '#hibernated': 'hibernated' });
+  assert.deepEqual(JSON.parse(input.ExpressionAttributeValues[':hibernated'].S), { ids: ['i-0123456789abcdef0'], at: 5 });
+});
+
 test('store pendingWake and holder updates are conditional', async () => {
   const outcomes = [{}, Object.assign(new Error('c'), { name: 'ConditionalCheckFailedException' })];
   const dynamo = fakeDynamo({ updateItem: async () => { const o = outcomes.shift() ?? {}; if (o instanceof Error) throw o; return o; } });

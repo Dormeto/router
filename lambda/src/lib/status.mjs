@@ -22,17 +22,19 @@ const iso = (ms) => (typeof ms === 'number' && ms > 0 ? new Date(ms).toISOString
 
 export function createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, kubernetesOf, now = Date.now, version = {} }) {
   const clients = { ec2, elbv2, autoscaling, ecs, tagging, appscaling, rds, kubernetesOf };
-  // Extras that depend on the caller: router rules, wake rules, statistics and IP lists loaders.
-  return async function status(workloadId, cfg, run, { pauses = [], drift = [], noWakeRules = [], wakeRules = [], loadStats = null, loadLists = null } = {}) {
+  // Extras that depend on the caller: router rules, wake rules, statistics and IP lists loaders, and the hibernation's
+  // (given the standalone instances, never failing; the controller's status only).
+  return async function status(workloadId, cfg, run, { pauses = [], drift = [], noWakeRules = [], wakeRules = [], loadStats = null, loadLists = null, loadHibernation = null } = {}) {
     const t = now();
     const resolved = await resolveBackends(clients, cfg);
     const instanceIds = resolved.backends.filter((b) => b.kind === 'instance').map((b) => b.id);
-    const [statuses, instances, health, rules, lastRequest] = await Promise.all([
+    const [statuses, instances, health, rules, lastRequest, hibernation] = await Promise.all([
       resolved.backends.length ? backendStatuses(clients, resolved.backends) : {},
       instanceIds.length ? instanceStates(ec2, instanceIds) : {},
       elbv2.describeTargetHealth({ TargetGroupArn: cfg.appTargetGroupArn }),
       resolveRules(elbv2, [cfg]).then((found) => found.get(cfg.workloadId)),
       lastRequestAt(cloudwatch, cfg, t - cfg.idleMinutes * 60_000, t),
+      loadHibernation ? loadHibernation(instanceIds) : null,
     ]);
     // Paused: never napped, no estimate.
     const nap = pauses.length ? null : napEstimate({ cfg, run, lastRequest, now: t });
@@ -80,6 +82,7 @@ export function createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging
       issues: rules.issues.map((i) => i.reason),
       discovery: resolved.mode,
       instances: instanceIds.map((id) => ({ id, state: instances[id] ?? 'unknown' })),
+      ...(hibernation ? { hibernation } : {}),
       backends: resolved.backends.map((b) => {
         const status = statuses[backendKey(b)];
         if (b.kind === 'asg') return { kind: 'asg', id: b.name, status, min: b.min, max: b.max, desired: b.desired, warmPool: b.warmPool };

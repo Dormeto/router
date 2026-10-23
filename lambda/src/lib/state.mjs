@@ -516,6 +516,18 @@ export function createStore({ dynamo, table, now = Date.now, log = null }) {
       })) !== null;
     },
 
+    // What a nap hibernated (hibernation design §4): written as soon as AWS accepts, whatever the nap does next, apart
+    // from the transitions (no version change); only a wake that reaches AWAKE removes it.
+    async setHibernated(workloadId, { ids, at }) {
+      await dynamo.updateItem({
+        TableName: table,
+        Key: itemKey(workloadId, 'RUN'),
+        UpdateExpression: 'SET #hibernated = :hibernated',
+        ExpressionAttributeNames: { '#hibernated': 'hibernated' },
+        ExpressionAttributeValues: { ':hibernated': { S: JSON.stringify({ ids, at }) } },
+      });
+    },
+
     async setPendingWake(workloadId) {
       const out = await update({
         TableName: table,

@@ -7,7 +7,7 @@ import { asgGroup, ecsService, fakeAppScaling, fakeEcs, fakeKubernetes, fakeRds,
 import { dormetoIngress, weightsOf } from '../src/lib/kube-route.mjs';
 import { ROUTER_RULES } from '../src/lib/kube-access.mjs';
 
-function setup({ run, instance = 'running', target = 'app', healthy = 1, metric = [], metricAt = [], cfg = testConfig(), groups = [], services = [], databases, k8s } = {}) {
+function setup({ run, instance = 'running', target = 'app', healthy = 1, metric = [], metricAt = [], cfg = testConfig(), groups = [], services = [], databases, k8s, managerSettings = null } = {}) {
   const clock = fakeClock();
   const store = fakeStore({ config: cfg, run, clock });
   const ec2 = fakeEc2(cfg.instanceIds, { state: instance });
@@ -31,7 +31,7 @@ function setup({ run, instance = 'running', target = 'app', healthy = 1, metric 
   const log = { ...silentLog };
   const handler = createController({
     store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, kubernetesOf: k8s ? async () => k8s : undefined,
-    invokeSelf: async (payload) => { invocations.push(payload); }, now: clock.now, sleep: clock.sleep, newId: () => `wake-${++ids}`, log,
+    invokeSelf: async (payload) => { invocations.push(payload); }, now: clock.now, sleep: clock.sleep, newId: () => `wake-${++ids}`, log, managerSettings,
   });
   return { handler, store, ec2, elbv2, cloudwatch, autoscaling, ecs, appscaling, rds, clock, cfg, invocations, log };
 }
@@ -1639,4 +1639,190 @@ test('list marks the workloads that have a schedule', async () => {
   assert.equal('scheduled' in (await s.handler({ action: 'list' })).workloads[0], false);
   await s.handler({ action: 'schedule', workloadId: 'demo', schedule: weekly(), by: 'me' });
   assert.equal((await s.handler({ action: 'list' })).workloads[0].scheduled, true);
+});
+
+// --- EC2 hibernation ------------------------------------------------------------------------------------------------
+
+const HIBERNATE = 'Client.UserInitiatedHibernate';
+const transitionsOf = (s) => {
+  const specs = [];
+  const transition = s.store.transition;
+  s.store.transition = async (id, spec) => { specs.push(spec); return transition(id, spec); };
+  return specs;
+};
+const stopsOf = (s) => s.ec2.state.stops.map((x) => [x.InstanceIds, x.Hibernate === true]);
+const managerSays = (hibernate, readAt = 1_700_000_000_000) => ({ url: 's3://b/settings.json', refresh: async () => {}, current: async () => ({ hibernate, readAt, error: null }) });
+
+test('nap: by default, an instance launched with hibernation is hibernated, said on the run and in the ASLEEP event (hibernation)', async () => {
+  const s = setup({ run: { state: STATES.AWAKE } });
+  const [id] = s.cfg.instanceIds;
+  s.ec2.state.configured[id] = true;
+  let stoppedAt;
+  s.ec2.state.onStop.push(() => { stoppedAt = s.clock.now(); });
+  const specs = transitionsOf(s);
+  assert.equal((await s.handler({ action: 'nap', workloadId: 'demo' })).state, STATES.ASLEEP);
+  assert.deepEqual(stopsOf(s), [[[id], true]]);
+  assert.deepEqual(JSON.parse(s.store.state.run.hibernated), { ids: [id], at: stoppedAt });
+  assert.deepEqual(specs.find((x) => x.set?.state === STATES.ASLEEP).event.hibernated, [id]);
+});
+
+test('nap: the router\'s or the manager\'s false stops the instance; an unreadable level is unset, never failing the nap (hibernation)', async () => {
+  const off = setup({ run: { state: STATES.AWAKE } });
+  const [id] = off.cfg.instanceIds;
+  off.ec2.state.configured[id] = true;
+  await off.store.putRouterSettings({ hibernate: false, by: 'ana', at: 1 });
+  const specs = transitionsOf(off);
+  assert.equal((await off.handler({ action: 'nap', workloadId: 'demo' })).state, STATES.ASLEEP);
+  assert.deepEqual(stopsOf(off), [[[id], false]]);
+  assert.equal('hibernated' in off.store.state.run, false);
+  assert.equal('hibernated' in specs.find((x) => x.set?.state === STATES.ASLEEP).event, false, 'only when the nap hibernated some');
+
+  const manager = setup({ run: { state: STATES.AWAKE }, managerSettings: managerSays(false) });
+  manager.ec2.state.configured[id] = true;
+  await manager.handler({ action: 'nap', workloadId: 'demo' });
+  assert.deepEqual(stopsOf(manager), [[[id], false]]);
+
+  // The router's record unreadable: the manager's false still applies; the manager's unreadable: the built-in default.
+  const unreadable = setup({ run: { state: STATES.AWAKE }, managerSettings: managerSays(false) });
+  unreadable.ec2.state.configured[id] = true;
+  const warnings = [];
+  unreadable.log.warn = (event, fields) => warnings.push({ event, ...fields });
+  unreadable.store.getRouterSettings = async () => { throw new Error('ProvisionedThroughputExceededException'); };
+  assert.equal((await unreadable.handler({ action: 'nap', workloadId: 'demo' })).state, STATES.ASLEEP);
+  assert.deepEqual(stopsOf(unreadable), [[[id], false]]);
+  const failing = setup({ run: { state: STATES.AWAKE }, managerSettings: { url: 's3://b/settings.json', refresh: async () => {}, current: async () => { throw new Error('table'); } } });
+  failing.ec2.state.configured[id] = true;
+  failing.log.warn = (event, fields) => warnings.push({ event, ...fields });
+  assert.equal((await failing.handler({ action: 'nap', workloadId: 'demo' })).state, STATES.ASLEEP);
+  assert.deepEqual(stopsOf(failing), [[[id], true]]);
+  assert.deepEqual(warnings.filter((w) => w.event.endsWith('Unreadable')).map((w) => [w.event, w.error]),
+    [['RouterSettingsUnreadable', 'ProvisionedThroughputExceededException'], ['ManagerSettingsUnreadable', 'table']]);
+});
+
+test('nap: a run that asks for a fresh boot stops the instance, and the nap removes freshBoot (hibernation, 60 days)', async () => {
+  const s = setup({ run: { state: STATES.AWAKE, freshBoot: true } });
+  const [id] = s.cfg.instanceIds;
+  s.ec2.state.configured[id] = true;
+  assert.equal((await s.handler({ action: 'nap', workloadId: 'demo' })).state, STATES.ASLEEP);
+  assert.deepEqual(stopsOf(s), [[[id], false]]);
+  assert.equal('freshBoot' in s.store.state.run, false);
+  assert.equal('hibernated' in s.store.state.run, false);
+});
+
+test('nap: a nap failing after an accepted hibernation keeps what it hibernated; the wake that reaches AWAKE removes it (hibernation)', async () => {
+  const cfg = testConfig({ instanceIds: ['i-0aaaaaaaaaaaaaaa1', 'i-0bbbbbbbbbbbbbbb2'] });
+  const s = setup({ run: { state: STATES.AWAKE }, cfg });
+  s.ec2.state.configured['i-0aaaaaaaaaaaaaaa1'] = true;
+  // The plain stop of the other instance never ends: the nap fails at the stop wait, after the hibernation.
+  s.ec2.state.slowStops = ['i-0bbbbbbbbbbbbbbb2'];
+  assert.equal((await s.handler({ action: 'nap', workloadId: 'demo' })).state, STATES.FAILED);
+  assert.deepEqual(stopsOf(s), [[['i-0aaaaaaaaaaaaaaa1'], true], [['i-0bbbbbbbbbbbbbbb2'], false]]);
+  assert.deepEqual(JSON.parse(s.store.state.run.hibernated).ids, ['i-0aaaaaaaaaaaaaaa1']);
+
+  const w = setup({ run: { state: STATES.WAKING, wakeId: 'w1', hibernated: JSON.stringify({ ids: ['i-0123456789abcdef0'], at: 1 }) }, instance: 'stopped', target: 'waker', healthy: 0 });
+  w.ec2.state.reasons['i-0123456789abcdef0'] = HIBERNATE;
+  w.ec2.state.onStart.push(() => { w.clock.onSleep(() => { w.elbv2.state.healthy = 1; }); });
+  assert.equal((await w.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' })).state, STATES.AWAKE);
+  assert.equal('hibernated' in w.store.state.run, false);
+});
+
+test('a workload found awake again (started outside Dormeto, or recovered) loses its hibernated record; a failed wake keeps it (hibernation)', async () => {
+  const hibernated = JSON.stringify({ ids: ['i-0123456789abcdef0'], at: 1 });
+  for (const state of [STATES.ASLEEP, STATES.FAILED]) {
+    const s = setup({ run: { state, failedAt: 1, hibernated }, instance: 'running', target: 'waker', healthy: 1 });
+    const [result] = await s.handler({ action: 'check' });
+    assert.equal(result.state, STATES.AWAKE);
+    assert.equal('hibernated' in s.store.state.run, false, state);
+  }
+  const failed = setup({ run: { state: STATES.WAKING, wakeId: 'w1', hibernated }, instance: 'stopped', target: 'waker', healthy: 0 });
+  assert.equal((await failed.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' })).state, STATES.FAILED);
+  assert.equal(failed.store.state.run.hibernated, hibernated);
+});
+
+test('release: a failed workload is stopped as a nap would be, hibernating what can be, freshBoot kept (hibernation)', async () => {
+  const s = setup({ run: { state: STATES.FAILED, failedAt: 1, failure: '{"kind":"unhealthy"}' }, instance: 'running', target: 'waker', healthy: 0 });
+  const [id] = s.cfg.instanceIds;
+  s.ec2.state.configured[id] = true;
+  assert.equal((await s.handler({ action: 'release', workloadId: 'demo' })).state, STATES.ASLEEP);
+  assert.deepEqual(stopsOf(s), [[[id], true]]);
+  assert.deepEqual(JSON.parse(s.store.state.run.hibernated).ids, [id]);
+
+  const fresh = setup({ run: { state: STATES.FAILED, failedAt: 1, freshBoot: true }, instance: 'running', target: 'waker', healthy: 0 });
+  fresh.ec2.state.configured[id] = true;
+  assert.equal((await fresh.handler({ action: 'release', workloadId: 'demo' })).state, STATES.ASLEEP);
+  assert.deepEqual(stopsOf(fresh), [[[id], false]]);
+  assert.equal(fresh.store.state.run.freshBoot, true, 'the next nap stops too');
+});
+
+test('settings of the router: true is recorded with who and when, null removes the record (hibernation)', async () => {
+  const s = setup({ run: { state: STATES.AWAKE } });
+  const at = s.clock.now();
+  assert.deepEqual(await s.handler({ action: 'settings', settings: { hibernate: true }, by: 'ana' }), { level: 'router', settings: { hibernate: true, by: 'ana', at: new Date(at).toISOString() } });
+  assert.deepEqual(s.store.state.routerSettings, { hibernate: true, by: 'ana', at });
+  assert.deepEqual(await s.handler({ action: 'settings', settings: { hibernate: null }, by: 'ana' }), { level: 'router', settings: { hibernate: null, by: null, at: null } });
+  assert.equal(s.store.state.routerSettings, undefined);
+});
+
+test('settings of a workload the manager onboarded: written in its configuration, null removes the key, answers the resolution (hibernation)', async () => {
+  const s = setup({ run: { state: STATES.ASLEEP }, instance: 'stopped', cfg: testConfig({ source: 'manager' }) });
+  const off = await s.handler({ action: 'settings', workloadId: 'demo', settings: { hibernate: false }, by: 'ana' });
+  assert.deepEqual([off.level, off.settings, off.hibernation.hibernate, off.hibernation.from], ['workload', { hibernate: false }, false, 'workload']);
+  assert.deepEqual(off.hibernation.instances, [{ id: 'i-0123456789abcdef0', configured: false, hibernated: false }]);
+  const written = await s.store.getConfig('demo');
+  assert.deepEqual([written.hibernate, written.appTargetGroupArn], [false, testConfig().appTargetGroupArn]);
+  const inherit = await s.handler({ action: 'settings', workloadId: 'demo', settings: { hibernate: null }, by: 'ana' });
+  assert.deepEqual([inherit.settings, inherit.hibernation.hibernate, inherit.hibernation.from], [{ hibernate: null }, true, 'default']);
+  assert.equal('hibernate' in (await s.store.getConfig('demo')), false);
+});
+
+test('settings: refused for a Terraform workload, an unknown one, or one offboarded meanwhile; bad settings answer the problems, nothing written (hibernation)', async () => {
+  const terraform = setup({ run: { state: STATES.AWAKE } });
+  await assert.rejects(terraform.handler({ action: 'settings', workloadId: 'demo', settings: { hibernate: true }, by: 'ana' }),
+    { message: 'workload demo was written by Terraform: set hibernate in its workload module' });
+  await assert.rejects(terraform.handler({ action: 'settings', workloadId: 'nope', settings: { hibernate: true }, by: 'ana' }), { message: 'workload not configured: nope' });
+  assert.equal('hibernate' in (await terraform.store.getConfig('demo')), false);
+
+  const s = setup({ run: { state: STATES.AWAKE }, cfg: testConfig({ source: 'manager' }) });
+  const problems = ['settings: hibernate must be true, false or null'];
+  assert.deepEqual(await s.handler({ action: 'settings', workloadId: 'demo', settings: { hibernate: 'x' }, by: 'ana' }), { problems });
+  assert.deepEqual(await s.handler({ action: 'settings', settings: { hibernate: 'x' }, by: 'ana' }), { problems });
+  assert.equal('hibernate' in (await s.store.getConfig('demo')), false);
+  assert.equal(s.store.state.routerSettings, undefined);
+
+  const writes = [];
+  s.store.putConfig = async (id, cfg, options) => { writes.push(options); if (options?.mustExist) return false; throw new Error('unconditional write'); };
+  await assert.rejects(s.handler({ action: 'settings', workloadId: 'demo', settings: { hibernate: true }, by: 'ana' }), { message: 'workload not configured: demo' });
+  assert.deepEqual(writes, [{ mustExist: true }]);
+});
+
+test('status gives the hibernation: the resolution, each level, the instances EC2 describes, freshBoot (hibernation)', async () => {
+  const readAt = 1_700_000_000_000 - 120_000;
+  const s = setup({ run: { state: STATES.ASLEEP, freshBoot: true }, instance: 'stopped', target: 'waker', managerSettings: managerSays(false, readAt) });
+  const [id] = s.cfg.instanceIds;
+  s.ec2.state.configured[id] = true;
+  s.ec2.state.reasons[id] = HIBERNATE;
+  await s.store.putRouterSettings({ hibernate: true, by: 'ana', at: 1 });
+  const { hibernation } = await s.handler({ action: 'status', workloadId: 'demo' });
+  assert.deepEqual(hibernation, {
+    hibernate: true, from: 'router', workload: null, router: true, manager: { hibernate: false, readAt: new Date(readAt).toISOString(), error: null },
+    instances: [{ id, configured: true, hibernated: true }], freshBoot: true,
+  });
+
+  // The hibernation's DescribeInstances (made once the levels are read) failing gives no instances, never a failed status.
+  const warnings = [];
+  s.log.warn = (event, fields) => warnings.push({ event, ...fields });
+  const describe = s.ec2.describeInstances;
+  const routerSettings = s.store.getRouterSettings;
+  let levelsRead = false;
+  s.store.getRouterSettings = async () => { levelsRead = true; return routerSettings(); };
+  s.ec2.describeInstances = async (input) => { if (levelsRead) throw new Error('RequestLimitExceeded'); return describe(input); };
+  const degraded = await s.handler({ action: 'status', workloadId: 'demo' });
+  assert.equal(degraded.hibernation.instances, null);
+  assert.deepEqual(warnings.map((w) => [w.event, w.error]), [['HibernationUnread', 'RequestLimitExceeded']]);
+});
+
+test('status of a workload without standalone instances (ECS) gives no instances; without manager settings, the built-in default (hibernation)', async () => {
+  const s = ecsSetup({ run: { state: STATES.AWAKE } });
+  const { hibernation } = await s.handler({ action: 'status', workloadId: 'demo' });
+  assert.deepEqual(hibernation, { hibernate: true, from: 'default', workload: null, router: null, manager: null, instances: null, freshBoot: false });
 });

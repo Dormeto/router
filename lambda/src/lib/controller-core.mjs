@@ -5,7 +5,7 @@ import { currentTarget, hostOf, setRoute } from './route.mjs';
 import { dormetoTargetGroup, ingressDrift, routeIngress } from './kube-route.mjs';
 import { checkRights } from './kube-access.mjs';
 import { resolveRules } from './rules.mjs';
-import { healthyCount, waitTargetsReleased } from './instances.mjs';
+import { healthyCount, instanceDetails, waitTargetsReleased } from './instances.mjs';
 import { createStatus } from './status.mjs';
 import { describeRules } from './no-wake.mjs';
 import { describeStoredLists } from './list-cache.mjs';
@@ -19,6 +19,7 @@ import { STATS_DAYS, totals, workloadSummary } from './summary.mjs';
 import { lastRequestAt } from './metrics.mjs';
 import { checkScope } from './check-scope.mjs';
 import { healthOf, lambdaMetrics, queueDepths } from './health.mjs';
+import { resolveHibernation, settingsProblems } from './hibernation.mjs';
 import {
   backendKey, backendStatuses, isCompanion, resolveBackends, resumeBackends, sleepBackends, startCompanions, stopCompanions, toRecord, wakeBackends,
 } from './backends.mjs';
@@ -150,7 +151,7 @@ export function createController({
       const done = await store.transition(workloadId, {
         cond: { state: STATES.WAKING, wakeId },
         set: { state: STATES.AWAKE, awakeSince: now(), holders: 0, ...(Object.keys(fallbacks).length ? { instanceTypes: JSON.stringify(fallbacks) } : {}) },
-        remove: ['pendingWake', 'napInstances', 'napBackends', 'failure', 'consecutiveFailures'],
+        remove: ['pendingWake', 'napInstances', 'napBackends', 'failure', 'consecutiveFailures', 'hibernated'],
         // The wake's duration (R7a, the base of R8's wake times), and the instance types it fell back to.
         event: { wakeId, durationMs: now() - (run.wakeStartedAt ?? now()), ...(Object.keys(fallbacks).length ? { fallbacks } : {}) },
       });
@@ -177,7 +178,7 @@ export function createController({
     const cfg = await config(workloadId);
     const backends = await managedBackends(cfg);
     await routeTo(cfg, 'waker', { allowIssues: true });
-    const records = await sleepBackends(clients, backends, { sleep, now, deadline: now() + STOP_TIMEOUT_MS });
+    const records = await sleepBackends(clients, backends, { sleep, now, deadline: now() + STOP_TIMEOUT_MS }, await stopOptions(cfg, run));
     await revertInstanceTypes(ec2, backends.filter((b) => b.kind === 'instance').map((b) => b.id), log);
     const asleep = await store.transition(workloadId, {
       cond: { state: STATES.FAILED, failedAt: run.failedAt },
@@ -220,6 +221,8 @@ export function createController({
     if (!napping) return { state: 'SKIPPED' };
     log.info('NapStarted', { workloadId });
     let stopped;
+    // The instances AWS accepted to hibernate, said in the ASLEEP event.
+    const hibernated = [];
     try {
       try {
         await routeTo(cfg, 'waker');
@@ -250,7 +253,7 @@ export function createController({
       }
       // What the nap stops, for the manager's savings (R9a): described before the stop, never failing the nap.
       stopped = await describeStopped(clients, backends).catch((err) => [{ kind: 'unknown', backend: 'all', reason: String(err?.message ?? err).slice(0, 200) }]);
-      await sleepBackends(clients, backends, { sleep, now, deadline: now() + STOP_TIMEOUT_MS });
+      await sleepBackends(clients, backends, { sleep, now, deadline: now() + STOP_TIMEOUT_MS }, await stopOptions(cfg, committed, hibernated));
       // A fallback instance type is for one wake only (R7a, FinOps): stopped, an instance gets its own type back.
       await revertInstanceTypes(ec2, backends.filter((b) => b.kind === 'instance').map((b) => b.id), log);
       if (!(await waitTargetsReleased(elbv2, cfg.appTargetGroupArn, { sleep, now, deadline: now() + RELEASE_TIMEOUT_MS, draining: !cfg.kubernetes }))) {
@@ -267,7 +270,8 @@ export function createController({
       return { state: STATES.FAILED, error: err.message };
     }
     const asleep = await store.transition(workloadId, {
-      cond: { state: STATES.NAPPING, pendingWake: false }, set: { state: STATES.ASLEEP, holders: 0 }, remove: ['stopping', 'instanceTypes'], event: { stopped },
+      cond: { state: STATES.NAPPING, pendingWake: false }, set: { state: STATES.ASLEEP, holders: 0 }, remove: ['stopping', 'instanceTypes', 'freshBoot'],
+      event: { stopped, ...(hibernated.length ? { hibernated } : {}) },
     });
     if (asleep) {
       log.info('NapCompleted', { workloadId });
@@ -284,6 +288,40 @@ export function createController({
     if (!waking) return { state: 'UNKNOWN' };
     log.info('WakeRequested', { workloadId, wakeId, reason: 'pendingWake' });
     return wake(workloadId, wakeId, cfg);
+  }
+
+  // The levels of the hibernation setting above the workload's (hibernation design §2): the router's record and the
+  // manager's settings as the router last read them. An unreadable one counts as unset (logged): it never fails a nap.
+  async function hibernationLevels(workloadId) {
+    const read = async (event, load) => {
+      try {
+        return (await load()) ?? null;
+      } catch (err) {
+        log.warn(event, { workloadId, error: err.message });
+        return null;
+      }
+    };
+    const [router, manager] = await Promise.all([
+      read('RouterSettingsUnreadable', () => store.getRouterSettings?.()),
+      read('ManagerSettingsUnreadable', () => managerSettings?.current?.()),
+    ]);
+    return { router, manager };
+  }
+  const resolvedFor = (cfg, { router, manager }) => resolveHibernation({ workload: cfg.hibernate, fallbackTypes: cfg.fallbackInstanceTypes, router: router?.hibernate, manager });
+
+  // How a nap or a release stops the instances (hibernation design §4): those that can be are hibernated when the setting
+  // resolves to true and the run asks for no fresh boot; what AWS accepted is recorded on the run at once, and added to
+  // `hibernated`.
+  async function stopOptions(cfg, run, hibernated = []) {
+    const { hibernate } = resolvedFor(cfg, await hibernationLevels(cfg.workloadId));
+    return {
+      hibernate: hibernate && run?.freshBoot !== true,
+      onHibernated: async (ids) => {
+        hibernated.push(...ids);
+        await store.setHibernated(cfg.workloadId, { ids, at: now() });
+      },
+      log,
+    };
   }
 
   // Rules found from the workload's target group, and the switch of its instrumented rules (issues are logged, and only
@@ -369,7 +407,7 @@ export function createController({
       else await startCompanions(clients, companions);
       await routeTo(cfg, 'app');
       run = (await store.transition(workloadId, {
-        cond: { state: from }, set: { state: STATES.AWAKE, awakeSince: now() }, remove: ['napBackends', 'napInstances', 'failure', 'consecutiveFailures'],
+        cond: { state: from }, set: { state: STATES.AWAKE, awakeSince: now() }, remove: ['napBackends', 'napInstances', 'failure', 'consecutiveFailures', 'hibernated'],
         cause: from === STATES.FAILED ? 'recovered' : 'external-start',
       }))
         ?? (await store.getRun(workloadId));
@@ -653,7 +691,62 @@ export function createController({
       wakeRules: describeRules([{ level: 'wake', rules: cfg.wakeRules }]),
       loadStats: () => store.getStats(workloadId, STATS_DAYS),
       loadLists: async () => [...await describeStoredLists(store, ipLists), ...(catalog ? (await catalog.describe()).lists : [])],
+      loadHibernation: (instanceIds) => hibernationView(cfg, run, instanceIds),
     }), ...view };
+  }
+
+  // The hibernation a workload gets (hibernation design §4): the resolution, each level, its standalone instances as one
+  // DescribeInstances gives them (null when it has none, or when they cannot be described: logged, never failing) and
+  // whether its next nap stops them for a fresh boot.
+  async function hibernationView(cfg, run, instanceIds) {
+    const levels = await hibernationLevels(cfg.workloadId);
+    let instances = null;
+    if (instanceIds?.length) {
+      try {
+        const details = await instanceDetails(ec2, instanceIds);
+        instances = instanceIds.map((id) => ({ id, configured: details.get(id)?.configured === true, hibernated: details.get(id)?.hibernated === true }));
+      } catch (err) {
+        log.warn('HibernationUnread', { workloadId: cfg.workloadId, error: err.message });
+      }
+    }
+    const { router, manager } = levels;
+    return {
+      ...resolvedFor(cfg, levels),
+      workload: typeof cfg.hibernate === 'boolean' ? cfg.hibernate : null,
+      router: typeof router?.hibernate === 'boolean' ? router.hibernate : null,
+      manager: manager && { hibernate: manager.hibernate ?? null, readAt: manager.readAt ? iso(manager.readAt) : null, error: manager.error ?? null },
+      instances,
+      freshBoot: run?.freshBoot === true,
+    };
+  }
+
+  // --- Settings (hibernation design §4): the router's record, or a workload's configuration ---------------------------
+
+  // Without workloadId the router's record (null removes it); with it the configuration of a workload the manager
+  // onboarded (null removes the key; Terraform writes the others'). Bad settings answer the problems, nothing written.
+  async function setSettings({ workloadId, settings, by }) {
+    const cfg = workloadId ? await config(workloadId) : null;
+    if (cfg && !cfg.source) throw new Error(`workload ${workloadId} was written by Terraform: set hibernate in its workload module`);
+    const problems = settingsProblems(settings);
+    if (problems.length) return { problems };
+    const hibernate = typeof settings.hibernate === 'boolean' ? settings.hibernate : null;
+    if (!cfg) {
+      // null deletes the record.
+      const record = { hibernate, by, at: now() };
+      await store.putRouterSettings(record);
+      log.info('RouterSettings', { hibernate, by });
+      return { level: 'router', settings: routerSettingsView(hibernate === null ? null : record) };
+    }
+    const { hibernate: previous, ...rest } = cfg;
+    const next = hibernate === null ? rest : { ...rest, hibernate };
+    // Conditional: a change racing an offboarding never writes the workload back.
+    if (!(await store.putConfig(workloadId, next, { mustExist: true }))) throw new Error(`workload not configured: ${workloadId}`);
+    log.info('WorkloadSettings', { workloadId, hibernate, previous: previous ?? null, by });
+    const instanceIds = await resolveBackends(clients, next).then(({ backends }) => backends.filter((b) => b.kind === 'instance').map((b) => b.id)).catch((err) => {
+      log.warn('HibernationUnread', { workloadId, error: err.message });
+      return null;
+    });
+    return { level: 'workload', settings: { hibernate }, hibernation: await hibernationView(next, await store.getRun(workloadId), instanceIds) };
   }
 
   // --- Schedules (R12): stored beside the workload, applied by the check ---------------------------------------------
@@ -1048,6 +1141,8 @@ export function createController({
   // --- Router: identity, configuration with its source, workloads, pauses, health ------------------------------------
 
   const TERRAFORM = 'terraform';
+  // The router's settings record as people read it (its time ISO): all null when unset.
+  const routerSettingsView = (record) => ({ hibernate: record?.hibernate ?? null, by: record?.by ?? null, at: record ? iso(record.at) : null });
   async function measure(t) {
     const [metrics, queues, limit] = await Promise.all([
       lambdaMetrics(cloudwatch, router.functions ?? {}, t).catch((err) => ({ error: err.message })),
@@ -1118,7 +1213,7 @@ export function createController({
     }
     return {
       router: { name: router.name, version: router.version, build: router.build },
-      settings: { hibernate: routerSettings?.hibernate ?? null, by: routerSettings?.by ?? null, at: routerSettings ? iso(routerSettings.at) : null },
+      settings: routerSettingsView(routerSettings),
       managerSettings: { url: managerSettings?.url ?? null, hibernate: manager?.hibernate ?? null, readAt: manager?.readAt ? iso(manager.readAt) : null, error: manager?.error ?? null },
       configuration: {
         checkSchedule: { value: router.checkSchedule ?? null, source: TERRAFORM },
@@ -1182,6 +1277,7 @@ export function createController({
       case 'tag': return tag(event);
       case 'schedule': return setSchedule(event);
       case 'clear-schedule': return clearSchedule(event);
+      case 'settings': return setSettings(event);
       case 'router': return routerInfo();
       case 'clusterCheck': return clusterCheck(event);
       default: throw new Error(`unknown action: ${event?.action}`);

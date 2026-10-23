@@ -1,5 +1,6 @@
 // Workload summary for the manager `list` action: state table only (configuration, runtime state, rule host).
 import { nextAttemptAt } from './failures.mjs';
+import { STATES } from './state.mjs';
 
 export const STATS_DAYS = 7;
 
@@ -61,6 +62,8 @@ export function workloadSummary(cfg, run = {}, host = null, stats7d = null, paus
     pauses,
     // Only when the workload has a schedule (R12).
     ...(scheduled ? { scheduled: true } : {}),
+    // Only while asleep with instances its nap hibernated (hibernation design §4).
+    ...(run?.state === STATES.ASLEEP && run.hibernated ? { hibernated: true } : {}),
     stats7d,
     settings: {
       waitSeconds: cfg.waitSeconds,

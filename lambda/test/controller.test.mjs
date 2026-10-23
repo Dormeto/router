@@ -1108,12 +1108,15 @@ test('wake: a hibernated instance never falls back to another type: tried again 
   const id = cfg.instanceIds[0];
   s.ec2.state.configured[id] = true;
   s.ec2.state.reasons[id] = 'Client.UserInitiatedHibernate';
+  // AWS's full message (325 characters): the note comes first, so that the failure's 300-character cut keeps it.
+  const aws = 'We currently do not have sufficient m5.large capacity in the Availability Zone you requested (us-east-1a). Our system will be working on provisioning additional capacity. You can currently get m5.large capacity by not specifying an Availability Zone in your request or choosing us-east-1b, us-east-1c, us-east-1d, us-east-1f.';
+  assert.equal(aws.length, 325);
   let attempts = 0;
-  s.ec2.startInstances = async () => { attempts += 1; throw capacityError('t3.medium'); };
+  s.ec2.startInstances = async () => { attempts += 1; throw Object.assign(new Error(aws), { name: 'InsufficientInstanceCapacity' }); };
   await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' });
   const failure = JSON.parse(s.store.state.run.failure);
   assert.equal(failure.kind, 'capacity');
-  assert.match(failure.message, /sufficient t3\.medium capacity.* \(hibernated: AWS does not allow its type to change\)$/);
+  assert.ok(failure.message.startsWith('hibernated: AWS does not allow its type to change; We currently do not have sufficient m5.large capacity'), failure.message);
   assert.deepEqual(s.ec2.state.modified, [], 'AWS refuses any change of a hibernated instance');
   assert.equal(s.ec2.state.tags[id]?.['dormeto:instance-type'], undefined);
   assert.ok(attempts > 3 && attempts < 10, `${attempts} attempts on its own type until the deadline`);

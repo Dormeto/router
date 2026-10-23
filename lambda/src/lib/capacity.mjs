@@ -6,7 +6,8 @@ import { HIBERNATE_REASON, instanceDetails, startInstances, TYPE_TAG } from './i
 
 export { TYPE_TAG };
 export const CAPACITY_WAITS_MS = [30_000, 60_000, 120_000];
-const HIBERNATED_NOTE = ' (hibernated: AWS does not allow its type to change)';
+// First in the message: the failure keeps 300 characters, and AWS's capacity message alone can be longer.
+const HIBERNATED_NOTE = 'hibernated: AWS does not allow its type to change; ';
 
 // run() again after 30 s, 60 s, then every 120 s while AWS has no capacity, until the wake's deadline; past the invocation's
 // budget (timing.deadline) it waits for the budget's end and gives up, so that the wake continues in a new invocation.
@@ -59,7 +60,7 @@ async function startHibernated(ec2, id, timing) {
   try {
     return await retryCapacity(() => startInstances(ec2, [id], timing), timing);
   } catch (err) {
-    if (classify(err).kind === 'capacity') err.message += HIBERNATED_NOTE;
+    if (classify(err).kind === 'capacity') err.message = HIBERNATED_NOTE + err.message;
     throw err;
   }
 }

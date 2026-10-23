@@ -1666,7 +1666,7 @@ test('nap: by default, an instance launched with hibernation is hibernated, said
   assert.deepEqual(specs.find((x) => x.set?.state === STATES.ASLEEP).event.hibernated, [id]);
 });
 
-test('nap: the router\'s or the manager\'s false stops the instance; an unreadable level is unset, never failing the nap (hibernation)', async () => {
+test('nap: the router\'s or the manager\'s false stops the instance; an unreadable level stops it too, never failing the nap (hibernation)', async () => {
   const off = setup({ run: { state: STATES.AWAKE } });
   const [id] = off.cfg.instanceIds;
   off.ec2.state.configured[id] = true;
@@ -1682,10 +1682,12 @@ test('nap: the router\'s or the manager\'s false stops the instance; an unreadab
   await manager.handler({ action: 'nap', workloadId: 'demo' });
   assert.deepEqual(stopsOf(manager), [[[id], false]]);
 
-  // The router's record unreadable: the manager's false still applies; the manager's unreadable: the built-in default.
-  const unreadable = setup({ run: { state: STATES.AWAKE }, managerSettings: managerSays(false) });
-  unreadable.ec2.state.configured[id] = true;
+  // A level that cannot be read (a throttled table) is a plain stop, never a lower level nor the built-in true: the record
+  // it could not read may be an administrator's "off". Without manager settings, the router's unreadable record would
+  // otherwise fall to true; the manager's unreadable settings alike.
   const warnings = [];
+  const unreadable = setup({ run: { state: STATES.AWAKE } });
+  unreadable.ec2.state.configured[id] = true;
   unreadable.log.warn = (event, fields) => warnings.push({ event, ...fields });
   unreadable.store.getRouterSettings = async () => { throw new Error('ProvisionedThroughputExceededException'); };
   assert.equal((await unreadable.handler({ action: 'nap', workloadId: 'demo' })).state, STATES.ASLEEP);
@@ -1694,9 +1696,16 @@ test('nap: the router\'s or the manager\'s false stops the instance; an unreadab
   failing.ec2.state.configured[id] = true;
   failing.log.warn = (event, fields) => warnings.push({ event, ...fields });
   assert.equal((await failing.handler({ action: 'nap', workloadId: 'demo' })).state, STATES.ASLEEP);
-  assert.deepEqual(stopsOf(failing), [[[id], true]]);
+  assert.deepEqual(stopsOf(failing), [[[id], false]]);
+  // The release of a failed workload stops as the nap does.
+  const release = setup({ run: { state: STATES.FAILED, failedAt: 1 }, instance: 'running', target: 'waker', healthy: 0 });
+  release.ec2.state.configured[id] = true;
+  release.log.warn = (event, fields) => warnings.push({ event, ...fields });
+  release.store.getRouterSettings = async () => { throw new Error('ThrottlingException'); };
+  assert.equal((await release.handler({ action: 'release', workloadId: 'demo' })).state, STATES.ASLEEP);
+  assert.deepEqual(stopsOf(release), [[[id], false]]);
   assert.deepEqual(warnings.filter((w) => w.event.endsWith('Unreadable')).map((w) => [w.event, w.error]),
-    [['RouterSettingsUnreadable', 'ProvisionedThroughputExceededException'], ['ManagerSettingsUnreadable', 'table']]);
+    [['HibernationLevelUnreadable', 'ProvisionedThroughputExceededException'], ['HibernationLevelUnreadable', 'table'], ['HibernationLevelUnreadable', 'ThrottlingException']]);
 });
 
 test('nap: a run that asks for a fresh boot stops the instance, and the nap removes freshBoot (hibernation, 60 days)', async () => {
@@ -1825,4 +1834,20 @@ test('status of a workload without standalone instances (ECS) gives no instances
   const s = ecsSetup({ run: { state: STATES.AWAKE } });
   const { hibernation } = await s.handler({ action: 'status', workloadId: 'demo' });
   assert.deepEqual(hibernation, { hibernate: true, from: 'default', workload: null, router: null, manager: null, instances: null, freshBoot: false });
+});
+
+test('status and the settings answer fail on a failed read of the router\'s or the manager\'s level (a store error), not "unset"; the settings write nothing then (hibernation)', async () => {
+  const router = setup({ run: { state: STATES.ASLEEP }, instance: 'stopped', target: 'waker', cfg: testConfig({ source: 'manager' }) });
+  router.store.getRouterSettings = async () => { throw new Error('ProvisionedThroughputExceededException'); };
+  await assert.rejects(router.handler({ action: 'status', workloadId: 'demo' }), /ProvisionedThroughputExceededException/);
+  await assert.rejects(router.handler({ action: 'settings', workloadId: 'demo', settings: { hibernate: false }, by: 'ana' }), /ProvisionedThroughputExceededException/);
+  assert.equal('hibernate' in (await router.store.getConfig('demo')), false);
+
+  const manager = setup({
+    run: { state: STATES.ASLEEP }, instance: 'stopped', target: 'waker', cfg: testConfig({ source: 'manager' }),
+    managerSettings: { url: 's3://b/settings.json', refresh: async () => {}, current: async () => { throw new Error('table'); } },
+  });
+  await assert.rejects(manager.handler({ action: 'status', workloadId: 'demo' }), /table/);
+  await assert.rejects(manager.handler({ action: 'settings', workloadId: 'demo', settings: { hibernate: true }, by: 'ana' }), /table/);
+  assert.equal('hibernate' in (await manager.store.getConfig('demo')), false);
 });

@@ -291,29 +291,23 @@ export function createController({
   }
 
   // The levels of the hibernation setting above the workload's (hibernation design §2): the router's record and the
-  // manager's settings as the router last read them. An unreadable one counts as unset (logged): it never fails a nap.
-  async function hibernationLevels(workloadId) {
-    const read = async (event, load) => {
-      try {
-        return (await load()) ?? null;
-      } catch (err) {
-        log.warn(event, { workloadId, error: err.message });
-        return null;
-      }
-    };
-    const [router, manager] = await Promise.all([
-      read('RouterSettingsUnreadable', () => store.getRouterSettings?.()),
-      read('ManagerSettingsUnreadable', () => managerSettings?.current?.()),
-    ]);
-    return { router, manager };
+  // manager's settings as the router last read them, null when unset. A failed read throws: an unreadable level is not
+  // an unset one.
+  async function hibernationLevels() {
+    const [router, manager] = await Promise.all([store.getRouterSettings?.(), managerSettings?.current?.()]);
+    return { router: router ?? null, manager: manager ?? null };
   }
   const resolvedFor = (cfg, { router, manager }) => resolveHibernation({ workload: cfg.hibernate, fallbackTypes: cfg.fallbackInstanceTypes, router: router?.hibernate, manager });
 
   // How a nap or a release stops the instances (hibernation design §4): those that can be are hibernated when the setting
   // resolves to true and the run asks for no fresh boot; what AWS accepted is recorded on the run at once, and added to
-  // `hibernated`.
+  // `hibernated`. A level that cannot be read stops them plainly (logged), never failing the stop: falling to a lower
+  // level or the built-in true could hibernate against an administrator's "off".
   async function stopOptions(cfg, run, hibernated = []) {
-    const { hibernate } = resolvedFor(cfg, await hibernationLevels(cfg.workloadId));
+    const hibernate = await hibernationLevels().then((levels) => resolvedFor(cfg, levels).hibernate, (err) => {
+      log.warn('HibernationLevelUnreadable', { workloadId: cfg.workloadId, error: err.message });
+      return false;
+    });
     return {
       hibernate: hibernate && run?.freshBoot !== true,
       onHibernated: async (ids) => {
@@ -695,11 +689,12 @@ export function createController({
     }), ...view };
   }
 
-  // The hibernation a workload gets (hibernation design §4): the resolution, each level, its standalone instances as one
-  // DescribeInstances gives them (null when it has none, or when they cannot be described: logged, never failing) and
-  // whether its next nap stops them for a fresh boot.
-  async function hibernationView(cfg, run, instanceIds) {
-    const levels = await hibernationLevels(cfg.workloadId);
+  // The hibernation a workload gets (hibernation design §4): the resolution, each level (a failed read of one fails it,
+  // as a failed schedule read fails the status), its standalone instances as one DescribeInstances gives them (null when
+  // it has none, or when they cannot be described: logged, never failing) and whether its next nap stops them for a
+  // fresh boot. levels: already read by the caller.
+  async function hibernationView(cfg, run, instanceIds, levels = null) {
+    levels ??= await hibernationLevels();
     let instances = null;
     if (instanceIds?.length) {
       try {
@@ -739,6 +734,8 @@ export function createController({
     }
     const { hibernate: previous, ...rest } = cfg;
     const next = hibernate === null ? rest : { ...rest, hibernate };
+    // The levels the answer resolves with, read before the write: a failed read changes nothing.
+    const levels = await hibernationLevels();
     // Conditional: a change racing an offboarding never writes the workload back.
     if (!(await store.putConfig(workloadId, next, { mustExist: true }))) throw new Error(`workload not configured: ${workloadId}`);
     log.info('WorkloadSettings', { workloadId, hibernate, previous: previous ?? null, by });
@@ -746,7 +743,7 @@ export function createController({
       log.warn('HibernationUnread', { workloadId, error: err.message });
       return null;
     });
-    return { level: 'workload', settings: { hibernate }, hibernation: await hibernationView(next, await store.getRun(workloadId), instanceIds) };
+    return { level: 'workload', settings: { hibernate }, hibernation: await hibernationView(next, await store.getRun(workloadId), instanceIds, levels) };
   }
 
   // --- Schedules (R12): stored beside the workload, applied by the check ---------------------------------------------

@@ -1,5 +1,6 @@
 // The check applies the schedules (R12 design, section 4): each window occurrence once, no idle nap in an awake window
-// or just before one, the maximum nap's maintenance wake, and the pauses that win over them.
+// or just before one, the maximum nap's maintenance wake, and the pauses that win over them. Then the hibernation's
+// 60-day limit (hibernation design §4), for every workload.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createController } from '../src/lib/controller-core.mjs';
@@ -23,7 +24,7 @@ function setup({ run, schedule, queue = true }) {
   const clock = fakeClock(at('19T07:00'));
   const cfg = testConfig();
   const store = fakeStore({ config: cfg, run, clock });
-  store.state.schedules.demo = schedule;
+  if (schedule) store.state.schedules.demo = schedule;
   const asleep = [STATES.ASLEEP, STATES.FAILED].includes(run.state);
   const ec2 = fakeEc2(cfg.instanceIds, { state: asleep ? 'stopped' : 'running' });
   const elbv2 = fakeElbv2(cfg, { target: asleep ? 'waker' : 'app', healthy: asleep ? 0 : 1 });
@@ -360,4 +361,115 @@ test('a nap window first applied within 30 minutes of an awake start is skipped 
   await s.checkAt('20T07:10');
   assert.deepEqual(s.queued, []);
   assert.equal(s.store.state.run.scheduleApplied, occurrence(1, '19T20:00'));
+});
+
+// --- The hibernation's 60-day limit (hibernation design §4) ---------------------------------------------------------
+
+const DAY = 86_400_000;
+// The run's record of what a nap hibernated, and when.
+const hibernated = (since) => JSON.stringify({ ids: ['i-0123456789abcdef0'], at: since });
+
+test('a workload hibernated 59 days ago, without a schedule, is woken at the first check after, cause maintenance, its run asking for a fresh boot (hibernation)', async () => {
+  const since = at('19T10:02') - 59 * DAY;
+  const s = setup({ run: { state: STATES.ASLEEP, stateAt: since, hibernated: hibernated(since) } });
+  await s.checkAt('19T10:00');
+  assert.equal(s.wakes(), 0);
+  const [result] = await s.checkAt('19T10:05');
+  assert.equal(s.wakes(), 1);
+  assert.deepEqual(result, { workloadId: 'demo', state: STATES.WAKING, hibernation: 'maintenance' });
+  assert.deepEqual(s.causes(), [[STATES.WAKING, 'maintenance']]);
+  assert.equal(s.store.state.run.freshBoot, true);
+  assert.deepEqual(s.store.state.stats, { 'wake:maintenance': 1 });
+  // Waking, it is not woken again at the next check.
+  await s.checkAt('19T10:10');
+  assert.equal(s.wakes(), 1);
+});
+
+test('a failed workload hibernated 59 days ago is woken too, before the loop would release it; hibernated 58 days ago, nothing (hibernation)', async () => {
+  const failed = setup({ run: { state: STATES.FAILED, failedAt: at('19T09:00'), hibernated: hibernated(at('19T10:05') - 59 * DAY) } });
+  const [result] = await failed.checkAt('19T10:05');
+  assert.deepEqual(result, { workloadId: 'demo', state: STATES.WAKING, hibernation: 'maintenance' });
+  assert.deepEqual(failed.causes(), [[STATES.WAKING, 'maintenance']]);
+  assert.equal(failed.store.state.run.freshBoot, true);
+  assert.deepEqual(failed.queued, []);
+
+  const recent = setup({ run: { state: STATES.ASLEEP, hibernated: hibernated(at('19T10:05') - 58 * DAY) } });
+  const [none] = await recent.checkAt('19T10:05');
+  assert.deepEqual(none, { workloadId: 'demo', state: STATES.ASLEEP });
+  assert.deepEqual([recent.wakes(), recent.changes, 'freshBoot' in recent.store.state.run], [0, [], false]);
+});
+
+test('a 60-day wake that fails is not tried again by the check: the failed workload is released as any other, and its next stop is plain (hibernation)', async () => {
+  const s = setup({ run: { state: STATES.ASLEEP, hibernated: hibernated(at('19T10:00') - 59 * DAY) } });
+  await s.checkAt('19T10:05');
+  assert.equal(s.wakes(), 1);
+  // The instance starts but never gets healthy: the wake fails at its timeout, its run keeping both records.
+  assert.equal((await s.handler(s.invocations.at(-1))).state, STATES.FAILED);
+  assert.deepEqual([s.store.state.run.freshBoot, typeof s.store.state.run.hibernated], [true, 'string']);
+  await s.checkAt('19T10:20');
+  assert.equal(s.wakes(), 1);
+  // Once its idle window passed since the failure, released as any failed workload.
+  await s.checkAt('19T10:35');
+  assert.deepEqual(s.queued, [{ action: 'release', workloadId: 'demo', requestedAt: at('19T10:35') }]);
+  assert.equal(s.wakes(), 1);
+  assert.equal((await s.handler({ action: 'status', workloadId: 'demo' })).maintenanceDue, null, 'no 60-day wake to come');
+});
+
+test('a keepAsleep pause holds the 60-day wake, the workload\'s or the router\'s; resumed, the next check wakes it (hibernation)', async () => {
+  const since = at('19T10:00') - 59 * DAY;
+  const s = setup({ run: { state: STATES.ASLEEP, hibernated: hibernated(since) } });
+  await s.handler({ action: 'pause', workloadId: 'demo', by: 'ops@example.com', reason: 'budget freeze', keepAsleep: true });
+  const [held] = await s.checkAt('19T10:05');
+  assert.deepEqual(held, { workloadId: 'demo', state: STATES.ASLEEP, hibernation: 'held by a keepAsleep pause' });
+  assert.deepEqual([s.wakes(), 'freshBoot' in s.store.state.run], [0, false]);
+  await s.handler({ action: 'resume', workloadId: 'demo', by: 'ops@example.com' });
+  await s.checkAt('19T10:10');
+  assert.equal(s.wakes(), 1);
+  assert.deepEqual(s.causes(), [[STATES.WAKING, 'maintenance']]);
+  assert.equal(s.store.state.run.freshBoot, true);
+
+  const router = setup({ run: { state: STATES.ASLEEP, hibernated: hibernated(since) } });
+  await router.handler({ action: 'pause', by: 'ops@example.com', reason: 'router freeze', keepAsleep: true });
+  await router.checkAt('19T10:05');
+  assert.equal(router.wakes(), 0);
+});
+
+test('a scheduled workload gets the 60-day wake too, when its schedule has nothing to do (hibernation)', async () => {
+  const s = setup({ run: { state: STATES.ASLEEP, hibernated: hibernated(at('19T10:00') - 59 * DAY) }, schedule: stored({ windows: [NIGHT] }) });
+  const [result] = await s.checkAt('19T10:05');
+  assert.deepEqual(result, { workloadId: 'demo', state: STATES.WAKING, hibernation: 'maintenance' });
+  assert.equal(s.store.state.run.freshBoot, true);
+});
+
+test('a schedule\'s maxNapDays wake asks for no fresh boot, and the 60-day pass leaves the workload it woke without reading it again (hibernation)', async () => {
+  const s = setup({ run: { state: STATES.ASLEEP, stateAt: at('12T10:02'), hibernated: hibernated(at('12T10:01')) }, schedule: stored({ maxNapDays: 7 }) });
+  const { getRun } = s.wrapped;
+  let reads = 0;
+  s.wrapped.getRun = async (id) => { reads += 1; return getRun(id); };
+  const [result] = await s.checkAt('19T10:05');
+  assert.deepEqual(result, { workloadId: 'demo', state: STATES.WAKING, schedule: 'maintenance' });
+  assert.deepEqual(s.causes(), [[STATES.WAKING, 'maintenance']]);
+  assert.equal('freshBoot' in s.store.state.run, false);
+  // The schedule's pass and the loop's reconcile.
+  assert.equal(reads, 2);
+});
+
+test('status: maintenanceDue is the earlier of the schedule\'s and the hibernation\'s 60-day limit, for an asleep or failed workload (hibernation)', async () => {
+  // Hibernated by a nap that failed, released asleep 49 days later: the 60-day limit comes before maxNapDays 30.
+  const since = at('19T07:00') - 50 * DAY;
+  const released = at('19T07:00') - DAY;
+  const s = setup({ run: { state: STATES.ASLEEP, stateAt: released, hibernated: hibernated(since) }, schedule: stored({ maxNapDays: 30 }) });
+  const due = async () => (await s.handler({ action: 'status', workloadId: 'demo' })).maintenanceDue;
+  const limit = new Date(since + 59 * DAY).toISOString();
+  assert.equal(await due(), limit);
+  s.store.state.schedules.demo = stored({ maxNapDays: 7 });
+  assert.equal(await due(), new Date(released + 7 * DAY).toISOString());
+  // A schedule the router cannot read, or none: the 60-day limit alone; failed alike.
+  s.store.state.schedules.demo = stored({ timeZone: 'Nowhere/Land', windows: [NIGHT] });
+  assert.equal(await due(), limit);
+  delete s.store.state.schedules.demo;
+  s.store.state.run.state = STATES.FAILED;
+  assert.equal(await due(), limit);
+  s.store.state.run.state = STATES.AWAKE;
+  assert.equal(await due(), null);
 });

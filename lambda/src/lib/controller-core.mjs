@@ -19,7 +19,7 @@ import { STATS_DAYS, totals, workloadSummary } from './summary.mjs';
 import { lastRequestAt } from './metrics.mjs';
 import { checkScope } from './check-scope.mjs';
 import { healthOf, lambdaMetrics, queueDepths } from './health.mjs';
-import { resolveHibernation, settingsProblems } from './hibernation.mjs';
+import { hibernationDue, resolveHibernation, settingsProblems } from './hibernation.mjs';
 import {
   backendKey, backendStatuses, isCompanion, resolveBackends, resumeBackends, sleepBackends, startCompanions, stopCompanions, toRecord, wakeBackends,
 } from './backends.mjs';
@@ -603,6 +603,38 @@ export function createController({
     return (await startWake(workloadId, run, undefined, 'maintenance')) ? 'maintenance' : null;
   }
 
+  // --- The hibernation's 60-day limit (hibernation design §4) ---------------------------------------------------------
+
+  // After the schedules and before the check's loop, every workload whatever the loop's budget, with or without a
+  // schedule: one asleep or failed whose run says a nap hibernated its instances at least 59 days ago is woken for
+  // maintenance, its run asking for a fresh boot (its next stop is plain: AWS keeps an instance hibernated 60 days at
+  // most, then start, stop, start); once it asks, never again (hibernationDue). A keepAsleep pause holds it, as it holds
+  // the schedule's maintenance wake. One run read each, 8 at a time, but for the workloads the schedules just woke or held
+  // (handled). Answers what it did or what held it.
+  async function wakeLongHibernated(configs, handled, keptAsleep, t) {
+    const ids = configs.map((c) => c.workloadId).filter((id) => !handled.has(id));
+    const outcomes = new Map();
+    let i = 0;
+    await Promise.all(Array.from({ length: Math.min(CHECK_CONCURRENCY, ids.length) }, async () => {
+      while (i < ids.length) {
+        const workloadId = ids[i++];
+        try {
+          const run = await store.getRun(workloadId);
+          const due = run?.state === STATES.ASLEEP || run?.state === STATES.FAILED ? hibernationDue(run) : null;
+          if (due === null || due > t) continue;
+          if (keptAsleep(workloadId)) outcomes.set(workloadId, 'held by a keepAsleep pause');
+          else if (await startWake(workloadId, run, undefined, 'maintenance', { set: { freshBoot: true } })) {
+            log.info('WokenForHibernationLimit', { workloadId, due: iso(due) });
+            outcomes.set(workloadId, 'maintenance');
+          }
+        } catch (err) {
+          log.error('HibernationLimitFailed', { workloadId, error: err.message });
+        }
+      }
+    }));
+    return outcomes;
+  }
+
   // Why a schedule keeps a workload from its idle nap now, else null: the nap the check's schedule pass just asked for
   // (not asked twice), an awake window active or starting within 30 minutes. A schedule it cannot read counts as none.
   function scheduleKeeps(workloadId, ctx, t) {
@@ -676,7 +708,8 @@ export function createController({
     } catch (err) {
       if (!(err instanceof SyntaxError || err instanceof RangeError)) throw err;
       log.warn('ScheduleSkipped', { workloadId, error: err.message });
-      view = { schedule: null, next: [], maintenanceDue: null };
+      // As without a schedule: the hibernation's maintenance wake still shows.
+      view = scheduleView(null, run);
     }
     return { ...await status(workloadId, cfg, run ?? {}, {
       pauses: await pausesFor(workloadId),
@@ -748,13 +781,17 @@ export function createController({
 
   // --- Schedules (R12): stored beside the workload, applied by the check ---------------------------------------------
 
-  // What people read: the schedule (its `at` as ISO; null when none), the next events and the maintenance wake.
+  // What people read: the schedule (its `at` as ISO; null when none), the next events and the maintenance wake, the
+  // schedule's (maxNapDays) or the hibernation's 60-day limit, whichever comes first.
   function scheduleView(schedule, run) {
-    const due = schedule && run?.state === STATES.ASLEEP && run.stateAt ? maintenanceDue(schedule, run.stateAt) : null;
+    const dues = [
+      schedule && run?.state === STATES.ASLEEP && run.stateAt ? maintenanceDue(schedule, run.stateAt) : null,
+      run?.state === STATES.ASLEEP || run?.state === STATES.FAILED ? hibernationDue(run) : null,
+    ].filter((due) => due !== null);
     return {
       schedule: schedule && { ...schedule, at: new Date(schedule.at).toISOString() },
       next: nextEvents(schedule, now()),
-      maintenanceDue: due === null ? null : new Date(due).toISOString(),
+      maintenanceDue: dues.length ? new Date(Math.min(...dues)).toISOString() : null,
     };
   }
 
@@ -860,6 +897,13 @@ export function createController({
       // The schedules first, whatever the budget; pauses that cannot be read hold every scheduled nap and wake too.
       const keptAsleep = (workloadId) => pauses === null || pauses.some((p) => p.keepAsleep && (p.workloadId === null || p.workloadId === workloadId));
       const { applied, readable } = await applySchedules(configs, listed.schedules, (id) => ({ paused: paused(id), keepAsleep: keptAsleep(id) }), now());
+      // Then the hibernation's 60-day limit, for every workload, held alike.
+      const limited = await wakeLongHibernated(configs, applied, keptAsleep, now());
+      // What these passes did for a workload, in its result.
+      const passed = (workloadId) => ({
+        ...(applied.has(workloadId) ? { schedule: applied.get(workloadId) } : {}),
+        ...(limited.has(workloadId) ? { hibernation: limited.get(workloadId) } : {}),
+      });
       // Starting after the workload where the previous check stopped (its time budget), so every workload gets its turn.
       const cursor = (await store.getCheck?.().catch(() => null))?.cursor;
       const from = cursor ? configs.findIndex((c) => c.workloadId > cursor) : 0;
@@ -890,8 +934,7 @@ export function createController({
             const cfg = chunk[i++];
             next += 1;
             try {
-              const outcome = applied.has(cfg.workloadId) ? { schedule: applied.get(cfg.workloadId) } : {};
-              results.push({ workloadId: cfg.workloadId, ...(await checkOne(cfg, paused(cfg.workloadId), ctx)), ...outcome });
+              results.push({ workloadId: cfg.workloadId, ...(await checkOne(cfg, paused(cfg.workloadId), ctx)), ...passed(cfg.workloadId) });
             } catch (err) {
               log.error('CheckFailed', { workloadId: cfg.workloadId, error: err.message });
               results.push({ workloadId: cfg.workloadId, error: err.message });
@@ -899,9 +942,9 @@ export function createController({
           }
         }));
       }
-      // What the schedules did for the workloads the loop did not reach.
+      // What the schedules and the 60-day limit did for the workloads the loop did not reach.
       const reached = new Set(results.map((r) => r.workloadId));
-      for (const [workloadId, outcome] of applied) if (!reached.has(workloadId)) results.push({ workloadId, schedule: outcome });
+      for (const workloadId of new Set([...applied.keys(), ...limited.keys()])) if (!reached.has(workloadId)) results.push({ workloadId, ...passed(workloadId) });
       // Cut short: the next check starts after the last workload checked (where this one started if it checked none).
       const stopped = next < order.length ? (next > 0 ? order[next - 1].workloadId : cursor ?? null) : null;
       if (next < order.length) log.warn('CheckBudgetReached', { checked: next, workloads: order.length, next: order[next].workloadId });

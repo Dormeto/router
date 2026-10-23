@@ -1736,7 +1736,8 @@ test('nap: a nap failing after an accepted hibernation keeps what it hibernated;
 });
 
 test('a workload found awake again (started outside Dormeto, or recovered) loses its hibernated record; a failed wake keeps it (hibernation)', async () => {
-  const hibernated = JSON.stringify({ ids: ['i-0123456789abcdef0'], at: 1 });
+  // A day ago (the fake clock's start): well within the 60-day limit, which would wake it first.
+  const hibernated = JSON.stringify({ ids: ['i-0123456789abcdef0'], at: 1_700_000_000_000 - 86_400_000 });
   for (const state of [STATES.ASLEEP, STATES.FAILED]) {
     const s = setup({ run: { state, failedAt: 1, hibernated }, instance: 'running', target: 'waker', healthy: 1 });
     const [result] = await s.handler({ action: 'check' });

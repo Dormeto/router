@@ -1,11 +1,23 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  HIBERNATION_MAX_DAYS, parseManagerSettings, resolveHibernation, settingsProblems,
+  HIBERNATION_MAX_DAYS, hibernationDue, parseManagerSettings, resolveHibernation, settingsProblems,
 } from '../src/lib/hibernation.mjs';
 
 test('the hibernation maintenance wake is 59 days', () => {
   assert.equal(HIBERNATION_MAX_DAYS, 59);
+});
+
+test('hibernationDue: the run\'s hibernated.at plus 59 days; null without a record, an unreadable one, or once the run asks for a fresh boot', () => {
+  const at = Date.UTC(2026, 7, 1);
+  const hibernated = JSON.stringify({ ids: ['i-0123456789abcdef0'], at });
+  assert.equal(hibernationDue({ hibernated }), at + 59 * 86_400_000);
+  assert.equal(hibernationDue({ hibernated, freshBoot: false }), at + 59 * 86_400_000);
+  // Its maintenance wake came (it failed, or the workload was released since): its next stop is plain already.
+  assert.equal(hibernationDue({ hibernated, freshBoot: true }), null);
+  for (const run of [null, {}, { hibernated: '{not json' }, { hibernated: '{"ids":[]}' }, { hibernated: '{"at":"yesterday"}' }]) {
+    assert.equal(hibernationDue(run), null, JSON.stringify(run));
+  }
 });
 
 test('resolveHibernation follows the order workload, fallback types, router, manager, default', () => {

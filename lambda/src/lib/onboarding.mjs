@@ -292,6 +292,8 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
         if (!Array.isArray(value) || value.length > FALLBACK_TYPES_MAX || !value.every((t) => typeof t === 'string' && INSTANCE_TYPE.test(t))) {
           problems.push(`settings: fallbackInstanceTypes must be at most ${FALLBACK_TYPES_MAX} EC2 instance types (for example t3a.medium)`);
         }
+      } else if (key === 'hibernate') {
+        if (typeof value !== 'boolean') problems.push('settings: hibernate must be true or false');
       } else if (SETTINGS[key]) {
         const [min, max] = SETTINGS[key];
         if (!Number.isInteger(value) || value < min || value > max) problems.push(`settings: ${key} must be an integer from ${min} to ${max}`);

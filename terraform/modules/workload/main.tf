@@ -48,7 +48,7 @@ resource "aws_dynamodb_table_item" "config" {
   item = jsonencode({
     pk = { S = "WL#${var.workload_id}" }
     sk = { S = "CFG" }
-    config = { S = jsonencode({
+    config = { S = jsonencode(merge({
       workloadId              = var.workload_id
       name                    = trimspace(coalesce(var.name, var.workload_id))
       tags                    = var.tags
@@ -76,7 +76,9 @@ resource "aws_dynamodb_table_item" "config" {
         # Where operators retrieve the secret (with ssm:GetParameter): never the secret itself.
         secretParameter = var.admin_enabled && var.admin_secret_parameter != null ? var.admin_secret_parameter : ""
       }
-    }) }
+      # Written only when set: the key is absent by default, so the router and manager levels apply and a later apply never
+      # writes false.
+    }, var.hibernate == null ? {} : { hibernate = var.hibernate })) }
   })
 }
 

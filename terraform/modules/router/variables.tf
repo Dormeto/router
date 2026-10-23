@@ -107,7 +107,7 @@ variable "ip_lists" {
 }
 
 variable "ip_lists_catalog" {
-  description = "The manager's IP lists (output ip_lists_catalog of the manager): s3://<bucket>/catalog.json. The waker reads the catalog, manifests and data every 5 minutes (only what changed), the controller describes them; a list of ip_lists with the same name wins. Null: only ip_lists."
+  description = "The manager's IP lists (output ip_lists_catalog of the manager): s3://<bucket>/catalog.json. The waker reads the catalog, manifests and data every 5 minutes (only what changed), the controller describes them; a list of ip_lists with the same name wins. The router also reads the manager's settings (settings.json) beside it. Null: only ip_lists."
   type        = string
   default     = null
   validation {

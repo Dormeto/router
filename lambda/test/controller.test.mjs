@@ -1735,6 +1735,31 @@ test('nap: a nap failing after an accepted hibernation keeps what it hibernated;
   assert.equal('hibernated' in w.store.state.run, false);
 });
 
+test('wake: one that completes with a run hibernated 59 days or more asks for a fresh boot, whatever woke it; a younger one does not (hibernation, 60 days)', async () => {
+  const wakeAfter = async (days) => {
+    const hibernated = JSON.stringify({ ids: ['i-0123456789abcdef0'], at: 1_700_000_000_000 - days * 86_400_000 });
+    const s = setup({ run: { state: STATES.WAKING, wakeId: 'w1', hibernated }, instance: 'stopped', target: 'waker', healthy: 0 });
+    s.ec2.state.reasons['i-0123456789abcdef0'] = HIBERNATE;
+    s.ec2.state.onStart.push(() => { s.clock.onSleep(() => { s.elbv2.state.healthy = 1; }); });
+    assert.equal((await s.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' })).state, STATES.AWAKE);
+    return s.store.state.run;
+  };
+  const old = await wakeAfter(59 + 1 / 24);
+  assert.equal(old.freshBoot, true);
+  assert.equal('hibernated' in old, false);
+  assert.equal('freshBoot' in (await wakeAfter(10)), false);
+});
+
+test('nap: an unreadable hibernation level is a plain stop even for a workload set hibernate true (hibernation)', async () => {
+  const s = setup({ run: { state: STATES.AWAKE }, cfg: testConfig({ hibernate: true }) });
+  const [id] = s.cfg.instanceIds;
+  s.ec2.state.configured[id] = true;
+  s.store.getRouterSettings = async () => { throw new Error('ProvisionedThroughputExceededException'); };
+  assert.equal((await s.handler({ action: 'nap', workloadId: 'demo' })).state, STATES.ASLEEP);
+  assert.deepEqual(stopsOf(s), [[[id], false]]);
+  assert.equal('hibernated' in s.store.state.run, false);
+});
+
 test('a workload found awake again (started outside Dormeto, or recovered) loses its hibernated record; a failed wake keeps it (hibernation)', async () => {
   // A day ago (the fake clock's start): well within the 60-day limit, which would wake it first.
   const hibernated = JSON.stringify({ ids: ['i-0123456789abcdef0'], at: 1_700_000_000_000 - 86_400_000 });

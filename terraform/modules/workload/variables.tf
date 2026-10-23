@@ -210,6 +210,12 @@ variable "fallback_instance_types" {
   }
 }
 
+variable "hibernate" {
+  description = "Hibernate the workload's instances at a nap instead of stopping them (router 0.32.0): true or false for this workload, null to inherit (the router's setting, else the manager's, true by default; a workload with fallback_instance_types does not hibernate unless this is true). Only instances launched with hibernation (an encrypted root volume with room for the memory) hibernate; any other is stopped. Never written to the configuration when null."
+  type        = bool
+  default     = null
+}
+
 variable "tags" {
   description = "Dormeto's own labels of the workload, key and value (for example { team = \"payments\", env = \"staging\" }), never AWS tags: the manager groups and grants access by them (router 0.30.0, manager 0.14.0). At most 50; a key of 1 to 128 characters and a value of at most 256, in letters, digits, spaces and _ . : / = + - @; keys are case-sensitive; the prefix dormeto: is reserved."
   type        = map(string)

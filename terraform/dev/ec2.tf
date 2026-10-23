@@ -29,6 +29,9 @@ resource "aws_instance" "demo" {
   vpc_security_group_ids      = [aws_security_group.app.id]
   user_data                   = file("${path.module}/user-data.sh")
   user_data_replace_on_change = true
+  # Launched with hibernation (encrypted root volume with room for the memory); the onboarding test instance (onb) is not,
+  # so both paths show in dev. Replaces the instance at the next dev apply.
+  hibernation = true
 
   metadata_options {
     http_tokens = "required"
@@ -36,6 +39,7 @@ resource "aws_instance" "demo" {
 
   root_block_device {
     volume_type = "gp3"
+    volume_size = 8
     encrypted   = true
   }
 

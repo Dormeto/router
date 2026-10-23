@@ -666,6 +666,18 @@ test('settings: fallback instance types (at most 5 type names) and the failed re
   ]);
 });
 
+test('settings: hibernate is a boolean, accepted and written to the configuration (hibernation R6)', async () => {
+  const s = setup();
+  assert.deepEqual((await s.onboarding.preview({ workloadId: 'shop', targetGroupArn: s.tg, settings: { hibernate: true } })).problems, []);
+  const bad = await s.onboarding.preview({ workloadId: 'shop', targetGroupArn: s.tg, settings: { hibernate: 'yes' } });
+  assert.deepEqual(bad.problems.filter((p) => p.startsWith('settings')), ['settings: hibernate must be true or false']);
+  await s.onboarding.onboard({ workloadId: 'shop', targetGroupArn: s.tg, settings: { hibernate: true }, by: 'ops' });
+  assert.equal((await s.a.store.getConfig('shop')).hibernate, true);
+  const off = setup();
+  await off.onboarding.onboard({ workloadId: 'shop', targetGroupArn: off.tg, settings: { hibernate: false }, by: 'ops' });
+  assert.equal((await off.a.store.getConfig('shop')).hibernate, false);
+});
+
 test('tags given at onboarding are echoed by the preview and written to the configuration; bad tags fail both before any change', async () => {
   const s = setup();
   const tags = { team: 'payments', env: 'staging' };

@@ -119,3 +119,33 @@ run "the_reserved_prefix_is_refused_in_any_case" {
   }
   expect_failures = [var.tags]
 }
+
+run "hibernate_is_absent_from_the_config_by_default" {
+  command = apply
+  assert {
+    condition     = !contains(keys(jsondecode(jsondecode(aws_dynamodb_table_item.config.item).config.S)), "hibernate")
+    error_message = "hibernate is written only when set, so an apply never writes false by default"
+  }
+}
+
+run "hibernate_false_is_written_to_the_config" {
+  command = apply
+  variables {
+    hibernate = false
+  }
+  assert {
+    condition     = jsondecode(jsondecode(aws_dynamodb_table_item.config.item).config.S).hibernate == false
+    error_message = "hibernate false is in the config"
+  }
+}
+
+run "hibernate_true_is_written_to_the_config" {
+  command = apply
+  variables {
+    hibernate = true
+  }
+  assert {
+    condition     = jsondecode(jsondecode(aws_dynamodb_table_item.config.item).config.S).hibernate == true
+    error_message = "hibernate true is in the config"
+  }
+}

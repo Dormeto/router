@@ -19,7 +19,7 @@ import { STATS_DAYS, totals, workloadSummary } from './summary.mjs';
 import { lastRequestAt } from './metrics.mjs';
 import { checkScope } from './check-scope.mjs';
 import { healthOf, lambdaMetrics, queueDepths } from './health.mjs';
-import { hibernationDue, resolveHibernation, settingsProblems } from './hibernation.mjs';
+import { HIBERNATION_MAX_DAYS, hibernationDue, resolveHibernation, settingsProblems } from './hibernation.mjs';
 import {
   backendKey, backendStatuses, isCompanion, resolveBackends, resumeBackends, sleepBackends, startCompanions, stopCompanions, toRecord, wakeBackends,
 } from './backends.mjs';
@@ -150,7 +150,7 @@ export function createController({
       await routeTo(cfg, 'app');
       const done = await store.transition(workloadId, {
         cond: { state: STATES.WAKING, wakeId },
-        set: { state: STATES.AWAKE, awakeSince: now(), holders: 0, ...(Object.keys(fallbacks).length ? { instanceTypes: JSON.stringify(fallbacks) } : {}) },
+        set: { state: STATES.AWAKE, awakeSince: now(), holders: 0, ...(Object.keys(fallbacks).length ? { instanceTypes: JSON.stringify(fallbacks) } : {}), ...(hibernatedTooLong(run) ? { freshBoot: true } : {}) },
         remove: ['pendingWake', 'napInstances', 'napBackends', 'failure', 'consecutiveFailures', 'hibernated'],
         // The wake's duration (R7a, the base of R8's wake times), and the instance types it fell back to.
         event: { wakeId, durationMs: now() - (run.wakeStartedAt ?? now()), ...(Object.keys(fallbacks).length ? { fallbacks } : {}) },
@@ -288,6 +288,18 @@ export function createController({
     if (!waking) return { state: 'UNKNOWN' };
     log.info('WakeRequested', { workloadId, wakeId, reason: 'pendingWake' });
     return wake(workloadId, wakeId, cfg);
+  }
+
+  // A wake that completes after the run was hibernated HIBERNATION_MAX_DAYS or more (whatever woke it: a schedule's
+  // maxNapDays, a visitor after a long keepAsleep pause) asks for a fresh boot: AWS keeps an instance hibernated 60 days at
+  // most, so the next nap stops it plainly (start, stop, start).
+  function hibernatedTooLong(run) {
+    try {
+      const at = run?.hibernated ? JSON.parse(run.hibernated)?.at : null;
+      return Number.isFinite(at) && now() - at >= HIBERNATION_MAX_DAYS * 86_400_000;
+    } catch {
+      return false;
+    }
   }
 
   // The levels of the hibernation setting above the workload's (hibernation design §2): the router's record and the

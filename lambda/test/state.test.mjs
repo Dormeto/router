@@ -394,3 +394,31 @@ test('a schedule item that cannot be read is logged and skipped: the scan goes o
   assert.deepEqual(logged.map(([event, data]) => [event, data.workloadId]), [['ScheduleSkipped', 'a']]);
   assert.match(logged[0][1].error, /JSON/);
 });
+
+test('router settings and the manager settings copy are ROUTER items; no hibernate deletes the settings', async () => {
+  const items = new Map();
+  const key = (k) => `${k.pk.S}/${k.sk.S}`;
+  const dynamo = fakeDynamo({
+    getItem: async ({ Key }) => ({ Item: items.get(key(Key)) }),
+    updateItem: async ({ Key, ExpressionAttributeNames: n, ExpressionAttributeValues: v }) => {
+      const item = {};
+      for (const [name, attr] of Object.entries(n)) item[attr] = v[`:${name.slice(1)}`];
+      items.set(key(Key), item);
+    },
+    deleteItem: async ({ Key }) => { items.delete(key(Key)); },
+  });
+  const store = createStore({ dynamo, table: 't' });
+  assert.equal(await store.getRouterSettings(), null);
+  assert.equal(await store.getManagerSettings(), null);
+  await store.putRouterSettings({ hibernate: false, by: 'ana', at: 5 });
+  assert.deepEqual(await store.getRouterSettings(), { hibernate: false, by: 'ana', at: 5 });
+  assert.ok(items.has('ROUTER/SETTINGS'));
+  await store.putRouterSettings({ by: 'ana', at: 6 });
+  assert.equal(await store.getRouterSettings(), null);
+  const copy = { hibernate: true, etag: '"e1"', readAt: 7, error: null };
+  await store.putManagerSettings(copy);
+  assert.deepEqual(await store.getManagerSettings(), copy);
+  await store.putManagerSettings({ hibernate: false, etag: null, readAt: 8, error: 'S3 SlowDown' });
+  assert.deepEqual(await store.getManagerSettings(), { hibernate: false, etag: null, readAt: 8, error: 'S3 SlowDown' });
+  assert.ok(items.has('ROUTER/MANAGER-SETTINGS'));
+});

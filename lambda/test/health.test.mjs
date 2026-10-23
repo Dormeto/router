@@ -131,7 +131,7 @@ test('healthOf: metrics or queues that cannot be read are warnings', () => {
 
 // --- Controller action -----------------------------------------------------------------------------------------------
 
-function setup({ run = { state: STATES.AWAKE, updatedAt: NOW - HOUR }, metrics = {}, depths = {}, concurrency = 1000, catalog = null } = {}) {
+function setup({ run = { state: STATES.AWAKE, updatedAt: NOW - HOUR }, metrics = {}, depths = {}, concurrency = 1000, catalog = null, managerSettings = null, log = silentLog } = {}) {
   const clock = fakeClock(NOW);
   const cfg = testConfig();
   const store = fakeStore({ config: cfg, run, clock });
@@ -141,14 +141,14 @@ function setup({ run = { state: STATES.AWAKE, updatedAt: NOW - HOUR }, metrics =
   const handler = createController({
     store, ec2: fakeEc2(cfg.instanceIds), elbv2: fakeElbv2(cfg), cloudwatch, autoscaling: fakeAutoScaling(), ecs, tagging: fakeTagging(ecs), appscaling: fakeAppScaling(),
     sqs, lambda: { getAccountSettings: async () => ({ AccountLimit: { ConcurrentExecutions: concurrency } }) },
-    invokeSelf: async () => {}, now: clock.now, sleep: clock.sleep, log: silentLog,
+    invokeSelf: async () => {}, now: clock.now, sleep: clock.sleep, log,
     router: {
       name: 'dmt-dev', version: '0.16.0', build: 'abc', checkSchedule: 'rate(5 minutes)', metrics: true,
       functions: { controller: 'dmt-dev-controller', waker: 'dmt-dev-waker' }, queues: { check: 'https://q/check', controller: 'https://q/controller' },
     },
     defaultRules: [{ name: 'e2e', headers: [{ name: 'x-e2e', value: '1' }] }],
     ipLists: [{ name: 'ipsum', url: 'https://x', action: 'defer', refreshHours: 24 }],
-    catalog,
+    catalog, managerSettings,
   });
   return { handler, store, clock, cloudwatch, sqs };
 }
@@ -257,4 +257,43 @@ test('router action: the manager\'s lists (R6b) in the configuration and the hea
     ['ip-list:do', 'IP list do: S3 AccessDenied'],
     ['ip-lists-catalog', 'IP lists catalog of the manager: S3 AccessDenied'],
   ]);
+});
+
+test('router action: the router\'s settings record and the manager\'s global settings', async () => {
+  const none = setup();
+  await none.store.recordScheduledCheck(NOW - 60_000);
+  const bare = await none.handler({ action: 'router' });
+  assert.deepEqual(bare.settings, { hibernate: null, by: null, at: null });
+  assert.equal(bare.managerSettings, null);
+  const managerSettings = { url: 's3://dmt-dev-manager-ip-lists-1/settings.json', refresh: async () => {}, current: async () => ({ hibernate: false, readAt: NOW - 120_000, error: null }) };
+  const s = setup({ managerSettings });
+  await s.store.recordScheduledCheck(NOW - 60_000);
+  await s.store.putRouterSettings({ hibernate: true, by: 'ana', at: NOW - HOUR });
+  const info = await s.handler({ action: 'router' });
+  assert.deepEqual(info.settings, { hibernate: true, by: 'ana', at: new Date(NOW - HOUR).toISOString() });
+  assert.deepEqual(info.managerSettings, { url: 's3://dmt-dev-manager-ip-lists-1/settings.json', hibernate: false, readAt: new Date(NOW - 120_000).toISOString(), error: null });
+  assert.equal(info.health.problems.some((p) => p.code === 'manager-settings-unreadable'), false);
+});
+
+test('router action: a manager settings error is a warning, manager-settings-unreadable', async () => {
+  const managerSettings = { url: 's3://b/settings.json', refresh: async () => {}, current: async () => ({ hibernate: false, readAt: NOW, error: 'S3 SlowDown' }) };
+  const s = setup({ managerSettings });
+  await s.store.recordScheduledCheck(NOW - 60_000);
+  const info = await s.handler({ action: 'router' });
+  assert.equal(info.health.status, 'warning');
+  assert.deepEqual(info.health.problems.filter((p) => p.code === 'manager-settings-unreadable'),
+    [{ level: 'warning', code: 'manager-settings-unreadable', text: 'manager settings unreadable: S3 SlowDown' }]);
+  assert.equal(healthOf({ checkSchedule: 'rate(5 minutes)', lastScheduledCheckAt: NOW - 60_000, now: NOW, managerSettingsError: 'x' }).problems[0].code, 'manager-settings-unreadable');
+});
+
+test('the check refreshes the manager settings once; a failure is logged and the check goes on', async () => {
+  let calls = 0;
+  const errors = [];
+  const log = { ...silentLog, error: (event, fields) => errors.push([event, fields]) };
+  const managerSettings = { url: 's3://b/settings.json', refresh: async () => { calls += 1; throw new Error('table'); }, current: async () => null };
+  const s = setup({ managerSettings, log });
+  const out = await s.handler({ action: 'check', source: 'schedule' });
+  assert.equal(calls, 1);
+  assert.equal(out.skipped, undefined);
+  assert.deepEqual(errors, [['ManagerSettingsFailed', { error: 'table' }]]);
 });

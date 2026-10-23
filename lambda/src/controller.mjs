@@ -13,6 +13,7 @@ import { createEvents } from './aws/events.mjs';
 import { createTagging } from './aws/tagging.mjs';
 import { createCatalog } from './lib/catalog.mjs';
 import { createController } from './lib/controller-core.mjs';
+import { createManagerSettings, settingsUrlOf } from './lib/manager-settings.mjs';
 import { kubernetesConnector } from './lib/k8s.mjs';
 import { memoizeAsync } from './lib/memo.mjs';
 import { createPublisher, withTransitionEvents } from './lib/events.mjs';
@@ -39,6 +40,8 @@ const s3 = lists.some((l) => parseS3Url(l.url)) || process.env.DMT_IP_LISTS_CATA
 const catalog = process.env.DMT_IP_LISTS_CATALOG
   ? createCatalog({ s3, url: process.env.DMT_IP_LISTS_CATALOG, own: lists.map((l) => l.name), log: logger })
   : null;
+// The manager's global settings: settings.json beside the catalog (hibernation design §3).
+const managerSettings = catalog ? createManagerSettings({ s3, url: settingsUrlOf(process.env.DMT_IP_LISTS_CATALOG), store, log: logger }) : null;
 const download = (url) => downloadText(url, { getObject: s3?.getObject });
 // Failure queues of the router (router health): { check, controller } queue URLs.
 const queues = JSON.parse(process.env.DMT_FAILURE_QUEUES || '{}');
@@ -84,4 +87,5 @@ export const handler = createController({
   defaultRules: parseRules(process.env.DMT_NO_WAKE_RULES, (error) => logger.error('NoWakeRulesUnreadable', { error })),
   ipLists: lists,
   catalog,
+  managerSettings,
 });

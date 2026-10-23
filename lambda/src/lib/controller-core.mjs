@@ -59,6 +59,8 @@ export function createController({
   lists = null, router = {}, defaultRules = [], ipLists = [], sqs = null, lambda = null, invokeOnboarder = null,
   // The manager's lists (R6b, lib/catalog.mjs): described from its catalog and manifests, never downloaded here.
   catalog = null,
+  // The manager's global settings (lib/manager-settings.mjs): read by the check, mirrored in the table.
+  managerSettings = null,
   // The router's work queue (scale design §6): naps and the wakes of a router pause, run at most 10 at a time.
   queueWork = null,
   // The drift queue: the check's repair requests, read with the drift events by the onboarder (2 at a time).
@@ -759,6 +761,7 @@ export function createController({
         await storedHealth(now(), { refresh: true });
       }
       await requestListRefresh();
+      await managerSettings?.refresh().catch((err) => log.error('ManagerSettingsFailed', { error: err.message }));
       const pauses = await activePauses();
       // Pauses that cannot be read stop every nap of this check (the reconcile still runs).
       const paused = (workloadId) => pauses === null || pauses.some((p) => p.workloadId === null || p.workloadId === workloadId);
@@ -1089,6 +1092,8 @@ export function createController({
     const check = await store.getCheck().catch(() => null);
     const own = (await describeStoredLists(store, ipLists)).map((l) => ({ ...l, source: TERRAFORM, refreshHours: ipLists.find((c) => c.name === l.name)?.refreshHours }));
     const managed = catalog ? await catalog.describe() : null;
+    const routerSettings = await store.getRouterSettings?.().catch(() => null);
+    const manager = managerSettings ? await managerSettings.current().catch((err) => ({ hibernate: null, readAt: null, error: err.message })) : null;
     const lists = [...own, ...(managed?.lists ?? [])];
     const health = healthOf({
       checkSchedule: router.checkSchedule, lastScheduledCheckAt: check?.lastScheduledCheckAt ?? null, now: t,
@@ -1096,6 +1101,7 @@ export function createController({
       // The manager's lists warn only when the router cannot read them: their freshness is the manager's alarm, once.
       ipLists: [...own, ...(managed?.lists ?? []).filter((l) => l.error && !l.pending).map(({ name, error }) => ({ name, error }))],
       catalogError: managed?.error ?? null,
+      managerSettingsError: manager?.error ?? null,
     });
     if (pausesError) {
       health.problems.push({ level: 'warning', code: 'pauses-unreadable', text: `pauses unreadable: ${pausesError}` });
@@ -1112,6 +1118,10 @@ export function createController({
     }
     return {
       router: { name: router.name, version: router.version, build: router.build },
+      settings: { hibernate: routerSettings?.hibernate ?? null, by: routerSettings?.by ?? null, at: routerSettings ? iso(routerSettings.at) : null },
+      managerSettings: managerSettings
+        ? { url: managerSettings.url, hibernate: manager?.hibernate ?? null, readAt: manager?.readAt ? iso(manager.readAt) : null, error: manager?.error ?? null }
+        : null,
       configuration: {
         checkSchedule: { value: router.checkSchedule ?? null, source: TERRAFORM },
         ipLists: { value: ipLists.map(({ name, url, action, refreshHours }) => ({ name, url, action, refreshHours })), source: TERRAFORM },

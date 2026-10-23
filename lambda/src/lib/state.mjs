@@ -377,6 +377,38 @@ export function createStore({ dynamo, table, now = Date.now, log = null }) {
       });
     },
 
+    // The router's own settings (hibernation design §3): ROUTER / SETTINGS {hibernate, by, at}; no hibernate: unset, no item.
+    async getRouterSettings() {
+      const { Item } = await dynamo.getItem({ TableName: table, Key: { pk: { S: 'ROUTER' }, sk: { S: 'SETTINGS' } }, ConsistentRead: true });
+      return Item?.hibernate ? { hibernate: Item.hibernate.BOOL, by: Item.by?.S ?? null, at: Number(Item.at?.N ?? 0) } : null;
+    },
+    async putRouterSettings({ hibernate, by, at }) {
+      const Key = { pk: { S: 'ROUTER' }, sk: { S: 'SETTINGS' } };
+      if (typeof hibernate !== 'boolean') {
+        await dynamo.deleteItem({ TableName: table, Key });
+        return;
+      }
+      await dynamo.updateItem({
+        TableName: table, Key,
+        UpdateExpression: 'SET #hibernate = :hibernate, #by = :by, #at = :at',
+        ExpressionAttributeNames: { '#hibernate': 'hibernate', '#by': 'by', '#at': 'at' },
+        ExpressionAttributeValues: { ':hibernate': { BOOL: hibernate }, ':by': { S: String(by ?? '') }, ':at': { N: String(at) } },
+      });
+    },
+
+    // The router's copy of the manager's global settings: { hibernate, etag, readAt, error } (a cold Lambda reads this, never S3).
+    async getManagerSettings() {
+      const { Item } = await dynamo.getItem({ TableName: table, Key: { pk: { S: 'ROUTER' }, sk: { S: 'MANAGER-SETTINGS' } }, ConsistentRead: true });
+      return Item?.managerSettings?.S ? JSON.parse(Item.managerSettings.S) : null;
+    },
+    async putManagerSettings(item) {
+      await dynamo.updateItem({
+        TableName: table, Key: { pk: { S: 'ROUTER' }, sk: { S: 'MANAGER-SETTINGS' } },
+        UpdateExpression: 'SET #managerSettings = :managerSettings', ExpressionAttributeNames: { '#managerSettings': 'managerSettings' },
+        ExpressionAttributeValues: { ':managerSettings': { S: JSON.stringify(item) } },
+      });
+    },
+
     // One check at a time (scale design §6): a lease on ROUTER / CHECK until the check ends, or expires (a check that died).
     async acquireCheckLease(holder, until, now) {
       try {

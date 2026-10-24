@@ -65,3 +65,9 @@ variable "dormeto_router" {
   type        = string
   default     = "dmt-dev"
 }
+
+variable "endpoint_public_access_cidrs" {
+  description = "The addresses allowed to the cluster's public endpoint. The default, every address, makes the routers call it directly; a narrower list makes them go through the kubernetes-proxy function (private access is on)."
+  type        = list(string)
+  default     = ["0.0.0.0/0"]
+}

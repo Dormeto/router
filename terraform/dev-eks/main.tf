@@ -35,9 +35,12 @@ module "eks" {
   name               = var.name
   kubernetes_version = var.kubernetes_version
 
-  # Public and open to every address: the routers' Lambda functions reach it (the spec's section 4).
-  endpoint_public_access = true
-  authentication_mode    = "API"
+  # Public, by default open to every address (the routers' Lambda functions call it directly); private access is on, so
+  # with a narrower range the routers reach the cluster through the kubernetes-proxy function in its VPC (dormeto.tf).
+  endpoint_private_access      = true
+  endpoint_public_access       = true
+  endpoint_public_access_cidrs = var.endpoint_public_access_cidrs
+  authentication_mode          = "API"
 
   # The audit log only, a week: it shows every call the routers make to the cluster (the spike, the e2e). The api and
   # authenticator logs would add CloudWatch ingestion (the controllers renew their leases every few seconds) that no

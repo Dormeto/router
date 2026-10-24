@@ -5,7 +5,7 @@ written as a customer would, with no Dormeto resource. The manager discovers its
 onboards them; `dormeto-e2e` runs its acceptance.
 
 - **What it holds:** its own VPC (two public and two private subnets, one NAT gateway), EKS 1.36 (authentication mode
-  `API`, public endpoint), one small system node (`t4g.medium`, tainted `CriticalAddonsOnly`) for CoreDNS, metrics-server,
+  `API`, private access on, public endpoint open to `endpoint_public_access_cidrs`, by default every address), one small system node (`t4g.medium`, tainted `CriticalAddonsOnly`) for CoreDNS, metrics-server,
   the AWS Load Balancer Controller and Karpenter, a Fargate profile for `demo-fargate`, and Karpenter's NodePool for the
   demos (nodes removed a minute after they are empty).
 - **Demos** (`charts/demos`): `web` (a Deployment), `cache` (a StatefulSet), `api` (with an HPA) and `docs` (on Fargate)
@@ -22,6 +22,11 @@ onboards them; `dormeto-e2e` runs its acceptance.
   (`router/terraform/dev`, the router of this account and region) in the group `dormeto:router` and `DmtDiscoveryRole`
   with the view policy (module `eks-access`), and that group's rights as Dormeto publishes them
   (`kubernetes/dormeto-router.yaml`, through a local chart). `-var dormeto_router=null` leaves them out.
+- **The proxy** (`dormeto.tf`, module `kubernetes-proxy`): the router's Kubernetes proxy for this cluster, which the
+  router uses when the public endpoint is limited. With the default `endpoint_public_access_cidrs` (`["0.0.0.0/0"]`) the
+  router calls the endpoint directly and the proxy stays idle. To test the proxy path, set the variable to a narrower
+  range, for example in a git-ignored `*.local.tfvars` (`tfenv exec plan -var-file=dev.local.tfvars`). Destroy the root
+  as usual: the module is destroyed before the VPC.
 
 **Needs** the AWS CLI and kubectl on the caller's PATH: before the charts, the root waits until every API server
 enforces the caller's admin access (EKS takes some seconds, each API server on its own); its destroy-time waits use the

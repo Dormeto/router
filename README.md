@@ -145,8 +145,15 @@ TargetGroupBinding), is napped by scaling its owner to 0 through the `scale` sub
 woken by giving back its recorded replicas (at least 1). A KEDA ScaledObject is paused at 0
 (`autoscaling.keda.sh/paused-replicas: "0"`) for the nap and given back its own pause at the wake; an HPA needs nothing
 (it leaves a target at 0 replicas alone). The router calls the cluster's API over HTTPS with an EKS token its role
-signs and the certificate authority from `eks:DescribeCluster` (no Kubernetes library in the bundles); the endpoint must
-be public and open to every address (a private cluster waits for the in-cluster agent, R10.6). The configuration's
+signs and the certificate authority from `eks:DescribeCluster` (no Kubernetes library in the bundles). The endpoint
+may be public and open to every address (called directly), or private, or public but limited to some addresses, with
+private access on: the calls then go through a **proxy**, a small function of the router's bundle (`kube-proxy.mjs`) that
+runs in the cluster's VPC and relays them to the cluster's API (router 0.33.0). There is one proxy per cluster, named
+`<router name>-kube-<cluster>`; it only reaches its own cluster's endpoint, holds no Kubernetes identity (the router's
+token travels with each call) and needs no NAT gateway. The manager creates, updates and removes the proxies of the
+routers it installs; for a router written in Terraform, use the module `terraform/modules/kubernetes-proxy` once per
+cluster, beside `eks-access` (its README says to destroy it before the cluster's VPC). A cluster whose public endpoint is
+limited to some addresses with private access off is not reachable: turn private access on. The configuration's
 `kubernetes` (written by the onboarding) names the cluster, namespace, owner, the switching mode and, for an Ingress,
 its name and the Service it routes to; Kubernetes workloads come from the manager's onboarding (the `workload` module
 has no Kubernetes setting). Their wake timeout defaults to 300 s (pods may wait for a node).

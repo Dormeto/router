@@ -17,6 +17,17 @@ module "dormeto_access" {
   apply_manifest     = false
 }
 
+# The router's Kubernetes proxy for this cluster, in its VPC (router/terraform/modules/kubernetes-proxy): used when the
+# public endpoint is limited to some addresses. The router module's functions find it by its name prefix.
+module "kubernetes_proxy" {
+  count             = var.dormeto_router == null ? 0 : 1
+  source            = "../modules/kubernetes-proxy"
+  router_name       = var.dormeto_router
+  lambda_source_dir = "${path.module}/../../lambda/src"
+  cluster_name      = module.eks.cluster_name
+  router_version    = jsondecode(file("${path.module}/../../package.json")).version
+}
+
 resource "helm_release" "dormeto_access" {
   count  = var.dormeto_router == null ? 0 : 1
   name   = "dormeto-access"

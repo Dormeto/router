@@ -118,8 +118,12 @@ annotation and the patched paths' backends. The onboarding dialog gives the snip
 
 ## Limits
 
-- **EKS only, with a public endpoint open to every address.** The router's Lambdas run outside any VPC. A private
-  cluster or an endpoint restricted to some addresses is not supported yet: it waits for an in-cluster agent.
+- **EKS only, with the API reachable by the router.** The router's Lambdas run outside any VPC, so they call a public
+  endpoint open to every address directly. A private endpoint, or a public one limited to some addresses, needs private
+  access on: the calls then go through a proxy function in the cluster's VPC (one per cluster, named
+  `<router name>-kube-<cluster>`). The manager installs it with the router; with a router written in Terraform, apply the
+  module `kubernetes-proxy` for each such cluster. A public endpoint limited to some addresses with private access off is
+  ineligible: turn private access on. Kubernetes outside EKS is not supported.
 - **Access entries.** A cluster in `CONFIG_MAP` mode (aws-auth only) needs the router's roles mapped to the group
   `dormeto:router` by hand, or a switch to `API_AND_CONFIG_MAP`.
 - **Kubernetes 1.30 or later** for the admission policy. On older clusters the group's Ingress rights are not narrowed.

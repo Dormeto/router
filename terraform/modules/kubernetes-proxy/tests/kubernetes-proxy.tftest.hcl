@@ -16,8 +16,8 @@ mock_provider "aws" {
       endpoint              = "https://ABCDEF.gr7.eu-west-1.eks.amazonaws.com"
       certificate_authority = [{ data = "Q0E=" }]
       vpc_config = [{
-        subnet_ids               = ["subnet-aaa", "subnet-bbb"]
-        vpc_id                   = "vpc-123"
+        subnet_ids                = ["subnet-aaa", "subnet-bbb"]
+        vpc_id                    = "vpc-123"
         cluster_security_group_id = "sg-cluster"
       }]
     }

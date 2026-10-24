@@ -111,15 +111,23 @@ test('store backend kinds are set on an existing run, its version untouched', as
   assert.deepEqual(input.ExpressionAttributeValues, { ':kinds': { S: 'asg,rds-instance' } });
 });
 
-test('store hibernated: what a nap hibernated, written on the run at once whatever its state, its version untouched', async () => {
+test('store hibernated: what a nap hibernated, written on an existing run at once whatever its state, its version untouched', async () => {
   const dynamo = fakeDynamo({ updateItem: async () => ({}) });
-  await createStore({ dynamo, table: 't' }).setHibernated('demo', { ids: ['i-0123456789abcdef0'], at: 5 });
+  assert.equal(await createStore({ dynamo, table: 't' }).setHibernated('demo', { ids: ['i-0123456789abcdef0'], at: 5 }), true);
   const [[, input]] = dynamo.calls;
   assert.deepEqual(input.Key, { pk: { S: 'WL#demo' }, sk: { S: 'RUN' } });
   assert.equal(input.UpdateExpression, 'SET #hibernated = :hibernated');
-  assert.equal(input.ConditionExpression, undefined);
+  assert.equal(input.ConditionExpression, 'attribute_exists(pk)');
   assert.deepEqual(input.ExpressionAttributeNames, { '#hibernated': 'hibernated' });
   assert.deepEqual(JSON.parse(input.ExpressionAttributeValues[':hibernated'].S), { ids: ['i-0123456789abcdef0'], at: 5 });
+});
+
+test('store hibernated: a run offboarded meanwhile is not recorded, never recreated, never throwing; other errors throw', async () => {
+  const conditional = Object.assign(new Error('The conditional request failed'), { name: 'ConditionalCheckFailedException' });
+  const gone = fakeDynamo({ updateItem: async () => { throw conditional; } });
+  assert.equal(await createStore({ dynamo: gone, table: 't' }).setHibernated('demo', { ids: ['i-0123456789abcdef0'], at: 5 }), false);
+  const throttled = fakeDynamo({ updateItem: async () => { throw Object.assign(new Error('slow down'), { name: 'ThrottlingException' }); } });
+  await assert.rejects(createStore({ dynamo: throttled, table: 't' }).setHibernated('demo', { ids: [], at: 5 }), /slow down/);
 });
 
 test('store pendingWake and holder updates are conditional', async () => {

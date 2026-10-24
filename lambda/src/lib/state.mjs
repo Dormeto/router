@@ -517,15 +517,17 @@ export function createStore({ dynamo, table, now = Date.now, log = null }) {
     },
 
     // What a nap hibernated (hibernation design §4): written as soon as AWS accepts, whatever the nap does next, apart
-    // from the transitions (no version change); only a wake that reaches AWAKE removes it.
+    // from the transitions (no version change); only a wake that reaches AWAKE removes it. On an existing run only: a
+    // workload offboarded meanwhile is not recorded (false), its run never written back.
     async setHibernated(workloadId, { ids, at }) {
-      await dynamo.updateItem({
+      return (await update({
         TableName: table,
         Key: itemKey(workloadId, 'RUN'),
         UpdateExpression: 'SET #hibernated = :hibernated',
+        ConditionExpression: 'attribute_exists(pk)',
         ExpressionAttributeNames: { '#hibernated': 'hibernated' },
         ExpressionAttributeValues: { ':hibernated': { S: JSON.stringify({ ids, at }) } },
-      });
+      })) !== null;
     },
 
     async setPendingWake(workloadId) {

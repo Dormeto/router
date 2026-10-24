@@ -1859,6 +1859,23 @@ test('a workload found awake again (started outside Dormeto, or recovered) loses
   assert.equal(failed.store.state.run.hibernated, hibernated);
 });
 
+test('a workload found awake again 59 days or more after its hibernation asks for a fresh boot, as a wake does; a younger one does not (hibernation, 60 days)', async () => {
+  const foundAwake = async (state, days) => {
+    const hibernated = JSON.stringify({ ids: ['i-0123456789abcdef0'], at: 1_700_000_000_000 - days * 86_400_000 });
+    const s = setup({ run: { state, failedAt: 1, hibernated }, instance: 'running', target: 'waker', healthy: 1 });
+    // Held asleep (the 60-day wake too) while someone starts its instance by hand: the check finds it running.
+    await s.handler({ action: 'pause', workloadId: 'demo', by: 'ops@example.com', reason: 'budget freeze', keepAsleep: true });
+    const [result] = await s.handler({ action: 'check' });
+    assert.equal(result.state, STATES.AWAKE, `${state} ${days}`);
+    assert.equal('hibernated' in s.store.state.run, false);
+    return s.store.state.run;
+  };
+  for (const state of [STATES.ASLEEP, STATES.FAILED]) {
+    assert.equal((await foundAwake(state, 60)).freshBoot, true, state);
+    assert.equal('freshBoot' in (await foundAwake(state, 10)), false, state);
+  }
+});
+
 test('release: a failed workload is stopped as a nap would be, hibernating what can be, freshBoot kept (hibernation)', async () => {
   const s = setup({ run: { state: STATES.FAILED, failedAt: 1, failure: '{"kind":"unhealthy"}' }, instance: 'running', target: 'waker', healthy: 0 });
   const [id] = s.cfg.instanceIds;

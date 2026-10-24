@@ -291,8 +291,8 @@ export function createController({
   }
 
   // A wake that completes after the run was hibernated HIBERNATION_MAX_DAYS or more (whatever woke it: a schedule's
-  // maxNapDays, a visitor after a long keepAsleep pause) asks for a fresh boot: AWS keeps an instance hibernated 60 days at
-  // most, so the next nap stops it plainly (start, stop, start).
+  // maxNapDays, a visitor after a long keepAsleep pause, a start outside Dormeto the check finds) asks for a fresh boot:
+  // AWS keeps an instance hibernated 60 days at most, so the next nap stops it plainly (start, stop, start).
   function hibernatedTooLong(run) {
     try {
       const at = run?.hibernated ? JSON.parse(run.hibernated)?.at : null;
@@ -425,7 +425,8 @@ export function createController({
       else await startCompanions(clients, companions);
       await routeTo(cfg, 'app');
       run = (await store.transition(workloadId, {
-        cond: { state: from }, set: { state: STATES.AWAKE, awakeSince: now() }, remove: ['napBackends', 'napInstances', 'failure', 'consecutiveFailures', 'hibernated'],
+        cond: { state: from }, set: { state: STATES.AWAKE, awakeSince: now(), ...(hibernatedTooLong(run) ? { freshBoot: true } : {}) },
+        remove: ['napBackends', 'napInstances', 'failure', 'consecutiveFailures', 'hibernated'],
         cause: from === STATES.FAILED ? 'recovered' : 'external-start',
       }))
         ?? (await store.getRun(workloadId));

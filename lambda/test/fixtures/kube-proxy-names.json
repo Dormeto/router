@@ -1,0 +1,14 @@
+[
+  {"prefix": "dmtr-dev-kube-", "cluster": "prod", "name": "dmtr-dev-kube-prod"},
+  {"prefix": "dmtr-dev-kube-", "cluster": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "name": "dmtr-dev-kube-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},
+  {"prefix": "dmtr-dev-kube-", "cluster": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeex", "name": "dmtr-dev-kube-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeex"},
+  {"prefix": "dmtr-dev-kube-", "cluster": "Zaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "name": "dmtr-dev-kube-Zaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-8583fe6d"},
+  {"prefix": "dmtr-dev-kube-", "cluster": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-first-variant-of-a-long-cluster-name", "name": "dmtr-dev-kube-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-d069a213"},
+  {"prefix": "dmtr-dev-kube-", "cluster": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-other-variant-of-a-long-cluster-name", "name": "dmtr-dev-kube-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-61a15f42"},
+  {"prefix": "dmtr-dev-kube-", "cluster": "my_cluster_1", "name": "dmtr-dev-kube-my_cluster_1"},
+  {"prefix": "dmtr-dev-kube-", "cluster": "1-numbers-first", "name": "dmtr-dev-kube-1-numbers-first"},
+  {"prefix": "dmtr-dev-eu-west-1-kube-", "cluster": "prod", "name": "dmtr-dev-eu-west-1-kube-prod"},
+  {"prefix": "dmtr-dev-eu-west-1-kube-", "cluster": "Zaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "name": "dmtr-dev-eu-west-1-kube-Zaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-8583fe6d"},
+  {"prefix": "dmt-dev-kube-", "cluster": "prod", "name": "dmt-dev-kube-prod"},
+  {"prefix": "dmt-dev-kube-", "cluster": "Zaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "name": "dmt-dev-kube-Zaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-8583fe6d"}
+]

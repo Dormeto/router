@@ -27,7 +27,7 @@ router's roles access to the cluster (module `eks-access`): the proxy only carri
 | `lambda_source_dir` | required | The router's Lambda source directory, the one given to the router module. |
 | `cluster_name` | required | The EKS cluster. |
 | `subnet_ids` | `null` | Subnets of the proxy; `null`: the cluster's own (`vpc_config.subnet_ids`). |
-| `security_group_ids` | `null` | `null`: a security group of its own, as below. Given: used as they are; nothing is made or opened, they must reach the cluster security group on TCP 443, which must admit them. |
+| `security_group_ids` | `null` | `null`: a security group of its own, as below. Given: used as they are; nothing is made or opened, they must reach the VPC on TCP 443, and the cluster security group must admit them. |
 | `log_retention_days` | `14` | Retention of the function's log group. |
 | `router_version` | `0.0.0` | Exposed as `DMT_VERSION` (the router's ping reports it). |
 
@@ -37,8 +37,10 @@ router's roles access to the cluster (module `eks-access`): the proxy only carri
   `DMT_CLUSTER`, `DMT_ENDPOINT` and `DMT_CA` read from the cluster, its log group, and its role
   `<router_name>-<region>-kube-<cluster>` (network-interface rights and its logs only);
 - without `security_group_ids`: a security group of the same name in the cluster's VPC, whose only egress is TCP 443
-  to the cluster security group (its default allow-all egress is removed), and one ingress rule on the cluster
-  security group admitting TCP 443 from it (the group EKS attaches to the endpoint's network interfaces);
+  to each associated IPv4 block of the cluster's VPC (one rule per block; its default allow-all egress is removed),
+  and one ingress rule on the cluster security group admitting TCP 443 from it (the group EKS attaches to the
+  endpoint's network interfaces). The egress does not name the cluster security group: a rule referencing it would keep
+  EKS from deleting that group with the cluster;
 - all tagged `dormeto:role = kubernetes-proxy` and `dormeto:cluster = <name>`.
 
 A cluster name too long for the 64 characters of a function name is cut: its first characters, `-` and the first 8

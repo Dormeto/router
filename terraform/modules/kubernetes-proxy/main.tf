@@ -9,6 +9,10 @@ data "aws_eks_cluster" "this" {
   name = var.cluster_name
 }
 
+data "aws_vpc" "cluster" {
+  id = data.aws_eks_cluster.this.vpc_config[0].vpc_id
+}
+
 locals {
   # One rule for the router, the manager and this module (lambda/src/lib/kube-proxy-name.mjs, pinned by
   # lambda/test/fixtures/kube-proxy-names.json): the cluster's name when the prefix and it fit in 64 characters (Lambda's
@@ -27,6 +31,8 @@ locals {
   own_group  = var.security_group_ids == null
   group_ids  = local.own_group ? [aws_security_group.proxy[0].id] : var.security_group_ids
   tags       = { "dormeto:role" = "kubernetes-proxy", "dormeto:cluster" = var.cluster_name }
+  # The VPC's associated IPv4 blocks (the primary one is among its associations).
+  vpc_cidrs  = toset([for a in data.aws_vpc.cluster.cidr_block_associations : a.cidr_block if a.state == "associated"])
   cluster_sg = local.vpc.cluster_security_group_id
   build      = substr(data.archive_file.lambda.output_sha256, 0, 12)
 }
@@ -79,7 +85,8 @@ resource "aws_iam_role_policy" "proxy" {
 }
 
 # The proxy's own group: its default egress rule (everything) is removed, since the group declares no rule inline; the
-# only egress is TCP 443 to the cluster security group, which EKS attaches to the endpoint's network interfaces.
+# only egress is TCP 443 to the VPC's IPv4 blocks (the endpoint's network interfaces are in them). A rule naming the
+# cluster security group would keep EKS from deleting that group with the cluster.
 resource "aws_security_group" "proxy" {
   count       = local.own_group ? 1 : 0
   name        = local.function_name
@@ -89,14 +96,14 @@ resource "aws_security_group" "proxy" {
 }
 
 resource "aws_vpc_security_group_egress_rule" "proxy" {
-  count                        = local.own_group ? 1 : 0
-  security_group_id            = aws_security_group.proxy[0].id
-  referenced_security_group_id = local.cluster_sg
-  ip_protocol                  = "tcp"
-  from_port                    = 443
-  to_port                      = 443
-  description                  = "The cluster's API"
-  tags                         = local.tags
+  for_each          = local.own_group ? local.vpc_cidrs : toset([])
+  security_group_id = aws_security_group.proxy[0].id
+  cidr_ipv4         = each.value
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
+  description       = "Kubernetes API of cluster ${var.cluster_name}"
+  tags              = local.tags
 }
 
 resource "aws_vpc_security_group_ingress_rule" "cluster" {
@@ -131,9 +138,10 @@ resource "aws_lambda_function" "proxy" {
     variables = {
       DMT_CLUSTER  = var.cluster_name
       DMT_ENDPOINT = data.aws_eks_cluster.this.endpoint
-      DMT_CA       = data.aws_eks_cluster.this.certificate_authority[0].data
-      DMT_VERSION  = var.router_version
-      DMT_BUILD    = local.build
+      # The cluster reports its certificate authority base64-encoded; the proxy expects the PEM text.
+      DMT_CA      = base64decode(data.aws_eks_cluster.this.certificate_authority[0].data)
+      DMT_VERSION = var.router_version
+      DMT_BUILD   = local.build
     }
   }
 

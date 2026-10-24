@@ -5,6 +5,16 @@ mock_provider "aws" {
   mock_data "aws_partition" {
     defaults = { partition = "aws" }
   }
+  mock_data "aws_vpc" {
+    defaults = {
+      cidr_block = "10.0.0.0/16"
+      cidr_block_associations = [
+        { association_id = "a-1", cidr_block = "10.0.0.0/16", state = "associated" },
+        { association_id = "a-2", cidr_block = "100.64.0.0/16", state = "associated" },
+        { association_id = "a-3", cidr_block = "192.168.0.0/16", state = "disassociated" },
+      ]
+    }
+  }
   mock_data "aws_iam_policy_document" {
     defaults = { json = "{\"Version\":\"2012-10-17\",\"Statement\":[]}" }
   }
@@ -14,7 +24,7 @@ mock_provider "aws" {
   mock_data "aws_eks_cluster" {
     defaults = {
       endpoint              = "https://ABCDEF.gr7.eu-west-1.eks.amazonaws.com"
-      certificate_authority = [{ data = "Q0E=" }]
+      certificate_authority = [{ data = "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCkNBCi0tLS0tRU5EIENFUlRJRklDQVRFLS0tLS0K" }]
       vpc_config = [{
         subnet_ids                = ["subnet-aaa", "subnet-bbb"]
         vpc_id                    = "vpc-123"
@@ -43,7 +53,7 @@ run "a_short_cluster_name_is_kept_and_the_proxy_runs_in_the_clusters_vpc" {
     error_message = "the router's runtime, arm64, 128 MB, 15 seconds"
   }
   assert {
-    condition     = aws_lambda_function.proxy.environment[0].variables.DMT_CLUSTER == "prod" && aws_lambda_function.proxy.environment[0].variables.DMT_ENDPOINT == "https://ABCDEF.gr7.eu-west-1.eks.amazonaws.com" && aws_lambda_function.proxy.environment[0].variables.DMT_CA == "Q0E=" && aws_lambda_function.proxy.environment[0].variables.DMT_VERSION == "0.33.0"
+    condition     = aws_lambda_function.proxy.environment[0].variables.DMT_CLUSTER == "prod" && aws_lambda_function.proxy.environment[0].variables.DMT_ENDPOINT == "https://ABCDEF.gr7.eu-west-1.eks.amazonaws.com" && aws_lambda_function.proxy.environment[0].variables.DMT_CA == "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n" && aws_lambda_function.proxy.environment[0].variables.DMT_VERSION == "0.33.0"
     error_message = "the cluster, its endpoint and certificate authority, the version"
   }
   assert {
@@ -60,15 +70,23 @@ run "a_short_cluster_name_is_kept_and_the_proxy_runs_in_the_clusters_vpc" {
   }
 }
 
-run "its_own_group_only_reaches_the_cluster_security_group_on_443_and_is_admitted_there" {
+run "its_own_group_only_reaches_the_vpc_on_443_and_is_admitted_by_the_cluster_security_group" {
   command = plan
   assert {
     condition     = length(aws_security_group.proxy) == 1 && aws_security_group.proxy[0].vpc_id == "vpc-123"
     error_message = "a security group of its own, in the cluster's VPC"
   }
   assert {
-    condition     = length(aws_vpc_security_group_egress_rule.proxy) == 1 && aws_vpc_security_group_egress_rule.proxy[0].referenced_security_group_id == "sg-cluster" && aws_vpc_security_group_egress_rule.proxy[0].ip_protocol == "tcp" && aws_vpc_security_group_egress_rule.proxy[0].from_port == 443 && aws_vpc_security_group_egress_rule.proxy[0].to_port == 443
-    error_message = "the only egress: TCP 443 to the cluster security group"
+    condition     = toset(keys(aws_vpc_security_group_egress_rule.proxy)) == toset(["10.0.0.0/16", "100.64.0.0/16"]) && alltrue([for r in aws_vpc_security_group_egress_rule.proxy : r.ip_protocol == "tcp" && r.from_port == 443 && r.to_port == 443 && r.referenced_security_group_id == null])
+    error_message = "the only egress: TCP 443 to each associated IPv4 block of the VPC, never to the cluster security group (it would keep EKS from deleting it)"
+  }
+  assert {
+    condition     = alltrue([for k, r in aws_vpc_security_group_egress_rule.proxy : r.cidr_ipv4 == k])
+    error_message = "one rule per block"
+  }
+  assert {
+    condition     = alltrue([for r in concat([for r in aws_vpc_security_group_egress_rule.proxy : r.description], [for r in aws_vpc_security_group_ingress_rule.cluster : r.description], [aws_security_group.proxy[0].description]) : can(regex("^[a-zA-Z0-9. _\\-:/()#,@\\[\\]+=&;{}!$*]*$", r))])
+    error_message = "descriptions use only the characters EC2 accepts (no apostrophe)"
   }
   assert {
     condition     = length(aws_vpc_security_group_ingress_rule.cluster) == 1 && aws_vpc_security_group_ingress_rule.cluster[0].security_group_id == "sg-cluster" && aws_vpc_security_group_ingress_rule.cluster[0].ip_protocol == "tcp" && aws_vpc_security_group_ingress_rule.cluster[0].from_port == 443 && aws_vpc_security_group_ingress_rule.cluster[0].to_port == 443

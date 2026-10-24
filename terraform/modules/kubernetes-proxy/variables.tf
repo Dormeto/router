@@ -20,7 +20,7 @@ variable "subnet_ids" {
 }
 
 variable "security_group_ids" {
-  description = "Security groups of the proxy; null: a group of its own, whose only egress is TCP 443 to the cluster security group, which admits it. Given: used as they are, nothing is made or opened (they must reach the cluster security group on TCP 443, which must admit them)."
+  description = "Security groups of the proxy; null: a group of its own, whose only egress is TCP 443 to the VPC's IPv4 blocks, admitted by the cluster security group. Given: used as they are, nothing is made or opened (they must reach the VPC on TCP 443, and the cluster security group must admit them)."
   type        = list(string)
   default     = null
 }

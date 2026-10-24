@@ -437,6 +437,11 @@ test('router settings and the manager settings copy are ROUTER items; no hiberna
   await store.putRouterSettings({ hibernate: true, by: 'ana', at: 7 });
   await store.putRouterSettings({ hibernate: null, by: 'ana', at: 8 });
   assert.equal(await store.getRouterSettings(), null);
+  assert.deepEqual(await store.getKubeProxies(), {});
+  const pings = { 'c-1': { name: 'dmt-kube-c-1', ok: true, version: '0.33.0', at: 5 } };
+  await store.putKubeProxies(pings);
+  assert.deepEqual(await store.getKubeProxies(), pings);
+  assert.ok(items.has('ROUTER/KUBE-PROXIES'));
   const copy = { hibernate: true, etag: '"e1"', readAt: 7, error: null };
   await store.putManagerSettings(copy);
   assert.deepEqual(await store.getManagerSettings(), copy);

@@ -297,3 +297,17 @@ test('the check refreshes the manager settings once; a failure is logged and the
   assert.equal(out.skipped, undefined);
   assert.deepEqual(errors, [['ManagerSettingsFailed', { error: 'table' }]]);
 });
+
+test('healthOf: a failed proxy ping is a warning naming the cluster, its proxy and what to do; a success is none', () => {
+  const at = NOW - 60_000;
+  const bad = (reason, message) => ({ 'c-1': { name: 'dmt-kube-c-1', ok: false, reason, message, at } });
+  const text = (kubeProxies) => healthOf({ ...healthy, kubeProxies }).problems.map((p) => [p.level, p.code, p.text]);
+  assert.deepEqual(healthOf({ ...healthy, kubeProxies: { 'c-1': { name: 'dmt-kube-c-1', ok: true, version: '0.33.0', at } } }), { status: 'ok', problems: [] });
+  assert.deepEqual(text(bad('Stale')), [['warning', 'kube-proxy:c-1', "cluster c-1: its proxy dmt-kube-c-1 has a stale endpoint: set up its access again (manager: cluster access; Terraform: apply the module kubernetes-proxy)"]]);
+  assert.deepEqual(text(bad('NoProxy')), [['warning', 'kube-proxy:c-1', "cluster c-1: its proxy dmt-kube-c-1 is not set up: upgrade the router or set up its cluster access (Terraform: module kubernetes-proxy)"]]);
+  assert.equal(text(bad('ProxyNotReady'))[0][2], 'cluster c-1: its proxy dmt-kube-c-1 is not active (unused for 14 days): it becomes active again within minutes');
+  for (const reason of ['Timeout', 'Network']) {
+    assert.equal(text(bad(reason))[0][2], 'cluster c-1: its proxy dmt-kube-c-1 did not reach the cluster: the cluster security group must admit TCP 443 from the security group dmt-kube-c-1');
+  }
+  assert.equal(text(bad('Throttled', 'throttled by Lambda'))[0][2], 'cluster c-1: its proxy dmt-kube-c-1 failed: throttled by Lambda');
+});

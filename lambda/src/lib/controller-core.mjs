@@ -4,6 +4,7 @@ import { checkName } from './names.mjs';
 import { currentTarget, hostOf, setRoute } from './route.mjs';
 import { dormetoTargetGroup, ingressDrift, routeIngress } from './kube-route.mjs';
 import { checkRights } from './kube-access.mjs';
+import { pingProxy } from './k8s.mjs';
 import { resolveRules } from './rules.mjs';
 import { healthyCount, instanceDetails, waitTargetsReleased } from './instances.mjs';
 import { createStatus } from './status.mjs';
@@ -919,6 +920,7 @@ export function createController({
       const paused = (workloadId) => pauses === null || pauses.some((p) => p.workloadId === null || p.workloadId === workloadId);
       const listed = await store.listWorkloads();
       const configs = listed.configs.sort((a, b) => a.workloadId.localeCompare(b.workloadId));
+      await pingProxies(configs);
       // The schedules first, whatever the budget; pauses that cannot be read hold every scheduled nap and wake too.
       const keptAsleep = (workloadId) => pauses === null || pauses.some((p) => p.keepAsleep && (p.workloadId === null || p.workloadId === workloadId));
       const { applied, readable } = await applySchedules(configs, listed.schedules, (id) => ({ paused: paused(id), keepAsleep: keptAsleep(id) }), now());
@@ -1253,6 +1255,7 @@ export function createController({
     const own = (await describeStoredLists(store, ipLists)).map((l) => ({ ...l, source: TERRAFORM, refreshHours: ipLists.find((c) => c.name === l.name)?.refreshHours }));
     const managed = catalog ? await catalog.describe() : null;
     const routerSettings = await store.getRouterSettings?.().catch(() => null);
+    const kubeProxies = await store.getKubeProxies?.().catch(() => null);
     const manager = managerSettings ? await managerSettings.current().catch((err) => ({ hibernate: null, readAt: null, error: err.message })) : null;
     const lists = [...own, ...(managed?.lists ?? [])];
     const health = healthOf({
@@ -1262,6 +1265,7 @@ export function createController({
       ipLists: [...own, ...(managed?.lists ?? []).filter((l) => l.error && !l.pending).map(({ name, error }) => ({ name, error }))],
       catalogError: managed?.error ?? null,
       managerSettingsError: manager?.error ?? null,
+      kubeProxies: kubeProxies ?? {},
     });
     if (pausesError) {
       health.problems.push({ level: 'warning', code: 'pauses-unreadable', text: `pauses unreadable: ${pausesError}` });
@@ -1310,14 +1314,53 @@ export function createController({
   // Whether the router reaches a cluster and may do what Kubernetes workloads need (vision
   // docs/specs/2026-10-11-kubernetes-design.md, section 4), in a namespace.
   async function clusterCheck({ cluster, namespace = 'default' }) {
+    let k8s;
+    let proxy;
+    const reach = () => (k8s?.via ? { via: k8s.via, ...(proxy ? { proxy } : {}) } : {});
     try {
-      const missing = await checkRights(await kubernetesOf(cluster), namespace);
-      return { cluster, reachable: true, allowed: missing.length === 0, missing };
+      k8s = await kubernetesOf(cluster);
+      if (k8s.via === 'proxy') {
+        proxy = { name: k8s.proxy, version: null };
+        proxy.version = (await pingProxy((name, payload) => lambda.invoke(name, payload), k8s.proxy, { version: router.version })).version;
+      }
+      const missing = await checkRights(k8s, namespace);
+      return { cluster, reachable: true, allowed: missing.length === 0, missing, ...reach() };
     } catch (err) {
       if (err?.status === 401 || err?.status === 403) {
-        return { cluster, reachable: true, allowed: false, missing: [], reason: `the cluster does not know the router's role (no access entry, or not mapped in aws-auth): ${err.message}` };
+        return { cluster, reachable: true, allowed: false, missing: [], reason: `the cluster does not know the router's role (no access entry, or not mapped in aws-auth): ${err.message}`, ...reach() };
       }
-      return { cluster, reachable: false, allowed: false, missing: [], reason: err.message };
+      // Through a proxy a timeout is the cluster's security group (the proxy's own, never the router's): spec section 9.
+      const reason = k8s?.via === 'proxy' && err?.reason === 'Timeout' ? `the cluster security group must admit TCP 443 from the security group ${k8s.proxy}` : err.message;
+      return { cluster, reachable: false, allowed: false, missing: [], reason, ...reach() };
+    }
+  }
+
+  // The 5-minute check pings the proxy of each proxied cluster with workloads: it keeps the VPC function active (Lambda
+  // deactivates one unused for 14 days) and gives the router's health its state, ROUTER / KUBE-PROXIES, replaced whole.
+  // Nothing here fails the check.
+  async function pingProxies(configs) {
+    if (!store.putKubeProxies || !lambda?.invoke) return;
+    try {
+      const clusters = [...new Set(configs.map((cfg) => cfg.kubernetes?.cluster).filter(Boolean))].sort();
+      const answers = await Promise.all(clusters.map(async (cluster) => {
+        const at = now();
+        let name = null;
+        try {
+          const k8s = await kubernetesOf(cluster);
+          if (k8s.via !== 'proxy') return null;
+          name = k8s.proxy;
+          const { version } = await pingProxy((fn, payload) => lambda.invoke(fn, payload), name, { version: router.version });
+          return [cluster, { name, ok: true, version, at }];
+        } catch (err) {
+          // A cluster unreachable altogether (no proxy needed or possible) is the cluster check's to say.
+          if (!name && err?.reason !== 'NoProxy') return null;
+          log.warn('KubeProxyPingFailed', { cluster, proxy: name, reason: err?.reason, error: err?.message });
+          return [cluster, { name, ok: false, reason: err?.reason ?? 'ProxyFailed', message: String(err?.message ?? err).slice(0, 300), at }];
+        }
+      }));
+      await store.putKubeProxies(Object.fromEntries(answers.filter(Boolean)));
+    } catch (err) {
+      log.warn('KubeProxiesNotRecorded', { error: err.message });
     }
   }
 

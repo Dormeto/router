@@ -90,6 +90,8 @@ export function fakeStore({ config, run, clock }) {
     async getCheck() { return structuredClone(state.check ?? null); },
     async getHealth() { return structuredClone(state.health ?? null); },
     async putHealth(health) { state.health = structuredClone(health); },
+    async getKubeProxies() { return structuredClone(state.kubeProxies ?? {}); },
+    async putKubeProxies(item) { state.kubeProxies = structuredClone(item); },
     async getRouterSettings() { return structuredClone(state.routerSettings ?? null); },
     async putRouterSettings(item) { if (typeof item.hibernate === 'boolean') state.routerSettings = structuredClone(item); else delete state.routerSettings; },
     async getManagerSettings() { return structuredClone(state.managerSettings ?? null); },
@@ -548,7 +550,7 @@ export function fakeKubernetes({ owners = [], pods = [], nodes = [], scaledObjec
     return owner.kind === 'Deployment' ? ref?.kind === 'ReplicaSet' && ref.name === `${owner.metadata.name}-5d4f8` : ref?.kind === owner.kind && ref.name === owner.metadata.name;
   };
   return {
-    state,
+    state, via: 'direct',
     async get(path) {
       state.calls.push(['GET', path]);
       if (OWNER.test(path)) {

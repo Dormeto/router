@@ -8,7 +8,7 @@ import { asgGroup, ecsService, fakeAppScaling, fakeEcs, fakeKubernetes, fakeRds,
 import { dormetoIngress, weightsOf } from '../src/lib/kube-route.mjs';
 import { ROUTER_RULES } from '../src/lib/kube-access.mjs';
 
-function setup({ run, instance = 'running', target = 'app', healthy = 1, metric = [], metricAt = [], cfg = testConfig(), groups = [], services = [], databases, k8s, managerSettings = null } = {}) {
+function setup({ run, instance = 'running', target = 'app', healthy = 1, metric = [], metricAt = [], cfg = testConfig(), groups = [], services = [], databases, k8s, managerSettings = null, kubernetesOf, lambda = null } = {}) {
   const clock = fakeClock();
   const store = fakeStore({ config: cfg, run, clock });
   const ec2 = fakeEc2(cfg.instanceIds, { state: instance });
@@ -33,7 +33,7 @@ function setup({ run, instance = 'running', target = 'app', healthy = 1, metric 
   // managerSettings: a fake, or ({ store, clock }) → the real reader on this store (lib/manager-settings.mjs).
   const settings = typeof managerSettings === 'function' ? managerSettings({ store, clock }) : managerSettings;
   const handler = createController({
-    store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, kubernetesOf: k8s ? async () => k8s : undefined,
+    store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, kubernetesOf: kubernetesOf ?? (k8s ? async () => k8s : undefined), lambda,
     invokeSelf: async (payload) => { invocations.push(payload); }, now: clock.now, sleep: clock.sleep, newId: () => `wake-${++ids}`, log, managerSettings: settings,
   });
   return { handler, store, ec2, elbv2, cloudwatch, autoscaling, ecs, appscaling, rds, clock, cfg, invocations, log, settings };
@@ -1420,10 +1420,10 @@ test('clusterCheck: whether the router reaches a cluster and may do what Kuberne
   const k8s = fakeKubernetes();
   k8s.state.review = { resourceRules: ROUTER_RULES.filter((r) => !r.resources.includes('nodes')).map((r) => ({ apiGroups: [r.group], resources: r.resources, verbs: r.verbs })), incomplete: false };
   const s = setup({ run: { state: STATES.AWAKE }, k8s });
-  assert.deepEqual(await s.handler({ action: 'clusterCheck', cluster: 'eks-demo', namespace: 'demo' }), { cluster: 'eks-demo', reachable: true, allowed: false, missing: ['get nodes'] });
+  assert.deepEqual(await s.handler({ action: 'clusterCheck', cluster: 'eks-demo', namespace: 'demo' }), { cluster: 'eks-demo', reachable: true, allowed: false, missing: ['get nodes'], via: 'direct' });
   assert.deepEqual(k8s.state.calls.at(-1), ['REVIEW', 'demo']);
   k8s.state.review.resourceRules.push({ apiGroups: [''], resources: ['nodes'], verbs: ['get'] });
-  assert.deepEqual(await s.handler({ action: 'clusterCheck', cluster: 'eks-demo' }), { cluster: 'eks-demo', reachable: true, allowed: true, missing: [] });
+  assert.deepEqual(await s.handler({ action: 'clusterCheck', cluster: 'eks-demo' }), { cluster: 'eks-demo', reachable: true, allowed: true, missing: [], via: 'direct' });
   assert.deepEqual(k8s.state.calls.at(-1), ['REVIEW', 'default']);
 });
 
@@ -1432,11 +1432,11 @@ test('clusterCheck: a cluster without the router\'s access entry, or one it cann
   const s = setup({ run: { state: STATES.AWAKE }, k8s });
   k8s.state.reviewError = Object.assign(new Error('Unauthorized'), { name: 'KubernetesError', status: 401, reason: 'Unauthorized' });
   assert.deepEqual(await s.handler({ action: 'clusterCheck', cluster: 'eks-demo' }), {
-    cluster: 'eks-demo', reachable: true, allowed: false, missing: [], reason: 'the cluster does not know the router\'s role (no access entry, or not mapped in aws-auth): Unauthorized',
+    cluster: 'eks-demo', reachable: true, allowed: false, missing: [], reason: 'the cluster does not know the router\'s role (no access entry, or not mapped in aws-auth): Unauthorized', via: 'direct',
   });
   k8s.state.reviewError = Object.assign(new Error('GET /apis: no connection within 3000 ms'), { name: 'KubernetesError', status: 0, reason: 'Timeout' });
   assert.deepEqual(await s.handler({ action: 'clusterCheck', cluster: 'eks-demo' }), {
-    cluster: 'eks-demo', reachable: false, allowed: false, missing: [], reason: 'GET /apis: no connection within 3000 ms',
+    cluster: 'eks-demo', reachable: false, allowed: false, missing: [], reason: 'GET /apis: no connection within 3000 ms', via: 'direct',
   });
 });
 
@@ -1445,10 +1445,81 @@ test('clusterCheck: rights an EKS access policy gives (a review that cannot list
   k8s.state.review = { resourceRules: [{ apiGroups: ['authorization.k8s.io'], resources: ['selfsubjectrulesreviews'], verbs: ['create'] }], incomplete: true };
   k8s.state.allow = ({ verb, resource }) => !(verb === 'get' && resource === 'nodes');
   const s = setup({ run: { state: STATES.AWAKE }, k8s });
-  assert.deepEqual(await s.handler({ action: 'clusterCheck', cluster: 'eks-demo', namespace: 'demo' }), { cluster: 'eks-demo', reachable: true, allowed: false, missing: ['get nodes'] });
+  assert.deepEqual(await s.handler({ action: 'clusterCheck', cluster: 'eks-demo', namespace: 'demo' }), { cluster: 'eks-demo', reachable: true, allowed: false, missing: ['get nodes'], via: 'direct' });
   const asked = k8s.state.calls.filter(([what]) => what === 'ACCESS').map(([, a]) => a);
   assert.deepEqual(asked.find((a) => a.resource === 'deployments' && a.subresource === 'scale' && a.verb === 'patch'), { namespace: 'demo', verb: 'patch', group: 'apps', resource: 'deployments', subresource: 'scale' });
   assert.equal(asked.find((a) => a.resource === 'nodes').namespace, undefined, 'nodes belong to no namespace');
+});
+
+// Clusters reached through a proxy function (vision docs/specs/2026-10-24-private-eks-endpoints-design.md, sections 5, 8, 9).
+const viaProxy = (k8s, proxy = 'dmt-kube-eks-demo') => Object.assign(k8s, { via: 'proxy', proxy });
+const proxyLambda = (answers = {}) => {
+  const calls = [];
+  return {
+    calls,
+    async getAccountSettings() { return { AccountLimit: { ConcurrentExecutions: 1000 } }; },
+    async invoke(name, payload) {
+      calls.push([name, payload]);
+      const answer = answers[name] ?? { v: 1, version: '0.33.0', cluster: name.replace('dmt-kube-', '') };
+      if (answer instanceof Error) throw answer;
+      return answer;
+    },
+  };
+};
+
+test('clusterCheck: a proxied cluster says so with its proxy and version', async () => {
+  const lambda = proxyLambda();
+  const s = setup({ run: { state: STATES.AWAKE }, k8s: viaProxy(fakeKubernetes()), lambda });
+  const check = await s.handler({ action: 'clusterCheck', cluster: 'eks-demo' });
+  assert.deepEqual(check, { cluster: 'eks-demo', reachable: true, allowed: check.allowed, missing: check.missing, via: 'proxy', proxy: { name: 'dmt-kube-eks-demo', version: '0.33.0' } });
+  assert.deepEqual(lambda.calls[0], ['dmt-kube-eks-demo', { v: 1, ping: true }]);
+});
+
+test('clusterCheck: a proxied Timeout is the cluster security group not admitting the proxy', async () => {
+  const k8s = viaProxy(fakeKubernetes());
+  k8s.state.reviewError = Object.assign(new Error('POST /apis: no connection within 3000 ms'), { name: 'KubernetesError', status: 0, reason: 'Timeout' });
+  const s = setup({ run: { state: STATES.AWAKE }, k8s, lambda: proxyLambda() });
+  const check = await s.handler({ action: 'clusterCheck', cluster: 'eks-demo' });
+  assert.equal(check.reachable, false);
+  assert.equal(check.reason, 'the cluster security group must admit TCP 443 from the security group dmt-kube-eks-demo');
+  assert.equal(check.via, 'proxy');
+});
+
+test('the check pings the proxy of each proxied cluster with workloads once, and records the answers', async () => {
+  const lambda = proxyLambda({ 'dmt-kube-c-bad': Object.assign(new Error('not found'), { name: 'ResourceNotFoundException' }) });
+  const clients = {
+    'c-one': viaProxy(fakeKubernetes(), 'dmt-kube-c-one'), 'c-bad': viaProxy(fakeKubernetes(), 'dmt-kube-c-bad'), 'c-direct': Object.assign(fakeKubernetes(), { via: 'direct' }),
+  };
+  const s = setup({ run: { state: STATES.AWAKE }, lambda, kubernetesOf: async (cluster) => clients[cluster] });
+  const at = (cluster, id) => k8sConfig({ cluster }, { workloadId: id });
+  const configs = [at('c-one', 'a'), at('c-one', 'b'), at('c-bad', 'c'), at('c-direct', 'd'), testConfig({ workloadId: 'e' })];
+  s.store.listConfigs = async () => structuredClone(configs);
+  await s.handler({ action: 'check' });
+  assert.deepEqual(lambda.calls.map(([name]) => name).sort(), ['dmt-kube-c-bad', 'dmt-kube-c-one']);
+  const kept = s.store.state.kubeProxies;
+  assert.deepEqual(Object.keys(kept).sort(), ['c-bad', 'c-one']);
+  assert.deepEqual(kept['c-one'], { name: 'dmt-kube-c-one', ok: true, version: '0.33.0', at: s.clock.now() });
+  assert.equal(kept['c-bad'].ok, false);
+  assert.equal(kept['c-bad'].reason, 'NoProxy');
+  assert.equal(kept['c-bad'].name, 'dmt-kube-c-bad');
+});
+
+test('the check: a cluster no longer with workloads leaves the record, a failing ping never fails the check', async () => {
+  const lambda = proxyLambda({ 'dmt-kube-c-one': new Error('boom') });
+  const s = setup({ run: { state: STATES.AWAKE }, lambda, kubernetesOf: async () => viaProxy(fakeKubernetes(), 'dmt-kube-c-one') });
+  s.store.state.kubeProxies = { gone: { name: 'dmt-kube-gone', ok: false, reason: 'NoProxy', at: 1 } };
+  s.store.listConfigs = async () => [k8sConfig({ cluster: 'c-one' })];
+  const result = await s.handler({ action: 'check' });
+  assert.ok(Array.isArray(result));
+  assert.deepEqual(Object.keys(s.store.state.kubeProxies), ['c-one']);
+  assert.equal(s.store.state.kubeProxies['c-one'].ok, false);
+});
+
+test('router status: a recorded failed ping is a health warning naming the cluster', async () => {
+  const s = setup({ run: { state: STATES.AWAKE } });
+  s.store.state.kubeProxies = { 'c-bad': { name: 'dmt-kube-c-bad', ok: false, reason: 'ProxyNotReady', message: 'the proxy is becoming active again', at: s.clock.now() } };
+  const { health } = await s.handler({ action: 'router' });
+  assert.ok(health.problems.some((p) => p.code === 'kube-proxy:c-bad' && p.text.startsWith('cluster c-bad: its proxy dmt-kube-c-bad ')));
 });
 
 // Drift (vision docs/specs/2026-10-11-kubernetes-design.md, section 8): Kubernetes changes do not reach CloudTrail, the

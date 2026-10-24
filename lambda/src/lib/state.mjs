@@ -377,6 +377,19 @@ export function createStore({ dynamo, table, now = Date.now, log = null }) {
       });
     },
 
+    // The proxies' last pings (private EKS endpoints design §5): ROUTER / KUBE-PROXIES {<cluster>: {name, ok, version?, reason?, message?, at}}.
+    async getKubeProxies() {
+      const { Item } = await dynamo.getItem({ TableName: table, Key: { pk: { S: 'ROUTER' }, sk: { S: 'KUBE-PROXIES' } }, ConsistentRead: true });
+      return Item?.kubeProxies?.S ? JSON.parse(Item.kubeProxies.S) : {};
+    },
+    async putKubeProxies(proxies) {
+      await dynamo.updateItem({
+        TableName: table, Key: { pk: { S: 'ROUTER' }, sk: { S: 'KUBE-PROXIES' } },
+        UpdateExpression: 'SET #kubeProxies = :kubeProxies', ExpressionAttributeNames: { '#kubeProxies': 'kubeProxies' },
+        ExpressionAttributeValues: { ':kubeProxies': { S: JSON.stringify(proxies) } },
+      });
+    },
+
     // The router's own settings (hibernation design §3): ROUTER / SETTINGS {hibernate, by, at}; no hibernate: unset, no item.
     async getRouterSettings() {
       const { Item } = await dynamo.getItem({ TableName: table, Key: { pk: { S: 'ROUTER' }, sk: { S: 'SETTINGS' } }, ConsistentRead: true });

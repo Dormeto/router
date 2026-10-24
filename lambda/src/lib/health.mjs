@@ -55,9 +55,22 @@ const QUEUES = {
   controller: 'controller-failures queue: naps or wakes that failed in their own invocation',
 };
 
+// What a failed ping of a cluster's proxy says (private EKS endpoints design, sections 8 and 9), and what to do.
+function proxyProblem({ name, reason, message }) {
+  const proxy = name ? `its proxy ${name}` : 'its proxy';
+  switch (reason) {
+    case 'Stale': return `${proxy} has a stale endpoint: set up its access again (manager: cluster access; Terraform: apply the module kubernetes-proxy)`;
+    case 'NoProxy': return `${proxy} is not set up: upgrade the router or set up its cluster access (Terraform: module kubernetes-proxy)`;
+    case 'ProxyNotReady': return `${proxy} is not active (unused for 14 days): it becomes active again within minutes`;
+    case 'Timeout':
+    case 'Network': return `${proxy} did not reach the cluster: the cluster security group must admit TCP 443 from the security group ${name ?? 'of the proxy'}`;
+    default: return `${proxy} failed: ${message ?? reason}`;
+  }
+}
+
 // { status: ok | warning | error, problems: [{ level, code, text }] }: only a late idle check is an error (no nap
 // happens). The code is stable whatever the figures in the text: the manager's alarms open and resolve on it.
-export function healthOf({ checkSchedule, lastScheduledCheckAt, now, lambda = {}, queues = {}, ipLists = [], catalogError = null, managerSettingsError = null, failed = 0, concurrency = null }) {
+export function healthOf({ checkSchedule, lastScheduledCheckAt, now, lambda = {}, queues = {}, ipLists = [], catalogError = null, managerSettingsError = null, failed = 0, concurrency = null, kubeProxies = {} }) {
   const problems = [];
   const warn = (code, text) => problems.push({ level: 'warning', code, text });
   if (checkLate(checkSchedule, lastScheduledCheckAt, now)) {
@@ -83,6 +96,7 @@ export function healthOf({ checkSchedule, lastScheduledCheckAt, now, lambda = {}
   }
   if (catalogError) warn('ip-lists-catalog', `IP lists catalog of the manager: ${catalogError}`);
   if (managerSettingsError) warn('manager-settings-unreadable', `manager settings unreadable: ${managerSettingsError}`);
+  for (const [cluster, ping] of Object.entries(kubeProxies ?? {})) if (ping?.ok === false) warn(`kube-proxy:${cluster}`, `cluster ${cluster}: ${proxyProblem(ping)}`);
   if (failed > 0) warn('failed-workloads', `${count(failed, 'failed workload')}`);
   // A region the account barely uses can be limited to 10 concurrent executions: held requests beyond it get errors. The
   // limit is shared by every function of the account: a warning once the router can need more than 80% of it.

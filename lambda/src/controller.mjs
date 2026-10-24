@@ -64,7 +64,8 @@ export const handler = createController({
   tagging: createTagging(),
   appscaling: createAppScaling(),
   rds: createRds(),
-  kubernetesOf: kubernetesConnector({ eks, region: process.env.AWS_REGION }),
+  // Private clusters through their proxy functions, <name>-kube-<cluster> (DMT_KUBE_PROXY_PREFIX).
+  kubernetesOf: kubernetesConnector({ eks, region: process.env.AWS_REGION, lambda, proxyPrefix: process.env.DMT_KUBE_PROXY_PREFIX, version: process.env.DMT_VERSION }),
   // Lambda sets AWS_LAMBDA_FUNCTION_NAME: the controller fans naps out to itself.
   invokeSelf: (payload) => lambda.invokeAsync(process.env.AWS_LAMBDA_FUNCTION_NAME, payload),
   sleep,

@@ -19,7 +19,18 @@ test('every SDK client of the router is created with a bounded request handler',
       if (inline) for (const key of ['connectionTimeout', 'requestTimeout', 'socketTimeout', 'throwOnRequestTimeout: true']) assert.match(inline, new RegExp(key), `${file}: ${key}`);
     }
   }
-  assert.equal(clients, 14, 'one client per AWS service the router calls');
+  assert.equal(clients, 15, 'one client per AWS service the router calls, and one for the synchronous invocations of the Kubernetes proxies');
+});
+
+test('a proxy\'s synchronous invocation waits beyond the proxy\'s 15-second timeout: its own Timeout answer comes back, not a silent socket the SDK would retry', async () => {
+  const text = await readFile(`${AWS}lambda.mjs`, 'utf8');
+  const handlers = [...text.matchAll(/new LambdaClient\(\{ requestHandler: \{([^}]*)\} \}\)/g)].map((m) => m[1]);
+  assert.equal(handlers.length, 1);
+  for (const key of ['connectionTimeout', 'requestTimeout', 'socketTimeout']) {
+    const ms = Number(new RegExp(`${key}: ([\\d_]+)`).exec(handlers[0])?.[1].replaceAll('_', ''));
+    assert.ok(key === 'connectionTimeout' ? ms === 3_000 : ms > 15_000 && ms <= 30_000, `${key}: ${ms}`);
+  }
+  assert.match(text, /invoke: async \(functionName, payload\) => \{[^]*?proxies\(\)\.send\(new InvokeCommand/);
 });
 
 test('the bound fails a silent connection in seconds, in every SDK version the Lambda runtime may bundle', async () => {

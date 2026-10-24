@@ -15,6 +15,8 @@ import { createStore } from './lib/state.mjs';
 const getEks = memoizeAsync(() => import('./aws/eks.mjs').then(({ createEks }) => createEks()));
 const eks = { describeCluster: async (input) => (await getEks()).describeCluster(input), credentials: async () => (await getEks()).credentials() };
 
+const lambda = createLambda();
+
 // Onboarding of workloads, invoked synchronously by the manager (its own role: it changes customer rules and tags).
 const onboarding = createOnboarding({
   elbv2: createElbv2(),
@@ -22,8 +24,9 @@ const onboarding = createOnboarding({
   autoscaling: createAutoScaling(),
   ecs: createEcs(),
   rds: createRds(),
-  lambda: createLambda(),
-  kubernetesOf: kubernetesConnector({ eks, region: process.env.AWS_REGION }),
+  lambda,
+  // Private clusters through their proxy functions, <name>-kube-<cluster> (DMT_KUBE_PROXY_PREFIX).
+  kubernetesOf: kubernetesConnector({ eks, region: process.env.AWS_REGION, lambda, proxyPrefix: process.env.DMT_KUBE_PROXY_PREFIX, version: process.env.DMT_VERSION }),
   store: createStore({ dynamo: createDynamo(), table: process.env.DMT_TABLE, log: logger }),
   router: {
     name: (process.env.DMT_TG_PREFIX ?? '').replace(/-$/, ''),

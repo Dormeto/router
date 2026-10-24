@@ -39,6 +39,25 @@ test('the waker and the controller read the manager\'s lists when the router has
   assert.match(await readFile(`${SRC}aws/s3.mjs`, 'utf8'), /notModified: true/);
 });
 
+test('the Kubernetes proxies are invoked synchronously: the parsed answer, a function error thrown (private EKS endpoints)', async () => {
+  const adapter = await readFile(`${SRC}aws/lambda.mjs`, 'utf8');
+  const invoke = /\binvoke: async \(functionName, payload\) => \{[\s\S]*?\n {4}\},/.exec(adapter)?.[0];
+  assert.ok(invoke, 'createLambda().invoke(functionName, payload)');
+  assert.match(invoke, /InvocationType: 'RequestResponse'/);
+  assert.match(invoke, /JSON\.parse\(/);
+  assert.match(invoke, /if \(out\.FunctionError\) throw /);
+});
+
+test('the controller, the waker and the onboarder reach private clusters through their proxies (DMT_KUBE_PROXY_PREFIX)', async () => {
+  for (const entry of ['controller.mjs', 'waker.mjs', 'onboarder.mjs']) {
+    const text = await readFile(`${SRC}${entry}`, 'utf8');
+    const connector = /kubernetesConnector\(\{[^}]*\}\)/.exec(text)?.[0] ?? '';
+    assert.match(connector, /\blambda\b/, entry);
+    assert.match(connector, /proxyPrefix: process\.env\.DMT_KUBE_PROXY_PREFIX/, entry);
+    assert.match(connector, /version: process\.env\.DMT_VERSION/, entry);
+  }
+});
+
 test('the ELB clients retry adaptively: they slow down under throttling instead of failing (scale design §6)', async () => {
   const adapter = await readFile(`${SRC}aws/elbv2.mjs`, 'utf8');
   assert.match(adapter, /new ElasticLoadBalancingV2Client\(\{[^}]*retryMode: 'adaptive'[^}]*maxAttempts: \d+/);

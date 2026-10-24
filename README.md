@@ -288,8 +288,11 @@ refuses becomes a stop, so it never fails a nap.
 - **Levels, the most specific set wins:** (1) the workload's `hibernate` (`true` or `false`); (2) otherwise, a workload
   with `fallback_instance_types` does not hibernate (a hibernated instance cannot change type, so the inherited default
   would silently disable the fallback that guarantees its wakes; `hibernate = true` on the workload accepts that trade);
-  (3) the router's setting (`true`, `false` or unset); (4) the manager's default (`true` when never set); (5) a router
-  that cannot read the manager's settings uses `true`, the built-in default.
+  (3) the router's setting (`true`, `false` or unset); (4) the manager's default (`true` when never set), as the router
+  last read it; (5) a router without `ip_lists_catalog` uses `true`, the built-in default, while a router that has not
+  read the manager's settings yet (just upgraded, before its first check), or whose reads keep failing, stops plainly
+  until a read succeeds (logged `HibernationLevelUnreadable`; its health warns while the reads fail), so that an
+  administrator's "off" holds from the first nap after an upgrade.
 - **Where each is set:** the workload's in the `workload` module (`hibernate`, `bool`, default `null`: inherit; the key is
   written to the configuration only when set, so an apply never writes `false` by default) or at onboarding (setting
   `hibernate`), and afterwards from the manager for the workloads it onboarded (a Terraform workload's is refused:
@@ -298,11 +301,11 @@ refuses becomes a stop, so it never fails a nap.
   state table at `ROUTER / SETTINGS` like a pause); the default for every router from the manager's Routers view or
   `dormeto settings set --hibernate true|false`, published as `settings.json` beside the IP lists catalog
   (`ip_lists_catalog`), which the routers already read. A router without `ip_lists_catalog` reads no manager settings
-  and uses the built-in default.
+  and ignores the manager's default: set its router level instead.
 - **The routers' pickup:** each router's check reads `settings.json` with a conditional GET at most every 5 minutes and
   keeps the last value in its state table (`ROUTER / MANAGER-SETTINGS`), so a nap reads the table and never S3. A missing
-  object means never set (`true`). An unreadable or invalid one keeps the last value read and shows a warning in the
-  router's details and health.
+  object means never set (`true`). An unreadable or invalid one keeps the last value read (with none read yet, the
+  manager's level stays unknown and the naps stop plainly) and shows a warning in the router's details and health.
 - **A level that cannot be read at a nap is a plain stop** (logged `HibernationLevelUnreadable`), even for a workload set
   `hibernate: true`: the record that could not be read may be an administrator's "off".
 - **What a nap does:** hibernated instances go in one `StopInstances` call with `Hibernate`, the others in one plain call.
@@ -313,13 +316,14 @@ refuses becomes a stop, so it never fails a nap.
 - **59 days, then a fresh boot:** AWS does not support an instance hibernated for more than 60 days. A workload
   hibernated for 59 days is woken for maintenance (cause `maintenance`), whether it has a schedule or not, and the nap
   after that wake stops instead of hibernating, so its next wake boots afresh (AWS: start, stop, start). Any wake that
-  completes 59 days or more after the hibernation does the same, whatever caused it. A schedule's shorter `maxNapDays`
-  wakes it earlier, and a `keepAsleep` pause holds the maintenance wake. `status` gives `maintenanceDue` as the earlier of
-  the two.
+  completes 59 days or more after the hibernation does the same, whatever caused it, and so does a start outside Dormeto
+  that the check finds. A schedule's shorter `maxNapDays` wakes it earlier, and a `keepAsleep` pause holds the
+  maintenance wake. `status` gives `maintenanceDue` as the earlier of the two.
 - **Never hibernated:** instances of an Auto Scaling group, of ECS or of a Kubernetes node group, databases, instances
   launched without hibernation, instances running on a fallback type (stopped so they get their own type back), instances
   of a run that asks for a fresh boot, and everything when the resolution says `false`. `status` answers `hibernation`
-  (the resolution and where it comes from, each level, the instances that can hibernate, `freshBoot`).
+  (the resolution and where it comes from, each level, the instances that can hibernate, `freshBoot`; `unknown: true`
+  with `false` from the manager while its level decides but has not been read yet).
 - **Access: nothing to apply again.** `ec2:StopInstances` and `ec2:DescribeInstances` were already granted, and the routers
   already read the catalog's prefix.
 

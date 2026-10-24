@@ -87,12 +87,19 @@ export function createKubeProxy({ env, request = httpsRequest, timeouts = TIMEOU
     }, (res) => {
       const chunks = [];
       let size = 0;
+      let tooLarge;
       res.on('data', (chunk) => {
         size += chunk.length;
-        if (size > LIMITS.answer) return req.destroy(new Failure('TooLarge', `${where}: the answer exceeds ${LIMITS.answer} bytes`));
+        if (tooLarge) return;
+        if (size > LIMITS.answer) {
+          tooLarge = new Failure('TooLarge', `${where}: the answer exceeds ${LIMITS.answer} bytes`);
+          return req.destroy(tooLarge);
+        }
         chunks.push(chunk);
       });
-      res.on('error', (err) => req.destroy(err));
+      // A cut in the middle of the answer reaches only the response: the request is already destroyed, and no idle timer
+      // fires on a closed socket.
+      res.on('error', (err) => reject(tooLarge ?? new Failure('Network', `${where}: ${err.code ?? 'connection failed'}`)));
       res.on('end', () => resolve({ v: PROTOCOL, status: res.statusCode, contentType: res.headers['content-type'], body: Buffer.concat(chunks).toString() }));
     });
     req.on('socket', (socket) => {
@@ -150,10 +157,15 @@ export function createKubeProxy({ env, request = httpsRequest, timeouts = TIMEOU
 
     const started = Date.now();
     const problem = misconfigured();
-    const checked = problem ? { answer: failed('Refused', `the proxy is not configured: ${problem}`) } : check(event);
+    let checked;
+    try {
+      checked = problem ? { answer: failed('Refused', `the proxy is not configured: ${problem}`) } : check(event);
+    } catch {
+      checked = { answer: failed('Refused', 'the request is not allowed') }; // e.g. a path that is not a URL
+    }
     const done = (answer) => {
       log('KubeProxyCall', {
-        method: String(event.method).slice(0, 20), path: typeof event.path === 'string' ? event.path.split(/[?#]/)[0] : undefined,
+        method: String(event.method).slice(0, 20), path: typeof event.path === 'string' ? event.path.split(/[?#]/)[0].slice(0, 200) : undefined,
         status: answer.status, ...(answer.reason ? { reason: answer.reason } : {}), ms: Date.now() - started,
       });
       return answer;

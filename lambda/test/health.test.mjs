@@ -307,7 +307,9 @@ test('healthOf: a failed proxy ping is a warning naming the cluster, its proxy a
   assert.deepEqual(text(bad('NoProxy')), [['warning', 'kube-proxy:c-1', "cluster c-1: its proxy dmt-kube-c-1 is not set up: upgrade the router or set up its cluster access (Terraform: module kubernetes-proxy)"]]);
   assert.equal(text(bad('ProxyNotReady'))[0][2], 'cluster c-1: its proxy dmt-kube-c-1 is not active (unused for 14 days): it becomes active again within minutes');
   for (const reason of ['Timeout', 'Network']) {
-    assert.equal(text(bad(reason))[0][2], 'cluster c-1: its proxy dmt-kube-c-1 did not reach the cluster: the cluster security group must admit TCP 443 from the security group dmt-kube-c-1');
+    assert.equal(text(bad(reason))[0][2], 'cluster c-1: its proxy dmt-kube-c-1 did not reach the cluster: the cluster security group must admit TCP 443 from the proxy\'s security group (dmt-kube-c-1 unless security_group_ids were given)');
   }
+  assert.equal(text(bad('NetworkInterfaces', 'There are not enough free IP addresses in the subnets'))[0][2],
+    "cluster c-1: its proxy dmt-kube-c-1's network interfaces could not be created: There are not enough free IP addresses in the subnets; free addresses in the cluster's subnets (or fix its subnets and security groups), then set up its access again");
   assert.equal(text(bad('Throttled', 'throttled by Lambda'))[0][2], 'cluster c-1: its proxy dmt-kube-c-1 failed: throttled by Lambda');
 });

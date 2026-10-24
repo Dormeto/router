@@ -1486,7 +1486,7 @@ test('clusterCheck: a proxied Timeout is the cluster security group not admittin
   const s = setup({ run: { state: STATES.AWAKE }, k8s, lambda: proxyLambda() });
   const check = await s.handler({ action: 'clusterCheck', cluster: 'eks-demo' });
   assert.equal(check.reachable, false);
-  assert.equal(check.reason, 'the cluster security group must admit TCP 443 from the security group dmt-kube-eks-demo');
+  assert.equal(check.reason, 'the cluster security group must admit TCP 443 from the proxy\'s security group (dmt-kube-eks-demo unless security_group_ids were given)');
   assert.equal(check.via, 'proxy');
 });
 
@@ -1521,7 +1521,7 @@ test('the check records a Stale and a Timeout from real pings: a recreated clust
   const texts = health.problems.filter((p) => p.code.startsWith('kube-proxy:')).map((p) => p.text);
   assert.equal(texts.length, 3);
   assert.ok(texts.some((t) => t.startsWith('cluster c-old: its proxy dmt-kube-c-old has a stale endpoint: set up its access again')));
-  assert.ok(texts.some((t) => t.includes('cluster c-sg: its proxy dmt-kube-c-sg did not reach the cluster: the cluster security group must admit TCP 443 from the security group dmt-kube-c-sg')));
+  assert.ok(texts.some((t) => t.includes('cluster c-sg: its proxy dmt-kube-c-sg did not reach the cluster: the cluster security group must admit TCP 443 from the proxy\'s security group (dmt-kube-c-sg unless security_group_ids were given)')));
 });
 
 test('the check pings after the schedules and the hibernation pass, and skips the pings its budget no longer allows', async () => {

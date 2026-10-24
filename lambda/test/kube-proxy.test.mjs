@@ -354,3 +354,44 @@ test('a ping validates the configuration as any call does', async () => {
   assert.equal(answer.reason, 'Refused');
   assert.match(answer.message, /^the proxy is not configured: /);
 });
+
+// Headers and half a body, then the server destroys the socket: only the response sees the failure.
+const CUTS = {
+  'content-length': (res) => { res.writeHead(200, { 'content-type': 'application/json', 'content-length': 1000 }); res.write('x'.repeat(500)); },
+  chunked: (res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.write('x'.repeat(500)); },
+  'close-delimited': (res) => { res.useChunkedEncodingByDefault = false; res.writeHead(200, { 'content-type': 'application/json', connection: 'close' }); res.write('x'.repeat(500)); },
+};
+for (const [kind, start] of Object.entries(CUTS)) {
+  test(`a connection cut in the middle of an answer (${kind}) is a Network failure within the idle bound`, async () => {
+    const api = await apiServer((req, body, res) => { start(res); setTimeout(() => (kind === 'close-delimited' ? res.socket._parent.resetAndDestroy() : res.socket.destroy()), 50); });
+    try {
+      const { proxy } = proxyFor(api.endpoint, { timeouts: { connect: 1000, idle: 2000 } });
+      const started = Date.now();
+      const answer = await proxy(get(api.endpoint));
+      assert.equal(answer.reason, 'Network');
+      assert.equal(answer.status, 0);
+      assert.ok(Date.now() - started < 1500, `took ${Date.now() - started} ms`);
+    } finally { await api.close(); }
+  });
+}
+
+test('a path that is not a URL is Refused, not a failed invocation', async () => {
+  const api = await apiServer(json(200, {}));
+  try {
+    const { proxy, logs } = proxyFor(api.endpoint);
+    const answer = await proxy(get(api.endpoint, { path: '//a b/api/v1' }));
+    assert.equal(answer.reason, 'Refused');
+    assert.equal(answer.status, 0);
+    assert.equal(api.seen.length, 0);
+    assert.equal(logs.length, 1);
+  } finally { await api.close(); }
+});
+
+test('the logged path is cut to 200 characters', async () => {
+  const api = await apiServer(json(200, {}));
+  try {
+    const { proxy, logs } = proxyFor(api.endpoint);
+    await proxy(get(api.endpoint, { path: `/api/v1/${'a'.repeat(500)}` }));
+    assert.equal(logs[0].path.length, 200);
+  } finally { await api.close(); }
+});

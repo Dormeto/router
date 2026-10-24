@@ -336,6 +336,9 @@ test('through the proxy, an invocation that fails says what to do: no proxy (nam
     const invoke = fakeInvoke(() => awsError(name, 'Function not found: arn:aws:lambda:eu-west-1:123456789012:function:dmtr-dev-kube-eks-demo'));
     await assert.rejects(proxied(invoke).get('/api/v1/pods'), { name: 'KubernetesError', status: 0, reason, message });
   }
+  for (const name of ['SubnetIPAddressLimitReachedException', 'ENILimitReachedException', 'EC2ThrottledException', 'EC2AccessDeniedException', 'InvalidSubnetIDException', 'InvalidSecurityGroupIDException', 'ResourceConflictException']) {
+    await assert.rejects(proxied(fakeInvoke(() => awsError(name, 'Lambda says why'))).get('/api/v1/pods'), { name: 'KubernetesError', status: 0, reason: 'NetworkInterfaces', message: 'Lambda says why' });
+  }
   const denied = fakeInvoke(() => awsError('AccessDeniedException', 'User: arn:aws:sts::123456789012:assumed-role/r/s is not authorized to perform: lambda:InvokeFunction'));
   await assert.rejects(proxied(denied).get('/api/v1/pods'), (err) => err instanceof KubernetesError && err.status === 0
     && err.reason === 'AccessDeniedException' && err.message.includes('dmtr-dev-kube-eks-demo') && err.message.includes('lambda:InvokeFunction'));
@@ -534,3 +537,20 @@ test('review: a cluster limited after onboarding moves to its proxy once its vie
   assert.equal(client.via, 'proxy');
   await assert.rejects(client.get('/apis/apps/v1/namespaces/demo/deployments/web'), { reason: 'NoProxy', message: /its proxy dmtr-dev-kube-eks-demo is not set up/ });
 });
+
+// Headers and half a body, then the server destroys the socket: only the response sees the failure.
+const CUTS = {
+  'content-length': (res) => { res.writeHead(200, { 'content-length': 1000 }); res.write('x'.repeat(500)); },
+  chunked: (res) => { res.writeHead(200); res.write('x'.repeat(500)); },
+  'close-delimited': (res) => { res.useChunkedEncodingByDefault = false; res.writeHead(200, { connection: 'close' }); res.write('x'.repeat(500)); },
+};
+for (const [kind, start] of Object.entries(CUTS)) {
+  test(`a connection cut in the middle of an answer (${kind}) fails the call within the idle bound`, async (t) => {
+    const api = await apiServer((req, body, res) => { start(res); setTimeout(() => (kind === 'close-delimited' ? res.socket._parent.resetAndDestroy() : res.socket.destroy()), 50); });
+    t.after(api.close);
+    const k8s = createKubernetes({ endpoint: api.endpoint, ca, token: 't', timeouts: { connect: 1_000, idle: 2_000 } });
+    const started = Date.now();
+    await assert.rejects(k8s.get('/api/v1/pods'), (err) => err.name === 'KubernetesError' && err.status === 0 && err.reason !== 'Timeout');
+    assert.ok(Date.now() - started < 1_500, `took ${Date.now() - started} ms`);
+  });
+}

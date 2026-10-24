@@ -38,6 +38,10 @@ tfenv exec plan -out dev-eks.tfplan        # read it
 tfenv exec apply dev-eks.tfplan            # the user's go-ahead
 ```
 
+**From scratch**, the proxy module's egress rules read the cluster's VPC at plan time, so a plan that also creates the
+cluster fails. Apply in two steps: first `tfenv exec plan -var dormeto_router=null -out dev-eks.tfplan` (or
+`-target=module.eks`) and apply it, then the full plan and apply above.
+
 From the vision repository, `dormeto-e2e cluster start` (`--lone-ingress`, `--target-group-binding`) and `dormeto-e2e
 cluster stop` run the same plans and apply them once you confirm; `stop` refuses while routers still nap workloads of
 the cluster, and checks what is left after the destroy.

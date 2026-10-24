@@ -92,7 +92,8 @@ function httpsTransport({ endpoint, ca, cert, key, request, timeouts }) {
     }, (res) => {
       const chunks = [];
       res.on('data', (chunk) => chunks.push(chunk));
-      res.on('error', (err) => req.destroy(err));
+      // A cut in the middle of the answer reaches only the response: the request is already destroyed.
+      res.on('error', (err) => reject(new KubernetesError(0, err.code ?? 'Network', `${where}: ${err.message}`)));
       res.on('end', () => resolve({ status: res.statusCode, contentType: res.headers['content-type'], body: Buffer.concat(chunks).toString() }));
     });
     req.on('socket', (socket) => {
@@ -180,6 +181,10 @@ const INVOKE_FAILURES = {
   ResourceNotFoundException: ['NoProxy', noProxy],
   // Lambda deactivates a VPC function unused for 14 days; its next invocations fail while its interfaces come back.
   ResourceNotReadyException: ['ProxyNotReady', (name) => `the proxy ${name} is becoming active again (unused for 14 days): retry in a minute`],
+  // The proxy's network interfaces could not be created (or its function is Failed for it): the message is Lambda's reason.
+  ...Object.fromEntries(['SubnetIPAddressLimitReachedException', 'ENILimitReachedException', 'EC2ThrottledException', 'EC2AccessDeniedException',
+    'InvalidSubnetIDException', 'InvalidSecurityGroupIDException', 'ResourceConflictException']
+    .map((name) => [name, ['NetworkInterfaces', (fn, err) => String(err?.message ?? name).slice(0, 300)]])),
   // After the SDK's retries.
   TooManyRequestsException: ['Throttled', (name) => `the proxy ${name} was throttled (the account's Lambda concurrency)`],
 };
@@ -191,7 +196,7 @@ async function invokeProxy({ invoke, functionName, version }, payload, where) {
     answer = await invoke(functionName, payload);
   } catch (err) {
     const [reason, message] = INVOKE_FAILURES[err?.name] ?? [];
-    if (reason) throw new KubernetesError(0, reason, message(functionName));
+    if (reason) throw new KubernetesError(0, reason, message(functionName, err));
     throw new KubernetesError(0, err?.name && err.name !== 'Error' ? err.name : 'ProxyFailed',
       `${where}: the proxy ${functionName} failed: ${String(err?.message ?? err).slice(0, 300)}`);
   }

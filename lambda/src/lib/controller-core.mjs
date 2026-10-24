@@ -1330,7 +1330,7 @@ export function createController({
         return { cluster, reachable: true, allowed: false, missing: [], reason: `the cluster does not know the router's role (no access entry, or not mapped in aws-auth): ${err.message}`, ...reach() };
       }
       // Through a proxy a timeout is the cluster's security group (the proxy's own, never the router's): spec section 9.
-      const reason = k8s?.via === 'proxy' && err?.reason === 'Timeout' ? `the cluster security group must admit TCP 443 from the security group ${k8s.proxy}` : err.message;
+      const reason = k8s?.via === 'proxy' && err?.reason === 'Timeout' ? `the cluster security group must admit TCP 443 from the proxy's security group (${k8s.proxy} unless security_group_ids were given)` : err.message;
       return { cluster, reachable: false, allowed: false, missing: [], reason, ...reach() };
     }
   }

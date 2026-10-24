@@ -93,6 +93,15 @@ resource "aws_security_group" "proxy" {
   description = "Dormeto Kubernetes proxy of cluster ${var.cluster_name}"
   vpc_id      = local.vpc.vpc_id
   tags        = local.tags
+
+  # Lambda can take longer than the provider's default to release the function's network interfaces (the manager waits an
+  # hour); a cluster recreated in another VPC under the same name needs the new group first (names are unique per VPC).
+  timeouts {
+    delete = "60m"
+  }
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 resource "aws_vpc_security_group_egress_rule" "proxy" {

@@ -8,7 +8,7 @@
   },
   "scripts": {
     "test": "node --test \"lambda/test/*.test.mjs\"",
-    "check": "node --check lambda/src/waker.mjs && node --check lambda/src/controller.mjs && node --check lambda/src/onboarder.mjs && node --check lambda/src/lists.mjs",
+    "check": "node --check lambda/src/waker.mjs && node --check lambda/src/controller.mjs && node --check lambda/src/onboarder.mjs && node --check lambda/src/lists.mjs && node --check lambda/src/kube-proxy.mjs",
     "package": "node install/package.mjs",
     "test:k8s": "bash scripts/kind-up.sh && node --test --test-concurrency=1 \"lambda/test-k8s/*.test.mjs\""
   }

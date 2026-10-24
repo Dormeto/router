@@ -63,7 +63,8 @@ function proxyProblem({ name, reason, message }) {
     case 'NoProxy': return `${proxy} is not set up: upgrade the router or set up its cluster access (Terraform: module kubernetes-proxy)`;
     case 'ProxyNotReady': return `${proxy} is not active (unused for 14 days): it becomes active again within minutes`;
     case 'Timeout':
-    case 'Network': return `${proxy} did not reach the cluster: the cluster security group must admit TCP 443 from the security group ${name ?? 'of the proxy'}`;
+    case 'Network': return `${proxy} did not reach the cluster: the cluster security group must admit TCP 443 from the proxy's security group (${name ?? 'the proxy'} unless security_group_ids were given)`;
+    case 'NetworkInterfaces': return `${proxy}'s network interfaces could not be created: ${message}; free addresses in the cluster's subnets (or fix its subnets and security groups), then set up its access again`;
     default: return `${proxy} failed: ${message ?? reason}`;
   }
 }

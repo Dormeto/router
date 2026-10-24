@@ -5,8 +5,9 @@
 import { request as httpsRequest } from 'node:https';
 
 export const PROTOCOL = 1;
-// A synchronous Lambda answer is at most 6 MB: the answer's body is held to 5 MB.
-export const LIMITS = { request: 1024 * 1024, answer: 5 * 1024 * 1024 };
+// A synchronous Lambda answer is at most 6 MB (6,291,456 bytes) once serialized as JSON, which escapes quotes: the
+// answer's body is held to 5 MB, and the serialized answer to a limit safely below Lambda's.
+export const LIMITS = { request: 1_000_000, answer: 5_000_000, serialized: 6_000_000 };
 export const TIMEOUTS = { connect: 3_000, idle: 10_000 };
 
 const METHODS = new Set(['GET', 'POST', 'PATCH', 'DELETE']);
@@ -31,6 +32,20 @@ const isTls = (err) => TLS_CODES.has(err.code) || /^(ERR_TLS|ERR_SSL)/.test(err.
 export function createKubeProxy({ env, request = httpsRequest, timeouts = TIMEOUTS, log = () => {} }) {
   const endpoint = env.DMT_ENDPOINT;
 
+  // The configuration the install wrote, or why it is not usable (never its values: the CA is not a secret, but nothing
+  // of the configuration is echoed).
+  function misconfigured() {
+    let url;
+    try {
+      url = new URL(endpoint);
+    } catch {
+      return 'DMT_ENDPOINT is missing or not a URL';
+    }
+    if (url.protocol !== 'https:') return 'DMT_ENDPOINT is not an https URL';
+    if (!env.DMT_CA) return 'DMT_CA is missing';
+    return undefined;
+  }
+
   // Checks a request in the order of the spec's section 4; returns the call to make, or the answer that refuses it.
   function check(event) {
     if (event.endpoint !== endpoint) {
@@ -44,6 +59,9 @@ export function createKubeProxy({ env, request = httpsRequest, timeouts = TIMEOU
     if (url.origin !== new URL(endpoint).origin) return { answer: failed('Refused', 'the path is not allowed') };
     const route = url.pathname;
     if (!(route.startsWith('/api/') || route.startsWith('/apis/') || route === '/version')) return { answer: failed('Refused', `path ${route} is not allowed`) };
+    // The legacy watch form: /api/<version>/watch/... and /apis/<group>/<version>/watch/...
+    const segments = route.split('/');
+    if (segments[route.startsWith('/api/') ? 3 : 4] === 'watch' && route !== '/version') return { answer: failed('Refused', 'watch is not allowed') };
     if (query === null || typeof query !== 'object') return { answer: failed('Refused', 'the query is not allowed') };
     for (const [name, value] of Object.entries(query)) {
       if (NO_QUERY.has(name.toLowerCase())) return { answer: failed('Refused', `${name} is not allowed`) };
@@ -95,7 +113,8 @@ export function createKubeProxy({ env, request = httpsRequest, timeouts = TIMEOU
     if (event.ping === true) return { v: PROTOCOL, version: env.DMT_VERSION, cluster: env.DMT_CLUSTER };
 
     const started = Date.now();
-    const checked = check(event);
+    const problem = misconfigured();
+    const checked = problem ? { answer: failed('Refused', `the proxy is not configured: ${problem}`) } : check(event);
     const done = (answer) => {
       log('KubeProxyCall', {
         method: String(event.method).slice(0, 20), path: typeof event.path === 'string' ? event.path.split(/[?#]/)[0] : undefined,
@@ -105,7 +124,12 @@ export function createKubeProxy({ env, request = httpsRequest, timeouts = TIMEOU
     };
     if (checked.answer) return done(checked.answer);
     try {
-      return done(await forward(checked.call));
+      const answer = await forward(checked.call);
+      // What Lambda carries is the serialized answer, whose escapes grow quote-heavy bodies.
+      if (Buffer.byteLength(JSON.stringify(answer)) > LIMITS.serialized) {
+        return done(failed('TooLarge', `${checked.call.method} ${checked.call.route}: the answer exceeds what a function can return`));
+      }
+      return done(answer);
     } catch (err) {
       return done(err instanceof Failure ? failed(err.reason, err.message) : failed('Network', `${checked.call.method} ${checked.call.route}: connection failed`));
     }

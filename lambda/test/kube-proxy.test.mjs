@@ -135,6 +135,10 @@ test('a path that leaves /api/ by dot segments or reaches another host is Refuse
   await refused({ path: '//evil.example.com/api/v1' });
   await refused({ path: '/api/v1?watch=true' });
 });
+test('the legacy watch path forms are Refused', async () => {
+  await refused({ path: '/api/v1/watch/namespaces' });
+  await refused({ path: '/apis/apps/v1/watch/namespaces/x/deployments' });
+});
 test('a watch is Refused', () => refused({ query: { watch: 'true' } }));
 test('a follow is Refused', () => refused({ path: '/api/v1/namespaces/x/pods/y/log', query: { follow: 'true' } }));
 test('a body of more than 1 MB is Refused, one of exactly 1 MB is not', async () => {
@@ -259,4 +263,45 @@ test('the handler answers a ping from its environment', async () => {
   process.env.DMT_VERSION = '9.9.9';
   process.env.DMT_CLUSTER = 'c1';
   assert.deepEqual(await handler({ v: 1, ping: true }), { v: 1, version: '9.9.9', cluster: 'c1' });
+});
+
+test('the limits are decimal megabytes', () => {
+  assert.equal(LIMITS.request, 1_000_000);
+  assert.equal(LIMITS.answer, 5_000_000);
+});
+
+test('a body under 5 MB whose JSON form exceeds what a Lambda answer can carry is TooLarge', async () => {
+  const api = await apiServer((req, body, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('"'.repeat(4_900_000));
+  });
+  try {
+    const { proxy } = proxyFor(api.endpoint);
+    const answer = await proxy(get(api.endpoint));
+    assert.equal(answer.reason, 'TooLarge', JSON.stringify(answer).slice(0, 200));
+    assert.equal(answer.status, 0);
+  } finally { await api.close(); }
+});
+
+test('a missing or malformed configuration is answered Refused, never thrown, and never matches an absent endpoint', async () => {
+  const cases = [
+    {},
+    { DMT_ENDPOINT: 'not a url', DMT_CA: 'pem' },
+    { DMT_ENDPOINT: 'http://127.0.0.1:1', DMT_CA: 'pem' },
+    { DMT_ENDPOINT: 'https://127.0.0.1:1' },
+  ];
+  for (const env of cases) {
+    const proxy = createKubeProxy({ env: { DMT_CLUSTER: 'prod', ...env } });
+    for (const request of [{ v: 1, method: 'GET', path: '/api/v1/namespaces' }, get('https://127.0.0.1:1')]) {
+      const answer = await proxy(request);
+      assert.equal(answer.reason, 'Refused', JSON.stringify(env));
+      assert.match(answer.message, /^the proxy is not configured: /);
+      assert.ok(!answer.message.includes('pem'));
+    }
+  }
+});
+
+test('a ping still answers when the configuration is missing', async () => {
+  const proxy = createKubeProxy({ env: { DMT_CLUSTER: 'prod', DMT_VERSION: '1' } });
+  assert.deepEqual(await proxy({ v: 1, ping: true }), { v: 1, version: '1', cluster: 'prod' });
 });

@@ -31,6 +31,11 @@ resource "aws_iam_role" "waker" {
 
 data "aws_iam_policy_document" "waker" {
   statement {
+    # Kubernetes workloads behind a private endpoint (R10.6): the proxies of the router's clusters.
+    actions   = ["lambda:InvokeFunction"]
+    resources = ["${local.arn_prefix}:lambda:${local.region}:${local.account_id}:function:${var.name}-kube-*"]
+  }
+  statement {
     # Kubernetes workloads (R10.5): a cluster's endpoint and certificate authority; its API answers through an access entry.
     actions   = ["eks:DescribeCluster"]
     resources = ["${local.arn_prefix}:eks:${local.region}:${local.account_id}:cluster/*"]
@@ -84,6 +89,11 @@ resource "aws_iam_role" "controller" {
 }
 
 data "aws_iam_policy_document" "controller" {
+  statement {
+    # Kubernetes workloads behind a private endpoint (R10.6): the proxies of the router's clusters.
+    actions   = ["lambda:InvokeFunction"]
+    resources = ["${local.arn_prefix}:lambda:${local.region}:${local.account_id}:function:${var.name}-kube-*"]
+  }
   statement {
     # Kubernetes workloads (R10.5): a cluster's endpoint and certificate authority; its API answers through an access entry.
     actions   = ["eks:DescribeCluster"]
@@ -309,6 +319,11 @@ locals {
 }
 
 data "aws_iam_policy_document" "onboarder" {
+  statement {
+    # Kubernetes workloads behind a private endpoint (R10.6): the proxies of the router's clusters.
+    actions   = ["lambda:InvokeFunction"]
+    resources = ["${local.arn_prefix}:lambda:${local.region}:${local.account_id}:function:${var.name}-kube-*"]
+  }
   statement {
     # Kubernetes workloads (R10.5): a cluster's endpoint and certificate authority; its API answers through an access entry.
     actions   = ["eks:DescribeCluster"]

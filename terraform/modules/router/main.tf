@@ -92,6 +92,8 @@ resource "aws_lambda_function" "controller" {
       DMT_WORK_QUEUE = aws_sqs_queue.work.url
       # The drift queue: the idle check's repair requests, read with the drift events.
       DMT_DRIFT_QUEUE = aws_sqs_queue.drift.url
+      # The Kubernetes proxies (R10.6), named <prefix><cluster> (module kubernetes-proxy).
+      DMT_KUBE_PROXY_PREFIX = "${var.name}-kube-"
     }
   }
 
@@ -167,6 +169,8 @@ resource "aws_lambda_function" "waker" {
       DMT_METRICS          = tostring(var.metrics_enabled)
       DMT_IP_LISTS         = local.ip_lists
       DMT_IP_LISTS_CATALOG = var.ip_lists_catalog == null ? "" : var.ip_lists_catalog
+      # The Kubernetes proxies (R10.6), named <prefix><cluster> (module kubernetes-proxy).
+      DMT_KUBE_PROXY_PREFIX = "${var.name}-kube-"
     }
   }
 
@@ -200,6 +204,8 @@ resource "aws_lambda_function" "onboarder" {
       DMT_BUILD              = local.build
       DMT_WAKER_FUNCTION     = aws_lambda_function.waker.function_name
       DMT_WAKER_FUNCTION_ARN = aws_lambda_function.waker.arn
+      # The Kubernetes proxies (R10.6), named <prefix><cluster> (module kubernetes-proxy).
+      DMT_KUBE_PROXY_PREFIX = "${var.name}-kube-"
     }
   }
 

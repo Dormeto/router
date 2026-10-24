@@ -42,6 +42,7 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
   const tags = { 'dormeto:router': p.name };
   const roleName = (role) => `${p.name}-${p.region}-${role}`;
   const roleArn = (role) => `arn:${p.partition}:iam::${p.account}:role${ROLE_PATH}${roleName(role)}`;
+  const kubeProxies = arn('lambda', `function:${p.name}-kube-*`);
   const listObjects = `arn:${p.partition}:s3:::${p.ipListsBucket}/*`;
 
   const policies = {
@@ -64,6 +65,8 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
       allow(['application-autoscaling:RegisterScalableTarget'], [arn('application-autoscaling', 'scalable-target/*')]),
       allow(['autoscaling:UpdateAutoScalingGroup', 'autoscaling:SuspendProcesses', 'autoscaling:ResumeProcesses'], [arn('autoscaling', 'autoScalingGroup:*:autoScalingGroupName/*')], tagged),
       allow(['lambda:InvokeFunction'], [functionArn('controller'), functionArn('onboarder')]),
+      // Kubernetes workloads behind a private endpoint (R10.6): the proxies of the router's clusters.
+      allow(['lambda:InvokeFunction'], [kubeProxies]),
       allow(['sqs:SendMessage'], [queueArn('controller-failures'), queueArn('work'), queueArn('drift')]),
       allow(['sqs:ReceiveMessage', 'sqs:DeleteMessage', 'sqs:GetQueueAttributes', 'sqs:ChangeMessageVisibility'], [queueArn('work')]),
       allow(['sqs:GetQueueAttributes'], [queueArn('controller-failures'), queueArn('check-failures')]),
@@ -77,6 +80,8 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
     waker: policy(
       allow(['dynamodb:GetItem', 'dynamodb:UpdateItem', 'dynamodb:Query'], [tableArn]),
       allow(['lambda:InvokeFunction'], [functionArn('controller')]),
+      // Kubernetes workloads behind a private endpoint (R10.6): the proxies of the router's clusters.
+      allow(['lambda:InvokeFunction'], [kubeProxies]),
       allow(['events:PutEvents'], [p.managerBus]),
       allow(['logs:CreateLogStream', 'logs:PutLogEvents'], [logArn('waker')]),
       // The manager's lists: its catalog, manifests and data (the waker loads them).
@@ -102,6 +107,9 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
       ], onboarderTagKeys),
       // A per-workload invoke permission of a router older than 0.20.0, removed at offboarding.
       allow(['lambda:RemovePermission'], [functionArn('waker')]),
+      // Kubernetes workloads behind a private endpoint (R10.6): the proxies of the router's clusters.
+      allow(['lambda:InvokeFunction'], [kubeProxies]),
+
       allow(['sqs:ReceiveMessage', 'sqs:DeleteMessage', 'sqs:GetQueueAttributes', 'sqs:ChangeMessageVisibility'], [queueArn('drift')]),
       allow(['logs:CreateLogStream', 'logs:PutLogEvents'], [logArn('onboarder')]),
       // Kubernetes workloads: onboarding reads the cluster, applies Dormeto's Ingress or the patch.
@@ -118,7 +126,8 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
     }],
   };
 
-  const common = { DMT_TABLE: table, DMT_TG_PREFIX: `${p.name}-`, DMT_VERSION: version, DMT_BUILD: p.build };
+  const proxyEnvironment = { DMT_VERSION: version, DMT_BUILD: p.build };
+  const common = { DMT_TABLE: table, DMT_TG_PREFIX: `${p.name}-`, ...proxyEnvironment, DMT_KUBE_PROXY_PREFIX: `${p.name}-kube-` };
   return {
     router: { name: p.name, region: p.region, account: p.account, version, build: p.build },
     tags,
@@ -159,6 +168,20 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
         environment: { ...common, DMT_WAKER_FUNCTION: fn('waker'), DMT_WAKER_FUNCTION_ARN: functionArn('waker') },
       },
     ].map((f) => ({ ...f, roleArn: roleArn(f.key), runtime: 'nodejs24.x', architectures: ['arm64'] })),
+    // The Kubernetes proxy (R10.6; vision docs/specs/2026-10-24-private-eks-endpoints-design.md, sections 4 and 7): one function
+    // per cluster whose endpoint is private, in the cluster's VPC, applied by the manager per cluster (handler, runtime,
+    // memory, timeout, role policy from here; name, role, log group, subnets and security group from the cluster, with
+    // namePrefix and rolePrefix + the cluster's part, see lambda/src/lib/kube-proxy-name.mjs). The manager adds
+    // DMT_CLUSTER, DMT_ENDPOINT and DMT_CA to the environment. The role: what Lambda requires of a VPC function, and its logs.
+    kubeProxy: {
+      handler: 'kube-proxy.handler', runtime: 'nodejs24.x', architectures: ['arm64'], memory: 128, timeout: 15, logRetentionDays,
+      environment: proxyEnvironment, tags,
+      namePrefix: `${p.name}-kube-`, rolePrefix: `${p.name}-${p.region}-kube-`,
+      rolePolicy: policy(
+        allow(['ec2:CreateNetworkInterface', 'ec2:DescribeNetworkInterfaces', 'ec2:DescribeSubnets', 'ec2:DeleteNetworkInterface', 'ec2:AssignPrivateIpAddresses', 'ec2:UnassignPrivateIpAddresses'], ['*']),
+        allow(['logs:CreateLogStream', 'logs:PutLogEvents'], [`${arn('logs', `log-group:/aws/lambda/${p.name}-kube-*`)}:*`]),
+      ),
+    },
     // The load balancers of the account invoke the waker from the router's waker target groups (<name>-<workload id>):
     // one statement whatever the number of workloads (a function's resource policy is limited to 20 KB).
     wakerPermission: {
@@ -215,6 +238,8 @@ export function routerBoundary({ p = PLACEHOLDERS } = {}) {
       // Onboarding lets the load balancer invoke the waker.
       { Sid: 'WakerPermissions', Effect: 'Allow', Action: ['lambda:RemovePermission'], Resource: any('lambda', 'function:dmtr-*-waker') },
       { Sid: 'RouterLogs', Effect: 'Allow', Action: ['logs:CreateLogStream', 'logs:PutLogEvents'], Resource: any('logs', 'log-group:/aws/lambda/dmtr-*') },
+      // The proxies' roles (R10.6): what Lambda requires of a function in a VPC (the proxies' invoke and logs are above).
+      { Sid: 'KubeProxyNetwork', Effect: 'Allow', Action: ['ec2:CreateNetworkInterface', 'ec2:DescribeNetworkInterfaces', 'ec2:DescribeSubnets', 'ec2:DeleteNetworkInterface', 'ec2:AssignPrivateIpAddresses', 'ec2:UnassignPrivateIpAddresses'], Resource: '*' },
       // The manager's event bus, in the manager's account (its policy admits the organization only).
       { Sid: 'ManagerBus', Effect: 'Allow', Action: ['events:PutEvents'], Resource: `arn:${p.partition}:events:*:*:event-bus/dmt-*-manager` },
       {

@@ -5,6 +5,7 @@ import { PLACEHOLDERS, blueprint, routerBoundary } from '../../install/blueprint
 import { ROUTER_PERMISSION } from '../src/lib/onboarding.mjs';
 
 const IAM_TF = new URL('../../terraform/modules/router/iam.tf', import.meta.url);
+const PROXY_TF = new URL('../../terraform/modules/kubernetes-proxy/main.tf', import.meta.url);
 
 // Replace every ${key} in the string values, as the installer does.
 const fill = (value, values) => (typeof value === 'string'
@@ -21,8 +22,8 @@ const VALUES = {
 };
 
 // Actions of each aws_iam_policy_document of the module, without its optional (dynamic) statements; those apart.
-async function terraformActions() {
-  const text = await readFile(IAM_TF, 'utf8');
+async function terraformActions(file = IAM_TF) {
+  const text = await readFile(file, 'utf8');
   const out = {};
   out.optional = {};
   for (const match of text.matchAll(/data "aws_iam_policy_document" "(\w+)" \{/g)) {
@@ -126,7 +127,7 @@ test('the roles that change rules with their actions may read the Cognito user p
 
 test('the boundary covers the resources of installed routers only (dmtr-*), never a router written in Terraform or the manager', () => {
   // Workloads are the customer's resources; the manager's bus is the manager's.
-  const resources = routerBoundary().Statement.filter((s) => s.Sid !== 'Workloads' && s.Sid !== 'ManagerBus').flatMap((s) => [].concat(s.Resource));
+  const resources = routerBoundary().Statement.filter((s) => s.Sid !== 'Workloads' && s.Sid !== 'ManagerBus' && s.Sid !== 'KubeProxyNetwork').flatMap((s) => [].concat(s.Resource));
   assert.ok(resources.length > 0);
   for (const r of resources) assert.match(r, /:(table\/|function:|log-group:\/aws\/lambda\/|)dmtr-/, r);
   const permissions = routerBoundary().Statement.find((s) => [].concat(s.Action).includes('lambda:RemovePermission'));
@@ -309,4 +310,50 @@ test('Kubernetes workloads (R10.5): the controller, the waker and the onboarder 
   }
   assert.ok(!b.roles.find((r) => r.key === 'scheduler').policy.Statement.some((s) => [].concat(s.Action).includes('eks:DescribeCluster')));
   assert.ok(routerBoundary().Statement.flatMap((s) => [].concat(s.Action)).includes('eks:DescribeCluster'));
+});
+
+const NETWORK_ACTIONS = ['ec2:AssignPrivateIpAddresses', 'ec2:CreateNetworkInterface', 'ec2:DeleteNetworkInterface', 'ec2:DescribeNetworkInterfaces', 'ec2:DescribeSubnets', 'ec2:UnassignPrivateIpAddresses'];
+
+test('Kubernetes proxy (R10.6): the blueprint defines the function, its role policy equals the module\'s, within the boundary', async () => {
+  const raw = blueprint({ version: '0.33.0' });
+  const k = fill(raw.kubeProxy, VALUES);
+  assert.deepEqual({ ...k, rolePolicy: undefined }, {
+    handler: 'kube-proxy.handler', runtime: 'nodejs24.x', architectures: ['arm64'], memory: 128, timeout: 15, logRetentionDays: 14,
+    rolePolicy: undefined, tags: { 'dormeto:router': 'dmtr-dev' },
+    namePrefix: 'dmtr-dev-kube-', rolePrefix: 'dmtr-dev-eu-west-3-kube-',
+    environment: { DMT_VERSION: '0.33.0', DMT_BUILD: 'abc123def456' },
+  });
+  // The manager adds DMT_CLUSTER, DMT_ENDPOINT and DMT_CA per cluster.
+  assert.deepEqual(Object.keys(k.environment), ['DMT_VERSION', 'DMT_BUILD']);
+  // The role: the network-interface rights on *, its own log groups.
+  const [network, logs] = k.rolePolicy.Statement;
+  assert.deepEqual([network.Action.slice().sort(), network.Resource], [NETWORK_ACTIONS, ['*']]);
+  assert.deepEqual([logs.Action, logs.Resource], [['logs:CreateLogStream', 'logs:PutLogEvents'], ['arn:aws:logs:eu-west-3:121014831971:log-group:/aws/lambda/dmtr-dev-kube-*:*']]);
+  assert.equal(k.rolePolicy.Statement.length, 2);
+  // The Terraform module: the same actions.
+  const terraform = await terraformActions(PROXY_TF);
+  assert.deepEqual(terraform.proxy, actionsOf(raw.kubeProxy.rolePolicy));
+  // The group declares no rule inline (the default egress is removed with it; its rules are separate resources).
+  const group = (await readFile(PROXY_TF, 'utf8')).match(/resource "aws_security_group" "proxy" \{[\s\S]*?\n\}/)[0];
+  assert.ok(!/\b(egress|ingress)\s*\{/.test(group));
+  // Within the boundary: the six actions, and the logs and the role are the existing statements.
+  const boundary = routerBoundary().Statement.find((s) => s.Sid === 'KubeProxyNetwork');
+  assert.deepEqual([boundary.Effect, boundary.Action.slice().sort(), boundary.Resource], ['Allow', NETWORK_ACTIONS, '*']);
+  const allowed = routerBoundary().Statement.flatMap((s) => [].concat(s.Action));
+  for (const action of actionsOf(raw.kubeProxy.rolePolicy)) assert.ok(allowed.includes(action), action);
+});
+
+test('Kubernetes proxy (R10.6): the three router roles may invoke the proxies, which they find by DMT_KUBE_PROXY_PREFIX, in the blueprint and the module', async () => {
+  const b = fill(blueprint({ version: '0.33.0' }), VALUES);
+  const main = await readFile(new URL('../../terraform/modules/router/main.tf', import.meta.url), 'utf8');
+  const iam = await readFile(IAM_TF, 'utf8');
+  for (const key of ['controller', 'waker', 'onboarder']) {
+    assert.equal(b.functions.find((f) => f.key === key).environment.DMT_KUBE_PROXY_PREFIX, 'dmtr-dev-kube-', key);
+    const statement = b.roles.find((r) => r.key === key).policy.Statement.find((s) => [].concat(s.Action).includes('lambda:InvokeFunction') && [].concat(s.Resource).some((r) => r.includes('-kube-')));
+    assert.deepEqual([].concat(statement?.Resource), ['arn:aws:lambda:eu-west-3:121014831971:function:dmtr-dev-kube-*'], key);
+    assert.ok((await terraformActions())[key].includes('lambda:InvokeFunction'), key);
+  }
+  assert.equal(b.roles.find((r) => r.key === 'scheduler').policy.Statement.some((s) => [].concat(s.Resource).some((r) => r.includes('-kube-'))), false);
+  assert.equal((main.match(/DMT_KUBE_PROXY_PREFIX\s*=\s*"\$\{var\.name\}-kube-"/g) ?? []).length, 3);
+  assert.equal((iam.match(/function:\$\{var\.name\}-kube-\*"\]/g) ?? []).length, 3);
 });

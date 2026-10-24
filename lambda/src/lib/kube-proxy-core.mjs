@@ -2,6 +2,8 @@
 // to a private EKS cluster's VPC, it forwards the router's and discovery's calls to that one endpoint, verified against
 // that one certificate authority. It has no AWS permission and no Kubernetes identity: the caller's token travels in the
 // request. The token, the query and the bodies are never logged nor put in an error message.
+import { isIP } from 'node:net';
+import { connect as tlsConnect } from 'node:tls';
 import { request as httpsRequest } from 'node:https';
 
 export const PROTOCOL = 1;
@@ -30,12 +32,11 @@ const isTls = (err) => TLS_CODES.has(err.code) || /^(ERR_TLS|ERR_SSL)/.test(err.
 
 // env: DMT_CLUSTER, DMT_ENDPOINT, DMT_CA (PEM) and DMT_VERSION; log(event, fields); request and timeouts for the tests.
 export function createKubeProxy({ env, request = httpsRequest, timeouts = TIMEOUTS, log = () => {} }) {
-  const endpoint = env.DMT_ENDPOINT;
-
   // The configuration the install wrote, or why it is not usable (never its values: the CA is not a secret, but nothing
   // of the configuration is echoed).
   function misconfigured() {
     let url;
+    const endpoint = env.DMT_ENDPOINT;
     try {
       url = new URL(endpoint);
     } catch {
@@ -47,10 +48,12 @@ export function createKubeProxy({ env, request = httpsRequest, timeouts = TIMEOU
   }
 
   // Checks a request in the order of the spec's section 4; returns the call to make, or the answer that refuses it.
+  const stale = (event) => (event.endpoint !== env.DMT_ENDPOINT
+    ? failed('Stale', `the proxy points to an earlier endpoint of cluster ${env.DMT_CLUSTER}: set up its access again`) : undefined);
+
   function check(event) {
-    if (event.endpoint !== endpoint) {
-      return { answer: failed('Stale', `the proxy points to an earlier endpoint of cluster ${env.DMT_CLUSTER}: set up its access again`) };
-    }
+    const endpoint = env.DMT_ENDPOINT;
+    if (stale(event)) return { answer: stale(event) };
     const { method, path, query = {}, headers = {}, body } = event;
     if (!METHODS.has(method)) return { answer: failed('Refused', `method ${String(method).slice(0, 20)} is not allowed`) };
     if (typeof path !== 'string' || !path.startsWith('/') || /[?#\\]/.test(path)) return { answer: failed('Refused', 'the path is not allowed') };
@@ -107,10 +110,43 @@ export function createKubeProxy({ env, request = httpsRequest, timeouts = TIMEOU
     req.end(body);
   });
 
+  // A TLS connection to the endpoint, verified against the CA, closed at once: no HTTP request, no token. Reaching the
+  // cluster's security group and its certificate is all a probe proves.
+  const probe = () => new Promise((resolve, reject) => {
+    const url = new URL(env.DMT_ENDPOINT);
+    const host = url.hostname.replace(/^\[|\]$/g, '');
+    const socket = tlsConnect({ host, port: Number(url.port) || 443, ca: env.DMT_CA, ...(isIP(host) ? {} : { servername: host }) });
+    const timer = setTimeout(() => socket.destroy(new Failure('Timeout', `no connection within ${timeouts.connect} ms`)), timeouts.connect);
+    socket.once('secureConnect', () => {
+      clearTimeout(timer);
+      socket.end();
+      resolve();
+    });
+    socket.once('error', (err) => {
+      clearTimeout(timer);
+      reject(err instanceof Failure ? err : new Failure(isTls(err) ? 'TLS' : 'Network', `ping: ${err.code ?? 'connection failed'}`));
+    });
+  });
+
+  async function ping(event) {
+    const problem = misconfigured();
+    if (problem) return failed('Refused', `the proxy is not configured: ${problem}`);
+    const old = stale(event);
+    if (old) return old;
+    if (event.probe === true) {
+      try {
+        await probe();
+      } catch (err) {
+        return failed(err.reason ?? 'Network', err.message);
+      }
+    }
+    return { v: PROTOCOL, version: env.DMT_VERSION, cluster: env.DMT_CLUSTER };
+  }
+
   return async function proxy(event) {
     if (event === null || typeof event !== 'object') return failed('Refused', 'the request is not an object');
     if (event.v !== PROTOCOL) return failed('Refused', `unknown protocol ${event.v}`);
-    if (event.ping === true) return { v: PROTOCOL, version: env.DMT_VERSION, cluster: env.DMT_CLUSTER };
+    if (event.ping === true) return ping(event);
 
     const started = Date.now();
     const problem = misconfigured();

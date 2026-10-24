@@ -224,8 +224,12 @@ export function proxyTransport({ invoke, functionName, endpoint, version }) {
 
 // A proxy's version and cluster, without any connection to the cluster: the router's check keeps the function active with
 // it (Lambda deactivates a VPC function unused for 14 days) and reports the proxy's version.
-export async function pingProxy(invoke, functionName, { version } = {}) {
-  const answer = await invokeProxy({ invoke, functionName, version }, { v: PROTOCOL, ping: true }, 'ping');
+// endpoint: the one the caller read from EKS, which the proxy compares with its own (Stale); probe: it also opens a
+// verified TLS connection to it (Timeout, Network or TLS), the check's use; without, no connection is made.
+export async function pingProxy(invoke, functionName, { version, endpoint, probe } = {}) {
+  const answer = await invokeProxy({ invoke, functionName, version }, {
+    v: PROTOCOL, ping: true, ...(endpoint === undefined ? {} : { endpoint }), ...(probe === true ? { probe: true } : {}),
+  }, 'ping');
   return { version: answer.version, cluster: answer.cluster };
 }
 
@@ -290,6 +294,6 @@ export function kubernetesConnector({ eks, region, now = Date.now, lambda, proxy
     const proxy = proxyPrefix ? kubeProxyName(proxyPrefix, cluster) : undefined;
     if (!proxy || !lambda) throw new KubernetesError(0, 'NoProxy', noProxy(proxy));
     const transport = proxyTransport({ invoke: (functionName, payload) => lambda.invoke(functionName, payload), functionName: proxy, endpoint: view.endpoint, version });
-    return Object.assign(createKubernetes({ endpoint: view.endpoint, token, transport }), { via: 'proxy', proxy });
+    return Object.assign(createKubernetes({ endpoint: view.endpoint, token, transport }), { via: 'proxy', proxy, endpoint: view.endpoint });
   };
 }

@@ -379,6 +379,10 @@ test('pingProxy asks the proxy its version and cluster, without any call to the 
   const invoke = fakeInvoke(() => ({ v: 1, version: '0.33.0', cluster: 'eks-demo' }));
   assert.deepEqual(await pingProxy(invoke, PROXY), { version: '0.33.0', cluster: 'eks-demo' });
   assert.deepEqual(invoke.calls, [{ functionName: PROXY, payload: { v: 1, ping: true } }]);
+  const probed = fakeInvoke(() => ({ v: 1, version: '0.33.0', cluster: 'eks-demo' }));
+  await pingProxy(probed, PROXY, { endpoint: 'https://ABC.eks', probe: true });
+  await pingProxy(probed, PROXY, { endpoint: 'https://ABC.eks' });
+  assert.deepEqual(probed.calls.map((c) => c.payload), [{ v: 1, ping: true, endpoint: 'https://ABC.eks', probe: true }, { v: 1, ping: true, endpoint: 'https://ABC.eks' }]);
   await assert.rejects(pingProxy(fakeInvoke(() => awsError('ResourceNotFoundException')), PROXY), { name: 'KubernetesError', status: 0, reason: 'NoProxy', message: /its proxy dmtr-dev-kube-eks-demo is not set up/ });
   await assert.rejects(pingProxy(fakeInvoke(() => awsError('ResourceNotReadyException')), PROXY), { reason: 'ProxyNotReady' });
   await assert.rejects(pingProxy(fakeInvoke(() => ({ v: 1, status: 0, reason: 'Refused', message: 'unknown protocol 1' })), PROXY, { version: '0.33.0' }), {

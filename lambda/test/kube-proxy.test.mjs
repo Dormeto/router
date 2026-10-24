@@ -226,10 +226,55 @@ test('a server that accepts but never completes the handshake is a Timeout after
   }
 });
 
-test('a ping answers the version and the cluster without any connection', async () => {
+test('a ping with the endpoint answers the version and the cluster without any connection', async () => {
   const { proxy, logs } = proxyFor('https://127.0.0.1:1');
-  assert.deepEqual(await proxy({ v: 1, ping: true }), { v: 1, version: '0.33.0', cluster: 'prod' });
+  assert.deepEqual(await proxy({ v: 1, ping: true, endpoint: 'https://127.0.0.1:1' }), { v: 1, version: '0.33.0', cluster: 'prod' });
   assert.deepEqual(logs, []);
+});
+
+test('a ping of another endpoint is Stale, a probe or not', async () => {
+  const { proxy } = proxyFor('https://127.0.0.1:1');
+  for (const extra of [{}, { probe: true }]) {
+    const answer = await proxy({ v: 1, ping: true, endpoint: 'https://127.0.0.1:2', ...extra });
+    assert.deepEqual([answer.status, answer.reason], [0, 'Stale']);
+    assert.match(answer.message, /earlier endpoint of cluster prod/);
+  }
+  assert.equal((await proxy({ v: 1, ping: true })).reason, 'Stale', 'a ping without the endpoint cannot match it');
+});
+
+test('a probe opens a verified TLS connection to the endpoint and sends no request', async () => {
+  const api = await apiServer(json(200, {}));
+  try {
+    const { proxy } = proxyFor(api.endpoint);
+    assert.deepEqual(await proxy({ v: 1, ping: true, endpoint: api.endpoint, probe: true }), { v: 1, version: '0.33.0', cluster: 'prod' });
+    assert.equal(api.seen.length, 0);
+  } finally { await api.close(); }
+});
+
+test('a probe to a closed port is Network, to another authority TLS, to a silent socket a Timeout', async () => {
+  const closed = await apiServer(json(200, {}));
+  const gone = closed.endpoint;
+  await closed.close();
+  assert.equal((await proxyFor(gone).proxy({ v: 1, ping: true, endpoint: gone, probe: true })).reason, 'Network');
+  const other = await apiServer(json(200, {}), 'other');
+  try {
+    const answer = await proxyFor(other.endpoint).proxy({ v: 1, ping: true, endpoint: other.endpoint, probe: true });
+    assert.equal(answer.reason, 'TLS', JSON.stringify(answer));
+    assert.equal(other.seen.length, 0);
+  } finally { await other.close(); }
+  const sockets = [];
+  const server = createNetServer((socket) => { sockets.push(socket); });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const endpoint = `https://127.0.0.1:${server.address().port}`;
+    const started = Date.now();
+    const answer = await proxyFor(endpoint, { timeouts: { connect: 150, idle: 5000 } }).proxy({ v: 1, ping: true, endpoint, probe: true });
+    assert.equal(answer.reason, 'Timeout');
+    assert.ok(Date.now() - started < 1500);
+  } finally {
+    sockets.forEach((s) => s.destroy());
+    await new Promise((resolve) => server.close(resolve));
+  }
 });
 
 test('the log lines hold the method, path, status and duration, never the token, the query or the body', async () => {
@@ -262,7 +307,9 @@ test('no error message carries the token, the query or the body', async () => {
 test('the handler answers a ping from its environment', async () => {
   process.env.DMT_VERSION = '9.9.9';
   process.env.DMT_CLUSTER = 'c1';
-  assert.deepEqual(await handler({ v: 1, ping: true }), { v: 1, version: '9.9.9', cluster: 'c1' });
+  process.env.DMT_ENDPOINT = 'https://10.0.0.1';
+  process.env.DMT_CA = pems.cluster.cert;
+  assert.deepEqual(await handler({ v: 1, ping: true, endpoint: 'https://10.0.0.1' }), { v: 1, version: '9.9.9', cluster: 'c1' });
 });
 
 test('the limits are decimal megabytes', () => {
@@ -301,7 +348,9 @@ test('a missing or malformed configuration is answered Refused, never thrown, an
   }
 });
 
-test('a ping still answers when the configuration is missing', async () => {
+test('a ping validates the configuration as any call does', async () => {
   const proxy = createKubeProxy({ env: { DMT_CLUSTER: 'prod', DMT_VERSION: '1' } });
-  assert.deepEqual(await proxy({ v: 1, ping: true }), { v: 1, version: '1', cluster: 'prod' });
+  const answer = await proxy({ v: 1, ping: true, endpoint: 'https://x' });
+  assert.equal(answer.reason, 'Refused');
+  assert.match(answer.message, /^the proxy is not configured: /);
 });

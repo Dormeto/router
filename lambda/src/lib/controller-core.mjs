@@ -920,12 +920,12 @@ export function createController({
       const paused = (workloadId) => pauses === null || pauses.some((p) => p.workloadId === null || p.workloadId === workloadId);
       const listed = await store.listWorkloads();
       const configs = listed.configs.sort((a, b) => a.workloadId.localeCompare(b.workloadId));
-      await pingProxies(configs);
       // The schedules first, whatever the budget; pauses that cannot be read hold every scheduled nap and wake too.
       const keptAsleep = (workloadId) => pauses === null || pauses.some((p) => p.keepAsleep && (p.workloadId === null || p.workloadId === workloadId));
       const { applied, readable } = await applySchedules(configs, listed.schedules, (id) => ({ paused: paused(id), keepAsleep: keptAsleep(id) }), now());
       // Then the hibernation's 60-day limit, for every workload, held alike.
       const limited = await wakeLongHibernated(configs, applied, keptAsleep, now());
+      await pingProxies(configs);
       // What these passes did for a workload, in its result.
       const passed = (workloadId) => ({
         ...(applied.has(workloadId) ? { schedule: applied.get(workloadId) } : {}),
@@ -1321,7 +1321,7 @@ export function createController({
       k8s = await kubernetesOf(cluster);
       if (k8s.via === 'proxy') {
         proxy = { name: k8s.proxy, version: null };
-        proxy.version = (await pingProxy((name, payload) => lambda.invoke(name, payload), k8s.proxy, { version: router.version })).version;
+        proxy.version = (await pingProxy((name, payload) => lambda.invoke(name, payload), k8s.proxy, { version: router.version, endpoint: k8s.endpoint })).version;
       }
       const missing = await checkRights(k8s, namespace);
       return { cluster, reachable: true, allowed: missing.length === 0, missing, ...reach() };
@@ -1337,19 +1337,26 @@ export function createController({
 
   // The 5-minute check pings the proxy of each proxied cluster with workloads: it keeps the VPC function active (Lambda
   // deactivates one unused for 14 days) and gives the router's health its state, ROUTER / KUBE-PROXIES, replaced whole.
-  // Nothing here fails the check.
+  // The ping carries the endpoint EKS gives now (a recreated cluster is Stale) and probes it (a removed security group
+  // rule is a Timeout). It runs after the schedules and the hibernation limit, within the check's budget: a ping not started
+  // before it is skipped (its previous record stays). Nothing here fails the check.
   async function pingProxies(configs) {
     if (!store.putKubeProxies || !lambda?.invoke) return;
     try {
       const clusters = [...new Set(configs.map((cfg) => cfg.kubernetes?.cluster).filter(Boolean))].sort();
+      const kept = (await store.getKubeProxies?.().catch(() => null)) ?? {};
       const answers = await Promise.all(clusters.map(async (cluster) => {
         const at = now();
+        if (at >= budgetEnd) {
+          log.warn('KubeProxyPingSkipped', { cluster, reason: 'the check\'s time budget is spent' });
+          return kept[cluster] ? [cluster, kept[cluster]] : null;
+        }
         let name = null;
         try {
           const k8s = await kubernetesOf(cluster);
           if (k8s.via !== 'proxy') return null;
           name = k8s.proxy;
-          const { version } = await pingProxy((fn, payload) => lambda.invoke(fn, payload), name, { version: router.version });
+          const { version } = await pingProxy((fn, payload) => lambda.invoke(fn, payload), name, { version: router.version, endpoint: k8s.endpoint, probe: true });
           return [cluster, { name, ok: true, version, at }];
         } catch (err) {
           // A cluster unreachable altogether (no proxy needed or possible) is the cluster check's to say.

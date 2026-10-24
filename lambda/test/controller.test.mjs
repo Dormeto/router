@@ -1452,17 +1452,22 @@ test('clusterCheck: rights an EKS access policy gives (a review that cannot list
 });
 
 // Clusters reached through a proxy function (vision docs/specs/2026-10-24-private-eks-endpoints-design.md, sections 5, 8, 9).
-const viaProxy = (k8s, proxy = 'dmt-kube-eks-demo') => Object.assign(k8s, { via: 'proxy', proxy });
-const proxyLambda = (answers = {}) => {
+const ENDPOINT = 'https://ABC.eks.example';
+const viaProxy = (k8s, proxy = 'dmt-kube-eks-demo', endpoint = ENDPOINT) => Object.assign(k8s, { via: 'proxy', proxy, endpoint });
+// A fake proxy answering per request, as the real one: Stale for another endpoint, the probe's failure when asked to probe.
+// proxies: {<function>: {endpoint?, probe?: 'Timeout' | 'Network', error?: Error}}.
+const proxyLambda = (proxies = {}) => {
   const calls = [];
   return {
     calls,
     async getAccountSettings() { return { AccountLimit: { ConcurrentExecutions: 1000 } }; },
     async invoke(name, payload) {
       calls.push([name, payload]);
-      const answer = answers[name] ?? { v: 1, version: '0.33.0', cluster: name.replace('dmt-kube-', '') };
-      if (answer instanceof Error) throw answer;
-      return answer;
+      const proxy = proxies[name] ?? {};
+      if (proxy.error) throw proxy.error;
+      if (payload.endpoint !== (proxy.endpoint ?? ENDPOINT)) return { v: 1, status: 0, reason: 'Stale', message: `the proxy points to an earlier endpoint of cluster ${name}: set up its access again` };
+      if (payload.probe && proxy.probe) return { v: 1, status: 0, reason: proxy.probe, message: `ping: ${proxy.probe}` };
+      return { v: 1, version: '0.33.0', cluster: name.replace('dmt-kube-', '') };
     },
   };
 };
@@ -1472,7 +1477,7 @@ test('clusterCheck: a proxied cluster says so with its proxy and version', async
   const s = setup({ run: { state: STATES.AWAKE }, k8s: viaProxy(fakeKubernetes()), lambda });
   const check = await s.handler({ action: 'clusterCheck', cluster: 'eks-demo' });
   assert.deepEqual(check, { cluster: 'eks-demo', reachable: true, allowed: check.allowed, missing: check.missing, via: 'proxy', proxy: { name: 'dmt-kube-eks-demo', version: '0.33.0' } });
-  assert.deepEqual(lambda.calls[0], ['dmt-kube-eks-demo', { v: 1, ping: true }]);
+  assert.deepEqual(lambda.calls[0], ['dmt-kube-eks-demo', { v: 1, ping: true, endpoint: ENDPOINT }], 'the cluster check pings without a probe');
 });
 
 test('clusterCheck: a proxied Timeout is the cluster security group not admitting the proxy', async () => {
@@ -1486,7 +1491,7 @@ test('clusterCheck: a proxied Timeout is the cluster security group not admittin
 });
 
 test('the check pings the proxy of each proxied cluster with workloads once, and records the answers', async () => {
-  const lambda = proxyLambda({ 'dmt-kube-c-bad': Object.assign(new Error('not found'), { name: 'ResourceNotFoundException' }) });
+  const lambda = proxyLambda({ 'dmt-kube-c-bad': { error: Object.assign(new Error('not found'), { name: 'ResourceNotFoundException' }) } });
   const clients = {
     'c-one': viaProxy(fakeKubernetes(), 'dmt-kube-c-one'), 'c-bad': viaProxy(fakeKubernetes(), 'dmt-kube-c-bad'), 'c-direct': Object.assign(fakeKubernetes(), { via: 'direct' }),
   };
@@ -1496,6 +1501,7 @@ test('the check pings the proxy of each proxied cluster with workloads once, and
   s.store.listConfigs = async () => structuredClone(configs);
   await s.handler({ action: 'check' });
   assert.deepEqual(lambda.calls.map(([name]) => name).sort(), ['dmt-kube-c-bad', 'dmt-kube-c-one']);
+  assert.ok(lambda.calls.every(([, payload]) => payload.endpoint === ENDPOINT && payload.probe === true), 'each ping carries the endpoint and probes');
   const kept = s.store.state.kubeProxies;
   assert.deepEqual(Object.keys(kept).sort(), ['c-bad', 'c-one']);
   assert.deepEqual(kept['c-one'], { name: 'dmt-kube-c-one', ok: true, version: '0.33.0', at: s.clock.now() });
@@ -1504,8 +1510,43 @@ test('the check pings the proxy of each proxied cluster with workloads once, and
   assert.equal(kept['c-bad'].name, 'dmt-kube-c-bad');
 });
 
+test('the check records a Stale and a Timeout from real pings: a recreated cluster, a removed security group rule', async () => {
+  const lambda = proxyLambda({ 'dmt-kube-c-old': { endpoint: 'https://OLD.eks.example' }, 'dmt-kube-c-sg': { probe: 'Timeout' }, 'dmt-kube-c-net': { probe: 'Network' } });
+  const s = setup({ run: { state: STATES.AWAKE }, lambda, kubernetesOf: async (cluster) => viaProxy(fakeKubernetes(), `dmt-kube-${cluster}`) });
+  s.store.listConfigs = async () => ['c-old', 'c-sg', 'c-net', 'c-ok'].map((cluster) => k8sConfig({ cluster }, { workloadId: cluster }));
+  await s.handler({ action: 'check' });
+  const kept = s.store.state.kubeProxies;
+  assert.deepEqual(Object.entries(kept).map(([cluster, p]) => [cluster, p.ok, p.reason]).sort(), [['c-net', false, 'Network'], ['c-ok', true, undefined], ['c-old', false, 'Stale'], ['c-sg', false, 'Timeout']]);
+  const { health } = await s.handler({ action: 'router' });
+  const texts = health.problems.filter((p) => p.code.startsWith('kube-proxy:')).map((p) => p.text);
+  assert.equal(texts.length, 3);
+  assert.ok(texts.some((t) => t.startsWith('cluster c-old: its proxy dmt-kube-c-old has a stale endpoint: set up its access again')));
+  assert.ok(texts.some((t) => t.includes('cluster c-sg: its proxy dmt-kube-c-sg did not reach the cluster: the cluster security group must admit TCP 443 from the security group dmt-kube-c-sg')));
+});
+
+test('the check pings after the schedules and the hibernation pass, and skips the pings its budget no longer allows', async () => {
+  const events = [];
+  const lambda = proxyLambda();
+  const invoke = lambda.invoke;
+  lambda.invoke = async (...args) => { events.push('ping'); return invoke(...args); };
+  const s = setup({ run: { state: STATES.ASLEEP }, lambda, kubernetesOf: async (cluster) => viaProxy(fakeKubernetes(), `dmt-kube-${cluster}`) });
+  const getRun = s.store.getRun;
+  s.store.getRun = async (...args) => { events.push('run'); return getRun.apply(s.store, args); };
+  s.store.listConfigs = async () => [k8sConfig({ cluster: 'c-one' })];
+  s.store.state.kubeProxies = { 'c-one': { name: 'dmt-kube-c-one', ok: true, version: '0.32.0', at: 1 } };
+  await s.handler({ action: 'check' });
+  assert.ok(events.indexOf('run') < events.indexOf('ping'), 'the hibernation pass reads the runs before any ping');
+  assert.equal(s.store.state.kubeProxies['c-one'].version, '0.33.0');
+  // No time left: nothing is pinged, the previous record stays.
+  s.store.state.kubeProxies = { 'c-one': { name: 'dmt-kube-c-one', ok: true, version: '0.32.0', at: 1 } };
+  const before = lambda.calls.length;
+  await s.handler({ action: 'check' }, { getRemainingTimeInMillis: () => 0 });
+  assert.equal(lambda.calls.length, before);
+  assert.equal(s.store.state.kubeProxies['c-one'].version, '0.32.0');
+});
+
 test('the check: a cluster no longer with workloads leaves the record, a failing ping never fails the check', async () => {
-  const lambda = proxyLambda({ 'dmt-kube-c-one': new Error('boom') });
+  const lambda = proxyLambda({ 'dmt-kube-c-one': { error: new Error('boom') } });
   const s = setup({ run: { state: STATES.AWAKE }, lambda, kubernetesOf: async () => viaProxy(fakeKubernetes(), 'dmt-kube-c-one') });
   s.store.state.kubeProxies = { gone: { name: 'dmt-kube-gone', ok: false, reason: 'NoProxy', at: 1 } };
   s.store.listConfigs = async () => [k8sConfig({ cluster: 'c-one' })];

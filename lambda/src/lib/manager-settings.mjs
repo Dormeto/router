@@ -22,7 +22,8 @@ export function settingsUrlOf(catalogUrl) {
 export function createManagerSettings({ s3, url, catalogUrl = null, store, now = Date.now, log, checkMs = CHECK_MS }) {
   const where = parseUrl(url);
   const catalog = parseUrl(catalogUrl);
-  const initial = { hibernate: true, etag: null, readAt: null, error: null };
+  // Nothing read yet: the level is unknown (null), never the built-in true, until a read succeeds (naps stop plainly).
+  const initial = { hibernate: null, etag: null, readAt: null, error: null };
 
   const catalogReads = async () => {
     if (!catalog) return false;
@@ -69,7 +70,8 @@ export function createManagerSettings({ s3, url, catalogUrl = null, store, now =
   return {
     url,
     refresh,
-    // The last known value, from the table: { hibernate, readAt, error }; null without a settings URL or before any read.
+    // The last known value, from the table: { hibernate, readAt, error }, hibernate null while every read failed; null
+    // without a settings URL or before any read.
     async current() {
       if (!where) return null;
       const stored = await store.getManagerSettings();

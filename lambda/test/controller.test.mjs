@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createController } from '../src/lib/controller-core.mjs';
 import { currentTarget } from '../src/lib/route.mjs';
 import { STATES } from '../src/lib/state.mjs';
+import { createManagerSettings } from '../src/lib/manager-settings.mjs';
 import { asgGroup, ecsService, fakeAppScaling, fakeEcs, fakeKubernetes, fakeRds, fakeRdsTagging, fakeTagging, fakeAutoScaling, fakeClock, fakeCloudWatch, fakeEc2, fakeElbv2, fakeStore, k8sConfig, k8sCustomerIngress, k8sGroupedConfig, k8sNode, k8sOwner, k8sPod, routeOf, silentLog, testConfig } from './fakes.mjs';
 import { dormetoIngress, weightsOf } from '../src/lib/kube-route.mjs';
 import { ROUTER_RULES } from '../src/lib/kube-access.mjs';
@@ -29,11 +30,13 @@ function setup({ run, instance = 'running', target = 'app', healthy = 1, metric 
   let ids = 0;
   const invocations = [];
   const log = { ...silentLog };
+  // managerSettings: a fake, or ({ store, clock }) → the real reader on this store (lib/manager-settings.mjs).
+  const settings = typeof managerSettings === 'function' ? managerSettings({ store, clock }) : managerSettings;
   const handler = createController({
     store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, kubernetesOf: k8s ? async () => k8s : undefined,
-    invokeSelf: async (payload) => { invocations.push(payload); }, now: clock.now, sleep: clock.sleep, newId: () => `wake-${++ids}`, log, managerSettings,
+    invokeSelf: async (payload) => { invocations.push(payload); }, now: clock.now, sleep: clock.sleep, newId: () => `wake-${++ids}`, log, managerSettings: settings,
   });
-  return { handler, store, ec2, elbv2, cloudwatch, autoscaling, ecs, appscaling, rds, clock, cfg, invocations, log };
+  return { handler, store, ec2, elbv2, cloudwatch, autoscaling, ecs, appscaling, rds, clock, cfg, invocations, log, settings };
 }
 
 test('wake: starts the instance, waits for health, switches the route and becomes AWAKE', async () => {
@@ -1758,6 +1761,88 @@ test('nap: an unreadable hibernation level is a plain stop even for a workload s
   assert.equal((await s.handler({ action: 'nap', workloadId: 'demo' })).state, STATES.ASLEEP);
   assert.deepEqual(stopsOf(s), [[[id], false]]);
   assert.equal('hibernated' in s.store.state.run, false);
+});
+
+// The manager's bucket as the router reads it: settings.json answers `answer` (its content, or an S3 error name); the
+// catalog is unreadable, so an AccessDenied is a failure, not "missing".
+function managerBucket() {
+  const bucket = { answer: 'SlowDown', tag: 0 };
+  bucket.s3 = {
+    async getObjectIf({ key }) {
+      const error = key === 'catalog.json' ? 'AccessDenied' : typeof bucket.answer === 'string' ? bucket.answer : null;
+      if (error) throw Object.assign(new Error(error), { name: error });
+      return { body: Buffer.from(JSON.stringify(bucket.answer)), etag: `"e${++bucket.tag}"` };
+    },
+  };
+  bucket.reader = (url = 's3://b/settings.json') => ({ store, clock }) => createManagerSettings({ s3: bucket.s3, url, catalogUrl: 's3://b/catalog.json', store, now: clock.now, log: silentLog });
+  return bucket;
+}
+
+// Naps the workload again from AWAKE, its instance running: the stop calls it made.
+async function napAgain(s) {
+  const [id] = s.cfg.instanceIds;
+  s.store.state.run = { state: STATES.AWAKE };
+  s.ec2.state.instances[id] = 'running';
+  delete s.ec2.state.reasons[id];
+  s.ec2.state.stops = [];
+  assert.equal((await s.handler({ action: 'nap', workloadId: 'demo' })).state, STATES.ASLEEP);
+  return stopsOf(s);
+}
+
+test('nap: a router that reads the manager\'s settings stops plainly until a read succeeds (just upgraded, then failed reads), then follows what it read; a missing object is true (hibernation)', async () => {
+  const bucket = managerBucket();
+  const s = setup({ run: { state: STATES.AWAKE }, managerSettings: bucket.reader() });
+  const [id] = s.cfg.instanceIds;
+  s.ec2.state.configured[id] = true;
+  const warnings = [];
+  s.log.warn = (event, fields) => warnings.push({ event, ...fields });
+  // Just upgraded: nothing read yet. The administrator's "off" may be what the router has not read.
+  assert.deepEqual(await napAgain(s), [[[id], false]]);
+  // A first read that fails: the level stays unknown, stored as such, and the naps stop plainly.
+  await s.settings.refresh();
+  assert.deepEqual(s.store.state.managerSettings, { hibernate: null, etag: null, readAt: s.clock.now(), error: 'S3 SlowDown' });
+  assert.deepEqual(await napAgain(s), [[[id], false]]);
+  assert.deepEqual(warnings.filter((w) => w.event === 'HibernationLevelUnreadable').map((w) => [w.workloadId, w.error]),
+    [['demo', 'manager settings not read yet'], ['demo', 'manager settings not read yet: S3 SlowDown']]);
+  // Once read, the manager's value decides; a missing object is never set: true.
+  for (const [answer, hibernate] of [[{ workloads: { hibernate: false } }, false], [{ workloads: { hibernate: true } }, true], ['NoSuchKey', true]]) {
+    bucket.answer = answer;
+    s.clock.advance(5 * 60_000);
+    await s.settings.refresh();
+    assert.deepEqual(await napAgain(s), [[[id], hibernate]], JSON.stringify(answer));
+  }
+  assert.equal(warnings.filter((w) => w.event === 'HibernationLevelUnreadable').length, 2);
+});
+
+test('nap: a router without a catalog (no settings URL) uses the built-in true; an unknown manager level never overrides the workload\'s or the router\'s own level (hibernation)', async () => {
+  const none = setup({ run: { state: STATES.AWAKE }, managerSettings: managerBucket().reader(null) });
+  const [id] = none.cfg.instanceIds;
+  none.ec2.state.configured[id] = true;
+  assert.deepEqual(await napAgain(none), [[[id], true]]);
+  // The manager level only decides when the workload and the router set nothing: theirs hold, read or not.
+  const workload = setup({ run: { state: STATES.AWAKE }, cfg: testConfig({ hibernate: true }), managerSettings: managerBucket().reader() });
+  workload.ec2.state.configured[id] = true;
+  assert.deepEqual(await napAgain(workload), [[[id], true]]);
+  const router = setup({ run: { state: STATES.AWAKE }, managerSettings: managerBucket().reader() });
+  router.ec2.state.configured[id] = true;
+  await router.store.putRouterSettings({ hibernate: true, by: 'ana', at: 1 });
+  assert.deepEqual(await napAgain(router), [[[id], true]]);
+});
+
+test('status: an unknown manager level says hibernate false from the manager with unknown true, its level null (hibernation)', async () => {
+  const bucket = managerBucket();
+  const s = setup({ run: { state: STATES.ASLEEP }, instance: 'stopped', target: 'waker', managerSettings: bucket.reader() });
+  const [id] = s.cfg.instanceIds;
+  const expected = (manager) => ({ hibernate: false, from: 'manager', unknown: true, workload: null, router: null, manager, instances: [{ id, configured: false, hibernated: false }], freshBoot: false });
+  assert.deepEqual((await s.handler({ action: 'status', workloadId: 'demo' })).hibernation, expected({ hibernate: null, readAt: null, error: null }));
+  await s.settings.refresh();
+  assert.deepEqual((await s.handler({ action: 'status', workloadId: 'demo' })).hibernation, expected({ hibernate: null, readAt: new Date(s.clock.now()).toISOString(), error: 'S3 SlowDown' }));
+  // Read at last: no unknown.
+  bucket.answer = { workloads: { hibernate: false } };
+  s.clock.advance(5 * 60_000);
+  await s.settings.refresh();
+  const { hibernation } = await s.handler({ action: 'status', workloadId: 'demo' });
+  assert.deepEqual([hibernation.hibernate, hibernation.from, 'unknown' in hibernation], [false, 'manager', false]);
 });
 
 test('a workload found awake again (started outside Dormeto, or recovered) loses its hibernated record; a failed wake keeps it (hibernation)', async () => {

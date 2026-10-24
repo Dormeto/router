@@ -93,7 +93,26 @@ test('an unreadable object keeps the last value and records the error; a good re
   assert.deepEqual(await s.settings.current(), { hibernate: false, readAt: s.clock.now(), error: null });
 });
 
-test('invalid content keeps the previous value and sets the error; nothing read before: true', async () => {
+test('a failed read with nothing read before stores the level as unknown (null) with the error, never true; a good read then sets it', async () => {
+  const s = setup();
+  s.s3.failures.set('settings.json', 'SlowDown');
+  await s.settings.refresh();
+  assert.deepEqual(await s.settings.current(), { hibernate: null, readAt: s.clock.now(), error: 'S3 SlowDown' });
+  assert.deepEqual(s.store.state.managerSettings, { hibernate: null, etag: null, readAt: s.clock.now(), error: 'S3 SlowDown' });
+  // Reads that keep failing keep it unknown; an AccessDenied from a bucket whose catalog is unreadable too is a failure.
+  s.clock.advance(5 * MIN);
+  s.s3.failures.set('settings.json', 'AccessDenied');
+  s.s3.failures.set('catalog.json', 'AccessDenied');
+  await s.settings.refresh();
+  assert.deepEqual(await s.settings.current(), { hibernate: null, readAt: s.clock.now(), error: 'S3 AccessDenied' });
+  s.clock.advance(5 * MIN);
+  s.s3.failures.clear();
+  s.s3.put('settings.json', { workloads: { hibernate: false } });
+  await s.settings.refresh();
+  assert.deepEqual(await s.settings.current(), { hibernate: false, readAt: s.clock.now(), error: null });
+});
+
+test('invalid content keeps the previous value and sets the error; nothing read before: unknown (null)', async () => {
   const s = setup();
   s.s3.put('settings.json', { workloads: { hibernate: false } });
   await s.settings.refresh();
@@ -106,7 +125,7 @@ test('invalid content keeps the previous value and sets the error; nothing read 
   const fresh = setup();
   fresh.s3.put('settings.json', { workloads: { hibernate: 'yes' } });
   await fresh.settings.refresh();
-  assert.equal((await fresh.settings.current()).hibernate, true);
+  assert.equal((await fresh.settings.current()).hibernate, null);
   assert.match((await fresh.settings.current()).error, /^settings\.json is invalid: .*workloads\.hibernate/);
 });
 

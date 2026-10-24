@@ -303,23 +303,35 @@ export function createController({
   }
 
   // The levels of the hibernation setting above the workload's (hibernation design §2): the router's record and the
-  // manager's settings as the router last read them, null when unset. A failed read throws: an unreadable level is not
-  // an unset one.
+  // manager's settings as the router last read them, null when unset (the manager's: when the router reads none, without a
+  // catalog). A router that reads them but has no value yet (nothing read since its upgrade, or every read failed) has the
+  // manager's level unknown: { hibernate: null, readAt, error }. A failed read throws: an unreadable level is not an unset
+  // one.
   async function hibernationLevels() {
     const [router, manager] = await Promise.all([store.getRouterSettings?.(), managerSettings?.current?.()]);
-    return { router: router ?? null, manager: manager ?? null };
+    return { router: router ?? null, manager: manager ?? (managerSettings?.url ? { hibernate: null, readAt: null, error: null } : null) };
   }
-  const resolvedFor = (cfg, { router, manager }) => resolveHibernation({ workload: cfg.hibernate, fallbackTypes: cfg.fallbackInstanceTypes, router: router?.hibernate, manager });
+  // An unknown manager level, when it is the one that decides (the workload and the router set nothing), is false, said
+  // `unknown`: the built-in true could hibernate against an administrator's "off" the router has not read yet (spec §3).
+  const resolvedFor = (cfg, { router, manager }) => {
+    const resolved = resolveHibernation({ workload: cfg.hibernate, fallbackTypes: cfg.fallbackInstanceTypes, router: router?.hibernate, manager });
+    return resolved.from === 'default' && manager ? { hibernate: false, from: 'manager', unknown: true } : resolved;
+  };
 
   // How a nap or a release stops the instances (hibernation design §4): those that can be are hibernated when the setting
   // resolves to true and the run asks for no fresh boot; what AWS accepted is recorded on the run at once, and added to
-  // `hibernated`. A level that cannot be read stops them plainly (logged), never failing the stop: falling to a lower
-  // level or the built-in true could hibernate against an administrator's "off".
+  // `hibernated`. A level that cannot be read, or the manager's still unknown, stops them plainly (logged), never failing
+  // the stop: falling to a lower level or the built-in true could hibernate against an administrator's "off".
   async function stopOptions(cfg, run, hibernated = []) {
-    const hibernate = await hibernationLevels().then((levels) => resolvedFor(cfg, levels).hibernate, (err) => {
-      log.warn('HibernationLevelUnreadable', { workloadId: cfg.workloadId, error: err.message });
+    const unreadable = (error) => {
+      log.warn('HibernationLevelUnreadable', { workloadId: cfg.workloadId, error });
       return false;
-    });
+    };
+    const hibernate = await hibernationLevels().then((levels) => {
+      const resolved = resolvedFor(cfg, levels);
+      if (!resolved.unknown) return resolved.hibernate;
+      return unreadable(levels.manager.error ? `manager settings not read yet: ${levels.manager.error}` : 'manager settings not read yet');
+    }, (err) => unreadable(err.message));
     return {
       hibernate: hibernate && run?.freshBoot !== true,
       onHibernated: async (ids) => {

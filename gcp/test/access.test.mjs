@@ -79,9 +79,12 @@ test('the custom roles: IDs, titles and descriptions as Google accepts them, no 
   assert.deepEqual(both, [], 'the conditional role must not repeat an unconditional permission');
 });
 
-test('dormetoRouter holds spec section 4\'s permissions', async () => {
+// Each custom role's permissions exactly, so that a permission in the wrong role fails.
+const sorted = (list) => [...list].sort();
+
+test('dormetoRouter holds spec section 4\'s permissions, exactly', async () => {
   const { roles } = await load();
-  includesAll(roles.dormetoRouter.permissions, [
+  assert.deepEqual(sorted(roles.dormetoRouter.permissions), sorted([
     'compute.urlMaps.get', 'compute.urlMaps.list', 'compute.urlMaps.update',
     'compute.backendServices.get', 'compute.backendServices.list', 'compute.backendServices.use', 'compute.backendServices.create', 'compute.backendServices.delete',
     'compute.regionNetworkEndpointGroups.get', 'compute.regionNetworkEndpointGroups.use',
@@ -90,20 +93,22 @@ test('dormetoRouter holds spec section 4\'s permissions', async () => {
     'compute.instances.get', 'compute.instances.list',
     'compute.instanceGroups.get', 'compute.instanceGroups.list',
     'compute.instanceGroupManagers.get', 'compute.instanceGroupManagers.list',
-    'compute.autoscalers.get',
+    'compute.autoscalers.get', 'compute.autoscalers.update',
     'compute.machineTypes.get',
     'compute.globalOperations.get', 'compute.zoneOperations.get', 'compute.regionOperations.get',
     'monitoring.timeSeries.list',
-  ], 'dormetoRouter');
+  ]));
 });
 
-test('dormetoRouterBackends holds what starts, stops, suspends and resumes the backends', async () => {
+test('dormetoRouterBackends holds what starts, stops, suspends and resumes the backends, exactly', async () => {
   const { roles } = await load();
-  includesAll(roles.dormetoRouterBackends.permissions, [
+  assert.deepEqual(sorted(roles.dormetoRouterBackends.permissions), sorted([
     'compute.instances.start', 'compute.instances.stop', 'compute.instances.suspend', 'compute.instances.resume',
-    'compute.instanceGroupManagers.update',
-    'compute.autoscalers.update',
-  ], 'dormetoRouterBackends');
+    'compute.instanceGroupManagers.update', 'compute.instanceGroupManagers.use',
+  ]));
+  // An autoscaler cannot carry a tag: under the tag condition its change would always be refused (ruling 7).
+  assert.ok(roles.dormetoRouter.permissions.includes('compute.autoscalers.update'));
+  assert.ok(!roles.dormetoRouterBackends.permissions.includes('compute.autoscalers.update'));
   // The router changes nothing in IAM and binds no tag (spec sections 5 and 11).
   for (const p of Object.values(roles).flatMap((r) => r.permissions)) {
     assert.doesNotMatch(p, /\.(setIamPolicy|createTagBinding|deleteTagBinding)$|^iam\.|^resourcemanager\./, p);
@@ -217,6 +222,11 @@ test('uninstall: the matching deletes, step by step, and the project policy', as
   includesAll(u.tag, ['resourcemanager.tagValues.delete', 'resourcemanager.tagKeys.delete'], 'uninstall.tag');
   includesAll(u.serviceAccount, ['iam.serviceAccounts.delete'], 'uninstall.serviceAccount');
   includesAll(u.roles, ['iam.roles.delete'], 'uninstall.roles');
+});
+
+test('no permission Google does not have: resourcemanager.tagValues.use appears nowhere', async () => {
+  // A tag value's binding is resourcemanager.tagValueBindings.create and .delete (ruling 6).
+  assert.doesNotMatch(await readFile(MANIFEST, 'utf8'), /resourcemanager\.tagValues\.use/);
 });
 
 test('npm test runs the Google Cloud tests', async () => {

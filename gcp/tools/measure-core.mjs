@@ -8,11 +8,11 @@ export class UsageError extends Error {}
 
 export const USAGE = `Usage: node gcp/tools/measure.mjs <command> [options]
 
-  switch --from <service> --to <service>   switch a URL map from one backend service to another, then probe; the
-         [--url-map dmt-dev] [--url https://gcp.dev.dormeto.com/]   health of both printed as it changes
-         [--region <region>] [--baseline 5]
-         [--weighted]                       --to at weight 1000 and --from at 0 in a weighted route, instead of
-                                            --to as the default service (without it, a weighted route is cleared)
+  switch --from <service> --to <service>   switch a URL map from one backend service to another, then probe the
+                                            load balancer and read both services' health
+         [--url-map dmt-dev] [--url https://gcp.dev.dormeto.com/] [--region <region>] [--baseline 5]
+         [--weighted] (--to at weight 1000 and --from at 0 in a weighted route, instead of --to as the default
+         service; without it, a weighted route is cleared)
   health                                    a backend service's health every 2 s, each change printed
          [--backend-service dmt-demo-app] [--region <region>] [--for 120] (seconds)
   vm stop|start|suspend|resume              the demo VM, through Compute Engine
@@ -21,9 +21,10 @@ export const USAGE = `Usage: node gcp/tools/measure.mjs <command> [options]
   mig stop|start|suspend|resume             the managed group's VMs, through the group (its autoscaler off, back on)
          [--group dmt-demo-mig] [--autoscaler dmt-demo-mig] [--autoscaler-mode ON] [--zone europe-west1-b]
          [--backend-service dmt-demo-mig-app] [--region <region>] [--url https://mig.gcp.dev.dormeto.com/]
-  metric                                    send requests, then wait for Cloud Monitoring to count them (the URL
-         [--url-map dmt-dev] [--url https://gcp.dev.dormeto.com/]   map's series, over what they held before)
-         [--count 20] [--metric loadbalancing.googleapis.com/https/request_count] [--filter <extra filter>]
+  metric                                    send requests, then wait for Cloud Monitoring to count them: the URL
+                                            map's series, over the points published before the requests
+         [--url-map dmt-dev] [--url https://gcp.dev.dormeto.com/] [--count 20]
+         [--metric loadbalancing.googleapis.com/https/request_count] [--filter <extra filter>]
 
   Every command: [--project dormeto-dev] [--configuration dormeto-dev] (gcloud's); all but health:
   [--timeout <seconds>]; switch, vm, mig: [--settle 20] (answers in a row from the new backend). --region: a regional

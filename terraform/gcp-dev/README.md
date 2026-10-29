@@ -86,7 +86,7 @@ refusal, 2 on a bad flag. Run each several times (G0: five). `--help` lists ever
    - the propagation ends with the last old answer (no front end sends to the stand-in any more);
    - the `http 503` answers until the app's health line turns `healthy` are its health check's warm-up: 2 checks, 5 s
      apart at the default;
-   - with the app's service `healthy` at the update, there is no such gap.
+   - with the app's service already `healthy` at the update, a 503 gap is not its warm-up.
 
    If neither (a) nor (b) of measurement 7 keeps the app's service health checked, the route grace must cover that
    warm-up as well as the propagation.
@@ -149,8 +149,9 @@ refusal, 2 on a bad flag. Run each several times (G0: five). `--help` lists ever
    The last switch is the weighted wake: if (a) has no status and (b) has one, the router writes weights, and this is
    the switch to time five times, as in 1. The map then stays weighted (the app at 1000), which Terraform ignores. To
    get a default service back, run a plain switch from it, `switch --from dmt-demo-app --to dmt-demo-standin`, then
-   back. The regional load balancer's services work the same way, with `--region europe-west1` (and `--url-map
-   dmt-dev-regional --url http://regional.gcp.dev.dormeto.com/` for its switch).
+   back. The regional load balancer works the same way: `--region europe-west1`, the services `dmt-demo-regional-app`
+   and `dmt-demo-regional-standin`, and for its switches `--url-map dmt-dev-regional --url
+   http://regional.gcp.dev.dormeto.com/`.
 
 The timeline of a wake's switch could read like this (illustrative numbers). The app's service was out of the URL map,
 so it had no status at the update. The propagation ended at +10.9 s with the last stand-in answer. The 503s until
@@ -186,5 +187,5 @@ GOOGLE_OAUTH_ACCESS_TOKEN="$(gcloud config config-helper --min-expiry=30m --form
 ```
 
 Stopped, suspended or switched (plainly or with weights), everything goes: the URL maps depend on all their backend
-services, so the destroy deletes them first, whichever service they name. What `dormeto gcp install` made (the APIs, the roles, the service
-account, the tag) stays until `dormeto gcp uninstall`.
+services, so the destroy deletes them first, whichever service they name. What `dormeto gcp install` made (the APIs,
+the roles, the service account, the tag) stays until `dormeto gcp uninstall`.

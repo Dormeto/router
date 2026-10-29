@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // G0's measuring tool (vision docs/specs/2026-10-29-google-cloud-design.md, section 12), for terraform/gcp-dev: how
 // fast a URL map switch takes effect, how fast stopped or suspended VMs come back healthy, Cloud Monitoring's request
-// count delay, and whether Google health checks a backend service out of service. Each command prints a timeline, one line per event: `<seconds since the start>s  <what>  <value>`.
+// count delay, and whether Google health checks a backend service out of service. Each command prints a timeline, one
+// line per event: `<seconds since the start>s  <what>  <value>`.
 //
 // Google's REST APIs with gcloud's access token (`gcloud config config-helper --format=json --min-expiry=20m
 // --configuration <configuration>`: at least 20 minutes left; asked again 5 minutes before it expires, and with a

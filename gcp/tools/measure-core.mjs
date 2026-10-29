@@ -245,26 +245,75 @@ export function swapService(map, from, to) {
   return { map: copy, paths };
 }
 
-// gcloud's access token, asked once and again after `refreshMs` (its tokens last an hour); concurrent requests share
-// one call. `run` returns gcloud's output.
-export function createTokens({ run, now = Date.now, refreshMs = 45 * 60_000 }) {
+// gcloud's access token. `gcloud auth print-access-token` refreshes only a token within 5 minutes of its expiry, so
+// it may return one with 5 minutes left; config-helper's --min-expiry refreshes one with less than that left, and
+// gives the expiry. After a 401, a forced refresh (the two flags exclude each other).
+export const TOKEN_MIN_EXPIRY_MS = 20 * 60_000;
+export const TOKEN_MARGIN_MS = 5 * 60_000;
+
+export const tokenArgs = (configuration, { force = false } = {}) => [
+  'config', 'config-helper', '--format=json',
+  force ? '--force-auth-refresh' : `--min-expiry=${TOKEN_MIN_EXPIRY_MS / 60_000}m`,
+  '--configuration', configuration,
+];
+
+// config-helper's JSON → { token, expiresAt (ms) }; without an expiry (some credential types), the minimum asked for.
+export function credentialOf(out, { askedAt, minExpiryMs = TOKEN_MIN_EXPIRY_MS }) {
+  let parsed;
+  try {
+    parsed = JSON.parse(out);
+  } catch {
+    throw new Error(`gcloud config config-helper: not JSON: ${String(out).trim().slice(0, 200)}`);
+  }
+  const token = parsed?.credential?.access_token;
+  if (typeof token !== 'string' || !token) throw new Error('gcloud returned no access token');
+  const expiry = Date.parse(parsed.credential.token_expiry ?? '');
+  return { token, expiresAt: Number.isFinite(expiry) ? expiry : askedAt + minExpiryMs };
+}
+
+// The access token, asked of gcloud once and again `marginMs` before it expires; concurrent requests share one call.
+// `drop(token)` after a 401: the next request asks for a forced refresh, unless the token was replaced already.
+// `run({ force })` returns config-helper's output.
+export function createTokens({ run, now = Date.now, marginMs = TOKEN_MARGIN_MS, minExpiryMs = TOKEN_MIN_EXPIRY_MS }) {
   let pending = null;
-  let at = 0;
+  let current = null;
+  let force = false;
+  const ask = () => {
+    const askedAt = now();
+    const forced = force;
+    force = false;
+    current = null;
+    const asked = Promise.resolve().then(() => run({ force: forced })).then((out) => {
+      const { token, expiresAt } = credentialOf(out, { askedAt, minExpiryMs });
+      if (pending === asked) current = { token, refreshAt: expiresAt - marginMs };
+      return token;
+    });
+    asked.catch(() => { if (pending === asked) pending = null; });
+    pending = asked;
+    return asked;
+  };
   return {
     get() {
-      if (!pending || now() - at >= refreshMs) {
-        at = now();
-        const asked = Promise.resolve().then(run).then((out) => {
-          const token = String(out).trim();
-          if (!token) throw new Error('gcloud returned no access token');
-          return token;
-        });
-        asked.catch(() => { if (pending === asked) pending = null; });
-        pending = asked;
-      }
+      if (!pending || (current && now() >= current.refreshAt)) return ask();
       return pending;
     },
+    drop(token) {
+      if (current?.token !== token) return;
+      pending = null;
+      current = null;
+      force = true;
+    },
   };
+}
+
+// A request with the token; refused with a 401 (the token expired or was revoked), sent once more with a new one.
+// `send(token)` returns the answer, with its `status`.
+export async function withToken(tokens, send) {
+  const token = await tokens.get();
+  const answer = await send(token);
+  if (answer.status !== 401) return answer;
+  tokens.drop(token);
+  return send(await tokens.get());
 }
 
 // Cloud Monitoring's timeSeries.list answer → one entry per point, with its series' labels.

@@ -3,9 +3,11 @@
 // fast a URL map switch takes effect, how fast stopped or suspended VMs come back healthy, and Cloud Monitoring's
 // request count delay. Each command prints a timeline, one line per event: `<seconds since the start>s  <what>  <value>`.
 //
-// Google's REST APIs with gcloud's access token (`gcloud auth print-access-token --configuration <configuration>`,
-// asked once and again after 45 minutes); the load balancer probed with a new connection for each request, every
-// 250 ms for a switch and 500 ms for a VM or a managed group. No dependency. Usage: --help, or terraform/gcp-dev's README.
+// Google's REST APIs with gcloud's access token (`gcloud config config-helper --format=json --min-expiry=20m
+// --configuration <configuration>`: at least 20 minutes left; asked again 5 minutes before it expires, and with a
+// forced refresh after a 401, the request then sent once more); the load balancer probed with a new connection for
+// each request, every 250 ms for a switch and 500 ms for a VM or a managed group. No dependency. Usage: --help, or
+// terraform/gcp-dev's README.
 import { execFile } from 'node:child_process';
 import { realpathSync } from 'node:fs';
 import { constants } from 'node:os';
@@ -50,23 +52,26 @@ class GoogleError extends Error {
 // A check that failed (exit 1): nothing to act on, a URL map without the service.
 class CheckError extends Error {}
 
+// A request to Google; refused with a 401, sent once more with a new token (core.withToken).
 function createGoogle(tokens) {
   return async function request(method, url, body) {
-    const res = await fetch(url, {
-      method,
-      headers: {
-        authorization: `Bearer ${await tokens.get()}`,
-        ...(body === undefined ? {} : { 'content-type': 'application/json' }),
-      },
-      body: body === undefined ? undefined : JSON.stringify(body),
-      signal: AbortSignal.timeout(OPERATION_TIMEOUT_MS),
+    const res = await core.withToken(tokens, async (token) => {
+      const answer = await fetch(url, {
+        method,
+        headers: {
+          authorization: `Bearer ${token}`,
+          ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: AbortSignal.timeout(OPERATION_TIMEOUT_MS),
+      });
+      return { status: answer.status, ok: answer.ok, statusText: answer.statusText, text: await answer.text() };
     });
-    const text = await res.text();
     let json;
     try {
-      json = text ? JSON.parse(text) : {};
+      json = res.text ? JSON.parse(res.text) : {};
     } catch {
-      json = { error: { message: text.slice(0, 300) } };
+      json = { error: { message: res.text.slice(0, 300) } };
     }
     if (!res.ok) throw new GoogleError(res.status, `${method} ${url}: ${json.error?.message ?? res.statusText}`);
     return json;
@@ -472,7 +477,7 @@ export async function main(argv, { out = console.log, err = console.error } = {}
   const start = Date.now();
   const at = () => Date.now() - start;
   const tokens = core.createTokens({
-    run: async () => (await promisify(execFile)('gcloud', ['auth', 'print-access-token', '--configuration', options.configuration], { timeout: 60_000 })).stdout,
+    run: async ({ force }) => (await promisify(execFile)('gcloud', core.tokenArgs(options.configuration, { force }), { timeout: 60_000 })).stdout,
   });
   const ctx = {
     command,

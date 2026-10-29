@@ -43,13 +43,15 @@ stopped or suspended VMs come back healthy, and Cloud Monitoring's request count
 
 **Needs** gcloud's configuration `dormeto-dev` signed in as the project's owner (spec section 15), and the AWS profile
 `kloudy-dormeto-prd` (state, Route 53). Google's credentials are never in the code or a file: each command takes
-gcloud's token (one hour) from the environment. The state is in the S3 bucket, key `router/gcp-dev.tfstate`.
+gcloud's token from the environment, with at least 30 minutes left (`--min-expiry=30m` refreshes one closer to its
+expiry; `gcloud auth print-access-token` refreshes only within 5 minutes of it, so its token may not outlast an apply).
+The state is in the S3 bucket, key `router/gcp-dev.tfstate`.
 
 ```
 cd terraform/gcp-dev
 tfenv exec init
-GOOGLE_OAUTH_ACCESS_TOKEN="$(gcloud auth print-access-token --configuration dormeto-dev)" tfenv exec plan -out gcp-dev.tfplan   # read it
-GOOGLE_OAUTH_ACCESS_TOKEN="$(gcloud auth print-access-token --configuration dormeto-dev)" tfenv exec apply gcp-dev.tfplan       # the user's go-ahead
+GOOGLE_OAUTH_ACCESS_TOKEN="$(gcloud config config-helper --min-expiry=30m --format='value(credential.access_token)' --configuration dormeto-dev)" tfenv exec plan -out gcp-dev.tfplan   # read it
+GOOGLE_OAUTH_ACCESS_TOKEN="$(gcloud config config-helper --min-expiry=30m --format='value(credential.access_token)' --configuration dormeto-dev)" tfenv exec apply gcp-dev.tfplan       # the user's go-ahead
 ```
 
 The certificate becomes active 15 to 60 minutes after the records resolve (`gcloud compute ssl-certificates describe
@@ -58,10 +60,11 @@ regional load balancer, HTTP, needs no certificate.
 
 ## Measure
 
-From the router's root, with Node 24 and gcloud's `dormeto-dev` configuration (the tool asks gcloud for a token, and
-again after 45 minutes). Each command prints a timeline, one line per event, `<seconds since start>s  <what>  <value>`,
-then its summary, and exits 0 when it saw the end, 1 on a timeout or a refusal, 2 on a bad flag. Run each several
-times (G0: five). `--help` lists every option.
+From the router's root, with Node 24 and gcloud's `dormeto-dev` configuration: the tool asks `gcloud config
+config-helper --min-expiry=20m` for a token and its expiry, asks again 5 minutes before it expires, and after a 401 asks
+for a forced refresh and sends the request once more. Each command prints a timeline, one line per event,
+`<seconds since start>s  <what>  <value>`, then its summary, and exits 0 when it saw the end, 1 on a timeout or a
+refusal, 2 on a bad flag. Run each several times (G0: five). `--help` lists every option.
 
 1. **The URL map switch** (every 250 ms, a new connection each): from the update's end to the first answer from the
    new backend service, the last from the old one, and 20 new ones in a row.
@@ -121,8 +124,8 @@ A switch's timeline, for example:
 ## Destroy
 
 ```
-GOOGLE_OAUTH_ACCESS_TOKEN="$(gcloud auth print-access-token --configuration dormeto-dev)" tfenv exec plan -destroy -out gcp-dev.tfplan
-GOOGLE_OAUTH_ACCESS_TOKEN="$(gcloud auth print-access-token --configuration dormeto-dev)" tfenv exec apply gcp-dev.tfplan
+GOOGLE_OAUTH_ACCESS_TOKEN="$(gcloud config config-helper --min-expiry=30m --format='value(credential.access_token)' --configuration dormeto-dev)" tfenv exec plan -destroy -out gcp-dev.tfplan
+GOOGLE_OAUTH_ACCESS_TOKEN="$(gcloud config config-helper --min-expiry=30m --format='value(credential.access_token)' --configuration dormeto-dev)" tfenv exec apply gcp-dev.tfplan
 ```
 
 Stopped, suspended or switched, everything goes. What `dormeto gcp install` made (the APIs, the roles, the service

@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import {
   UsageError, parseArgs, line, delta, pageOf, kindOfPort, summarize, changes, healthStates, managedStates, targets, actionSummary,
-  swapService, createTokens, pointsOf, counted,
+  swapService, tokenArgs, credentialOf, createTokens, withToken, pointsOf, counted,
 } from '../tools/measure-core.mjs';
 import { probe } from '../tools/measure.mjs';
 
@@ -337,23 +337,96 @@ test('swap: a regional map\'s default service; a map without the service changes
 
 // --- Tokens ---
 
-test('tokens: gcloud once, again after 45 minutes; one call for concurrent requests', async () => {
-  let clock = 0;
-  let calls = 0;
-  const tokens = createTokens({ run: async () => `token-${++calls}\n`, now: () => clock });
-  assert.deepEqual(await Promise.all([tokens.get(), tokens.get()]), ['token-1', 'token-1']);
-  clock = 45 * 60_000 - 1;
-  assert.equal(await tokens.get(), 'token-1');
-  clock = 45 * 60_000;
-  assert.equal(await tokens.get(), 'token-2');
-  assert.equal(calls, 2);
+// gcloud config config-helper --format=json: the token, its expiry as gcloud writes it (UTC, to the second).
+const helper = (token, expiry) => `${JSON.stringify({
+  configuration: { active_configuration: 'dormeto-dev', properties: { core: { project: 'dormeto-dev' } } },
+  credential: { access_token: token, id_token: 'eyJ.x.y', token_expiry: expiry === undefined ? undefined : expiry },
+  sentinels: { config_sentinel: '/home/u/.config/gcloud/config_sentinel' },
+}, null, 2)}\n`;
+const utc = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
+const T0 = Date.parse('2026-10-29T10:00:00Z');
+
+test('the token from gcloud: config-helper, at least 20 minutes left, or a forced refresh after a 401', () => {
+  assert.deepEqual(tokenArgs('dormeto-dev'), ['config', 'config-helper', '--format=json', '--min-expiry=20m', '--configuration', 'dormeto-dev']);
+  assert.deepEqual(tokenArgs('other', { force: true }), ['config', 'config-helper', '--format=json', '--force-auth-refresh', '--configuration', 'other']);
 });
 
-test('tokens: an empty answer from gcloud is an error, and the next request asks again', async () => {
+test('the token from gcloud: its access token and expiry; without an expiry, the 20 minutes gcloud was asked for', () => {
+  assert.deepEqual(credentialOf(helper('ya29.a', '2026-10-29T10:41:07Z'), { askedAt: T0 }), { token: 'ya29.a', expiresAt: Date.parse('2026-10-29T10:41:07Z') });
+  assert.deepEqual(credentialOf(helper('ya29.b'), { askedAt: T0 }), { token: 'ya29.b', expiresAt: T0 + 20 * 60_000 });
+  assert.deepEqual(credentialOf(helper('ya29.c', null), { askedAt: T0 }), { token: 'ya29.c', expiresAt: T0 + 20 * 60_000 });
+  assert.deepEqual(credentialOf(helper('ya29.d', 'soon'), { askedAt: T0 }), { token: 'ya29.d', expiresAt: T0 + 20 * 60_000 });
+  assert.throws(() => credentialOf(helper(''), { askedAt: T0 }), /no access token/);
+  assert.throws(() => credentialOf('{"configuration": {}}', { askedAt: T0 }), /no access token/);
+  assert.throws(() => credentialOf('ERROR: (gcloud.config.config-helper) You do not currently have an active account', { askedAt: T0 }), /config-helper.*not JSON/);
+});
+
+test('tokens: gcloud once, again 5 minutes before the token expires; one call for concurrent requests', async () => {
+  let clock = T0;
+  const calls = [];
+  const run = async ({ force }) => {
+    calls.push(force);
+    return helper(`token-${calls.length}`, utc(clock + 25 * 60_000));
+  };
+  const tokens = createTokens({ run, now: () => clock });
+  assert.deepEqual(await Promise.all([tokens.get(), tokens.get()]), ['token-1', 'token-1']);
+  clock = T0 + 20 * 60_000 - 1;
+  assert.equal(await tokens.get(), 'token-1');
+  clock = T0 + 20 * 60_000;
+  assert.deepEqual(await Promise.all([tokens.get(), tokens.get()]), ['token-2', 'token-2']);
+  clock = T0 + 40 * 60_000 - 1;
+  assert.equal(await tokens.get(), 'token-2');
+  assert.deepEqual(calls, [false, false]);
+});
+
+test('tokens: a dropped token is asked again with a forced refresh, once for concurrent 401s; an older one changes nothing', async () => {
+  const calls = [];
+  const run = async ({ force }) => {
+    calls.push(force);
+    return helper(`token-${calls.length}`, utc(T0 + 60 * 60_000));
+  };
+  const tokens = createTokens({ run, now: () => T0 });
+  assert.equal(await tokens.get(), 'token-1');
+  tokens.drop('token-1');
+  tokens.drop('token-1');
+  assert.deepEqual(await Promise.all([tokens.get(), tokens.get()]), ['token-2', 'token-2']);
+  tokens.drop('token-1');
+  assert.equal(await tokens.get(), 'token-2');
+  assert.deepEqual(calls, [false, true]);
+});
+
+test('tokens: a gcloud failure or an answer without a token is an error, and the next request asks again', async () => {
   let calls = 0;
-  const tokens = createTokens({ run: async () => (++calls === 1 ? '\n' : 'token'), now: () => 0 });
+  const answers = [() => { throw new Error('gcloud exited 1'); }, () => helper(''), () => helper('token', utc(T0 + 60 * 60_000))];
+  const tokens = createTokens({ run: async () => answers[calls++](), now: () => T0 });
+  await assert.rejects(tokens.get(), /exited 1/);
   await assert.rejects(tokens.get(), /no access token/);
   assert.equal(await tokens.get(), 'token');
+});
+
+test('a request refused with a 401 is sent once more with a new token, and no more', async () => {
+  const fake = (statuses) => {
+    const sent = [];
+    let n = 0;
+    const tokens = { get: async () => `token-${n + 1}`, drop: (token) => { if (token === `token-${n + 1}`) n += 1; } };
+    const send = async (token) => {
+      sent.push(token);
+      return { status: statuses[sent.length - 1] };
+    };
+    return { sent, run: () => withToken(tokens, send) };
+  };
+  const ok = fake([200]);
+  assert.equal((await ok.run()).status, 200);
+  assert.deepEqual(ok.sent, ['token-1']);
+  const once = fake([401, 200]);
+  assert.equal((await once.run()).status, 200);
+  assert.deepEqual(once.sent, ['token-1', 'token-2']);
+  const twice = fake([401, 401, 200]);
+  assert.equal((await twice.run()).status, 401);
+  assert.deepEqual(twice.sent, ['token-1', 'token-2']);
+  const denied = fake([403, 200]);
+  assert.equal((await denied.run()).status, 403);
+  assert.deepEqual(denied.sent, ['token-1']);
 });
 
 // --- Cloud Monitoring ---

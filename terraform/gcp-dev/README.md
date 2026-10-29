@@ -115,12 +115,15 @@ refusal, 2 on a bad flag. Run each several times (G0: five). `--help` lists ever
 5. **The health check at the lowest interval**: plan and apply with `-var health_check_interval=1` (the timeout follows
    it), then 2 to 4 again; back to the default after.
 
-6. **`request_count` in Cloud Monitoring**: 20 requests, then the metric read every 10 s until its points count them:
-   the delay, and the series' exact metric and resource labels. For the regional load balancer, its own metric:
+6. **`request_count` in Cloud Monitoring**: the URL map's series read (`resource.labels.url_map_name`, `--url-map`,
+   default `dmt-dev`), 20 requests, then the metric read every 10 s until its points count them: the delay, and the
+   series' exact metric and resource labels. Only what a point adds to the points published before the requests
+   counts; a point covers a minute, so other traffic in the requests' minute would count, and nothing else should
+   probe the load balancer meanwhile. For the regional load balancer, its URL map and its own metric:
 
    ```
    node gcp/tools/measure.mjs metric
-   node gcp/tools/measure.mjs metric --url http://regional.gcp.dev.dormeto.com/ \
+   node gcp/tools/measure.mjs metric --url-map dmt-dev-regional --url http://regional.gcp.dev.dormeto.com/ \
      --metric loadbalancing.googleapis.com/https/external/regional/request_count
    ```
 

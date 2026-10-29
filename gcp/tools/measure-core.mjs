@@ -21,9 +21,9 @@ export const USAGE = `Usage: node gcp/tools/measure.mjs <command> [options]
   mig stop|start|suspend|resume             the managed group's VMs, through the group (its autoscaler off, back on)
          [--group dmt-demo-mig] [--autoscaler dmt-demo-mig] [--autoscaler-mode ON] [--zone europe-west1-b]
          [--backend-service dmt-demo-mig-app] [--region <region>] [--url https://mig.gcp.dev.dormeto.com/]
-  metric                                    send requests, then wait for Cloud Monitoring to count them
-         [--url https://gcp.dev.dormeto.com/] [--count 20]
-         [--metric loadbalancing.googleapis.com/https/request_count] [--filter <extra filter>]
+  metric                                    send requests, then wait for Cloud Monitoring to count them (the URL
+         [--url-map dmt-dev] [--url https://gcp.dev.dormeto.com/]   map's series, over what they held before)
+         [--count 20] [--metric loadbalancing.googleapis.com/https/request_count] [--filter <extra filter>]
 
   Every command: [--project dormeto-dev] [--configuration dormeto-dev] (gcloud's); all but health:
   [--timeout <seconds>]; switch, vm, mig: [--settle 20] (answers in a row from the new backend). --region: a regional
@@ -72,7 +72,7 @@ const COMMANDS = {
     options: ['project', 'configuration', 'timeout', 'settle', 'region', 'zone', 'group', 'autoscaler', 'autoscalerMode', 'backendService', 'url'],
     defaults: { group: 'dmt-demo-mig', backendService: 'dmt-demo-mig-app', url: 'https://mig.gcp.dev.dormeto.com/' },
   },
-  metric: { actions: null, timeout: 900, options: ['project', 'configuration', 'timeout', 'url', 'count', 'metric', 'filter'] },
+  metric: { actions: null, timeout: 900, options: ['project', 'configuration', 'timeout', 'urlMap', 'url', 'count', 'metric', 'filter'] },
   health: { actions: null, options: ['project', 'configuration', 'region', 'backendService', 'duration'] },
 };
 const NAMES = Object.keys(COMMANDS).join(', ');
@@ -407,7 +407,16 @@ export function pointsOf(response) {
   });
 }
 
-// The requests the points count between `from` and `to` (ms): the points whose interval meets that time.
-export const counted = (points, { from, to }) => points
-  .filter((p) => Date.parse(p.end) > from && Date.parse(p.start) <= to)
-  .reduce((sum, p) => sum + p.value, 0);
+// The metric's series: its type, the URL map's (each load balancer's resource has `url_map_name`), and an extra filter.
+export const metricFilter = ({ metric, urlMap, filter }) =>
+  `metric.type = "${metric}" AND resource.labels.url_map_name = "${urlMap}"${filter ? ` AND ${filter}` : ''}`;
+
+// The requests the points count between `from` and `to` (ms): the points whose interval meets that time, each for
+// what it adds to the same point read before the requests were sent (`before`), so other traffic already published
+// does not count.
+export function counted(points, { from, to, before = [] }) {
+  const base = new Map(before.map((p) => [p.key, p.value]));
+  return points
+    .filter((p) => Date.parse(p.end) > from && Date.parse(p.start) <= to)
+    .reduce((sum, p) => sum + Math.max(0, p.value - (base.get(p.key) ?? 0)), 0);
+}

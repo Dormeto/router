@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import {
   UsageError, parseArgs, line, delta, pageOf, kindOfPort, summarize, changes, healthStates, managedStates, targets, actionSummary,
-  switchService, healthLevel, changesSince, periods, tokenArgs, credentialOf, createTokens, withToken, pointsOf, counted,
+  switchService, healthLevel, changesSince, periods, tokenArgs, credentialOf, createTokens, withToken, pointsOf, metricFilter, counted,
 } from '../tools/measure-core.mjs';
 import { probe } from '../tools/measure.mjs';
 
@@ -67,15 +67,16 @@ test('mig: the managed group, its autoscaler and backend service by default', ()
   assert.equal(parseArgs(['mig', 'start', '--autoscaler-mode', 'ONLY_SCALE_OUT']).options.autoscalerMode, 'ONLY_SCALE_OUT');
 });
 
-test('metric: the global request count, 20 requests', () => {
+test('metric: the global request count of the URL map dmt-dev, 20 requests', () => {
   assert.deepEqual(parseArgs(['metric']), {
     command: 'metric',
     action: null,
     options: {
-      project: 'dormeto-dev', configuration: 'dormeto-dev', timeout: 900, url: 'https://gcp.dev.dormeto.com/', count: 20,
+      project: 'dormeto-dev', configuration: 'dormeto-dev', timeout: 900, urlMap: 'dmt-dev', url: 'https://gcp.dev.dormeto.com/', count: 20,
       metric: 'loadbalancing.googleapis.com/https/request_count', filter: null,
     },
   });
+  assert.equal(parseArgs(['metric', '--url-map', 'dmt-dev-regional']).options.urlMap, 'dmt-dev-regional');
   const { options } = parseArgs(['metric', '--filter', 'resource.labels.backend_target_name="dmt-demo-app"']);
   assert.equal(options.filter, 'resource.labels.backend_target_name="dmt-demo-app"');
 });
@@ -619,6 +620,32 @@ test('Cloud Monitoring points: each with its series\' labels, its interval and i
   assert.equal(points[2].value, 1);
   assert.notEqual(points[0].series, points[2].series);
   assert.deepEqual(pointsOf({}), []);
+});
+
+test('the metric\'s filter: its type and the URL map, then the extra filter', () => {
+  assert.equal(metricFilter({ metric: 'loadbalancing.googleapis.com/https/request_count', urlMap: 'dmt-dev', filter: null }),
+    'metric.type = "loadbalancing.googleapis.com/https/request_count" AND resource.labels.url_map_name = "dmt-dev"');
+  assert.equal(metricFilter({ metric: 'loadbalancing.googleapis.com/https/request_count', urlMap: 'dmt-dev', filter: 'resource.labels.backend_target_name = "dmt-demo-app"' }),
+    'metric.type = "loadbalancing.googleapis.com/https/request_count" AND resource.labels.url_map_name = "dmt-dev" AND resource.labels.backend_target_name = "dmt-demo-app"');
+});
+
+test('the requests counted: only the increase over the points published before the requests', () => {
+  const at = (end, value, code = '200') => ({
+    metric: { type: 'loadbalancing.googleapis.com/https/request_count', labels: { response_code: code } },
+    resource: { type: 'https_lb_rule', labels: { url_map_name: 'dmt-dev' } },
+    points: [{ interval: { startTime: new Date(Date.parse(end) - 60_000).toISOString(), endTime: end }, value: { int64Value: String(value) } }],
+  });
+  const before = pointsOf({ timeSeries: [at('2026-10-29T10:01:00.000Z', 300), at('2026-10-29T10:01:00.000Z', 4, '503')] });
+  const later = pointsOf({ timeSeries: [
+    at('2026-10-29T10:01:00.000Z', 300),
+    at('2026-10-29T10:01:00.000Z', 6, '503'),
+    at('2026-10-29T10:02:00.000Z', 15),
+  ] });
+  const window = { from: Date.parse('2026-10-29T10:00:50Z'), to: Date.parse('2026-10-29T10:01:20Z') };
+  assert.equal(counted(later, window), 321);
+  assert.equal(counted(later, { ...window, before }), 17);
+  assert.equal(counted(before, { ...window, before }), 0);
+  assert.equal(counted(pointsOf({ timeSeries: [at('2026-10-29T10:01:00.000Z', 2)] }), { ...window, before }), 0);
 });
 
 test('the requests counted: the points whose interval meets the requests\' time', () => {

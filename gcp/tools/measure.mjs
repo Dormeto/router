@@ -437,11 +437,15 @@ async function listPoints(request, o, filter, from) {
   return points;
 }
 
-// metric: --count requests through the load balancer, then Cloud Monitoring read every 10 s until its points count
-// them: the metric's delay, its series' labels.
+// metric: the URL map's series read, --count requests through the load balancer, then Cloud Monitoring read every 10 s
+// until its points count them over what they held before: the metric's delay, its series' labels.
 async function runMetric(ctx) {
   const { options: o, request, log } = ctx;
+  const filter = core.metricFilter(o);
+  log('filter', filter);
   const from = Date.now();
+  const before = await listPoints(request, o, filter, from);
+  log('before', `${plural(before.length, 'point')} published, ${plural(before.reduce((sum, p) => sum + p.value, 0), 'request')}: not counted`);
   const kinds = {};
   for (let i = 0; i < o.count && !ctx.interrupted(); i++) {
     const { kind } = await probe(o.url);
@@ -451,9 +455,7 @@ async function runMetric(ctx) {
   const sent = ctx.at();
   log('requests', `${Object.values(kinds).reduce((a, b) => a + b, 0)} sent to ${o.url}: ${Object.entries(kinds).map(([k, n]) => `${n} ${k}`).join(', ')}`);
 
-  const filter = `metric.type = "${o.metric}"${o.filter ? ` AND ${o.filter}` : ''}`;
-  log('filter', filter);
-  const seen = new Set();
+  const seen = new Set(before.map((p) => `${p.key} ${p.value}`));
   const seenSeries = new Set();
   let first = null;
   let complete = null;
@@ -465,12 +467,12 @@ async function runMetric(ctx) {
         seenSeries.add(p.series);
         log('series', `${p.metric.type} {${labelsText(p.metric.labels)}} ${p.resource.type} {${labelsText(p.resource.labels)}}`);
       }
-      if (!seen.has(p.key)) {
-        seen.add(p.key);
+      if (!seen.has(`${p.key} ${p.value}`)) {
+        seen.add(`${p.key} ${p.value}`);
         log('point', `${p.start}..${p.end} ${p.value} {${labelsText(p.metric.labels)}}`);
       }
     }
-    const n = core.counted(points, { from, to });
+    const n = core.counted(points, { from, to, before });
     if (n > 0 && first === null) first = ctx.at();
     if (n >= o.count) {
       complete = ctx.at();

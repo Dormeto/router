@@ -25,6 +25,8 @@ resource "google_compute_region_backend_service" "demo" {
   protocol              = "HTTP"
   port_name             = each.key
   health_checks         = [google_compute_region_health_check.demo.id]
+  # The router's drain, as the global ones.
+  connection_draining_timeout_sec = 30
 
   backend {
     group           = google_compute_instance_group.demo.self_link
@@ -37,6 +39,9 @@ resource "google_compute_region_url_map" "dev" {
   name            = "${local.name}-regional"
   region          = var.region
   default_service = google_compute_region_backend_service.demo["app"].id
+
+  # Both backend services: a destroy deletes the map first, whichever it names.
+  depends_on = [google_compute_region_backend_service.demo]
 
   lifecycle {
     # The service the measuring tool switches: the default service, or with `switch --weighted` the default route

@@ -30,6 +30,8 @@ resource "google_compute_backend_service" "demo" {
   protocol              = "HTTP"
   port_name             = each.value.port
   health_checks         = [google_compute_health_check.demo.id]
+  # The router's drain (Google's default is 300 s, which a managed group's stop or suspend waits for: README).
+  connection_draining_timeout_sec = 30
 
   backend {
     group           = each.value.group
@@ -41,6 +43,9 @@ resource "google_compute_backend_service" "demo" {
 resource "google_compute_url_map" "dev" {
   name            = local.name
   default_service = google_compute_backend_service.demo["app"].id
+
+  # Every backend service, the stand-in included: a destroy deletes the map first, whichever service it names.
+  depends_on = [google_compute_backend_service.demo]
 
   host_rule {
     hosts        = [var.domain]

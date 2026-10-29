@@ -12,7 +12,7 @@ backend service out of service.
   VMs tagged `dmt-demo`); the VM `dmt-demo` (`e2-small`, Debian 12, no external address) in the unmanaged instance
   group `dmt-demo` (named ports `app` 80, `standin` 8080); the managed group `dmt-demo-mig` (zonal, two VMs from a
   template, autoscaler 2 to 3 on CPU); the health check `dmt-demo` (HTTP 80 `/`, every 5 s, 2 healthy and 2 unhealthy,
-  timeout 5 s).
+  timeout 5 s). Every backend service drains connections for 30 s, the router's drain, instead of Google's 300 s.
 - **Each VM** answers on 80 a page "Dormeto demo: app" and on 8080 "Dormeto demo: stand-in" (the stand-in for
   Dormeto's waker), with its name and boot time (`startup.sh`). Compute Engine runs the startup script at every boot,
   not after a resume: a resumed VM shows the boot time it had, a started one a new one.
@@ -102,7 +102,10 @@ refusal, 2 on a bad flag. Run each several times (G0: five). `--help` lists ever
 
 4. **The managed group's VMs**, through the group: its autoscaler turned off before a stop or suspend and back on
    (`--autoscaler-mode`, default `ON`) after a start or resume, as the router will; the group's target sizes before and
-   after (what the standby pool keeps).
+   after (what the standby pool keeps). A group behind a backend service with connection draining stops or suspends its
+   VMs "up to 60 seconds after the connection draining duration has elapsed" (Compute Engine's `stopInstances` and
+   `suspendInstances`). So the 30 s set here is in the measure, and a customer's draining (300 s unless they set it)
+   delays a managed group's nap by that much.
 
    ```
    node gcp/tools/measure.mjs mig stop     # then mig start
@@ -179,5 +182,6 @@ GOOGLE_OAUTH_ACCESS_TOKEN="$(gcloud config config-helper --min-expiry=30m --form
 GOOGLE_OAUTH_ACCESS_TOKEN="$(gcloud config config-helper --min-expiry=30m --format='value(credential.access_token)' --configuration dormeto-dev)" tfenv exec apply gcp-dev.tfplan
 ```
 
-Stopped, suspended or switched, everything goes. What `dormeto gcp install` made (the APIs, the roles, the service
+Stopped, suspended or switched (plainly or with weights), everything goes: the URL maps depend on all their backend
+services, so the destroy deletes them first, whichever service they name. What `dormeto gcp install` made (the APIs, the roles, the service
 account, the tag) stays until `dormeto gcp uninstall`.

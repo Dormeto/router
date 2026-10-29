@@ -73,3 +73,34 @@ test('terraform/gcp-dev creates its VM and template, which run without a service
   assert.match(code, /resource\s+"google_compute_instance"\s+"demo"/);
   assert.match(code, /resource\s+"google_compute_instance_template"\s+"demo_mig"/);
 });
+
+// A resource's body: from its opening brace to the matching closing one (the root's HCL has no brace in a string).
+function bodies(code, type) {
+  const found = [];
+  for (const match of code.matchAll(new RegExp(`^resource\\s+"${type}"\\s+"([^"]+)"\\s*\\{`, 'gm'))) {
+    let depth = 1;
+    let i = match.index + match[0].length;
+    while (depth > 0 && i < code.length) {
+      if (code[i] === '{') depth += 1;
+      else if (code[i] === '}') depth -= 1;
+      i += 1;
+    }
+    found.push([match[1], code.slice(match.index + match[0].length, i - 1)]);
+  }
+  return found;
+}
+
+test('the demo backend services drain connections for 30 s, as the router does, not Google\'s 300', async () => {
+  const code = uncommented((await terraformFiles()).map(([, text]) => text).join('\n'));
+  const services = [...bodies(code, 'google_compute_backend_service'), ...bodies(code, 'google_compute_region_backend_service')];
+  assert.equal(services.length, 2);
+  for (const [name, body] of services) assert.match(body, /^\s*connection_draining_timeout_sec\s*=\s*30\s*$/m, name);
+});
+
+test('the URL maps depend on all their backend services, so a destroy deletes a map switched to the stand-in first', async () => {
+  const code = uncommented((await terraformFiles()).map(([, text]) => text).join('\n'));
+  const [[, global]] = bodies(code, 'google_compute_url_map');
+  const [[, regional]] = bodies(code, 'google_compute_region_url_map');
+  assert.match(global, /^\s*depends_on\s*=\s*\[google_compute_backend_service\.demo\]\s*$/m);
+  assert.match(regional, /^\s*depends_on\s*=\s*\[google_compute_region_backend_service\.demo\]\s*$/m);
+});

@@ -1,0 +1,287 @@
+{
+  "version": 1,
+  "apis": [
+    "compute.googleapis.com",
+    "run.googleapis.com",
+    "firestore.googleapis.com",
+    "cloudtasks.googleapis.com",
+    "cloudscheduler.googleapis.com",
+    "monitoring.googleapis.com",
+    "artifactregistry.googleapis.com",
+    "iam.googleapis.com",
+    "cloudresourcemanager.googleapis.com",
+    "logging.googleapis.com"
+  ],
+  "roles": {
+    "dormetoRouter": {
+      "title": "Dormeto router",
+      "description": "Lets a Dormeto router read its workloads' load balancers, VMs and groups, switch their URL maps, create and delete their waker backend services, and read their request counts.",
+      "permissions": [
+        "compute.urlMaps.get",
+        "compute.urlMaps.list",
+        "compute.urlMaps.update",
+        "compute.backendServices.get",
+        "compute.backendServices.list",
+        "compute.backendServices.use",
+        "compute.backendServices.create",
+        "compute.backendServices.delete",
+        "compute.regionNetworkEndpointGroups.get",
+        "compute.regionNetworkEndpointGroups.use",
+        "compute.healthChecks.get",
+        "compute.globalForwardingRules.list",
+        "compute.targetHttpProxies.list",
+        "compute.targetHttpsProxies.list",
+        "compute.instances.get",
+        "compute.instances.list",
+        "compute.instanceGroups.get",
+        "compute.instanceGroups.list",
+        "compute.instanceGroupManagers.get",
+        "compute.instanceGroupManagers.list",
+        "compute.autoscalers.get",
+        "compute.machineTypes.get",
+        "compute.globalOperations.get",
+        "compute.zoneOperations.get",
+        "compute.regionOperations.get",
+        "monitoring.timeSeries.list"
+      ]
+    },
+    "dormetoRouterBackends": {
+      "title": "Dormeto router backends",
+      "description": "Lets a Dormeto router start, stop, suspend and resume its workloads' VMs and managed instance groups. Granted on the condition that the resource has the tag dormeto=managed.",
+      "permissions": [
+        "compute.instances.start",
+        "compute.instances.stop",
+        "compute.instances.suspend",
+        "compute.instances.resume",
+        "compute.instanceGroupManagers.update",
+        "compute.instanceGroupManagers.use",
+        "compute.autoscalers.update"
+      ]
+    }
+  },
+  "predefined": {
+    "roles/datastore.user": [
+      "datastore.entities.get",
+      "datastore.entities.list",
+      "datastore.entities.create",
+      "datastore.entities.update",
+      "datastore.entities.delete"
+    ],
+    "roles/cloudtasks.enqueuer": [
+      "cloudtasks.tasks.create"
+    ],
+    "roles/run.invoker": [
+      "run.routes.invoke"
+    ],
+    "roles/iam.serviceAccountUser": [
+      "iam.serviceAccounts.actAs"
+    ]
+  },
+  "router": [
+    {
+      "role": "projects/{project}/roles/dormetoRouter",
+      "on": "project"
+    },
+    {
+      "role": "projects/{project}/roles/dormetoRouterBackends",
+      "on": "project",
+      "condition": {
+        "title": "Dormeto-managed resources",
+        "expression": "resource.matchTag('{project}/dormeto', 'managed')"
+      }
+    },
+    {
+      "role": "roles/datastore.user",
+      "on": "project",
+      "condition": {
+        "title": "The router's database",
+        "expression": "resource.name == \"projects/{project}/databases/{database}\""
+      }
+    },
+    {
+      "role": "roles/cloudtasks.enqueuer",
+      "on": "queue"
+    },
+    {
+      "role": "roles/run.invoker",
+      "on": "controller"
+    },
+    {
+      "role": "roles/iam.serviceAccountUser",
+      "on": "serviceAccount"
+    }
+  ],
+  "operator": {
+    "check": {
+      "read": [
+        "resourcemanager.projects.get",
+        "resourcemanager.projects.getIamPolicy",
+        "serviceusage.services.list",
+        "serviceusage.services.use"
+      ]
+    },
+    "install": {
+      "read": [
+        "resourcemanager.projects.get",
+        "resourcemanager.projects.getIamPolicy",
+        "serviceusage.services.list",
+        "serviceusage.services.use"
+      ],
+      "apis": [
+        "serviceusage.services.enable",
+        "serviceusage.operations.get"
+      ],
+      "roles": [
+        "iam.roles.get",
+        "iam.roles.create",
+        "iam.roles.update",
+        "iam.roles.undelete"
+      ],
+      "serviceAccount": [
+        "iam.serviceAccounts.get",
+        "iam.serviceAccounts.create",
+        "iam.serviceAccounts.getIamPolicy",
+        "iam.serviceAccounts.setIamPolicy",
+        "iam.serviceAccounts.actAs"
+      ],
+      "projectBindings": [
+        "resourcemanager.projects.getIamPolicy",
+        "resourcemanager.projects.setIamPolicy"
+      ],
+      "tag": [
+        "resourcemanager.tagKeys.create",
+        "resourcemanager.tagKeys.get",
+        "resourcemanager.tagValues.create",
+        "resourcemanager.tagValues.get"
+      ],
+      "database": [
+        "datastore.databases.create",
+        "datastore.databases.get",
+        "datastore.operations.get",
+        "datastore.entities.create",
+        "datastore.entities.get",
+        "datastore.entities.update"
+      ],
+      "queue": [
+        "cloudtasks.queues.create",
+        "cloudtasks.queues.get",
+        "cloudtasks.queues.update",
+        "cloudtasks.queues.getIamPolicy",
+        "cloudtasks.queues.setIamPolicy"
+      ]
+    },
+    "install-router": {
+      "image": [
+        "artifactregistry.repositories.get",
+        "artifactregistry.repositories.downloadArtifacts",
+        "artifactregistry.dockerimages.get"
+      ],
+      "cloudRun": [
+        "run.services.create",
+        "run.services.get",
+        "run.services.update",
+        "run.services.getIamPolicy",
+        "run.services.setIamPolicy",
+        "run.operations.get",
+        "run.routes.invoke",
+        "iam.serviceAccounts.actAs"
+      ],
+      "neg": [
+        "compute.regionNetworkEndpointGroups.create",
+        "compute.regionNetworkEndpointGroups.get",
+        "compute.regionOperations.get"
+      ],
+      "job": [
+        "cloudscheduler.jobs.create",
+        "cloudscheduler.jobs.get",
+        "cloudscheduler.jobs.update",
+        "iam.serviceAccounts.actAs"
+      ]
+    },
+    "uninstall": {
+      "read": [
+        "resourcemanager.projects.get",
+        "resourcemanager.projects.getIamPolicy",
+        "serviceusage.services.list",
+        "serviceusage.services.use",
+        "datastore.databases.list",
+        "datastore.databases.get",
+        "datastore.entities.get",
+        "datastore.entities.list"
+      ],
+      "job": [
+        "cloudscheduler.jobs.get",
+        "cloudscheduler.jobs.delete"
+      ],
+      "neg": [
+        "compute.regionNetworkEndpointGroups.get",
+        "compute.regionNetworkEndpointGroups.delete",
+        "compute.instances.use",
+        "compute.regionOperations.get"
+      ],
+      "cloudRun": [
+        "run.services.get",
+        "run.services.delete",
+        "run.operations.get"
+      ],
+      "queue": [
+        "cloudtasks.queues.get",
+        "cloudtasks.queues.delete"
+      ],
+      "database": [
+        "datastore.databases.get",
+        "datastore.databases.delete",
+        "datastore.operations.get"
+      ],
+      "projectBindings": [
+        "resourcemanager.projects.getIamPolicy",
+        "resourcemanager.projects.setIamPolicy"
+      ],
+      "tag": [
+        "resourcemanager.tagKeys.get",
+        "resourcemanager.tagKeys.delete",
+        "resourcemanager.tagValues.get",
+        "resourcemanager.tagValues.delete"
+      ],
+      "serviceAccount": [
+        "iam.serviceAccounts.get",
+        "iam.serviceAccounts.delete"
+      ],
+      "roles": [
+        "iam.roles.get",
+        "iam.roles.delete"
+      ]
+    },
+    "workloads": {
+      "invoke": [
+        "run.routes.invoke"
+      ]
+    },
+    "onboard": {
+      "invoke": [
+        "run.routes.invoke"
+      ],
+      "tag": [
+        "resourcemanager.tagValues.get",
+        "resourcemanager.tagValueBindings.create",
+        "compute.instances.listTagBindings",
+        "compute.instances.createTagBinding",
+        "compute.instanceGroupManagers.listTagBindings",
+        "compute.instanceGroupManagers.createTagBinding"
+      ]
+    },
+    "offboard": {
+      "invoke": [
+        "run.routes.invoke"
+      ],
+      "tag": [
+        "resourcemanager.tagValues.get",
+        "resourcemanager.tagValueBindings.delete",
+        "compute.instances.listTagBindings",
+        "compute.instances.deleteTagBinding",
+        "compute.instanceGroupManagers.listTagBindings",
+        "compute.instanceGroupManagers.deleteTagBinding"
+      ]
+    }
+  }
+}

@@ -63,8 +63,16 @@ resource "google_compute_url_map" "dev" {
   }
 
   lifecycle {
-    # The services the measuring tool (and later Dormeto) switches.
-    ignore_changes = [default_service, path_matcher[0].default_service, path_matcher[1].default_service]
+    # The services the measuring tool (and later Dormeto) switches: as default services, or with `switch --weighted` in
+    # the default route actions' weighted backend services (only one of the two can be set).
+    ignore_changes = [
+      default_service,
+      default_route_action,
+      path_matcher[0].default_service,
+      path_matcher[0].default_route_action,
+      path_matcher[1].default_service,
+      path_matcher[1].default_route_action,
+    ]
   }
 }
 

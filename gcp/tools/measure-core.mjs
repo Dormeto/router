@@ -1,15 +1,20 @@
 // The pure parts of G0's measuring tool (measure.mjs; vision docs/specs/2026-10-29-google-cloud-design.md, section 12):
 // the arguments, the timeline's lines, the load balancer's answers and their summary, the health and status
-// transitions, the URL map's switch, the token cache and Cloud Monitoring's points. No I/O here: measure.mjs calls
-// Google and the load balancer.
+// transitions, the URL map's switch (plain or weighted), the token cache and Cloud Monitoring's points. No I/O here:
+// measure.mjs calls Google and the load balancer.
 import { parseArgs as parse } from 'node:util';
 
 export class UsageError extends Error {}
 
 export const USAGE = `Usage: node gcp/tools/measure.mjs <command> [options]
 
-  switch --from <service> --to <service>   switch a URL map from one backend service to another, then probe
-         [--url-map dmt-dev] [--url https://gcp.dev.dormeto.com/] [--region <region>] [--baseline 5]
+  switch --from <service> --to <service>   switch a URL map from one backend service to another, then probe; the
+         [--url-map dmt-dev] [--url https://gcp.dev.dormeto.com/]   health of both printed as it changes
+         [--region <region>] [--baseline 5]
+         [--weighted]                       --to at weight 1000 and --from at 0 in a weighted route, instead of
+                                            --to as the default service (without it, a weighted route is cleared)
+  health                                    a backend service's health every 2 s, each change printed
+         [--backend-service dmt-demo-app] [--region <region>] [--for 120] (seconds)
   vm stop|start|suspend|resume              the demo VM, through Compute Engine
          [--instance dmt-demo] [--group dmt-demo] [--zone europe-west1-b]
          [--backend-service dmt-demo-app] [--region <region>] [--url https://gcp.dev.dormeto.com/]
@@ -20,9 +25,9 @@ export const USAGE = `Usage: node gcp/tools/measure.mjs <command> [options]
          [--url https://gcp.dev.dormeto.com/] [--count 20]
          [--metric loadbalancing.googleapis.com/https/request_count] [--filter <extra filter>]
 
-  Every command: [--project dormeto-dev] [--configuration dormeto-dev] (gcloud's) [--timeout <seconds>];
-  switch, vm, mig: [--settle 20] (answers in a row from the new backend). --region: a regional load balancer's
-  URL map or backend service (none: global).`;
+  Every command: [--project dormeto-dev] [--configuration dormeto-dev] (gcloud's); all but health:
+  [--timeout <seconds>]; switch, vm, mig: [--settle 20] (answers in a row from the new backend). --region: a regional
+  load balancer's URL map or backend service (none: global).`;
 
 const ACTIONS = ['stop', 'start', 'suspend', 'resume'];
 const AUTOSCALER_MODES = ['ON', 'OFF', 'ONLY_SCALE_OUT'];
@@ -54,10 +59,12 @@ const OPTIONS = {
   count: { flag: 'count', kind: 'positive', default: 20 },
   metric: { flag: 'metric', kind: 'metric', default: 'loadbalancing.googleapis.com/https/request_count' },
   filter: { flag: 'filter', kind: 'text', default: null },
+  weighted: { flag: 'weighted', kind: 'boolean', default: false },
+  duration: { flag: 'for', kind: 'positive', default: 120 },
 };
 
 const COMMANDS = {
-  switch: { actions: null, timeout: 300, options: ['project', 'configuration', 'timeout', 'settle', 'region', 'urlMap', 'from', 'to', 'url', 'baseline'] },
+  switch: { actions: null, timeout: 300, options: ['project', 'configuration', 'timeout', 'settle', 'region', 'urlMap', 'from', 'to', 'url', 'baseline', 'weighted'] },
   vm: { actions: ACTIONS, timeout: 600, options: ['project', 'configuration', 'timeout', 'settle', 'region', 'zone', 'instance', 'group', 'backendService', 'url'] },
   mig: {
     actions: ACTIONS,
@@ -66,7 +73,9 @@ const COMMANDS = {
     defaults: { group: 'dmt-demo-mig', backendService: 'dmt-demo-mig-app', url: 'https://mig.gcp.dev.dormeto.com/' },
   },
   metric: { actions: null, timeout: 900, options: ['project', 'configuration', 'timeout', 'url', 'count', 'metric', 'filter'] },
+  health: { actions: null, options: ['project', 'configuration', 'region', 'backendService', 'duration'] },
 };
+const NAMES = Object.keys(COMMANDS).join(', ');
 
 function value(key, kind, raw) {
   const fail = (what) => { throw new UsageError(`--${OPTIONS[key].flag}: ${what}, not ${JSON.stringify(raw)}`); };
@@ -91,6 +100,7 @@ function value(key, kind, raw) {
     case 'configuration': return CONFIGURATION.test(raw) ? raw : fail('a gcloud configuration name');
     case 'autoscalerMode': return AUTOSCALER_MODES.includes(raw) ? raw : fail(AUTOSCALER_MODES.join(', '));
     case 'metric': return /^[a-z0-9.]+\/[a-z0-9_/]+$/.test(raw) ? raw : fail('a metric type');
+    case 'boolean': return raw === true;
     default: return raw;
   }
 }
@@ -99,9 +109,9 @@ function value(key, kind, raw) {
 export function parseArgs(argv) {
   if (argv.some((a) => a === '--help' || a === '-h') || argv[0] === 'help') return { help: true };
   const [command, ...rest] = argv;
-  if (!command) throw new UsageError('a command: switch, vm, mig or metric');
-  const spec = COMMANDS[command];
-  if (!spec) throw new UsageError(`unknown command ${JSON.stringify(command)}: switch, vm, mig or metric`);
+  if (!command) throw new UsageError(`a command: ${NAMES}`);
+  const spec = Object.hasOwn(COMMANDS, command) ? COMMANDS[command] : null;
+  if (!spec) throw new UsageError(`unknown command ${JSON.stringify(command)}: ${NAMES}`);
 
   let action = null;
   let args = rest;
@@ -111,7 +121,7 @@ export function parseArgs(argv) {
     args = rest.slice(1);
   }
 
-  const options = Object.fromEntries(spec.options.map((key) => [OPTIONS[key].flag, { type: 'string' }]));
+  const options = Object.fromEntries(spec.options.map((key) => [OPTIONS[key].flag, { type: OPTIONS[key].kind === 'boolean' ? 'boolean' : 'string' }]));
   let parsed;
   try {
     parsed = parse({ args, options, strict: true, allowPositionals: false });
@@ -192,6 +202,46 @@ export function healthStates(response) {
   return Object.fromEntries((response.healthStatus ?? []).map((h) => [lastSegment(h.instance), h.healthState]));
 }
 
+// { instance: healthState } → the backend service's health: 'no status' (no instance has one: Google health checks
+// only a backend service that a forwarding rule references through a URL map), 'healthy' (one instance at least),
+// else 'unhealthy'.
+export function healthLevel(states) {
+  const values = Object.values(states);
+  if (values.length === 0) return 'no status';
+  return values.includes('HEALTHY') ? 'healthy' : 'unhealthy';
+}
+
+// Poller samples [{ t, states: { name: state } }] → each name's state in the last sample before `since`, and what
+// changed from `since` on: { before: { name: state }, after: [{ t, name, from, to }] }.
+export function changesSince(samples, since) {
+  const sorted = [...samples].sort((a, b) => a.t - b.t);
+  let previous = {};
+  let before = {};
+  const after = [];
+  for (const { t, states } of sorted) {
+    if (t < since) before = states;
+    else after.push(...changes(previous, states).map((c) => ({ t, ...c })));
+    previous = states;
+  }
+  return { before, after };
+}
+
+// Poller samples → one name's runs of one state: [{ state, from, to, samples }] (from, to: its first and last sample).
+export function periods(samples, name) {
+  const runs = [];
+  for (const { t, states } of [...samples].sort((a, b) => a.t - b.t)) {
+    const state = states[name] ?? null;
+    const last = runs.at(-1);
+    if (last && last.state === state) {
+      last.to = t;
+      last.samples += 1;
+    } else {
+      runs.push({ state, from: t, to: t, samples: 1 });
+    }
+  }
+  return runs;
+}
+
 // instanceGroupManagers.listManagedInstances's answer → each instance's status and the group's current action on it.
 export function managedStates(response) {
   const list = response.managedInstances ?? [];
@@ -225,22 +275,47 @@ export function actionSummary(action, { since, names, settle = 20, statuses, hea
   return { reached, [wake ? 'healthy' : 'unhealthy']: healthAt, ...answered, done };
 }
 
-// A URL map → a copy with every reference to the backend service `from` (by name: default service, path matchers'
-// default services, path rules) naming `to` instead, in the same scope, and the paths changed.
-export function swapService(map, from, to) {
+const WEIGHT = 1000;
+
+// One holder of a backend service (the map, a path matcher, a path rule): its service key and its route action's.
+// It serves `from` when it names it as its service, or gives it a weight above 0 (Google leaves a 0 out) in its
+// weighted route. Plain: `to` as its service, the weighted route cleared (only one of the two can be set). Weighted:
+// `to` at 1000 and `from` at 0, the service cleared.
+function switchHolder(holder, serviceKey, actionKey, path, { from, to, weighted }, paths) {
+  const action = holder?.[actionKey];
+  const plain = holder?.[serviceKey];
+  const ref = typeof plain === 'string' && lastSegment(plain) === from ? plain
+    : (action?.weightedBackendServices ?? [])
+      .find((w) => typeof w.backendService === 'string' && lastSegment(w.backendService) === from && (w.weight ?? 0) > 0)
+      ?.backendService;
+  if (!ref) return;
+  const toRef = `${ref.slice(0, ref.lastIndexOf('/') + 1)}${to}`;
+  if (weighted) {
+    delete holder[serviceKey];
+    holder[actionKey] = { ...action, weightedBackendServices: [{ backendService: toRef, weight: WEIGHT }, { backendService: ref, weight: 0 }] };
+    paths.push(`${path}${actionKey}.weightedBackendServices`);
+    return;
+  }
+  holder[serviceKey] = toRef;
+  if (action) {
+    const { weightedBackendServices, ...rest } = action;
+    if (Object.keys(rest).length > 0) holder[actionKey] = rest;
+    else delete holder[actionKey];
+  }
+  paths.push(`${path}${serviceKey}`);
+}
+
+// A URL map → a copy where every holder serving the backend service `from` (by name: the map's default, the path
+// matchers' defaults, their path rules) serves `to` instead, in the same scope: as its service, or with `weighted`
+// in a weighted route (`to` 1000, `from` 0); and the paths written.
+export function switchService(map, from, to, { weighted = false } = {}) {
   const copy = structuredClone(map);
   const paths = [];
-  const swap = (holder, key, path) => {
-    const ref = holder?.[key];
-    if (typeof ref === 'string' && lastSegment(ref) === from) {
-      holder[key] = `${ref.slice(0, ref.lastIndexOf('/') + 1)}${to}`;
-      paths.push(path);
-    }
-  };
-  swap(copy, 'defaultService', 'defaultService');
+  const options = { from, to, weighted };
+  switchHolder(copy, 'defaultService', 'defaultRouteAction', '', options, paths);
   (copy.pathMatchers ?? []).forEach((pm, i) => {
-    swap(pm, 'defaultService', `pathMatchers[${i}].defaultService`);
-    (pm.pathRules ?? []).forEach((rule, j) => swap(rule, 'service', `pathMatchers[${i}].pathRules[${j}].service`));
+    switchHolder(pm, 'defaultService', 'defaultRouteAction', `pathMatchers[${i}].`, options, paths);
+    (pm.pathRules ?? []).forEach((rule, j) => switchHolder(rule, 'service', 'routeAction', `pathMatchers[${i}].pathRules[${j}].`, options, paths));
   });
   return { map: copy, paths };
 }

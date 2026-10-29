@@ -39,8 +39,9 @@ resource "google_compute_region_url_map" "dev" {
   default_service = google_compute_region_backend_service.demo["app"].id
 
   lifecycle {
-    # The service the measuring tool switches.
-    ignore_changes = [default_service]
+    # The service the measuring tool switches: the default service, or with `switch --weighted` the default route
+    # action's weighted backend services (this map has no path matcher).
+    ignore_changes = [default_service, default_route_action]
   }
 }
 

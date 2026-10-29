@@ -424,7 +424,7 @@ Design: `docs/specs/2026-10-03-mvp-alb-ec2-design.md` in the Dormeto/vision repo
 | `terraform/dev-eks` | `dev-eks`: an EKS cluster written as a customer would, with six demo workloads (about 155 USD a month while it exists) |
 | `lambda/test-k8s`, `scripts/kind-*.sh` | Kubernetes integration tests in kind (podman by default) |
 | `terraform/gcp-dev` | `gcp-dev`: Google Cloud demo VMs behind a global and a regional external Application Load Balancer in `dormeto-dev`, no IAM (about 80 USD a month while it exists) |
-| `gcp/tools/measure.mjs` | G0's measures on `gcp-dev`: URL map switch, VM and managed group wake, `request_count` delay |
+| `gcp/tools/measure.mjs` | G0's measures on `gcp-dev`: URL map switch (plain or weighted), VM and managed group wake, `request_count` delay, the health of a backend service out of service |
 
 ## Usage
 

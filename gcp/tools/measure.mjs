@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // G0's measuring tool (vision docs/specs/2026-10-29-google-cloud-design.md, section 12), for terraform/gcp-dev: how
-// fast a URL map switch takes effect, how fast stopped or suspended VMs come back healthy, and Cloud Monitoring's
-// request count delay. Each command prints a timeline, one line per event: `<seconds since the start>s  <what>  <value>`.
+// fast a URL map switch takes effect, how fast stopped or suspended VMs come back healthy, Cloud Monitoring's request
+// count delay, and whether Google health checks a backend service out of service. Each command prints a timeline, one line per event: `<seconds since the start>s  <what>  <value>`.
 //
 // Google's REST APIs with gcloud's access token (`gcloud config config-helper --format=json --min-expiry=20m
 // --configuration <configuration>`: at least 20 minutes left; asked again 5 minutes before it expires, and with a
@@ -161,11 +161,11 @@ function startPoller(ctx, everyMs, read, report) {
   };
 }
 
-// A reporter of { name: state } samples: each change on a line `<what>  <name> <state>`.
-function reporter(ctx, what, initial = {}) {
+// A reporter of { name: state } samples: each change on a line `<what>  <name> <state>` (`none`: no longer there).
+function reporter(ctx, what, initial = {}, none = 'absent') {
   let previous = initial;
   return (states, t) => {
-    for (const c of core.changes(previous, states)) ctx.log(what, `${c.name} ${c.to ?? 'absent'}`, t);
+    for (const c of core.changes(previous, states)) ctx.log(what, `${c.name} ${c.to ?? none}`, t);
     previous = states;
   };
 }
@@ -180,14 +180,19 @@ function printSummary(log, rows) {
 
 const scopeOf = (o) => `${COMPUTE}/projects/${o.project}/${o.region ? `regions/${o.region}` : 'global'}`;
 
+const nameOf = (url) => url.slice(url.lastIndexOf('/') + 1);
+
 async function readHealth(request, backendService) {
   const groups = (backendService.backends ?? []).map((b) => b.group);
   const answers = await Promise.all(groups.map((group) => request('POST', `${backendService.selfLink}/getHealth`, { group })));
   return Object.assign({}, ...answers.map(core.healthStates));
 }
 
-// switch: the URL map's references to --from written as --to, the load balancer probed every 250 ms until 20 answers in
-// a row come from --to's page.
+// switch: the URL map's references to --from written as --to (with --weighted: --to at 1000 and --from at 0 in a
+// weighted route), the load balancer probed every 250 ms until 20 answers in a row come from --to's page, and both
+// backend services' health read every 2 s: Google health checks only a backend service that a forwarding rule
+// references (spec section 12, 7), so a service the switch brings back may answer 503 until its health checks pass, and
+// its health line tells that warm-up from the propagation.
 async function runSwitch(ctx) {
   const { options: o, request, log } = ctx;
   const scope = scopeOf(o);
@@ -199,18 +204,23 @@ async function runSwitch(ctx) {
   }
   const mapUrl = `${scope}/urlMaps/${o.urlMap}`;
   const map = await request('GET', mapUrl);
-  const { map: next, paths } = core.swapService(map, o.from, o.to);
-  if (paths.length === 0) throw new CheckError(`the URL map ${o.urlMap} does not name ${o.from}`);
-  log('url map', `${o.urlMap}: ${o.from} (${oldKind}) at ${paths.join(', ')}`);
+  const { map: next, paths } = core.switchService(map, o.from, o.to, { weighted: o.weighted });
+  if (paths.length === 0) throw new CheckError(`the URL map ${o.urlMap} does not send traffic to ${o.from}`);
+  log('url map', `${o.urlMap}: ${o.from} (${oldKind}) to ${o.to} (${newKind})${o.weighted ? ', weighted' : ''}, at ${paths.join(', ')}`);
 
+  const readLevels = async () => Object.fromEntries(await Promise.all([from, to].map(
+    async (service) => [service.name, core.healthLevel(await readHealth(request, service))],
+  )));
+  const health = startPoller(ctx, HEALTH_EVERY_MS, readLevels, reporter(ctx, 'health'));
   const prober = startProber(ctx, o.url, 250);
+  let sent = null;
   let end = null;
   try {
     await ctx.wait(o.baseline * 1000);
     const before = core.summarize(prober.answers, { old: oldKind, fresh: newKind });
     if (before.firstNew !== null) log('warning', `${newKind} answered before the update`);
     if (!ctx.interrupted()) {
-      const sent = ctx.at();
+      sent = ctx.at();
       log('update', `sent: ${o.to} at ${plural(paths.length, 'reference')}`);
       await waitOperation(request, await request('PUT', mapUrl, next));
       end = ctx.at();
@@ -222,13 +232,18 @@ async function runSwitch(ctx) {
       }
     }
   } finally {
-    await prober.stop();
+    await Promise.all([prober.stop(), health.stop()]);
   }
   if (end === null) return 1;
   const summary = core.summarize(prober.answers, { old: oldKind, fresh: newKind, settle: o.settle });
 
   const since = (t) => `${core.delta(t - end)} after the update`;
+  const healthChanges = core.changesSince(health.samples, sent);
+  const atUpdate = [from.name, to.name].map((name) => `${name} ${healthChanges.before[name] ?? 'not read yet'}`).join(', ');
   printSummary(log, [
+    ['health', sent, `when the update was sent: ${atUpdate}`],
+    ...healthChanges.after.map((c) => ['health', c.t, `${c.name} ${c.to ?? 'not read'}, ${since(c.t)}`]),
+    ...(healthChanges.after.length === 0 ? [['health', null, null, 'no change after the update was sent']] : []),
     ['first new', summary.firstNew, `${newKind}, ${since(summary.firstNew)}`, `no ${newKind} answer`],
     ['last old', summary.lastOld, `${oldKind}, ${since(summary.lastOld)}`, `no ${oldKind} answer`],
     ['settled', summary.settled, `${o.settle} ${newKind} in a row from ${since(summary.settled)}`, `no: not ${o.settle} ${newKind} in a row within ${o.timeout} s`],
@@ -242,7 +257,7 @@ async function runSwitch(ctx) {
 // 20 answers in a row say so.
 async function runAction(ctx, { names, statusPoller, backendService, act, beforeAct = async () => {}, afterAct = async () => {}, finish = async () => {} }) {
   const { options: o, action, log } = ctx;
-  const health = startPoller(ctx, HEALTH_EVERY_MS, () => readHealth(ctx.request, backendService), reporter(ctx, 'health'));
+  const health = startPoller(ctx, HEALTH_EVERY_MS, () => readHealth(ctx.request, backendService), reporter(ctx, 'health', {}, 'no status'));
   const prober = startProber(ctx, o.url, 500);
   await ctx.wait(1000);
 
@@ -379,6 +394,31 @@ async function runMig(ctx) {
   });
 }
 
+// health: a backend service's health (getHealth on each of its groups) every 2 s for --for seconds, each change
+// printed, per instance and for the service: 'no status' while Google does not health check it (spec section 12, 7:
+// a backend service named in no URL map, or at weight 0 in a weighted route), then the periods of each state.
+async function runHealth(ctx) {
+  const { options: o, request, log } = ctx;
+  const service = await request('GET', `${scopeOf(o)}/backendServices/${o.backendService}`);
+  const groups = (service.backends ?? []).map((b) => nameOf(b.group));
+  log('backend service', `${o.backendService}: ${plural(groups.length, 'group')}${groups.length ? ` ${groups.join(', ')}` : ''}`);
+  const reportInstances = reporter(ctx, 'instance', {}, 'no status');
+  const poller = startPoller(ctx, HEALTH_EVERY_MS, async () => {
+    const states = await readHealth(request, service);
+    reportInstances(states, ctx.at());
+    return { [o.backendService]: core.healthLevel(states) };
+  }, reporter(ctx, 'health'));
+  await ctx.wait(o.duration * 1000);
+  await poller.stop();
+
+  const runs = core.periods(poller.samples, o.backendService);
+  for (const run of runs) {
+    log('period', `${o.backendService} ${run.state} until ${(run.to / 1000).toFixed(1)}s, ${plural(run.samples, 'sample')}`, run.from);
+  }
+  if (runs.length === 0) log('period', 'none: the health was never read');
+  return runs.length > 0 ? 0 : 1;
+}
+
 async function listPoints(request, o, filter, from) {
   const points = [];
   let pageToken = '';
@@ -444,7 +484,7 @@ async function runMetric(ctx) {
   return complete !== null ? 0 : 1;
 }
 
-const RUN = { switch: runSwitch, vm: runVm, mig: runMig, metric: runMetric };
+const RUN = { switch: runSwitch, vm: runVm, mig: runMig, metric: runMetric, health: runHealth };
 
 export async function main(argv, { out = console.log, err = console.error } = {}) {
   let parsed;

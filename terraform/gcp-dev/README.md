@@ -3,7 +3,8 @@
 G0's demo workloads in the Google Cloud project `dormeto-dev` (vision `docs/specs/2026-10-29-google-cloud-design.md`,
 section 12): web VMs behind a global and a regional external Application Load Balancer, written as a customer would,
 with no Dormeto resource. `gcp/tools/measure.mjs` measures them: how fast a URL map switch takes effect, how fast
-stopped or suspended VMs come back healthy, and Cloud Monitoring's request count delay.
+stopped or suspended VMs come back healthy, Cloud Monitoring's request count delay, and whether Google health checks a
+backend service out of service.
 
 - **What it holds** (project `dormeto-dev`, region `europe-west1`, zone `europe-west1-b`): the VPC `dmt-dev` (subnet
   `10.10.0.0/24`, proxy-only subnet `dmt-dev-proxy` `10.10.1.0/24`), the firewall rule `dmt-dev-demo` (Google's front
@@ -28,9 +29,9 @@ stopped or suspended VMs come back healthy, and Cloud Monitoring's request count
   every backend here balances by `UTILIZATION`). A VM can be in one load-balanced instance group only, so a second
   group of the same VM is not an option: if Compute Engine refuses the shared group at the apply, the regional backend
   services move to the managed group.
-- **The switched services are Dormeto's**: the URL maps ignore changes to their default service and their path
-  matchers' services, which the measuring tool (and later Dormeto) switches. The autoscaler ignores its mode, which a
-  managed group's stop turns off.
+- **The switched services are Dormeto's**: the URL maps ignore changes to their default services and default route
+  actions (the map's and its path matchers'), which the measuring tool (and later Dormeto) switches, as a default
+  service or with weights. The autoscaler ignores its mode, which a managed group's stop turns off.
 - **No IAM, no API**: every IAM change and every API turned on in the project go through `dormeto gcp install` or
   `uninstall`. This root holds no `google_*_iam_*` resource, no service account and no `google_project_service`, and its
   VMs and template run without a service account (attaching one is an IAM grant); `gcp/test/gcp-dev.test.mjs` checks
@@ -67,7 +68,8 @@ for a forced refresh and sends the request once more. Each command prints a time
 refusal, 2 on a bad flag. Run each several times (G0: five). `--help` lists every option.
 
 1. **The URL map switch** (every 250 ms, a new connection each): from the update's end to the first answer from the
-   new backend service, the last from the old one, and 20 new ones in a row.
+   new backend service, the last from the old one, and 20 new ones in a row; with both backend services' health
+   (every 2 s) as it changes: `no status`, `unhealthy`, `healthy`.
 
    ```
    node gcp/tools/measure.mjs switch --from dmt-demo-app --to dmt-demo-standin
@@ -75,6 +77,19 @@ refusal, 2 on a bad flag. Run each several times (G0: five). `--help` lists ever
    node gcp/tools/measure.mjs switch --region europe-west1 --url-map dmt-dev-regional --url http://regional.gcp.dev.dormeto.com/ \
      --from dmt-demo-regional-app --to dmt-demo-regional-standin
    ```
+
+   The wake direction (stand-in to app) is the decisive one: it is the switch the route grace covers, to a backend
+   service of instance groups as a customer's is. The other direction says little of the router: its target, the
+   waker's serverless NEG, has no health check, unlike the stand-in here. Google health checks only a backend service
+   that a forwarding rule reaches through a URL map (measurement 7), so the app's service may have `no status` at the
+   update. Then read the timeline this way:
+   - the propagation ends with the last old answer (no front end sends to the stand-in any more);
+   - the `http 503` answers until the app's health line turns `healthy` are its health check's warm-up: 2 checks, 5 s
+     apart at the default;
+   - with the app's service `healthy` at the update, there is no such gap.
+
+   If neither (a) nor (b) of measurement 7 keeps the app's service health checked, the route grace must cover that
+   warm-up as well as the propagation.
 
 2. **A stopped VM started** and **3. a suspended VM resumed** (the load balancer every 500 ms, the VM's status every
    second, the backend service's health every 2 s): running, healthy, first answer from the app, and whether the VM is
@@ -106,19 +121,55 @@ refusal, 2 on a bad flag. Run each several times (G0: five). `--help` lists ever
      --metric loadbalancing.googleapis.com/https/external/regional/request_count
    ```
 
-A switch's timeline, for example:
+7. **The health of a backend service out of service** (the nap): `health` reads a backend service's health every 2 s
+   for `--for` seconds and prints each change, per instance and for the service, then how long each state lasted;
+   `no status` means Google does not health check it. Two cases: (a) the service named in no URL map, after a plain
+   switch; (b) the service at weight 0 in a weighted route, after `switch --weighted`. That switch writes the map's and
+   its path matcher's `defaultRouteAction.weightedBackendServices`, `--to` at 1000 and `--from` at 0, in place of
+   their `defaultService` (Google allows only one of the two). A switch without `--weighted` writes `defaultService`
+   again and clears the weights.
+
+   ```
+   # (a) dmt-demo-app in no URL map
+   node gcp/tools/measure.mjs switch --from dmt-demo-app --to dmt-demo-standin
+   node gcp/tools/measure.mjs health --backend-service dmt-demo-app --for 120
+   node gcp/tools/measure.mjs switch --from dmt-demo-standin --to dmt-demo-app
+   # (b) dmt-demo-app at weight 0
+   node gcp/tools/measure.mjs switch --weighted --from dmt-demo-app --to dmt-demo-standin
+   node gcp/tools/measure.mjs health --backend-service dmt-demo-app --for 120
+   node gcp/tools/measure.mjs switch --weighted --from dmt-demo-standin --to dmt-demo-app
+   ```
+
+   The last switch is the weighted wake: if (a) has no status and (b) has one, the router writes weights, and this is
+   the switch to time five times, as in 1. The map then stays weighted (the app at 1000), which Terraform ignores. To
+   get a default service back, run a plain switch from it, `switch --from dmt-demo-app --to dmt-demo-standin`, then
+   back. The regional load balancer's services work the same way, with `--region europe-west1` (and `--url-map
+   dmt-dev-regional --url http://regional.gcp.dev.dormeto.com/` for its switch).
+
+The timeline of a wake's switch could read like this (illustrative numbers). The app's service was out of the URL map,
+so it had no status at the update. The propagation ended at +10.9 s with the last stand-in answer. The 503s until
++19.2 s were the app's health check warm-up:
 
 ```
 0.0s  start  switch 2026-10-30T09:00:00.000Z dormeto-dev
-0.4s  url map  dmt-dev: dmt-demo-app (app) at defaultService, pathMatchers[0].defaultService
-0.4s  answer  app dmt-demo
-5.4s  update  sent: dmt-demo-standin at 2 references
+0.4s  url map  dmt-dev: dmt-demo-standin (stand-in) to dmt-demo-app (app), at defaultService, pathMatchers[0].defaultService
+0.5s  answer  stand-in dmt-demo
+0.6s  health  dmt-demo-app no status
+0.6s  health  dmt-demo-standin healthy
+5.4s  update  sent: dmt-demo-app at 2 references
 9.9s  update  done, +4.5s after it was sent
-21.1s  answer  stand-in dmt-demo
+18.3s  answer  http 503
+18.6s  health  dmt-demo-app unhealthy
 ...
-21.1s  first new  stand-in, +11.2s after the update
-33.6s  last old  app, +23.7s after the update
-33.9s  settled  20 stand-in in a row from +24.0s after the update
+28.6s  health  dmt-demo-app healthy
+29.1s  answer  app dmt-demo
+...
+5.4s  health  when the update was sent: dmt-demo-standin healthy, dmt-demo-app no status
+18.6s  health  dmt-demo-app unhealthy, +8.7s after the update
+20.8s  last old  stand-in, +10.9s after the update
+28.6s  health  dmt-demo-app healthy, +18.7s after the update
+29.1s  first new  app, +19.2s after the update
+29.1s  settled  20 app in a row from +19.2s after the update
 ```
 
 ## Destroy

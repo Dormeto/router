@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import {
   UsageError, parseArgs, line, delta, pageOf, kindOfPort, summarize, changes, healthStates, managedStates, targets, actionSummary,
-  swapService, tokenArgs, credentialOf, createTokens, withToken, pointsOf, counted,
+  switchService, healthLevel, changesSince, periods, tokenArgs, credentialOf, createTokens, withToken, pointsOf, counted,
 } from '../tools/measure-core.mjs';
 import { probe } from '../tools/measure.mjs';
 
@@ -22,8 +22,10 @@ test('switch: the URL map, both backend services and the URL, the global load ba
     options: {
       project: 'dormeto-dev', configuration: 'dormeto-dev', timeout: 300, settle: 20, region: null,
       urlMap: 'dmt-dev', from: 'dmt-demo-app', to: 'dmt-demo-standin', url: 'https://gcp.dev.dormeto.com/', baseline: 5,
+      weighted: false,
     },
   });
+  assert.equal(parseArgs(['switch', '--weighted', '--from', 'dmt-demo-app', '--to', 'dmt-demo-standin']).options.weighted, true);
 });
 
 test('switch on the regional load balancer: its region, URL map and URL', () => {
@@ -78,6 +80,18 @@ test('metric: the global request count, 20 requests', () => {
   assert.equal(options.filter, 'resource.labels.backend_target_name="dmt-demo-app"');
 });
 
+test('health: a backend service\'s health every 2 s for 2 minutes, dmt-demo-app by default, regional with --region', () => {
+  assert.deepEqual(parseArgs(['health']), {
+    command: 'health',
+    action: null,
+    options: { project: 'dormeto-dev', configuration: 'dormeto-dev', region: null, backendService: 'dmt-demo-app', duration: 120 },
+  });
+  const { options } = parseArgs(['health', '--backend-service', 'dmt-demo-regional-app', '--region', 'europe-west1', '--for', '300']);
+  assert.equal(options.backendService, 'dmt-demo-regional-app');
+  assert.equal(options.region, 'europe-west1');
+  assert.equal(options.duration, 300);
+});
+
 test('help: --help, -h and help', () => {
   for (const argv of [['--help'], ['-h'], ['help'], ['vm', '--help']]) assert.deepEqual(parseArgs(argv), { help: true });
 });
@@ -110,6 +124,16 @@ test('a bad command, action, flag or value is a usage error', () => {
     ['vm', 'start', '--project', 'x'],
     ['mig', 'start', '--autoscaler-mode', 'SOMETIMES'],
     ['metric', '--count', '0'],
+    ['switch', '--from', 'a', '--to', 'b', '--weighted', 'yes'],
+    ['switch', '--from', 'a', '--to', 'b', '--weighted=true'],
+    ['vm', 'start', '--weighted'],
+    ['health', 'extra'],
+    ['health', '--for', '0'],
+    ['health', '--for', '1.5'],
+    ['health', '--timeout', '60'],
+    ['health', '--url', 'https://gcp.dev.dormeto.com/'],
+    ['constructor'],
+    ['toString'],
   ];
   for (const argv of bad) assert.throws(() => parseArgs(argv), UsageError, argv.join(' '));
 });
@@ -201,6 +225,57 @@ test('health: each instance\'s state in a backend service\'s group health', () =
   };
   assert.deepEqual(healthStates(response), { 'dmt-demo-mig-x1k2': 'HEALTHY', 'dmt-demo-mig-p9q8': 'UNHEALTHY' });
   assert.deepEqual(healthStates({ kind: 'compute#backendServiceGroupHealth' }), {});
+});
+
+test('a backend service\'s health: no status (not health checked), healthy (one instance at least), else unhealthy', () => {
+  assert.equal(healthLevel({}), 'no status');
+  assert.equal(healthLevel({ 'dmt-demo': 'UNHEALTHY' }), 'unhealthy');
+  assert.equal(healthLevel({ 'dmt-demo-mig-x1k2': 'UNHEALTHY', 'dmt-demo-mig-p9q8': 'HEALTHY' }), 'healthy');
+  assert.equal(healthLevel(healthStates({ kind: 'compute#backendServiceGroupHealth' })), 'no status');
+});
+
+test('changes since a time: each state just before it, then what changed from it on', () => {
+  const samples = [
+    { t: 4000, states: { app: 'healthy', standin: 'no status' } },
+    { t: 0, states: { app: 'healthy' } },
+    { t: 2000, states: { app: 'healthy', standin: 'no status' } },
+    { t: 6000, states: { app: 'healthy', standin: 'unhealthy' } },
+    { t: 8000, states: { app: 'no status', standin: 'unhealthy' } },
+    { t: 10_000, states: { app: 'no status', standin: 'healthy' } },
+  ];
+  assert.deepEqual(changesSince(samples, 5000), {
+    before: { app: 'healthy', standin: 'no status' },
+    after: [
+      { t: 6000, name: 'standin', from: 'no status', to: 'unhealthy' },
+      { t: 8000, name: 'app', from: 'healthy', to: 'no status' },
+      { t: 10_000, name: 'standin', from: 'unhealthy', to: 'healthy' },
+    ],
+  });
+  assert.deepEqual(changesSince(samples, 0).before, {});
+  assert.deepEqual(changesSince(samples, 0).after.slice(0, 2), [
+    { t: 0, name: 'app', from: null, to: 'healthy' },
+    { t: 2000, name: 'standin', from: null, to: 'no status' },
+  ]);
+  assert.deepEqual(changesSince([], 0), { before: {}, after: [] });
+});
+
+test('periods: each run of one state, from its first sample to its last', () => {
+  const samples = [
+    { t: 2000, states: { app: 'healthy' } },
+    { t: 0, states: { app: 'healthy' } },
+    { t: 4000, states: { app: 'unhealthy' } },
+    { t: 6000, states: {} },
+    { t: 8000, states: { app: 'no status' } },
+    { t: 10_000, states: { app: 'healthy' } },
+  ];
+  assert.deepEqual(periods(samples, 'app'), [
+    { state: 'healthy', from: 0, to: 2000, samples: 2 },
+    { state: 'unhealthy', from: 4000, to: 4000, samples: 1 },
+    { state: null, from: 6000, to: 6000, samples: 1 },
+    { state: 'no status', from: 8000, to: 8000, samples: 1 },
+    { state: 'healthy', from: 10_000, to: 10_000, samples: 1 },
+  ]);
+  assert.deepEqual(periods([], 'app'), []);
 });
 
 test('a managed group\'s instances: their status and the group\'s current action', () => {
@@ -303,7 +378,7 @@ test('a stop\'s summary: stopped, no instance healthy, last answer from the app,
 
 // --- The switch's URL map change ---
 
-test('swap: every reference to the backend service, by name, in a copy; the rest untouched', () => {
+test('switch: every reference to the backend service, by name, in a copy; the rest untouched', () => {
   const map = {
     name: 'dmt-dev',
     fingerprint: 'f1=',
@@ -315,7 +390,7 @@ test('swap: every reference to the backend service, by name, in a copy; the rest
     ],
   };
   const before = structuredClone(map);
-  const { map: swapped, paths } = swapService(map, 'dmt-demo-app', 'dmt-demo-standin');
+  const { map: swapped, paths } = switchService(map, 'dmt-demo-app', 'dmt-demo-standin');
   assert.deepEqual(paths, ['defaultService', 'pathMatchers[0].defaultService', 'pathMatchers[0].pathRules[0].service']);
   assert.equal(swapped.defaultService, `${BS}/dmt-demo-standin`);
   assert.equal(swapped.pathMatchers[0].defaultService, `${BS}/dmt-demo-standin`);
@@ -326,13 +401,91 @@ test('swap: every reference to the backend service, by name, in a copy; the rest
   assert.deepEqual(map, before);
 });
 
-test('swap: a regional map\'s default service; a map without the service changes nothing', () => {
+test('switch: a regional map\'s default service; a map without the service changes nothing', () => {
   const regional = { defaultService: 'https://www.googleapis.com/compute/v1/projects/dormeto-dev/regions/europe-west1/backendServices/dmt-demo-regional-app' };
-  assert.deepEqual(swapService(regional, 'dmt-demo-regional-app', 'dmt-demo-regional-standin'), {
+  assert.deepEqual(switchService(regional, 'dmt-demo-regional-app', 'dmt-demo-regional-standin'), {
     map: { defaultService: 'https://www.googleapis.com/compute/v1/projects/dormeto-dev/regions/europe-west1/backendServices/dmt-demo-regional-standin' },
     paths: ['defaultService'],
   });
-  assert.deepEqual(swapService(regional, 'dmt-demo-app', 'dmt-demo-standin').paths, []);
+  assert.deepEqual(switchService(regional, 'dmt-demo-app', 'dmt-demo-standin').paths, []);
+});
+
+// gcp-dev's global map, as Terraform writes it.
+const devMap = () => ({
+  name: 'dmt-dev',
+  fingerprint: 'f1=',
+  defaultService: `${BS}/dmt-demo-app`,
+  hostRules: [{ hosts: ['gcp.dev.dormeto.com'], pathMatcher: 'app' }, { hosts: ['mig.gcp.dev.dormeto.com'], pathMatcher: 'mig' }],
+  pathMatchers: [
+    { name: 'app', defaultService: `${BS}/dmt-demo-app` },
+    { name: 'mig', defaultService: `${BS}/dmt-demo-mig-app` },
+  ],
+});
+const weights = (first, second) => ({
+  weightedBackendServices: [{ backendService: `${BS}/${first}`, weight: 1000 }, { backendService: `${BS}/${second}`, weight: 0 }],
+});
+
+test('switch --weighted: the old service at weight 0 beside the new one at 1000, instead of the default service', () => {
+  const map = devMap();
+  const { map: weighted, paths } = switchService(map, 'dmt-demo-app', 'dmt-demo-standin', { weighted: true });
+  assert.deepEqual(paths, ['defaultRouteAction.weightedBackendServices', 'pathMatchers[0].defaultRouteAction.weightedBackendServices']);
+  const { defaultService, ...rest } = devMap();
+  assert.equal(defaultService, `${BS}/dmt-demo-app`);
+  assert.deepEqual(weighted, {
+    ...rest,
+    defaultRouteAction: weights('dmt-demo-standin', 'dmt-demo-app'),
+    pathMatchers: [
+      { name: 'app', defaultRouteAction: weights('dmt-demo-standin', 'dmt-demo-app') },
+      { name: 'mig', defaultService: `${BS}/dmt-demo-mig-app` },
+    ],
+  });
+  assert.deepEqual(map, devMap());
+});
+
+test('switch --weighted back: the weights reversed; the other matcher untouched', () => {
+  const asleep = switchService(devMap(), 'dmt-demo-app', 'dmt-demo-standin', { weighted: true }).map;
+  const { map: awake, paths } = switchService(asleep, 'dmt-demo-standin', 'dmt-demo-app', { weighted: true });
+  assert.deepEqual(paths, ['defaultRouteAction.weightedBackendServices', 'pathMatchers[0].defaultRouteAction.weightedBackendServices']);
+  assert.deepEqual(awake.defaultRouteAction, weights('dmt-demo-app', 'dmt-demo-standin'));
+  assert.deepEqual(awake.pathMatchers[0], { name: 'app', defaultRouteAction: weights('dmt-demo-app', 'dmt-demo-standin') });
+  assert.deepEqual(awake.pathMatchers[1], devMap().pathMatchers[1]);
+  assert.equal('defaultService' in awake, false);
+});
+
+test('switch without --weighted from a weighted map: the default service again, the weights cleared', () => {
+  const asleep = switchService(devMap(), 'dmt-demo-app', 'dmt-demo-standin', { weighted: true }).map;
+  const { map: plain, paths } = switchService(asleep, 'dmt-demo-standin', 'dmt-demo-app');
+  assert.deepEqual(paths, ['defaultService', 'pathMatchers[0].defaultService']);
+  assert.deepEqual(plain, devMap());
+
+  const awake = switchService(asleep, 'dmt-demo-standin', 'dmt-demo-app', { weighted: true }).map;
+  const napped = switchService(awake, 'dmt-demo-app', 'dmt-demo-standin').map;
+  assert.equal(napped.defaultService, `${BS}/dmt-demo-standin`);
+  assert.deepEqual(napped.pathMatchers[0], { name: 'app', defaultService: `${BS}/dmt-demo-standin` });
+  assert.deepEqual(napped.pathMatchers[1], devMap().pathMatchers[1]);
+});
+
+test('switch: a service at weight 0 is not served, so not switched; a route action\'s other settings stay', () => {
+  const awake = switchService(switchService(devMap(), 'dmt-demo-app', 'dmt-demo-standin', { weighted: true }).map,
+    'dmt-demo-standin', 'dmt-demo-app', { weighted: true }).map;
+  assert.deepEqual(switchService(awake, 'dmt-demo-standin', 'dmt-demo-app').paths, []);
+  assert.deepEqual(switchService(awake, 'dmt-demo-standin', 'dmt-demo-app', { weighted: true }).paths, []);
+
+  const map = { pathMatchers: [{ name: 'app', defaultService: `${BS}/dmt-demo-app`, defaultRouteAction: { timeout: { seconds: '30' } } }] };
+  const weighted = switchService(map, 'dmt-demo-app', 'dmt-demo-standin', { weighted: true }).map;
+  assert.deepEqual(weighted.pathMatchers[0], { name: 'app', defaultRouteAction: { timeout: { seconds: '30' }, ...weights('dmt-demo-standin', 'dmt-demo-app') } });
+  const plain = switchService(weighted, 'dmt-demo-standin', 'dmt-demo-app').map;
+  assert.deepEqual(plain.pathMatchers[0], { name: 'app', defaultService: `${BS}/dmt-demo-app`, defaultRouteAction: { timeout: { seconds: '30' } } });
+});
+
+test('switch --weighted: a path rule\'s service in its route action; a weight Google left out is 0', () => {
+  const map = { pathMatchers: [{ name: 'app', defaultService: `${BS}/other`, pathRules: [{ paths: ['/a'], service: `${BS}/dmt-demo-app` }] }] };
+  const { map: weighted, paths } = switchService(map, 'dmt-demo-app', 'dmt-demo-standin', { weighted: true });
+  assert.deepEqual(paths, ['pathMatchers[0].pathRules[0].routeAction.weightedBackendServices']);
+  assert.deepEqual(weighted.pathMatchers[0].pathRules[0], { paths: ['/a'], routeAction: weights('dmt-demo-standin', 'dmt-demo-app') });
+  const fromGoogle = { defaultRouteAction: { weightedBackendServices: [{ backendService: `${BS}/dmt-demo-standin`, weight: 1000 }, { backendService: `${BS}/dmt-demo-app` }] } };
+  assert.deepEqual(switchService(fromGoogle, 'dmt-demo-app', 'dmt-demo-standin').paths, []);
+  assert.deepEqual(switchService(fromGoogle, 'dmt-demo-standin', 'dmt-demo-app').map, { defaultService: `${BS}/dmt-demo-app` });
 });
 
 // --- Tokens ---

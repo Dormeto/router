@@ -29,8 +29,13 @@ const ROUTE_PATH = '/_dormeto/*';
 const ROUTE_PREFIX = '/_dormeto/';
 const ROUTE_NAMESPACE = '/_dormeto';
 const DEFAULT_MATCHER = 'dormeto-default';
-const RETRIES = 3;
+// Between two tries of an update refused because of another one, which takes 14 to 25 s (G0): about 60 s in all.
+const PAUSES_MS = [5000, 10_000, 15_000, 30_000];
 const WAIT_MS = 120_000;
+
+// Another update got there first (412: the fingerprint), or is under way: at the request, or as its operation ended.
+const NOT_READY = new Set(['resourceNotReady', 'RESOURCE_NOT_READY']);
+export const mapBusy = (err) => err?.code === 412 || NOT_READY.has(err?.reason);
 
 const nameOf = (url) => (typeof url === 'string' ? url.slice(url.lastIndexOf('/') + 1) : null);
 
@@ -214,7 +219,9 @@ export const CALLS = {
   modify: ['compute.urlMaps.get', 'compute.urlMaps.update', 'compute.backendServices.use', 'compute.globalOperations.get'],
 };
 
-export function createUrlMaps({ google, project, now = Date.now }) {
+const pause = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+
+export function createUrlMaps({ google, project, now = Date.now, sleep = pause }) {
   const maps = `${COMPUTE}/projects/${project}/global/urlMaps`;
   const url = (name) => `${maps}/${name}`;
   const get = (name) => google.request('GET', url(name));
@@ -231,18 +238,19 @@ export function createUrlMaps({ google, project, now = Date.now }) {
   }
 
   // Reads the map, applies `change(map)` (one of the functions above), and updates it with the map's fingerprint;
-  // changes nothing if `change` wrote nothing. A 412 (another change got there first) reads the map again and applies
-  // the change to it, three times at most.
+  // changes nothing if `change` wrote nothing. Refused for another update (mapBusy): a pause, then the map read again and
+  // the change applied to it, up to about 60 s.
   async function modify(name, change) {
-    for (let retry = 0; ; retry += 1) {
+    for (const wait of [...PAUSES_MS, null]) {
       const result = change(await get(name));
       if (result.paths.length === 0) return result;
       try {
         await google.waitCompute(await google.request('PUT', url(name), result.map), now() + WAIT_MS);
         return result;
       } catch (e) {
-        if (e.code !== 412 || retry >= RETRIES) throw e;
+        if (!mapBusy(e) || wait === null) throw e;
       }
+      await sleep(wait);
     }
   }
 

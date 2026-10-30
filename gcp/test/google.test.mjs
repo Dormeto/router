@@ -16,7 +16,7 @@ function harness({ expiresIn = 3600, api = () => json({ ok: true }) } = {}) {
     }
     return api(url, init, state);
   };
-  const google = createGoogle({ fetch, now: () => state.time });
+  const google = createGoogle({ fetch, now: () => state.time, sleep: async (ms) => { state.sleeps.push(ms); } });
   return { google, state, api: () => state.calls.filter((c) => c.url !== TOKEN_URL) };
 }
 
@@ -83,6 +83,65 @@ test('errors: the reason from the details when the errors list has none; a non-J
   await assert.rejects(google.request('GET', 'https://x/1'), { code: 429, reason: 'RATE_LIMIT_EXCEEDED' });
   const html = harness({ api: () => new Response('<html>bad gateway</html>', { status: 502 }) });
   await assert.rejects(html.google.request('GET', 'https://x/1'), (e) => e.code === 502 && /bad gateway/.test(e.message));
+});
+
+// `then`: what the first try got, then a good answer.
+const failingOnce = (then) => {
+  let n = 0;
+  return () => (++n === 1 ? then() : json({ ok: 1 }));
+};
+const unavailable = () => json({ error: { code: 503, message: 'backend error', status: 'UNAVAILABLE' } }, 503);
+const throttled = () => json({ error: { code: 429, message: 'quota', status: 'RESOURCE_EXHAUSTED' } }, 429);
+const lost = () => { throw new TypeError('fetch failed'); };
+const OPERATION_WAIT = 'https://compute.googleapis.com/compute/v1/projects/p/global/operations/op/wait';
+const GET_HEALTH = 'https://compute.googleapis.com/compute/v1/projects/p/global/backendServices/app/getHealth';
+const LIST_MANAGED = 'https://compute.googleapis.com/compute/v1/projects/p/zones/z/instanceGroupManagers/mig/listManagedInstances';
+const LIST_GROUP = 'https://compute.googleapis.com/compute/v1/projects/p/zones/z/instanceGroups/ig/listInstances';
+
+for (const [name, method, url] of [['a GET', 'GET', 'https://x/1'], ['an operation\'s wait', 'POST', OPERATION_WAIT], ['getHealth', 'POST', GET_HEALTH], ['listManagedInstances', 'POST', LIST_MANAGED], ['an unmanaged group\'s listInstances', 'POST', LIST_GROUP]]) {
+  for (const [what, failure] of [['a 503', unavailable], ['a 429', throttled], ['a network error', lost]]) {
+    test(`${name} is tried again after ${what}, with a pause`, async () => {
+      const { google, state, api } = harness({ api: failingOnce(failure) });
+      assert.deepEqual(await google.request(method, url).catch((err) => err.message), { ok: 1 });
+      assert.equal(api().length, 2);
+      assert.deepEqual(state.sleeps, [1000]);
+    });
+  }
+}
+
+test('three tries at most, the pause growing: then the last failure is thrown', async () => {
+  const { google, state, api } = harness({ api: unavailable });
+  await assert.rejects(google.request('GET', 'https://x/1'), { code: 503 });
+  assert.equal(api().length, 3);
+  assert.deepEqual(state.sleeps, [1000, 2000]);
+});
+
+for (const [name, method, url] of [['a PUT', 'PUT', 'https://x/urlMaps/lb'], ['a change\'s POST', 'POST', 'https://x/instances/vm/stop'], ['Firestore\'s commit', 'POST', 'https://firestore.googleapis.com/v1/projects/p/databases/d/documents:commit'], ['a PATCH', 'PATCH', 'https://x/autoscalers?autoscaler=a'], ['a DELETE', 'DELETE', 'https://x/backendServices/b'], ['a VM named wait', 'POST', 'https://x/zones/z/instances/wait']]) {
+  for (const [what, failure, expected] of [['a 503', unavailable, { code: 503 }], ['a network error', lost, /fetch failed/]]) {
+    test(`${name} is never tried again after ${what}`, async () => {
+      const { google, state, api } = harness({ api: failure });
+      await assert.rejects(google.request(method, url, {}), expected);
+      assert.equal(api().length, 1);
+      assert.deepEqual(state.sleeps, []);
+    });
+  }
+}
+
+test('a refusal is not tried again, a read\'s either: 403, 404', async () => {
+  for (const code of [403, 404]) {
+    const { google, state, api } = harness({ api: () => json({ error: { code, message: 'no' } }, code) });
+    await assert.rejects(google.request('GET', 'https://x/1'), { code });
+    assert.equal(api().length, 1);
+    assert.deepEqual(state.sleeps, []);
+  }
+});
+
+test('a read that ran out of its 150 s is not tried again: three times that would pass what its caller has left', async () => {
+  const timedOut = () => { throw new DOMException('The operation was aborted due to timeout', 'TimeoutError'); };
+  const { google, state, api } = harness({ api: timedOut });
+  await assert.rejects(google.request('POST', OPERATION_WAIT), { name: 'TimeoutError' });
+  assert.equal(api().length, 1);
+  assert.deepEqual(state.sleeps, []);
 });
 
 test('a token the metadata server refuses is an error', async () => {

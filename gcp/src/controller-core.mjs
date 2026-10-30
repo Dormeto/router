@@ -13,7 +13,7 @@ import { failedSpec, failureError } from '../../lambda/src/lib/failures.mjs';
 import { resolveHibernation } from '../../lambda/src/lib/hibernation.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { OPERATION_NOT_DONE } from './google.mjs';
-import { references, UrlMapRefused, withErrorPolicy, withoutErrorPolicy, withWakerRoute } from './urlmaps.mjs';
+import { mapBusy, references, UrlMapRefused, withErrorPolicy, withoutErrorPolicy, withWakerRoute } from './urlmaps.mjs';
 
 const COMPUTE = 'https://compute.googleapis.com/compute/v1';
 const POLL_MS = 2000;
@@ -42,8 +42,8 @@ const GOING = new Set(['STOPPING', 'SUSPENDING']);
 const DOWN = new Set([...GONE, ...GOING]);
 // A managed instance's status lags behind what its group is doing to it (G0: 92 s of draining while RUNNING).
 const STATUS_OF_ACTION = { STOPPING: 'STOPPING', SUSPENDING: 'SUSPENDING', STARTING: 'STAGING', RESUMING: 'STAGING' };
-// What the shared classification cannot read in a Google error. 412: the URL map kept changing, as a throttled switch.
-const KIND_OF_CODE = { 403: 'permission', 412: 'throttled', 429: 'throttled' };
+// What the shared classification cannot read in a Google error.
+const KIND_OF_CODE = { 403: 'permission', 429: 'throttled' };
 
 const nameOf = (url) => url.slice(url.lastIndexOf('/') + 1);
 const zoneOf = (url) => /\/zones\/([^/]+)\//.exec(url)?.[1];
@@ -66,7 +66,8 @@ async function each(items, action) {
 }
 
 function failedFrom(err, options) {
-  const kind = err.kind ?? (err.reason === OPERATION_NOT_DONE ? 'timeout' : KIND_OF_CODE[err.code]);
+  // The URL map kept changing, as a throttled switch.
+  const kind = err.kind ?? (err.reason === OPERATION_NOT_DONE ? 'timeout' : mapBusy(err) ? 'throttled' : KIND_OF_CODE[err.code]);
   return failedSpec(kind ? Object.assign(err, { kind }) : err, options);
 }
 

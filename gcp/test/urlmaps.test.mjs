@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { fakeClock } from '../../lambda/test/fakes.mjs';
 import {
   hostsOf, references, UrlMapRefused, withErrorPolicy, withoutErrorPolicy, withWakerRoute, withoutWakerRoute, createUrlMaps, CALLS,
 } from '../src/urlmaps.mjs';
@@ -290,28 +291,78 @@ test('modify: nothing to change writes nothing', async () => {
   assert.deepEqual(google.calls.map((c) => c.method), ['GET']);
 });
 
-test('modify: a 412 reads the map again and applies the change to it, three times at most', async () => {
-  let puts = 0;
-  const google = fakeGoogle((method) => {
-    if (method === 'GET') return { ...fixture(), fingerprint: `f${google.calls.length}` };
-    puts += 1;
-    if (puts <= 2) throw gerr(412);
-    return { selfLink: 'op' };
-  });
-  const urlmaps = createUrlMaps({ google, project: 'p' });
-  await urlmaps.modify('dmt-dev', (map) => withErrorPolicy(map, APP, WAKER));
-  assert.equal(google.calls.filter((c) => c.method === 'GET').length, 3);
-  assert.notEqual(google.calls.filter((c) => c.method === 'PUT')[2].body.fingerprint, google.calls.filter((c) => c.method === 'PUT')[0].body.fingerprint);
+const notReady = () => Object.assign(new Error('Google: PUT: 400 The resource is not ready'), { code: 400, reason: 'resourceNotReady' });
+const noWait = (sleeps = []) => async (ms) => { sleeps.push(ms); };
 
-  const always = fakeGoogle((method) => { if (method === 'GET') return fixture(); throw gerr(412); });
-  await assert.rejects(createUrlMaps({ google: always, project: 'p' }).modify('dmt-dev', (map) => withErrorPolicy(map, APP, WAKER)), { code: 412 });
-  assert.equal(always.calls.filter((c) => c.method === 'GET').length, 4);
+for (const [name, refusal] of [['a 412', () => gerr(412)], ['a resourceNotReady', notReady], ['an operation that ended RESOURCE_NOT_READY', () => Object.assign(new Error('op'), { code: 400, reason: 'RESOURCE_NOT_READY' })]]) {
+  test(`modify: ${name} waits, reads the map again and applies the change to it: 5 s, growing, 60 s in all`, async () => {
+    let puts = 0;
+    const google = fakeGoogle((method) => {
+      if (method === 'GET') return { ...fixture(), fingerprint: `f${google.calls.length}` };
+      puts += 1;
+      if (puts <= 2) throw refusal();
+      return { selfLink: 'op' };
+    });
+    const sleeps = [];
+    await assert.doesNotReject(createUrlMaps({ google, project: 'p', sleep: noWait(sleeps) }).modify('dmt-dev', (map) => withErrorPolicy(map, APP, WAKER)));
+    assert.equal(google.calls.filter((c) => c.method === 'GET').length, 3);
+    assert.notEqual(google.calls.filter((c) => c.method === 'PUT')[2].body.fingerprint, google.calls.filter((c) => c.method === 'PUT')[0].body.fingerprint);
+    assert.deepEqual(sleeps, [5000, 10_000]);
+
+    const always = fakeGoogle((method) => { if (method === 'GET') return fixture(); throw refusal(); });
+    const paused = [];
+    await assert.rejects(createUrlMaps({ google: always, project: 'p', sleep: noWait(paused) }).modify('dmt-dev', (map) => withErrorPolicy(map, APP, WAKER)), { code: refusal().code });
+    assert.deepEqual(paused, [5000, 10_000, 15_000, 30_000]);
+    assert.equal(paused.reduce((sum, ms) => sum + ms, 0), 60_000);
+    assert.equal(always.calls.filter((c) => c.method === 'PUT').length, 5);
+  });
+}
+
+// Google with an update taking 20 s (G0: 14 to 25 s): during it, another one is `resourceNotReady`; after it, an update made
+// on the map read before it is a 412. Time is the fake clock's: what a fake answering at once cannot show.
+function busyGoogle(clock, stored) {
+  let busyUntil = 0;
+  let version = 0;
+  const google = {
+    puts: [],
+    request: async (method, url, body) => {
+      if (method === 'GET') return { ...structuredClone(stored.map), fingerprint: `v${version}` };
+      if (clock.now() < busyUntil) throw notReady();
+      if (body.fingerprint !== `v${version}`) throw gerr(412);
+      busyUntil = clock.now() + 20_000;
+      version += 1;
+      stored.map = body;
+      google.puts.push(clock.now());
+      return { selfLink: 'op' };
+    },
+    waitCompute: async () => {},
+  };
+  return google;
+}
+
+test('modify: two workloads writing one URL map at once, an update taking 20 s: both policies are there, neither fails', async () => {
+  const clock = fakeClock();
+  const OTHER = `${V1}/dmtr-europe-west1-other`;
+  // terraform/gcp-dev's map: two workloads, one matcher each.
+  const stored = { map: { name: 'dmt-dev', pathMatchers: [{ name: 'app', defaultService: `${V1}/${APP}` }, { name: 'mig', defaultService: `${V1}/mig` }] } };
+  const google = busyGoogle(clock, stored);
+  const urlmaps = createUrlMaps({ google, project: 'p', now: clock.now, sleep: clock.sleep });
+  await assert.doesNotReject(Promise.all([
+    urlmaps.modify('dmt-dev', (map) => withErrorPolicy(map, APP, WAKER)),
+    urlmaps.modify('dmt-dev', (map) => withErrorPolicy(map, 'mig', OTHER)),
+  ]));
+  assert.equal(google.puts.length, 2);
+  assert.ok(google.puts[1] - google.puts[0] >= 20_000);
+  assert.equal(stored.map.pathMatchers[0].defaultCustomErrorResponsePolicy.errorService, WAKER);
+  assert.equal(stored.map.pathMatchers[1].defaultCustomErrorResponsePolicy.errorService, OTHER);
 });
 
 test('modify: another error is not retried', async () => {
   const google = fakeGoogle((method) => { if (method === 'GET') return fixture(); throw gerr(403); });
-  await assert.rejects(createUrlMaps({ google, project: 'p' }).modify('dmt-dev', (map) => withErrorPolicy(map, APP, WAKER)), { code: 403 });
+  const sleeps = [];
+  await assert.rejects(createUrlMaps({ google, project: 'p', sleep: noWait(sleeps) }).modify('dmt-dev', (map) => withErrorPolicy(map, APP, WAKER)), { code: 403 });
   assert.equal(google.calls.length, 2);
+  assert.deepEqual(sleeps, []);
 });
 
 test('CALLS names the adapter\'s functions', () => {

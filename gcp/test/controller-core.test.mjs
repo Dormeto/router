@@ -119,10 +119,15 @@ function setup({
     waitCompute: async () => {},
   };
   const log = Object.fromEntries(['info', 'warn', 'error'].map((level) => [level, (event, fields = {}) => world.logs.push({ level, event, ...fields })]));
+  const sleep = async (ms) => {
+    world.sleeps.push(ms);
+    if (ms >= MINUTE) world.calls.push(`wait ${ms / 1000} s`);
+    await clock.sleep(ms);
+  };
   const controller = createController({
     store,
     compute,
-    urlmaps: createUrlMaps({ google, project: 'p', now: clock.now }),
+    urlmaps: createUrlMaps({ google, project: 'p', now: clock.now, sleep }),
     monitoring: {
       requestCount: async (query) => {
         world.metricReads.push(query);
@@ -132,11 +137,7 @@ function setup({
     tasks: { enqueue: async (task) => { world.tasks.push(task); } },
     config: { project: 'p', controllerUrl: CONTROLLER },
     now: clock.now,
-    sleep: async (ms) => {
-      world.sleeps.push(ms);
-      if (ms >= MINUTE) world.calls.push(`wait ${ms / 1000} s`);
-      await clock.sleep(ms);
-    },
+    sleep,
     log,
     newId: () => 'wake-2',
   });
@@ -520,19 +521,36 @@ test('a stop refused: FAILED with the kind permission', async () => {
   assert.equal(JSON.parse(t.run().failure).kind, 'permission');
 });
 
-test('a URL map changed four times over: a failure of the switch (throttled), nothing stopped', async () => {
+test('a URL map changed five times over: a failure of the switch (throttled), nothing stopped', async () => {
   const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
-  t.world.conflicts = 4;
+  t.world.conflicts = 5;
   const out = await t.controller.nap('demo');
   assert.equal(out.state, STATES.FAILED);
   assert.equal(JSON.parse(t.run().failure).kind, 'throttled');
   assert.deepEqual(t.world.calls, []);
 });
 
-test('a URL map changed three times over is read again and written', async () => {
+test('a URL map changed four times over is read again and written, with its pauses', async () => {
   const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } }, cfg: { hibernate: false } });
-  t.world.conflicts = 3;
+  t.world.conflicts = 4;
   assert.equal((await t.controller.nap('demo')).state, STATES.ASLEEP);
+});
+
+test('another update of the URL map under way (resourceNotReady): the nap waits for it; for ever, a failure of the switch', async () => {
+  const notReady = () => new GoogleError('Google: PUT: 400 The resource is not ready', { code: 400, reason: 'resourceNotReady' });
+  const waits = setup({ vms: { 'vm-a': { status: 'RUNNING' } }, cfg: { hibernate: false } });
+  let refusals = 2;
+  waits.world.on.put = async () => {
+    if (refusals-- > 0) throw notReady();
+  };
+  assert.equal((await waits.controller.nap('demo')).state, STATES.ASLEEP);
+  assert.deepEqual(waits.world.sleeps.slice(0, 2), [5000, 10_000]);
+
+  const never = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
+  never.world.on.put = async () => { throw notReady(); };
+  assert.equal((await never.controller.nap('demo')).state, STATES.FAILED);
+  assert.equal(JSON.parse(never.run().failure).kind, 'throttled');
+  assert.deepEqual(never.world.calls, []);
 });
 
 test('a customer\'s own error policy: the nap is aborted, AWAKE, nothing stopped', async () => {

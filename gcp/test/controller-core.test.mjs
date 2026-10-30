@@ -50,6 +50,8 @@ function setup({
     calls: [],
     on: {},
     groupsRead: [],
+    autoscalerOf: {},
+    autoscalerReads: [],
     conflicts: 0,
     puts: 0,
     healthReads: 0,
@@ -77,7 +79,12 @@ function setup({
       world.groupsRead.push(group);
       return structuredClone(world.groups[group.name] ?? []);
     },
+    getManagedGroup: async ({ name }) => {
+      const scaler = world.autoscalerOf[name] ?? (world.autoscalers[name] ? name : null);
+      return { name, status: scaler ? { autoscaler: `${V1}/zones/${ZONE}/autoscalers/${scaler}` } : {} };
+    },
     getAutoscaler: async ({ name }) => {
+      world.autoscalerReads.push(name);
       if (!world.autoscalers[name]) throw new GoogleError('no autoscaler', { code: 404 });
       return { name, autoscalingPolicy: { mode: world.autoscalers[name] } };
     },
@@ -116,7 +123,12 @@ function setup({
     store,
     compute,
     urlmaps: createUrlMaps({ google, project: 'p', now: clock.now }),
-    monitoring: { requestCount: async (query) => { world.metricReads.push(query); return world.requests; } },
+    monitoring: {
+      requestCount: async (query) => {
+        world.metricReads.push(query);
+        return typeof world.requests === 'function' ? world.requests(query) : world.requests;
+      },
+    },
     tasks: { enqueue: async (task) => { world.tasks.push(task); } },
     config: { project: 'p', controllerUrl: CONTROLLER },
     now: clock.now,
@@ -425,6 +437,25 @@ test('an autoscaler already off, or none: nothing recorded, nothing changed', as
   assert.equal(t.run().state, STATES.ASLEEP);
   assert.deepEqual(t.run().autoscalers ?? [], []);
   assert.equal(t.world.calls.some((c) => c.startsWith('autoscaler')), false);
+  assert.deepEqual(t.world.autoscalerReads, ['mig'], 'a group naming no autoscaler has none');
+});
+
+test('an autoscaler not named like its group: found through the group, off for the nap, its name recorded, given back', async () => {
+  const t = setup({
+    cfg: { backends: [MIG], hibernate: false },
+    groups: { mig: [managed('mig-1', 'RUNNING')] },
+    autoscalers: { 'mig-scaler': 'ON' },
+  });
+  t.world.autoscalerOf.mig = 'mig-scaler';
+  await t.controller.nap('demo');
+  assert.equal(t.world.autoscalers['mig-scaler'], 'OFF');
+  assert.ok(t.world.calls.includes('autoscaler mig-scaler OFF'));
+  assert.deepEqual(t.run().autoscalers, [{ kind: 'zonal', location: ZONE, name: 'mig-scaler', mode: 'ON' }]);
+  t.run().state = STATES.WAKING;
+  t.run().wakeId = 'w1';
+  await t.controller.wake('demo', 'w1');
+  assert.equal(t.world.autoscalers['mig-scaler'], 'ON');
+  assert.equal(t.run().autoscalers, undefined);
 });
 
 test('a managed group\'s slow stop (198 s, past the operation\'s wait) is no failure, and fits the request', async () => {
@@ -479,7 +510,7 @@ test('a slow URL map write leaves the stop less time: the nap\'s deadline still 
   t.world.on['stop vm-a'] = async () => { t.world.vms['vm-a'].status = 'STOPPING'; throw notDone(); };
   const out = await t.controller.nap('demo');
   assert.equal(out.state, STATES.FAILED);
-  assert.ok(t.clock.now() - START < REQUEST_LIMIT - 30_000, `${t.clock.now() - START} ms`);
+  assert.ok(t.clock.now() - START <= REQUEST_LIMIT - 30_000, `${t.clock.now() - START} ms`);
 });
 
 test('a stop refused: FAILED with the kind permission', async () => {
@@ -514,6 +545,63 @@ test('a customer\'s own error policy: the nap is aborted, AWAKE, nothing stopped
   assert.equal(t.run().state, STATES.AWAKE);
   assert.equal(t.run().awakeSince, t.clock.now());
   assert.deepEqual(t.world.calls, []);
+  assert.equal(t.logged('NapAborted').length, 1);
+});
+
+test('the policy lost during the 300 s: written again and a fresh wait before the VMs go, a group\'s 198 s stop still fitting', async () => {
+  const t = setup({ cfg: { backends: [MIG], hibernate: false }, groups: { mig: [managed('mig-1', 'RUNNING')] } });
+  t.world.on.put = async () => { t.clock.advance(25_000); };
+  let lost = false;
+  let stopAsked;
+  t.clock.onSleep((now) => {
+    if (!lost) {
+      lost = true;
+      delete t.world.map.pathMatchers[0].defaultCustomErrorResponsePolicy;
+    }
+    if (stopAsked && now >= stopAsked + 198_000) t.world.groups.mig = [managed('mig-1', 'TERMINATED')];
+  });
+  t.world.on['stop mig mig-1'] = async () => {
+    stopAsked = t.clock.now();
+    t.world.groups.mig = [managed('mig-1', 'RUNNING', 'STOPPING')];
+    return 'under way';
+  };
+  const out = await t.controller.nap('demo');
+  assert.deepEqual(t.world.calls, ['map policy', 'wait 300 s', 'map policy', 'wait 300 s', 'stop mig mig-1']);
+  assert.equal(out.state, STATES.ASLEEP);
+  assert.equal(t.run().failure, undefined);
+  assert.equal(t.logged('PolicyLost').length, 1);
+  assert.ok(t.clock.now() - START < REQUEST_LIMIT - 30_000, `${t.clock.now() - START} ms`);
+});
+
+test('the policy lost with no room for a fresh wait: AWAKE, the policy removed, nothing stopped', async () => {
+  const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
+  let slowed = false;
+  t.world.on.put = async () => {
+    if (!slowed) t.clock.advance(400_000);
+    slowed = true;
+  };
+  t.clock.onSleep(() => { delete t.world.map.pathMatchers[0].defaultCustomErrorResponsePolicy; });
+  const out = await t.controller.nap('demo');
+  assert.deepEqual(out, { state: STATES.AWAKE, aborted: true });
+  assert.deepEqual(t.world.calls, ['map policy', 'wait 300 s', 'map policy', 'map no policy']);
+  assert.equal(t.run().state, STATES.AWAKE);
+  assert.equal(t.run().awakeSince, t.clock.now());
+  assert.equal(hasPolicy(t.world.map), false);
+  assert.equal(t.world.vms['vm-a'].status, 'RUNNING');
+  assert.equal(t.logged('NapAborted').length, 1);
+});
+
+test('a customer\'s own policy written during the 300 s: AWAKE, theirs kept, nothing stopped', async () => {
+  const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
+  t.clock.onSleep(() => {
+    t.world.map.pathMatchers[0].defaultCustomErrorResponsePolicy = { errorService: `${V1}/global/backendServices/theirs`, errorResponseRules: [] };
+  });
+  const out = await t.controller.nap('demo');
+  assert.equal(out.state, STATES.AWAKE);
+  assert.equal(out.aborted, true);
+  assert.equal(t.world.vms['vm-a'].status, 'RUNNING');
+  assert.equal(t.world.calls.some((c) => c.startsWith('stop') || c.startsWith('suspend')), false);
+  assert.equal(t.world.map.pathMatchers[0].defaultCustomErrorResponsePolicy.errorService, `${V1}/global/backendServices/theirs`);
   assert.equal(t.logged('NapAborted').length, 1);
 });
 
@@ -561,7 +649,7 @@ test('idle: the check enqueues the nap and never waits for it', async () => {
   assert.deepEqual(t.world.tasks, [{ url: `${CONTROLLER}/v1/tasks`, body: { action: 'nap', workloadId: 'demo' } }]);
   assert.deepEqual(t.world.sleeps, []);
   assert.deepEqual(t.world.calls, []);
-  assert.deepEqual(t.world.metricReads, [{ urlMap: 'lb', backendService: 'app', from: START - 15 * MINUTE, to: START }]);
+  assert.deepEqual(t.world.metricReads, [{ urlMap: 'lb', backendService: 'app', from: START - 15 * MINUTE - 180_000, to: START }]);
   assert.equal(t.run().state, STATES.AWAKE);
   assert.equal(t.logged('NapRequested').length, 1);
 });
@@ -577,6 +665,31 @@ test('awake for less than the idle window: no metric read', async () => {
   const t = setup({ run: { state: STATES.AWAKE, awakeSince: START - 14 * MINUTE }, vms: { 'vm-a': { status: 'RUNNING' } } });
   assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.AWAKE }]);
   assert.deepEqual(t.world.metricReads, []);
+  assert.deepEqual(t.world.tasks, []);
+});
+
+test('awake for less than the idle window and the metric\'s margin: no metric read; at that distance, read', async () => {
+  const within = setup({ run: { state: STATES.AWAKE, awakeSince: START - 15 * MINUTE - 179_999 }, vms: { 'vm-a': { status: 'RUNNING' } } });
+  assert.deepEqual(await within.controller.check(), [{ workloadId: 'demo', state: STATES.AWAKE }]);
+  assert.deepEqual(within.world.metricReads, []);
+  assert.deepEqual(within.world.tasks, []);
+  const at = setup({ run: { state: STATES.AWAKE, awakeSince: START - 15 * MINUTE - 180_000 }, vms: { 'vm-a': { status: 'RUNNING' } } });
+  await at.controller.check();
+  assert.equal(at.world.metricReads.length, 1);
+});
+
+// What Cloud Monitoring answers at `now`: the requests' points in the query's interval, once published (125 s at worst).
+const publishedPoints = (ages, now = START) => ({ from, to }) => ages.map((age) => now - age).filter((at) => at >= from && at <= to && at + 125_000 <= now).length;
+
+test('a request 200 s ago, its point the only one, with a 5-minute window: stays awake', async () => {
+  const t = setup({ run: AWAKE_LONG, cfg: { idleMinutes: 5 }, vms: { 'vm-a': { status: 'RUNNING' } }, requests: publishedPoints([200_000]) });
+  assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.AWAKE }]);
+  assert.deepEqual(t.world.tasks, []);
+});
+
+test('with a 5-minute window, a request 30 s ago not published yet and the one before 320 s ago: stays awake on the older point', async () => {
+  const t = setup({ run: AWAKE_LONG, cfg: { idleMinutes: 5 }, vms: { 'vm-a': { status: 'RUNNING' } }, requests: publishedPoints([30_000, 320_000]) });
+  assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.AWAKE }]);
   assert.deepEqual(t.world.tasks, []);
 });
 
@@ -649,6 +762,47 @@ test('a VM started by hand while another one has no capacity: awake all the same
   assert.equal(t.world.autoscalers.mig, 'ON');
   assert.equal(t.logged('BackendsNotWoken').length, 1);
   assert.equal(hasPolicy(t.world.map), false);
+});
+
+test('a failed give-back at an external wake: awake, the record kept; a later check gives the mode back and clears it', async () => {
+  const recorded = [{ kind: 'zonal', location: ZONE, name: 'mig', mode: 'ON' }];
+  const t = setup({
+    run: { state: STATES.ASLEEP, autoscalers: recorded },
+    cfg: { backends: [VM_A, MIG] },
+    vms: { 'vm-a': { status: 'RUNNING' } },
+    groups: { mig: [managed('mig-1', 'RUNNING')] },
+    autoscalers: { mig: 'OFF' },
+    map: asleepMap(),
+  });
+  t.world.on['autoscaler mig ON'] = async () => { throw new GoogleError('Google: PATCH: 503 unavailable', { code: 503 }); };
+  const [first] = await t.controller.check();
+  assert.equal(first.state, STATES.AWAKE);
+  assert.deepEqual(t.run().autoscalers, recorded);
+  assert.equal(t.world.autoscalers.mig, 'OFF');
+  assert.equal(t.logged('AutoscalersNotGivenBack').length, 1);
+  assert.equal(t.world.calls.filter((c) => c === 'autoscaler mig ON').length, 1, 'once per check');
+
+  const [still] = await t.controller.check();
+  assert.equal(still.state, STATES.AWAKE);
+  assert.deepEqual(t.run().autoscalers, recorded);
+
+  delete t.world.on['autoscaler mig ON'];
+  await t.controller.check();
+  assert.equal(t.world.autoscalers.mig, 'ON');
+  assert.equal(t.run().autoscalers, undefined);
+});
+
+test('a record kept on an awake run survives its next nap: the mode read OFF does not replace it', async () => {
+  const recorded = [{ kind: 'zonal', location: ZONE, name: 'mig', mode: 'ON' }];
+  const t = setup({
+    run: { state: STATES.AWAKE, awakeSince: START, autoscalers: recorded },
+    cfg: { backends: [MIG], hibernate: false },
+    groups: { mig: [managed('mig-1', 'RUNNING')] },
+    autoscalers: { mig: 'OFF' },
+  });
+  await t.controller.nap('demo');
+  assert.equal(t.run().state, STATES.ASLEEP);
+  assert.deepEqual(t.run().autoscalers, recorded);
 });
 
 test('asleep, a VM running but not healthy yet: still asleep', async () => {

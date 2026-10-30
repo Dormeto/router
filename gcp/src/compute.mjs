@@ -62,12 +62,13 @@ export function createCompute({ google, project, now = Date.now }) {
     listGroupInstances: async (z, name) => (await google.request('POST', `${zone(z)}/instanceGroups/${e(name)}/listInstances`, { instanceState: 'ALL' })).items ?? [],
     getManagedGroup: (group) => google.request('GET', managedUrl(group)),
     listManagedInstances: async (group) => (await google.request('POST', `${managedUrl(group)}/listManagedInstances`)).managedInstances ?? [],
-    getAutoscaler: (group) => google.request('GET', `${scope(group)}/autoscalers/${e(group.name)}`),
-    // The autoscaler is named like its group in the group's own location (`mode`: ON, OFF, ONLY_SCALE_OUT).
-    setAutoscalerMode: async (group, mode) => waited(await google.request(
+    // An autoscaler: `{ kind, location, name }`, in its group's location, under its own name (the last segment of the
+    // group's `status.autoscaler`; none there: the group has none). `mode`: ON, OFF, ONLY_SCALE_OUT.
+    getAutoscaler: (autoscaler) => google.request('GET', `${scope(autoscaler)}/autoscalers/${e(autoscaler.name)}`),
+    setAutoscalerMode: async (autoscaler, mode) => waited(await google.request(
       'PATCH',
-      `${scope(group)}/autoscalers?autoscaler=${e(group.name)}`,
-      { name: group.name, autoscalingPolicy: { mode } },
+      `${scope(autoscaler)}/autoscalers?autoscaler=${e(autoscaler.name)}`,
+      { name: autoscaler.name, autoscalingPolicy: { mode } },
     )),
     getBackendService: (name) => google.request('GET', `${base}/global/backendServices/${e(name)}`),
     listBackendServices: () => list(`${base}/global/backendServices`),

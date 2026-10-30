@@ -6,7 +6,7 @@
 // | 'mig', location, name }], idleMinutes, wakeTimeoutSeconds, hibernate? }`. `config`: `{ project, controllerUrl }`.
 //
 // What the run adds to AWS's: `stopped`, `suspended` (the VMs a nap acted on, names), `autoscalers` (`[{ kind, location,
-// name, mode }]`, what the wake gives back) and `lastWake` (`{ durationMs }`). The cause and the event of a state change
+// name (the autoscaler's), mode }]`, what the wake gives back) and `lastWake` (`{ durationMs }`). The cause and the event of a state change
 // are logged (`StateChanged`): the state history in the manager comes with G2.
 import { randomUUID } from 'node:crypto';
 import { failedSpec, failureError } from '../../lambda/src/lib/failures.mjs';
@@ -21,8 +21,15 @@ const POLL_MS = 2000;
 const POLICY_WAIT_MS = 300_000;
 // Until the VMs are down, from the moment they are asked to go. G0: 106 s, 96 s suspended, 198 s for a managed group's.
 const STOP_TIMEOUT_MS = 300_000;
-// Within the request's 900 s: what is left records a failure, or removes the policy after the wake.
-const REQUEST_BUDGET_MS = 840_000;
+// Within the request's 900 s: what is left removes the policy after the wake, or records a nap's failure. The nap's fits
+// a lost policy's second wait: two writes (G0: 25 s), twice 300 s and a managed group's stop.
+const WAKE_BUDGET_MS = 840_000;
+const NAP_BUDGET_MS = 870_000;
+// A fresh wait for a lost policy needs this left after it: a managed group's stop (G0: 198 s).
+const STOP_ROOM_MS = 200_000;
+// Cloud Monitoring publishes the first point 72 to 125 s after the requests (spec section 12): the newest requests cannot
+// be seen, so the idle read goes this much further back, and the run must have been awake for all of it.
+const METRIC_DELAY_MS = 180_000;
 const WAKING_STUCK_GRACE_MS = 60_000;
 const NAPPING_STUCK_MS = 15 * 60_000;
 const CHECK_BUDGET_MS = 240_000;
@@ -154,14 +161,23 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
     }
   }
 
-  // The autoscalers get their modes back whatever a VM's start says: the wake's record goes with the next AWAKE.
+  const giveBackAutoscalers = (run) => each(run.autoscalers ?? [], (recorded) => setAutoscaler(recorded, recorded.mode));
+
+  // The autoscalers get their modes back whatever a VM's start says.
   async function wakeBackends(cfg, run, deadline) {
     try {
       await each(cfg.backends, (backend) => wakeBackend(backend, deadline));
     } finally {
-      await each(run.autoscalers ?? [], (recorded) => setAutoscaler(recorded, recorded.mode));
+      await giveBackAutoscalers(run);
     }
   }
+
+  // Outside a wake, a mode that cannot be given back leaves the workload awake all the same: the record stays on the run
+  // until it is, and the next checks try again. True once it is.
+  const gaveBackAutoscalers = (workloadId, run) => giveBackAutoscalers(run).then(() => true, (err) => {
+    log.warn('AutoscalersNotGivenBack', { workloadId, error: err.message });
+    return false;
+  });
 
   // At the wake's deadline: what a managed group failed on (it keeps trying on its own), else why none is healthy.
   async function noHealthyError(cfg) {
@@ -207,11 +223,14 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
   async function autoscalersToRecord(cfg, run) {
     const modes = await each(cfg.backends.filter((b) => b.kind === 'mig'), async (backend) => {
       const group = groupOf(backend);
-      const mode = await compute.getAutoscaler(group).then((a) => a.autoscalingPolicy?.mode ?? 'ON', (err) => {
+      const url = (await compute.getManagedGroup(group)).status?.autoscaler;
+      if (!url) return { ...group, mode: 'OFF' };
+      const autoscaler = { ...group, name: nameOf(url) };
+      const mode = await compute.getAutoscaler(autoscaler).then((a) => a.autoscalingPolicy?.mode ?? 'ON', (err) => {
         if (err.code === 404) return 'OFF';
         throw err;
       });
-      return { ...group, mode };
+      return { ...autoscaler, mode };
     });
     const on = modes.filter((a) => a.mode !== 'OFF');
     const kept = (run.autoscalers ?? []).filter((old) => !on.some((a) => a.location === old.location && a.name === old.name));
@@ -266,7 +285,7 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
       return fail(err);
     }
     const since = run.wakeStartedAt ?? started;
-    const deadline = Math.min(since + cfg.wakeTimeoutSeconds * 1000, started + REQUEST_BUDGET_MS);
+    const deadline = Math.min(since + cfg.wakeTimeoutSeconds * 1000, started + WAKE_BUDGET_MS);
     try {
       await wakeBackends(cfg, run, deadline);
       while ((await healthyCount(cfg)) < 1) {
@@ -291,8 +310,21 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
 
   // --- The nap -------------------------------------------------------------------------------------------------------
 
+  // Written, then still there after a whole wait: a check's repair or a customer's apply may have removed it meanwhile,
+  // and the VMs must not go with no way to wake. False when it was lost with no room left for another wait.
+  async function policyHeld(cfg, latest) {
+    await writePolicy(cfg);
+    for (;;) {
+      await sleep(POLICY_WAIT_MS);
+      const { paths } = await writePolicy(cfg);
+      if (!paths.length) return true;
+      log.warn('PolicyLost', { workloadId: cfg.workloadId, paths });
+      if (now() + POLICY_WAIT_MS + STOP_ROOM_MS > latest) return false;
+    }
+  }
+
   async function nap(workloadId, { cause = 'idle' } = {}) {
-    const latest = now() + REQUEST_BUDGET_MS;
+    const latest = now() + NAP_BUDGET_MS;
     const cfg = await getConfig(workloadId);
     const napping = await transition(workloadId, { cond: { state: STATES.AWAKE }, set: { state: STATES.NAPPING }, remove: ['pendingWake'], cause });
     if (!napping) return { state: 'SKIPPED' };
@@ -303,15 +335,20 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
     let slept;
     try {
       try {
-        await writePolicy(cfg);
+        if (!(await policyHeld(cfg, latest))) {
+          await backToAwake('policy-lost');
+          log.warn('NapAborted', { workloadId, reason: 'the policy was lost, no time left to wait for it again' });
+          await removePolicy(cfg);
+          return { state: STATES.AWAKE, aborted: true };
+        }
       } catch (err) {
         // A customer's own policy, written since the onboarding: nothing is stopped yet, the application keeps serving.
         if (!(err instanceof UrlMapRefused)) throw err;
         await backToAwake('switch-failed');
         log.warn('NapAborted', { workloadId, reason: err.message });
+        await removePolicy(cfg);
         return { state: STATES.AWAKE, aborted: true, error: err.message };
       }
-      await sleep(POLICY_WAIT_MS);
       const autoscalers = await autoscalersToRecord(cfg, napping);
       // Commit point: after this transition the VMs go, even if a request arrives. The modes are on the run before any
       // autoscaler is turned off.
@@ -365,7 +402,7 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
   // A failed workload whose backends run for nothing is stopped like a nap and left asleep behind the policy, its failure
   // kept (requests wake it again, backed off). The policy is there since its nap, unless the nap failed before writing it.
   async function release(workloadId) {
-    const latest = now() + REQUEST_BUDGET_MS;
+    const latest = now() + NAP_BUDGET_MS;
     const run = await store.getRun(workloadId);
     if (run?.state !== STATES.FAILED) return { state: 'SKIPPED', reason: run?.state ?? 'unknown' };
     const cfg = await getConfig(workloadId);
@@ -410,11 +447,12 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
       // Started by hand: the others too, and the autoscalers given back, as a wake would. One that cannot start does not
       // keep the workload from being what it is, awake.
       log.warn(from === STATES.FAILED ? 'FailedRecovered' : 'ExternalWake', { workloadId });
-      await wakeBackends(cfg, run, deadline).catch((err) => log.warn('BackendsNotWoken', { workloadId, error: err.message }));
+      await each(cfg.backends, (backend) => wakeBackend(backend, deadline)).catch((err) => log.warn('BackendsNotWoken', { workloadId, error: err.message }));
+      const givenBack = await gaveBackAutoscalers(workloadId, run);
       run = (await transition(workloadId, {
         cond: { state: from },
         set: { state: STATES.AWAKE, awakeSince: now() },
-        remove: ['stopped', 'suspended', 'autoscalers', 'failure', 'consecutiveFailures', 'failedAt'],
+        remove: ['stopped', 'suspended', ...(givenBack ? ['autoscalers'] : []), 'failure', 'consecutiveFailures', 'failedAt'],
         cause: from === STATES.FAILED ? 'recovered' : 'external-start',
       })) ?? (await store.getRun(workloadId));
     } else if (from !== STATES.ASLEEP && vms.length > 0 && vms.every((vm) => DOWN.has(vm.status)) && (await healthyCount(cfg)) < 1) {
@@ -426,6 +464,9 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
       })) ?? store.getRun(workloadId);
     }
     if ([STATES.AWAKE, STATES.ASLEEP, STATES.FAILED].includes(run?.state)) await repair(cfg, run.state);
+    if (from === STATES.AWAKE && run.autoscalers?.length && (await gaveBackAutoscalers(workloadId, run))) {
+      run = (await transition(workloadId, { cond: { state: STATES.AWAKE }, remove: ['autoscalers'] })) ?? run;
+    }
     return run;
   }
 
@@ -455,8 +496,9 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
       log.info('ReleaseRequested', { workloadId });
       return { state: run.state, release: 'requested' };
     }
-    if (run?.state !== STATES.AWAKE || (run.awakeSince ?? 0) > t - idleMs) return { state: run?.state ?? 'UNKNOWN' };
-    if ((await monitoring.requestCount({ urlMap: cfg.urlMap, backendService: cfg.backendService, from: t - idleMs, to: t })) > 0) return { state: run.state };
+    const from = t - idleMs - METRIC_DELAY_MS;
+    if (run?.state !== STATES.AWAKE || (run.awakeSince ?? 0) > from) return { state: run?.state ?? 'UNKNOWN' };
+    if ((await monitoring.requestCount({ urlMap: cfg.urlMap, backendService: cfg.backendService, from, to: t })) > 0) return { state: run.state };
     await enqueue({ action: 'nap', workloadId });
     log.info('NapRequested', { workloadId });
     return { state: run.state, nap: 'requested' };

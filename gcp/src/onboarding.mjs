@@ -1,11 +1,12 @@
-// A workload's onboarding and offboarding on the router, its list, show, and nap and wake now (vision
+// A workload's onboarding and offboarding on the router, its list, show, nap and wake now, its schedule and its pause (vision
 // docs/specs/2026-10-29-google-cloud-design.md, sections 5 and 7). The tags are the CLI's, as the operator: the router holds
 // no tag permission, so it neither binds them nor can see them.
 //
 // A refusal is a `Refusal`: its status and short reason are the API's, its message is what is wrong and what to change.
 // Anything else thrown is a failure, a 500 for the caller.
+import { nextEvents, normalizeSchedule, scheduleProblems } from '../../lambda/src/lib/schedule.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
-import { groupOf } from './controller-core.mjs';
+import { groupOf, PauseRefused } from './controller-core.mjs';
 import { WORKLOAD_HEADER, WORKLOAD_ID } from './names.mjs';
 import { hostsOf, inMatcher, references, UrlMapRefused, withErrorPolicy, withoutErrorPolicy, withWakerRoute, withoutWakerRoute } from './urlmaps.mjs';
 
@@ -70,8 +71,8 @@ function failureOf(run) {
   }
 }
 
-// The API's Workload. `awakeSince` is a time the CLI prints, and left on the run by a nap.
-function workloadOf(cfg, run) {
+// The API's Workload. `awakeSince` is a time the CLI prints, and left on the run by a nap. `paused`: its active pause.
+function workloadOf(cfg, run, paused) {
   const failure = failureOf(run);
   return {
     id: cfg.workloadId,
@@ -85,6 +86,7 @@ function workloadOf(cfg, run) {
     ...(run?.state === STATES.AWAKE && run.awakeSince !== undefined ? { awakeSince: isoOf(run.awakeSince) } : {}),
     ...(run?.lastWake ? { lastWake: run.lastWake } : {}),
     ...(failure ? { failure } : {}),
+    ...(paused ? { paused } : {}),
   };
 }
 
@@ -367,14 +369,16 @@ export function createOnboarding({ store, compute, urlmaps, core, config, now = 
     return {};
   }
 
-  async function show(id) {
-    const cfg = await find(id);
-    return workloadOf(cfg, await store.getRun(id));
+  // The Workload as it is now.
+  async function current(cfg) {
+    const [run, [paused]] = await Promise.all([store.getRun(cfg.workloadId), core.pausesFor(cfg.workloadId)]);
+    return workloadOf(cfg, run, paused);
   }
 
+  const show = async (id) => current(await find(id));
+
   async function list() {
-    const configs = await store.listConfigs();
-    const workloads = await Promise.all(configs.map(async (cfg) => workloadOf(cfg, await store.getRun(cfg.workloadId))));
+    const workloads = await Promise.all((await store.listConfigs()).map(current));
     return workloads.sort((a, b) => a.id.localeCompare(b.id));
   }
 
@@ -384,11 +388,66 @@ export function createOnboarding({ store, compute, urlmaps, core, config, now = 
     const { state } = (await store.getRun(id)) ?? {};
     if (acts.includes(state)) await act(id);
     else if (state !== there) throw new Refusal(409, 'busy', `workload ${id} is ${state ?? 'UNKNOWN'}`);
-    return workloadOf(cfg, await store.getRun(id));
+    return current(cfg);
   }
 
-  const nap = (id) => move(id, { acts: [STATES.AWAKE], there: STATES.ASLEEP, act: core.napNow });
+  // Refused at once with its reason, as its task would be.
+  async function napUnlessPaused(id) {
+    const [paused] = await core.pausesFor(id);
+    if (paused) throw new Refusal(409, 'paused', `workload ${id} is paused by ${paused.by}: ${paused.reason}`);
+    await core.napNow(id);
+  }
+
+  const nap = (id) => move(id, { acts: [STATES.AWAKE], there: STATES.ASLEEP, act: napUnlessPaused });
   const wake = (id) => move(id, { acts: [STATES.ASLEEP, STATES.FAILED, STATES.NAPPING], there: STATES.AWAKE, act: core.wakeNow });
 
-  return { dryRun, onboard, offboard, find, show, list, nap, wake };
+  // A schedule's answer. One the router cannot read (a time zone Intl refuses) is shown, with no next event.
+  function scheduleView(id, schedule) {
+    const shown = schedule && { ...schedule, at: isoOf(schedule.at) };
+    try {
+      return { schedule: shown, nextEvents: nextEvents(schedule, now()) };
+    } catch (err) {
+      log.warn('ScheduleSkipped', { workloadId: id, error: err.message });
+      return { schedule: shown, nextEvents: [] };
+    }
+  }
+
+  async function showSchedule(id) {
+    await find(id);
+    return scheduleView(id, await store.getSchedule(id));
+  }
+
+  // The body is the schedule, as on AWS; `by` says who sets it.
+  async function setSchedule(id, schedule) {
+    await find(id);
+    const problems = scheduleProblems(schedule);
+    if (problems.length) throw bad(problems.join('; '));
+    const stored = { ...normalizeSchedule(schedule), by: schedule.by ?? 'unknown', at: now() };
+    await store.putSchedule(id, stored);
+    log.info('Scheduled', { workloadId: id, by: stored.by });
+    return scheduleView(id, stored);
+  }
+
+  async function clearSchedule(id) {
+    await find(id);
+    log.info('ScheduleCleared', { workloadId: id, cleared: await store.deleteSchedule(id) });
+    return scheduleView(id, null);
+  }
+
+  async function pause(id, input) {
+    const cfg = await find(id);
+    await core.pause(id, input).catch((err) => {
+      if (err instanceof PauseRefused) throw bad(err.message);
+      throw err;
+    });
+    return current(cfg);
+  }
+
+  async function resume(id, { by } = {}) {
+    const cfg = await find(id);
+    await core.resume(id, by ?? 'unknown');
+    return current(cfg);
+  }
+
+  return { dryRun, onboard, offboard, find, show, list, nap, wake, showSchedule, setSchedule, clearSchedule, pause, resume };
 }

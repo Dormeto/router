@@ -6,11 +6,16 @@
 // | 'mig', location, name }], idleMinutes, wakeTimeoutSeconds, hibernate? }`. `config`: `{ project, controllerUrl }`.
 //
 // What the run adds to AWS's: `stopped`, `suspended` (the VMs a nap acted on, names), `autoscalers` (`[{ kind, location,
-// name (the autoscaler's), mode }]`, what the wake gives back) and `lastWake` (`{ durationMs }`). The cause and the event of a state change
-// are logged (`StateChanged`): the state history in the manager comes with G2.
+// name (the autoscaler's), mode }]`, what the wake gives back), `lastWake` (`{ durationMs }`) and `scheduleApplied` (the last
+// nap or awake window's occurrence applied). The cause and the event of a state change are logged (`StateChanged`): the
+// state history in the manager comes with G2.
+//
+// Schedules and pauses as on AWS (vision docs/specs/2026-10-30-google-cloud-coverage-design.md, section 5). Here a pause is
+// a workload's: the router's and the exclusions wait for G2.
 import { randomUUID } from 'node:crypto';
 import { failedSpec, failureError } from '../../lambda/src/lib/failures.mjs';
 import { resolveHibernation } from '../../lambda/src/lib/hibernation.mjs';
+import { awakeStartWithin, CLOSE_START_MS, maintenanceDue, occurrenceAt } from '../../lambda/src/lib/schedule.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { OPERATION_NOT_DONE } from './google.mjs';
 import { mapBusy, references, UrlMapRefused, withErrorPolicy, withoutErrorPolicy, withWakerRoute } from './urlmaps.mjs';
@@ -35,6 +40,12 @@ const NAPPING_STUCK_MS = 15 * 60_000;
 const CHECK_BUDGET_MS = 240_000;
 const CHECK_CONCURRENCY = 8;
 const SUSPEND_MAX_MEMORY_MB = 208 * 1024;
+// A nap holds a request of the controller for minutes: a nap window on many workloads is spread over the checks.
+const SCHEDULED_NAPS_MAX = 10;
+// Pauses: automatic resume at most this far ahead, reason length.
+const PAUSE_MAX_MS = 366 * 86_400_000;
+const REASON_MAX = 256;
+const ANY_STATE = Object.values(STATES);
 
 const STOPPED = new Set(['TERMINATED', 'STOPPED']);
 const GONE = new Set([...STOPPED, 'SUSPENDED']);
@@ -45,6 +56,7 @@ const STATUS_OF_ACTION = { STOPPING: 'STOPPING', SUSPENDING: 'SUSPENDING', START
 // What the shared classification cannot read in a Google error.
 const KIND_OF_CODE = { 403: 'permission', 429: 'throttled' };
 
+const iso = (ms) => new Date(ms).toISOString();
 const nameOf = (url) => url.slice(url.lastIndexOf('/') + 1);
 const zoneOf = (url) => /\/zones\/([^/]+)\//.exec(url)?.[1];
 const names = (vms) => vms.map((vm) => vm.name);
@@ -69,6 +81,14 @@ function failedFrom(err, options) {
   // The URL map kept changing, as a throttled switch.
   const kind = err.kind ?? (err.reason === OPERATION_NOT_DONE ? 'timeout' : mapBusy(err) ? 'throttled' : KIND_OF_CODE[err.code]);
   return failedSpec(kind ? Object.assign(err, { kind }) : err, options);
+}
+
+// What is wrong with a pause asked for.
+export class PauseRefused extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'PauseRefused';
+  }
 }
 
 export function createController({ store, compute, urlmaps, monitoring, tasks, config, now = Date.now, sleep, newId = randomUUID, log }) {
@@ -333,19 +353,33 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
     return wakeId;
   }
 
-  // The operator's wake, whatever the backoff, in a request of its own: this one answers at once. During a nap, it is kept
-  // for the nap's end. A task that cannot be enqueued fails the wake now rather than at the check.
-  async function wakeNow(workloadId) {
-    const run = await store.getRun(workloadId);
-    if (run?.state === STATES.NAPPING) {
-      if (await store.setPendingWake(workloadId)) log.info('PendingWake', { workloadId, reason: 'operator' });
-      return;
+  // A daily counter: a failed update changes nothing else.
+  async function count(workloadId, counter) {
+    try {
+      await store.count(workloadId, counter);
+    } catch (err) {
+      log.warn('StatsWriteFailed', { workloadId, counter, error: err.message });
     }
-    if (![STATES.ASLEEP, STATES.FAILED].includes(run?.state)) return;
-    const wakeId = await beginWake(workloadId, run.state, 'operator');
-    if (!wakeId) return;
+  }
+
+  // A napping workload's wake is kept for the nap's end. True when this call kept it: one log line and one counted wake.
+  async function pendingWake(workloadId, kind) {
+    if (!(await store.setPendingWake(workloadId))) return false;
+    log.info('PendingWake', { workloadId, reason: kind });
+    await count(workloadId, `wake:${kind}`);
+    return true;
+  }
+
+  // The wake of an asleep or failed workload from the run read, in a request of its own. True when its task was accepted;
+  // false when the state changed since, or when the task cannot be enqueued, which fails the wake now rather than at the
+  // check.
+  async function startWake(workloadId, run, kind) {
+    const wakeId = await beginWake(workloadId, run.state, kind);
+    if (!wakeId) return false;
+    await count(workloadId, `wake:${kind}`);
     try {
       await enqueue({ action: 'wake', workloadId, wakeId });
+      return true;
     } catch (err) {
       const at = now();
       const failed = failedFrom(err, { step: 'wake', wakeId, at });
@@ -357,7 +391,15 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
         cause: 'invoke-failed',
         event: failed.event,
       });
+      return false;
     }
+  }
+
+  // The wake of an operator or a pause, whatever the backoff; this request answers at once.
+  async function wakeNow(workloadId, kind = 'operator') {
+    const run = await store.getRun(workloadId);
+    if (run?.state === STATES.NAPPING) await pendingWake(workloadId, kind);
+    else if ([STATES.ASLEEP, STATES.FAILED].includes(run?.state)) await startWake(workloadId, run, kind);
   }
 
   // --- The nap -------------------------------------------------------------------------------------------------------
@@ -375,9 +417,23 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
     }
   }
 
-  async function nap(workloadId, { cause = 'idle' } = {}) {
+  // Why a nap's task no longer holds, else null: a pause written since it was asked for; for a nap window's (`until`, its
+  // end), a task delivered late or twice, a window ended or the workload woken since.
+  async function napRefusal(workloadId, requestedAt, until) {
+    if (await isPaused(workloadId)) return 'paused';
+    if (until === undefined) return null;
+    if (now() >= until) return 'the nap window ended';
+    return ((await store.getRun(workloadId))?.awakeSince ?? 0) > requestedAt ? 'woken since it was requested' : null;
+  }
+
+  async function nap(workloadId, { cause = 'idle', requestedAt, until } = {}) {
     const latest = now() + NAP_BUDGET_MS;
     const cfg = await getConfig(workloadId);
+    const refusal = await napRefusal(workloadId, requestedAt, until);
+    if (refusal) {
+      log.warn('NapSkipped', { workloadId, reason: refusal });
+      return { state: 'SKIPPED', reason: refusal };
+    }
     const napping = await transition(workloadId, { cond: { state: STATES.AWAKE }, set: { state: STATES.NAPPING }, remove: ['pendingWake'], cause });
     if (!napping) return { state: 'SKIPPED' };
     log.info('NapStarted', { workloadId });
@@ -404,10 +460,11 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
       }
       const autoscalers = await autoscalersToRecord(cfg, napping);
       // Commit point: after this transition the VMs go, even if a request arrives. The modes are on the run before any
-      // autoscaler is turned off.
-      if (!(await transition(workloadId, { cond: { state: STATES.NAPPING, pendingWake: false }, set: { stopping: true, autoscalers } }))) {
-        await backToAwake('pending-wake');
-        log.info('NapAborted', { workloadId });
+      // autoscaler is turned off. A pause written since the nap started aborts it, like a request.
+      const paused = await isPaused(workloadId);
+      if (paused || !(await transition(workloadId, { cond: { state: STATES.NAPPING, pendingWake: false }, set: { stopping: true, autoscalers } }))) {
+        await backToAwake(paused ? 'paused' : 'pending-wake');
+        log.info('NapAborted', { workloadId, ...(paused ? { reason: 'paused' } : {}) });
         await removePolicy(cfg);
         return { state: STATES.AWAKE, aborted: true };
       }
@@ -461,6 +518,7 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
     const latest = now() + NAP_BUDGET_MS;
     let run = await store.getRun(workloadId);
     if (run?.state !== STATES.FAILED) return { state: 'SKIPPED', reason: run?.state ?? 'unknown' };
+    if (await isPaused(workloadId)) return { state: 'SKIPPED', reason: 'paused' };
     const cfg = await getConfig(workloadId);
     try {
       const { paths } = await writeOnlyPolicy(cfg);
@@ -482,6 +540,199 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
       log.error('ReleaseFailed', { workloadId, error: err.message });
       return { state: STATES.FAILED, error: err.message };
     }
+  }
+
+  // --- Schedules, applied by the check -----------------------------------------------------------------------------------
+
+  const recordOccurrence = async (workloadId, occurrence, action, state) => {
+    if (await transition(workloadId, { cond: { state }, set: { scheduleApplied: occurrence.id } })) {
+      log.info('ScheduleApplied', { workloadId, occurrence: occurrence.id, kind: occurrence.kind, action });
+    }
+  };
+
+  // The nap windows' naps a check asks for, oldest occurrence first and at most SCHEDULED_NAPS_MAX accepted: the next check
+  // takes the rest, and those a Cloud Tasks too slow left past the check's budget. Each occurrence is recorded only once its
+  // task is accepted, whatever the state by then: the task may have started. A record lost asks again at the next check, and
+  // the task it adds finds the nap under way.
+  async function askScheduledNaps(naps, applied, t, deadline) {
+    const deferred = [];
+    const failed = (workloadId) => (err) => log.error('ScheduleFailed', { workloadId, error: err.message });
+    let accepted = 0;
+    naps.sort((a, b) => a.occurrence.start - b.occurrence.start || a.workloadId.localeCompare(b.workloadId));
+    for (const { workloadId, occurrence } of naps) {
+      if (accepted === SCHEDULED_NAPS_MAX || now() >= deadline) {
+        deferred.push(workloadId);
+        applied.set(workloadId, 'nap deferred');
+        continue;
+      }
+      try {
+        await enqueue({ action: 'nap', workloadId, cause: 'schedule', requestedAt: t, until: occurrence.end });
+      } catch (err) {
+        failed(workloadId)(err);
+        applied.set(workloadId, 'nap refused');
+        continue;
+      }
+      accepted += 1;
+      applied.set(workloadId, 'nap');
+      log.info('NapRequested', { workloadId, cause: 'schedule' });
+      await recordOccurrence(workloadId, occurrence, 'nap', ANY_STATE).catch(failed(workloadId));
+    }
+    if (deferred.length) log.info('ScheduledNapsDeferred', { workloads: deferred });
+  }
+
+  // Before the check's loop, every scheduled workload whatever the loop's budget: 8 at a time, one run read each, nothing
+  // called but the tasks it enqueues. holdOf(workloadId): { paused, keepAsleep }. Answers each workload's outcome (what it did,
+  // or what held it) and the schedules the router can read: one it cannot (a time zone Intl refuses) is logged and the
+  // workload behaves as if it had none.
+  async function applySchedules(configs, schedules, holdOf, t, deadline) {
+    const due = [];
+    const readable = new Map();
+    for (const { workloadId } of configs) {
+      const schedule = schedules.get(workloadId);
+      if (!schedule) continue;
+      try {
+        const occurrence = occurrenceAt(schedule, t);
+        // A nap window's occurrence is skipped when an awake window starts within 30 minutes of its start, or of now (an
+        // occurrence first applied late).
+        const closeStart = occurrence?.kind === 'nap'
+          && (awakeStartWithin(schedule, occurrence.start, CLOSE_START_MS) || awakeStartWithin(schedule, t, CLOSE_START_MS));
+        readable.set(workloadId, schedule);
+        due.push({ workloadId, schedule, occurrence, closeStart });
+      } catch (err) {
+        log.warn('ScheduleSkipped', { workloadId, error: err.message });
+      }
+    }
+    const applied = new Map();
+    const naps = [];
+    let i = 0;
+    await Promise.all(Array.from({ length: Math.min(CHECK_CONCURRENCY, due.length) }, async () => {
+      while (i < due.length) {
+        const item = due[i++];
+        try {
+          const outcome = await applySchedule(item, holdOf(item.workloadId), t, naps);
+          if (outcome) applied.set(item.workloadId, outcome);
+        } catch (err) {
+          log.error('ScheduleFailed', { workloadId: item.workloadId, error: err.message });
+        }
+      }
+    }));
+    await askScheduledNaps(naps, applied, t, deadline);
+    return { applied, readable };
+  }
+
+  // The occurrence active now, applied once: the run records the last applied one, so a late check, a deploy inside a window
+  // or two checks in it apply it once. Then the maintenance wake of a workload asleep longer than maxNapDays. A pause holds
+  // the window's nap and a keepAsleep pause the wakes: held, the occurrence stays unapplied and applies once the pause is
+  // gone. A nap goes in `naps`, each nap a task, which holds nothing here. Every other write is conditional on the run read:
+  // one that changed since (a request's wake) is left for the next check. Answers what it did or what held it, else null.
+  async function applySchedule({ workloadId, schedule, occurrence, closeStart }, hold, t, naps) {
+    if (!occurrence && !schedule.maxNapDays) return null;
+    const run = await store.getRun(workloadId);
+    if (!run) return null;
+    const pending = occurrence && run.scheduleApplied !== occurrence.id ? occurrence : null;
+    const asleep = run.state === STATES.ASLEEP || run.state === STATES.FAILED;
+    if (pending?.kind === 'awake' && (asleep || run.state === STATES.NAPPING)) {
+      if (hold.keepAsleep) return 'held by a keepAsleep pause';
+      // A napping workload gets its pending wake; the occurrence is recorded once the nap settled (a write now would delay
+      // the detection of a stuck nap, which reads updatedAt).
+      if (run.state === STATES.NAPPING) return (await pendingWake(workloadId, 'schedule')) ? 'pending wake' : null;
+      // Recorded once its task is accepted: refused, the run is FAILED and the next check wakes it.
+      if (!(await startWake(workloadId, run, 'schedule'))) return null;
+      await recordOccurrence(workloadId, pending, 'wake', ANY_STATE);
+      return 'wake';
+    }
+    if (pending?.kind === 'nap' && run.state === STATES.AWAKE && !closeStart) {
+      if (hold.paused) return 'held by a pause';
+      naps.push({ workloadId, occurrence: pending });
+      return null;
+    }
+    // Napping or waking at a nap window: left for the next check, which naps it once awake.
+    if (pending?.kind === 'nap' && (run.state === STATES.NAPPING || run.state === STATES.WAKING)) return null;
+    // Nothing to do (the workload is already as the window wants it, or the nap window comes just before an awake one).
+    if (pending) await recordOccurrence(workloadId, pending, closeStart ? 'skipped: an awake window starts within 30 minutes' : 'none', run.state);
+    const due = run.state === STATES.ASLEEP ? maintenanceDue(schedule, run.stateAt) : null;
+    if (due === null || due > t) return null;
+    if (hold.keepAsleep) return 'held by a keepAsleep pause';
+    return (await startWake(workloadId, run, 'maintenance')) ? 'maintenance' : null;
+  }
+
+  // Why a schedule keeps a workload from its idle nap now, else null: the nap the schedules just decided (asked, put off or
+  // refused, not asked twice and not ahead of the spread), an awake window active or starting within 30 minutes. The
+  // schedules here are those the router can read.
+  function scheduleKeeps(workloadId, ctx, t) {
+    const schedule = ctx.schedules.get(workloadId);
+    if (!schedule) return null;
+    if (ctx.applied.get(workloadId)?.startsWith('nap')) return {};
+    if (occurrenceAt(schedule, t)?.kind === 'awake') return { kept: 'awake window' };
+    if (awakeStartWithin(schedule, t, CLOSE_START_MS)) return { kept: 'awake window within 30 minutes' };
+    return null;
+  }
+
+  // --- Pauses: a paused workload is never napped -------------------------------------------------------------------------
+
+  const expired = (p) => p.until !== undefined && p.until <= now();
+
+  // A workload's active pause, as people read it (at most one).
+  async function pausesFor(workloadId) {
+    return (await store.getPauses(workloadId)).filter((p) => !expired(p)).map(({ by, at, reason, until, keepAsleep }) => ({
+      by, at: iso(at), reason, until: until === undefined ? null : iso(until), keepAsleep: keepAsleep === true,
+    }));
+  }
+
+  // A nap needs to know: pauses that cannot be read count as a pause.
+  async function isPaused(workloadId) {
+    try {
+      return (await pausesFor(workloadId)).length > 0;
+    } catch (err) {
+      log.warn('PausesUnreadable', { workloadId, error: err.message });
+      return true;
+    }
+  }
+
+  // Every active pause, null when they cannot be read; the expired ones are deleted (unless a newer pause replaced them).
+  async function activePauses() {
+    let pauses;
+    try {
+      pauses = await store.listPauses();
+    } catch (err) {
+      log.warn('PausesUnreadable', { error: err.message });
+      return null;
+    }
+    for (const p of pauses.filter(expired)) {
+      const deleted = await store.removePauses(p.workloadId, { at: p.at }).catch((err) => {
+        log.warn('PauseDeleteFailed', { workloadId: p.workloadId, error: err.message });
+        return false;
+      });
+      if (deleted) log.info('PauseExpired', { workloadId: p.workloadId, by: p.by, reason: p.reason });
+    }
+    return pauses.filter((p) => !expired(p));
+  }
+
+  // The record as stored. No `until` when none is asked for: the store would make `undefined` a null, read as expired.
+  function pauseRecord({ by, reason, until, keepAsleep }) {
+    const text = typeof reason === 'string' ? reason.trim() : '';
+    if (!text || text.length > REASON_MAX) throw new PauseRefused(`reason required (1 to ${REASON_MAX} characters)`);
+    if (keepAsleep !== undefined && typeof keepAsleep !== 'boolean') throw new PauseRefused('keepAsleep must be true or false');
+    let untilMs;
+    if (until !== undefined && until !== null) {
+      untilMs = typeof until === 'number' ? until : Date.parse(until);
+      if (!(untilMs > now() && untilMs <= now() + PAUSE_MAX_MS)) throw new PauseRefused('until must be in the future, within 366 days');
+    }
+    return { by: by ?? 'unknown', at: now(), reason: text, ...(untilMs === undefined ? {} : { until: untilMs }), keepAsleep: keepAsleep === true };
+  }
+
+  // Unless keepAsleep, an asleep or failed workload is woken and a napping one gets a pending wake. keepAsleep holds the
+  // scheduled and maintenance wakes only: a visitor still wakes it (the waker knows nothing of pauses).
+  async function pause(workloadId, input) {
+    const record = pauseRecord(input);
+    await store.addPause(workloadId, record);
+    log.info('Paused', { workloadId, ...record });
+    if (record.keepAsleep) return;
+    await wakeNow(workloadId, 'pause').catch((err) => log.error('PauseWakeFailed', { workloadId, error: err.message }));
+  }
+
+  async function resume(workloadId, by) {
+    if (await store.removePauses(workloadId)) log.info('Resumed', { workloadId, by });
   }
 
   // --- The check -----------------------------------------------------------------------------------------------------
@@ -531,7 +782,7 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
     return run;
   }
 
-  async function checkOne(cfg, deadline) {
+  async function checkOne(cfg, deadline, paused, ctx) {
     const { workloadId } = cfg;
     let run = await store.getRun(workloadId);
     if (!run) return { state: 'UNKNOWN' };
@@ -551,32 +802,45 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
     run = await reconcile(cfg, run, deadline);
     const t = now();
     const idleMs = cfg.idleMinutes * 60_000;
-    // Still paying for backends that run without a healthy instance: released once its idle window has passed.
-    if (run?.state === STATES.FAILED && (run.failedAt ?? 0) <= t - idleMs) {
+    // Still paying for backends that run without a healthy instance: released once its idle window has passed; a paused one
+    // is left for its team.
+    if (run?.state === STATES.FAILED && !paused && (run.failedAt ?? 0) <= t - idleMs) {
       await enqueue({ action: 'release', workloadId });
       log.info('ReleaseRequested', { workloadId });
       return { state: run.state, release: 'requested' };
     }
+    if (run?.state !== STATES.AWAKE) return { state: run?.state ?? 'UNKNOWN' };
+    if (paused) return { state: run.state, paused: true };
+    const kept = scheduleKeeps(workloadId, ctx, t);
+    if (kept) return { state: run.state, ...kept };
     const from = t - idleMs - METRIC_DELAY_MS;
-    if (run?.state !== STATES.AWAKE || (run.awakeSince ?? 0) > from) return { state: run?.state ?? 'UNKNOWN' };
+    if ((run.awakeSince ?? 0) > from) return { state: run.state };
     if ((await monitoring.requestCount({ backendService: cfg.backendService, from, to: t })) > 0) return { state: run.state };
     await enqueue({ action: 'nap', workloadId });
     log.info('NapRequested', { workloadId });
     return { state: run.state, nap: 'requested' };
   }
 
-  // 8 workloads at a time, none started past the budget; one that fails is logged and stops only itself.
+  // 8 workloads at a time, none started past the budget; one that fails is logged and stops only itself. The schedules
+  // first, whatever the budget. Pauses that cannot be read hold every nap and scheduled wake of this check; the reconcile
+  // still runs.
   async function check() {
     const deadline = now() + CHECK_BUDGET_MS;
-    const { configs } = await store.listWorkloads();
+    const pauses = await activePauses();
+    const paused = (workloadId) => pauses === null || pauses.some((p) => p.workloadId === workloadId);
+    const keptAsleep = (workloadId) => pauses === null || pauses.some((p) => p.keepAsleep && p.workloadId === workloadId);
+    const { configs, schedules } = await store.listWorkloads();
     const order = [...configs].sort((a, b) => a.workloadId.localeCompare(b.workloadId));
+    const { applied, readable } = await applySchedules(order, schedules, (id) => ({ paused: paused(id), keepAsleep: keptAsleep(id) }), now(), deadline);
+    const ctx = { schedules: readable, applied };
+    const passed = (workloadId) => (applied.has(workloadId) ? { schedule: applied.get(workloadId) } : {});
     const results = [];
     let next = 0;
     await Promise.all(Array.from({ length: Math.min(CHECK_CONCURRENCY, order.length) }, async () => {
       while (next < order.length && now() < deadline) {
         const cfg = order[next++];
         try {
-          results.push({ workloadId: cfg.workloadId, ...(await checkOne(cfg, deadline)) });
+          results.push({ workloadId: cfg.workloadId, ...(await checkOne(cfg, deadline, paused(cfg.workloadId), ctx)), ...passed(cfg.workloadId) });
         } catch (err) {
           log.error('CheckFailed', { workloadId: cfg.workloadId, error: err.message });
           results.push({ workloadId: cfg.workloadId, error: err.message });
@@ -584,8 +848,11 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
       }
     }));
     if (next < order.length) log.warn('CheckBudgetReached', { checked: next, workloads: order.length, next: order[next].workloadId });
+    // What the schedules did for the workloads the loop did not reach.
+    const reached = new Set(results.map((r) => r.workloadId));
+    for (const workloadId of applied.keys()) if (!reached.has(workloadId)) results.push({ workloadId, ...passed(workloadId) });
     return results;
   }
 
-  return { wake, beginWake, wakeNow, nap, napNow, release, check };
+  return { wake, beginWake, wakeNow, nap, napNow, release, check, pause, resume, pausesFor };
 }

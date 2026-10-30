@@ -2,9 +2,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { fakeClock, fakeStore } from '../../lambda/test/fakes.mjs';
-import { createController } from '../src/controller-core.mjs';
+import { createController, PauseRefused } from '../src/controller-core.mjs';
+import { fromFields, toFields } from '../src/firestore.mjs';
 import { GoogleError, OPERATION_NOT_DONE } from '../src/google.mjs';
 import { createUrlMaps, withErrorPolicy } from '../src/urlmaps.mjs';
+import { setup as worldOf } from './world.mjs';
 
 const V1 = 'https://compute.googleapis.com/compute/v1/projects/p';
 const ZONE = 'europe-west1-b';
@@ -64,6 +66,13 @@ function setup({
     workloadId: 'demo', urlMap: 'lb', backendService: 'app', wakerBackendService: WAKER, backends: [VM_A], idleMinutes: 15, wakeTimeoutSeconds: 600, failedRetrySeconds: 60, pollSeconds: 3, ...cfg,
   };
   const store = fakeStore({ config, run, clock });
+  // The Firestore store's names, and what its fields do to a value: an `undefined` comes back null.
+  store.addPause = (id, pause) => store.putPause(id, fromFields(toFields(pause)));
+  store.removePauses = async (id, { at } = {}) => {
+    const found = store.state.pauses.find((p) => p.workloadId === id && (at === undefined || p.at === at));
+    store.state.pauses = store.state.pauses.filter((p) => p !== found);
+    return Boolean(found);
+  };
   const change = async (line, apply) => {
     world.calls.push(line);
     if ((await world.on[line]?.()) !== 'under way') apply();
@@ -134,7 +143,13 @@ function setup({
         return typeof world.requests === 'function' ? world.requests(query) : world.requests;
       },
     },
-    tasks: { enqueue: async (task) => { world.tasks.push(task); } },
+    tasks: {
+      enqueue: async (task) => {
+        if (world.taskRefused) throw world.taskRefused;
+        world.tasks.push(task);
+        world.onTask?.(task);
+      },
+    },
     config: { project: 'p', controllerUrl: CONTROLLER },
     now: clock.now,
     sleep,
@@ -1014,7 +1029,8 @@ test('the check stops at its 240 s, and one workload\'s failure does not stop th
     getBackendService: async () => ({ backends: [] }),
   };
   const store = {
-    listWorkloads: async () => ({ configs: [...ids].reverse().map((workloadId) => ({ workloadId, urlMap: 'lb', backendService: 'app', wakerBackendService: WAKER, backends: [VM_A], idleMinutes: 15, wakeTimeoutSeconds: 600 })) }),
+    listWorkloads: async () => ({ configs: [...ids].reverse().map((workloadId) => ({ workloadId, urlMap: 'lb', backendService: 'app', wakerBackendService: WAKER, backends: [VM_A], idleMinutes: 15, wakeTimeoutSeconds: 600 })), schedules: new Map() }),
+    listPauses: async () => [],
     getRun: async (id) => {
       if (id === 'w01') throw new Error('unreadable');
       return { state: STATES.AWAKE, awakeSince: clock.now() };
@@ -1037,4 +1053,459 @@ test('the check stops at its 240 s, and one workload\'s failure does not stop th
   assert.match(out.find((r) => r.workloadId === 'w01').error, /unreadable/);
   assert.equal(logs.find((l) => l.event === 'CheckFailed').workloadId, 'w01');
   assert.equal(logs.find((l) => l.event === 'CheckBudgetReached').workloads, 12);
+});
+
+// --- Schedules ---------------------------------------------------------------------------------------------------------
+
+// The fake clock starts on Tuesday 2023-11-14 at 22:13 UTC.
+const scheduleOf = (...windows) => ({ timeZone: 'UTC', windows, by: 'ops', at: START - 1000 });
+const NAP = { kind: 'nap', days: ['tue'], start: '22:00', end: '23:00' };
+const AWAKE_WINDOW = { kind: 'awake', days: ['tue'], start: '22:00', end: '23:00' };
+const NAP_ID = '0@2023-11-14T22:00:00.000Z';
+const NAP_END = Date.parse('2023-11-14T23:00:00Z');
+const DAY = 86_400_000;
+const FIVE_MINUTES = 5 * MINUTE;
+const scheduled = (schedule, options) => {
+  const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } }, ...options });
+  t.store.state.schedules.demo = schedule;
+  return t;
+};
+const pauseFor = (t, pause = {}) => t.store.state.pauses.push({ workloadId: 'demo', by: 'ops', at: START - 1000, reason: 'load test', keepAsleep: false, ...pause });
+const check = async (t) => (await t.controller.check()).find((r) => r.workloadId === 'demo');
+const napTask = { url: `${CONTROLLER}/v1/tasks`, body: { action: 'nap', workloadId: 'demo', cause: 'schedule', requestedAt: START, until: NAP_END } };
+
+test('a nap window naps once, whatever the traffic: its task says its cause and its end, a second check asks nothing', async () => {
+  const t = scheduled(scheduleOf(NAP), { requests: 5 });
+  assert.equal((await check(t)).schedule, 'nap');
+  assert.deepEqual(t.world.tasks, [napTask]);
+  assert.equal(t.run().scheduleApplied, NAP_ID);
+  assert.equal(t.run().state, STATES.AWAKE, 'only asked: a nap holds a request for minutes');
+  assert.deepEqual(t.logged('ScheduleApplied').map((l) => [l.occurrence, l.kind, l.action]), [[NAP_ID, 'nap', 'nap']]);
+  assert.equal(t.logged('NapRequested')[0].cause, 'schedule');
+  t.clock.advance(FIVE_MINUTES);
+  assert.equal((await check(t)).schedule, undefined);
+  assert.equal(t.world.tasks.length, 1);
+});
+
+test('an idle workload in its nap window gets the scheduled nap only, not an idle one too', async () => {
+  const t = scheduled(scheduleOf(NAP));
+  await check(t);
+  assert.deepEqual(t.world.tasks, [napTask]);
+});
+
+test('the scheduled nap\'s task runs with its cause: the state change says schedule', async () => {
+  const t = scheduled(scheduleOf(NAP), { map: mapOf() });
+  await t.controller.nap('demo', { cause: 'schedule', requestedAt: START, until: NAP_END });
+  assert.equal(t.logged('StateChanged').find((l) => l.to === STATES.NAPPING).cause, 'schedule');
+});
+
+test('a nap window\'s task delivered late or twice stops nothing: its window ended, or the workload woke since', async () => {
+  const ended = scheduled(scheduleOf(NAP));
+  ended.clock.advance(NAP_END - START);
+  assert.deepEqual(await ended.controller.nap('demo', { cause: 'schedule', requestedAt: START, until: NAP_END }), { state: 'SKIPPED', reason: 'the nap window ended' });
+  const woken = scheduled(scheduleOf(NAP), { run: { state: STATES.AWAKE, awakeSince: START + 1000 } });
+  assert.deepEqual(await woken.controller.nap('demo', { cause: 'schedule', requestedAt: START, until: NAP_END }), { state: 'SKIPPED', reason: 'woken since it was requested' });
+  for (const t of [ended, woken]) {
+    assert.equal(t.run().state, STATES.AWAKE);
+    assert.deepEqual(t.world.calls, []);
+    assert.equal(t.logged('NapSkipped').length, 1);
+  }
+});
+
+test('an awake window wakes a sleeper in a request of its own, once', async () => {
+  const t = scheduled(scheduleOf(AWAKE_WINDOW), { run: { state: STATES.ASLEEP, stateAt: START - DAY }, vms: { 'vm-a': { status: 'TERMINATED' } }, map: asleepMap() });
+  assert.equal((await check(t)).schedule, 'wake');
+  assert.equal(t.run().state, STATES.WAKING);
+  assert.equal(t.run().scheduleApplied, NAP_ID);
+  assert.deepEqual(t.world.tasks.map((task) => task.body), [{ action: 'wake', workloadId: 'demo', wakeId: 'wake-2' }]);
+  assert.equal(t.logged('StateChanged').find((l) => l.to === STATES.WAKING).cause, 'schedule');
+  assert.equal(t.store.state.stats['wake:schedule'], 1);
+  t.clock.advance(FIVE_MINUTES);
+  assert.equal((await check(t)).schedule, undefined);
+  assert.equal(t.world.tasks.length, 1);
+});
+
+test('an awake window gives a napping workload its pending wake, and the occurrence is recorded once the nap settled', async () => {
+  const t = scheduled(scheduleOf(AWAKE_WINDOW), { run: { state: STATES.NAPPING, updatedAt: START } });
+  assert.equal((await check(t)).schedule, 'pending wake');
+  assert.equal(t.run().pendingWake, true);
+  assert.equal(t.run().scheduleApplied, undefined);
+  assert.equal(t.world.tasks.length, 0);
+  Object.assign(t.store.state.run, { state: STATES.AWAKE, awakeSince: START, pendingWake: false });
+  await check(t);
+  assert.equal(t.run().scheduleApplied, NAP_ID);
+});
+
+test('an awake window while awake: recorded with nothing to do, and the idle nap kept off', async () => {
+  const t = scheduled(scheduleOf(AWAKE_WINDOW));
+  const out = await check(t);
+  assert.equal(out.kept, 'awake window');
+  assert.equal(t.run().scheduleApplied, NAP_ID);
+  assert.deepEqual(t.world.tasks, []);
+  assert.deepEqual(t.logged('ScheduleApplied').map((l) => l.action), ['none']);
+});
+
+test('within 30 minutes of an awake start, the nap is skipped and recorded, and the idle nap kept off', async () => {
+  const t = scheduled(scheduleOf({ ...NAP, start: '21:00', end: '22:30' }, { ...AWAKE_WINDOW, start: '22:30', end: '23:30' }));
+  const out = await check(t);
+  assert.equal(out.kept, 'awake window within 30 minutes');
+  assert.deepEqual(t.world.tasks, []);
+  assert.equal(t.run().scheduleApplied, '0@2023-11-14T21:00:00.000Z');
+  assert.deepEqual(t.logged('ScheduleApplied').map((l) => l.action), ['skipped: an awake window starts within 30 minutes']);
+});
+
+test('napping or waking at a nap window: left for the next check, which naps it once awake', async () => {
+  const t = scheduled(scheduleOf(NAP), { run: waking(START) });
+  await check(t);
+  assert.equal(t.run().scheduleApplied, undefined);
+  Object.assign(t.store.state.run, { state: STATES.AWAKE, awakeSince: START });
+  await check(t);
+  assert.equal(t.world.tasks.length, 1);
+  assert.equal(t.run().scheduleApplied, NAP_ID);
+});
+
+test('a schedule the router cannot read: logged, the workload as with none', async () => {
+  const t = scheduled({ timeZone: 'Nowhere/Land', windows: [NAP], at: START }, { requests: 0 });
+  const out = await check(t);
+  assert.equal(t.logged('ScheduleSkipped').length, 1);
+  assert.equal(out.nap, 'requested');
+  assert.deepEqual(t.world.tasks.map((task) => task.body), [{ action: 'nap', workloadId: 'demo' }]);
+});
+
+// Twelve workloads on the same URL map, their VMs read through the world.
+function crowded(schedules) {
+  const world = worldOf();
+  for (const [workloadId, schedule] of Object.entries(schedules)) {
+    world.store.configs.set(workloadId, { workloadId, urlMap: 'lb', backendService: 'app', wakerBackendService: WAKER, backends: [{ kind: 'vm', location: ZONE, name: 'vm-a' }], idleMinutes: 15, wakeTimeoutSeconds: 600 });
+    world.store.runs.set(workloadId, { state: STATES.AWAKE, awakeSince: world.clock.now() - DAY });
+    world.store.schedules.set(workloadId, schedule);
+  }
+  return world;
+}
+const napsOf = (world) => world.w.tasks.map((task) => task.body.workloadId);
+const twelve = Array.from({ length: 12 }, (_, i) => `w${String(i).padStart(2, '0')}`);
+
+test('12 workloads in one window → 10 tasks, the 2 others at the next check, their occurrences unrecorded until then', async () => {
+  const world = crowded(Object.fromEntries(twelve.map((id) => [id, scheduleOf(NAP)])));
+  const { store, core, clock, w } = world;
+  const out = await core.check();
+  assert.deepEqual(napsOf(world), twelve.slice(0, 10), 'and no idle nap for the two others');
+  assert.equal(w.tasks.every((task) => task.body.cause === 'schedule'), true);
+  for (const id of twelve.slice(0, 10)) assert.equal(store.runs.get(id).scheduleApplied, NAP_ID, id);
+  for (const id of twelve.slice(10)) {
+    assert.equal(store.runs.get(id).scheduleApplied, undefined, id);
+    assert.equal(out.find((r) => r.workloadId === id).schedule, 'nap deferred', id);
+  }
+  assert.deepEqual(w.logs.find((l) => l.event === 'ScheduledNapsDeferred').workloads, twelve.slice(10));
+
+  // The first ten's tasks are running: only the two others are left to ask for.
+  for (const id of twelve.slice(0, 10)) store.runs.get(id).state = STATES.NAPPING;
+  for (const id of twelve.slice(0, 10)) store.runs.get(id).updatedAt = clock.now();
+  w.tasks.length = 0;
+  clock.advance(FIVE_MINUTES);
+  await core.check();
+  assert.deepEqual(napsOf(world), twelve.slice(10));
+  for (const id of twelve.slice(10)) assert.equal(store.runs.get(id).scheduleApplied, NAP_ID, id);
+  w.tasks.length = 0;
+  for (const id of twelve.slice(10)) store.runs.get(id).awakeSince = clock.now();
+  clock.advance(FIVE_MINUTES);
+  await core.check();
+  assert.deepEqual(w.tasks, []);
+});
+
+test('the oldest occurrence goes first, whatever the workload\'s name', async () => {
+  const world = crowded({ ...Object.fromEntries(twelve.slice(0, 10).map((id) => [id, scheduleOf(NAP)])), zz: scheduleOf({ ...NAP, start: '21:00' }) });
+  await world.core.check();
+  assert.deepEqual(napsOf(world), ['zz', ...twelve.slice(0, 9)]);
+  assert.equal(world.store.runs.get('w09').scheduleApplied, undefined);
+});
+
+test('a scheduled nap\'s task refused: the occurrence unrecorded, another workload\'s goes on, the next check asks again', async () => {
+  const world = crowded({ a: scheduleOf(NAP), b: scheduleOf(NAP) });
+  world.w.fail.enqueue = new GoogleError('Google: 403 denied', { code: 403 });
+  const out = await world.core.check();
+  assert.deepEqual(world.w.tasks, []);
+  for (const id of ['a', 'b']) {
+    assert.equal(world.store.runs.get(id).scheduleApplied, undefined);
+    assert.equal(out.find((r) => r.workloadId === id).schedule, 'nap refused');
+  }
+  assert.equal(world.w.logs.filter((l) => l.event === 'ScheduleFailed').length, 2);
+  delete world.w.fail.enqueue;
+  world.store.runs.get('a').awakeSince = world.store.runs.get('b').awakeSince = world.clock.now();
+  await world.core.check();
+  assert.deepEqual(napsOf(world), ['a', 'b']);
+  assert.equal(world.store.runs.get('a').scheduleApplied, NAP_ID);
+});
+
+test('a task accepted while its nap already started: the occurrence recorded all the same', async () => {
+  const t = scheduled(scheduleOf(NAP), { requests: 1 });
+  t.world.onTask = () => { Object.assign(t.store.state.run, { state: STATES.NAPPING, updatedAt: START }); };
+  await check(t);
+  assert.equal(t.run().scheduleApplied, NAP_ID);
+  assert.equal(t.run().state, STATES.NAPPING);
+});
+
+test('an awake window\'s wake with its task refused: failed, the occurrence unrecorded, the next check wakes it', async () => {
+  const t = scheduled(scheduleOf(AWAKE_WINDOW), { run: { state: STATES.ASLEEP, stateAt: START - DAY }, vms: { 'vm-a': { status: 'TERMINATED' } }, map: asleepMap() });
+  t.world.taskRefused = new GoogleError('Google: 403 denied', { code: 403 });
+  await check(t);
+  assert.equal(t.logged('StateChanged').find((l) => l.to === STATES.FAILED).cause, 'invoke-failed');
+  assert.equal(t.logged('WakeInvokeFailed').length, 1);
+  assert.equal(t.run().scheduleApplied, undefined);
+  // Its VMs down, the same check's reconcile leaves it asleep, the failure kept.
+  assert.equal(t.run().state, STATES.ASLEEP);
+  assert.match(t.run().failure, /denied/);
+  t.world.taskRefused = null;
+  assert.equal((await check(t)).schedule, 'wake');
+  assert.equal(t.run().state, STATES.WAKING);
+  assert.equal(t.run().scheduleApplied, NAP_ID);
+});
+
+test('maxNapDays fires from stateAt, once past; a wake for maintenance, as a request of its own', async () => {
+  const schedule = { maxNapDays: 7, by: 'ops', at: START };
+  const early = scheduled(schedule, { run: { state: STATES.ASLEEP, stateAt: START - 7 * DAY + 1000 }, vms: { 'vm-a': { status: 'TERMINATED' } }, map: asleepMap() });
+  assert.equal((await check(early)).schedule, undefined);
+  assert.equal(early.run().state, STATES.ASLEEP);
+
+  const due = scheduled(schedule, { run: { state: STATES.ASLEEP, stateAt: START - 7 * DAY }, vms: { 'vm-a': { status: 'TERMINATED' } }, map: asleepMap() });
+  assert.equal((await check(due)).schedule, 'maintenance');
+  assert.equal(due.run().state, STATES.WAKING);
+  assert.deepEqual(due.world.tasks.map((task) => task.body.action), ['wake']);
+  assert.equal(due.logged('StateChanged').find((l) => l.to === STATES.WAKING).cause, 'maintenance');
+  assert.equal(due.store.state.stats['wake:maintenance'], 1);
+});
+
+test('the budget gone before the loop: no task asked, the nap put off, and said for a workload the loop did not reach', async () => {
+  const world = crowded({ a: scheduleOf(NAP) });
+  const { getRun } = world.store;
+  // The schedules read the run first: that read takes the whole budget.
+  world.store.getRun = async (id) => {
+    world.clock.advance(300_000);
+    return getRun(id);
+  };
+  assert.deepEqual(await world.core.check(), [{ workloadId: 'a', schedule: 'nap deferred' }]);
+  assert.deepEqual(world.w.tasks, []);
+  assert.equal(world.store.runs.get('a').scheduleApplied, undefined);
+});
+
+// --- Pauses ------------------------------------------------------------------------------------------------------------
+
+test('a nap asked before a pause is refused at its start: nothing written', async () => {
+  const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
+  pauseFor(t);
+  assert.deepEqual(await t.controller.nap('demo'), { state: 'SKIPPED', reason: 'paused' });
+  assert.equal(t.run().state, STATES.AWAKE);
+  assert.deepEqual(t.world.calls, []);
+  assert.deepEqual(t.logged('NapSkipped').map((l) => l.reason), ['paused']);
+});
+
+test('a pause written during the nap\'s wait → back to awake at the commit point, no VM stopped, the policy removed', async () => {
+  const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
+  t.clock.onSleep(() => pauseFor(t));
+  const out = await t.controller.nap('demo');
+  assert.deepEqual(out, { state: STATES.AWAKE, aborted: true });
+  assert.equal(t.run().state, STATES.AWAKE);
+  assert.equal(t.run().awakeSince, t.clock.now());
+  assert.equal(t.run().stopping, undefined);
+  assert.deepEqual(t.world.calls, ['map policy', 'wait 300 s', 'map no policy']);
+  assert.equal(t.logged('StateChanged').find((l) => l.to === STATES.AWAKE).cause, 'paused');
+  assert.deepEqual(t.logged('NapAborted').map((l) => l.reason), ['paused']);
+  assert.equal(hasPolicy(t.world.map), false);
+});
+
+test('unreadable pauses count as a pause, at a nap\'s start and at its commit point', async () => {
+  const unreadable = async () => { throw new Error('Google: 503 firestore'); };
+  const start = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
+  start.store.getPauses = unreadable;
+  assert.deepEqual(await start.controller.nap('demo'), { state: 'SKIPPED', reason: 'paused' });
+  assert.equal(start.logged('PausesUnreadable').length, 1);
+
+  const commit = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
+  commit.clock.onSleep(() => { commit.store.getPauses = unreadable; });
+  assert.deepEqual(await commit.controller.nap('demo'), { state: STATES.AWAKE, aborted: true });
+  assert.equal(commit.world.vms['vm-a'].status, 'RUNNING');
+});
+
+test('pauses the check cannot read hold every nap and wake of the check, logged; the reconcile still runs', async () => {
+  const napper = scheduled(scheduleOf(NAP), { map: { ...mapOf(), pathMatchers: [{ name: 'm', defaultService: APP_URL }] } });
+  napper.store.listPauses = async () => { throw new Error('Google: 503 firestore'); };
+  const held = await check(napper);
+  assert.equal(held.schedule, 'held by a pause');
+  assert.equal(held.paused, true);
+  assert.deepEqual(napper.world.tasks, []);
+  assert.equal(napper.logged('PausesUnreadable').length, 1);
+  assert.equal(hasRoute(napper.world.map), true, 'the route repaired');
+
+  const sleeper = scheduled(scheduleOf(AWAKE_WINDOW), { run: { state: STATES.ASLEEP, stateAt: START - DAY }, vms: { 'vm-a': { status: 'TERMINATED' } }, map: asleepMap() });
+  sleeper.store.listPauses = napper.store.listPauses;
+  assert.equal((await check(sleeper)).schedule, 'held by a keepAsleep pause');
+  assert.equal(sleeper.run().state, STATES.ASLEEP);
+});
+
+test('a pause holds the window\'s nap, unrecorded: it applies once the pause is gone', async () => {
+  const t = scheduled(scheduleOf(NAP));
+  pauseFor(t);
+  const out = await check(t);
+  assert.equal(out.schedule, 'held by a pause');
+  assert.equal(out.paused, true);
+  assert.deepEqual(t.world.tasks, []);
+  assert.equal(t.run().scheduleApplied, undefined);
+  await t.controller.resume('demo');
+  assert.equal((await check(t)).schedule, 'nap');
+  assert.equal(t.run().scheduleApplied, NAP_ID);
+});
+
+test('a pause keeps a workload from its idle nap', async () => {
+  const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
+  pauseFor(t);
+  assert.deepEqual(await check(t), { workloadId: 'demo', state: STATES.AWAKE, paused: true });
+  assert.deepEqual(t.world.tasks, []);
+  assert.deepEqual(t.world.metricReads, []);
+});
+
+test('a paused failed workload is left for its team: no release asked, and a release refused', async () => {
+  const t = setup({ run: { state: STATES.FAILED, failedAt: START - DAY }, vms: { 'vm-a': { status: 'RUNNING' } }, unhealthyPolls: 99 });
+  pauseFor(t);
+  await check(t);
+  assert.deepEqual(t.world.tasks, []);
+  assert.deepEqual(await t.controller.release('demo'), { state: 'SKIPPED', reason: 'paused' });
+  assert.equal(t.world.vms['vm-a'].status, 'RUNNING');
+});
+
+test('keepAsleep holds an awake window, unrecorded, until the pause is gone', async () => {
+  const t = scheduled(scheduleOf(AWAKE_WINDOW), { run: { state: STATES.ASLEEP, stateAt: START - DAY }, vms: { 'vm-a': { status: 'TERMINATED' } }, map: asleepMap() });
+  pauseFor(t, { keepAsleep: true });
+  assert.equal((await check(t)).schedule, 'held by a keepAsleep pause');
+  assert.equal(t.run().state, STATES.ASLEEP);
+  assert.equal(t.run().scheduleApplied, undefined);
+  assert.deepEqual(t.world.tasks, []);
+  await t.controller.resume('demo');
+  assert.equal((await check(t)).schedule, 'wake');
+});
+
+test('keepAsleep holds the maintenance wake; a plain pause does not', async () => {
+  const asleep = { run: { state: STATES.ASLEEP, stateAt: START - 8 * DAY }, vms: { 'vm-a': { status: 'TERMINATED' } }, map: asleepMap() };
+  const kept = scheduled({ maxNapDays: 7, at: START }, asleep);
+  pauseFor(kept, { keepAsleep: true });
+  assert.equal((await check(kept)).schedule, 'held by a keepAsleep pause');
+  assert.equal(kept.run().state, STATES.ASLEEP);
+  const plain = scheduled({ maxNapDays: 7, at: START }, asleep);
+  pauseFor(plain);
+  assert.equal((await check(plain)).schedule, 'maintenance');
+});
+
+test('a pause past its until no longer holds, and the check deletes it, unless a newer one replaced it', async () => {
+  const t = scheduled(scheduleOf(NAP));
+  pauseFor(t, { until: START });
+  assert.equal((await check(t)).schedule, 'nap');
+  assert.deepEqual(t.store.state.pauses, []);
+  assert.deepEqual(t.logged('PauseExpired').map((l) => [l.workloadId, l.by, l.reason]), [['demo', 'ops', 'load test']]);
+  assert.deepEqual(await t.controller.pausesFor('demo'), []);
+
+  const kept = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
+  pauseFor(kept, { until: START });
+  kept.store.removePauses = async () => false;
+  await check(kept);
+  assert.deepEqual(kept.logged('PauseExpired'), []);
+
+  const broken = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
+  pauseFor(broken, { until: START });
+  broken.store.removePauses = async () => { throw new Error('Google: 503 firestore'); };
+  await check(broken);
+  assert.equal(broken.logged('PauseDeleteFailed').length, 1);
+});
+
+test('a pause with no until goes through the store without one, and never expires', async () => {
+  for (const input of [{}, { until: undefined }, { until: null }]) {
+    const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
+    const { addPause } = t.store;
+    const written = [];
+    t.store.addPause = (id, pause) => {
+      written.push(pause);
+      return addPause(id, pause);
+    };
+    await t.controller.pause('demo', { reason: 'load test', by: 'ops', ...input });
+    assert.equal(Object.hasOwn(written[0], 'until'), false, JSON.stringify(input));
+    assert.equal(Object.hasOwn(t.store.state.pauses[0], 'until'), false, JSON.stringify(input));
+    t.clock.advance(400 * DAY);
+    assert.equal((await t.controller.pausesFor('demo')).length, 1, JSON.stringify(input));
+    assert.deepEqual(await t.controller.nap('demo'), { state: 'SKIPPED', reason: 'paused' });
+  }
+});
+
+test('the pause as written and shown: its author, its reason trimmed, keepAsleep only when true, until to its limit', async () => {
+  const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
+  const until = new Date(START + 366 * DAY).toISOString();
+  await t.controller.pause('demo', { reason: '  load test ', by: 'ops', until, keepAsleep: true });
+  assert.deepEqual(t.store.state.pauses, [{ workloadId: 'demo', by: 'ops', at: START, reason: 'load test', until: START + 366 * DAY, keepAsleep: true }]);
+  assert.deepEqual(await t.controller.pausesFor('demo'), [{ by: 'ops', at: new Date(START).toISOString(), reason: 'load test', until, keepAsleep: true }]);
+  assert.deepEqual(t.logged('Paused').map((l) => [l.workloadId, l.by]), [['demo', 'ops']]);
+  await t.controller.pause('demo', { reason: 'again' });
+  assert.deepEqual(await t.controller.pausesFor('demo'), [{ by: 'unknown', at: new Date(START).toISOString(), reason: 'again', until: null, keepAsleep: false }]);
+});
+
+test('a pause refused: no reason, one too long, an until in the past or too far, a keepAsleep that is not a boolean', async () => {
+  const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
+  for (const [input, message] of [
+    [{}, /reason required/],
+    [{ reason: '   ' }, /reason required/],
+    [{ reason: 7 }, /reason required/],
+    [{ reason: 'x'.repeat(257) }, /reason required/],
+    [{ reason: 'r', until: new Date(START).toISOString() }, /until must be in the future, within 366 days/],
+    [{ reason: 'r', until: START + 366 * DAY + 1 }, /until must be/],
+    [{ reason: 'r', until: 'soon' }, /until must be/],
+    [{ reason: 'r', keepAsleep: 'true' }, /keepAsleep must be true or false/],
+  ]) {
+    await assert.rejects(t.controller.pause('demo', input), (err) => err instanceof PauseRefused && message.test(err.message), JSON.stringify(input));
+  }
+  assert.deepEqual(t.store.state.pauses, []);
+});
+
+test('a pause without keepAsleep wakes a sleeper, or a failed one, in a request of its own', async () => {
+  for (const state of [STATES.ASLEEP, STATES.FAILED]) {
+    const t = setup({ run: { state }, vms: { 'vm-a': { status: 'TERMINATED' } }, map: asleepMap() });
+    await t.controller.pause('demo', { reason: 'load test', by: 'ops' });
+    assert.equal(t.run().state, STATES.WAKING, state);
+    assert.deepEqual(t.world.tasks.map((task) => task.body), [{ action: 'wake', workloadId: 'demo', wakeId: 'wake-2' }]);
+    assert.equal(t.logged('StateChanged').find((l) => l.to === STATES.WAKING).cause, 'pause');
+    assert.equal(t.store.state.stats['wake:pause'], 1);
+  }
+});
+
+test('a pause without keepAsleep gives a napping workload its pending wake; awake: nothing to wake', async () => {
+  const napping = setup({ run: { state: STATES.NAPPING } });
+  await napping.controller.pause('demo', { reason: 'load test' });
+  assert.equal(napping.run().pendingWake, true);
+  assert.deepEqual(napping.logged('PendingWake').map((l) => l.reason), ['pause']);
+  assert.equal(napping.store.state.stats['wake:pause'], 1);
+  const awake = setup();
+  await awake.controller.pause('demo', { reason: 'load test' });
+  assert.equal(awake.run().state, STATES.AWAKE);
+  assert.deepEqual(awake.world.tasks, []);
+});
+
+test('a pause with keepAsleep leaves a sleeper asleep', async () => {
+  const t = setup({ run: { state: STATES.ASLEEP }, vms: { 'vm-a': { status: 'TERMINATED' } }, map: asleepMap() });
+  await t.controller.pause('demo', { reason: 'load test', keepAsleep: true });
+  assert.equal(t.run().state, STATES.ASLEEP);
+  assert.deepEqual(t.world.tasks, []);
+});
+
+test('the pause stays when its wake cannot start: logged', async () => {
+  const t = setup({ run: { state: STATES.ASLEEP }, vms: { 'vm-a': { status: 'TERMINATED' } }, map: asleepMap() });
+  t.store.transition = async () => { throw new Error('Google: 503 firestore'); };
+  await t.controller.pause('demo', { reason: 'load test' });
+  assert.equal(t.store.state.pauses.length, 1);
+  assert.equal(t.logged('PauseWakeFailed').length, 1);
+});
+
+test('resume removes the pause, once; the wake it made stays', async () => {
+  const t = setup({ run: { state: STATES.ASLEEP }, vms: { 'vm-a': { status: 'TERMINATED' } }, map: asleepMap() });
+  await t.controller.pause('demo', { reason: 'load test' });
+  await t.controller.resume('demo', 'ops');
+  assert.deepEqual(t.store.state.pauses, []);
+  assert.equal(t.run().state, STATES.WAKING);
+  assert.deepEqual(t.logged('Resumed').map((l) => l.by), ['ops']);
+  await t.controller.resume('demo', 'ops');
+  assert.equal(t.logged('Resumed').length, 1);
 });

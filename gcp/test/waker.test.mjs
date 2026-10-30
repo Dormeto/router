@@ -389,6 +389,134 @@ test('AWS\'s page, without probeUrl: its probe\'s 503 keeps probing, AWAKE too, 
   assert.equal(browser.reloads, 1);
 });
 
+// --- Schedules ---------------------------------------------------------------------------------------------------------
+
+// The fake clock starts on Tuesday 2023-11-14 at 22:13 UTC.
+const windowed = (more = {}) => ({ timeZone: 'UTC', windows: [{ kind: 'nap', days: ['tue'], start: '22:00', end: '23:00', ...more }], by: 'ops', at: 1 });
+const NAP_UNTIL = { at: '2023-11-14T23:00:00.000Z', local: 'Tue 23:00', timeZone: 'UTC' };
+const napping = ({ schedule = windowed(), ...options } = {}) => {
+  const world = setup(options);
+  world.store.state.schedules.demo = schedule;
+  return world;
+};
+
+test('a nap window: the page says its end, whatever state it keeps the workload in, and the fetch wakes nothing', async () => {
+  const clock = fakeClock();
+  for (const run of [{ state: STATES.ASLEEP }, { state: STATES.NAPPING }, { state: STATES.FAILED, failedAt: clock.now(), consecutiveFailures: 1, failure: JSON.stringify({ kind: 'capacity' }) }]) {
+    const { handler, created } = napping({ run });
+    const res = await handler(request());
+    assert.equal(res.statusCode, 200);
+    assert.match(res.body, /<h1[^>]*>Napping on schedule until Tue 23:00 \(UTC\)\.<\/h1>/, run.state);
+    assert.equal(headerOf(res, 'x-dormeto-nap-until'), NAP_UNTIL.at);
+    assert.equal(headerOf(res, 'x-dormeto-state'), run.state);
+    assert.equal(created.length, 0);
+  }
+});
+
+test('the page says no nap when none keeps the workload: waking or awake in the window, or asleep out of it', async () => {
+  for (const [run, words] of [[{ state: STATES.WAKING }, /Waking up/], [{ state: STATES.AWAKE, awakeSince: 1 }, /Almost there/]]) {
+    const res = await napping({ run }).handler(request());
+    assert.match(res.body, words);
+    assert.equal(headerOf(res, 'x-dormeto-nap-until'), undefined);
+  }
+  const out = await napping({ schedule: windowed({ days: ['mon'] }) }).handler(request());
+  assert.match(out.body, /<h1[^>]*>Waking up/);
+  const awakeWindow = await napping({ schedule: { timeZone: 'UTC', windows: [{ kind: 'awake', days: ['tue'], start: '22:00', end: '23:00' }] } }).handler(request());
+  assert.match(awakeWindow.body, /<h1[^>]*>Waking up/);
+});
+
+test('a HEAD at the fetch says the end in its headers', async () => {
+  const res = await napping().handler(request({ method: 'HEAD' }));
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body, '');
+  assert.equal(headerOf(res, 'x-dormeto-nap-until'), NAP_UNTIL.at);
+});
+
+test('a schedule that cannot be read: the page all the same, as with none, logged', async () => {
+  const unread = napping();
+  unread.store.getSchedule = async () => { throw new Error('Google: 503 firestore'); };
+  const zone = napping({ schedule: { ...windowed(), timeZone: 'Nowhere/Land' } });
+  for (const { handler } of [unread, zone]) {
+    const res = await handler(request());
+    assert.equal(res.statusCode, 200);
+    assert.match(res.body, /<h1[^>]*>Waking up/);
+  }
+  const logged = [];
+  const clock = fakeClock();
+  const store = fakeStore({ config: testConfig(), run: { state: STATES.ASLEEP }, clock });
+  store.getSchedule = unread.store.getSchedule;
+  const handler = createCloudRunWaker({ store, tasks: {}, controllerUrl: CONTROLLER, now: clock.now, log: { ...silentLog, warn: (event, fields) => logged.push({ event, ...fields }) } });
+  await handler(request());
+  assert.deepEqual(logged, [{ event: 'ScheduleSkipped', workloadId: 'demo', error: 'Google: 503 firestore' }]);
+});
+
+test('a visitor\'s probe in a nap window wakes nothing, and says the same as the page', async () => {
+  const { handler, store, created } = napping();
+  const res = await handler(probe());
+  assert.equal(res.statusCode, 202);
+  assert.equal(headerOf(res, 'x-dormeto-nap-until'), NAP_UNTIL.at);
+  assert.equal(headerOf(res, 'x-dormeto-state'), STATES.ASLEEP);
+  assert.deepEqual(JSON.parse(res.body).napUntil, NAP_UNTIL);
+  assert.equal(created.length, 0);
+  assert.equal(store.state.run.state, STATES.ASLEEP);
+  assert.equal(store.state.stats['ignored:schedule'], 1);
+});
+
+test('a probe no filter lets through says the end too: the page it came from said it to every visitor', async () => {
+  const { handler, created } = napping({ cfg: testConfig({ noWakeRules: [{ name: 'office', sourceIps: ['1.2.3.0/24'] }] }) });
+  const res = await handler(probe());
+  assert.equal(res.statusCode, 202);
+  assert.equal(headerOf(res, 'x-dormeto-nap-until'), NAP_UNTIL.at);
+  assert.deepEqual(JSON.parse(res.body).napUntil, NAP_UNTIL);
+  assert.equal(created.length, 0);
+  const head = await napping().handler(request({ method: 'HEAD', url: '/_dormeto/wake' }));
+  assert.equal(head.statusCode, 202);
+  assert.equal(head.body, '');
+  assert.equal(headerOf(head, 'x-dormeto-nap-until'), NAP_UNTIL.at);
+});
+
+test('the page\'s script in a nap window: it keeps saying when the nap ends, keeps probing, and wakes nothing', async () => {
+  const { handler, clock, created } = napping();
+  const page = await handler(request());
+  const browser = browse(page.body, wakerAnswers(handler), clock);
+  await browser.settled();
+  assert.equal(browser.message.textContent, undefined, 'the message of the page stays');
+  assert.equal(browser.reloads, 0);
+  assert.equal(browser.nextTimer().ms, 3000);
+  assert.equal(created.length, 0);
+});
+
+test('a window that allows it: a POST to /_dormeto/wake wakes, a probe does not', async () => {
+  const { handler, store, created } = napping({ schedule: windowed({ wake: 'header' }) });
+  const refused = await handler(probe());
+  assert.equal(headerOf(refused, 'x-dormeto-nap-until'), NAP_UNTIL.at);
+  assert.equal(created.length, 0);
+  const res = await handler(request({ method: 'POST', url: '/_dormeto/wake' }));
+  assert.equal(res.statusCode, 202);
+  assert.equal(headerOf(res, 'x-dormeto-state'), STATES.WAKING);
+  assert.equal(headerOf(res, 'x-dormeto-nap-until'), undefined);
+  assert.equal(created.length, 1);
+  assert.equal(store.state.run.state, STATES.WAKING);
+});
+
+test('a window that does not allow it: a POST to /_dormeto/wake wakes nothing, and says why', async () => {
+  const { handler, created } = napping();
+  const res = await handler(request({ method: 'POST', url: '/_dormeto/wake' }));
+  assert.equal(res.statusCode, 202);
+  assert.equal(headerOf(res, 'x-dormeto-nap-until'), NAP_UNTIL.at);
+  assert.equal(created.length, 0);
+});
+
+test('with keepAsleep, a visitor\'s probe still wakes: the pause holds scheduled and maintenance wakes only', async () => {
+  const { handler, store, created } = setup();
+  await store.putPause('demo', { by: 'ops', at: 1, reason: 'load test', keepAsleep: true });
+  const res = await handler(probe());
+  assert.equal(res.statusCode, 202);
+  assert.equal(headerOf(res, 'x-dormeto-state'), STATES.WAKING);
+  assert.equal(created.length, 1);
+  assert.equal(store.state.run.state, STATES.WAKING);
+});
+
 test('fromEnvironment wires the store and the queue on the environment\'s names', async () => {
   const calls = [];
   const documents = 'https://firestore.googleapis.com/v1/projects/p/databases/dmtr-europe-west1/documents';

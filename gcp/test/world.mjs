@@ -137,12 +137,28 @@ export function setup(change = () => {}) {
   };
   const configs = new Map();
   const runs = new Map();
+  const schedules = new Map();
+  const pauses = new Map();
   const store = {
     configs,
     runs,
+    schedules,
+    pauses,
     getConfig: async (id) => structuredClone(configs.get(id) ?? null),
     listConfigs: async () => [...configs.values()].map((c) => structuredClone(c)),
-    listWorkloads: async () => ({ configs: [...configs.values()].map((c) => structuredClone(c)), schedules: new Map() }),
+    listWorkloads: async () => ({ configs: [...configs.values()].map((c) => structuredClone(c)), schedules: structuredClone(schedules) }),
+    getSchedule: async (id) => structuredClone(schedules.get(id) ?? null),
+    putSchedule: async (id, schedule) => {
+      schedules.set(id, structuredClone(schedule));
+    },
+    deleteSchedule: async (id) => schedules.delete(id),
+    getPauses: async (id) => (pauses.has(id) ? [{ workloadId: id, ...structuredClone(pauses.get(id)) }] : []),
+    listPauses: async () => [...pauses].map(([workloadId, pause]) => ({ workloadId, ...structuredClone(pause) })),
+    addPause: async (id, pause) => {
+      pauses.set(id, structuredClone(pause));
+    },
+    removePauses: async (id) => pauses.delete(id),
+    count: async () => {},
     getRun: async (id) => structuredClone(runs.get(id) ?? null),
     putConfig: async (id, config) => {
       configs.set(id, structuredClone(config));
@@ -154,8 +170,7 @@ export function setup(change = () => {}) {
       return true;
     },
     deleteWorkload: async (id) => {
-      configs.delete(id);
-      runs.delete(id);
+      for (const kind of [configs, runs, schedules, pauses]) kind.delete(id);
     },
     transition: async (id, { cond, set = {}, remove = [], increment = [] }) => {
       const run = runs.get(id);

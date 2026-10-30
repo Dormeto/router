@@ -244,12 +244,171 @@ test('POST /v1/check: what the check found, workload by workload', async () => {
   assert.deepEqual(res.body, { results: [{ workloadId: 'demo', state: STATES.AWAKE }] });
 });
 
+test('POST /v1/tasks: a nap task passes on what the check asked it with', async () => {
+  const { call, store, clock, w } = api();
+  await call('POST', '/v1/workloads', INPUT);
+  clock.advance(1000);
+  const body = { action: 'nap', workloadId: 'demo', cause: 'schedule', requestedAt: clock.now(), until: clock.now() };
+  assert.deepEqual((await call('POST', '/v1/tasks', body)).body, { state: 'SKIPPED', reason: 'the nap window ended' });
+  assert.equal(store.runs.get('demo').state, STATES.AWAKE);
+  assert.deepEqual(w.changes.filter((line) => line.startsWith('stop')), []);
+  await call('POST', '/v1/tasks', { ...body, until: clock.now() + 3_600_000 });
+  assert.equal(w.logs.find((l) => l.event === 'StateChanged' && l.to === STATES.NAPPING).cause, 'schedule');
+});
+
+// --- Schedules and pauses --------------------------------------------------------------------------------------------
+
+const SCHEDULE = { timeZone: 'europe/paris', windows: [{ kind: 'nap', days: ['sat', 'sun'], start: '20:00', end: '08:00' }], maxNapDays: 7 };
+
+test('GET /v1/workloads/:id/schedule: none, then the schedule and its next events', async () => {
+  const { call, clock } = api();
+  assert.equal((await call('GET', '/v1/workloads/demo/schedule')).status, 404);
+  assert.equal((await call('GET', '/v1/workloads/Bad_ID/schedule')).status, 400);
+  await call('POST', '/v1/workloads', INPUT);
+  assert.deepEqual((await call('GET', '/v1/workloads/demo/schedule')).body, { schedule: null, nextEvents: [] });
+  await call('PUT', '/v1/workloads/demo/schedule', { ...SCHEDULE, by: 'ops' });
+  const res = await call('GET', '/v1/workloads/demo/schedule');
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.schedule, { timeZone: 'Europe/Paris', windows: SCHEDULE.windows, maxNapDays: 7, by: 'ops', at: new Date(clock.now()).toISOString() });
+  assert.deepEqual(res.body.nextEvents[0], { at: '2023-11-18T19:00:00.000Z', kind: 'nap-start', window: 0 });
+});
+
+test('PUT /v1/workloads/:id/schedule: stored as normalized, answered with its next events; unknown: 404', async () => {
+  const { call, store, clock } = api();
+  assert.equal((await call('PUT', '/v1/workloads/demo/schedule', SCHEDULE)).status, 404);
+  await call('POST', '/v1/workloads', INPUT);
+  const res = await call('PUT', '/v1/workloads/demo/schedule', SCHEDULE);
+  assert.equal(res.status, 200);
+  assert.equal(res.body.schedule.timeZone, 'Europe/Paris');
+  assert.equal(res.body.schedule.by, 'unknown');
+  assert.equal(res.body.nextEvents.length > 0, true);
+  assert.deepEqual(store.schedules.get('demo'), { timeZone: 'Europe/Paris', windows: SCHEDULE.windows, maxNapDays: 7, by: 'unknown', at: clock.now() });
+  // A schedule read back can be sent again as it is.
+  const again = await call('PUT', '/v1/workloads/demo/schedule', res.body.schedule);
+  assert.equal(again.status, 200);
+  assert.deepEqual(again.body, res.body);
+});
+
+test('PUT /v1/workloads/:id/schedule: a bad schedule → 400 with scheduleProblems\' words, nothing stored', async () => {
+  const { call, store } = api();
+  await call('POST', '/v1/workloads', INPUT);
+  const res = await call('PUT', '/v1/workloads/demo/schedule', { windows: [{ kind: 'nap', days: ['someday'], start: '20:00', end: '08:00' }], other: 1 });
+  assert.equal(res.status, 400);
+  assert.equal(res.body.reason, 'bad-request');
+  assert.equal(res.body.error, 'timeZone: required with windows; windows[0].days: one or more of mon, tue, wed, thu, fri, sat, sun, each once; other: unknown field');
+  const empty = await call('PUT', '/v1/workloads/demo/schedule', {});
+  assert.equal(empty.status, 400);
+  assert.equal(empty.body.error, 'schedule: windows or maxNapDays required');
+  assert.equal(store.schedules.size, 0);
+});
+
+test('DELETE /v1/workloads/:id/schedule: gone, and none left is no failure; unknown: 404', async () => {
+  const { call, store, w } = api();
+  assert.equal((await call('DELETE', '/v1/workloads/demo/schedule')).status, 404);
+  await call('POST', '/v1/workloads', INPUT);
+  await call('PUT', '/v1/workloads/demo/schedule', SCHEDULE);
+  for (const cleared of [true, false]) {
+    const res = await call('DELETE', '/v1/workloads/demo/schedule');
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.body, { schedule: null, nextEvents: [] });
+    assert.equal(w.logs.findLast((l) => l.event === 'ScheduleCleared').cleared, cleared);
+  }
+  assert.equal(store.schedules.size, 0);
+});
+
+test('GET /v1/workloads/:id/schedule: one the router cannot read is shown, with no next events, logged', async () => {
+  const { call, store, w } = api();
+  await call('POST', '/v1/workloads', INPUT);
+  store.schedules.set('demo', { ...SCHEDULE, timeZone: 'Nowhere/Land', at: 1 });
+  const res = await call('GET', '/v1/workloads/demo/schedule');
+  assert.equal(res.status, 200);
+  assert.equal(res.body.schedule.timeZone, 'Nowhere/Land');
+  assert.deepEqual(res.body.nextEvents, []);
+  assert.equal(w.logs.filter((l) => l.event === 'ScheduleSkipped').length, 1);
+});
+
+test('POST /v1/workloads/:id/pause: the Workload with its pause; a sleeper woken; unknown: 404; a bad one: 400', async () => {
+  const { call, store, clock, w } = api();
+  assert.equal((await call('POST', '/v1/workloads/demo/pause', { reason: 'r' })).status, 404);
+  assert.equal((await call('POST', '/v1/workloads/Bad_ID/pause', { reason: 'r' })).status, 400);
+  await call('POST', '/v1/workloads', INPUT);
+  store.runs.get('demo').state = STATES.ASLEEP;
+  const until = new Date(clock.now() + 3_600_000).toISOString();
+  const res = await call('POST', '/v1/workloads/demo/pause', { reason: 'load test', by: 'ops', until });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.state, STATES.WAKING);
+  assert.deepEqual(res.body.paused, { by: 'ops', at: new Date(clock.now()).toISOString(), reason: 'load test', until, keepAsleep: false });
+  assert.deepEqual(w.tasks.at(-1).body, { action: 'wake', workloadId: 'demo', wakeId: 'wake-1' });
+  for (const [body, words] of [[{}, /reason required/], [{ reason: 'r', until: 'soon' }, /until must be/], [{ reason: 'r', keepAsleep: 'yes' }, /keepAsleep must be/]]) {
+    const refused = await call('POST', '/v1/workloads/demo/pause', body);
+    assert.equal(refused.status, 400, JSON.stringify(body));
+    assert.equal(refused.body.reason, 'bad-request');
+    assert.match(refused.body.error, words);
+  }
+});
+
+test('POST /v1/workloads/:id/pause with keepAsleep: the sleeper stays asleep', async () => {
+  const { call, store, w } = api();
+  await call('POST', '/v1/workloads', INPUT);
+  store.runs.get('demo').state = STATES.ASLEEP;
+  const res = await call('POST', '/v1/workloads/demo/pause', { reason: 'load test', keepAsleep: true });
+  assert.equal(res.body.state, STATES.ASLEEP);
+  assert.equal(res.body.paused.keepAsleep, true);
+  assert.deepEqual(w.tasks, []);
+});
+
+test('POST /v1/workloads/:id/resume: the Workload without its pause, with or without one; unknown: 404', async () => {
+  const { call } = api();
+  assert.equal((await call('POST', '/v1/workloads/demo/resume')).status, 404);
+  await call('POST', '/v1/workloads', INPUT);
+  await call('POST', '/v1/workloads/demo/pause', { reason: 'load test' });
+  for (const body of [{ by: 'ops' }, undefined]) {
+    const res = await call('POST', '/v1/workloads/demo/resume', body);
+    assert.equal(res.status, 200);
+    assert.equal(res.body.id, 'demo');
+    assert.equal(res.body.paused, undefined);
+  }
+});
+
+test('GET /v1/workloads and /:id show the pause, not an expired one', async () => {
+  const { call, clock } = api();
+  await call('POST', '/v1/workloads', INPUT);
+  assert.equal((await call('GET', '/v1/workloads/demo')).body.paused, undefined);
+  await call('POST', '/v1/workloads/demo/pause', { reason: 'load test', until: clock.now() + 60_000 });
+  assert.equal((await call('GET', '/v1/workloads/demo')).body.paused.reason, 'load test');
+  assert.equal((await call('GET', '/v1/workloads')).body[0].paused.reason, 'load test');
+  clock.advance(60_000);
+  assert.equal((await call('GET', '/v1/workloads/demo')).body.paused, undefined);
+  assert.equal((await call('GET', '/v1/workloads')).body[0].paused, undefined);
+});
+
+test('POST /v1/workloads/:id/nap of a paused workload: a 409 saying whose pause, no task', async () => {
+  const { call, w } = api();
+  await call('POST', '/v1/workloads', INPUT);
+  await call('POST', '/v1/workloads/demo/pause', { reason: 'load test', by: 'ops' });
+  const res = await call('POST', '/v1/workloads/demo/nap');
+  assert.equal(res.status, 409);
+  assert.deepEqual(res.body, { error: 'workload demo is paused by ops: load test', reason: 'paused' });
+  assert.deepEqual(w.tasks, []);
+  await call('POST', '/v1/workloads/demo/resume');
+  assert.equal((await call('POST', '/v1/workloads/demo/nap')).status, 200);
+});
+
+test('an offboarding takes the schedule and the pause with it', async () => {
+  const { call, store } = api();
+  await call('POST', '/v1/workloads', INPUT);
+  await call('PUT', '/v1/workloads/demo/schedule', SCHEDULE);
+  await call('POST', '/v1/workloads/demo/pause', { reason: 'load test' });
+  assert.equal((await call('DELETE', '/v1/workloads/demo')).status, 200);
+  assert.equal(store.schedules.size + store.pauses.size, 0);
+});
+
 test('any other route or method: a 404 in the same shape', async () => {
   const { call } = api();
   for (const [method, path] of [
     ['GET', '/'], ['GET', '/v1'], ['POST', '/v1/health'], ['PUT', '/v1/workloads'], ['DELETE', '/v1/workloads'],
     ['POST', '/v1/workloads/demo'], ['PUT', '/v1/workloads/demo'], ['GET', '/v1/workloads/demo/nap'], ['POST', '/v1/workloads/demo/other'], ['POST', '/v1/workloads/demo/nap/x'],
-    ['GET', '/v1/tasks'], ['GET', '/v1/check'],
+    ['GET', '/v1/tasks'], ['GET', '/v1/check'], ['POST', '/v1/workloads/demo/schedule'], ['GET', '/v1/workloads/demo/pause'], ['PUT', '/v1/workloads/demo/pause'], ['GET', '/v1/workloads/demo/resume'],
   ]) {
     const res = await call(method, path);
     assert.equal(res.status, 404, `${method} ${path}`);

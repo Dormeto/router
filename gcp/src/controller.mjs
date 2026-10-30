@@ -61,7 +61,7 @@ export function createControllerApi({ core, onboarding, config }) {
       if (typeof wakeId !== 'string' || !wakeId) throw bad('a wake task needs its wakeId');
       return core.wake(workloadId, wakeId);
     },
-    nap: ({ workloadId }) => core.nap(workloadId),
+    nap: ({ workloadId, cause, requestedAt, until }) => core.nap(workloadId, { cause, requestedAt, until }),
     release: ({ workloadId }) => core.release(workloadId),
   };
 
@@ -88,6 +88,11 @@ export function createControllerApi({ core, onboarding, config }) {
     if (!verb && method === 'DELETE') return onboarding.offboard(idOf(encoded), { force: forceOf(query) });
     if (verb === 'nap' && method === 'POST') return onboarding.nap(idOf(encoded));
     if (verb === 'wake' && method === 'POST') return onboarding.wake(idOf(encoded));
+    if (verb === 'schedule' && method === 'GET') return onboarding.showSchedule(idOf(encoded));
+    if (verb === 'schedule' && method === 'PUT') return onboarding.setSchedule(idOf(encoded), await bodyOf(request));
+    if (verb === 'schedule' && method === 'DELETE') return onboarding.clearSchedule(idOf(encoded));
+    if (verb === 'pause' && method === 'POST') return onboarding.pause(idOf(encoded), await bodyOf(request));
+    if (verb === 'resume' && method === 'POST') return onboarding.resume(idOf(encoded), await bodyOf(request));
     return null;
   }
 

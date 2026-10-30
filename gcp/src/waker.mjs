@@ -6,10 +6,15 @@
 // It never answers a 503. The fetch must succeed for the load balancer to serve the page (Google: a failed fetch gets a
 // generic error), and its policy's override gives the visitor the 503. On `/_dormeto/wake`, a 503 would be replaced by the
 // page: the nap's policy applies to all the matcher's traffic, and the waker is a backend of it.
+//
+// A nap window: the page and `/_dormeto/wake` say when it ends. Pauses mean nothing here: `keepAsleep` holds the scheduled and
+// maintenance wakes only, and a visitor still wakes the workload (vision docs/specs/2026-10-30-google-cloud-coverage-design.md,
+// section 5).
 import { failureKind, nextAttemptAt } from '../../lambda/src/lib/failures.mjs';
 import { WAKE_HEADER, header, response } from '../../lambda/src/lib/http.mjs';
 import { logger } from '../../lambda/src/lib/log.mjs';
 import { renderPage } from '../../lambda/src/lib/page.mjs';
+import { localTime, occurrenceAt } from '../../lambda/src/lib/schedule.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { createWaker } from '../../lambda/src/lib/waker-core.mjs';
 import { createFirestoreStore } from './firestore.mjs';
@@ -22,6 +27,9 @@ const CLOUD = 'Google Cloud';
 const UNKNOWN_POLL_SECONDS = 10;
 // The run could not be read: nothing is claimed, the page says it wakes.
 const UNREAD_STATE = 'UNKNOWN';
+const NAP_UNTIL_HEADER = 'x-dormeto-nap-until';
+// What a nap window can keep a workload in, as the shared code reads it.
+const KEPT_BY_NAP = [STATES.ASLEEP, STATES.NAPPING, STATES.FAILED];
 
 // A `node:http` request as the shared code reads an ALB event. The query string stays encoded, as the ALB passes it. The
 // load balancer appends the client's address and then its own to X-Forwarded-For: its entry is dropped, so that the last
@@ -73,16 +81,46 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, now = Date.no
     log,
   });
 
+  // The end of the nap window active now, as the page says it, or null. A schedule that cannot be read counts as none: the
+  // page is served all the same.
+  async function napUntilOf(workloadId, state) {
+    if (!KEPT_BY_NAP.includes(state)) return null;
+    try {
+      const schedule = await store.getSchedule(workloadId);
+      const occurrence = occurrenceAt(schedule, now());
+      if (occurrence?.kind !== 'nap') return null;
+      return { at: new Date(occurrence.end).toISOString(), local: localTime(occurrence.end, schedule.timeZone), timeZone: schedule.timeZone };
+    } catch (err) {
+      log.warn('ScheduleSkipped', { workloadId, error: err.message });
+      return null;
+    }
+  }
+
+  // The shared code reads the nap window for what it might wake. A request it filters before that (a rule, a bot, a list)
+  // read the page all the same, which says the window to everyone here: its probe must not go back to "Waking up". An
+  // explicit wake is its own answer: a window that allows one has woken the workload.
+  async function sayingNapEnd(res, event, workloadId, state) {
+    if (event.httpMethod === 'POST' || res.multiValueHeaders[NAP_UNTIL_HEADER]) return res;
+    const napUntil = await napUntilOf(workloadId, state);
+    if (!napUntil) return res;
+    return {
+      ...res,
+      multiValueHeaders: { ...res.multiValueHeaders, [NAP_UNTIL_HEADER]: [napUntil.at] },
+      ...(res.body ? { body: JSON.stringify({ ...JSON.parse(res.body), napUntil }) } : {}),
+    };
+  }
+
   // Asked by the page's script or an API client, answered in headers and JSON. A POST is an explicit wake. Not awake, the
   // shared code's 503 is a 202, the rest as it is. Awake, it answers a redirect, or a 503 in AWS's route grace: here,
   // plainly `AWAKE`.
-  async function wake(event) {
+  async function wake(event, workloadId) {
     const res = await core({
       ...event,
       headers: { ...event.headers, accept: 'application/json', ...(event.httpMethod === 'POST' ? { [WAKE_HEADER]: '1' } : {}) },
     });
-    if (res.statusCode !== 307 && res.multiValueHeaders['x-dormeto-state']?.[0] !== STATES.AWAKE) {
-      return res.statusCode === 503 ? { ...res, statusCode: 202, statusDescription: '202 Accepted' } : res;
+    const state = res.multiValueHeaders['x-dormeto-state']?.[0];
+    if (res.statusCode !== 307 && state !== STATES.AWAKE) {
+      return sayingNapEnd(res.statusCode === 503 ? { ...res, statusCode: 202, statusDescription: '202 Accepted' } : res, event, workloadId, state);
     }
     const headers = { 'cache-control': 'no-store', 'x-dormeto-state': STATES.AWAKE, 'content-type': 'application/json' };
     return event.httpMethod === 'HEAD' ? response(200, headers) : response(200, headers, JSON.stringify({ status: 'awake' }));
@@ -101,9 +139,13 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, now = Date.no
     const pollSeconds = cfg && run ? cfg.pollSeconds : UNKNOWN_POLL_SECONDS;
     const retryAt = cfg && run ? nextAttemptAt(cfg, run) : null;
     const failed = retryAt === null ? {} : { failure: failureKind(run), retryInMs: Math.max(0, retryAt - now()) };
-    const headers = { 'cache-control': 'no-store', 'retry-after': String(pollSeconds), 'x-dormeto-state': state, 'content-type': 'text/html; charset=utf-8' };
+    const napUntil = cfg && run ? await napUntilOf(workloadId, state) : null;
+    const headers = {
+      ...(napUntil ? { [NAP_UNTIL_HEADER]: napUntil.at } : {}),
+      'cache-control': 'no-store', 'retry-after': String(pollSeconds), 'x-dormeto-state': state, 'content-type': 'text/html; charset=utf-8',
+    };
     if (event.httpMethod === 'HEAD') return response(200, headers);
-    return response(200, headers, renderPage({ state, pollSeconds, ...failed, probeUrl: WAKE_PATH, cloud: CLOUD }));
+    return response(200, headers, renderPage({ state, pollSeconds, ...failed, napUntil, probeUrl: WAKE_PATH, cloud: CLOUD }));
   }
 
   return async function handler(request) {
@@ -112,7 +154,7 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, now = Date.no
     if (!workloadId) {
       return response(400, { 'cache-control': 'no-store', 'content-type': 'application/json' }, JSON.stringify({ error: 'bad request', reason: `${WORKLOAD_HEADER} names no workload` }));
     }
-    return event.path === WAKE_PATH ? wake(event) : waiting(event, workloadId);
+    return event.path === WAKE_PATH ? wake(event, workloadId) : waiting(event, workloadId);
   };
 }
 

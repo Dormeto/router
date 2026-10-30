@@ -85,23 +85,25 @@ test('the query string stays encoded', () => {
   assert.deepEqual(eventOf(request({ url: '/_dormeto/wake' })).multiValueQueryStringParameters, {});
 });
 
-test('HEAD → 503 without a body and no task, at both paths', async () => {
+test('HEAD → no body and no task: 200 at the error response\'s fetch, 202 at the wake', async () => {
   const { handler, created } = setup();
-  for (const url of ['/_dormeto/waiting', '/_dormeto/wake']) {
+  for (const [url, status] of [['/_dormeto/waiting', 200], ['/_dormeto/wake', 202]]) {
     const res = await handler(request({ method: 'HEAD', url, headers: { accept: 'text/html', 'x-dormeto-probe': '1' } }));
-    assert.equal(res.statusCode, 503, url);
+    assert.equal(res.statusCode, status, url);
     assert.equal(res.body, '', url);
     assert.equal(headerOf(res, 'retry-after'), '3', url);
   }
   assert.equal(created.length, 0);
 });
 
-test('the error response\'s fetch → the waiting page, 503, Retry-After, and no task', async () => {
+// The load balancer may take a 5xx for a failed fetch, and serve a generic error instead: its overrideResponseCode gives the
+// visitor the 503 (G0 measured an error service answering 200).
+test('the error response\'s fetch → the waiting page, 200, Retry-After, and no task', async () => {
   const { handler, store, created } = setup();
   // Whatever the fetch carries: no Accept here, an explicit wake's headers next.
   for (const headers of [{}, { accept: 'text/html', 'x-dormeto-probe': '1', 'x-dormeto-wake': '1' }]) {
     const res = await handler(request({ headers }));
-    assert.equal(res.statusCode, 503);
+    assert.equal(res.statusCode, 200);
     assert.equal(headerOf(res, 'retry-after'), '3');
     assert.equal(headerOf(res, 'cache-control'), 'no-store');
     assert.equal(headerOf(res, 'x-dormeto-state'), STATES.ASLEEP);
@@ -116,7 +118,7 @@ test('the error response\'s fetch → the waiting page, 503, Retry-After, and no
 test('any other path gets the waiting page too, never a wake', async () => {
   const { handler, created } = setup();
   const res = await handler(request({ method: 'POST', url: '/orders', headers: { 'x-dormeto-wake': '1' } }));
-  assert.equal(res.statusCode, 503);
+  assert.equal(res.statusCode, 200);
   assert.match(res.body, /Waking up the application/);
   assert.equal(created.length, 0);
 });
@@ -124,11 +126,25 @@ test('any other path gets the waiting page too, never a wake', async () => {
 test('the waiting page of a workload not configured says it failed and logs it', async () => {
   const { handler, logged } = setup();
   const res = await handler(request({ headers: { 'x-dormeto-workload': 'other' } }));
-  assert.equal(res.statusCode, 503);
+  assert.equal(res.statusCode, 200);
   assert.equal(headerOf(res, 'retry-after'), '10');
   assert.equal(headerOf(res, 'x-dormeto-state'), STATES.FAILED);
   assert.match(res.body, /could not be started/);
   assert.deepEqual(logged, [{ event: 'WorkloadNotConfigured', workloadId: 'other' }]);
+});
+
+test('the waiting page when Firestore cannot be read: the page all the same, 200, no state claimed, logged', async () => {
+  for (const broken of ['getConfig', 'getRun']) {
+    const { handler, store, logged, created } = setup();
+    store[broken] = async () => { throw new Error('Google: 503 firestore'); };
+    const res = await handler(request()).catch((err) => ({ statusCode: err.message }));
+    assert.equal(res.statusCode, 200, broken);
+    assert.equal(headerOf(res, 'x-dormeto-state'), 'UNKNOWN');
+    assert.equal(headerOf(res, 'retry-after'), '10');
+    assert.match(res.body, /<h1[^>]*>Waking up the application/);
+    assert.deepEqual(logged, [{ event: 'WaitingPageUnread', workloadId: 'demo', error: 'Google: 503 firestore' }]);
+    assert.equal(created.length, 0);
+  }
 });
 
 test('the waiting page of a failed workload says why and when, in Google Cloud\'s words', async () => {
@@ -145,7 +161,7 @@ test('the waiting page of a failed workload says why and when, in Google Cloud\'
 test('a probe from a browser → one task for the controller: service account, audience', async () => {
   const { handler, store, created } = setup();
   const res = await handler(probe());
-  assert.equal(res.statusCode, 503);
+  assert.equal(res.statusCode, 202);
   assert.equal(headerOf(res, 'x-dormeto-state'), STATES.WAKING);
   assert.equal(created.length, 1);
   const [{ httpRequest, dispatchDeadline }] = created;
@@ -166,18 +182,23 @@ test('concurrent probes, and the next ones, make one task', async () => {
 test('a bot\'s probe → no task', async () => {
   const { handler, store, created } = setup();
   const res = await handler(probe({ 'user-agent': 'Googlebot/2.1' }));
-  assert.equal(res.statusCode, 503);
+  assert.equal(res.statusCode, 202);
   assert.equal(created.length, 0);
   assert.equal(store.state.run.state, STATES.ASLEEP);
   assert.equal(store.state.stats['ignored:bot user agent'], 1);
 });
 
-test('POST /_dormeto/wake → one task, at once: no hold', async () => {
+// A matcher's policy applies to all its traffic, and the waker is a backend: a 503 here would be replaced by the waiting
+// page, with an API client's JSON and these headers lost.
+test('POST /_dormeto/wake → 202, one task, at once: no hold', async () => {
   const { handler, clock, created, store } = setup({ cfg: testConfig({ waitSeconds: 20 }) });
   const start = clock.now();
   const res = await handler(request({ method: 'POST', url: '/_dormeto/wake', headers: { 'user-agent': 'curl/8.7.1', accept: '*/*' } }));
-  assert.equal(res.statusCode, 503);
+  assert.equal(res.statusCode, 202);
+  assert.equal(res.statusDescription, '202 Accepted');
   assert.deepEqual(JSON.parse(res.body), { status: 'waking', retryAfter: 3 });
+  assert.equal(headerOf(res, 'retry-after'), '3');
+  assert.equal(headerOf(res, 'x-dormeto-state'), STATES.WAKING);
   assert.equal(created.length, 1);
   assert.equal(store.state.run.state, STATES.WAKING);
   assert.equal(clock.now(), start);
@@ -186,12 +207,12 @@ test('POST /_dormeto/wake → one task, at once: no hold', async () => {
 test('POST /_dormeto/wake goes through the filters: a bot and a no-wake rule get no task', async () => {
   const bot = setup();
   const bots = await bot.handler(request({ method: 'POST', url: '/_dormeto/wake', headers: { 'user-agent': 'UptimeRobot/2.0' } }));
-  assert.equal(bots.statusCode, 503);
+  assert.equal(bots.statusCode, 202);
   assert.equal(bot.created.length, 0);
   assert.equal(bot.store.state.stats['ignored:bot user agent'], 1);
   const ruled = setup({ cfg: testConfig({ noWakeRules: [{ name: 'office', sourceIps: ['1.2.3.0/24'] }] }) });
   const rules = await ruled.handler(request({ method: 'POST', url: '/_dormeto/wake' }));
-  assert.equal(rules.statusCode, 503);
+  assert.equal(rules.statusCode, 202);
   assert.equal(ruled.created.length, 0);
   assert.equal(ruled.store.state.stats['ignored:rule office'], 1);
 });
@@ -199,7 +220,7 @@ test('POST /_dormeto/wake goes through the filters: a bot and a no-wake rule get
 test('GET /_dormeto/wake that is no probe (a scanner, a link) → no task, whatever the workload\'s wake mode', async () => {
   const { handler, created, store } = setup({ cfg: testConfig({ wakeMode: 'traffic' }) });
   const res = await handler(request({ url: '/_dormeto/wake', headers: { accept: 'text/html' } }));
-  assert.equal(res.statusCode, 503);
+  assert.equal(res.statusCode, 202);
   assert.match(headerOf(res, 'content-type'), /application\/json/);
   assert.equal(created.length, 0);
   assert.equal(store.state.run.state, STATES.ASLEEP);
@@ -225,10 +246,22 @@ test('awake: no redirect, no hold and no task, whichever way /_dormeto/wake is a
   assert.equal(head.body, '');
 });
 
+test('a failed workload\'s POST /_dormeto/wake keeps what it says: 202, its state, its failure and the next attempt', async () => {
+  const clock = fakeClock();
+  const run = { state: STATES.FAILED, failedAt: clock.now(), consecutiveFailures: 1, failure: JSON.stringify({ kind: 'capacity' }) };
+  const { handler, created } = setup({ run });
+  const res = await handler(request({ method: 'POST', url: '/_dormeto/wake' }));
+  assert.equal(res.statusCode, 202);
+  assert.equal(headerOf(res, 'x-dormeto-state'), STATES.FAILED);
+  assert.equal(headerOf(res, 'x-dormeto-failure'), 'capacity');
+  assert.equal(headerOf(res, 'x-dormeto-retry-at'), new Date(clock.now() + 60_000).toISOString());
+  assert.equal(created.length, 0);
+});
+
 test('a task refused by Cloud Tasks → the run fails with a retry, not a crash', async () => {
   const { handler, store } = setup({ enqueue: async () => { throw new Error('Google: 403 denied'); } });
   const res = await handler(probe());
-  assert.equal(res.statusCode, 503);
+  assert.equal(res.statusCode, 202);
   assert.equal(headerOf(res, 'x-dormeto-state'), STATES.FAILED);
   assert.equal(store.state.run.state, STATES.FAILED);
 });
@@ -236,18 +269,21 @@ test('a task refused by Cloud Tasks → the run fails with a retry, not a crash'
 // The page's real script, in a sandbox with what it uses of a browser; `fetch` is what the waker answers.
 function browse(html, respond, clock) {
   const script = html.match(/<script>([\s\S]*)<\/script>/)[1];
-  const browser = { timers: [], reloads: 0, asked: [], pending: Promise.resolve() };
+  const browser = { timers: [], reloads: 0, asked: [], answers: [], pending: Promise.resolve(), message: {} };
   const location = { href: 'https://app.example/orders?page=2', reload: () => { browser.reloads += 1; } };
   vm.runInNewContext(script, {
     location,
-    document: { getElementById: () => ({}) },
+    document: { getElementById: (id) => (id === 'message' ? browser.message : {}) },
     Date: { now: clock.now, parse: Date.parse },
     Math,
     setInterval: () => {},
     setTimeout: (fn, ms) => { browser.timers.push({ fn, ms }); },
     fetch: (url, init) => {
       browser.asked.push({ url, headers: { ...init.headers } });
-      const answer = respond(url, init).then((res) => ({ type: 'basic', headers: { get: (name) => res.multiValueHeaders[name]?.[0] ?? null } }));
+      const answer = respond(url, init).then((res) => {
+        browser.answers.push(res.statusCode);
+        return { type: 'basic', status: res.statusCode, ok: res.statusCode < 300, headers: { get: (name) => res.multiValueHeaders[name]?.[0] ?? null } };
+      });
       browser.pending = answer;
       return answer;
     },
@@ -270,6 +306,7 @@ test('the page\'s script: its probe wakes, and it reloads the visitor\'s address
   const browser = browse(page.body, wakerAnswers(handler), clock);
   await browser.settled();
   assert.deepEqual(browser.asked, [{ url: '/_dormeto/wake', headers: { 'x-dormeto-probe': '1' } }]);
+  assert.deepEqual(browser.answers, [202], 'not a 503, which the nap\'s policy would replace');
   assert.equal(created.length, 1);
   assert.equal(browser.reloads, 0);
 
@@ -294,10 +331,23 @@ test('the page\'s script: its probe wakes, and it reloads the visitor\'s address
   assert.equal(browser.timers.length, 0, 'no probe after the reload');
 });
 
+test('the page\'s script: a 202 with FAILED says why and when, keeps probing, and does not reload', async () => {
+  const clock = fakeClock();
+  const run = { state: STATES.FAILED, failedAt: clock.now(), consecutiveFailures: 1, failure: JSON.stringify({ kind: 'capacity' }) };
+  const { handler } = setup({ run });
+  const page = await handler(request());
+  const browser = browse(page.body, wakerAnswers(handler), clock);
+  await browser.settled();
+  assert.deepEqual(browser.answers, [202]);
+  assert.equal(browser.message.textContent, 'Google Cloud has no capacity for this application right now: the start is retried, next attempt in 1 minute.');
+  assert.equal(browser.reloads, 0);
+  assert.equal(browser.nextTimer().ms, 3000);
+});
+
 test('the page\'s script: a page served once awake reloads after one poll, not in a loop', async () => {
   const { handler, clock } = setup({ run: { state: STATES.AWAKE, awakeSince: fakeClock().now() - 60_000 } });
   const page = await handler(request());
-  assert.equal(page.statusCode, 503);
+  assert.equal(page.statusCode, 200);
   assert.equal(headerOf(page, 'x-dormeto-state'), STATES.AWAKE);
   const browser = browse(page.body, wakerAnswers(handler), clock);
   await browser.settled();
@@ -320,8 +370,14 @@ test('the page\'s script: a probe answered by something else (the waker\'s 500, 
   assert.equal(browser.reloads, 1);
 });
 
-test('AWS\'s page, without probeUrl: AWAKE keeps probing its own address, only a redirect reloads', async () => {
+test('AWS\'s page, without probeUrl: its probe\'s 503 keeps probing, AWAKE too, only a redirect reloads', async () => {
   const clock = fakeClock();
+  const answers = browse(renderPage({ state: 'WAKING', pollSeconds: 3 }), async () => ({ statusCode: 503, multiValueHeaders: { 'x-dormeto-state': [STATES.WAKING] } }), clock);
+  await answers.settled();
+  assert.deepEqual(answers.answers, [503]);
+  assert.equal(answers.reloads, 0);
+  assert.equal(answers.nextTimer().ms, 3000);
+
   let answer = { multiValueHeaders: { 'x-dormeto-state': [STATES.AWAKE] } };
   const browser = browse(renderPage({ state: 'WAKING', pollSeconds: 3 }), async () => answer, clock);
   await browser.settled();

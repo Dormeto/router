@@ -2,6 +2,10 @@
 // `x-dormeto-workload`. It answers the error response's fetch with the waiting page, and wakes through the `/_dormeto/wake`
 // that the page probes, after the shared request filters. It holds nothing and redirects nothing: once the VMs are
 // healthy, the load balancer sends the next request to them.
+//
+// It never answers a 503. The fetch must succeed for the load balancer to serve the page (Google: a failed fetch gets a
+// generic error), and its policy's override gives the visitor the 503. On `/_dormeto/wake`, a 503 would be replaced by the
+// page: the nap's policy applies to all the matcher's traffic, and the waker is a backend of it.
 import { failureKind, nextAttemptAt } from '../../lambda/src/lib/failures.mjs';
 import { WAKE_HEADER, header, response } from '../../lambda/src/lib/http.mjs';
 import { logger } from '../../lambda/src/lib/log.mjs';
@@ -16,6 +20,8 @@ import { createTasks } from './tasks.mjs';
 const WAKE_PATH = '/_dormeto/wake';
 const CLOUD = 'Google Cloud';
 const UNKNOWN_POLL_SECONDS = 10;
+// The run could not be read: nothing is claimed, the page says it wakes.
+const UNREAD_STATE = 'UNKNOWN';
 
 // A `node:http` request as the shared code reads an ALB event. The query string stays encoded, as the ALB passes it. The
 // load balancer appends the client's address and then its own to X-Forwarded-For: its entry is dropped, so that the last
@@ -67,14 +73,17 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, now = Date.no
     log,
   });
 
-  // Asked by the page's script or an API client, answered in headers and JSON. A POST is an explicit wake. Awake, the
-  // shared code answers a redirect, or a 503 in AWS's route grace: here, plainly `AWAKE`.
+  // Asked by the page's script or an API client, answered in headers and JSON. A POST is an explicit wake. Not awake, the
+  // shared code's 503 is a 202, the rest as it is. Awake, it answers a redirect, or a 503 in AWS's route grace: here,
+  // plainly `AWAKE`.
   async function wake(event) {
     const res = await core({
       ...event,
       headers: { ...event.headers, accept: 'application/json', ...(event.httpMethod === 'POST' ? { [WAKE_HEADER]: '1' } : {}) },
     });
-    if (res.statusCode !== 307 && res.multiValueHeaders['x-dormeto-state']?.[0] !== STATES.AWAKE) return res;
+    if (res.statusCode !== 307 && res.multiValueHeaders['x-dormeto-state']?.[0] !== STATES.AWAKE) {
+      return res.statusCode === 503 ? { ...res, statusCode: 202, statusDescription: '202 Accepted' } : res;
+    }
     const headers = { 'cache-control': 'no-store', 'x-dormeto-state': STATES.AWAKE, 'content-type': 'application/json' };
     return event.httpMethod === 'HEAD' ? response(200, headers) : response(200, headers, JSON.stringify({ status: 'awake' }));
   }
@@ -82,15 +91,19 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, now = Date.no
   // The error response's fetch, which may carry nothing of the visitor's request: the page whatever the path, method and
   // headers, never a wake (every scanner's request would wake the workload).
   async function waiting(event, workloadId) {
-    const [cfg, run] = await Promise.all([store.getConfig(workloadId), store.getRun(workloadId)]);
-    if (!cfg || !run) log.error('WorkloadNotConfigured', { workloadId });
-    const state = cfg && run ? run.state : STATES.FAILED;
+    const read = await Promise.all([store.getConfig(workloadId), store.getRun(workloadId)]).catch((err) => {
+      log.error('WaitingPageUnread', { workloadId, error: err.message });
+      return null;
+    });
+    const [cfg, run] = read ?? [];
+    if (read && (!cfg || !run)) log.error('WorkloadNotConfigured', { workloadId });
+    const state = cfg && run ? run.state : read ? STATES.FAILED : UNREAD_STATE;
     const pollSeconds = cfg && run ? cfg.pollSeconds : UNKNOWN_POLL_SECONDS;
     const retryAt = cfg && run ? nextAttemptAt(cfg, run) : null;
     const failed = retryAt === null ? {} : { failure: failureKind(run), retryInMs: Math.max(0, retryAt - now()) };
     const headers = { 'cache-control': 'no-store', 'retry-after': String(pollSeconds), 'x-dormeto-state': state, 'content-type': 'text/html; charset=utf-8' };
-    if (event.httpMethod === 'HEAD') return response(503, headers);
-    return response(503, headers, renderPage({ state, pollSeconds, ...failed, probeUrl: WAKE_PATH, cloud: CLOUD }));
+    if (event.httpMethod === 'HEAD') return response(200, headers);
+    return response(200, headers, renderPage({ state, pollSeconds, ...failed, probeUrl: WAKE_PATH, cloud: CLOUD }));
   }
 
   return async function handler(request) {

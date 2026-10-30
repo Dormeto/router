@@ -1,6 +1,6 @@
 # Supported scenarios
 
-What the router naps and wakes, as of router 0.29.0. A **workload** is an Application Load Balancer target group and
+What the router naps and wakes, as of router 0.34.0. A **workload** is an Application Load Balancer target group and
 the backends behind it: the router naps them together once the target group has had no request for the idle window, and
 wakes them on the next request. Each page below gives the scenario's diagram, the services it uses, its measured wake
 time, its behavior and its limits.
@@ -12,6 +12,7 @@ time, its behavior and its limits.
 | [ECS services](ecs-services.md) | Desired count 0, Application Auto Scaling suspended | 25–57 s on Fargate | 600 s |
 | [RDS and Aurora databases](databases.md) | Stopped after the application, started before it | 6–15 min with PostgreSQL | 1800 s (manager onboarding) |
 | [Kubernetes on EKS](kubernetes.md) | Deployment or StatefulSet scaled to 0 | 22–26 s on EC2 nodes, 62–74 s on Fargate | 300 s (manager onboarding) |
+| [Google Cloud: Compute Engine VMs](google-cloud-compute-engine.md) | VMs suspended or stopped, then resumed or started | 13–25 s after a resume, 37–41 s after a start (Compute Engine's part) | 600 s |
 
 A workload may combine backends: Auto Scaling groups and loose instances, an ECS service and its database, pods and
 their database. Databases are always companions of an application's backends.

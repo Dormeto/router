@@ -1,0 +1,4 @@
+*
+!package.json
+!lambda/src/lib
+!gcp/src

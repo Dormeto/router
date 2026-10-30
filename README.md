@@ -12,7 +12,7 @@ Data plane of [Dormeto](https://dormeto.com) ("nap" in Esperanto): it puts idle 
 sleep and wakes them just-in-time on the next request.
 
 **[Supported scenarios](docs/scenarios/README.md):** EC2 instances, Auto Scaling groups, ECS services, RDS and Aurora
-databases, Kubernetes on EKS, each with its diagram, services, measured wake time, behavior and limits.
+databases, Kubernetes on EKS, Compute Engine VMs on Google Cloud, each with its diagram, services, measured wake time, behavior and limits.
 
 This MVP manages one EC2 instance behind an ALB:
 
@@ -425,6 +425,7 @@ Design: `docs/specs/2026-10-03-mvp-alb-ec2-design.md` in the Dormeto/vision repo
 | `lambda/test-k8s`, `scripts/kind-*.sh` | Kubernetes integration tests in kind (podman by default) |
 | `terraform/gcp-dev` | `gcp-dev`: Google Cloud demo VMs behind a global and a regional external Application Load Balancer in `dormeto-dev`, no IAM (about 80 USD a month while it exists) |
 | `gcp/tools/measure.mjs` | G0's measures on `gcp-dev`: URL map switch (plain or weighted), VM and managed group wake, `request_count` delay, the health of a backend service out of service |
+| `gcp/Containerfile`, `scripts/gcp-image.sh` | The Google Cloud router's container image (Node 24, distroless) and its build script |
 
 ## Usage
 
@@ -450,6 +451,33 @@ aws lambda invoke --cli-read-timeout 900 --function-name dmt-dev-controller --cl
 aws lambda invoke --cli-read-timeout 900 --function-name dmt-dev-controller --cli-binary-format raw-in-base64-out --payload '{"action":"check"}' /dev/stdout
 aws dynamodb get-item --table-name dmt-dev-router --key '{"pk":{"S":"WL#demo"},"sk":{"S":"RUN"}}'
 ```
+
+## Google Cloud
+
+Since 0.34.0 the router also runs on Google Cloud (Compute Engine VMs behind a global external Application Load
+Balancer, [the scenario](docs/scenarios/google-cloud-compute-engine.md)): `gcp/src` holds the two Cloud Run roles, one
+container image, `DMT_ROLE` (`waker` or `controller`) picks the role. `dormeto gcp install` (the CLI) creates the
+services; it takes the image with `--image`.
+
+```bash
+# Build (podman, linux/amd64) dormeto-router:<version> from gcp/Containerfile
+./scripts/gcp-image.sh 0.34.0
+# Run the controller's health locally: GET /v1/health -> {"version","project","region"}
+podman run --rm -p 8080:8080 -e DMT_ROLE=controller -e DMT_PROJECT=p -e DMT_REGION=europe-west1 -e DMT_DATABASE=d -e DMT_QUEUE=q dormeto-router:0.34.0
+# Build and push to the dev Artifact Registry repository (the gcloud configuration dormeto-dev's own access)
+./scripts/gcp-image.sh 0.34.0 --push europe-west1-docker.pkg.dev/dormeto-dev/dormeto/router
+```
+
+The dev repository `dormeto` is created once, by hand, in `dormeto-dev` (a repository is not IAM: nothing is granted;
+Cloud Run's service agent reads the project's repositories, so the same project needs no grant):
+
+```bash
+gcloud artifacts repositories create dormeto --repository-format=docker --location=europe-west1 --configuration=dormeto-dev
+```
+
+The image carries `package.json`, `lambda/src/lib` and `gcp/src` only, on `gcr.io/distroless/nodejs24-debian12` (Node
+24.2 or later: `server.mjs` uses `import.meta.main`). `gcp/access.json` is the manifest of the access the router needs.
+`terraform/gcp-dev` is the demo VMs and load balancer of the acceptance, with no IAM.
 
 ## Version
 

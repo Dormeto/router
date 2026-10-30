@@ -1,0 +1,13 @@
+# The router's one image on Google Cloud, two Cloud Run services: DMT_ROLE (waker | controller) picks the entry point.
+# Build from the router's root: scripts/gcp-image.sh <version> (podman, linux/amd64). The base is Node 24 (24.2 or later:
+# server.mjs uses import.meta.main), distroless: no shell, no package manager, a non-root user available as :nonroot.
+FROM gcr.io/distroless/nodejs24-debian12:nonroot
+WORKDIR /app
+# Only what the roles import: the shared lib, the Google Cloud code, and package.json (the health's version, "type").
+COPY package.json ./package.json
+COPY lambda/src/lib ./lambda/src/lib
+COPY gcp/src ./gcp/src
+ENV NODE_ENV=production PORT=8080
+EXPOSE 8080
+# The distroless entry point is `node`.
+CMD ["gcp/src/server.mjs"]

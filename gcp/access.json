@@ -207,7 +207,8 @@
         "datastore.databases.list",
         "datastore.databases.get",
         "datastore.entities.get",
-        "datastore.entities.list"
+        "datastore.entities.list",
+        "run.routes.invoke"
       ],
       "job": [
         "cloudscheduler.jobs.get",

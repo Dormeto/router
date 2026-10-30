@@ -216,7 +216,6 @@
       "neg": [
         "compute.regionNetworkEndpointGroups.get",
         "compute.regionNetworkEndpointGroups.delete",
-        "compute.instances.use",
         "compute.regionOperations.get"
       ],
       "cloudRun": [

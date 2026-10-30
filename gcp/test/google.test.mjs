@@ -118,3 +118,8 @@ test('waitCompute: past the deadline it gives up', async () => {
   });
   await assert.rejects(google.waitCompute({ status: 'RUNNING', selfLink: 's', name: 'op' }, state.time + 60_000), /not done/);
 });
+
+test('waitCompute: giving up says the operation is not done, not that it failed', async () => {
+  const { google, state } = harness({ api: (url, init, s) => { s.time += 40_000; return json({ status: 'RUNNING', selfLink: 's', name: 'op' }); } });
+  await assert.rejects(google.waitCompute({ status: 'RUNNING', selfLink: 's', name: 'op' }, state.time + 60_000), { reason: 'OPERATION_NOT_DONE' });
+});

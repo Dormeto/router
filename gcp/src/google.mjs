@@ -6,6 +6,9 @@ const TOKEN_MARGIN_MS = 60_000;
 // `wait` returns when the operation is done or after about 2 minutes.
 const REQUEST_TIMEOUT_MS = 150_000;
 
+// A GoogleError's reason when `waitCompute` gives up: the operation goes on, whatever becomes of it.
+export const OPERATION_NOT_DONE = 'OPERATION_NOT_DONE';
+
 export class GoogleError extends Error {
   // code: the HTTP status (0: none); status: Google's (`PERMISSION_DENIED`); reason: `forbidden`, `RATE_LIMIT_EXCEEDED`...
   constructor(message, { code = 0, status = '', reason = '' } = {}) {
@@ -74,7 +77,7 @@ export function createGoogle({ fetch = globalThis.fetch, now = Date.now } = {}) 
   async function waitCompute(operation, deadline) {
     let op = operation;
     while (op.status !== 'DONE') {
-      if (now() > deadline) throw new GoogleError(`Google: operation ${op.name} not done in time`);
+      if (now() > deadline) throw new GoogleError(`Google: operation ${op.name} not done in time`, { reason: OPERATION_NOT_DONE });
       op = await request('POST', `${op.selfLink}/wait`);
     }
     if (op.error) {

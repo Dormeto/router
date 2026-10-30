@@ -43,7 +43,23 @@
         "compute.globalOperations.get",
         "compute.zoneOperations.get",
         "compute.regionOperations.get",
-        "monitoring.timeSeries.list"
+        "monitoring.timeSeries.list",
+        "compute.networkEndpointGroups.get",
+        "compute.networkEndpointGroups.list",
+        "compute.networkEndpointGroups.use",
+        "compute.regionUrlMaps.get",
+        "compute.regionUrlMaps.list",
+        "compute.regionUrlMaps.update",
+        "compute.regionUrlMaps.use",
+        "compute.regionBackendServices.get",
+        "compute.regionBackendServices.list",
+        "compute.regionBackendServices.use",
+        "compute.regionBackendServices.create",
+        "compute.regionBackendServices.delete",
+        "compute.regionHealthChecks.get",
+        "compute.regionTargetHttpProxies.list",
+        "compute.regionTargetHttpsProxies.list",
+        "compute.forwardingRules.list"
       ]
     },
     "dormetoRouterBackends": {
@@ -282,6 +298,97 @@
         "compute.instanceGroupManagers.listTagBindings",
         "compute.instanceGroupManagers.deleteTagBinding"
       ]
+    }
+  },
+  "features": {
+    "cloud-sql": {
+      "apis": [
+        "sqladmin.googleapis.com"
+      ],
+      "roles": {
+        "dormetoRouterDatabasesRead": {
+          "title": "Dormeto router databases (read)",
+          "description": "Lets a Dormeto router read its workloads' Cloud SQL instances: whether they run and their activation policy. Granted on the whole project; it changes nothing.",
+          "permissions": [
+            "cloudsql.instances.get"
+          ]
+        },
+        "dormetoRouterDatabases": {
+          "title": "Dormeto router databases",
+          "description": "Lets a Dormeto router start and stop its workloads' Cloud SQL instances by changing their activation policy. Granted on the condition that the resource has the tag dormeto=managed.",
+          "permissions": [
+            "cloudsql.instances.update"
+          ]
+        }
+      },
+      "router": [
+        {
+          "role": "projects/{project}/roles/dormetoRouterDatabasesRead",
+          "on": "project"
+        },
+        {
+          "role": "projects/{project}/roles/dormetoRouterDatabases",
+          "on": "project",
+          "condition": {
+            "title": "Dormeto-managed resources",
+            "expression": "resource.matchTag('{project}/dormeto', 'managed')"
+          }
+        }
+      ],
+      "operator": {
+        "onboard": {
+          "tag": [
+            "cloudsql.instances.get",
+            "cloudsql.instances.createTagBinding"
+          ]
+        },
+        "offboard": {
+          "tag": [
+            "cloudsql.instances.deleteTagBinding"
+          ]
+        }
+      }
+    },
+    "gke": {
+      "apis": [
+        "container.googleapis.com"
+      ],
+      "roles": {
+        "dormetoRouterKubernetes": {
+          "title": "Dormeto router Kubernetes",
+          "description": "Lets a Dormeto router find a GKE cluster and connect to it. It grants nothing inside the cluster: what the router reads and scales there is the Role the operator applies.",
+          "permissions": [
+            "container.clusters.get",
+            "container.clusters.connect"
+          ]
+        }
+      },
+      "router": [
+        {
+          "role": "projects/{project}/roles/dormetoRouterKubernetes",
+          "on": "project"
+        }
+      ],
+      "operator": {
+        "onboard": {
+          "cluster": [
+            "container.clusters.get",
+            "container.roles.create",
+            "container.roles.update",
+            "container.roleBindings.create",
+            "container.roleBindings.update",
+            "container.deployments.get",
+            "container.statefulSets.get",
+            "container.services.get"
+          ]
+        },
+        "offboard": {
+          "cluster": [
+            "container.roles.delete",
+            "container.roleBindings.delete"
+          ]
+        }
+      }
     }
   }
 }

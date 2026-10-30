@@ -1,6 +1,6 @@
 // The controller on Google Cloud (vision docs/specs/2026-10-29-google-cloud-design.md, section 6): the wake, the nap and
 // the check, with AWS's states, causes and event names (lambda/src/lib/controller-core.mjs). Each action runs within one
-// request of at most 900 s; the check only enqueues the naps it decides (POST /v1/tasks), never waiting in its 240 s.
+// request of at most 1800 s; the check only enqueues the naps it decides (POST /v1/tasks), never waiting in its 240 s.
 //
 // A workload's configuration: `{ workloadId, urlMap, backendService, wakerBackendService (names), backends: [{ kind: 'vm'
 // | 'mig', location, name }], idleMinutes, wakeTimeoutSeconds, hibernate? }`. `config`: `{ project, controllerUrl }`.
@@ -27,17 +27,17 @@ const POLL_MS = 2000;
 const POLICY_WAIT_MS = 300_000;
 // Until the VMs are down, from the moment they are asked to go. G0: 106 s, 96 s suspended, 198 s for a managed group's.
 const STOP_TIMEOUT_MS = 300_000;
-// Within the request's 900 s: what is left removes the policy after the wake, or records a nap's failure. The nap's fits
+// Within the request's 1800 s: what is left removes the policy after the wake, or records a nap's failure. The nap's fits
 // a lost policy's second wait: two writes (G0: 25 s), twice 300 s and a managed group's stop.
-const WAKE_BUDGET_MS = 840_000;
-const NAP_BUDGET_MS = 870_000;
+const WAKE_BUDGET_MS = 1_740_000;
+const NAP_BUDGET_MS = 1_770_000;
 // A fresh wait for a lost policy needs this left after it: a managed group's stop (G0: 198 s).
 const STOP_ROOM_MS = 200_000;
 // Cloud Monitoring publishes the first point 72 to 125 s after the requests (spec section 12): the newest requests cannot
 // be seen, so the idle read goes this much further back, and the run must have been awake for all of it.
 const METRIC_DELAY_MS = 180_000;
 const WAKING_STUCK_GRACE_MS = 60_000;
-const NAPPING_STUCK_MS = 15 * 60_000;
+const NAPPING_STUCK_MS = 35 * 60_000;
 const CHECK_BUDGET_MS = 240_000;
 const CHECK_CONCURRENCY = 8;
 const SUSPEND_MAX_MEMORY_MB = 208 * 1024;
@@ -494,7 +494,7 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
       log.info('NapCompleted', { workloadId });
       return { state: STATES.ASLEEP };
     }
-    // A wake asked during the stop: in a request of its own, as this one may have used most of its 900 s. Its task lost,
+    // A wake asked during the stop: in a request of its own, as this one may have used most of its 1800 s. Its task lost,
     // the check finds the wake stuck.
     const wakeId = newId();
     const waking = await transition(workloadId, {

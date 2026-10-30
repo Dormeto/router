@@ -1,8 +1,8 @@
 // Cloud Tasks: the router's asynchronous actions (a nap, a wake, a check) are tasks that call the controller with an
 // OIDC token of the router's service account; Cloud Run checks it (invoker IAM) and the controller's audience is its
-// URL. Ruling 27: the dispatch deadline is the controller's timeout, 900 s.
+// URL. Ruling 27: the dispatch deadline is the controller's timeout, 1800 s (Cloud Tasks' maximum).
 const TASKS = 'https://cloudtasks.googleapis.com/v2';
-const DISPATCH_DEADLINE = '900s';
+const DISPATCH_DEADLINE = '1800s';
 
 export const CALLS = {
   enqueue: ['cloudtasks.tasks.create'],

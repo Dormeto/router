@@ -16,9 +16,10 @@ const ADAPTERS = { compute, urlmaps, monitoring, tasks, firestore };
 async function granted() {
   const manifest = JSON.parse(await readFile(new URL('../access.json', import.meta.url), 'utf8'));
   const permissions = new Set();
-  for (const { role } of manifest.router) {
+  const grants = [...manifest.router.map((g) => [g, manifest.roles]), ...Object.values(manifest.features).flatMap((f) => f.router.map((g) => [g, f.roles]))];
+  for (const [{ role }, roles] of grants) {
     const custom = /\/roles\/(.+)$/.exec(role)?.[1];
-    for (const p of custom ? manifest.roles[custom].permissions : manifest.predefined[role]) permissions.add(p);
+    for (const p of custom ? roles[custom].permissions : manifest.predefined[role]) permissions.add(p);
   }
   return permissions;
 }

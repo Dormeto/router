@@ -37,6 +37,10 @@ function permissionLists(m) {
     ...Object.entries(m.roles).map(([id, role]) => [`roles.${id}`, role.permissions]),
     ...Object.entries(m.predefined).map(([role, list]) => [`predefined.${role}`, list]),
     ...Object.entries(m.operator).flatMap(([command, steps]) => Object.entries(steps).map(([step, list]) => [`operator.${command}.${step}`, list])),
+    ...Object.entries(m.features ?? {}).flatMap(([name, f]) => [
+      ...Object.entries(f.roles).map(([id, role]) => [`features.${name}.roles.${id}`, role.permissions]),
+      ...Object.entries(f.operator).flatMap(([command, steps]) => Object.entries(steps).map(([step, list]) => [`features.${name}.operator.${command}.${step}`, list])),
+    ]),
   ];
 }
 
@@ -45,9 +49,9 @@ const includesAll = (list, wanted, where) => {
   assert.deepEqual(missing, [], `${where} lacks ${missing.join(', ')}`);
 };
 
-test('the manifest is valid JSON, version 1, with its six sections', async () => {
+test('the manifest is valid JSON, version 1, with its seven sections', async () => {
   const m = await load();
-  assert.deepEqual(Object.keys(m), ['version', 'apis', 'roles', 'predefined', 'router', 'operator']);
+  assert.deepEqual(Object.keys(m), ['version', 'apis', 'roles', 'predefined', 'router', 'operator', 'features']);
   assert.equal(m.version, 1);
 });
 
@@ -97,6 +101,13 @@ test('dormetoRouter holds spec section 4\'s permissions, exactly', async () => {
     'compute.machineTypes.get',
     'compute.globalOperations.get', 'compute.zoneOperations.get', 'compute.regionOperations.get',
     'monitoring.timeSeries.list',
+    // S3: zonal NEGs of VMs (spec section 6).
+    'compute.networkEndpointGroups.get', 'compute.networkEndpointGroups.list', 'compute.networkEndpointGroups.use',
+    // S4: regional and classic load balancers (spec section 7).
+    'compute.regionUrlMaps.get', 'compute.regionUrlMaps.list', 'compute.regionUrlMaps.update', 'compute.regionUrlMaps.use',
+    'compute.regionBackendServices.get', 'compute.regionBackendServices.list', 'compute.regionBackendServices.use', 'compute.regionBackendServices.create', 'compute.regionBackendServices.delete',
+    'compute.regionHealthChecks.get',
+    'compute.regionTargetHttpProxies.list', 'compute.regionTargetHttpsProxies.list', 'compute.forwardingRules.list',
   ]));
 });
 
@@ -165,8 +176,8 @@ test('placeholders appear only in the conditions and in the custom roles\' names
   assert.ok(found.length > 0);
   for (const [path, placeholder, value] of found) {
     assert.ok(PLACEHOLDERS.includes(placeholder), `${path}: unknown placeholder ${placeholder}`);
-    const inCondition = /^\.router\.\d+\.condition\.expression$/.test(path);
-    const inRoleName = /^\.router\.\d+\.role$/.test(path) && /^projects\/\{project\}\/roles\/[a-zA-Z0-9_.]+$/.test(value);
+    const inCondition = /^(\.features\.[a-z-]+)?\.router\.\d+\.condition\.expression$/.test(path);
+    const inRoleName = /^(\.features\.[a-z-]+)?\.router\.\d+\.role$/.test(path) && /^projects\/\{project\}\/roles\/[a-zA-Z0-9_.]+$/.test(value);
     assert.ok(inCondition || inRoleName, `${path}: ${placeholder} outside a condition or a custom role's name`);
   }
 });
@@ -233,4 +244,62 @@ test('npm test runs the Google Cloud tests', async () => {
   const pkg = JSON.parse(await readFile(new URL('../../package.json', import.meta.url), 'utf8'));
   assert.match(pkg.scripts.test, /"gcp\/test\/\*\.test\.mjs"/);
   assert.match(pkg.scripts.test, /"lambda\/test\/\*\.test\.mjs"/);
+});
+
+// Spec sections 4, 8 and 9: optional features, not in `apis`.
+test('features: cloud-sql and gke, their APIs apart from the ten', async () => {
+  const m = await load();
+  assert.deepEqual(Object.keys(m.features), ['cloud-sql', 'gke']);
+  assert.deepEqual(m.features['cloud-sql'].apis, ['sqladmin.googleapis.com']);
+  assert.deepEqual(m.features.gke.apis, ['container.googleapis.com']);
+  for (const api of ['sqladmin.googleapis.com', 'container.googleapis.com']) assert.ok(!m.apis.includes(api), `${api} must not be in apis`);
+  for (const f of Object.values(m.features)) assert.deepEqual(Object.keys(f), ['apis', 'roles', 'router', 'operator']);
+});
+
+test('features: dormetoRouterKubernetes holds exactly the cluster get and connect', async () => {
+  const { features } = await load();
+  assert.deepEqual(Object.keys(features.gke.roles), ['dormetoRouterKubernetes']);
+  assert.deepEqual(sorted(features.gke.roles.dormetoRouterKubernetes.permissions), ['container.clusters.connect', 'container.clusters.get']);
+  assert.deepEqual(features.gke.router, [{ role: 'projects/{project}/roles/dormetoRouterKubernetes', on: 'project' }]);
+});
+
+test('features: the cloudsql.instances.update grant carries the tag condition, get does not', async () => {
+  const { features, router } = await load();
+  const roles = features['cloud-sql'].roles;
+  assert.deepEqual(Object.keys(roles), ['dormetoRouterDatabasesRead', 'dormetoRouterDatabases']);
+  assert.deepEqual(roles.dormetoRouterDatabasesRead.permissions, ['cloudsql.instances.get']);
+  assert.deepEqual(roles.dormetoRouterDatabases.permissions, ['cloudsql.instances.update']);
+  const tagCondition = router.find((g) => g.role.endsWith('/dormetoRouterBackends')).condition;
+  assert.deepEqual(features['cloud-sql'].router, [
+    { role: 'projects/{project}/roles/dormetoRouterDatabasesRead', on: 'project' },
+    { role: 'projects/{project}/roles/dormetoRouterDatabases', on: 'project', condition: tagCondition },
+  ]);
+});
+
+test('features: every grant names a role of its feature; roles are valid and none repeats a permission of the base roles', async () => {
+  const m = await load();
+  const base = new Set(Object.values(m.roles).flatMap((r) => r.permissions));
+  for (const [name, f] of Object.entries(m.features)) {
+    for (const [id, role] of Object.entries(f.roles)) {
+      assert.match(id, ROLE_ID);
+      assert.deepEqual(Object.keys(role), ['title', 'description', 'permissions'], id);
+      assert.ok(role.title.length > 0 && role.title.length <= 100, id);
+      assert.ok(role.description.length > 0 && role.description.length <= 256, id);
+      for (const p of role.permissions) assert.ok(!base.has(p), `${id}: ${p} is in a base role`);
+    }
+    for (const grant of f.router) assert.ok(f.roles[/\/roles\/(.+)$/.exec(grant.role)[1]], `${name}: ${grant.role}`);
+    assert.deepEqual(Object.keys(f.roles).filter((id) => !f.router.some((g) => g.role.endsWith(`/${id}`))), [], `${name}: a role not granted`);
+  }
+});
+
+test('features: the operator permissions of Cloud SQL and GKE', async () => {
+  const { features } = await load();
+  assert.deepEqual(features['cloud-sql'].operator, {
+    onboard: { tag: ['cloudsql.instances.get', 'cloudsql.instances.createTagBinding'] },
+    offboard: { tag: ['cloudsql.instances.deleteTagBinding'] },
+  });
+  assert.deepEqual(features.gke.operator, {
+    onboard: { cluster: ['container.clusters.get', 'container.roles.create', 'container.roles.update', 'container.roleBindings.create', 'container.roleBindings.update', 'container.deployments.get', 'container.statefulSets.get', 'container.services.get'] },
+    offboard: { cluster: ['container.roles.delete', 'container.roleBindings.delete'] },
+  });
 });

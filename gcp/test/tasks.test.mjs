@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createTasks, CALLS } from '../src/tasks.mjs';
 
-test('enqueue: a POST task for the controller, with an OIDC token of the router\'s service account (ruling 27: 900 s)', async () => {
+test('enqueue: a POST task for the controller, with an OIDC token of the router\'s service account (ruling 27: 1800 s)', async () => {
   const calls = [];
   const google = { request: async (method, url, body) => { calls.push({ method, url, body }); return { name: 'projects/p/locations/europe-west1/queues/dmtr-europe-west1/tasks/1' }; } };
   const tasks = createTasks({
@@ -16,7 +16,7 @@ test('enqueue: a POST task for the controller, with an OIDC token of the router\
     url: 'https://cloudtasks.googleapis.com/v2/projects/p/locations/europe-west1/queues/dmtr-europe-west1/tasks',
     body: {
       task: {
-        dispatchDeadline: '900s',
+        dispatchDeadline: '1800s',
         httpRequest: {
           httpMethod: 'POST',
           url: 'https://dmtr-europe-west1-controller-123.europe-west1.run.app/v1/tasks',

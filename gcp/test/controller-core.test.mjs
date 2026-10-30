@@ -16,7 +16,7 @@ const WAKER = 'dmtr-europe-west1-demo';
 const WAKER_URL = `${V1}/global/backendServices/${WAKER}`;
 const APP_URL = `${V1}/global/backendServices/app`;
 const MINUTE = 60_000;
-const REQUEST_LIMIT = 900_000;
+const REQUEST_LIMIT = 1_800_000;
 const vmUrl = (name) => `${V1}/zones/${ZONE}/instances/${name}`;
 const VM_A = { kind: 'vm', location: ZONE, name: 'vm-a' };
 const VM_B = { kind: 'vm', location: ZONE, name: 'vm-b' };
@@ -632,7 +632,7 @@ test('the policy lost with no room for a fresh wait: AWAKE, the policy removed, 
   const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
   let slowed = false;
   t.world.on.put = async () => {
-    if (!slowed) t.clock.advance(400_000);
+    if (!slowed) t.clock.advance(1_300_000);
     slowed = true;
   };
   t.clock.onSleep(() => { delete t.world.map.pathMatchers[0].defaultCustomErrorResponsePolicy; });
@@ -910,15 +910,20 @@ test('stuck waking: FAILED with the kind timeout, past the wake timeout and its 
   assert.equal(within.world.calls.length, 0);
 });
 
-test('stuck napping: FAILED with the kind timeout, past 15 minutes only', async () => {
-  const stuck = setup({ run: { state: STATES.NAPPING, updatedAt: START - 15 * MINUTE - 1, stopping: true }, vms: { 'vm-a': { status: 'RUNNING' } } });
+test('stuck napping: FAILED with the kind timeout, past 35 minutes only', async () => {
+  const stuck = setup({ run: { state: STATES.NAPPING, updatedAt: START - 35 * MINUTE - 1, stopping: true }, vms: { 'vm-a': { status: 'RUNNING' } } });
   await stuck.controller.check();
   assert.equal(stuck.run().state, STATES.FAILED);
   assert.equal(stuck.run().stopping, undefined);
   assert.equal(JSON.parse(stuck.run().failure).step, 'nap');
   assert.equal(stuck.logged('NapStuck').length, 1);
-  const within = setup({ run: { state: STATES.NAPPING, updatedAt: START - 15 * MINUTE }, vms: { 'vm-a': { status: 'RUNNING' } } });
+  const within = setup({ run: { state: STATES.NAPPING, updatedAt: START - 34 * MINUTE }, vms: { 'vm-a': { status: 'RUNNING' } } });
   assert.deepEqual(await within.controller.check(), [{ workloadId: 'demo', state: STATES.NAPPING }]);
+  const at = setup({ run: { state: STATES.NAPPING, updatedAt: START - 35 * MINUTE }, vms: { 'vm-a': { status: 'RUNNING' } } });
+  assert.deepEqual(await at.controller.check(), [{ workloadId: 'demo', state: STATES.NAPPING }]);
+  const late = setup({ run: { state: STATES.NAPPING, updatedAt: START - 36 * MINUTE, stopping: true }, vms: { 'vm-a': { status: 'RUNNING' } } });
+  await late.controller.check();
+  assert.equal(late.run().state, STATES.FAILED);
 });
 
 const FAILED_RUN = (failedAt) => ({

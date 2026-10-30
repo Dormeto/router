@@ -167,7 +167,7 @@ test('a probe from a browser → one task for the controller: service account, a
   assert.equal(headerOf(res, 'x-dormeto-state'), STATES.WAKING);
   assert.equal(created.length, 1);
   const [{ httpRequest, dispatchDeadline }] = created;
-  assert.equal(dispatchDeadline, '900s');
+  assert.equal(dispatchDeadline, '1800s');
   assert.equal(httpRequest.url, `${CONTROLLER}/v1/tasks`);
   assert.deepEqual(httpRequest.oidcToken, { serviceAccountEmail: SERVICE_ACCOUNT, audience: CONTROLLER });
   assert.deepEqual(decoded(created[0]), { action: 'wake', workloadId: 'demo', wakeId: store.state.run.wakeId });

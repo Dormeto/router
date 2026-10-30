@@ -8,6 +8,8 @@ const BASE = 'https://firestore.googleapis.com/v1';
 // Reads again after a lost precondition (another writer changed the run between the read and the commit).
 const ATTEMPTS = 5;
 const LIST_PAGE = 300;
+// Between two attempts: a random delay up to BACKOFF_MS times the attempt, so contending writers drift apart.
+const BACKOFF_MS = 40;
 
 export function toValue(value) {
   if (value === null || value === undefined) return { nullValue: null };
@@ -54,7 +56,7 @@ export const CALLS = {
 const lostPrecondition = (err) => err?.status === 'FAILED_PRECONDITION' || err?.status === 'ABORTED';
 const isStatus = (status) => (err) => err?.status === status;
 
-export function createFirestoreStore({ google, project, database, now = Date.now }) {
+export function createFirestoreStore({ google, project, database, now = Date.now, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), log = null }) {
   const root = `projects/${project}/databases/${database}/documents`;
   const url = (path) => `${BASE}/${root}/${path}`;
   const commit = (writes) => google.request('POST', `${BASE}/${root}:commit`, { writes });
@@ -92,6 +94,7 @@ export function createFirestoreStore({ google, project, database, now = Date.now
         return next;
       } catch (err) {
         if (!lostPrecondition(err) || attempt >= ATTEMPTS) throw err;
+        await sleep(Math.random() * BACKOFF_MS * attempt);
       }
     }
   }
@@ -214,11 +217,23 @@ export function createFirestoreStore({ google, project, database, now = Date.now
     },
 
     async tryAcquireHolder(workloadId, max) {
-      return (await modifyRun(workloadId, (run) => ((run.holders ?? 0) < max ? { set: { holders: (run.holders ?? 0) + 1 } } : null))) !== null;
+      try {
+        return (await modifyRun(workloadId, (run) => ((run.holders ?? 0) < max ? { set: { holders: (run.holders ?? 0) + 1 } } : null))) !== null;
+      } catch (err) {
+        if (!lostPrecondition(err)) throw err;
+        // Too many writers on the run: refused, as when the maximum is reached.
+        log?.warn('HolderContended', { workloadId, error: err.message });
+        return false;
+      }
     },
 
     async releaseHolder(workloadId) {
-      await modifyRun(workloadId, (run) => ((run.holders ?? 0) > 0 ? { set: { holders: run.holders - 1 } } : null));
+      try {
+        await modifyRun(workloadId, (run) => ((run.holders ?? 0) > 0 ? { set: { holders: run.holders - 1 } } : null));
+      } catch (err) {
+        if (!lostPrecondition(err)) throw err;
+        log?.warn('HolderReleaseContended', { workloadId, error: err.message });
+      }
     },
   };
 }

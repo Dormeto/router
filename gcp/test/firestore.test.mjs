@@ -345,3 +345,46 @@ test('deleteWorkload: the configuration and the run go, the daily counters stay;
   await store.deleteWorkload('app');
   assert.equal(await store.getConfig('app'), null);
 });
+
+// A store whose commits are all refused as stale (the run is contended for good), with the sleeps and warnings recorded.
+async function contended() {
+  const { store, request } = setup();
+  await store.initRun('app', 1);
+  const sleeps = [];
+  const warnings = [];
+  const stale = createFirestoreStore({
+    google: {
+      request: async (method, url, body) => {
+        if (url.endsWith(':commit')) throw new GoogleError('Google: 400 stale', { code: 400, status: 'FAILED_PRECONDITION' });
+        return request(method, url, body);
+      },
+    },
+    project: 'p', database: 'dmtr-europe-west1',
+    sleep: async (ms) => { sleeps.push(ms); },
+    log: { warn: (event, fields) => warnings.push({ event, ...fields }) },
+  });
+  return { stale, store, sleeps, warnings };
+}
+
+test('a contended run: a jittered backoff between the attempts, not after the last', async () => {
+  const { stale, sleeps } = await contended();
+  await assert.rejects(stale.transition('app', { cond: { state: 'AWAKE' }, set: { state: 'NAPPING' } }), (err) => err.status === 'FAILED_PRECONDITION');
+  assert.equal(sleeps.length, 4);
+  assert.ok(sleeps.every((ms) => Number.isFinite(ms) && ms >= 0 && ms <= 1000), `delays ${sleeps}`);
+});
+
+test('tryAcquireHolder: retries exhausted, the caller is refused (false) and a warning is logged', async () => {
+  const { stale, warnings } = await contended();
+  assert.equal(await stale.tryAcquireHolder('app', 3), false);
+  assert.equal(warnings.length, 1);
+  assert.equal(warnings[0].event, 'HolderContended');
+  assert.equal(warnings[0].workloadId, 'app');
+});
+
+test('releaseHolder: retries exhausted, it resolves and logs a warning', async () => {
+  const { stale, store, warnings } = await contended();
+  await store.tryAcquireHolder('app', 3);
+  await stale.releaseHolder('app');
+  assert.equal(warnings.length, 1);
+  assert.equal(warnings[0].event, 'HolderReleaseContended');
+});

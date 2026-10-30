@@ -7,8 +7,9 @@ import * as compute from '../src/compute.mjs';
 import * as urlmaps from '../src/urlmaps.mjs';
 import * as monitoring from '../src/monitoring.mjs';
 import * as tasks from '../src/tasks.mjs';
+import * as firestore from '../src/firestore.mjs';
 
-const ADAPTERS = { compute, urlmaps, monitoring, tasks };
+const ADAPTERS = { compute, urlmaps, monitoring, tasks, firestore };
 
 async function granted() {
   const manifest = JSON.parse(await readFile(new URL('../access.json', import.meta.url), 'utf8'));

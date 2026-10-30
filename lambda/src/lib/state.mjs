@@ -12,12 +12,12 @@ const listKey = (name, sk) => ({ pk: { S: `LIST#${name}` }, sk: { S: sk } });
 const pauseKey = (workloadId, exclusionId) => ({ pk: { S: workloadId ? `WL#${workloadId}` : 'ROUTER' }, sk: { S: exclusionId ? `PAUSE#${exclusionId}` : 'PAUSE' } });
 const pauseOf = (item) => ({ workloadId: item.pk.S === 'ROUTER' ? null : item.pk.S.slice(3), ...JSON.parse(item.pause.S) });
 
-const DAY_MS = 86_400_000;
+export const DAY_MS = 86_400_000;
 const STATS_TTL_DAYS = 35;
-const utcDay = (ms) => new Date(ms).toISOString().slice(0, 10);
+export const utcDay = (ms) => new Date(ms).toISOString().slice(0, 10);
 
 // Daily statistics item → { ignored: { reason: n }, deferred: { reason: n }, wakes: { trigger: n } }, added into `into`.
-function addStats(into, item) {
+export function addStats(into, item) {
   for (const [name, attr] of Object.entries(item)) {
     if (!('N' in attr) || name === 'expiresAt') continue;
     const n = Number(attr.N);
@@ -29,7 +29,7 @@ function addStats(into, item) {
   }
   return into;
 }
-const emptyStats = () => ({ ignored: {}, deferred: {}, wakes: {} });
+export const emptyStats = () => ({ ignored: {}, deferred: {}, wakes: {} });
 
 export function toValue(value) {
   if (typeof value === 'string') return { S: value };

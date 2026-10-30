@@ -114,7 +114,7 @@ test('values: an integer above 2^31, nested maps, arrays, booleans, null and a f
   assert.deepEqual(update.fields.config.mapValue.fields.nested.mapValue.fields.list.arrayValue.values[0], { integerValue: '1' });
 });
 
-test('getConfig and getRun: null for a workload that does not exist; getSchedule is always null (no schedules in G1)', async () => {
+test('getConfig, getRun and getSchedule: null for a workload that does not exist or has no schedule', async () => {
   const { store } = setup();
   assert.equal(await store.getConfig('nope'), null);
   assert.equal(await store.getRun('nope'), null);
@@ -150,6 +150,7 @@ test('transition: set, increment, remove, version and updatedAt; the new run is 
   assert.deepEqual(next, stored);
   assert.deepEqual(stored, {
     state: 'ASLEEP', version: 2, awakeSince: 1, holders: 0, wakeCount: 1, failedAt: 5, napCount: 2, updatedAt: Date.parse('2026-03-10T12:00:00Z'),
+    stateAt: Date.parse('2026-03-10T12:00:00Z'),
   });
 });
 
@@ -324,7 +325,7 @@ test('setBackendKinds and setHibernated: written apart from the transitions, on 
   assert.equal(run.version, 0);
 });
 
-test('listConfigs and listWorkloads: every configuration across pages, without schedules', async () => {
+test('listConfigs and listWorkloads: every configuration across pages; no schedule, an empty map', async () => {
   const { store } = setup();
   for (let i = 0; i < 5; i += 1) await store.putConfig(`w${i}`, { workloadId: `w${i}` });
   await store.initRun('w0', 1);
@@ -387,4 +388,128 @@ test('releaseHolder: retries exhausted, it resolves and logs a warning', async (
   await stale.releaseHolder('app');
   assert.equal(warnings.length, 1);
   assert.equal(warnings[0].event, 'HolderReleaseContended');
+});
+
+const SCHEDULE = { timezone: 'Europe/Paris', nap: [{ days: ['mon'], from: '20:00', to: '07:00' }], by: 'ops', at: 1_700_000_000_000 };
+
+test('schedules: a round trip, listWorkloads returns the map, deleteSchedule says whether there was one', async () => {
+  const { store } = setup();
+  await store.putConfig('app', { workloadId: 'app' });
+  await store.putConfig('other', { workloadId: 'other' });
+  await store.putSchedule('app', SCHEDULE);
+  assert.deepEqual(await store.getSchedule('app'), SCHEDULE);
+  assert.equal(await store.getSchedule('other'), null);
+  const { configs, schedules } = await store.listWorkloads();
+  assert.deepEqual(configs.map((c) => c.workloadId).sort(), ['app', 'other']);
+  assert.deepEqual([...schedules], [['app', SCHEDULE]]);
+  await store.putSchedule('app', { ...SCHEDULE, timezone: 'UTC' });
+  assert.equal((await store.getSchedule('app')).timezone, 'UTC');
+  assert.equal(await store.deleteSchedule('app'), true);
+  assert.equal(await store.deleteSchedule('app'), false);
+  assert.equal((await store.listWorkloads()).schedules.size, 0);
+});
+
+test('pauses: two workloads paused, one expired; the store gives both, the expired one with its until', async () => {
+  const { store } = setup();
+  const live = { by: 'ops', at: 1000, reason: 'release', until: Date.parse('2026-03-11T00:00:00Z'), keepAsleep: false };
+  const old = { by: 'ops', at: 900, reason: 'freeze', until: Date.parse('2026-03-09T00:00:00Z'), keepAsleep: true };
+  await store.addPause('a', live);
+  await store.addPause('b', old);
+  assert.deepEqual(await store.getPauses('a'), [{ workloadId: 'a', ...live }]);
+  assert.deepEqual(await store.getPauses('b'), [{ workloadId: 'b', ...old }]);
+  assert.deepEqual(await store.getPauses('none'), []);
+  assert.deepEqual(await store.getPauses(null), []);
+  assert.deepEqual((await store.listPauses()).map((p) => p.workloadId).sort(), ['a', 'b']);
+  // A newer pause is kept when the removal names the older one's time.
+  assert.equal(await store.removePauses('a', { at: 999 }), false);
+  assert.equal((await store.getPauses('a')).length, 1);
+  assert.equal(await store.removePauses('b', { at: 900 }), true);
+  assert.equal(await store.removePauses('a'), true);
+  assert.equal(await store.removePauses('a'), false);
+  assert.deepEqual(await store.listPauses(), []);
+});
+
+test('transition: a state change sets stateAt to now, no state change leaves it; an explicit stateAt is kept', async () => {
+  let t = Date.parse('2026-03-10T12:00:00Z');
+  const { store } = setup({ now: () => t });
+  await store.initRun('app', 1);
+  assert.equal((await store.getRun('app')).stateAt, undefined);
+  t += 1000;
+  const napping = await store.transition('app', { cond: { state: 'AWAKE' }, set: { state: 'NAPPING' } });
+  assert.equal(napping.stateAt, t);
+  assert.equal((await store.getRun('app')).stateAt, t);
+  const dated = t;
+  t += 5000;
+  const same = await store.transition('app', { cond: { state: 'NAPPING' }, set: { state: 'NAPPING', napId: 'x' } });
+  assert.equal(same.stateAt, dated);
+  const other = await store.transition('app', { cond: { state: 'NAPPING' }, set: { napId: 'y' } });
+  assert.equal(other.stateAt, dated);
+  const explicit = await store.transition('app', { cond: { state: 'NAPPING' }, set: { state: 'ASLEEP', stateAt: 42 } });
+  assert.equal(explicit.stateAt, 42);
+});
+
+const bytes = (seed, size) => Buffer.from(Array.from({ length: size }, (_, i) => (i * 31 + seed) % 256));
+
+test('lists: the meta is set and removed by field; parts of 350 kB round trip as bytes, in order', async () => {
+  const { store } = setup();
+  assert.equal(await store.getListMeta('bad'), null);
+  await store.setListMeta('bad', { lastAttemptAt: 5, attemptUrl: 'https://x/l.txt' });
+  await store.setListMeta('bad', { error: 'HTTP 500', errorAt: 6 });
+  await store.setListMeta('bad', { entries: 3 }, ['error', 'errorAt']);
+  assert.deepEqual(await store.getListMeta('bad'), { lastAttemptAt: 5, attemptUrl: 'https://x/l.txt', entries: 3 });
+  const parts = Array.from({ length: 12 }, (_, i) => bytes(i, 350 * 1024));
+  for (const [index, part] of parts.entries()) await store.putListPart('bad', '100', index, part, 9999999999);
+  const read = await store.getListParts('bad', '100');
+  assert.equal(read.length, 12);
+  read.forEach((part, i) => {
+    assert.ok(Buffer.isBuffer(part));
+    assert.ok(part.equals(parts[i]), `part ${i}`);
+  });
+  assert.deepEqual(await store.getListParts('bad', '101'), []);
+  assert.deepEqual(await store.getListParts('other', '100'), []);
+});
+
+test('lists: a new version leaves the old parts until the meta points at it, then they go; other lists and expired parts too', async () => {
+  const { store, docs } = setup({ now: () => Date.parse('2026-03-10T12:00:00Z') });
+  const future = Math.floor(Date.parse('2026-04-01T00:00:00Z') / 1000);
+  const past = Math.floor(Date.parse('2026-03-01T00:00:00Z') / 1000);
+  const partsOf = (name) => [...docs.keys()].filter((k) => k.startsWith('listParts/') && docs.get(k).fields.list.stringValue === name).length;
+  await store.putListPart('a', '1', 0, bytes(1, 10), future);
+  await store.putListPart('a', '1', 1, bytes(2, 10), future);
+  await store.setListMeta('a', { version: '1', parts: 2 });
+  await store.putListPart('b', '1', 0, bytes(3, 10), future);
+  await store.setListMeta('b', { version: '1', parts: 1 });
+  await store.putListPart('a', '2', 0, bytes(4, 10), future);
+  await store.putListPart('a', '0', 0, bytes(5, 10), past);
+  assert.equal(partsOf('a'), 4);
+  // Not the version: the meta of attempts leaves the parts alone.
+  await store.setListMeta('a', { lastAttemptAt: 7 });
+  assert.equal(partsOf('a'), 4);
+  assert.equal((await store.getListParts('a', '1')).length, 2);
+  await store.setListMeta('a', { version: '2', parts: 1 }, ['error']);
+  assert.equal(partsOf('a'), 1);
+  assert.equal((await store.getListParts('a', '2')).length, 1);
+  assert.equal((await store.getListParts('a', '1')).length, 0);
+  assert.equal(partsOf('b'), 1);
+});
+
+test('lists: a list named with a slash or a dash is its own', async () => {
+  const { store } = setup();
+  await store.putListPart('a/b', '1', 0, bytes(1, 4), 9999999999);
+  await store.putListPart('a', '1', 0, bytes(2, 4), 9999999999);
+  assert.ok((await store.getListParts('a/b', '1'))[0].equals(bytes(1, 4)));
+  assert.ok((await store.getListParts('a', '1'))[0].equals(bytes(2, 4)));
+});
+
+test('deleteWorkload: the schedule and the pause go with the configuration and the run', async () => {
+  const { store, docs } = setup();
+  await store.putConfig('app', { workloadId: 'app' });
+  await store.initRun('app', 1);
+  await store.putSchedule('app', SCHEDULE);
+  await store.addPause('app', { by: 'ops', at: 1, reason: 'x', keepAsleep: false });
+  await store.putSchedule('keep', SCHEDULE);
+  await store.deleteWorkload('app');
+  assert.deepEqual([...docs.keys()], ['schedules/keep']);
+  assert.equal(await store.getSchedule('app'), null);
+  assert.deepEqual(await store.getPauses('app'), []);
 });

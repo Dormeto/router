@@ -56,6 +56,15 @@ export function references(map, service) {
   return [...(named ? [POLICY] : []), ...matchers.map(({ i }) => `pathMatchers[${i}].${POLICY}`)];
 }
 
+// The hosts that reach the service: those of the matchers naming it, and `*` for the map's default when it is reachable.
+export function hostsOf(map, service) {
+  const { named, matchers } = holders(map, service);
+  const names = new Set(matchers.map(({ matcher }) => matcher.name));
+  const hostRules = map.hostRules ?? [];
+  const hosts = hostRules.filter((h) => names.has(h.pathMatcher)).flatMap((h) => h.hosts ?? []);
+  return named && !hostRules.some((h) => (h.hosts ?? []).includes('*')) ? [...hosts, '*'] : hosts;
+}
+
 const isOurs = (policy, waker) => nameOf(policy?.errorService) === nameOf(waker);
 
 export function withErrorPolicy(map, service, waker) {
@@ -167,8 +176,11 @@ export function withoutWakerRoute(map, waker) {
   const copy = structuredClone(map);
   const paths = [];
   const kept = [];
+  let held = false;
   (copy.pathMatchers ?? []).forEach((matcher, i) => {
-    if (matcher.name === DEFAULT_MATCHER) {
+    // Another workload's, when it is that workload's service in the map's default.
+    if (matcher.name === DEFAULT_MATCHER && (matcher.pathRules ?? []).some((r) => pathRuleOurs(r, waker))) {
+      held = true;
       paths.push(`pathMatchers[${i}]`);
       return;
     }
@@ -183,7 +195,7 @@ export function withoutWakerRoute(map, waker) {
   if (copy.pathMatchers) {
     copy.pathMatchers = kept;
     if (kept.length === 0) delete copy.pathMatchers;
-    if (copy.hostRules) {
+    if (held && copy.hostRules) {
       copy.hostRules = copy.hostRules.filter((h) => h.pathMatcher !== DEFAULT_MATCHER);
       if (copy.hostRules.length === 0) delete copy.hostRules;
     }
@@ -193,12 +205,25 @@ export function withoutWakerRoute(map, waker) {
 
 export const CALLS = {
   get: ['compute.urlMaps.get'],
+  list: ['compute.urlMaps.list'],
   modify: ['compute.urlMaps.get', 'compute.urlMaps.update'],
 };
 
 export function createUrlMaps({ google, project, now = Date.now }) {
-  const url = (name) => `${COMPUTE}/projects/${project}/global/urlMaps/${name}`;
+  const maps = `${COMPUTE}/projects/${project}/global/urlMaps`;
+  const url = (name) => `${maps}/${name}`;
   const get = (name) => google.request('GET', url(name));
+
+  async function list() {
+    const items = [];
+    let page = '';
+    do {
+      const answer = await google.request('GET', page ? `${maps}?pageToken=${encodeURIComponent(page)}` : maps);
+      items.push(...(answer.items ?? []));
+      page = answer.nextPageToken ?? '';
+    } while (page);
+    return items;
+  }
 
   // Reads the map, applies `change(map)` (one of the functions above), and updates it with the map's fingerprint;
   // changes nothing if `change` wrote nothing. A 412 (another change got there first) reads the map again and applies
@@ -216,5 +241,5 @@ export function createUrlMaps({ google, project, now = Date.now }) {
     }
   }
 
-  return { get, modify };
+  return { get, list, modify };
 }

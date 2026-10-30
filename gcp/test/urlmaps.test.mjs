@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  references, withErrorPolicy, withoutErrorPolicy, withWakerRoute, withoutWakerRoute, createUrlMaps, CALLS,
+  hostsOf, references, withErrorPolicy, withoutErrorPolicy, withWakerRoute, withoutWakerRoute, createUrlMaps, CALLS,
 } from '../src/urlmaps.mjs';
 
 const V1 = 'https://www.googleapis.com/compute/v1/projects/p/global/backendServices';
@@ -132,6 +132,41 @@ test('withoutWakerRoute: removed again to the byte', () => {
   }
 });
 
+test('withoutWakerRoute: another workload\'s dormeto-default and its host rule stay', () => {
+  const OTHER = `${V1}/dmtr-europe-west1-other`;
+  const { map } = withWakerRoute(mapNaming(APP), APP, OTHER);
+  const back = withoutWakerRoute(map, WAKER);
+  assert.deepEqual(back.map, map);
+  assert.deepEqual(back.paths, []);
+});
+
+test('hostsOf: the hosts of the matchers naming the service, and the map\'s default as *', () => {
+  const map = {
+    defaultService: `${V1}/other`,
+    hostRules: [{ hosts: ['a.example.com', 'b.example.com'], pathMatcher: 'one' }, { hosts: ['c.example.com'], pathMatcher: 'two' }],
+    pathMatchers: [{ name: 'one', defaultService: `${V1}/${APP}` }, { name: 'two', defaultService: `${V1}/other` }],
+  };
+  assert.deepEqual(hostsOf(map, APP), ['a.example.com', 'b.example.com']);
+  assert.deepEqual(hostsOf(map, 'other'), ['c.example.com', '*']);
+  assert.deepEqual(hostsOf(map, 'none'), []);
+  // A host rule * means the map's default is never reached.
+  const all = { defaultService: `${V1}/${APP}`, hostRules: [{ hosts: ['*'], pathMatcher: 'one' }], pathMatchers: [{ name: 'one', defaultService: `${V1}/other` }] };
+  assert.deepEqual(hostsOf(all, APP), []);
+});
+
+test('createUrlMaps.list: every page of the project\'s global URL maps', async () => {
+  const pages = { '': { items: [{ name: 'a' }], nextPageToken: 't' }, t: { items: [{ name: 'b' }] } };
+  const seen = [];
+  const google = { request: async (method, url) => {
+    seen.push(`${method} ${url}`);
+    return pages[new URL(url).searchParams.get('pageToken') ?? ''];
+  } };
+  const maps = await createUrlMaps({ google, project: 'p' }).list();
+  assert.deepEqual(maps.map((m) => m.name), ['a', 'b']);
+  assert.equal(seen[0], 'GET https://compute.googleapis.com/compute/v1/projects/p/global/urlMaps');
+  assert.deepEqual(CALLS.list, ['compute.urlMaps.list']);
+});
+
 test('withWakerRoute: idempotent', () => {
   const once = withWakerRoute(fixture(), APP, WAKER);
   const twice = withWakerRoute(once.map, APP, WAKER);
@@ -257,5 +292,5 @@ test('modify: another error is not retried', async () => {
 });
 
 test('CALLS names the adapter\'s functions', () => {
-  assert.deepEqual(Object.keys(CALLS).sort(), ['get', 'modify']);
+  assert.deepEqual(Object.keys(CALLS).sort(), ['get', 'list', 'modify']);
 });

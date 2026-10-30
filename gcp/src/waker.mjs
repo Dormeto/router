@@ -10,11 +10,10 @@ import { STATES } from '../../lambda/src/lib/state.mjs';
 import { createWaker } from '../../lambda/src/lib/waker-core.mjs';
 import { createFirestoreStore } from './firestore.mjs';
 import { createGoogle } from './google.mjs';
+import { WORKLOAD_HEADER, WORKLOAD_ID } from './names.mjs';
 import { createTasks } from './tasks.mjs';
 
 const WAKE_PATH = '/_dormeto/wake';
-const WORKLOAD_HEADER = 'x-dormeto-workload';
-const WORKLOAD_ID = /^[a-z]([a-z0-9-]{0,38}[a-z0-9])?$/;
 const CLOUD = 'Google Cloud';
 const UNKNOWN_POLL_SECONDS = 10;
 

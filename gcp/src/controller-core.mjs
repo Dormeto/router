@@ -308,6 +308,48 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
     }
   }
 
+  // The run to WAKING for a wake asked here, not by a request (the waker's). Null when its state changed meanwhile.
+  async function beginWake(workloadId, from, cause) {
+    const wakeId = newId();
+    const waking = await transition(workloadId, {
+      cond: { state: from },
+      set: { state: STATES.WAKING, wakeId, wakeStartedAt: now() },
+      remove: ['failedAt'],
+      increment: ['wakeCount'],
+      cause,
+    });
+    if (!waking) return null;
+    log.info('WakeRequested', { workloadId, wakeId, reason: cause });
+    return wakeId;
+  }
+
+  // The operator's wake, whatever the backoff, in a request of its own: this one answers at once. During a nap, it is kept
+  // for the nap's end. A task that cannot be enqueued fails the wake now rather than at the check.
+  async function wakeNow(workloadId) {
+    const run = await store.getRun(workloadId);
+    if (run?.state === STATES.NAPPING) {
+      if (await store.setPendingWake(workloadId)) log.info('PendingWake', { workloadId, reason: 'operator' });
+      return;
+    }
+    if (![STATES.ASLEEP, STATES.FAILED].includes(run?.state)) return;
+    const wakeId = await beginWake(workloadId, run.state, 'operator');
+    if (!wakeId) return;
+    try {
+      await enqueue({ action: 'wake', workloadId, wakeId });
+    } catch (err) {
+      const at = now();
+      const failed = failedFrom(err, { step: 'wake', wakeId, at });
+      log.error('WakeInvokeFailed', { workloadId, wakeId, error: err.message });
+      await transition(workloadId, {
+        cond: { state: STATES.WAKING, wakeId },
+        set: { state: STATES.FAILED, failedAt: at, ...failed.set },
+        increment: failed.increment,
+        cause: 'invoke-failed',
+        event: failed.event,
+      });
+    }
+  }
+
   // --- The nap -------------------------------------------------------------------------------------------------------
 
   // Written, then still there after a whole wait: a check's repair or a customer's apply may have removed it meanwhile,
@@ -398,6 +440,9 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
     await enqueue({ action: 'wake', workloadId, wakeId });
     return { state: STATES.WAKING, wakeId };
   }
+
+  // The operator's nap, in a request of its own: it takes minutes.
+  const napNow = (workloadId) => enqueue({ action: 'nap', workloadId });
 
   // A failed workload whose backends run for nothing is stopped like a nap and left asleep behind the policy, its failure
   // kept (requests wake it again, backed off). The policy is there since its nap, unless the nap failed before writing it.
@@ -526,5 +571,5 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
     return results;
   }
 
-  return { wake, nap, release, check };
+  return { wake, beginWake, wakeNow, nap, napNow, release, check };
 }

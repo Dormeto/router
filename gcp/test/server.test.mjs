@@ -1,10 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { response } from '../../lambda/src/lib/http.mjs';
+import { createLogger } from '../../lambda/src/lib/log.mjs';
 import { silentLog } from '../../lambda/test/fakes.mjs';
-import { serve } from '../src/server.mjs';
+import { serve, withSeverity } from '../src/server.mjs';
 
 const SERVER = fileURLToPath(new URL('../src/server.mjs', import.meta.url));
 
@@ -69,6 +71,33 @@ test('DMT_ROLE=waker on PORT: answers, and SIGTERM closes it with exit code 0', 
   await assert.rejects(fetch(`http://127.0.0.1:${port}/_dormeto/waiting`));
 });
 
+test('DMT_ROLE=controller on PORT: its health answers the version built into the image, and SIGTERM closes it', async (t) => {
+  const { version } = JSON.parse(await readFile(new URL('../../package.json', import.meta.url), 'utf8'));
+  const { child, listening, exited } = start(t, { DMT_ROLE: 'controller', PORT: '0', DMT_PROJECT: 'p', DMT_REGION: 'europe-west1', DMT_VERSION: '9.9.9' });
+  const { role, port, severity } = await listening;
+  assert.equal(role, 'controller');
+  assert.equal(severity, 'INFO');
+  const res = await fetch(`http://127.0.0.1:${port}/v1/health`);
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { version, project: 'p', region: 'europe-west1' });
+  child.kill('SIGTERM');
+  const { code, signal } = await exited;
+  assert.deepEqual({ code, signal }, { code: 0, signal: null });
+});
+
+test('withSeverity: Cloud Logging\'s severity on each line of a logger, its fields kept', () => {
+  const lines = [];
+  const log = withSeverity(createLogger({ out: (line) => lines.push(JSON.parse(line)) }));
+  log.info('A', { workloadId: 'demo' });
+  log.warn('B');
+  log.error('C', { error: 'x' });
+  assert.deepEqual(lines, [
+    { level: 'info', event: 'A', severity: 'INFO', workloadId: 'demo' },
+    { level: 'warn', event: 'B', severity: 'WARNING' },
+    { level: 'error', event: 'C', severity: 'ERROR', error: 'x' },
+  ]);
+});
+
 test('an unknown DMT_ROLE stops the process at once, naming the roles', async (t) => {
   for (const env of [{ DMT_ROLE: 'other' }, {}]) {
     const { exited, listening } = start(t, { ...env, PORT: '0' });
@@ -76,6 +105,7 @@ test('an unknown DMT_ROLE stops the process at once, naming the roles', async (t
     const { code, output } = await exited;
     assert.equal(code, 1);
     assert.match(output(), /"UnknownRole"/);
+    assert.match(output(), /"severity":"ERROR"/);
     assert.match(output(), /waker/);
   }
 });

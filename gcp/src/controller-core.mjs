@@ -17,6 +17,7 @@ import { failedSpec, failureError } from '../../lambda/src/lib/failures.mjs';
 import { resolveHibernation } from '../../lambda/src/lib/hibernation.mjs';
 import { awakeStartWithin, CLOSE_START_MS, maintenanceDue, occurrenceAt } from '../../lambda/src/lib/schedule.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
+import { createListRefresher } from '../../lambda/src/lib/list-refresh.mjs';
 import { OPERATION_NOT_DONE } from './google.mjs';
 import { mapBusy, references, UrlMapRefused, withErrorPolicy, withoutErrorPolicy, withWakerRoute } from './urlmaps.mjs';
 
@@ -91,7 +92,7 @@ export class PauseRefused extends Error {
   }
 }
 
-export function createController({ store, compute, urlmaps, monitoring, tasks, config, now = Date.now, sleep, newId = randomUUID, log }) {
+export function createController({ store, compute, urlmaps, monitoring, tasks, config, lists = [], download, now = Date.now, sleep, newId = randomUUID, log }) {
   const enqueue = (body) => tasks.enqueue({ url: `${config.controllerUrl}/v1/tasks`, body });
 
   async function transition(workloadId, change) {
@@ -782,6 +783,28 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
     return run;
   }
 
+  // --- IP lists ------------------------------------------------------------------------------------------------------------
+
+  // The router's lists (DMT_IP_LISTS). A download is a task of its own, never held by a check: it fetches, and a list that
+  // fails is that list's error, stored and logged.
+  const refresher = lists.length ? createListRefresher({ store, lists, download, now, log }) : null;
+
+  async function refreshLists(names) {
+    return { results: refresher ? await refresher.refresh(names) : [] };
+  }
+
+  async function requestListRefresh() {
+    if (!refresher) return;
+    try {
+      const names = await refresher.due();
+      if (!names.length) return;
+      await enqueue({ action: 'refreshLists', names });
+      log.info('ListRefreshRequested', { names });
+    } catch (err) {
+      log.error('ListRefreshCheckFailed', { error: err.message });
+    }
+  }
+
   async function checkOne(cfg, deadline, paused, ctx) {
     const { workloadId } = cfg;
     let run = await store.getRun(workloadId);
@@ -826,6 +849,7 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
   // still runs.
   async function check() {
     const deadline = now() + CHECK_BUDGET_MS;
+    await requestListRefresh();
     const pauses = await activePauses();
     const paused = (workloadId) => pauses === null || pauses.some((p) => p.workloadId === workloadId);
     const keptAsleep = (workloadId) => pauses === null || pauses.some((p) => p.keepAsleep && p.workloadId === workloadId);
@@ -854,5 +878,5 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
     return results;
   }
 
-  return { wake, beginWake, wakeNow, nap, napNow, release, check, pause, resume, pausesFor };
+  return { refreshLists, wake, beginWake, wakeNow, nap, napNow, release, check, pause, resume, pausesFor };
 }

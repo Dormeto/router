@@ -228,6 +228,17 @@ test('POST /v1/tasks: what is not a task is a 400, a workload gone a 404', async
   assert.deepEqual(gone.body, { error: 'no workload demo', reason: 'not-found' });
 });
 
+test('POST /v1/tasks: refreshLists needs no workload ID, any other action does', async () => {
+  const { call } = api();
+  const refresh = await call('POST', '/v1/tasks', { action: 'refreshLists', names: ['scanners'] });
+  assert.equal(refresh.status, 200);
+  assert.deepEqual(refresh.body, { results: [] });
+  const wake = await call('POST', '/v1/tasks', { action: 'wake', wakeId: 'w1' });
+  assert.equal(wake.status, 400);
+  assert.equal(wake.body.reason, 'bad-request');
+  assert.equal((await call('POST', '/v1/tasks', { action: 'refreshLists', names: 'scanners' })).status, 400);
+});
+
 test('POST /v1/tasks: a wake without its wakeId is a 400', async () => {
   const { call } = api();
   await call('POST', '/v1/workloads', INPUT);

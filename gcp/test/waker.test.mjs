@@ -4,6 +4,7 @@ import vm from 'node:vm';
 import { clientIp, requestTarget } from '../../lambda/src/lib/http.mjs';
 import { renderPage } from '../../lambda/src/lib/page.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
+import { FORMAT, dropReserved, packList, parseList } from '../../lambda/src/lib/ip-lists.mjs';
 import { fakeClock, fakeStore, silentLog, testConfig } from '../../lambda/test/fakes.mjs';
 import { toFields } from '../src/firestore.mjs';
 import { createTasks } from '../src/tasks.mjs';
@@ -13,16 +14,17 @@ const CONTROLLER = 'https://dmtr-europe-west1-controller-123.europe-west1.run.ap
 const SERVICE_ACCOUNT = 'dmtr-europe-west1@p.iam.gserviceaccount.com';
 const BROWSER = 'Mozilla/5.0';
 
-function setup({ run = { state: STATES.ASLEEP }, cfg = testConfig(), enqueue } = {}) {
+function setup({ run = { state: STATES.ASLEEP }, cfg = testConfig(), enqueue, lists = [], seed } = {}) {
   const clock = fakeClock();
   const store = fakeStore({ config: cfg, run, clock });
   const created = [];
   const google = { request: async (method, url, body) => { created.push(body.task); return {}; } };
   const tasks = enqueue ? { enqueue } : createTasks({ google, project: 'p', region: 'europe-west1', queue: 'dmtr-europe-west1', serviceAccount: SERVICE_ACCOUNT });
   const logged = [];
-  const log = { ...silentLog, error: (event, fields) => logged.push({ event, ...fields }) };
-  const handler = createCloudRunWaker({ store, tasks, controllerUrl: CONTROLLER, now: clock.now, log });
-  return { handler, store, clock, created, logged };
+  const warned = [];
+  const log = { ...silentLog, error: (event, fields) => logged.push({ event, ...fields }), warn: (event, fields) => warned.push({ event, ...fields }) };
+  const handler = createCloudRunWaker({ store: seed ? seed(store) : store, tasks, controllerUrl: CONTROLLER, lists, now: clock.now, log });
+  return { handler, store, clock, created, logged, warned };
 }
 
 const request = ({ method = 'GET', url = '/_dormeto/waiting', headers = {} } = {}) => ({
@@ -541,4 +543,45 @@ test('fromEnvironment wires the store and the queue on the environment\'s names'
   assert.equal(tasks[0].body.task.httpRequest.url, `${CONTROLLER}/v1/tasks`);
   assert.equal(tasks[0].body.task.httpRequest.oidcToken.serviceAccountEmail, SERVICE_ACCOUNT);
   assert.ok(calls.some((call) => call.url === `${documents}:commit`));
+});
+
+// --- IP lists -------------------------------------------------------------------------------------------------------------
+
+const LISTED = [{ name: 'scanners', url: 'https://lists.example/scanners.txt', action: 'ignore', refreshHours: 24 }];
+
+async function stored(store, name, text) {
+  const parts = packList(dropReserved(parseList(text).entries).kept);
+  for (const [index, part] of parts.entries()) await store.putListPart(name, '1', index, part, 0);
+  await store.setListMeta(name, { version: '1', format: FORMAT, parts: parts.length, entries: 1, url: LISTED[0].url, fetchedAt: 0 });
+}
+
+test('a listed ignore address: its probe makes no task and answers a 202; its POST wakes; another address wakes', async () => {
+  const t = setup({ lists: LISTED });
+  await stored(t.store, 'scanners', '1.2.3.4\n');
+  const probed = await t.handler(probe());
+  assert.equal(probed.statusCode, 202);
+  assert.equal(t.created.length, 0);
+  const explicit = await t.handler(request({ method: 'POST', url: '/_dormeto/wake', headers: { accept: '*/*' } }));
+  assert.equal(explicit.statusCode, 202);
+  assert.equal(t.created.length, 1);
+  assert.equal(decoded(t.created[0]).action, 'wake');
+  const other = setup({ lists: LISTED });
+  await stored(other.store, 'scanners', '1.2.3.4\n');
+  await other.handler(probe({ 'x-forwarded-for': '5.6.7.8, 35.1.1.1' }));
+  assert.equal(other.created.length, 1);
+});
+
+test('lists that cannot be read count as none: logged, the wake goes on', async () => {
+  const t = setup({ lists: LISTED, seed: (store) => ({ ...store, getListMeta: async () => { throw new Error('firestore down'); } }) });
+  const res = await t.handler(probe());
+  assert.equal(res.statusCode, 202);
+  assert.equal(t.created.length, 1);
+  assert.deepEqual(t.warned.map((w) => [w.event, w.name, w.error]), [['ListLoadFailed', 'scanners', 'firestore down']]);
+});
+
+test('DMT_IP_LISTS names the lists of the waker; unreadable, none and logged', () => {
+  const logged = [];
+  const log = { ...silentLog, error: (event, fields) => logged.push({ event, ...fields }) };
+  assert.equal(typeof fromEnvironment({ DMT_PROJECT: 'p', DMT_REGION: 'r', DMT_QUEUE: 'q', DMT_IP_LISTS: 'not json' }, { fetch: async () => ({}), log }), 'function');
+  assert.equal(logged[0].event, 'IpListsUnreadable');
 });

@@ -3,6 +3,8 @@
 // and a short reason for a program; a failure is left to `serve`, which logs it and answers a 500.
 import { response } from '../../lambda/src/lib/http.mjs';
 import { logger } from '../../lambda/src/lib/log.mjs';
+import { parseLists } from '../../lambda/src/lib/list-cache.mjs';
+import { downloadText } from '../../lambda/src/lib/list-refresh.mjs';
 import PACKAGE from '../../package.json' with { type: 'json' };
 import { createCompute } from './compute.mjs';
 import { createController } from './controller-core.mjs';
@@ -63,11 +65,17 @@ export function createControllerApi({ core, onboarding, config }) {
     },
     nap: ({ workloadId, cause, requestedAt, until }) => core.nap(workloadId, { cause, requestedAt, until }),
     release: ({ workloadId }) => core.release(workloadId),
+    refreshLists: ({ names }) => {
+      if (!Array.isArray(names) || names.some((name) => typeof name !== 'string')) throw bad('a refreshLists task needs its names');
+      return core.refreshLists(names);
+    },
   };
+  // The one action that belongs to no workload.
+  const WORKLOADLESS = new Set(['refreshLists']);
 
   async function task(body) {
-    if (!Object.hasOwn(TASKS, body.action ?? '')) throw bad('action must be wake, nap or release');
-    await onboarding.find(body.workloadId);
+    if (!Object.hasOwn(TASKS, body.action ?? '')) throw bad('action must be wake, nap or release (or refreshLists, which has no workload)');
+    if (!WORKLOADLESS.has(body.action)) await onboarding.find(body.workloadId);
     return TASKS[body.action](body);
   }
 
@@ -124,6 +132,8 @@ export function fromEnvironment(env = process.env, { fetch, log = logger } = {})
     monitoring: createMonitoring({ google, project }),
     tasks: createTasks({ google, project, region: env.DMT_REGION, queue: env.DMT_QUEUE, serviceAccount: env.DMT_SERVICE_ACCOUNT }),
     config,
+    lists: parseLists(env.DMT_IP_LISTS, (error) => log.error('IpListsUnreadable', { error })),
+    download: (url) => downloadText(url, { fetch }),
     sleep: (ms) => new Promise((resolve) => { setTimeout(resolve, ms); }),
     log,
   });

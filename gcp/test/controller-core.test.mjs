@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { FORMAT } from '../../lambda/src/lib/ip-lists.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { fakeClock, fakeStore } from '../../lambda/test/fakes.mjs';
 import { createController, PauseRefused } from '../src/controller-core.mjs';
@@ -38,7 +39,7 @@ const notDone = () => new GoogleError('Google: operation op not done in time', {
 // The world as Compute Engine, the URL map and Monitoring see it. `calls`: what changed, in order, with the nap's wait.
 // `on[line]`: runs when that change is asked; it may throw (refused), or answer 'under way' (done later): not applied.
 function setup({
-  run = { state: STATES.AWAKE, awakeSince: 1 }, cfg = {}, vms = {}, groups = {}, autoscalers = {}, machineTypes = {}, map = mapOf(), requests = 0, unhealthyPolls = 0,
+  run = { state: STATES.AWAKE, awakeSince: 1 }, cfg = {}, vms = {}, groups = {}, autoscalers = {}, machineTypes = {}, map = mapOf(), requests = 0, unhealthyPolls = 0, lists, download,
 } = {}) {
   const clock = fakeClock();
   const world = {
@@ -151,6 +152,8 @@ function setup({
       },
     },
     config: { project: 'p', controllerUrl: CONTROLLER },
+    lists,
+    download,
     now: clock.now,
     sleep,
     log,
@@ -1508,4 +1511,56 @@ test('resume removes the pause, once; the wake it made stays', async () => {
   assert.deepEqual(t.logged('Resumed').map((l) => l.by), ['ops']);
   await t.controller.resume('demo', 'ops');
   assert.equal(t.logged('Resumed').length, 1);
+});
+
+// --- IP lists --------------------------------------------------------------------------------------------------------
+
+const LISTS = [{ name: 'scanners', url: 'https://lists.example/scanners.txt', action: 'ignore', refreshHours: 24 }];
+
+test('a check with no list enqueues no refresh', async () => {
+  const t = setup({ run: { state: STATES.ASLEEP } });
+  await t.controller.check();
+  assert.deepEqual(t.world.tasks, []);
+});
+
+test('a check enqueues one refreshLists with the due lists, no workload; none due: nothing', async () => {
+  const t = setup({ run: { state: STATES.ASLEEP }, lists: LISTS });
+  await t.controller.check();
+  assert.deepEqual(t.world.tasks, [{ url: `${CONTROLLER}/v1/tasks`, body: { action: 'refreshLists', names: ['scanners'] } }]);
+  assert.deepEqual(t.logged('ListRefreshRequested').map((l) => l.names), [['scanners']]);
+  const fresh = setup({ run: { state: STATES.ASLEEP }, lists: LISTS });
+  await fresh.store.setListMeta('scanners', { url: LISTS[0].url, format: FORMAT, fetchedAt: fresh.clock.now() });
+  await fresh.controller.check();
+  assert.deepEqual(fresh.world.tasks, []);
+});
+
+test('a refused refresh task is logged and the check goes on', async () => {
+  const t = setup({ run: AWAKE_LONG, vms: { 'vm-a': { status: 'RUNNING' } }, lists: LISTS });
+  t.world.onTask = undefined;
+  t.world.taskRefused = new Error('queue down');
+  const out = await t.controller.check();
+  assert.equal(out[0].workloadId, 'demo');
+  assert.equal(t.logged('ListRefreshCheckFailed').length, 1);
+});
+
+test('refreshLists downloads the named lists into the store and logs AWS\'s events', async () => {
+  const t = setup({ lists: LISTS, download: async () => '1.2.3.4\n10.0.0.1\n' });
+  const { results } = await t.controller.refreshLists(['scanners']);
+  assert.deepEqual(results, [{ name: 'scanners', entries: 1, dropped: 1 }]);
+  assert.equal((await t.store.getListMeta('scanners')).entries, 1);
+  assert.equal(t.logged('ListRefreshed').length, 1);
+});
+
+test('a list that fails, an s3:// one included, is a list error: logged, stored, no throw', async () => {
+  const s3 = [{ name: 'private', url: 's3://bucket/key.txt', action: 'ignore', refreshHours: 24 }];
+  const t = setup({ lists: s3 });
+  const { results } = await t.controller.refreshLists(['private']);
+  assert.match(results[0].error, /S3/);
+  assert.equal(t.logged('ListRefreshFailed').length, 1);
+  assert.match((await t.store.getListMeta('private')).error, /S3/);
+});
+
+test('refreshLists with no list configured does nothing', async () => {
+  const t = setup();
+  assert.deepEqual(await t.controller.refreshLists(['scanners']), { results: [] });
 });

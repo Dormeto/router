@@ -10,6 +10,7 @@
 // A nap window: the page and `/_dormeto/wake` say when it ends. Pauses mean nothing here: `keepAsleep` holds the scheduled and
 // maintenance wakes only, and a visitor still wakes the workload (vision docs/specs/2026-10-30-google-cloud-coverage-design.md,
 // section 5).
+import { createListCache, parseLists } from '../../lambda/src/lib/list-cache.mjs';
 import { failureKind, nextAttemptAt } from '../../lambda/src/lib/failures.mjs';
 import { WAKE_HEADER, header, response } from '../../lambda/src/lib/http.mjs';
 import { logger } from '../../lambda/src/lib/log.mjs';
@@ -62,7 +63,7 @@ export function workloadIdOf(event) {
   return WORKLOAD_ID.test(id) ? id : undefined;
 }
 
-export function createCloudRunWaker({ store, tasks, controllerUrl, now = Date.now, log }) {
+export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], now = Date.now, log }) {
   const core = createWaker({
     // Whatever the configuration says: no request is held, and only the page's probe and explicit wakes wake.
     store: {
@@ -77,6 +78,8 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, now = Date.no
       if (payload.action === 'wake') await tasks.enqueue({ url: `${controllerUrl}/v1/tasks`, body: payload });
     },
     workloadIdOf,
+    // The lists' data is read from the store; one that cannot be read counts as none (the cache logs it) and wakes go on.
+    listCache: lists.length ? createListCache({ store, lists, now, log }) : null,
     now,
     log,
   });
@@ -165,6 +168,7 @@ export function fromEnvironment(env = process.env, { fetch, log = logger } = {})
     store: createFirestoreStore({ google, project: env.DMT_PROJECT, database: env.DMT_DATABASE, log }),
     tasks: createTasks({ google, project: env.DMT_PROJECT, region: env.DMT_REGION, queue: env.DMT_QUEUE, serviceAccount: env.DMT_SERVICE_ACCOUNT }),
     controllerUrl: env.DMT_CONTROLLER_URL,
+    lists: parseLists(env.DMT_IP_LISTS, (error) => log.error('IpListsUnreadable', { error })),
     log,
   });
 }

@@ -30,3 +30,22 @@ test('the failure message says the kind and the next attempt (R7a)', async () =>
   assert.match(other, /The application could not be started; its team is notified\. Next attempt in less than a minute/);
   assert.match(renderPage({ state: 'FAILED', pollSeconds: 3 }), /The application could not be started\. Retrying shortly/);
 });
+
+test('renderPage probes probeUrl, and only then reloads once AWAKE; without it the page keeps probing its own address', () => {
+  const page = renderPage({ state: 'WAKING', pollSeconds: 3 });
+  assert.match(page, /fetch\(location\.href, /);
+  assert.doesNotMatch(page, /state === 'AWAKE'/);
+  const elsewhere = renderPage({ state: 'WAKING', pollSeconds: 3, probeUrl: '/_dormeto/wake' });
+  assert.match(elsewhere, /fetch\("\/_dormeto\/wake", /);
+  assert.doesNotMatch(elsewhere, /fetch\(location\.href/);
+  assert.match(elsewhere, /state === 'AWAKE'/);
+});
+
+test('renderPage names the cloud that has no capacity, in the page and in its script; AWS by default', () => {
+  const capacity = { state: 'FAILED', pollSeconds: 3, failure: 'capacity', retryInMs: 30_000 };
+  assert.match(renderPage(capacity), /<h1[^>]*>AWS has no capacity for this application right now: the start is retried, next attempt in less than a minute\.<\/h1>/);
+  const google = renderPage({ ...capacity, cloud: 'Google Cloud' });
+  assert.match(google, /<h1[^>]*>Google Cloud has no capacity for this application right now: the start is retried, next attempt in less than a minute\.<\/h1>/);
+  assert.match(google, /const failures = \{"capacity":"Google Cloud has no capacity/);
+  assert.doesNotMatch(google, /AWS/);
+});

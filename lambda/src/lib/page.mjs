@@ -10,22 +10,26 @@ const escapeHtml = (value) => String(value).replace(/[&<>"']/g,
   (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 
 // Why a wake failed, for the visitor (R7a); the next attempt is added to it.
-const FAILURES = {
-  capacity: 'AWS has no capacity for this application right now: the start is retried',
+const failuresOn = (cloud) => ({
+  capacity: `${cloud} has no capacity for this application right now: the start is retried`,
   other: 'The application could not be started; its team is notified.',
-};
+});
 const inText = (ms) => (ms < 60_000 ? 'less than a minute' : `${Math.round(ms / 60_000)} minute${Math.round(ms / 60_000) === 1 ? '' : 's'}`);
-export function failureMessage(failure, retryInMs) {
+export function failureMessage(failure, retryInMs, cloud = 'AWS') {
   if (!failure) return MESSAGES.FAILED;
-  const text = FAILURES[failure] ?? FAILURES.other;
+  const failures = failuresOn(cloud);
+  const text = failures[failure] ?? failures.other;
   if (retryInMs === undefined) return text;
   return failure === 'capacity' ? `${text}, next attempt in ${inText(retryInMs)}.` : `${text} Next attempt in ${inText(retryInMs)}.`;
 }
 
 export const napMessage = (napUntil) => `Napping on schedule until ${napUntil.local} (${napUntil.timeZone}).`;
 
-export function renderPage({ state, pollSeconds, failure, retryInMs, napUntil }) {
-  const message = napUntil ? napMessage(napUntil) : state === 'FAILED' ? failureMessage(failure, retryInMs) : MESSAGES[state] ?? MESSAGES.WAKING;
+// probeUrl: where the script probes, when the page is not served at the address it wakes: no redirect comes back then,
+// and the script reloads the visitor's address once AWAKE or on an answer not the waker's, at most one reload per poll
+// (the page can come back until the load balancer reaches the application). By default it probes its own address.
+export function renderPage({ state, pollSeconds, failure, retryInMs, napUntil, probeUrl, cloud = 'AWS' }) {
+  const message = napUntil ? napMessage(napUntil) : state === 'FAILED' ? failureMessage(failure, retryInMs, cloud) : MESSAGES[state] ?? MESSAGES.WAKING;
   const seconds = Number(pollSeconds);
   return `<!doctype html>
 <html lang="en">
@@ -57,16 +61,18 @@ p{color:var(--muted)}
 (() => {
   const pollMs = ${seconds * 1000};
   const messages = ${JSON.stringify(MESSAGES)};
-  const failures = ${JSON.stringify(FAILURES)};
+  const failures = ${JSON.stringify(failuresOn(cloud))};
   const started = Date.now();
   const message = document.getElementById('message');
   const elapsed = document.getElementById('elapsed');
   setInterval(() => { elapsed.textContent = Math.round((Date.now() - started) / 1000) + ' s'; }, 1000);
   const probe = async () => {
     try {
-      const r = await fetch(location.href, { cache: 'no-store', credentials: 'same-origin', redirect: 'manual', headers: { 'x-dormeto-probe': '1' } });
+      const r = await fetch(${probeUrl ? JSON.stringify(probeUrl) : 'location.href'}, { cache: 'no-store', credentials: 'same-origin', redirect: 'manual', headers: { 'x-dormeto-probe': '1' } });
       const state = r.type === 'opaqueredirect' ? null : r.headers.get('x-dormeto-state');
-      if (!state) { location.reload(); return; }
+      ${probeUrl
+    ? "if (!state || state === 'AWAKE') { setTimeout(() => location.reload(), Math.max(0, started + pollMs - Date.now())); return; }"
+    : 'if (!state) { location.reload(); return; }'}
       // Still napping on schedule: the page keeps saying so.
       if (r.headers.get('x-dormeto-nap-until')) { setTimeout(probe, pollMs); return; }
       const failure = r.headers.get('x-dormeto-failure');

@@ -16,7 +16,8 @@ const ROUTE_GRACE_MS = 15_000;
 // Route repairs requested from a warm waker instance: at most one per workload in this interval.
 const ENSURE_INTERVAL_MS = 10_000;
 
-export function createWaker({ store, invokeController, prefix, now = Date.now, sleep, newId = randomUUID, log, getAdmin, defaultRules = [], listCache = null }) {
+// workloadIdOf(event): how a request names its workload; by default, its target group under the prefix.
+export function createWaker({ store, invokeController, prefix, workloadIdOf = (event) => workloadIdFromEvent(event, prefix), now = Date.now, sleep, newId = randomUUID, log, getAdmin, defaultRules = [], listCache = null }) {
   const ensured = new Map(); // workload id → last ensure-awake request
   const inRouteGrace = (run) => run.state === STATES.AWAKE && (run.awakeSince ?? 0) > now() - ROUTE_GRACE_MS;
   const servable = (run) => run.state === STATES.AWAKE && !inRouteGrace(run);
@@ -196,7 +197,7 @@ export function createWaker({ store, invokeController, prefix, now = Date.now, s
   }
 
   return async function handler(event) {
-    const workloadId = workloadIdFromEvent(event, prefix);
+    const workloadId = workloadIdOf(event);
     const [cfg, initial] = await Promise.all([store.getConfig(workloadId), store.getRun(workloadId)]);
     if (!cfg || !initial) {
       log.error('WorkloadNotConfigured', { workloadId });

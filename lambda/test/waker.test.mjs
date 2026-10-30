@@ -318,3 +318,30 @@ test('ASLEEP after a failure (released, or back to ASLEEP at a check): requests 
   await clean.handler(albEvent());
   assert.equal(clean.invocations.length, 1, 'an ASLEEP workload without failure wakes at once');
 });
+
+test('workloadIdOf names the workload instead of the target group', async () => {
+  const clock = fakeClock();
+  const cfg = testConfig({ waitSeconds: 0 });
+  const invocations = [];
+  const seen = [];
+  const handler = createWaker({
+    store: fakeStore({ config: cfg, run: { state: STATES.ASLEEP }, clock }),
+    invokeController: async (payload) => { invocations.push(payload); },
+    prefix: 'dmt-dev-',
+    workloadIdOf: (event) => { seen.push(event.path); return 'demo'; },
+    now: clock.now,
+    newId: () => 'wake-1',
+    log: silentLog,
+  });
+  // A target group naming another workload: the option decides, not the event's ARN.
+  const res = await handler(albEvent({ path: '/orders', cfg: testConfig({ wakerTargetGroupArn: 'arn:aws:elasticloadbalancing:eu-west-1:111122223333:targetgroup/dmt-dev-other/222' }) }));
+  assert.equal(headerOf(res, 'x-dormeto-state'), STATES.WAKING);
+  assert.deepEqual(invocations, [{ action: 'wake', workloadId: 'demo', wakeId: 'wake-1' }]);
+  assert.deepEqual(seen, ['/orders']);
+});
+
+test('without workloadIdOf, the target group names the workload, under the prefix', async () => {
+  const { handler } = setup({ run: { state: STATES.ASLEEP }, cfg: testConfig({ waitSeconds: 0 }) });
+  await assert.rejects(handler(albEvent({ cfg: testConfig({ wakerTargetGroupArn: 'arn:aws:elasticloadbalancing:eu-west-1:111122223333:targetgroup/other-demo/222' }) })), /unexpected target group/);
+  assert.equal((await handler(albEvent())).statusCode, 503);
+});

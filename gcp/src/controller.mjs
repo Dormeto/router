@@ -49,6 +49,12 @@ function idOf(encoded) {
   }
 }
 
+function forceOf(query) {
+  const force = query.get('force');
+  if (force !== null && force !== 'true') throw bad('force can only be true');
+  return force === 'true';
+}
+
 export function createControllerApi({ core, onboarding, config }) {
   const TASKS = {
     wake: ({ workloadId, wakeId }) => {
@@ -79,10 +85,7 @@ export function createControllerApi({ core, onboarding, config }) {
     const [, encoded, verb] = WORKLOAD.exec(path) ?? [];
     if (!encoded) return null;
     if (!verb && method === 'GET') return onboarding.show(idOf(encoded));
-    if (!verb && method === 'DELETE') {
-      await onboarding.offboard(idOf(encoded));
-      return {};
-    }
+    if (!verb && method === 'DELETE') return onboarding.offboard(idOf(encoded), { force: forceOf(query) });
     if (verb === 'nap' && method === 'POST') return onboarding.nap(idOf(encoded));
     if (verb === 'wake' && method === 'POST') return onboarding.wake(idOf(encoded));
     return null;

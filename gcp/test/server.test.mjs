@@ -10,12 +10,20 @@ import { serve, withSeverity } from '../src/server.mjs';
 
 const SERVER = fileURLToPath(new URL('../src/server.mjs', import.meta.url));
 
+// The URL of the address a server is bound to. `listen(port)` binds the dual-stack `::`: on 127.0.0.1, another process
+// bound to that address and port would answer instead.
+function urlOf({ address, port }) {
+  assert.ok(address, 'the address the server is bound to');
+  if (address === '::') return `http://[::1]:${port}`;
+  return `http://${address === '0.0.0.0' ? '127.0.0.1' : address}:${port}`;
+}
+
 // A server on a free port, closed at the end of the test.
 async function serving(t, handler, log = silentLog) {
   const server = serve(handler, { port: 0, log });
   t.after(() => new Promise((resolve) => { server.close(resolve); }));
   await new Promise((resolve) => { server.once('listening', resolve); });
-  return `http://127.0.0.1:${server.address().port}`;
+  return urlOf(server.address());
 }
 
 test('serve hands the request to the role and writes its answer, the body of a POST unread', async (t) => {
@@ -60,24 +68,25 @@ function start(t, env) {
 
 test('DMT_ROLE=waker on PORT: answers, and SIGTERM closes it with exit code 0', async (t) => {
   const { child, listening, exited } = start(t, { DMT_ROLE: 'waker', PORT: '0' });
-  const { role, port } = await listening;
-  assert.equal(role, 'waker');
-  const res = await fetch(`http://127.0.0.1:${port}/_dormeto/waiting`);
+  const listened = await listening;
+  assert.equal(listened.role, 'waker');
+  const url = urlOf(listened);
+  const res = await fetch(`${url}/_dormeto/waiting`);
   assert.equal(res.status, 400);
   assert.equal((await res.json()).reason, 'x-dormeto-workload names no workload');
   child.kill('SIGTERM');
   const { code, signal } = await exited;
   assert.deepEqual({ code, signal }, { code: 0, signal: null });
-  await assert.rejects(fetch(`http://127.0.0.1:${port}/_dormeto/waiting`));
+  await assert.rejects(fetch(`${url}/_dormeto/waiting`));
 });
 
 test('DMT_ROLE=controller on PORT: its health answers the version built into the image, and SIGTERM closes it', async (t) => {
   const { version } = JSON.parse(await readFile(new URL('../../package.json', import.meta.url), 'utf8'));
   const { child, listening, exited } = start(t, { DMT_ROLE: 'controller', PORT: '0', DMT_PROJECT: 'p', DMT_REGION: 'europe-west1', DMT_VERSION: '9.9.9' });
-  const { role, port, severity } = await listening;
-  assert.equal(role, 'controller');
-  assert.equal(severity, 'INFO');
-  const res = await fetch(`http://127.0.0.1:${port}/v1/health`);
+  const listened = await listening;
+  assert.equal(listened.role, 'controller');
+  assert.equal(listened.severity, 'INFO');
+  const res = await fetch(`${urlOf(listened)}/v1/health`);
   assert.equal(res.status, 200);
   assert.deepEqual(await res.json(), { version, project: 'p', region: 'europe-west1' });
   child.kill('SIGTERM');

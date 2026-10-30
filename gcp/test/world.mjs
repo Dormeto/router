@@ -50,7 +50,7 @@ const notFound = (what) => new GoogleError(`Google: ${what}: 404 not found`, { c
 // `change(world)`: what differs from the defaults. `fail['<method> <path>']` refuses that call, `on[...]` runs before it.
 export function setup(change = () => {}) {
   const clock = fakeClock();
-  const w = { ...defaults(), changes: [], tasks: [], fail: {}, on: {}, logs: [] };
+  const w = { ...defaults(), changes: [], tasks: [], fail: {}, on: {}, logs: [], used: new Set() };
   change(w);
   const instance = (name) => {
     const vm = w.vms[name];
@@ -174,8 +174,13 @@ export function setup(change = () => {}) {
   };
   const log = Object.fromEntries(['info', 'warn', 'error'].map((level) => [level, (event, fields = {}) => { w.logs.push({ level, event, ...fields }); }]));
   const config = { project: 'p', region: w.region ?? REGION, wakerNeg: NEG, controllerUrl: CONTROLLER };
-  const compute = createCompute({ google, project: 'p', now: clock.now });
-  const urlmaps = createUrlMaps({ google, project: 'p', now: clock.now });
+  // `used`: each adapter function called, as `compute.getInstance`.
+  const recorded = (adapter, calls) => Object.fromEntries(Object.entries(calls).map(([name, call]) => [name, (...args) => {
+    w.used.add(`${adapter}.${name}`);
+    return call(...args);
+  }]));
+  const compute = recorded('compute', createCompute({ google, project: 'p', now: clock.now }));
+  const urlmaps = recorded('urlmaps', createUrlMaps({ google, project: 'p', now: clock.now }));
   const tasks = {
     enqueue: async (task) => {
       if (w.fail.enqueue) throw w.fail.enqueue;

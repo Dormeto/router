@@ -142,6 +142,30 @@ test('DELETE /v1/workloads/:id: 200 once it is gone; unknown: 404; a bad ID: 400
   assert.equal(w.services[WAKER], undefined);
 });
 
+test('DELETE /v1/workloads/:id?force=true: without the wake, what was left down named; any other value: 400', async () => {
+  const { call, w, store } = api();
+  await call('POST', '/v1/workloads', INPUT);
+  delete w.vms['vm-a'];
+  store.runs.get('demo').state = STATES.ASLEEP;
+  const plain = await call('DELETE', '/v1/workloads/demo');
+  assert.equal(plain.status, 409);
+  assert.equal(plain.body.reason, 'wake-failed');
+  assert.match(plain.body.error, /--force/);
+  for (const value of ['false', '', '1', 'TRUE']) {
+    const res = await call('DELETE', `/v1/workloads/demo?force=${value}`);
+    assert.equal(res.status, 400, value);
+    assert.equal(res.body.reason, 'bad-request');
+    assert.match(res.body.error, /force/);
+  }
+  assert.equal(store.configs.size, 1);
+  const forced = await call('DELETE', '/v1/workloads/demo?force=true');
+  assert.equal(forced.status, 200);
+  assert.deepEqual(forced.body, { id: 'demo', left: [{ kind: 'vm', location: ZONE, name: 'vm-a', id: '1001' }] });
+  assert.equal(store.configs.size, 0);
+  assert.equal(w.services[WAKER], undefined);
+  assert.equal((await call('DELETE', '/v1/workloads/demo?force=true')).status, 404);
+});
+
 test('POST /v1/workloads/:id/nap and /wake: the Workload; unknown: 404; busy: 409', async () => {
   const { call, w, store } = api();
   for (const verb of ['nap', 'wake']) {

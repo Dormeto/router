@@ -49,7 +49,7 @@ const nameOf = (url) => url.slice(url.lastIndexOf('/') + 1);
 const zoneOf = (url) => /\/zones\/([^/]+)\//.exec(url)?.[1];
 const names = (vms) => vms.map((vm) => vm.name);
 // A zone ends in its letter, a region in its number.
-const groupOf = ({ location, name }) => ({ kind: /-[a-z]$/.test(location) ? 'zonal' : 'regional', location, name });
+export const groupOf = ({ location, name }) => ({ kind: /-[a-z]$/.test(location) ? 'zonal' : 'regional', location, name });
 
 // The operation's wait ran out (the only thing the wait knows) or its request did: the change is still under way, and
 // what comes next reads the VMs themselves.

@@ -5,6 +5,7 @@
 // A refusal is a `Refusal`: its status and short reason are the API's, its message is what is wrong and what to change.
 // Anything else thrown is a failure, a 500 for the caller.
 import { STATES } from '../../lambda/src/lib/state.mjs';
+import { groupOf } from './controller-core.mjs';
 import { WORKLOAD_HEADER, WORKLOAD_ID } from './names.mjs';
 import { hostsOf, references, UrlMapRefused, withErrorPolicy, withoutErrorPolicy, withWakerRoute, withoutWakerRoute } from './urlmaps.mjs';
 
@@ -53,7 +54,7 @@ function settingsProblems(settings) {
   if (typeof settings !== 'object' || settings === null || Array.isArray(settings)) return ['settings: must be an object'];
   return Object.entries(settings).flatMap(([key, value]) => {
     if (key === 'hibernate') return typeof value === 'boolean' ? [] : ['settings: hibernate must be true or false'];
-    if (!RANGES[key]) return [`settings: unknown setting ${key}`];
+    if (!Object.hasOwn(RANGES, key)) return [`settings: unknown setting ${key}`];
     const [min, max] = RANGES[key];
     return Number.isInteger(value) && value >= min && value <= max ? [] : [`settings: ${key} must be an integer from ${min} to ${max}`];
   });
@@ -309,13 +310,43 @@ export function createOnboarding({ store, compute, urlmaps, core, config, now = 
     const wakeId = await core.beginWake(id, run.state, 'offboarding');
     if (!wakeId) throw new Refusal(409, 'busy', `cannot offboard ${id}: its state just changed, try again`);
     const { state, error } = await core.wake(id, wakeId);
-    if (state !== STATES.AWAKE) throw new Refusal(409, 'wake-failed', `cannot offboard ${id}: its wake failed: ${error ?? state}; fix that, or try again`);
+    if (state !== STATES.AWAKE) throw new Refusal(409, 'wake-failed', `cannot offboard ${id}: its wake failed: ${error ?? state}; fix that and try again, or offboard with --force, which leaves its backends down`);
+  }
+
+  // Running, as far as it can be read: anything else, a backend gone included, is not known to be up.
+  async function isUp(backend, workloadId) {
+    try {
+      const statuses = backend.kind === 'mig'
+        ? (await compute.listManagedInstances(groupOf(backend))).map((m) => m.instanceStatus)
+        : [(await compute.getInstance(backend.location, backend.name)).status];
+      return statuses.length > 0 && statuses.every((status) => status === 'RUNNING');
+    } catch (err) {
+      log.warn('BackendUnread', { workloadId, backend: backend.name, error: err.message });
+      return false;
+    }
+  }
+
+  // A workload that cannot wake, or whose state is stuck: no wake, and all of Dormeto's goes. The backends stay as they are,
+  // and those not up are named. A nap in flight finds its waker backend service gone before it would stop anything, unless
+  // it is already stopping them.
+  async function forceOff(cfg, run) {
+    const { workloadId } = cfg;
+    const up = await Promise.all(cfg.backends.map((backend) => isUp(backend, workloadId)));
+    const left = cfg.backends.filter((_, i) => !up[i]);
+    await Promise.all((run?.autoscalers ?? []).map((a) => compute.setAutoscalerMode(a, a.mode).catch((err) => {
+      log.warn('AutoscalerNotGivenBack', { workloadId, autoscaler: a.name, mode: a.mode, error: err.message });
+    })));
+    await removeFromGoogle(cfg);
+    await store.deleteWorkload(workloadId);
+    log.warn('Offboarded', { workloadId, force: true, left: left.map((backend) => backend.name) });
+    return { id: workloadId, left };
   }
 
   // An offboarding that stops keeps the documents: they name what is left to remove when it runs again.
-  async function offboard(id) {
+  async function offboard(id, { force = false } = {}) {
     const cfg = await find(id);
     let run = await store.getRun(id);
+    if (force) return forceOff(cfg, run);
     if ([STATES.WAKING, STATES.NAPPING].includes(run?.state)) throw new Refusal(409, 'busy', `cannot offboard ${id}: it is ${run.state}, try again once it is done`);
     if (run && run.state !== STATES.AWAKE) {
       await awaken(id, run);
@@ -326,6 +357,7 @@ export function createOnboarding({ store, compute, urlmaps, core, config, now = 
     await removeFromGoogle(cfg);
     await store.deleteWorkload(id);
     log.info('Offboarded', { workloadId: id });
+    return {};
   }
 
   async function show(id) {

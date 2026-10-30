@@ -206,7 +206,7 @@ export function withoutWakerRoute(map, waker) {
 export const CALLS = {
   get: ['compute.urlMaps.get'],
   list: ['compute.urlMaps.list'],
-  modify: ['compute.urlMaps.get', 'compute.urlMaps.update'],
+  modify: ['compute.urlMaps.get', 'compute.urlMaps.update', 'compute.backendServices.use', 'compute.globalOperations.get'],
 };
 
 export function createUrlMaps({ google, project, now = Date.now }) {

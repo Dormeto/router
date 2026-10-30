@@ -37,7 +37,7 @@ async function main({ DMT_ROLE: role, PORT: port = '8080' } = process.env) {
   }
   const { fromEnvironment } = await import(ROLES[role]);
   const server = serve(fromEnvironment(process.env, { log }), { port: Number(port), log });
-  server.once('listening', () => log.info('Listening', { role, port: server.address().port }));
+  server.once('listening', () => log.info('Listening', { role, address: server.address().address, port: server.address().port }));
   process.once('SIGTERM', () => server.close());
 }
 

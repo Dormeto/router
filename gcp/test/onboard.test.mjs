@@ -144,6 +144,8 @@ test('bad input is a 400 before any read', async () => {
     [{ ...INPUT, settings: { waitSeconds: 121 } }, /settings: waitSeconds must be an integer from 5 to 120/],
     [{ ...INPUT, settings: { hibernate: 'yes' } }, /settings: hibernate must be true or false/],
     [{ ...INPUT, settings: { wakeMode: 'any' } }, /settings: unknown setting wakeMode/],
+    [{ ...INPUT, settings: { constructor: 1 } }, /settings: unknown setting constructor/],
+    [{ ...INPUT, settings: JSON.parse('{"__proto__": 1}') }, /settings: unknown setting __proto__/],
     [{ ...INPUT, settings: [] }, /settings: must be an object/],
   ];
   for (const [input, message] of cases) {
@@ -392,6 +394,124 @@ test('offboard: a second workload\'s dormeto-default in the same map stays', asy
   assert.deepEqual(w.urlMaps.lb.hostRules.at(-1), { hosts: ['*'], pathMatcher: 'dormeto-default' });
   assert.deepEqual(held().pathRules, [{ paths: ['/_dormeto/*'], service: serviceUrl('dmtr-europe-west1-second') }]);
   assert.equal(store.configs.size, 1);
+});
+
+// --- The forced offboarding: a workload that cannot wake, or whose state is stuck --------------------------------------
+
+const VM_A = { kind: 'vm', location: ZONE, name: 'vm-a', id: '1001' };
+
+// `demo` onboarded, then asleep behind its policy, its VM deleted by hand.
+async function asleepVmDeleted() {
+  const world = setup();
+  const original = structuredClone(world.w.urlMaps.lb);
+  await world.onboarding.onboard(INPUT);
+  delete world.w.vms['vm-a'];
+  Object.assign(world.store.runs.get('demo'), { state: STATES.ASLEEP, stopped: ['vm-a'] });
+  world.w.urlMaps.lb.pathMatchers[0].defaultCustomErrorResponsePolicy = { errorService: WAKER_URL };
+  world.w.changes.length = 0;
+  return { ...world, original };
+}
+
+test('offboarding a workload that cannot wake: a 409 naming --force, nothing removed', async () => {
+  const { w, store, onboarding } = await asleepVmDeleted();
+  await assert.rejects(onboarding.offboard('demo'), refused(409, 'wake-failed', /cannot offboard demo: its wake failed: .*--force/));
+  assert.deepEqual(w.changes, []);
+  assert.ok(w.services[WAKER]);
+  assert.ok(w.urlMaps.lb.pathMatchers[0].defaultCustomErrorResponsePolicy);
+  assert.equal(store.configs.size, 1);
+  assert.equal(store.runs.size, 1);
+});
+
+test('force: no wake; the map restored, the service and the documents gone, the backend left down named', async () => {
+  const { w, store, onboarding, original } = await asleepVmDeleted();
+  assert.deepEqual(await onboarding.offboard('demo', { force: true }), { id: 'demo', left: [VM_A] });
+  assert.deepEqual(w.changes, ['map lb', `delete ${WAKER}`]);
+  assert.deepEqual(w.urlMaps.lb, original);
+  assert.equal(w.services[WAKER], undefined);
+  assert.equal(store.configs.size, 0);
+  assert.equal(store.runs.size, 0);
+  assert.deepEqual(w.tasks, []);
+  assert.ok(w.logs.some((l) => l.event === 'Offboarded' && l.force === true && l.workloadId === 'demo'));
+});
+
+test('force works once the run shows the failed wake', async () => {
+  const { store, onboarding } = await asleepVmDeleted();
+  await assert.rejects(onboarding.offboard('demo'), refused(409, 'wake-failed'));
+  assert.equal(store.runs.get('demo').state, STATES.FAILED);
+  assert.deepEqual((await onboarding.offboard('demo', { force: true })).left, [VM_A]);
+  assert.equal(store.configs.size, 0);
+});
+
+test('force on a stuck WAKING or NAPPING takes the same path', async () => {
+  for (const state of [STATES.WAKING, STATES.NAPPING]) {
+    const { w, store, onboarding } = setup();
+    await onboarding.onboard(INPUT);
+    store.runs.get('demo').state = state;
+    w.vms['vm-a'].status = 'TERMINATED';
+    assert.deepEqual(await onboarding.offboard('demo', { force: true }), { id: 'demo', left: [VM_A] });
+    assert.equal(store.configs.size, 0);
+    assert.equal(w.services[WAKER], undefined);
+  }
+});
+
+test('force on an awake workload leaves nothing down', async () => {
+  const { store, onboarding } = setup();
+  await onboarding.onboard(INPUT);
+  assert.deepEqual(await onboarding.offboard('demo', { force: true }), { id: 'demo', left: [] });
+  assert.equal(store.configs.size, 0);
+});
+
+test('force: a managed group with a VM down, or gone, is left; one whose VMs all run is not', async () => {
+  const { w, onboarding } = setup((world) => {
+    world.managed.up = mig({ id: '2001', members: ['up-1'] });
+    world.managed.down = mig({ id: '2002', members: ['down-1', 'down-2'] });
+    world.managed.gone = mig({ id: '2003', members: ['gone-1'] });
+    Object.assign(world.vms, { 'up-1': { id: '3001', status: 'RUNNING' }, 'down-1': { id: '3002', status: 'RUNNING' }, 'down-2': { id: '3003', status: 'RUNNING' }, 'gone-1': { id: '3004', status: 'RUNNING' } });
+    world.services.app.backends = ['up', 'down', 'gone'].map((name) => ({ group: `${V1}/zones/${ZONE}/instanceGroups/${name}` }));
+  });
+  await onboarding.onboard(INPUT);
+  w.vms['down-2'].status = 'TERMINATED';
+  delete w.managed.gone;
+  const { left } = await onboarding.offboard('demo', { force: true });
+  assert.deepEqual(left, [{ kind: 'mig', location: ZONE, name: 'down', id: '2002' }, { kind: 'mig', location: ZONE, name: 'gone', id: '2003' }]);
+});
+
+test('force: a backend that cannot be read is not known to be up: left, logged, and the offboarding goes on', async () => {
+  const { w, store, onboarding } = setup();
+  await onboarding.onboard(INPUT);
+  w.fail[`GET zones/${ZONE}/instances/vm-a`] = new GoogleError('Google: refused', { code: 403 });
+  assert.deepEqual((await onboarding.offboard('demo', { force: true })).left, [VM_A]);
+  assert.ok(w.logs.some((l) => l.event === 'BackendUnread' && l.backend === 'vm-a'));
+  assert.equal(store.configs.size, 0);
+});
+
+test('force: an autoscaler\'s mode goes back, and one that cannot is logged without stopping the offboarding', async () => {
+  const { w, store, onboarding } = setup((world) => { Object.assign(world.autoscalers, { good: 'OFF', bad: 'OFF' }); });
+  await onboarding.onboard(INPUT);
+  Object.assign(store.runs.get('demo'), {
+    state: STATES.FAILED,
+    autoscalers: [{ kind: 'zonal', location: ZONE, name: 'good', mode: 'ON' }, { kind: 'zonal', location: ZONE, name: 'bad', mode: 'ON' }],
+  });
+  w.fail[`PATCH zones/${ZONE}/autoscalers?autoscaler=bad`] = new GoogleError('Google: refused', { code: 500 });
+  await onboarding.offboard('demo', { force: true });
+  assert.equal(w.autoscalers.good, 'ON');
+  assert.equal(w.autoscalers.bad, 'OFF');
+  assert.ok(w.logs.some((l) => l.event === 'AutoscalerNotGivenBack' && l.autoscaler === 'bad'));
+  assert.equal(store.configs.size, 0);
+});
+
+test('force: what must go still must: a refused removal is a failure, the documents kept for the next run', async () => {
+  const { w, store, onboarding } = await asleepVmDeleted();
+  const failure = new GoogleError('Google: in use', { code: 400 });
+  w.fail[`DELETE global/backendServices/${WAKER}`] = failure;
+  await assert.rejects(onboarding.offboard('demo', { force: true }), failure);
+  assert.equal(store.configs.size, 1);
+});
+
+test('force: an unknown workload is still a 404, a bad ID a 400', async () => {
+  const { onboarding } = setup();
+  await assert.rejects(onboarding.offboard('demo', { force: true }), refused(404, 'not-found'));
+  await assert.rejects(onboarding.offboard('Bad_ID', { force: true }), refused(400, 'bad-request'));
 });
 
 // --- List, show, nap and wake now ---------------------------------------------------------------------------------------

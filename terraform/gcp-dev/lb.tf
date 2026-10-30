@@ -68,15 +68,16 @@ resource "google_compute_url_map" "dev" {
   }
 
   lifecycle {
-    # The services the measuring tool (and later Dormeto) switches: as default services, or with `switch --weighted` in
-    # the default route actions' weighted backend services (only one of the two can be set).
+    # The services the measuring tool switches: as default services, or with `switch --weighted` in the default route
+    # actions' weighted backend services (only one of the two can be set). And what the router writes, as the scenario
+    # page advises: its host rule and matcher for the map's default, its route and policy in the matchers. A later edit
+    # of a matcher here takes removing the ignore for that apply.
     ignore_changes = [
       default_service,
       default_route_action,
-      path_matcher[0].default_service,
-      path_matcher[0].default_route_action,
-      path_matcher[1].default_service,
-      path_matcher[1].default_route_action,
+      default_custom_error_response_policy,
+      host_rule,
+      path_matcher,
     ]
   }
 }

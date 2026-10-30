@@ -60,6 +60,41 @@ test('the scenario page is linked from the scenarios index and states its limits
   assert.match(page.replace(/[`*]/g, '').replace(/\s+/g, ' '), /another service too shows the waiting page for that service's own 502 and 503 while the workload is asleep/);
 });
 
+const flat = (text) => text.replace(/[`*]/g, '').replace(/\s+/g, ' ');
+
+test('the scenario page: where the policy goes, what the waker answers, and when a nap does not happen', () => {
+  const page = flat(read('docs/scenarios/google-cloud-compute-engine.md'));
+  assert.doesNotMatch(page, /\(and the map's default\)/);
+  assert.doesNotMatch(page, /on the google_compute_url_map and/);
+  assert.match(page, /a policy on the map itself would cover the whole load balancer/);
+  assert.match(page, /A service that no URL map names any more, or that another URL map names too, is not napped/);
+  assert.match(page, /the waker answers the load balancer's fetch with a 200/);
+  assert.match(page, /POST \/_dormeto\/wake, answered with a 202/);
+  assert.match(page, /retried with a pause, up to 60 s/);
+  assert.doesNotMatch(page, /retried 3 times/);
+  assert.match(page, /request_count over the idle window, through any URL map/);
+  assert.match(page, /regional managed group with the target shape EVEN and instance redistribution on is refused/);
+});
+
+test('the scenario page: a managed group recreates a VM suspended for over 60 days', () => {
+  const page = flat(read('docs/scenarios/google-cloud-compute-engine.md'));
+  assert.match(page, /A managed group recreates a VM suspended for over 60 days, without keeping its name, IP addresses or disks unless they are stateful/);
+});
+
+test('the scenario page: what ignoring the map\'s fields costs, and what is only expected without it', () => {
+  const page = flat(read('docs/scenarios/google-cloud-compute-engine.md'));
+  assert.match(page, /ignore_changes = \[host_rule, path_matcher\]/);
+  assert.match(page, /is then expected to show the load balancer's own error page/);
+  assert.doesNotMatch(page, /and cannot be woken from its browser/);
+  assert.match(page, /later edits of your path matchers must go outside Terraform's plan, or by removing the ignore for that apply/);
+});
+
+test('the README does not say the hand-made repository can grant nothing', () => {
+  const readme = flat(read('README.md'));
+  assert.doesNotMatch(readme, /a repository is not IAM: nothing is granted/);
+  assert.match(readme, /can create Artifact Registry's service agent and its binding: Google's own, the CLI shows it at its next run/);
+});
+
 test('the README has a Google Cloud section naming the image script and the dev repository', () => {
   const readme = read('README.md');
   assert.match(readme, /^## Google Cloud$/m);

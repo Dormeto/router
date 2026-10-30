@@ -60,21 +60,27 @@ balancer (measured), far beyond what a request can wait. So the application's ba
 good, and the nap uses the load balancer's **custom error response** instead.
 
 **Nap.**
-1. In each path matcher of the URL map (and the map's default) that names the application's backend service, the router
-   writes a custom error response policy: the load balancer's `502` and `503`, which it answers when no backend is
-   healthy, are served from the workload's waker backend service at `/_dormeto/waiting`, with the status overridden to
-   `503`. One `urlMaps.update` each, with the map's fingerprint, read again and retried 3 times if it changed.
+1. In each path matcher of the URL map that names the application's backend service (a map's default service gets a
+   matcher `dormeto-default` of its own at the onboarding: a policy on the map itself would cover the whole load
+   balancer), the router writes a custom error response policy: the load balancer's `502` and `503`, which it answers
+   when no backend is healthy, are served from the workload's waker backend service at `/_dormeto/waiting`, with the
+   status overridden to `503`. One `urlMaps.update` each, with the map's fingerprint; refused because of another update
+   of the map, it is read again and retried with a pause, up to 60 s. A service that no URL map names any more, or that
+   another URL map names too, is not napped: the workload stays awake, nothing is stopped, and the log says why.
 2. It waits 300 s for the change to reach the load balancer (measured: 163–215 s). The application serves during that
    wait: it is the drain.
 3. It stops the VMs, or suspends them when the `hibernate` setting is on and the VM can be suspended (no GPU, no TPU,
    not confidential, at most 208 GB of memory; a refused suspension falls back to a stop). A managed group is napped
-   through the group (`stopInstances`, `suspendInstances`), which keeps the VMs as a standby pool: none is re-created.
+   through the group (`stopInstances`, `suspendInstances`), which keeps the VMs as a standby pool: none is re-created
+   (but see the 60 days in the limits).
    Its autoscaler, if any, is turned off for the nap.
 
-**While asleep.** Every request gets the waiting page (a `503` with `Retry-After`), served by the waker. Its script
+**While asleep.** Every request gets the waiting page (a `503` with `Retry-After`), served by the waker: the waker
+answers the load balancer's fetch with a `200`, and the policy's override gives the visitor the `503`. The page's script
 probes `/_dormeto/wake`, a route the onboarding added to the URL map for good, which goes through the same request
 filters as on AWS (bots, scanners, no-wake rules) before it wakes the workload. API clients wake it with
-`POST /_dormeto/wake`. A plain request does not wake: the error response's fetch may not carry the visitor's request, and
+`POST /_dormeto/wake`, answered with a `202`, JSON and the headers `x-dormeto-state` and `Retry-After` (a `200` once
+awake): the waker answers no `503` there, which the policy would replace with the page. A plain request does not wake: the error response's fetch may not carry the visitor's request, and
 waking on it would let every scanner wake the workload. The page reloads the visitor's address once the workload is
 awake.
 
@@ -91,7 +97,7 @@ refused for lack of capacity (`ZONE_RESOURCE_POOL_EXHAUSTED`) is a capacity fail
 fallback machine type.
 
 **Idle check (every 5 minutes).** For each awake workload, the router reads the application's backend service's
-`request_count` over the idle window (Cloud Monitoring publishes it 72–125 s late, and a single request can be missed:
+`request_count` over the idle window, through any URL map (Cloud Monitoring publishes it 72–125 s late, and a single request can be missed:
 the effective idle window is that much longer). None: nap. For each workload asleep, it checks the URL map still holds
 the error response policy and the `/_dormeto/*` route (else it repairs them), and that the VMs are still down: a VM
 started by hand makes the workload awake, and VMs all stopped by hand while it is awake make it `ASLEEP` with the cause
@@ -105,14 +111,16 @@ started by hand makes the workload awake, and VMs all stopped by hand while it i
 - **The global external Application Load Balancer only.** The regional external and classic load balancers, zonal
   NEGs, Cloud Run and GKE backends are not supported yet.
 - **A URL map written in Terraform must ignore what Dormeto writes.** The nap writes the custom error response policy
-  (`default_custom_error_response_policy`, on the `google_compute_url_map` and on each `path_matcher` naming the
-  application's backend service), and the onboarding adds the route `/_dormeto/*` to those path matchers (a `path_rule`
-  with `paths = ["/_dormeto/*"]`, or, when the matcher has `route_rule`s, a `route_rule` of priority 0). Ignore those
-  fields: `lifecycle { ignore_changes = [default_custom_error_response_policy, path_matcher] }`. Otherwise `terraform
-  apply` removes them: the workload then shows the load balancer's own error page while it is asleep, and cannot be
-  woken from its browser, until the 5-minute check repairs the map. A custom error response policy of your own on a
-  path matcher that names the backend service, or a route of your own under `/_dormeto/`, makes the workload
-  ineligible.
+  (`default_custom_error_response_policy`, on each `path_matcher` naming the application's backend service), and the
+  onboarding adds the route `/_dormeto/*` to those path matchers (a `path_rule` with `paths = ["/_dormeto/*"]`, or, when
+  the matcher has `route_rule`s, a `route_rule` of priority 0); when the map's own default names the service, it adds a
+  `host_rule` `*` and a `path_matcher` `dormeto-default` to hold them. Ignore those fields:
+  `lifecycle { ignore_changes = [host_rule, path_matcher] }`. Otherwise `terraform apply` removes them: the workload is
+  then expected to show the load balancer's own error page while it is asleep, and not to wake from its browser, until
+  the 5-minute check repairs the map. The trade-off: later edits of your path matchers must go outside Terraform's plan,
+  or by removing the ignore for that apply, which removes Dormeto's fields too until the check writes them back. A custom
+  error response policy of your own on a path matcher that names the backend service, or a route of your own under
+  `/_dormeto/`, makes the workload ineligible.
 - **A path matcher naming another service too** shows the waiting page for that service's own `502` and `503` while the
   workload is asleep.
 - **The waiting page's browser wake.** The wake comes from the page's script, or from `POST /_dormeto/wake`. A client
@@ -125,7 +133,10 @@ started by hand makes the workload awake, and VMs all stopped by hand while it i
 - **Stops lose what a stop loses.** A VM with a local SSD or a GPU is refused at onboarding (a stop would lose the
   data). An ephemeral external IPv4 address changes at each start, which does not affect traffic through the load
   balancer. A suspended VM pays for its memory's storage; after 60 days Compute Engine turns it into a stopped one by
-  itself, and the next wake is a normal start.
+  itself, and the next wake is a normal start. A managed group recreates a VM suspended for over 60 days, without
+  keeping its name, IP addresses or disks unless they are stateful, and a stateful group is refused at onboarding: what
+  such a VM's disks held is gone. A regional managed group with the target shape `EVEN` and instance redistribution on is
+  refused at onboarding: Google cannot stop or suspend its VMs one by one.
 - **One router per project and region**, named `dmtr-<region>`. A workload's ID matches
   `^[a-z]([a-z0-9-]{0,38}[a-z0-9])?$` so that its backend service's name fits Compute Engine's 63 characters; it
   defaults to the application's backend service's name when that matches, else `--id` names it.

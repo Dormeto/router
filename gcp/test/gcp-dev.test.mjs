@@ -104,3 +104,12 @@ test('the URL maps depend on all their backend services, so a destroy deletes a 
   assert.match(global, /^\s*depends_on\s*=\s*\[google_compute_backend_service\.demo\]\s*$/m);
   assert.match(regional, /^\s*depends_on\s*=\s*\[google_compute_region_backend_service\.demo\]\s*$/m);
 });
+
+test('the demo\'s URL map ignores what Dormeto writes, as the scenario page advises', async () => {
+  const lb = uncommented(await readFile(join(ROOT, 'lb.tf'), 'utf8'));
+  const urlMap = /resource "google_compute_url_map" "dev" \{[\s\S]*?\n\}/.exec(lb)[0];
+  const ignored = /ignore_changes = \[([^\]]*)\]/.exec(urlMap)[1].split(',').map((name) => name.trim()).filter(Boolean);
+  for (const name of ['host_rule', 'path_matcher', 'default_custom_error_response_policy', 'default_service', 'default_route_action']) {
+    assert.ok(ignored.includes(name), `${name} in ${ignored}`);
+  }
+});

@@ -30,8 +30,10 @@ backend service out of service.
   group of the same VM is not an option: if Compute Engine refuses the shared group at the apply, the regional backend
   services move to the managed group.
 - **The switched services are Dormeto's**: the URL maps ignore changes to their default services and default route
-  actions (the map's and its path matchers'), which the measuring tool (and later Dormeto) switches, as a default
-  service or with weights. The autoscaler ignores its mode, which a managed group's stop turns off.
+  actions, which the measuring tool switches, as a default service or with weights. The global map also ignores its host
+  rules, its path matchers and its error response policy, which the router writes (the scenario page's advice): a later
+  edit of a path matcher takes removing the ignore for that apply. The autoscaler ignores its mode, which a managed
+  group's stop turns off.
 - **No IAM, no API**: every IAM change and every API turned on in the project go through `dormeto gcp install` or
   `uninstall`. This root holds no `google_*_iam_*` resource, no service account and no `google_project_service`, and its
   VMs and template run without a service account (attaching one is an IAM grant); `gcp/test/gcp-dev.test.mjs` checks

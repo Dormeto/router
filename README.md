@@ -468,8 +468,9 @@ podman run --rm -p 8080:8080 -e DMT_ROLE=controller -e DMT_PROJECT=p -e DMT_REGI
 ./scripts/gcp-image.sh 0.34.0 --push europe-west1-docker.pkg.dev/dormeto-dev/dormeto/router
 ```
 
-The dev repository `dormeto` is created once, by hand, in `dormeto-dev` (a repository is not IAM: nothing is granted;
-Cloud Run's service agent reads the project's repositories, so the same project needs no grant):
+The dev repository `dormeto` is created once, by hand, in `dormeto-dev`. Creating it grants nothing of ours, but it can
+create Artifact Registry's service agent and its binding: Google's own, the CLI shows it at its next run. Cloud Run's
+service agent reads the project's repositories, so the same project needs no grant:
 
 ```bash
 gcloud artifacts repositories create dormeto --repository-format=docker --location=europe-west1 --configuration=dormeto-dev

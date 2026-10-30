@@ -61,10 +61,17 @@ binding for a resource it makes (a service agent's).
 | `enable_classic` | `classic.tf`: a classic external Application Load Balancer (`EXTERNAL`, HTTP on port 80, no certificate) on the demo group: the backend services `dmt-demo-classic-app` and `dmt-demo-classic-standin`, the URL map `dmt-dev-classic`, its HTTP proxy, address and forwarding rule | $18 (the forwarding rule) |
 | `enable_neg` | `neg.tf`: the VM `dmt-demo-neg` (`var.machine_type`, no service account), the zonal `GCE_VM_IP_PORT` NEG `dmt-demo-neg` holding it, the `EXTERNAL_MANAGED` backend service `dmt-demo-neg` on it, and a global load balancer of its own: the URL map `dmt-dev-neg`, an HTTP proxy, an address and a forwarding rule on port 80 | $32: the VM $13, its disk $1, the forwarding rule $18 |
 | `enable_sql` | `sql.tf`: the PostgreSQL 16 instance `dmt-demo-sql`, `db-f1-micro`, 10 GB on a hard disk, `deletion_protection = false`, a public address and no authorized network (no connection can be made; no user, no database) | $12 (Cloud SQL keeps a deleted instance's name for about a week) |
-| `enable_gke` | `gke.tf`: the zonal Standard cluster `dmt-demo-gke` (its own subnet `dmt-dev-gke`, the DNS endpoint on and reachable from outside, Gateway API standard channel, `deletion_protection = false`), one node pool of one `e2-small` node on the default compute service account, a firewall rule for Google's health checkers to the pods' port 8080, and a global load balancer for the Service's NEG: the backend service `dmt-demo-gke`, its health check, the URL map `dmt-dev-gke`, an HTTP proxy, an address and a forwarding rule on port 80 | $32: the node $13, its disk $1, the forwarding rule $18; the cluster's fee ($73) is within the free tier of one zonal cluster per billing account, if this account's is unused |
+| `enable_gke` | `gke.tf`: the zonal Standard cluster `dmt-demo-gke` (its own subnet `dmt-dev-gke`, the DNS endpoint on and reachable from outside, Gateway API standard channel, `deletion_protection = false`), one node pool of one `e2-small` node on the default compute service account, a firewall rule for Google's health checkers to the pods' port 8080, and a global load balancer for the Service's NEG: the backend service `dmt-demo-gke`, its health check, the URL map `dmt-dev-gke`, an HTTP proxy, an address and a forwarding rule on port 80 | $32: the node $13, its disk $1, the forwarding rule $18; the cluster's fee ($73) is within the free tier of one zonal cluster per billing account, if this account's is unused. The Gateway of `gke-demo.yaml` makes GKE create another forwarding rule, about $18 more while it exists: delete the Gateway and the HTTPRoute right after M10 |
 
-The NEG VM and the GKE load balancer have no domain name: their addresses are in the output `optional` (`terraform output
-optional`), and the measuring tool takes them as `--url`. The demo VM still belongs to one workload at a time (G1's rule):
+**Needs first.** `enable_sql` and `enable_gke` need the `sqladmin` and `container` APIs, which this root does not turn on
+(no `google_project_service`, by design): `dormeto gcp install --with cloud-sql,gke` does, and **not in `europe-west1`
+before 2026-11-02**. The probe's Cloud Run job (below) needs a router image holding `probe.mjs`: one built and pushed
+for the measures (`scripts/gcp-image.sh <version> --push <repository>`).
+
+The NEG VM and the GKE load balancer have no domain name, and the root has no output for them (an output the defaults do
+not store would show in a plan): read an address with `gcloud compute addresses describe dmt-dev-neg --global
+--format='value(address)' --configuration=dormeto-dev` (`dmt-dev-classic`, `dmt-dev-gke` the same), and give the measuring tool
+`--url http://<address>/`. The demo VM still belongs to one workload at a time (G1's rule):
 the global, regional and classic load balancers share its group, so the acceptance offboards between them, and a nap on
 one takes the others' backends down meanwhile. If Compute Engine refuses the group as the backend of both an `EXTERNAL`
 and an `EXTERNAL_MANAGED` service at the apply, the classic backend services move to the managed group.
@@ -84,27 +91,36 @@ gcloud compute backend-services add-backend dmt-demo-gke --global --network-endp
   --network-endpoint-group-zone=europe-west1-b --balancing-mode=RATE --max-rate-per-endpoint=100 --configuration=dormeto-dev
 ```
 
-(The backend service ignores its `backend` in Terraform, so a later plan does not remove the NEG; delete the Service
-before the destroy, so that the NEG goes before its backend service.)
+(The backend service ignores its `backend` in Terraform, so a later plan does not remove the NEG.)
+
+**Teardown, in this order**: Google refuses to delete a NEG a backend service still uses, and the NEG was attached by
+hand. (1) Detach it: `gcloud compute backend-services remove-backend dmt-demo-gke --global --network-endpoint-group=dmt-demo-gke
+--network-endpoint-group-zone=europe-west1-b --configuration=dormeto-dev`. (2) Delete the manifest: `kubectl delete -f
+terraform/gcp-dev/gke-demo.yaml` (the Service's NEG and the Gateway's load balancer go with it). (3) `plan -out` with
+`enable_gke` off, read it, apply the saved plan. Terraform has no dependency between the cluster and the backend service, so
+they are destroyed in parallel: a cluster deleted while the Service still exists leaves its NEG behind, and the NEG then
+blocks nothing but stays and costs nothing much; check `gcloud compute network-endpoint-groups list
+--configuration=dormeto-dev` after the apply and delete a leftover `dmt-demo-gke` by hand.
 
 ### Measure the optional parts
 
 ```
+addr() { gcloud compute addresses describe "$1" --global --format='value(address)' --configuration=dormeto-dev; }
 # S3: a stopped VM in a NEG keeps its endpoint? (M1)
-node gcp/tools/measure.mjs neg stop  --url "$(terraform output -json optional | jq -r .neg.url)"
-node gcp/tools/measure.mjs neg start --url "$(terraform output -json optional | jq -r .neg.url)"
+node gcp/tools/measure.mjs neg stop  --url "http://$(addr dmt-dev-neg)/"
+node gcp/tools/measure.mjs neg start --url "http://$(addr dmt-dev-neg)/"
 # S4: the classic map's switch (M2), health of a service in no map (M3), the classic request count (M5)
-node gcp/tools/measure.mjs switch --url-map dmt-dev-classic --url "$(terraform output -json optional | jq -r .classic.url)" \
+node gcp/tools/measure.mjs switch --url-map dmt-dev-classic --url "http://$(addr dmt-dev-classic)/" \
   --from dmt-demo-classic-standin --to dmt-demo-classic-app
 node gcp/tools/measure.mjs health --backend-service dmt-demo-classic-app --for 120
-node gcp/tools/measure.mjs metric --url-map dmt-dev-classic --url "$(terraform output -json optional | jq -r .classic.url)" \
+node gcp/tools/measure.mjs metric --url-map dmt-dev-classic --url "http://$(addr dmt-dev-classic)/" \
   --metric loadbalancing.googleapis.com/https/request_count
 # S5: Cloud SQL stopped and started by its activation policy, state and policy read every 10 s (M6)
 node gcp/tools/measure.mjs sql stop
 node gcp/tools/measure.mjs sql start
 # S6: the Deployment scaled to 0 and back through the cluster's DNS endpoint, as the owner (M9)
-node gcp/tools/measure.mjs gke scale --replicas 0 --url "$(terraform output -json optional | jq -r .gke.url)"
-node gcp/tools/measure.mjs gke scale --replicas 1 --url "$(terraform output -json optional | jq -r .gke.url)"
+node gcp/tools/measure.mjs gke scale --replicas 0 --url "http://$(addr dmt-dev-gke)/"
+node gcp/tools/measure.mjs gke scale --replicas 1 --url "http://$(addr dmt-dev-gke)/"
 ```
 
 Each prints a timeline like the others. `neg` adds the NEG's endpoints (kept or dropped while the VM is stopped);

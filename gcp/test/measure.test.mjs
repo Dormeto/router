@@ -841,3 +841,9 @@ test('the demo pods\' page (Google\'s hello-app) is the app\'s answer, with the 
     { kind: 'app', instance: 'dmt-demo-gke-5d8c9-abcde', boot: null });
   assert.equal(pageOf(503, 'Hello, world!').kind, 'http 503');
 });
+
+test('the stand-in page is still the stand-in, and a hello-app page is not taken for it', () => {
+  assert.equal(pageOf(200, '<h1>Dormeto demo: stand-in</h1><span id="instance">dmt-demo</span>').kind, 'stand-in');
+  assert.equal(pageOf(200, '<h1>Dormeto demo: app</h1>').kind, 'app');
+  assert.equal(pageOf(200, 'something else').kind, 'http 200');
+});

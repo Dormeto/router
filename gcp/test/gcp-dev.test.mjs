@@ -183,3 +183,9 @@ test('the GKE demo manifest holds the Deployment, the Service with a standalone 
   assert.match(yaml, /cloud\.google\.com\/neg/);
   assert.doesNotMatch(yaml, /kind: (?:ClusterRole|Role|RoleBinding|ClusterRoleBinding)\b/);
 });
+
+test('outputs.tf gains nothing conditional: an output a plan with the defaults would show is a change', async () => {
+  const outputs = uncommented(await readFile(join(ROOT, 'outputs.tf'), 'utf8'));
+  assert.doesNotMatch(outputs, /enable_|\boptional\b|\bone\(|\[0\]|\[\*\]|google_sql_|google_container_|\.(?:classic|neg|gke)\b/);
+  assert.deepEqual([...outputs.matchAll(/^output\s+"([^"]+)"/gm)].map((m) => m[1]), ['urls', 'addresses', 'url_maps', 'backend_services']);
+});

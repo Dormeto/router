@@ -7,6 +7,7 @@ import http from 'node:http';
 import {
   UsageError, parseArgs, line, delta, pageOf, kindOfPort, summarize, changes, healthStates, managedStates, targets, actionSummary,
   switchService, healthLevel, changesSince, periods, tokenArgs, credentialOf, createTokens, withToken, pointsOf, metricFilter, counted,
+  USAGE, endpointStates, endpointAddresses, endpointRange, sqlState, sqlSummary, podsState, scaleAction, deploymentPath,
 } from '../tools/measure-core.mjs';
 import { probe } from '../tools/measure.mjs';
 
@@ -91,6 +92,79 @@ test('health: a backend service\'s health every 2 s for 2 minutes, dmt-demo-app 
   assert.equal(options.backendService, 'dmt-demo-regional-app');
   assert.equal(options.region, 'europe-west1');
   assert.equal(options.duration, 300);
+});
+
+test('switch on a classic load balancer: a global URL map by its name and the address, nothing else new', () => {
+  const { options } = parseArgs(['switch', '--url-map', 'dmt-dev-classic', '--from', 'dmt-demo-classic-app', '--to', 'dmt-demo-classic-standin',
+    '--url', 'http://203.0.113.7/']);
+  assert.equal(options.region, null);
+  assert.equal(options.urlMap, 'dmt-dev-classic');
+  assert.equal(options.url, 'http://203.0.113.7/');
+});
+
+test('health of a backend service in no URL map, and the metric of the classic and regional load balancers: the existing options', () => {
+  const { options } = parseArgs(['health', '--backend-service', 'dmt-demo-classic-app', '--for', '60']);
+  assert.equal(options.backendService, 'dmt-demo-classic-app');
+  assert.equal(options.region, null);
+  assert.equal(parseArgs(['metric', '--url-map', 'dmt-dev-classic', '--url', 'http://203.0.113.7/']).options.metric,
+    'loadbalancing.googleapis.com/https/request_count');
+  const regional = parseArgs(['metric', '--url-map', 'dmt-dev-regional', '--url', 'http://regional.gcp.dev.dormeto.com/',
+    '--metric', 'loadbalancing.googleapis.com/https/external/regional/request_count', '--filter', 'resource.labels.backend_target_name="dmt-demo-regional-app"']);
+  assert.equal(regional.options.metric, 'loadbalancing.googleapis.com/https/external/regional/request_count');
+});
+
+test('neg: the VM of the zonal NEG, its group and backend service by default; the address is required', () => {
+  for (const action of ['stop', 'start']) {
+    assert.deepEqual(parseArgs(['neg', action, '--url', 'http://203.0.113.8/']), {
+      command: 'neg',
+      action,
+      options: {
+        project: 'dormeto-dev', configuration: 'dormeto-dev', timeout: 600, settle: 20, region: null,
+        zone: 'europe-west1-b', instance: 'dmt-demo-neg', group: 'dmt-demo-neg', backendService: 'dmt-demo-neg',
+        url: 'http://203.0.113.8/',
+      },
+    });
+  }
+  assert.throws(() => parseArgs(['neg', 'stop']), UsageError);
+  assert.throws(() => parseArgs(['neg', 'suspend', '--url', 'http://203.0.113.8/']), UsageError);
+});
+
+test('sql: the instance dmt-demo-sql, stopped or started, 30 minutes at most', () => {
+  assert.deepEqual(parseArgs(['sql', 'stop']), {
+    command: 'sql',
+    action: 'stop',
+    options: { project: 'dormeto-dev', configuration: 'dormeto-dev', timeout: 1800, instance: 'dmt-demo-sql' },
+  });
+  assert.equal(parseArgs(['sql', 'start', '--instance', 'other-sql']).options.instance, 'other-sql');
+  for (const argv of [['sql'], ['sql', 'suspend'], ['sql', 'stop', '--url', 'http://203.0.113.8/'], ['sql', 'stop', '--region', 'europe-west1']]) {
+    assert.throws(() => parseArgs(argv), UsageError, argv.join(' '));
+  }
+});
+
+test('gke scale: the demo Deployment to a number of replicas, 0 included; the address is required', () => {
+  assert.deepEqual(parseArgs(['gke', 'scale', '--replicas', '0', '--url', 'http://203.0.113.9/']), {
+    command: 'gke',
+    action: 'scale',
+    options: {
+      project: 'dormeto-dev', configuration: 'dormeto-dev', timeout: 900, settle: 20, region: null,
+      zone: 'europe-west1-b', cluster: 'dmt-demo-gke', namespace: 'default', deployment: 'dmt-demo-gke', replicas: 0,
+      backendService: 'dmt-demo-gke', url: 'http://203.0.113.9/',
+    },
+  });
+  assert.equal(parseArgs(['gke', 'scale', '--replicas', '2', '--url', 'http://203.0.113.9/', '--namespace', 'demo']).options.namespace, 'demo');
+  for (const argv of [
+    ['gke', 'scale', '--url', 'http://203.0.113.9/'],
+    ['gke', 'scale', '--replicas', '1'],
+    ['gke', 'scale', '--replicas', '-1', '--url', 'http://203.0.113.9/'],
+    ['gke', 'scale', '--replicas', '1.5', '--url', 'http://203.0.113.9/'],
+    ['gke', 'scale', '--replicas', '1', '--url', 'http://203.0.113.9/', '--namespace', 'a/b'],
+    ['gke', 'start', '--replicas', '1', '--url', 'http://203.0.113.9/'],
+    ['vm', 'start', '--replicas', '1'],
+  ]) assert.throws(() => parseArgs(argv), UsageError, argv.join(' '));
+});
+
+test('the usage lists the new commands', () => {
+  for (const word of ['neg stop|start', 'sql stop|start', 'gke scale']) assert.ok(USAGE.includes(word), word);
 });
 
 test('help: --help, -h and help', () => {
@@ -683,4 +757,87 @@ test('the probe: a refused connection is an error answer, not an exception', asy
   assert.equal(answer.kind, 'error');
   assert.equal(answer.status, 0);
   assert.match(answer.error, /ECONNREFUSED/);
+});
+
+// --- NEG, Cloud SQL and GKE ---
+
+test('a NEG\'s endpoints: each instance with its address and port; none when the NEG is empty', () => {
+  assert.deepEqual(endpointStates({
+    items: [{ networkEndpoint: { instance: `${ZONE}/instances/dmt-demo-neg`, ipAddress: '10.10.0.5', port: 80 } }],
+  }), { 'dmt-demo-neg': '10.10.0.5:80' });
+  assert.deepEqual(endpointStates({}), {});
+});
+
+test('Cloud SQL\'s reading: the state and the activation policy', () => {
+  assert.equal(sqlState({ state: 'RUNNABLE', settings: { activationPolicy: 'ALWAYS' } }), 'RUNNABLE ALWAYS');
+  assert.equal(sqlState({ state: 'SUSPENDED', settings: { activationPolicy: 'NEVER' } }), 'SUSPENDED NEVER');
+  assert.equal(sqlState({}), 'unknown none');
+});
+
+test('a stop\'s summary: the policy read as NEVER, then the instance SUSPENDED; samples before the request do not count', () => {
+  const samples = [
+    { t: 0, states: { db: 'RUNNABLE ALWAYS' } },
+    { t: 10_000, states: { db: 'SUSPENDED NEVER' } },
+    { t: 20_000, states: { db: 'RUNNABLE NEVER' } },
+    { t: 30_000, states: { db: 'RUNNABLE NEVER' } },
+    { t: 40_000, states: { db: 'SUSPENDED NEVER' } },
+  ];
+  assert.deepEqual(sqlSummary('stop', { since: 15_000, name: 'db', samples }), { policy: 20_000, reached: 40_000 });
+  assert.deepEqual(sqlSummary('stop', { since: 50_000, name: 'db', samples }), { policy: null, reached: null });
+});
+
+test('a start\'s summary: the policy ALWAYS, then RUNNABLE', () => {
+  const samples = [
+    { t: 1000, states: { db: 'SUSPENDED NEVER' } },
+    { t: 11_000, states: { db: 'SUSPENDED ALWAYS' } },
+    { t: 21_000, states: { db: 'RUNNABLE ALWAYS' } },
+  ];
+  assert.deepEqual(sqlSummary('start', { since: 500, name: 'db', samples }), { policy: 11_000, reached: 21_000 });
+});
+
+test('a Deployment\'s state: STOPPED at 0 replicas, RUNNING when all are ready, else PENDING', () => {
+  assert.equal(podsState({ spec: { replicas: 0 }, status: {} }), 'STOPPED');
+  assert.equal(podsState({ spec: { replicas: 0 }, status: { replicas: 1, readyReplicas: 1 } }), 'PENDING');
+  assert.equal(podsState({ spec: { replicas: 2 }, status: { replicas: 2, readyReplicas: 1 } }), 'PENDING');
+  assert.equal(podsState({ spec: { replicas: 2 }, status: { replicas: 2, readyReplicas: 2 } }), 'RUNNING');
+  assert.equal(podsState({ spec: { replicas: 1 } }), 'PENDING');
+});
+
+test('a scale is a stop to 0 and a start to more, as the summary of a VM\'s action; the same number is nothing to do', () => {
+  assert.equal(scaleAction(1, 0), 'stop');
+  assert.equal(scaleAction(0, 1), 'start');
+  assert.equal(scaleAction(1, 3), 'start');
+  assert.equal(scaleAction(3, 1), 'start');
+  assert.equal(scaleAction(2, 2), null);
+});
+
+test('the Deployment\'s scale path on the cluster\'s DNS endpoint', () => {
+  assert.equal(deploymentPath('default', 'dmt-demo-gke'), '/apis/apps/v1/namespaces/default/deployments/dmt-demo-gke');
+});
+
+test('a GKE NEG\'s endpoints are pods: each address and port with the node holding it', () => {
+  assert.deepEqual(endpointAddresses({
+    items: [
+      { networkEndpoint: { instance: `${ZONE}/instances/gke-node-1`, ipAddress: '10.20.0.5', port: 8080 } },
+      { networkEndpoint: { instance: `${ZONE}/instances/gke-node-1`, ipAddress: '10.20.0.6', port: 8080 } },
+    ],
+  }), { '10.20.0.5:8080': 'gke-node-1', '10.20.0.6:8080': 'gke-node-1' });
+  assert.deepEqual(endpointAddresses({}), {});
+});
+
+test('the endpoints during an action: how many there were, at least, at most, and at the end; the reads before it do not count', () => {
+  const samples = [
+    { t: 0, states: { a: 'x', b: 'y' } },
+    { t: 1000, states: { a: 'x' } },
+    { t: 2000, states: {} },
+    { t: 3000, states: { a: 'x' } },
+  ];
+  assert.deepEqual(endpointRange(samples, 500), { reads: 3, min: 0, max: 1, last: 1 });
+  assert.deepEqual(endpointRange(samples, 9000), { reads: 0, min: null, max: null, last: null });
+});
+
+test('the demo pods\' page (Google\'s hello-app) is the app\'s answer, with the pod as its instance', () => {
+  assert.deepEqual(pageOf(200, 'Hello, world!\nVersion: 1.0.0\nHostname: dmt-demo-gke-5d8c9-abcde\n'),
+    { kind: 'app', instance: 'dmt-demo-gke-5d8c9-abcde', boot: null });
+  assert.equal(pageOf(503, 'Hello, world!').kind, 'http 503');
 });

@@ -21,14 +21,26 @@ export const USAGE = `Usage: node gcp/tools/measure.mjs <command> [options]
   mig stop|start|suspend|resume             the managed group's VMs, through the group (its autoscaler off, back on)
          [--group dmt-demo-mig] [--autoscaler dmt-demo-mig] [--autoscaler-mode ON] [--zone europe-west1-b]
          [--backend-service dmt-demo-mig-app] [--region <region>] [--url https://mig.gcp.dev.dormeto.com/]
+  neg stop|start --url <address of the NEG's load balancer>
+                                            the VM of the zonal NEG, through Compute Engine: the NEG's endpoints,
+                                            the backend service's health, the answers
+         [--instance dmt-demo-neg] [--group dmt-demo-neg] [--backend-service dmt-demo-neg] [--zone europe-west1-b]
+  sql stop|start                            the Cloud SQL instance, by its activation policy (NEVER | ALWAYS):
+         [--instance dmt-demo-sql]          its state and policy read every 10 s
+  gke scale --replicas <n> --url <address of the GKE load balancer>
+                                            the Deployment's scale through the cluster's DNS endpoint, with the
+                                            caller's token: the pods, the NEG's endpoints, the backend service's
+                                            health, the answers
+         [--cluster dmt-demo-gke] [--namespace default] [--deployment dmt-demo-gke] [--backend-service dmt-demo-gke]
+         [--zone europe-west1-b]
   metric                                    send requests, then wait for Cloud Monitoring to count them: the URL
                                             map's series, over the points published before the requests
          [--url-map dmt-dev] [--url https://gcp.dev.dormeto.com/] [--count 20]
          [--metric loadbalancing.googleapis.com/https/request_count] [--filter <extra filter>]
 
   Every command: [--project dormeto-dev] [--configuration dormeto-dev] (gcloud's); all but health:
-  [--timeout <seconds>]; switch, vm, mig: [--settle 20] (answers in a row from the new backend). --region: a regional
-  load balancer's URL map or backend service (none: global).`;
+  [--timeout <seconds>]; switch, vm, mig, neg, gke: [--settle 20] (answers in a row from the new backend). --region: a
+  regional load balancer's URL map or backend service (none: global; a classic load balancer's is global too).`;
 
 const ACTIONS = ['stop', 'start', 'suspend', 'resume'];
 const AUTOSCALER_MODES = ['ON', 'OFF', 'ONLY_SCALE_OUT'];
@@ -62,6 +74,10 @@ const OPTIONS = {
   filter: { flag: 'filter', kind: 'text', default: null },
   weighted: { flag: 'weighted', kind: 'boolean', default: false },
   duration: { flag: 'for', kind: 'positive', default: 120 },
+  replicas: { flag: 'replicas', kind: 'count', required: true },
+  cluster: { flag: 'cluster', kind: 'name', default: 'dmt-demo-gke' },
+  namespace: { flag: 'namespace', kind: 'name', default: 'default' },
+  deployment: { flag: 'deployment', kind: 'name', default: 'dmt-demo-gke' },
 };
 
 const COMMANDS = {
@@ -75,6 +91,22 @@ const COMMANDS = {
   },
   metric: { actions: null, timeout: 900, options: ['project', 'configuration', 'timeout', 'urlMap', 'url', 'count', 'metric', 'filter'] },
   health: { actions: null, options: ['project', 'configuration', 'region', 'backendService', 'duration'] },
+  // The NEG's VM and the GKE demo have no domain name: the address of their load balancer (terraform output optional).
+  neg: {
+    actions: ['stop', 'start'],
+    timeout: 600,
+    options: ['project', 'configuration', 'timeout', 'settle', 'region', 'zone', 'instance', 'group', 'backendService', 'url'],
+    defaults: { instance: 'dmt-demo-neg', group: 'dmt-demo-neg', backendService: 'dmt-demo-neg' },
+    required: ['url'],
+  },
+  sql: { actions: ['stop', 'start'], timeout: 1800, options: ['project', 'configuration', 'timeout', 'instance'], defaults: { instance: 'dmt-demo-sql' } },
+  gke: {
+    actions: ['scale'],
+    timeout: 900,
+    options: ['project', 'configuration', 'timeout', 'settle', 'region', 'zone', 'cluster', 'namespace', 'deployment', 'replicas', 'backendService', 'url'],
+    defaults: { backendService: 'dmt-demo-gke' },
+    required: ['url'],
+  },
 };
 const NAMES = Object.keys(COMMANDS).join(', ');
 
@@ -134,7 +166,7 @@ export function parseArgs(argv) {
   for (const key of spec.options) {
     const raw = parsed.values[OPTIONS[key].flag];
     if (raw === undefined) {
-      if (OPTIONS[key].required) throw new UsageError(`${command}: --${OPTIONS[key].flag} is required`);
+      if (OPTIONS[key].required || spec.required?.includes(key)) throw new UsageError(`${command}: --${OPTIONS[key].flag} is required`);
       result[key] = key === 'timeout' ? spec.timeout : (spec.defaults?.[key] ?? OPTIONS[key].default ?? null);
     } else {
       result[key] = value(key, OPTIONS[key].kind, raw);
@@ -152,6 +184,8 @@ export const delta = (ms) => `${ms < 0 ? '-' : '+'}${(Math.abs(ms) / 1000).toFix
 
 // A load balancer's answer: the demo's app or stand-in page (instance, boot time), else its HTTP status.
 export function pageOf(status, body) {
+  // The GKE demo's pods run Google's hello-app, which says "Hello, world!" and its pod's name.
+  if (status === 200 && body.includes('Hello, world!')) return { kind: 'app', instance: body.match(/Hostname: (\S+)/)?.[1] ?? null, boot: null };
   const kind = status !== 200 ? null
     : body.includes('Dormeto demo: stand-in') ? 'stand-in'
       : body.includes('Dormeto demo: app') ? 'app' : null;
@@ -420,4 +454,52 @@ export function counted(points, { from, to, before = [] }) {
   return points
     .filter((p) => Date.parse(p.end) > from && Date.parse(p.start) <= to)
     .reduce((sum, p) => sum + Math.max(0, p.value - (base.get(p.key) ?? 0)), 0);
+}
+
+// A NEG's listNetworkEndpoints answer → { instance name: 'address:port' }.
+export function endpointStates(response) {
+  return Object.fromEntries((response.items ?? []).map(({ networkEndpoint: e }) => [lastSegment(e.instance), `${e.ipAddress}:${e.port}`]));
+}
+
+// Cloud SQL's instance → what the timeline follows: its state and its activation policy.
+export const sqlState = (instance) => `${instance.state ?? 'unknown'} ${instance.settings?.activationPolicy ?? 'none'}`;
+
+// The policy and the state a Cloud SQL stop or start ends on (M6 pins the state a stopped instance reads).
+const SQL_FINAL = { stop: { policy: 'NEVER', state: 'SUSPENDED' }, start: { policy: 'ALWAYS', state: 'RUNNABLE' } };
+
+// Poller samples [{ t, states: { name: 'STATE POLICY' } }] → when the instance first read the new policy and then the
+// final state, from `since` on (a sample before the request does not count): { policy, reached } (ms or null).
+export function sqlSummary(action, { since, name, samples }) {
+  const final = SQL_FINAL[action];
+  const after = [...samples].filter((s) => s.t >= since).sort((a, b) => a.t - b.t);
+  const read = (s) => (s.states[name] ?? '').split(' ');
+  const policy = after.find((s) => read(s)[1] === final.policy)?.t ?? null;
+  const reached = after.find((s) => read(s)[0] === final.state && read(s)[1] === final.policy)?.t ?? null;
+  return { policy, reached };
+}
+
+// A Deployment (or its scale) → STOPPED at 0 replicas wanted and none left, RUNNING when all wanted are ready, else PENDING.
+export function podsState(deployment) {
+  const wanted = deployment.spec?.replicas ?? 0;
+  const status = deployment.status ?? {};
+  if (wanted === 0) return (status.replicas ?? 0) === 0 ? 'STOPPED' : 'PENDING';
+  return (status.readyReplicas ?? 0) >= wanted && (status.replicas ?? 0) <= wanted ? 'RUNNING' : 'PENDING';
+}
+
+// A scale's summary is a VM action's: to 0 a stop, to more a start; the same number is nothing to do (null).
+export const scaleAction = (current, wanted) => (current === wanted ? null : wanted === 0 ? 'stop' : 'start');
+
+export const deploymentPath = (namespace, name) => `/apis/apps/v1/namespaces/${namespace}/deployments/${name}`;
+
+// A GKE NEG's endpoints are pods: { 'address:port': node name }.
+export function endpointAddresses(response) {
+  return Object.fromEntries((response.items ?? []).map(({ networkEndpoint: e }) => [`${e.ipAddress}:${e.port}`, lastSegment(e.instance)]));
+}
+
+// Poller samples [{ t, states }] of endpoints → how many there were from `since` on: the reads, the fewest, the most
+// and the last (null when none was read).
+export function endpointRange(samples, since) {
+  const counts = [...samples].filter((s) => s.t >= since).sort((a, b) => a.t - b.t).map((s) => Object.keys(s.states).length);
+  if (counts.length === 0) return { reads: 0, min: null, max: null, last: null };
+  return { reads: counts.length, min: Math.min(...counts), max: Math.max(...counts), last: counts.at(-1) };
 }

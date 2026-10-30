@@ -7,6 +7,8 @@ WORKDIR /app
 COPY package.json ./package.json
 COPY lambda/src/lib ./lambda/src/lib
 COPY gcp/src ./gcp/src
+# The one tool of the image: a Cloud Run job runs it as the router's service account (spec 2026-10-30, section 10).
+COPY gcp/tools/probe.mjs ./gcp/tools/probe.mjs
 ENV NODE_ENV=production PORT=8080
 EXPOSE 8080
 # The distroless entry point is `node`.

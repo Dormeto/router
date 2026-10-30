@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // G0's measuring tool (vision docs/specs/2026-10-29-google-cloud-design.md, section 12), for terraform/gcp-dev: how
 // fast a URL map switch takes effect, how fast stopped or suspended VMs come back healthy, Cloud Monitoring's request
-// count delay, and whether Google health checks a backend service out of service. Each command prints a timeline, one
+// count delay, and whether Google health checks a backend service out of service; and (spec 2026-10-30, section 10) a
+// VM in a zonal NEG, a Cloud SQL instance stopped and started, and a Deployment scaled behind a standalone NEG. Each command prints a timeline, one
 // line per event: `<seconds since the start>s  <what>  <value>`.
 //
 // Google's REST APIs with gcloud's access token (`gcloud config config-helper --format=json --min-expiry=20m
@@ -19,11 +20,15 @@ import * as core from './measure-core.mjs';
 
 const COMPUTE = 'https://compute.googleapis.com/compute/v1';
 const MONITORING = 'https://monitoring.googleapis.com/v3';
+const SQLADMIN = 'https://sqladmin.googleapis.com/v1';
+const CONTAINER = 'https://container.googleapis.com/v1';
 const PROBE_TIMEOUT_MS = 10_000;
 const OPERATION_TIMEOUT_MS = 180_000;
 const STATUS_EVERY_MS = 1000;
 const HEALTH_EVERY_MS = 2000;
 const METRIC_EVERY_MS = 10_000;
+// Cloud SQL's state and policy: the router polls every 10 s (spec section 9), so does the measure.
+const SQL_EVERY_MS = 10_000;
 
 // One request to the load balancer, on a new connection (`Connection: close`: undici closes the socket after the
 // answer, so the next request opens another, as a new client would), never cached, never redirected.
@@ -395,6 +400,131 @@ async function runMig(ctx) {
   });
 }
 
+// An action's endpoints, read while it ran: how many there were (a stopped VM keeps its NEG endpoint, M1; scaled to 0,
+// a Deployment's NEG holds none, M9).
+function logEndpoints(ctx, poller, since) {
+  const { reads, min, max, last } = core.endpointRange(poller.samples, since);
+  ctx.log('endpoints', reads === 0 ? 'not read' : `${min} to ${max} during the ${ctx.action}, ${last} at the end, ${plural(reads, 'read')}`);
+}
+
+// neg stop|start: a VM held by a zonal NEG, as `vm`, with the NEG's endpoints read every 2 s beside the backend
+// service's health (getHealth on the NEG): the endpoint kept while the VM is stopped, unhealthy, then healthy (M1).
+async function runNeg(ctx) {
+  const { options: o, action, request, log } = ctx;
+  const zone = `${COMPUTE}/projects/${o.project}/zones/${o.zone}`;
+  const instanceUrl = `${zone}/instances/${o.instance}`;
+  const backendService = await request('GET', `${scopeOf(o)}/backendServices/${o.backendService}`);
+  const readStatus = async () => ({ [o.instance]: (await request('GET', instanceUrl)).status });
+  const initial = await readStatus();
+  log('status', `${o.instance} ${initial[o.instance]}`);
+  if (core.targets(action, initial).length === 0) throw new CheckError(`${o.instance} is ${initial[o.instance]}: nothing to ${action}`);
+
+  const readEndpoints = async () => core.endpointStates(await request('POST', `${zone}/networkEndpointGroups/${o.group}/listNetworkEndpoints`, {}));
+  const firstEndpoints = await readEndpoints();
+  log('endpoint', `${o.group}: ${Object.entries(firstEndpoints).map(([name, at]) => `${name} ${at}`).join(', ') || 'none'}`);
+  const endpoints = startPoller(ctx, HEALTH_EVERY_MS, readEndpoints, reporter(ctx, 'endpoint', firstEndpoints, 'none'));
+  const statusPoller = startPoller(ctx, STATUS_EVERY_MS, readStatus, reporter(ctx, 'status', initial));
+  const since = ctx.at();
+  try {
+    return await runAction(ctx, {
+      names: [o.instance],
+      statusPoller,
+      backendService,
+      act: () => request('POST', `${instanceUrl}/${action}`),
+      finish: async () => {
+        await endpoints.stop();
+        logEndpoints(ctx, endpoints, since);
+      },
+    });
+  } finally {
+    await endpoints.stop();
+  }
+}
+
+// sql stop|start: the activation policy patched (NEVER | ALWAYS), then the instance's state and policy read every 10 s
+// until it is SUSPENDED (stop) or RUNNABLE (start) (M6).
+async function runSql(ctx) {
+  const { options: o, action, request, log } = ctx;
+  const url = `${SQLADMIN}/projects/${o.project}/instances/${o.instance}`;
+  const policy = action === 'stop' ? 'NEVER' : 'ALWAYS';
+  const instance = await request('GET', url);
+  log('instance', `${o.instance}: ${core.sqlState(instance)}, ${instance.databaseVersion ?? '?'} ${instance.settings?.tier ?? '?'}, ${instance.settings?.dataDiskType ?? '?'} ${instance.settings?.dataDiskSizeGb ?? '?'} GB`);
+  if (instance.settings?.activationPolicy === policy) throw new CheckError(`${o.instance} has the activation policy ${policy} already: nothing to ${action}`);
+  const initial = { [o.instance]: core.sqlState(instance) };
+  const poller = startPoller(ctx, SQL_EVERY_MS, async () => ({ [o.instance]: core.sqlState(await request('GET', url)) }), reporter(ctx, 'state', initial));
+  let since = null;
+  let summary = { policy: null, reached: null };
+  try {
+    since = ctx.at();
+    log(action, `sent: activationPolicy ${policy}`);
+    const operation = await request('PATCH', url, { settings: { activationPolicy: policy } });
+    log('operation', `${operation.operationType ?? '?'} ${operation.status ?? '?'}, ${core.delta(ctx.at() - since)} after the request`);
+    const deadline = Date.now() + o.timeout * 1000;
+    while (!ctx.interrupted() && Date.now() < deadline) {
+      summary = core.sqlSummary(action, { since, name: o.instance, samples: poller.samples });
+      if (summary.reached !== null) break;
+      await ctx.wait(1000);
+    }
+  } finally {
+    await poller.stop();
+  }
+  summary = core.sqlSummary(action, { since, name: o.instance, samples: poller.samples });
+  const after = (t) => `${core.delta(t - since)} after the request`;
+  printSummary(log, [
+    ['policy', summary.policy, `${policy}, ${after(summary.policy)}`, `no: not read as ${policy}`],
+    ['reached', summary.reached, `${action === 'stop' ? 'SUSPENDED' : 'RUNNABLE'}, ${after(summary.reached)}`, `no: not within ${o.timeout} s`],
+  ]);
+  return summary.reached !== null ? 0 : 1;
+}
+
+// gke scale --replicas <n>: the cluster's DNS endpoint from the Container API, the Deployment's scale read and put
+// through it with the caller's token (the owner is cluster-admin), then as a VM's action: the pods, the NEG's
+// endpoints, the backend service's health and the load balancer's answers (M9, M11's scale as the owner).
+async function runGke(ctx) {
+  const { options: o, request, log } = ctx;
+  const cluster = await request('GET', `${CONTAINER}/projects/${o.project}/locations/${o.zone}/clusters/${o.cluster}`);
+  const host = cluster.controlPlaneEndpointsConfig?.dnsEndpointConfig?.endpoint;
+  if (!host) throw new CheckError(`the cluster ${o.cluster} has no DNS endpoint: turn on controlPlaneEndpointsConfig.dnsEndpointConfig`);
+  log('cluster', `${o.cluster}: ${cluster.autopilot?.enabled ? 'Autopilot' : 'Standard'}, DNS endpoint ${host}`);
+  const base = `https://${host}${core.deploymentPath(o.namespace, o.deployment)}`;
+  const deployment = await request('GET', base);
+  const action = core.scaleAction(deployment.spec?.replicas ?? 0, o.replicas);
+  log('deployment', `${o.namespace}/${o.deployment}: ${deployment.spec?.replicas ?? 0} replicas wanted, ${deployment.status?.readyReplicas ?? 0} ready`);
+  if (action === null) throw new CheckError(`${o.deployment} wants ${o.replicas} replicas already: nothing to scale`);
+
+  const backendService = await request('GET', `${scopeOf(o)}/backendServices/${o.backendService}`);
+  const groups = (backendService.backends ?? []).map((b) => b.group);
+  if (groups.length === 0) throw new CheckError(`the backend service ${o.backendService} has no NEG: attach the Service's NEG first (terraform/gcp-dev's README)`);
+  const readEndpoints = async () => Object.assign({}, ...(await Promise.all(groups.map(
+    async (group) => core.endpointAddresses(await request('POST', `${group}/listNetworkEndpoints`, {})),
+  ))));
+  const firstEndpoints = await readEndpoints();
+  log('endpoint', `${plural(Object.keys(firstEndpoints).length, 'endpoint')} in ${groups.map(nameOf).join(', ')}`);
+  const endpoints = startPoller(ctx, HEALTH_EVERY_MS, readEndpoints, reporter(ctx, 'endpoint', firstEndpoints, 'none'));
+  const initial = { [o.deployment]: core.podsState(deployment) };
+  const statusPoller = startPoller(ctx, STATUS_EVERY_MS, async () => ({ [o.deployment]: core.podsState(await request('GET', base)) }), reporter(ctx, 'pods', initial));
+  const since = ctx.at();
+  try {
+    return await runAction({ ...ctx, action }, {
+      names: [o.deployment],
+      statusPoller,
+      backendService,
+      act: async () => {
+        const scale = await request('GET', `${base}/scale`);
+        scale.spec = { ...scale.spec, replicas: o.replicas };
+        await request('PUT', `${base}/scale`, scale);
+        return { status: 'DONE' };
+      },
+      finish: async () => {
+        await endpoints.stop();
+        logEndpoints({ ...ctx, action }, endpoints, since);
+      },
+    });
+  } finally {
+    await endpoints.stop();
+  }
+}
+
 // health: a backend service's health (getHealth on each of its groups) every 2 s for --for seconds, each change
 // printed, per instance and for the service: 'no status' while Google does not health check it (spec section 12, 7:
 // a backend service named in no URL map, or at weight 0 in a weighted route), then the periods of each state.
@@ -487,7 +617,7 @@ async function runMetric(ctx) {
   return complete !== null ? 0 : 1;
 }
 
-const RUN = { switch: runSwitch, vm: runVm, mig: runMig, metric: runMetric, health: runHealth };
+const RUN = { switch: runSwitch, vm: runVm, mig: runMig, neg: runNeg, sql: runSql, gke: runGke, metric: runMetric, health: runHealth };
 
 export async function main(argv, { out = console.log, err = console.error } = {}) {
   let parsed;

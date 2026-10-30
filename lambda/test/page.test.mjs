@@ -31,6 +31,13 @@ test('the failure message says the kind and the next attempt (R7a)', async () =>
   assert.match(renderPage({ state: 'FAILED', pollSeconds: 3 }), /The application could not be started\. Retrying shortly/);
 });
 
+test('on Google Cloud the failure message promises no notification: nothing sends one before the manager', async () => {
+  const { renderPage } = await import('../src/lib/page.mjs');
+  const other = renderPage({ state: 'FAILED', pollSeconds: 3, failure: 'permission', retryInMs: 30_000, cloud: 'Google Cloud' });
+  assert.match(other, /The application could not be started\. Next attempt in less than a minute/);
+  assert.doesNotMatch(other, /notified/);
+});
+
 test('renderPage probes probeUrl, and only then reloads once AWAKE; without it the page keeps probing its own address', () => {
   const page = renderPage({ state: 'WAKING', pollSeconds: 3 });
   assert.match(page, /fetch\(location\.href, /);

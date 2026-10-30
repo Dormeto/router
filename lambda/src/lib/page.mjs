@@ -12,7 +12,8 @@ const escapeHtml = (value) => String(value).replace(/[&<>"']/g,
 // Why a wake failed, for the visitor (R7a); the next attempt is added to it.
 const failuresOn = (cloud) => ({
   capacity: `${cloud} has no capacity for this application right now: the start is retried`,
-  other: 'The application could not be started; its team is notified.',
+  // On Google Cloud nothing notifies anyone before the manager comes (spec G1): the logs and the CLI only.
+  other: cloud === 'AWS' ? 'The application could not be started; its team is notified.' : 'The application could not be started.',
 });
 const inText = (ms) => (ms < 60_000 ? 'less than a minute' : `${Math.round(ms / 60_000)} minute${Math.round(ms / 60_000) === 1 ? '' : 's'}`);
 export function failureMessage(failure, retryInMs, cloud = 'AWS') {

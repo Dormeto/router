@@ -38,6 +38,11 @@ const REFUSALS = [
   ['a target proxy no forwarding rule sends to', (w) => { w.forwardingRules = []; }, ['no forwarding rule sends to the target proxy of URL map lb: add one, then onboard again']],
   ['a backend service that does not exist', (w) => { delete w.services.app; }, ['backend service app not found: name a global backend service of this project']],
   ['a service the URL map does not name', (w) => { w.urlMaps.lb.pathMatchers[0].defaultService = serviceUrl('other'); }, ['backend service app is not named in URL map lb: route to it there, or name the URL map that does']],
+  ['a service only in a default no host reaches', (w) => {
+    w.urlMaps.lb.defaultService = serviceUrl('app');
+    w.urlMaps.lb.pathMatchers[0].defaultService = serviceUrl('other');
+    w.urlMaps.lb.hostRules.push({ hosts: ['*'], pathMatcher: 'm' });
+  }, ['backend service app is named in URL map lb only by its default, which a host rule * hides: route to it in a path matcher, then onboard again']],
   ['a service in another URL map', (w) => { w.urlMaps.second = { name: 'second', defaultService: serviceUrl('app') }; }, ['backend service app is also named in URL map second: that load balancer would lose its backends during a nap; give it a backend service of its own']],
   ['a network endpoint group backend', (w) => { w.services.app.backends = [{ group: `${V1}/zones/${ZONE}/networkEndpointGroups/neg` }]; }, ['backend neg of backend service app is a network endpoint group: only instance groups are supported (unmanaged, managed zonal or regional)']],
   ['a service without a backend', (w) => { w.services.app.backends = []; }, ['backend service app has no backend: add an instance group, then onboard again']],
@@ -611,4 +616,85 @@ test('wake now: awake, nothing to do; during a nap, the pending wake; waking, a 
   assert.deepEqual(w.tasks, []);
   store.runs.get('demo').state = STATES.WAKING;
   await assert.rejects(onboarding.wake('demo'), refused(409, 'busy', /workload demo is WAKING/));
+});
+
+// --- A URL map changed since the onboarding: the nap goes on only with a policy that catches the service's requests ---
+
+async function onboarded(change) {
+  const world = setup();
+  await world.onboarding.onboard(INPUT);
+  change?.(world.w);
+  world.w.changes.length = 0;
+  return world;
+}
+const moved = (w) => {
+  w.urlMaps.lb.pathMatchers[0].defaultService = serviceUrl('other');
+  w.urlMaps.lb2 = { name: 'lb2', fingerprint: 'x', defaultService: serviceUrl('app') };
+};
+const napRefused = ({ w, store }, out, reason) => {
+  assert.equal(out.state, STATES.AWAKE);
+  assert.equal(out.aborted, true);
+  assert.equal(store.runs.get('demo').state, STATES.AWAKE);
+  assert.equal(w.vms['vm-a'].status, 'RUNNING');
+  assert.equal(w.changes.some((line) => !line.startsWith('map ')), false, w.changes.join());
+  assert.match(w.logs.find((l) => l.event === 'NapAborted').reason, reason);
+};
+
+test('the service moved to another URL map: the nap stops nothing, AWAKE, the log says why', async () => {
+  const world = await onboarded(moved);
+  napRefused(world, await world.core.nap('demo'), /backend service app is also named in URL map lb2/);
+  assert.deepEqual(world.w.changes, []);
+  assert.equal(world.w.urlMaps.lb2.defaultCustomErrorResponsePolicy, undefined);
+});
+
+test('the service in no URL map any more: the nap stops nothing, AWAKE, the log says why', async () => {
+  const world = await onboarded((w) => { w.urlMaps.lb.pathMatchers[0].defaultService = serviceUrl('other'); });
+  napRefused(world, await world.core.nap('demo'), /backend service app is named by no path matcher of URL map lb/);
+  assert.deepEqual(world.w.changes, []);
+});
+
+test('the service in a second URL map too: the nap stops nothing and writes nothing', async () => {
+  const world = await onboarded((w) => { w.urlMaps.lb2 = { name: 'lb2', fingerprint: 'x', defaultService: serviceUrl('app') }; });
+  napRefused(world, await world.core.nap('demo'), /also named in URL map lb2/);
+  assert.deepEqual(world.w.changes, []);
+});
+
+test('the service named by a second URL map during the 300 s: the policy goes again, nothing stopped', async () => {
+  const world = await onboarded();
+  world.clock.onSleep(() => { world.w.urlMaps.lb2 = { name: 'lb2', fingerprint: 'x', defaultService: serviceUrl('app') }; });
+  napRefused(world, await world.core.nap('demo'), /also named in URL map lb2/);
+  assert.deepEqual(world.w.changes, ['map lb', 'map lb']);
+  assert.equal(world.w.urlMaps.lb.pathMatchers[0].defaultCustomErrorResponsePolicy, undefined);
+});
+
+test('the release of a failed workload whose service moved stops nothing either', async () => {
+  const world = await onboarded(moved);
+  world.store.runs.get('demo').state = STATES.FAILED;
+  const out = await world.core.release('demo');
+  assert.equal(out.state, STATES.FAILED);
+  assert.equal(world.w.vms['vm-a'].status, 'RUNNING');
+  assert.deepEqual(world.w.changes, []);
+});
+
+test('asleep, the service in no URL map any more: the check says so and changes nothing', async () => {
+  const world = await onboarded((w) => { w.urlMaps.lb.pathMatchers[0].defaultService = serviceUrl('other'); });
+  world.store.runs.get('demo').state = STATES.ASLEEP;
+  world.w.vms['vm-a'].status = 'TERMINATED';
+  const [result] = await world.core.check();
+  assert.match(result.error, /named by no path matcher/);
+  assert.equal(world.store.runs.get('demo').state, STATES.ASLEEP);
+  assert.deepEqual(world.w.changes, []);
+});
+
+test('the map\'s default alone names the service: eligible, it gets its matcher, and the nap\'s policy goes there, not on the map', async () => {
+  const change = (w) => {
+    w.urlMaps.lb = { name: 'lb', fingerprint: 'f', defaultService: serviceUrl('app') };
+  };
+  const { w, core, onboarding } = setup(change);
+  assert.deepEqual((await onboarding.dryRun(INPUT)).reasons, []);
+  await onboarding.onboard(INPUT);
+  assert.equal((await core.nap('demo')).state, STATES.ASLEEP);
+  assert.equal(w.urlMaps.lb.defaultCustomErrorResponsePolicy, undefined);
+  assert.equal(w.urlMaps.lb.pathMatchers.at(-1).name, 'dormeto-default');
+  assert.equal(w.urlMaps.lb.pathMatchers.at(-1).defaultCustomErrorResponsePolicy.errorService, WAKER_URL);
 });

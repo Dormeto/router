@@ -13,7 +13,7 @@ import { failedSpec, failureError } from '../../lambda/src/lib/failures.mjs';
 import { resolveHibernation } from '../../lambda/src/lib/hibernation.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { OPERATION_NOT_DONE } from './google.mjs';
-import { UrlMapRefused, withErrorPolicy, withoutErrorPolicy, withWakerRoute } from './urlmaps.mjs';
+import { references, UrlMapRefused, withErrorPolicy, withoutErrorPolicy, withWakerRoute } from './urlmaps.mjs';
 
 const COMPUTE = 'https://compute.googleapis.com/compute/v1';
 const POLL_MS = 2000;
@@ -92,6 +92,14 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
 
   const wakerUrl = (cfg) => `${COMPUTE}/projects/${config.project}/global/backendServices/${cfg.wakerBackendService}`;
   const writePolicy = (cfg) => urlmaps.modify(cfg.urlMap, (map) => withErrorPolicy(map, cfg.backendService, wakerUrl(cfg)));
+
+  // Before VMs go: the map must be the only one naming the service. Another load balancer would keep its visitors with no
+  // policy and no way to wake (spec section 7, checked at the onboarding and true only then).
+  async function writeOnlyPolicy(cfg) {
+    const other = (await urlmaps.list()).find((map) => map.name !== cfg.urlMap && references(map, cfg.backendService).length);
+    if (other) throw new UrlMapRefused(`backend service ${cfg.backendService} is also named in URL map ${other.name}: that load balancer would lose its backends during a nap`);
+    return writePolicy(cfg);
+  }
 
   // After the state changed to AWAKE: a removal that fails is drift the check repairs.
   async function removePolicy(cfg) {
@@ -355,10 +363,10 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
   // Written, then still there after a whole wait: a check's repair or a customer's apply may have removed it meanwhile,
   // and the VMs must not go with no way to wake. False when it was lost with no room left for another wait.
   async function policyHeld(cfg, latest) {
-    await writePolicy(cfg);
+    await writeOnlyPolicy(cfg);
     for (;;) {
       await sleep(POLICY_WAIT_MS);
-      const { paths } = await writePolicy(cfg);
+      const { paths } = await writeOnlyPolicy(cfg);
       if (!paths.length) return true;
       log.warn('PolicyLost', { workloadId: cfg.workloadId, paths });
       if (now() + POLICY_WAIT_MS + STOP_ROOM_MS > latest) return false;
@@ -384,7 +392,8 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
           return { state: STATES.AWAKE, aborted: true };
         }
       } catch (err) {
-        // A customer's own policy, written since the onboarding: nothing is stopped yet, the application keeps serving.
+        // A customer's own policy, or a service moved or named elsewhere, since the onboarding: nothing is stopped yet, the
+        // application keeps serving.
         if (!(err instanceof UrlMapRefused)) throw err;
         await backToAwake('switch-failed');
         log.warn('NapAborted', { workloadId, reason: err.message });
@@ -452,7 +461,7 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
     if (run?.state !== STATES.FAILED) return { state: 'SKIPPED', reason: run?.state ?? 'unknown' };
     const cfg = await getConfig(workloadId);
     try {
-      const { paths } = await writePolicy(cfg);
+      const { paths } = await writeOnlyPolicy(cfg);
       if (paths.length) await sleep(POLICY_WAIT_MS);
       const autoscalers = await autoscalersToRecord(cfg, run);
       // A wake asked meanwhile takes over.
@@ -543,7 +552,7 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
     }
     const from = t - idleMs - METRIC_DELAY_MS;
     if (run?.state !== STATES.AWAKE || (run.awakeSince ?? 0) > from) return { state: run?.state ?? 'UNKNOWN' };
-    if ((await monitoring.requestCount({ urlMap: cfg.urlMap, backendService: cfg.backendService, from, to: t })) > 0) return { state: run.state };
+    if ((await monitoring.requestCount({ backendService: cfg.backendService, from, to: t })) > 0) return { state: run.state };
     await enqueue({ action: 'nap', workloadId });
     log.info('NapRequested', { workloadId });
     return { state: run.state, nap: 'requested' };

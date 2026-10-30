@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  hostsOf, references, withErrorPolicy, withoutErrorPolicy, withWakerRoute, withoutWakerRoute, createUrlMaps, CALLS,
+  hostsOf, references, UrlMapRefused, withErrorPolicy, withoutErrorPolicy, withWakerRoute, withoutWakerRoute, createUrlMaps, CALLS,
 } from '../src/urlmaps.mjs';
 
 const V1 = 'https://www.googleapis.com/compute/v1/projects/p/global/backendServices';
@@ -57,9 +57,29 @@ test('withErrorPolicy: the policy sits on every matcher naming the service and n
   assert.deepEqual(before, fixture(), 'the input is not changed');
 });
 
-test('withErrorPolicy: the map\'s default too when it names the service', () => {
-  const { map } = withErrorPolicy(mapNaming(APP), APP, WAKER);
-  assert.deepEqual(map.defaultCustomErrorResponsePolicy, POLICY);
+test('withErrorPolicy: never on the map itself, which would cover the whole load balancer: on the default\'s own matcher', () => {
+  const routed = withWakerRoute(mapNaming(APP), APP, WAKER).map;
+  const { map, paths } = withErrorPolicy(routed, APP, WAKER);
+  assert.equal(map.defaultCustomErrorResponsePolicy, undefined);
+  assert.deepEqual(map.pathMatchers.at(-1).defaultCustomErrorResponsePolicy, POLICY);
+  assert.equal(paths.includes('defaultCustomErrorResponsePolicy'), false);
+  assert.ok(paths.includes(`pathMatchers[${map.pathMatchers.length - 1}].defaultCustomErrorResponsePolicy`));
+});
+
+test('withErrorPolicy: no matcher names the service: refused, not "already held" (the service left the map, or only a hidden default names it)', () => {
+  assert.throws(() => withErrorPolicy(fixture(), 'nothing', WAKER), (err) => err instanceof UrlMapRefused && /backend service nothing is named by no path matcher of URL map dmt-dev/.test(err.message));
+  assert.throws(() => withErrorPolicy({ name: 'dmt-dev', defaultService: `${V1}/${APP}` }, APP, WAKER), UrlMapRefused);
+  const hidden = { name: 'dmt-dev', defaultService: `${V1}/${APP}`, hostRules: [{ hosts: ['*'], pathMatcher: 'one' }], pathMatchers: [{ name: 'one', defaultService: `${V1}/other` }] };
+  assert.throws(() => withErrorPolicy(hidden, APP, WAKER), UrlMapRefused);
+});
+
+test('withoutErrorPolicy: a map-level policy of this waker\'s is still removed, a customer\'s stays', () => {
+  const ours = { ...fixture(), defaultCustomErrorResponsePolicy: POLICY };
+  const { map, paths } = withoutErrorPolicy(ours, WAKER);
+  assert.equal(map.defaultCustomErrorResponsePolicy, undefined);
+  assert.deepEqual(paths, ['defaultCustomErrorResponsePolicy']);
+  const theirs = { ...fixture(), defaultCustomErrorResponsePolicy: { errorService: `${V1}/theirs` } };
+  assert.deepEqual(withoutErrorPolicy(theirs, WAKER).paths, []);
 });
 
 test('withoutErrorPolicy: removed again to the byte', () => {
@@ -92,15 +112,18 @@ test('withErrorPolicy: a customer\'s own error policy is refused', () => {
   const atMatcher = fixture();
   atMatcher.pathMatchers[1].defaultCustomErrorResponsePolicy = own;
   assert.throws(() => withErrorPolicy(atMatcher, APP, WAKER), /error response policy.*pathMatchers\[1\]/);
-  const atMap = mapNaming(APP);
-  atMap.defaultCustomErrorResponsePolicy = own;
-  assert.throws(() => withErrorPolicy(atMap, APP, WAKER), /error response policy/);
   const atRule = fixture();
   atRule.pathMatchers[1].pathRules[0].customErrorResponsePolicy = own;
   assert.throws(() => withErrorPolicy(atRule, APP, WAKER), /error response policy/);
   const atRoute = fixture();
   atRoute.pathMatchers[3].routeRules[0].customErrorResponsePolicy = own;
   assert.throws(() => withErrorPolicy(atRoute, APP, WAKER), /error response policy/);
+});
+
+test('withErrorPolicy: a customer\'s policy on the map itself stays: nothing is written there, and a matcher\'s comes first', () => {
+  const own = { errorService: `${V1}/theirs`, errorResponseRules: [] };
+  const { map } = withErrorPolicy({ ...withWakerRoute(mapNaming(APP), APP, WAKER).map, defaultCustomErrorResponsePolicy: own }, APP, WAKER);
+  assert.deepEqual(map.defaultCustomErrorResponsePolicy, own);
 });
 
 test('withErrorPolicy: a policy on a matcher that does not name the service does not matter', () => {

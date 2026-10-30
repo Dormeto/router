@@ -2,13 +2,14 @@
 // functions that add and remove what Dormeto writes in a map, and the adapter that reads and updates it.
 //
 // What Dormeto writes, and nothing else:
-// - at the nap, an error response policy (`defaultCustomErrorResponsePolicy`) on the map and on each path matcher that
-//   names the application's backend service: the load balancer's 502 and 503 are served by the workload's waker
-//   backend service, from `/_dormeto/waiting`, as a 503. Removed at the wake;
+// - at the nap, an error response policy (`defaultCustomErrorResponsePolicy`) on each path matcher that names the
+//   application's backend service: the load balancer's 502 and 503 are served by the workload's waker backend service,
+//   from `/_dormeto/waiting`, as a 503. Removed at the wake. Never on the map itself, which would cover the whole load
+//   balancer: the map's default reaches the service through the matcher below, or not at all;
 // - for good, the route `/_dormeto/*` to the waker backend service, in each of those matchers (a path rule, or a route
 //   rule where the matcher uses route rules); the map's default alone gets a host rule `*` and a matcher
 //   `dormeto-default` to hold it.
-// A customer's own policy or `/_dormeto/` route is refused (UrlMapRefused), never overwritten.
+// A customer's own policy on such a matcher or `/_dormeto/` route is refused (UrlMapRefused), never overwritten.
 //
 // The functions take a map as Google returns it and return a copy: `{ map, paths }`, `paths` being what was written
 // (removed): the policy's or the rules' place, as `pathMatchers[1].pathRules`. The backend services are matched by
@@ -50,7 +51,7 @@ function holders(map, service) {
   return { named: holds(map, 'defaultService', 'defaultRouteAction', service), matchers };
 }
 
-// Where the error policy goes: the map's default when it names the service, then each matcher naming it.
+// Where the map names the service, as the place of a policy there: the map's default, then each matcher naming it.
 export function references(map, service) {
   const { named, matchers } = holders(map, service);
   return [...(named ? [POLICY] : []), ...matchers.map(({ i }) => `pathMatchers[${i}].${POLICY}`)];
@@ -67,6 +68,10 @@ export function hostsOf(map, service) {
 
 const isOurs = (policy, waker) => nameOf(policy?.errorService) === nameOf(waker);
 
+// Whether a matcher names the service: what the policy needs. The map's default gets one from withWakerRoute.
+export const inMatcher = (map, service) => holders(map, service).matchers.length > 0;
+
+// `paths` empty: the policy is there already. Nothing to hold it is a refusal: it would catch no request of the service.
 export function withErrorPolicy(map, service, waker) {
   const copy = structuredClone(map);
   const paths = [];
@@ -82,8 +87,8 @@ export function withErrorPolicy(map, service, waker) {
     holder[POLICY] = policy;
     paths.push(path);
   };
-  const { named, matchers } = holders(copy, service);
-  if (named) put(copy, POLICY);
+  const { matchers } = holders(copy, service);
+  if (!matchers.length) throw new UrlMapRefused(`backend service ${service} is named by no path matcher of URL map ${map.name}`);
   for (const { matcher, i } of matchers) {
     for (const [kind, rules] of [['pathRules', matcher.pathRules], ['routeRules', matcher.routeRules]]) {
       (rules ?? []).forEach((rule, j) => {

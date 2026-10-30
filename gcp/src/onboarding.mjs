@@ -7,7 +7,7 @@
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { groupOf } from './controller-core.mjs';
 import { WORKLOAD_HEADER, WORKLOAD_ID } from './names.mjs';
-import { hostsOf, references, UrlMapRefused, withErrorPolicy, withoutErrorPolicy, withWakerRoute, withoutWakerRoute } from './urlmaps.mjs';
+import { hostsOf, inMatcher, references, UrlMapRefused, withErrorPolicy, withoutErrorPolicy, withWakerRoute, withoutWakerRoute } from './urlmaps.mjs';
 
 const COMPUTE = 'https://compute.googleapis.com/compute/v1';
 const SCHEME = 'EXTERNAL_MANAGED';
@@ -121,21 +121,24 @@ export function createOnboarding({ store, compute, urlmaps, core, config, now = 
     });
   }
 
-  // What the nap and the route would write, tried on the map as it is.
+  // What the route and the nap would write, tried on the map as it is, the nap's after the route: the route gives the map's
+  // default its matcher. A map that does not name the service has its reason already.
   function mapProblems(map, backendService, waker) {
-    const attempts = [
-      [withErrorPolicy, 'a nap would replace it, remove it first'],
-      [withWakerRoute, 'change that, then onboard again'],
-    ];
-    return attempts.flatMap(([write, advice]) => {
+    if (!references(map, backendService).length) return [];
+    const problems = [];
+    const tried = (write, on, advice) => {
       try {
-        write(map, backendService, waker);
-        return [];
+        return write(on, backendService, waker).map;
       } catch (err) {
         if (!(err instanceof UrlMapRefused)) throw err;
-        return [`${err.message}: ${advice}`];
+        problems.push(`${err.message}: ${advice}`);
+        return null;
       }
-    });
+    };
+    const routed = tried(withWakerRoute, map, 'change that, then onboard again');
+    if (inMatcher(routed ?? map, backendService)) tried(withErrorPolicy, routed ?? map, 'a nap would replace it, remove it first');
+    else if (routed) problems.push(`backend service ${backendService} is named in URL map ${map.name} only by its default, which a host rule * hides: route to it in a path matcher, then onboard again`);
+    return problems;
   }
 
   // A backend of the service: `{ reasons, members (its VMs' URLs), group? }`, `group` when it is a managed one.

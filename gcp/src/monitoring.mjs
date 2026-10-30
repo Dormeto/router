@@ -9,9 +9,9 @@ export const CALLS = {
 };
 
 export function createMonitoring({ google, project }) {
-  // The requests the backend service's series count over [from, to] (ms): the sum of its points.
-  async function requestCount({ urlMap, backendService, from, to }) {
-    const filter = `metric.type = "${METRIC}" AND resource.labels.url_map_name = "${urlMap}" AND resource.labels.backend_target_name = "${backendService}"`;
+  // The requests the backend service's series count over [from, to] (ms), through any URL map: the sum of its points.
+  async function requestCount({ backendService, from, to }) {
+    const filter = `metric.type = "${METRIC}" AND resource.labels.backend_target_name = "${backendService}"`;
     let total = 0;
     let page = '';
     do {

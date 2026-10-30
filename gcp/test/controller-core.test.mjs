@@ -649,7 +649,7 @@ test('idle: the check enqueues the nap and never waits for it', async () => {
   assert.deepEqual(t.world.tasks, [{ url: `${CONTROLLER}/v1/tasks`, body: { action: 'nap', workloadId: 'demo' } }]);
   assert.deepEqual(t.world.sleeps, []);
   assert.deepEqual(t.world.calls, []);
-  assert.deepEqual(t.world.metricReads, [{ urlMap: 'lb', backendService: 'app', from: START - 15 * MINUTE - 180_000, to: START }]);
+  assert.deepEqual(t.world.metricReads, [{ backendService: 'app', from: START - 15 * MINUTE - 180_000, to: START }]);
   assert.equal(t.run().state, STATES.AWAKE);
   assert.equal(t.logged('NapRequested').length, 1);
 });

@@ -59,6 +59,32 @@ variable "health_check_interval" {
   }
 }
 
+# Optional parts, off by default: a plan with the defaults shows no change. They cost money while they exist (README), so
+# they are turned on for the measures and the acceptance, on the user's word, and off after.
+variable "enable_classic" {
+  description = "A classic external Application Load Balancer (EXTERNAL, HTTP) on the demo VM's group."
+  type        = bool
+  default     = false
+}
+
+variable "enable_neg" {
+  description = "A VM, a zonal NEG holding it and a global backend service on it, behind a load balancer of its own."
+  type        = bool
+  default     = false
+}
+
+variable "enable_sql" {
+  description = "A PostgreSQL Cloud SQL instance, the smallest shared-core, 10 GB."
+  type        = bool
+  default     = false
+}
+
+variable "enable_gke" {
+  description = "A zonal Standard GKE cluster with one small node, a backend service for its standalone NEG (gke-demo.yaml)."
+  type        = bool
+  default     = false
+}
+
 locals {
   name            = "dmt-dev"
   demo            = "dmt-demo"

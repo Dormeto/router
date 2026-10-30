@@ -32,8 +32,10 @@ backend service out of service.
 - **The switched services are Dormeto's**: the URL maps ignore changes to their default services and default route
   actions, which the measuring tool switches, as a default service or with weights. The global map also ignores its host
   rules, its path matchers and its error response policy, which the router writes (the scenario page's advice): a later
-  edit of a path matcher takes removing the ignore for that apply. The autoscaler ignores its mode, which a managed
+  edit of a path matcher takes removing the ignore for that apply. The regional map ignores its host rules and path
+  matchers too, and so do the optional maps. The autoscaler ignores its mode, which a managed
   group's stop turns off.
+- **Optional parts** (`classic.tf`, `neg.tf`, `sql.tf`, `gke.tf`, `gke-demo.yaml`), off by default: see Optional parts below.
 - **No IAM, no API**: every IAM change and every API turned on in the project go through `dormeto gcp install` or
   `uninstall`. This root holds no `google_*_iam_*` resource, no service account and no `google_project_service`, and its
   VMs and template run without a service account (attaching one is an IAM grant); `gcp/test/gcp-dev.test.mjs` checks
@@ -43,6 +45,94 @@ backend service out of service.
   month while running, their 10 GB balanced disks $3 (also while stopped; a suspended VM also pays for its memory's
   storage), the two forwarding rules (global and regional) $36; health checks, the certificate and the Route 53
   records nothing of note. Created for G0's measures and destroyed after.
+
+## Optional parts
+
+Four variables, `false` by default: a plan with the defaults shows no change (nothing above is renamed or moved, and
+`gcp/test/gcp-dev.test.mjs` checks that each variable defaults to false and that every resource of the optional files
+is behind its own). They cost money while they exist, so they are turned on for the measures of the Google Cloud
+coverage (vision `docs/specs/2026-10-30-google-cloud-coverage-design.md`, sections 10 and 11) and for its acceptance, on
+the user's "run it", and off after (`-var enable_x=true` for the plan; destroy the part by planning without it). None of
+them holds an IAM resource or a `service_account`; read the project's IAM policy after each apply, as Google may add a
+binding for a resource it makes (a service agent's).
+
+| Variable | Adds | About, per month (list prices) |
+|---|---|---|
+| `enable_classic` | `classic.tf`: a classic external Application Load Balancer (`EXTERNAL`, HTTP on port 80, no certificate) on the demo group: the backend services `dmt-demo-classic-app` and `dmt-demo-classic-standin`, the URL map `dmt-dev-classic`, its HTTP proxy, address and forwarding rule | $18 (the forwarding rule) |
+| `enable_neg` | `neg.tf`: the VM `dmt-demo-neg` (`var.machine_type`, no service account), the zonal `GCE_VM_IP_PORT` NEG `dmt-demo-neg` holding it, the `EXTERNAL_MANAGED` backend service `dmt-demo-neg` on it, and a global load balancer of its own: the URL map `dmt-dev-neg`, an HTTP proxy, an address and a forwarding rule on port 80 | $32: the VM $13, its disk $1, the forwarding rule $18 |
+| `enable_sql` | `sql.tf`: the PostgreSQL 16 instance `dmt-demo-sql`, `db-f1-micro`, 10 GB on a hard disk, `deletion_protection = false`, a public address and no authorized network (no connection can be made; no user, no database) | $12 (Cloud SQL keeps a deleted instance's name for about a week) |
+| `enable_gke` | `gke.tf`: the zonal Standard cluster `dmt-demo-gke` (its own subnet `dmt-dev-gke`, the DNS endpoint on and reachable from outside, Gateway API standard channel, `deletion_protection = false`), one node pool of one `e2-small` node on the default compute service account, a firewall rule for Google's health checkers to the pods' port 8080, and a global load balancer for the Service's NEG: the backend service `dmt-demo-gke`, its health check, the URL map `dmt-dev-gke`, an HTTP proxy, an address and a forwarding rule on port 80 | $32: the node $13, its disk $1, the forwarding rule $18; the cluster's fee ($73) is within the free tier of one zonal cluster per billing account, if this account's is unused |
+
+The NEG VM and the GKE load balancer have no domain name: their addresses are in the output `optional` (`terraform output
+optional`), and the measuring tool takes them as `--url`. The demo VM still belongs to one workload at a time (G1's rule):
+the global, regional and classic load balancers share its group, so the acceptance offboards between them, and a nap on
+one takes the others' backends down meanwhile. If Compute Engine refuses the group as the backend of both an `EXTERNAL`
+and an `EXTERNAL_MANAGED` service at the apply, the classic backend services move to the managed group.
+
+**The GKE demo's workload is not Terraform**: `gke-demo.yaml` holds the Deployment `dmt-demo-gke` (Google's hello-app,
+8080), the Service with the annotation `cloud.google.com/neg` (a standalone NEG named `dmt-demo-gke`), a Gateway and its
+HTTPRoute (the Gateway's load balancer is GKE's own: M10 writes a policy on its URL map). The measure applies it, on the
+user's "run it", with the owner's own rights (the project owner is cluster-admin through IAM, the DNS endpoint and
+`gcloud container clusters get-credentials`): no Role or binding is written for it, the router's RBAC is the CLI's
+(`dormeto gcp workloads access`). Then the NEG is attached to the backend service, by `gcloud` with the `dormeto-dev`
+configuration (no IAM):
+
+```
+gcloud container clusters get-credentials dmt-demo-gke --zone europe-west1-b --dns-endpoint --configuration=dormeto-dev
+kubectl apply -f terraform/gcp-dev/gke-demo.yaml
+gcloud compute backend-services add-backend dmt-demo-gke --global --network-endpoint-group=dmt-demo-gke \
+  --network-endpoint-group-zone=europe-west1-b --balancing-mode=RATE --max-rate-per-endpoint=100 --configuration=dormeto-dev
+```
+
+(The backend service ignores its `backend` in Terraform, so a later plan does not remove the NEG; delete the Service
+before the destroy, so that the NEG goes before its backend service.)
+
+### Measure the optional parts
+
+```
+# S3: a stopped VM in a NEG keeps its endpoint? (M1)
+node gcp/tools/measure.mjs neg stop  --url "$(terraform output -json optional | jq -r .neg.url)"
+node gcp/tools/measure.mjs neg start --url "$(terraform output -json optional | jq -r .neg.url)"
+# S4: the classic map's switch (M2), health of a service in no map (M3), the classic request count (M5)
+node gcp/tools/measure.mjs switch --url-map dmt-dev-classic --url "$(terraform output -json optional | jq -r .classic.url)" \
+  --from dmt-demo-classic-standin --to dmt-demo-classic-app
+node gcp/tools/measure.mjs health --backend-service dmt-demo-classic-app --for 120
+node gcp/tools/measure.mjs metric --url-map dmt-dev-classic --url "$(terraform output -json optional | jq -r .classic.url)" \
+  --metric loadbalancing.googleapis.com/https/request_count
+# S5: Cloud SQL stopped and started by its activation policy, state and policy read every 10 s (M6)
+node gcp/tools/measure.mjs sql stop
+node gcp/tools/measure.mjs sql start
+# S6: the Deployment scaled to 0 and back through the cluster's DNS endpoint, as the owner (M9)
+node gcp/tools/measure.mjs gke scale --replicas 0 --url "$(terraform output -json optional | jq -r .gke.url)"
+node gcp/tools/measure.mjs gke scale --replicas 1 --url "$(terraform output -json optional | jq -r .gke.url)"
+```
+
+Each prints a timeline like the others. `neg` adds the NEG's endpoints (kept or dropped while the VM is stopped);
+`sql` follows `state` and `settings.activationPolicy` until `SUSPENDED` (stop) or `RUNNABLE` (start); `gke scale` reads
+the cluster's DNS endpoint from the Container API, reads and puts the Deployment's scale through it with gcloud's token,
+and follows the pods, the NEG's endpoints, the backend service's health and the answers.
+
+### Acting as the router (M7, M11)
+
+The owner would bypass a condition or an RBAC rule, so these two calls are made as the router's service account:
+`gcp/tools/probe.mjs` is in the router's image and makes one call with the account's token from the metadata server,
+printing the status and the body. It runs as a Cloud Run job with `--service-account dmtr-<region>@dormeto-dev.iam.gserviceaccount.com`
+(the owner can act as that account: no IAM change, nothing granted; if Google refuses, the measure waits for the
+code of S5 or S6 on a workload). What the router holds comes from `dormeto gcp install --with cloud-sql,gke` and its RBAC
+from the CLI's onboarding step; nothing is applied by hand.
+
+```
+gcloud run jobs deploy dmt-probe --configuration=dormeto-dev --region europe-west1 \
+  --image europe-west1-docker.pkg.dev/dormeto-dev/dormeto/router:<version> \
+  --service-account dmtr-europe-west1@dormeto-dev.iam.gserviceaccount.com --max-retries 0 \
+  --args=gcp/tools/probe.mjs,GET,https://<the cluster's DNS endpoint>/apis/apps/v1/namespaces/default/deployments/dmt-demo-gke/scale
+gcloud run jobs execute dmt-probe --configuration=dormeto-dev --region europe-west1 --wait
+gcloud run jobs delete dmt-probe --configuration=dormeto-dev --region europe-west1
+```
+
+The job's log (Cloud Logging, `gcloud run jobs executions` with `--configuration=dormeto-dev`) holds the status line and the
+body. For a call with a JSON body, give the arguments with another delimiter, `--args=^@^gcp/tools/probe.mjs@PUT@https://…@{"spec":{"replicas":0}}`.
+Delete the job after (`jobs deploy` again for the next call).
 
 **Needs** gcloud's configuration `dormeto-dev` signed in as the project's owner (spec section 15), and the AWS profile
 `kloudy-dormeto-prd` (state, Route 53). Google's credentials are never in the code or a file: each command takes

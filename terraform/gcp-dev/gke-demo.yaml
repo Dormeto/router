@@ -1,0 +1,69 @@
+# The GKE demo's workload (enable_gke), applied by the measure with the owner's rights, on the user's "run it":
+#   kubectl apply -f gke-demo.yaml
+# Not Terraform: Kubernetes makes the NEG `dmt-demo-gke` from the Service's annotation, and the Gateway's load balancer is
+# GKE's own (M10: a policy written on its URL map). No Role or binding here: the RBAC of the router is the CLI's.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dmt-demo-gke
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dmt-demo-gke
+  template:
+    metadata:
+      labels:
+        app: dmt-demo-gke
+    spec:
+      containers:
+        - name: hello
+          image: us-docker.pkg.dev/google-samples/containers/gke/hello-app:1.0
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dmt-demo-gke
+  namespace: default
+  annotations:
+    # A standalone NEG, named: terraform's backend service dmt-demo-gke takes it (README).
+    cloud.google.com/neg: '{"exposed_ports": {"80": {"name": "dmt-demo-gke"}}}'
+spec:
+  type: ClusterIP
+  selector:
+    app: dmt-demo-gke
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: dmt-demo-gke
+  namespace: default
+spec:
+  gatewayClassName: gke-l7-global-external-managed
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: dmt-demo-gke
+  namespace: default
+spec:
+  parentRefs:
+    - name: dmt-demo-gke
+  rules:
+    - backendRefs:
+        - name: dmt-demo-gke
+          port: 80

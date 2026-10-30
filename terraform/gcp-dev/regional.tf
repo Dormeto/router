@@ -45,8 +45,8 @@ resource "google_compute_region_url_map" "dev" {
 
   lifecycle {
     # The service the measuring tool switches: the default service, or with `switch --weighted` the default route
-    # action's weighted backend services (this map has no path matcher).
-    ignore_changes = [default_service, default_route_action]
+    # action's weighted backend services; and what the router writes when it owns the map: its host rule and matcher.
+    ignore_changes = [default_service, default_route_action, host_rule, path_matcher]
   }
 }
 

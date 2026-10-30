@@ -31,8 +31,8 @@ flowchart LR
 - **Compute Engine:** the VMs, their groups and autoscalers.
 - **Cloud Run:** the waker `dmtr-<region>-waker` (ingress internal and Cloud Load Balancing, no invoker check, 0 to 10
   instances, 80 concurrent requests, 256 MiB, timeout 120 s) and the controller `dmtr-<region>-controller` (invoker
-  check on, at most 3 instances, 10 concurrent requests, 512 MiB, timeout 900 s). One container image, `DMT_ROLE`
-  picks the role.
+  check on, at most 3 instances, 10 concurrent requests, 512 MiB, timeout 900 s). Both get CPU during requests only, so
+  an idle instance costs nothing. One container image, `DMT_ROLE` picks the role.
 - **Firestore, Cloud Tasks, Cloud Scheduler, Cloud Monitoring:** the router's state (database `dmtr-<region>`), its
   asynchronous actions (queue `dmtr-<region>`: 3 attempts, 5 to 60 s apart), the check every 5 minutes (job
   `dmtr-<region>-check`) and the request counts.
@@ -44,14 +44,23 @@ binds to the workload's VMs and groups).
 
 ## Wake time
 
-**About 13–25 s after a resume, 37–41 s after a start** (five runs each, a small web server on an e2 VM, health check
-every 5 s with 2 healthy checks; the VM running after 9–17 s). A managed group of two: 28–34 s after a resume, 37–43 s
-after a start. At a health check of 1 s: 13 s after a resume, 30–39 s after a start. Set the health check to 1 s for
-the fastest wakes.
+**About 15–20 s after a resume, 43 s after a start** for a VM, **28 s after a resume, 40–43 s after a start** for a
+managed group of two: from the wake request to the workload awake, through the router, with a small web server on `e2`
+VMs and a health check every 5 s with 2 healthy checks.
 
-These are Compute Engine's times, measured through the load balancer before the router existed. What the router's own
-wake adds (the task, the health poll every 2 s, the error response's removal) comes from the acceptance run, and will
-be added here.
+| Measured through the router (2026-10-30, 6 runs) | Wake request to `AWAKE` | Browser: page opened to application shown |
+|---|---|---|
+| VM, resume | 14.8 s, 19.8 s | 16.8 s |
+| VM, start | 42.6 s | |
+| Managed group of two, resume | 28.2 s | 31.8 s |
+| Managed group of two, start | 40.3 s, 43.1 s | 44.7 s |
+
+Compute Engine's own times, measured through the load balancer before the router existed, five runs each: 13–25 s after
+a resume and 37–41 s after a start for a VM, 28–34 s and 37–43 s for the group. So the router adds no delay that these runs
+can tell apart, and the page's probe every 3 s adds at most 3 s. At a health check of 1 s, Compute Engine's times were 13 s
+after a resume and 30–39 s after a start: set the health check to 1 s for the fastest wakes.
+
+A waker with no instance running starts in about a second: the first page took 1.7 s, the others about 30 ms.
 
 ## Behavior
 
@@ -68,7 +77,7 @@ good, and the nap uses the load balancer's **custom error response** instead.
    of the map, it is read again and retried with a pause, up to 60 s. A service that no URL map names any more, or that
    another URL map names too, is not napped: the workload stays awake, nothing is stopped, and the log says why.
 2. It waits 300 s for the change to reach the load balancer (measured: 163–215 s). The application serves during that
-   wait: it is the drain.
+   wait: it is the drain. A whole nap takes 6.5 to 8 minutes (measured).
 3. It stops the VMs, or suspends them when the `hibernate` setting is on and the VM can be suspended (no GPU, no TPU,
    not confidential, at most 208 GB of memory; a refused suspension falls back to a stop). A managed group is napped
    through the group (`stopInstances`, `suspendInstances`), which keeps the VMs as a standby pool: none is re-created
@@ -83,6 +92,10 @@ filters as on AWS (bots, scanners, no-wake rules) before it wakes the workload. 
 awake): the waker answers no `503` there, which the policy would replace with the page. A plain request does not wake: the error response's fetch may not carry the visitor's request, and
 waking on it would let every scanner wake the workload. The page reloads the visitor's address once the workload is
 awake.
+
+What the error response's fetch carries (measured): always a `GET` of `/_dormeto/waiting`, whatever the visitor's method and
+path, with the visitor's query string, `Host`, `User-Agent`, `Referer` and address. So the waker could read who asks but not
+what for, which is why a plain request still does not wake.
 
 **Wake.**
 1. The waker asks the controller for the wake through a task. The first request wins, as on AWS.
@@ -101,7 +114,8 @@ fallback machine type.
 the effective idle window is that much longer). None: nap. For each workload asleep, it checks the URL map still holds
 the error response policy and the `/_dormeto/*` route (else it repairs them), and that the VMs are still down: a VM
 started by hand makes the workload awake, and VMs all stopped by hand while it is awake make it `ASLEEP` with the cause
-`external-stop`, as on AWS. A wake asked during a nap is kept: the workload wakes once the nap ends.
+`external-stop`, as on AWS. A wake asked during a nap is kept: during the wait the nap gives up, no VM is stopped and the policy is removed; once the
+VMs are going down, the workload wakes as soon as the nap ends.
 
 **Offboarding.** `DELETE /v1/workloads/<id>` (the CLI) removes the policy, the route and the waker backend service. With
 `force=true` it does so for a workload that cannot wake, and leaves its VMs down, saying so.
@@ -123,11 +137,25 @@ started by hand makes the workload awake, and VMs all stopped by hand while it i
   `/_dormeto/`, makes the workload ineligible.
 - **A path matcher naming another service too** shows the waiting page for that service's own `502` and `503` while the
   workload is asleep.
+- **A request with a body gets Google's error, not the page.** While asleep, a `POST`, `PUT`, `PATCH` or `DELETE` with a
+  body gets Google's plain `503` (`unconditional drop overload`, no `Retry-After`): the load balancer does not use the
+  custom error response for it (measured). The same request without a body gets the page. API clients should read a `503` as
+  asleep, send `POST /_dormeto/wake`, then retry their request.
+- **The last requests of a nap.** Stopping or suspending a VM that is not in a managed group happens before the health
+  check notices: a request in the few seconds until then can hang or fail (one request of the demo's run timed out at
+  8 s). A managed group drains its VMs first.
+- **VMs stopped by hand.** Until the next check, and until the policy it writes has spread (up to 8 minutes in all),
+  visitors get Google's plain `503` and not the page, since no nap wrote the policy.
+- **Internet noise counts.** The idle check counts every request the backend service answers, scanners' too: 8 such requests
+  in 2 minutes kept a demo VM awake past its window. The browser filters refuse declared bots, but a scanner that runs
+  JavaScript with a browser's user agent wakes the workload as a visitor would (seen on the demo). A map's default service
+  gets the requests for any host name, so it is the most exposed.
 - **The waiting page's browser wake.** The wake comes from the page's script, or from `POST /_dormeto/wake`. A client
   that runs no JavaScript and does not know that route (a `curl` of the application, a webhook) gets the page and does
   not wake the workload: the next visitor with a browser does.
 - **The tag condition's limits.** The start, stop, suspend and resume permissions are granted on resources tagged
-  `dormeto=managed`. An autoscaler cannot carry a tag, so its mode is changed under `compute.autoscalers.update`
+  `dormeto=managed`. Removing a VM's binding is enforced with a delay: a suspend 2.5 minutes after the removal still
+  passed, a resume 25 minutes after it was refused (`403`, the workload `FAILED` with the kind `permission`). An autoscaler cannot carry a tag, so its mode is changed under `compute.autoscalers.update`
   without the tag condition. `compute.urlMaps.get`, `.list` and `.update` are marked "testing" in custom roles by
   Google (usable, not recommended for production); no narrower predefined role holds them.
 - **Stops lose what a stop loses.** A VM with a local SSD or a GPU is refused at onboarding (a stop would lose the
@@ -141,7 +169,8 @@ started by hand makes the workload awake, and VMs all stopped by hand while it i
   `^[a-z]([a-z0-9-]{0,38}[a-z0-9])?$` so that its backend service's name fits Compute Engine's 63 characters; it
   defaults to the application's backend service's name when that matches, else `--id` names it.
 - **No manager yet.** The CLI talks to the controller with the operator's identity; the manager, discovery and the
-  dashboard come with the next increment.
+  dashboard come with the next increment. A failed wake therefore notifies nobody: it shows in the router's logs and in
+  `dormeto gcp workloads show`.
 
 ## Setup
 

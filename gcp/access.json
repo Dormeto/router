@@ -15,7 +15,7 @@
   "roles": {
     "dormetoRouter": {
       "title": "Dormeto router",
-      "description": "Lets a Dormeto router read its workloads' load balancers, VMs and groups, switch their URL maps, create and delete their waker backend services, turn their autoscalers off and back on, and read their request counts.",
+      "description": "Lets a Dormeto router read its workloads' load balancers, VMs and groups, update their URL maps, create and delete their waker backend services, turn their autoscalers off and back on, and read their request counts.",
       "permissions": [
         "compute.urlMaps.get",
         "compute.urlMaps.list",

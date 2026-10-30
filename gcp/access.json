@@ -379,13 +379,23 @@
             "container.roleBindings.update",
             "container.deployments.get",
             "container.statefulSets.get",
-            "container.services.get"
+            "container.services.get",
+            "container.roles.escalate",
+            "container.roles.bind",
+            "container.clusters.connect",
+            "container.services.list",
+            "container.deployments.list",
+            "container.statefulSets.list",
+            "container.replicaSets.get",
+            "container.replicaSets.list",
+            "container.pods.list"
           ]
         },
         "offboard": {
           "cluster": [
             "container.roles.delete",
-            "container.roleBindings.delete"
+            "container.roleBindings.delete",
+            "container.clusters.connect"
           ]
         }
       }

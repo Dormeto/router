@@ -789,8 +789,11 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
   // fails is that list's error, stored and logged.
   const refresher = lists.length ? createListRefresher({ store, lists, download, now, log }) : null;
 
+  // Only the lists still due: a duplicate task (the check asks again while an earlier one is queued) downloads nothing.
   async function refreshLists(names) {
-    return { results: refresher ? await refresher.refresh(names) : [] };
+    if (!refresher) return { results: [] };
+    const due = await refresher.due();
+    return { results: await refresher.refresh(names.filter((name) => due.includes(name))) };
   }
 
   async function requestListRefresh() {
@@ -849,13 +852,13 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
   // still runs.
   async function check() {
     const deadline = now() + CHECK_BUDGET_MS;
-    await requestListRefresh();
     const pauses = await activePauses();
     const paused = (workloadId) => pauses === null || pauses.some((p) => p.workloadId === workloadId);
     const keptAsleep = (workloadId) => pauses === null || pauses.some((p) => p.keepAsleep && p.workloadId === workloadId);
     const { configs, schedules } = await store.listWorkloads();
     const order = [...configs].sort((a, b) => a.workloadId.localeCompare(b.workloadId));
     const { applied, readable } = await applySchedules(order, schedules, (id) => ({ paused: paused(id), keepAsleep: keptAsleep(id) }), now(), deadline);
+    await requestListRefresh();
     const ctx = { schedules: readable, applied };
     const passed = (workloadId) => (applied.has(workloadId) ? { schedule: applied.get(workloadId) } : {});
     const results = [];

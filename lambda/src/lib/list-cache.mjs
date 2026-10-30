@@ -30,8 +30,17 @@ export function parseLists(text, onError = () => {}) {
 // catalog: the manager's lists (lib/catalog.mjs), after the router's own.
 export function createListCache({ store, lists, catalog = null, now = Date.now, log, checkMs = CHECK_MS }) {
   const loaded = new Map();
+  const inFlight = new Map();
 
-  async function load(list) {
+  // Concurrent lookups of one list share one load (a Cloud Run waker takes many requests at once); a failed load is not kept.
+  function load(list) {
+    if (!inFlight.has(list.name)) {
+      inFlight.set(list.name, loadOnce(list).finally(() => inFlight.delete(list.name)));
+    }
+    return inFlight.get(list.name);
+  }
+
+  async function loadOnce(list) {
     const current = loaded.get(list.name);
     if (current && now() - current.checkedAt < checkMs) return current;
     try {

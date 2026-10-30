@@ -155,3 +155,25 @@ test('the cache gives the router\'s own lists, then the catalog\'s (the manager\
   const onlyCatalog = createListCache({ store, lists: [], catalog, now: clock.now, log: silentLog });
   assert.deepEqual((await onlyCatalog.get()).map((l) => l.name), ['aws']);
 });
+
+test('concurrent lookups on a cold cache share one load; a failed load is not kept in flight', async () => {
+  const clock = fakeClock();
+  const store = storeWith(clock, { ipsum: ['45.130.203.183/32'] });
+  let reads = 0;
+  const getListParts = store.getListParts.bind(store);
+  store.getListParts = async (...args) => { reads += 1; await new Promise((resolve) => setImmediate(resolve)); return getListParts(...args); };
+  const cache = createListCache({ store, lists: [LISTS[0]], now: clock.now, log: silentLog });
+  const [a, b] = await Promise.all([cache.get(), cache.get()]);
+  assert.equal(reads, 1);
+  assert.equal(a.length, 1);
+  assert.equal(b.length, 1);
+
+  const failing = storeWith(clock, { ipsum: ['45.130.203.183/32'] });
+  let fail = true;
+  const parts = failing.getListParts.bind(failing);
+  failing.getListParts = async (...args) => { if (fail) throw new Error('down'); return parts(...args); };
+  const retry = createListCache({ store: failing, lists: [LISTS[0]], now: clock.now, log: silentLog, checkMs: 0 });
+  assert.deepEqual(await retry.get(), []);
+  fail = false;
+  assert.equal((await retry.get()).length, 1);
+});

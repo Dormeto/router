@@ -1564,3 +1564,11 @@ test('refreshLists with no list configured does nothing', async () => {
   const t = setup();
   assert.deepEqual(await t.controller.refreshLists(['scanners']), { results: [] });
 });
+
+test('a second refreshLists task for a list the first just refreshed downloads nothing', async () => {
+  let downloads = 0;
+  const t = setup({ lists: LISTS, download: async () => { downloads += 1; return '1.2.3.4\n'; } });
+  await t.controller.refreshLists(['scanners']);
+  assert.deepEqual(await t.controller.refreshLists(['scanners']), { results: [] });
+  assert.equal(downloads, 1);
+});

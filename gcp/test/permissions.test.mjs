@@ -54,7 +54,7 @@ const callsOf = (name) => {
 test('onboarding: every call it makes is in CALLS, and in the manifest\'s router grants', async () => {
   const { w, store, onboarding } = setup((world) => {
     world.managed.zonal = { kind: 'zonal', location: ZONE, id: '2001', members: ['z-1'] };
-    world.managed.regional = { kind: 'regional', location: REGION, id: '2002', members: ['r-1'] };
+    world.managed.regional = { kind: 'regional', location: REGION, id: '2002', members: ['r-1'], updatePolicy: { instanceRedistributionType: 'NONE' } };
     world.vms['z-1'] = { id: '3001', status: 'RUNNING' };
     world.vms['r-1'] = { id: '3002', status: 'RUNNING' };
     world.services.app.backends.push({ group: `${V1}/zones/${ZONE}/instanceGroups/zonal` }, { group: `${V1}/regions/${REGION}/instanceGroups/regional` });

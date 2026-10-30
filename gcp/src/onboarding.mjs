@@ -154,6 +154,10 @@ export function createOnboarding({ store, compute, urlmaps, core, config, now = 
     const reasons = [];
     if (!members.length) reasons.push(`instance group ${name} has no VM: add one, then onboard again`);
     if (managed?.status?.stateful?.hasStatefulConfig) reasons.push(`managed group ${name} has a stateful configuration: a nap might not keep it, take the group out of the backend service`);
+    // Google's defaults for a regional group, when its answer says nothing.
+    if (managed && group.kind === 'regional' && (managed.distributionPolicy?.targetShape ?? 'EVEN') === 'EVEN' && (managed.updatePolicy?.instanceRedistributionType ?? 'PROACTIVE') !== 'NONE') {
+      reasons.push(`regional managed group ${name} has the target shape EVEN with instance redistribution on: Google cannot stop or suspend its VMs one by one, set its instance redistribution type to NONE or change its target shape, then onboard again`);
+    }
     return { reasons, members, ...(managed ? { group: { ...group, selfLink: managed.selfLink, id: String(managed.id) } } : {}) };
   }
 

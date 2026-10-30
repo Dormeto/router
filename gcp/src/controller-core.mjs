@@ -213,7 +213,8 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
   }
 
   async function sleepBackend(backend, hibernate) {
-    const vms = (await vmsOf(backend)).filter((vm) => !DOWN.has(vm.status));
+    // Only what runs: Google refuses a request naming a VM being created or started, and the whole nap with it.
+    const vms = (await vmsOf(backend)).filter((vm) => vm.status === 'RUNNING');
     const fits = hibernate ? await Promise.all(vms.map(canSuspend)) : vms.map(() => false);
     let suspended = vms.filter((_, i) => fits[i]);
     let stopped = vms.filter((_, i) => !fits[i]);
@@ -458,12 +459,17 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
   // kept (requests wake it again, backed off). The policy is there since its nap, unless the nap failed before writing it.
   async function release(workloadId) {
     const latest = now() + NAP_BUDGET_MS;
-    const run = await store.getRun(workloadId);
+    let run = await store.getRun(workloadId);
     if (run?.state !== STATES.FAILED) return { state: 'SKIPPED', reason: run?.state ?? 'unknown' };
     const cfg = await getConfig(workloadId);
     try {
       const { paths } = await writeOnlyPolicy(cfg);
-      if (paths.length) await sleep(POLICY_WAIT_MS);
+      if (paths.length) {
+        await sleep(POLICY_WAIT_MS);
+        // What it records may have changed: with the old record, an autoscaler read OFF would lose its mode for good.
+        run = await store.getRun(workloadId);
+        if (run?.state !== STATES.FAILED) return { state: 'SUPERSEDED' };
+      }
       const autoscalers = await autoscalersToRecord(cfg, run);
       // A wake asked meanwhile takes over.
       if (!(await transition(workloadId, { cond: { state: STATES.FAILED }, set: { autoscalers } }))) return { state: 'SUPERSEDED' };

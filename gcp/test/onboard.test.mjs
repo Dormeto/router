@@ -50,6 +50,11 @@ const REFUSALS = [
   ['a GPU VM', (w) => { w.vms['vm-a'].guestAccelerators = [{ acceleratorCount: 1 }]; }, ['VM vm-a has a GPU: GPU VMs are not supported, take it out of the backend service']],
   ['a VM whose machine type brings a GPU', (w) => { w.machineTypes['e2-small'].accelerators = [{ guestAcceleratorCount: 1 }]; }, ['VM vm-a has a GPU: GPU VMs are not supported, take it out of the backend service']],
   ['a local SSD', (w) => { w.vms['vm-a'].disks = [{ type: 'PERSISTENT' }, { type: 'SCRATCH' }]; }, ['VM vm-a has a local SSD: a stop would lose its data, take it out of the backend service']],
+  ['a regional managed group with an even target shape and instance redistribution on', (w) => {
+    w.managed.mig = mig({ kind: 'regional', location: REGION, distributionPolicy: { targetShape: 'EVEN' }, updatePolicy: { instanceRedistributionType: 'PROACTIVE' } });
+    w.vms['mig-1'] = { id: '3001', status: 'RUNNING' };
+    w.services.app.backends = [{ group: `${V1}/regions/${REGION}/instanceGroups/mig` }];
+  }, ['regional managed group mig has the target shape EVEN with instance redistribution on: Google cannot stop or suspend its VMs one by one, set its instance redistribution type to NONE or change its target shape, then onboard again']],
   ['a GPU VM in a managed group', (w) => {
     withMig(w);
     w.vms['mig-1'].guestAccelerators = [{ acceleratorCount: 1 }];
@@ -102,10 +107,36 @@ test('a refused onboarding is a 400 naming every reason, with nothing changed', 
 
 // --- The dry run --------------------------------------------------------------------------------------------------------
 
+const REGIONAL_GROUPS = [
+  ['instance redistribution off', { distributionPolicy: { targetShape: 'EVEN' }, updatePolicy: { instanceRedistributionType: 'NONE' } }],
+  ['another target shape', { distributionPolicy: { targetShape: 'BALANCED' }, updatePolicy: { instanceRedistributionType: 'PROACTIVE' } }],
+];
+for (const [name, fields] of REGIONAL_GROUPS) {
+  test(`dry run accepts a regional managed group with ${name}`, async () => {
+    const { onboarding } = setup((w) => {
+      w.managed.mig = mig({ kind: 'regional', location: REGION, ...fields });
+      w.vms['mig-1'] = { id: '3001', status: 'RUNNING' };
+      w.services.app.backends = [{ group: `${V1}/regions/${REGION}/instanceGroups/mig` }];
+    });
+    assert.deepEqual((await onboarding.dryRun(INPUT)).reasons, []);
+  });
+}
+
+test('dry run: Google\'s defaults hold when it says nothing: a regional group is even and redistributes; a zonal one has neither', async () => {
+  const silent = setup((w) => {
+    w.managed.mig = mig({ kind: 'regional', location: REGION });
+    w.vms['mig-1'] = { id: '3001', status: 'RUNNING' };
+    w.services.app.backends = [{ group: `${V1}/regions/${REGION}/instanceGroups/mig` }];
+  });
+  assert.match((await silent.onboarding.dryRun(INPUT)).reasons.join(), /regional managed group mig has the target shape EVEN/);
+  const zonal = setup((w) => withMig(w));
+  assert.deepEqual((await zonal.onboarding.dryRun(INPUT)).reasons, []);
+});
+
 test('dry run lists the VMs and the groups, with their numeric IDs, and changes nothing', async () => {
   const { w, store, onboarding } = setup((world) => {
     world.managed.zonal = { kind: 'zonal', location: ZONE, id: '2001', members: ['z-1'] };
-    world.managed.regional = { kind: 'regional', location: REGION, id: '2002', members: ['r-1'] };
+    world.managed.regional = { kind: 'regional', location: REGION, id: '2002', members: ['r-1'], updatePolicy: { instanceRedistributionType: 'NONE' } };
     world.vms['z-1'] = { id: '3001', status: 'RUNNING' };
     world.vms['r-1'] = { id: '3002', status: 'RUNNING', zone: 'europe-west1-c' };
     world.services.app.backends.push({ group: `${V1}/zones/${ZONE}/instanceGroups/zonal` }, { group: `${V1}/regions/${REGION}/instanceGroups/regional` });

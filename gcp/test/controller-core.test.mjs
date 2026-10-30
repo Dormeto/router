@@ -492,6 +492,25 @@ test('a stop whose operation is done while the group still stops its VMs: ASLEEP
   assert.equal(polled, 5);
 });
 
+test('the nap asks to stop only what runs: a VM being created or started would have the whole request refused', async () => {
+  const t = setup({
+    cfg: { backends: [MIG], hibernate: false },
+    groups: {
+      mig: [
+        managed('mig-1', 'RUNNING'),
+        managed('mig-2', 'PROVISIONING', 'CREATING'),
+        managed('mig-3', 'STAGING'),
+        managed('mig-4', 'RUNNING', 'STARTING'),
+        managed('mig-5', 'TERMINATED'),
+      ],
+    },
+  });
+  t.world.on['stop mig mig-1'] = async () => { t.world.groups.mig = t.world.groups.mig.map((m) => ({ ...m, instanceStatus: 'TERMINATED', currentAction: 'NONE' })); return 'under way'; };
+  assert.equal((await t.controller.nap('demo')).state, STATES.ASLEEP);
+  assert.deepEqual(t.world.calls.filter((c) => c.startsWith('stop')), ['stop mig mig-1']);
+  assert.deepEqual(t.run().stopped, ['mig-1']);
+});
+
 test('a stop that never ends: FAILED with the kind timeout, within the request', async () => {
   const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } }, cfg: { hibernate: false } });
   t.world.on['stop vm-a'] = async () => { t.world.vms['vm-a'].status = 'STOPPING'; throw notDone(); };
@@ -952,6 +971,28 @@ test('the release gives way to a wake asked meanwhile, and keeps a recorded auto
   const running = setup({ run: { state: STATES.AWAKE }, vms: { 'vm-a': { status: 'RUNNING' } } });
   assert.deepEqual(await running.controller.release('demo'), { state: 'SKIPPED', reason: STATES.AWAKE });
   assert.deepEqual(running.world.calls, []);
+});
+
+test('the release reads the run again after its wait: a mode recorded meanwhile survives, with the autoscaler now off', async () => {
+  const recorded = [{ kind: 'zonal', location: ZONE, name: 'mig', mode: 'ON' }];
+  const t = setup({
+    run: FAILED_RUN(START), cfg: { backends: [MIG], hibernate: false }, groups: { mig: [managed('mig-1', 'RUNNING')] }, autoscalers: { mig: 'ON' },
+  });
+  t.clock.onSleep(() => {
+    t.run().autoscalers = recorded;
+    t.world.autoscalers.mig = 'OFF';
+  });
+  assert.equal((await t.controller.release('demo')).state, STATES.ASLEEP);
+  assert.deepEqual(t.run().autoscalers, recorded);
+});
+
+test('the release whose run left FAILED, or is gone, during its wait reads nothing more and stops nothing', async () => {
+  const gone = setup({ run: FAILED_RUN(START), vms: { 'vm-a': { status: 'RUNNING' } }, cfg: { backends: [MIG], hibernate: false }, groups: { mig: [managed('mig-1', 'RUNNING')] } });
+  gone.clock.onSleep(() => { gone.store.state.run = null; });
+  assert.deepEqual(await gone.controller.release('demo'), { state: 'SUPERSEDED' });
+  assert.equal(gone.world.calls.some((c) => c.startsWith('stop')), false);
+  assert.deepEqual(gone.world.autoscalerReads, []);
+  assert.deepEqual(gone.logged('ReleaseFailed'), []);
 });
 
 test('a release that fails stays failed, logged, for the next check to ask again', async () => {

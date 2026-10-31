@@ -23,7 +23,7 @@ test('switch: the URL map, both backend services and the URL, the global load ba
     options: {
       project: 'dormeto-dev', configuration: 'dormeto-dev', timeout: 300, settle: 20, region: null,
       urlMap: 'dmt-dev', from: 'dmt-demo-app', to: 'dmt-demo-standin', url: 'https://gcp.dev.dormeto.com/', baseline: 5,
-      weighted: false, hold: false, instance: 'dmt-demo', zone: 'europe-west1-b',
+      weighted: false, hold: false, suspend: false, instance: 'dmt-demo', zone: 'europe-west1-b',
     },
   });
   assert.equal(parseArgs(['switch', '--weighted', '--from', 'dmt-demo-app', '--to', 'dmt-demo-standin']).options.weighted, true);
@@ -50,6 +50,9 @@ test('switch --hold: the VM it stops and starts; not with --weighted; --instance
   assert.throws(() => parseArgs(['switch', '--from', 'a', '--to', 'b', '--instance', 'other']), /--instance and --zone go with --hold/);
   assert.throws(() => parseArgs(['switch', '--hold=yes', '--from', 'a', '--to', 'b']), UsageError);
   assert.throws(() => parseArgs(['vm', 'start', '--hold']), UsageError);
+  assert.equal(parseArgs(['switch', '--hold', '--suspend', '--from', 'a', '--to', 'b']).options.suspend, true);
+  assert.throws(() => parseArgs(['switch', '--suspend', '--from', 'a', '--to', 'b']), /--suspend goes with --hold/);
+  assert.throws(() => parseArgs(['vm', 'suspend', '--suspend']), UsageError);
 });
 
 test('vm: the demo VM, its unmanaged group and backend service by default', () => {
@@ -140,7 +143,7 @@ test('metric on the regional load balancer: its URL map as the metric labels it,
 });
 
 test('neg: the VM of the zonal NEG, its group and backend service by default; the address is required', () => {
-  for (const action of ['stop', 'start']) {
+  for (const action of ['stop', 'start', 'suspend', 'resume']) {
     assert.deepEqual(parseArgs(['neg', action, '--url', 'http://203.0.113.8/']), {
       command: 'neg',
       action,
@@ -152,7 +155,7 @@ test('neg: the VM of the zonal NEG, its group and backend service by default; th
     });
   }
   assert.throws(() => parseArgs(['neg', 'stop']), UsageError);
-  assert.throws(() => parseArgs(['neg', 'suspend', '--url', 'http://203.0.113.8/']), UsageError);
+  assert.throws(() => parseArgs(['neg', 'scale', '--url', 'http://203.0.113.8/']), UsageError);
 });
 
 test('sql: the instance dmt-demo-sql, stopped or started, 30 minutes at most', () => {
@@ -204,7 +207,7 @@ test('gke scale: the demo Deployment to a number of replicas, 0 included; the ad
 });
 
 test('the usage lists the new commands', () => {
-  for (const word of ['neg stop|start', 'sql stop|start', 'gke scale', '[--hold]', 'tag bind|unbind']) assert.ok(USAGE.includes(word), word);
+  for (const word of ['neg stop|start|suspend|resume', 'sql stop|start', 'gke scale', '[--hold]', '[--suspend]', 'tag bind|unbind']) assert.ok(USAGE.includes(word), word);
 });
 
 test('help: --help, -h and help', () => {

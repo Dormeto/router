@@ -16,6 +16,7 @@ export const USAGE = `Usage: node gcp/tools/measure.mjs <command> [options]
          [--hold] [--instance dmt-demo] [--zone europe-west1-b] (M3: a path rule /_dormeto/backend/* to --from written
          beside the plain swap; once settled, the VM stopped and started under both services' getHealth, then the map
          restored to what it was)
+         [--suspend] (with --hold: the VM suspended and resumed instead)
   health                                    a backend service's health every 2 s, each change printed
          [--backend-service dmt-demo-app] [--region <region>] [--for 120] (seconds)
   vm stop|start|suspend|resume              the demo VM, through Compute Engine
@@ -24,7 +25,7 @@ export const USAGE = `Usage: node gcp/tools/measure.mjs <command> [options]
   mig stop|start|suspend|resume             the managed group's VMs, through the group (its autoscaler off, back on)
          [--group dmt-demo-mig] [--autoscaler dmt-demo-mig] [--autoscaler-mode ON] [--zone europe-west1-b]
          [--backend-service dmt-demo-mig-app] [--region <region>] [--url https://mig.gcp.dev.dormeto.com/]
-  neg stop|start --url <address of the NEG's load balancer>
+  neg stop|start|suspend|resume --url <address of the NEG's load balancer>
                                             the VM of the zonal NEG, through Compute Engine: the NEG's endpoints,
                                             the backend service's health, the answers
          [--instance dmt-demo-neg] [--group dmt-demo-neg] [--backend-service dmt-demo-neg] [--zone europe-west1-b]
@@ -83,6 +84,7 @@ const OPTIONS = {
   weighted: { flag: 'weighted', kind: 'boolean', default: false },
   duration: { flag: 'for', kind: 'positive', default: 120 },
   hold: { flag: 'hold', kind: 'boolean', default: false },
+  suspend: { flag: 'suspend', kind: 'boolean', default: false },
   replicas: { flag: 'replicas', kind: 'count', required: true },
   cluster: { flag: 'cluster', kind: 'name', default: 'dmt-demo-gke' },
   namespace: { flag: 'namespace', kind: 'name', default: 'default' },
@@ -90,7 +92,7 @@ const OPTIONS = {
 };
 
 const COMMANDS = {
-  switch: { actions: null, timeout: 300, options: ['project', 'configuration', 'timeout', 'settle', 'region', 'urlMap', 'from', 'to', 'url', 'baseline', 'weighted', 'hold', 'instance', 'zone'] },
+  switch: { actions: null, timeout: 300, options: ['project', 'configuration', 'timeout', 'settle', 'region', 'urlMap', 'from', 'to', 'url', 'baseline', 'weighted', 'hold', 'suspend', 'instance', 'zone'] },
   vm: { actions: ACTIONS, timeout: 600, options: ['project', 'configuration', 'timeout', 'settle', 'region', 'zone', 'instance', 'group', 'backendService', 'url'] },
   mig: {
     actions: ACTIONS,
@@ -102,7 +104,7 @@ const COMMANDS = {
   health: { actions: null, options: ['project', 'configuration', 'region', 'backendService', 'duration'] },
   // The NEG's VM and the GKE demo have no domain name: the address of their load balancer (the README reads it with gcloud).
   neg: {
-    actions: ['stop', 'start'],
+    actions: ACTIONS,
     timeout: 600,
     options: ['project', 'configuration', 'timeout', 'settle', 'region', 'zone', 'instance', 'group', 'backendService', 'url'],
     defaults: { instance: 'dmt-demo-neg', group: 'dmt-demo-neg', backendService: 'dmt-demo-neg' },
@@ -187,6 +189,7 @@ export function parseArgs(argv) {
     if (result.from === result.to) throw new UsageError('switch: --from and --to are the same backend service');
     if (result.hold && result.weighted) throw new UsageError('switch: --hold writes a plain swap, not --weighted');
     if (!result.hold && (parsed.values.instance !== undefined || parsed.values.zone !== undefined)) throw new UsageError('switch: --instance and --zone go with --hold');
+    if (!result.hold && result.suspend) throw new UsageError('switch: --suspend goes with --hold');
   }
   return { command, action, options: result };
 }

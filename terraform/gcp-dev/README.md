@@ -109,6 +109,9 @@ addr() { gcloud compute addresses describe "$1" --global --format='value(address
 # S3: a stopped VM in a NEG keeps its endpoint? (M1)
 node gcp/tools/measure.mjs neg stop  --url "http://$(addr dmt-dev-neg)/"
 node gcp/tools/measure.mjs neg start --url "http://$(addr dmt-dev-neg)/"
+# S3: and a suspended one
+node gcp/tools/measure.mjs neg suspend --url "http://$(addr dmt-dev-neg)/"
+node gcp/tools/measure.mjs neg resume  --url "http://$(addr dmt-dev-neg)/"
 # S4: the classic map's switch, away from the app (its default) and back (M2), five runs
 node gcp/tools/measure.mjs switch --url-map dmt-dev-classic --url "http://$(addr dmt-dev-classic)/" \
   --from dmt-demo-classic-app --to dmt-demo-classic-standin
@@ -118,6 +121,11 @@ node gcp/tools/measure.mjs switch --url-map dmt-dev-classic --url "http://$(addr
 node gcp/tools/measure.mjs switch --hold --url-map dmt-dev-classic --url "http://$(addr dmt-dev-classic)/" \
   --from dmt-demo-classic-app --to dmt-demo-classic-standin
 node gcp/tools/measure.mjs switch --hold --region europe-west1 --url-map dmt-dev-regional --url http://regional.gcp.dev.dormeto.com/ \
+  --from dmt-demo-regional-app --to dmt-demo-regional-standin
+# S4: the same with the VM suspended and resumed
+node gcp/tools/measure.mjs switch --hold --suspend --url-map dmt-dev-classic --url "http://$(addr dmt-dev-classic)/" \
+  --from dmt-demo-classic-app --to dmt-demo-classic-standin
+node gcp/tools/measure.mjs switch --hold --suspend --region europe-west1 --url-map dmt-dev-regional --url http://regional.gcp.dev.dormeto.com/ \
   --from dmt-demo-regional-app --to dmt-demo-regional-standin
 # S4: the classic request count (M5)
 node gcp/tools/measure.mjs metric --url-map dmt-dev-classic --url "http://$(addr dmt-dev-classic)/" \

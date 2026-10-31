@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { parseArgs } from '../tools/measure-core.mjs';
-import { GoogleError, createGoogle, runGke, runSql, runSwitch, runTag } from '../tools/measure.mjs';
+import { GoogleError, createGoogle, runGke, runNeg, runSql, runSwitch, runTag } from '../tools/measure.mjs';
 
 function virtualTime() {
   let clock = 0;
@@ -317,9 +317,9 @@ function holdWorld({ scope = 'global', urlMap = 'dmt-dev-classic', from = CLASSI
       return { status: 'DONE' };
     }
     if (method === 'GET' && url === VM) return { name: 'dmt-demo', status: world.vm };
-    if (method === 'POST' && (url === `${VM}/stop` || url === `${VM}/start`)) {
+    if (method === 'POST' && [`${VM}/stop`, `${VM}/start`, `${VM}/suspend`, `${VM}/resume`].includes(url)) {
       const action = url.slice(url.lastIndexOf('/') + 1);
-      world.vm = action === 'stop' ? 'TERMINATED' : 'RUNNING';
+      world.vm = { stop: 'TERMINATED', suspend: 'SUSPENDED', start: 'RUNNING', resume: 'RUNNING' }[action];
       world.changedAt = t;
       world.events.push(action);
       return { status: 'DONE' };
@@ -447,6 +447,38 @@ test('switch --hold refuses before any change: the VM not running, a hold route 
   assert.deepEqual(rules.events, []);
 });
 
+test('switch --hold --suspend: the VM suspended and resumed under getHealth, never stopped, the map restored', async () => {
+  const world = holdWorld();
+  const { code, said } = holdRun(world, holdArgs(['--suspend']));
+  assert.equal(await code, 0);
+  assert.deepEqual(world.events, ['map', 'suspend', 'resume', 'map']);
+  assert.match(said('hold unhealthy')[0], /dmt-demo-classic-app unhealthy, \+\d+\.\ds after the suspend/);
+  assert.match(said('hold healthy')[0], /dmt-demo-classic-app healthy, \+\d+\.\ds after the resume/);
+  assert.deepEqual(said('suspend'), ['sent: dmt-demo']);
+  assert.deepEqual(said('resume'), ['sent: dmt-demo']);
+  assert.deepEqual(world.map.defaultService, classicMap().defaultService);
+});
+
+test('switch --hold --suspend: interrupted with the VM suspended, the map restored and the command that resumes it said', async () => {
+  const world = holdWorld();
+  const run = contextOf(holdArgs(['--suspend']), { google: world.google, answer: world.answer });
+  run.ctx.interrupted = () => world.vm === 'SUSPENDED';
+  const code = await run.time.drive(runSwitch(run.ctx));
+  assert.equal(code, 1);
+  assert.deepEqual(world.events, ['map', 'suspend', 'map']);
+  assert.ok(run.said('vm').some((text) => text === 'dmt-demo is still suspended: node gcp/tools/measure.mjs vm resume'), run.said('vm').join());
+  assert.deepEqual(run.said('hold healthy'), ['no: the VM was not asked to resume']);
+});
+
+test('switch --hold --suspend: a swap that does not settle suspends no VM', async () => {
+  const world = holdWorld();
+  world.answer = () => ({ status: 200, kind: 'app', instance: 'dmt-demo', boot: 'b', error: null });
+  const { code, said } = holdRun(world, holdArgs(['--suspend', '--timeout', '20']));
+  assert.equal(await code, 1);
+  assert.deepEqual(world.events, ['map', 'map']);
+  assert.deepEqual(said('hold unhealthy'), ['no: the VM was not asked to suspend']);
+});
+
 test('switch without --hold: the map stays swapped, no VM is touched', async () => {
   const world = holdWorld();
   const { code } = holdRun(world, ['switch', '--url-map', 'dmt-dev-classic', '--url', 'http://203.0.113.7/', '--from', CLASSIC_APP, '--to', CLASSIC_STANDIN, '--settle', '3', '--baseline', '1']);
@@ -454,6 +486,84 @@ test('switch without --hold: the map stays swapped, no VM is touched', async () 
   assert.deepEqual(world.events, ['map']);
   assert.equal(world.map.defaultService, service('global', CLASSIC_STANDIN));
   assert.equal(world.map.hostRules, undefined);
+});
+
+// --- neg: M1, and a suspended VM behind a zonal NEG ---------------------------------------------------------------------------
+
+const NEG_VM = `${COMPUTE}/zones/europe-west1-b/instances/dmt-demo-neg`;
+const NEG_GROUP = `${COMPUTE}/zones/europe-west1-b/networkEndpointGroups/dmt-demo-neg`;
+const NEG_SERVICE = service('global', 'dmt-demo-neg');
+
+// A VM in a zonal NEG: its endpoint kept whatever its status (`gone`: the endpoint goes at the action), its health behind it.
+function negWorld({ vm = 'RUNNING', gone = false } = {}) {
+  const world = { vm, events: [], reads: 0, gone };
+  world.google = (method, url, body) => {
+    if (method === 'GET' && url === NEG_SERVICE) return { name: 'dmt-demo-neg', selfLink: NEG_SERVICE, backends: [{ group: NEG_GROUP }] };
+    if (method === 'GET' && url === NEG_VM) return { name: 'dmt-demo-neg', status: world.vm };
+    if (method === 'POST' && url === `${NEG_GROUP}/listNetworkEndpoints`) {
+      world.reads += 1;
+      const held = !world.gone || world.events.length === 0;
+      return { items: held ? [{ networkEndpoint: { instance: NEG_VM, ipAddress: '10.10.0.5', port: 80 } }] : [] };
+    }
+    if (method === 'POST' && url === `${NEG_SERVICE}/getHealth`) {
+      assert.deepEqual(body, { group: NEG_GROUP });
+      return { healthStatus: [{ instance: NEG_VM, ipAddress: '10.10.0.5', port: 80, healthState: world.vm === 'RUNNING' ? 'HEALTHY' : 'UNHEALTHY' }] };
+    }
+    if (method === 'POST' && url.startsWith(`${NEG_VM}/`)) {
+      const action = url.slice(url.lastIndexOf('/') + 1);
+      world.vm = { stop: 'TERMINATED', suspend: 'SUSPENDED', start: 'RUNNING', resume: 'RUNNING' }[action];
+      world.events.push(action);
+      return { status: 'DONE' };
+    }
+    return unexpected(method, url);
+  };
+  world.answer = () => (world.vm === 'RUNNING'
+    ? { status: 200, kind: 'app', instance: 'dmt-demo-neg', boot: 'b', error: null }
+    : { status: 503, kind: 'http 503', instance: null, boot: null, error: null });
+  return world;
+}
+
+const negRun = (world, action) => {
+  const run = contextOf(['neg', action, '--url', 'http://203.0.113.8/', '--settle', '3'], { google: world.google, answer: world.answer });
+  return { ...run, code: run.time.drive(runNeg(run.ctx)) };
+};
+
+test('neg suspend: the VM suspended, its endpoint read all along and kept, none healthy, the answers gone', async () => {
+  const world = negWorld();
+  const { code, said } = negRun(world, 'suspend');
+  assert.equal(await code, 0);
+  assert.deepEqual(world.events, ['suspend']);
+  assert.deepEqual(said('endpoint'), ['dmt-demo-neg: dmt-demo-neg 10.10.0.5:80']);
+  assert.match(said('endpoints')[0], /^1 to 1 during the suspend, 1 at the end, \d+ reads$/);
+  assert.match(said('suspended')[0], /^all 1 instance, /);
+  assert.match(said('unhealthy')[0], /^no instance healthy, /);
+});
+
+test('neg resume: the VM resumed from suspended, healthy, the answers back, its endpoint kept', async () => {
+  const world = negWorld({ vm: 'SUSPENDED' });
+  const { code, said } = negRun(world, 'resume');
+  assert.equal(await code, 0);
+  assert.deepEqual(world.events, ['resume']);
+  assert.match(said('endpoints')[0], /^1 to 1 during the resume, 1 at the end/);
+  assert.match(said('running')[0], /^all 1 instance, /);
+  assert.match(said('healthy')[0], /^one instance, /);
+  assert.match(said('first app answer')[0], /after the request/);
+});
+
+test('neg suspend: an endpoint lost while suspended shows in its reads', async () => {
+  const world = negWorld({ gone: true });
+  const { code, said } = negRun(world, 'suspend');
+  assert.equal(await code, 0);
+  assert.match(said('endpoints')[0], /^0 to 1 during the suspend, 0 at the end/);
+  assert.ok(said('endpoint').includes('dmt-demo-neg none'), said('endpoint').join());
+});
+
+test('neg: nothing to act on is refused before any change: resume of a running VM, suspend of a stopped one', async () => {
+  const running = negWorld();
+  await assert.rejects(negRun(running, 'resume').code, /dmt-demo-neg is RUNNING: nothing to resume/);
+  const stopped = negWorld({ vm: 'TERMINATED' });
+  await assert.rejects(negRun(stopped, 'suspend').code, /dmt-demo-neg is TERMINATED: nothing to suspend/);
+  assert.deepEqual([...running.events, ...stopped.events], []);
 });
 
 // --- tag bind|unbind: M7 ---------------------------------------------------------------------------------------------------

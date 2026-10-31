@@ -203,7 +203,8 @@ async function readHealth(request, backendService) {
 // backend services' health read every 2 s: Google health checks only a backend service that a forwarding rule
 // references (spec section 12, 7), so a service the switch brings back may answer 503 until its health checks pass, and
 // its health line tells that warm-up from the propagation. With --hold (M3, spec 2026-10-30, section 10), the hold route
-// beside the swap; once settled, the VM stopped and started under that health; and the map restored at the end.
+// beside the swap; once settled, the VM stopped and started (with --suspend, suspended and resumed) under that health; and the map
+// restored at the end.
 export async function runSwitch(ctx) {
   const { options: o, request, log } = ctx;
   const scope = scopeOf(o);
@@ -222,7 +223,7 @@ export async function runSwitch(ctx) {
   const vmUrl = `${COMPUTE}/projects/${o.project}/zones/${o.zone}/instances/${o.instance}`;
   if (o.hold) {
     const { status } = await request('GET', vmUrl);
-    if (status !== 'RUNNING') throw new CheckError(`${o.instance} is ${status}: --hold stops and starts a running VM`);
+    if (status !== 'RUNNING') throw new CheckError(`${o.instance} is ${status}: --hold ${o.suspend ? 'suspends and resumes' : 'stops and starts'} a running VM`);
   }
   log('url map', `${o.urlMap}: ${o.from} (${oldKind}) to ${o.to} (${newKind})${o.weighted ? ', weighted' : ''}, at ${paths.join(', ')}`);
   if (o.hold) log('hold route', `/_dormeto/backend/* to ${o.from}, at ${holds.join(', ')}`);
@@ -281,11 +282,14 @@ export async function runSwitch(ctx) {
   return summary.settled !== null && held && restored ? 0 : 1;
 }
 
-// M3: with the hold route written, the VM stopped, then started, each as soon as the application's service reads what it
-// should or within --timeout, its health read all along by the switch's poller. The times of the requests, null for a start
-// not asked (interrupted).
+// What --hold does to the VM: down, then up.
+const holdActions = ({ suspend }) => (suspend ? { down: 'suspend', gone: 'suspended', up: 'resume' } : { down: 'stop', gone: 'stopped', up: 'start' });
+
+// M3: with the hold route written, the VM down, then up, each as soon as the application's service reads what it should or within
+// --timeout, its health read all along by the switch's poller. The times of the requests, null for an `up` not asked (interrupted).
 async function holdCycle(ctx, vmUrl, health) {
   const { options: o, request, log } = ctx;
+  const { down, gone, up } = holdActions(o);
   const act = async (action) => {
     const asked = ctx.at();
     log(action, `sent: ${o.instance}`);
@@ -297,27 +301,28 @@ async function holdCycle(ctx, vmUrl, health) {
     const deadline = ctx.at() + o.timeout * 1000;
     while (!ctx.interrupted() && ctx.at() < deadline && core.levelAt(health.samples, o.from, asked, level) === null) await ctx.wait(500);
   };
-  const stopped = await act('stop');
-  await until(stopped, 'unhealthy');
+  const wentDown = await act(down);
+  await until(wentDown, 'unhealthy');
   if (ctx.interrupted()) {
-    log('vm', `${o.instance} is still stopped: node gcp/tools/measure.mjs vm start`);
-    return { stopped, started: null };
+    log('vm', `${o.instance} is still ${gone}: node gcp/tools/measure.mjs vm ${up}`);
+    return { wentDown, cameUp: null };
   }
-  const started = await act('start');
-  await until(started, 'healthy');
-  return { stopped, started };
+  const cameUp = await act(up);
+  await until(cameUp, 'healthy');
+  return { wentDown, cameUp };
 }
 
-// M3's answer: the application's service unhealthy after the stop and healthy after the start, and what its health read since
-// the swap (`no status`: the hold route did not keep it health checked). True when it is so.
+// M3's answer: the application's service unhealthy after the VM went down and healthy after it came up, and what its health read
+// since the swap (`no status`: the hold route did not keep it health checked). True when it is so.
 function holdSummary(ctx, health, sent, cycle) {
   const { options: o, log } = ctx;
+  const { down, up } = holdActions(o);
   const row = (what, level, asked, action) => {
     const t = asked === null ? null : core.levelAt(health.samples, o.from, asked, level);
     const none = asked === null ? `no: the VM was not asked to ${action}` : `no: ${o.from} not read as ${level} within ${o.timeout} s of the ${action}`;
     return [what, t, t === null ? null : `${o.from} ${level}, ${core.delta(t - asked)} after the ${action}`, none];
   };
-  const rows = [row('hold unhealthy', 'unhealthy', cycle?.stopped ?? null, 'stop'), row('hold healthy', 'healthy', cycle?.started ?? null, 'start')];
+  const rows = [row('hold unhealthy', 'unhealthy', cycle?.wentDown ?? null, down), row('hold healthy', 'healthy', cycle?.cameUp ?? null, up)];
   printSummary(log, rows);
   const counts = core.levelCounts(health.samples, o.from, sent);
   log('hold reads', `${o.from} since the update: ${counts.healthy} healthy, ${counts.unhealthy} unhealthy, ${counts['no status']} no status`);
@@ -489,9 +494,9 @@ function logEndpoints(ctx, poller, since) {
   ctx.log('endpoints', reads === 0 ? 'not read' : `${min} to ${max} during the ${ctx.action}, ${last} at the end, ${plural(reads, 'read')}`);
 }
 
-// neg stop|start: a VM held by a zonal NEG, as `vm`, with the NEG's endpoints read every 2 s beside the backend
-// service's health (getHealth on the NEG): the endpoint kept while the VM is stopped, unhealthy, then healthy (M1).
-async function runNeg(ctx) {
+// neg stop|start|suspend|resume: a VM held by a zonal NEG, as `vm`, with the NEG's endpoints read every 2 s beside the backend
+// service's health (getHealth on the NEG): the endpoint kept while the VM is down, unhealthy, then healthy (M1).
+export async function runNeg(ctx) {
   const { options: o, action, request, log } = ctx;
   const zone = `${COMPUTE}/projects/${o.project}/zones/${o.zone}`;
   const instanceUrl = `${zone}/instances/${o.instance}`;

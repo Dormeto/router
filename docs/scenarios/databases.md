@@ -80,3 +80,6 @@ workload sleeps and stops it again (`DatabaseRestopped` in the controller's logs
 
 Tag the database `dormeto:workload = <workload id>`, with the same id as the application's backends. The manager's
 onboarding of the target group tags the databases it is given and sets the 1800 s wake timeout.
+
+If Terraform writes the database, a workload onboarded from the manager needs the AWS provider's `ignore_tags` for
+`dormeto:` (see [A customer's Terraform](../../README.md)).

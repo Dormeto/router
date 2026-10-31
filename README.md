@@ -382,6 +382,27 @@ target groups and `dormeto:workload` tags (any caller but the router's roles, su
 onboarder, which repairs the workloads they concern; the idle check asks for a repair when it finds one to make. Each
 repair is a drift event (90 days) in the workload status and the router health.
 
+**A customer's Terraform.** Terraform does not know what onboarding added, so every plan offers to remove it, and an apply
+is repaired about a minute later (69 s measured twice). Until the repair a rule changed in place forwards straight to the
+application, so visitors of a sleeping workload get the load balancer's own error. Onboarding from the manager, a customer's
+configuration needs:
+
+```hcl
+provider "aws" {
+  ignore_tags {
+    key_prefixes = ["dormeto:"]
+  }
+}
+```
+
+and `lifecycle { ignore_changes = [...] }` with `action` on a rule instrumented in place (a rule covered by a shadow needs
+nothing). `aws_ecs_service`, `aws_autoscaling_group` and `aws_instance` have their fields in their
+[scenario pages](docs/scenarios/README.md). The provider block covers everything that provider writes: leave it out if it
+also declares `dormeto:` tags, as it does for a workload written with the `workload` module, which is not repaired either.
+Checked with a saved plan on imported dev resources (2026-10-31): without these lines the plan removes the tags on an EC2
+instance, an Auto Scaling group, an ECS service, an RDS instance and a rule, and resets the rule's action and the group's
+capacity; with them, none of that is in the plan.
+
 ```bash
 aws lambda invoke --function-name dmt-dev-onboarder --cli-binary-format raw-in-base64-out --payload '{"action":"preview","workloadId":"onb","targetGroupArn":"<arn>"}' /dev/stdout
 ```

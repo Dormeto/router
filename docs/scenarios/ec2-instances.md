@@ -89,3 +89,7 @@ There is no early failure check for instances: a wake that never gets a healthy 
 
 Onboard the target group from the manager, which tags the instances and instruments the rules. With Terraform, use the
 `workload` module and tag the instances `dormeto:workload = <workload id>` (see the [README](../../README.md)).
+
+If Terraform writes the instance, a workload onboarded from the manager needs the AWS provider's `ignore_tags` for
+`dormeto:` (see [A customer's Terraform](../../README.md)) and, with fallback instance types, `ignore_changes = [instance_type]`:
+a wake may run the instance on a fallback type until its next nap, and an apply would change it back.

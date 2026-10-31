@@ -89,3 +89,7 @@ A nap took 34–70 s.
 
 Onboard the target group from the manager, which tags the services and instruments the rules. With Terraform, use the
 `workload` module and tag the service itself `dormeto:workload = <workload id>` (see the [README](../../README.md)).
+
+If Terraform writes the service, a workload onboarded from the manager needs `ignore_changes = [desired_count]` on it (a nap
+sets it to 0, and an apply would start the service again) and the AWS provider's `ignore_tags` for `dormeto:` (see
+[A customer's Terraform](../../README.md)).

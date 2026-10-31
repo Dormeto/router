@@ -106,3 +106,7 @@ resource "aws_autoscaling_group" "app" {
   }
 }
 ```
+
+If Terraform writes the group, a workload onboarded from the manager needs
+`ignore_changes = [min_size, max_size, desired_capacity, suspended_processes]` on it (a nap scales it to 0 and suspends its
+scaling processes) and the AWS provider's `ignore_tags` for `dormeto:` (see [A customer's Terraform](../../README.md)).

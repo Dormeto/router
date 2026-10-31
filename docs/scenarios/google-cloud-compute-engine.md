@@ -135,6 +135,14 @@ VMs are going down, the workload wakes as soon as the nap ends.
   or by removing the ignore for that apply, which removes Dormeto's fields too until the check writes them back. A custom
   error response policy of your own on a path matcher that names the backend service, or a route of your own under
   `/_dormeto/`, makes the workload ineligible.
+- **The VMs and groups written in Terraform must ignore what a nap changes.** On `google_compute_instance_group_manager`
+  and `google_compute_region_instance_group_manager`, `ignore_changes = [target_size, target_stopped_size,
+  target_suspended_size]`: a nap moves the VMs from the target size to the stopped or suspended size (measured), so an
+  apply would move them back and could create new VMs. On `google_compute_autoscaler` and
+  `google_compute_region_autoscaler`, `ignore_changes = [autoscaling_policy[0].mode]`: a nap turns it off. On
+  `google_compute_instance`, `ignore_changes = [desired_status]` if you set it: an apply would start a napped VM. These
+  field names pass `terraform validate`; no apply was run against a napped workload. The tag's binding is not a field of
+  these resources, so it needs nothing.
 - **A path matcher naming another service too** shows the waiting page for that service's own `502` and `503` while the
   workload is asleep.
 - **A request with a body gets Google's error, not the page.** While asleep, a `POST`, `PUT`, `PATCH` or `DELETE` with a

@@ -143,6 +143,10 @@ VMs are going down, the workload wakes as soon as the nap ends.
   `google_compute_instance`, `ignore_changes = [desired_status]` if you set it: an apply would start a napped VM. These
   field names pass `terraform validate`; no apply was run against a napped workload. The tag's binding is not a field of
   these resources, so it needs nothing.
+- **From router 0.35.0, not accepted yet.** A regional or classic load balancer's URL map also ignores `default_service` and
+  `default_route_action`, since a nap swaps the map's references to the waker (`ignore_changes = [default_service,
+  default_route_action, host_rule, path_matcher]`). A Cloud SQL companion ignores `settings[0].activation_policy`, and a GKE
+  workload's `kubernetes_deployment_v1` or `kubernetes_stateful_set_v1` ignores `spec[0].replicas`.
 - **A path matcher naming another service too** shows the waiting page for that service's own `502` and `503` while the
   workload is asleep.
 - **A request with a body gets Google's error, not the page.** While asleep, a `POST`, `PUT`, `PATCH` or `DELETE` with a

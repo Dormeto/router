@@ -554,7 +554,8 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
   // The nap windows' naps a check asks for, oldest occurrence first and at most SCHEDULED_NAPS_MAX accepted: the next check
   // takes the rest, and those a Cloud Tasks too slow left past the check's budget. Each occurrence is recorded only once its
   // task is accepted, whatever the state by then: the task may have started. A record lost asks again at the next check, and
-  // the task it adds finds the nap under way.
+  // the task it adds finds the nap under way. A pause written after that refuses the task, and the occurrence stays consumed:
+  // once the pause is gone only an idle nap comes, not the window's.
   async function askScheduledNaps(naps, applied, t, deadline) {
     const deferred = [];
     const failed = (workloadId) => (err) => log.error('ScheduleFailed', { workloadId, error: err.message });
@@ -825,6 +826,8 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
       const message = `the wake did not finish within ${cfg.wakeTimeoutSeconds} s (its request stopped)`;
       return { state: (await failStuck(workloadId, { state: STATES.WAKING, wakeId: run.wakeId }, 'wake', message, 'wake-stuck'))?.state };
     }
+    // The nap this check just asked for may have started since the run was read: a repair on that read would remove its policy.
+    if (ctx.applied.get(workloadId) === 'nap') return { state: run.state };
     run = await reconcile(cfg, run, deadline);
     const t = now();
     const idleMs = cfg.idleMinutes * 60_000;

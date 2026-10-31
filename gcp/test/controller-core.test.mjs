@@ -1253,6 +1253,43 @@ test('a task accepted while its nap already started: the occurrence recorded all
   assert.equal(t.run().state, STATES.NAPPING);
 });
 
+test('the same check\'s reconcile leaves the policy of the nap it just asked for, whatever a stale read of the run says', async () => {
+  const t = scheduled(scheduleOf(NAP), { requests: 1 });
+  // The task starts at once: the run NAPPING, the policy written. The check's read of the run went out before that.
+  t.world.onTask = () => {
+    Object.assign(t.store.state.run, { state: STATES.NAPPING, updatedAt: START });
+    t.world.map = asleepMap();
+  };
+  const { getRun } = t.store;
+  t.store.getRun = async (id) => ({ ...(await getRun(id)), state: STATES.AWAKE, awakeSince: 1 });
+  const out = await check(t);
+  assert.equal(out.schedule, 'nap');
+  assert.equal(hasPolicy(t.world.map), true, 'the check\'s repair would have removed it');
+  assert.deepEqual(t.world.calls, []);
+  assert.equal(t.world.tasks.length, 1, 'no idle nap on top');
+});
+
+// Deliberate: an occurrence is recorded once its task is accepted, and the task may have started by then.
+test('a pause after the task was accepted: the task refused and the occurrence consumed, so only an idle nap comes after the pause', async () => {
+  const t = scheduled(scheduleOf(NAP), { requests: 5 });
+  assert.equal((await check(t)).schedule, 'nap');
+  assert.equal(t.run().scheduleApplied, NAP_ID);
+  pauseFor(t);
+  assert.deepEqual(await t.controller.nap('demo', { cause: 'schedule', requestedAt: START, until: NAP_END }), { state: 'SKIPPED', reason: 'paused' });
+  assert.equal(t.run().state, STATES.AWAKE);
+  assert.equal(t.world.vms['vm-a'].status, 'RUNNING');
+
+  await t.controller.resume('demo');
+  t.clock.advance(FIVE_MINUTES);
+  assert.equal((await check(t)).schedule, undefined);
+  assert.equal(t.world.tasks.length, 1, 'the window\'s nap is not asked again');
+  assert.equal(t.run().scheduleApplied, NAP_ID);
+
+  t.world.requests = 0;
+  assert.equal((await check(t)).nap, 'requested');
+  assert.deepEqual(t.world.tasks.at(-1).body, { action: 'nap', workloadId: 'demo' });
+});
+
 test('an awake window\'s wake with its task refused: failed, the occurrence unrecorded, the next check wakes it', async () => {
   const t = scheduled(scheduleOf(AWAKE_WINDOW), { run: { state: STATES.ASLEEP, stateAt: START - DAY }, vms: { 'vm-a': { status: 'TERMINATED' } }, map: asleepMap() });
   t.world.taskRefused = new GoogleError('Google: 403 denied', { code: 403 });

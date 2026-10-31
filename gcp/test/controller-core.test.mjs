@@ -3634,3 +3634,89 @@ for (const [name, change] of [
     assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
   });
 }
+
+// --- What a regression would lose unseen -------------------------------------------------------------------------------------------------------------------------------------
+
+// `at` the nap's commit point, when the record is written and nothing is scaled yet: what happens between the checks and the scale.
+const atCommit = (t, happen) => {
+  const { transition } = t.store;
+  t.store.transition = async (id, change) => {
+    if (change.set?.stopping) happen();
+    return transition(id, change);
+  };
+};
+
+test('a nap that failed with KEDA paused and the pods up: its release keeps the customer\'s own pause, read now as Dormeto\'s 0', async () => {
+  const t = await withPods(withScaler({ [KEDA_PAUSE]: '4' }));
+  t.w.kube.denied = ['patch deployments/scale'];
+  assert.equal((await t.core.nap('demo')).state, STATES.FAILED);
+  assert.equal(scalerAnnotations(t)[KEDA_PAUSE], '0');
+  assert.equal(replicasOf(t), 2);
+  t.w.kube.denied = [];
+  assert.equal((await t.core.release('demo')).state, STATES.ASLEEP);
+  assert.equal(runOf(t).owners[0].keda.paused, '4');
+  assert.equal((await wakePods(t)).state, STATES.AWAKE);
+  assert.equal(scalerAnnotations(t)[KEDA_PAUSE], '4');
+});
+
+test('a release with no record yet (its nap failed before the commit) records the replicas: its wake brings them back', async () => {
+  const t = await withPods((w) => { w.kube.owners[OWNER].replicas = 4; });
+  runOf(t).state = STATES.FAILED;
+  assert.equal(runOf(t).owners, undefined);
+  assert.equal((await t.core.release('demo')).state, STATES.ASLEEP);
+  assert.equal(replicasOf(t), 0);
+  assert.equal(runOf(t).owners[0].replicas, 4);
+  assert.equal((await wakePods(t)).state, STATES.AWAKE);
+  assert.equal(replicasOf(t), 4);
+});
+
+test('an offboarding of an awake workload gives back the KEDA pause a check could not', async () => {
+  const t = await asleepPods(withScaler({ [KEDA_PAUSE]: '4' }));
+  t.w.kube.owners[OWNER].replicas = 2;
+  t.w.kube.denied = ['patch scaledobjects'];
+  await t.core.check();
+  assert.equal(runOf(t).state, STATES.AWAKE);
+  assert.equal(scalerAnnotations(t)[KEDA_PAUSE], '0');
+  t.w.kube.denied = [];
+  await t.onboarding.offboard('demo');
+  assert.equal(scalerAnnotations(t)[KEDA_PAUSE], '4');
+  assert.equal(t.store.configs.size, 0);
+});
+
+test('an owner deleted between the checks and the scale: failed, worded', async () => {
+  const t = await withPods();
+  atCommit(t, () => { delete t.w.kube.owners[OWNER]; });
+  const out = await t.core.nap('demo');
+  assert.equal(out.state, STATES.FAILED);
+  assert.match(out.error, /Deployment shop\/web not found in GKE cluster europe-west1-b\/shop/);
+  assert.equal(failureOfRun(t).kind, 'configuration');
+});
+
+test('a ScaledObject deleted between the read and the pause is not said to be the owner: it is there, and left at its replicas', async () => {
+  const t = await withPods(withScaler());
+  atCommit(t, () => { t.w.kube.scaledObjects.length = 0; });
+  const out = await t.core.nap('demo');
+  assert.equal(out.state, STATES.FAILED);
+  assert.match(out.error, /scaledobjects\.keda\.sh "web-scaler" not found/);
+  assert.doesNotMatch(out.error, /Deployment shop\/web not found/);
+  assert.equal(replicasOf(t), 2);
+});
+
+test('a terminating pod is still the owner\'s: its endpoint, not gone yet, is no foreign one', async () => {
+  const t = await withPods();
+  Object.assign(t.w.kube.owners[OWNER], { leavingFrom: 3, leavingReads: 4 });
+  t.w.negs[GKE_NEG].foreign = ['10.8.0.3'];
+  assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
+});
+
+test('pods ready, the load balancer\'s health check failing: unhealthy at the wake\'s deadline, and a check leaves it asleep', async () => {
+  const t = await asleepPods();
+  t.w.kube.unhealthy = true;
+  t.w.kube.owners[OWNER].replicas = 2;
+  await t.core.check();
+  assert.equal(runOf(t).state, STATES.ASLEEP);
+  const started = t.clock.now();
+  assert.equal((await wakePods(t)).state, STATES.FAILED);
+  assert.equal(failureOfRun(t).kind, 'unhealthy');
+  assert.ok(t.clock.now() - started >= 300_000);
+});

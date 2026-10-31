@@ -234,8 +234,9 @@ export const watchRecord = (backend) => k8sRecord({ ...backend, id: recordId(bac
 
 // KEDA paused at 0, the owner scaled to 0, its pods gone (the shared code). `timing`: `{ now, sleep, deadline }`.
 export async function sleepOwner({ kubernetesOf }, backend, record, timing) {
-  await sleepK8s({ kubernetesOf }, record, timing).catch((err) => {
-    if (err?.status === 404) throw ownerGone(backend);
+  await sleepK8s({ kubernetesOf }, record, timing).catch(async (err) => {
+    // The 404 may be the ScaledObject's: its own words then say so.
+    if (err?.status === 404 && !(await ownerOf(await kubernetesOf(backend.cluster), backend))) throw ownerGone(backend);
     throw err;
   });
 }

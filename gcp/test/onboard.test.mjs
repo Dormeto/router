@@ -437,6 +437,50 @@ test('onboard: a waker refused at its operation\'s end is the same refusal', asy
   assert.equal(t.store.configs.size, 0);
 });
 
+// A map's change Google refuses for what the map holds: the operator can do something about it, it is no internal error.
+for (const [kind, world, path] of [['global', () => {}, 'global/urlMaps/lb'], ['classic', classic, 'global/urlMaps/lb'], ['regional', regional, `regions/${REGION}/urlMaps/lb`]]) {
+  for (const code of [400, 403]) {
+    test(`onboard ${kind}: Google's ${code} on the map's update is a refusal in Google's words, undone`, async () => {
+      const { w, store, onboarding } = setup(world);
+      w.fail[`PUT ${path}`] = new GoogleError(`Google: PUT ${path}: ${code} Invalid value for field 'resource.pathMatchers[0]'`, { code });
+      await assert.rejects(onboarding.onboard(INPUT), refused(400, 'not-eligible', new RegExp(`^cannot onboard demo: Google refused the update of URL map lb: .*${code} Invalid value`)));
+      assert.equal(store.configs.size, 0);
+      assert.equal(store.runs.size, 0);
+      assert.equal(w.services[WAKER] ?? w.regions[REGION]?.services[WAKER], undefined);
+      assert.ok(w.logs.some((l) => l.event === 'OnboardUndone'));
+    });
+  }
+
+  test(`onboard ${kind}: anything else on the map's update stays a failure`, async () => {
+    const { w, onboarding } = setup(world);
+    const failure = new GoogleError('Google: 503 unavailable', { code: 503 });
+    w.fail[`PUT ${path}`] = failure;
+    await assert.rejects(onboarding.onboard(INPUT), failure);
+  });
+}
+
+test('onboard: a map refused at its operation\'s end is the same refusal; the waker goes with it', async () => {
+  const t = setup();
+  const wait = t.google.waitCompute;
+  let waits = 0;
+  // The waker's insert, then the map's update.
+  t.google.waitCompute = async (...args) => {
+    waits += 1;
+    if (waits === 2) throw new GoogleError('Google: operation update: INVALID_FIELD_VALUE: refused', { code: 400, reason: 'INVALID_FIELD_VALUE' });
+    return wait(...args);
+  };
+  await assert.rejects(t.onboarding.onboard(INPUT), refused(400, 'not-eligible', /Google refused the update of URL map lb: .*INVALID_FIELD_VALUE/));
+  assert.equal(t.w.services[WAKER], undefined);
+  assert.equal(t.store.configs.size, 0);
+});
+
+test('onboard: the store\'s own 400 stays a failure, not a refusal of the map', async () => {
+  const { store, onboarding } = setup();
+  const failure = new GoogleError('Google: documents:commit: 400 bad', { code: 400 });
+  store.putConfig = async () => { throw failure; };
+  await assert.rejects(onboarding.onboard(INPUT), failure);
+});
+
 test('onboard: a failure whose undo fails too still answers the failure, and says so in the logs', async () => {
   const { w, store, onboarding } = setup();
   const failure = new GoogleError('Google: refused', { code: 500 });

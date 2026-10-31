@@ -68,6 +68,13 @@ const absent = (err) => {
   return null;
 };
 
+// At the request or at its operation's end, as `.catch(refusedByGoogle(id, what))`. Google's words say what to change, as the
+// operator can read them; anything else stays a failure.
+const refusedByGoogle = (id, what) => (err) => {
+  if (err?.code === 400 || err?.code === 403) throw new Refusal(400, 'not-eligible', `cannot onboard ${id}: Google refused ${what}: ${err.message}`);
+  throw err;
+};
+
 function checkedId(id) {
   if (typeof id !== 'string' || !WORKLOAD_ID.test(id)) throw bad(`workload ID ${JSON.stringify(id)} does not match ${WORKLOAD_ID.source}`);
   return id;
@@ -418,15 +425,11 @@ export function createOnboarding({ store, compute, urlmaps, regionalUrlmaps, cor
           protocol: 'HTTPS',
           backends: [{ group: `${COMPUTE}/projects/${config.project}/regions/${config.region}/networkEndpointGroups/${config.wakerNeg}` }],
           customRequestHeaders: wakerHeaders(id, lb),
-        }, lb).catch((err) => {
-          // At the request or at its operation's end. Google's words say what to change, as the operator can read them.
-          if (err?.code === 400 || err?.code === 403) throw new Refusal(400, 'not-eligible', `cannot onboard ${id}: Google refused its waker backend service ${name}: ${err.message}`);
-          throw err;
-        });
+        }, lb).catch(refusedByGoogle(id, `its waker backend service ${name}`));
       }
       await mapsOf(lb).modify(urlMap, (map) => inOneUpdate(map, isSwapped(lb)
         ? [(m) => withWakerRoute(m, backendService, waker), (m) => withHoldRoute(m, backendService, waker)]
-        : [(m) => withWakerRoute(m, backendService, waker)]));
+        : [(m) => withWakerRoute(m, backendService, waker)])).catch(refusedByGoogle(id, `the update of URL map ${urlMap}`));
       await store.putConfig(id, cfg);
       await store.initRun(id, now());
     } catch (err) {

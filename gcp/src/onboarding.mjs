@@ -19,7 +19,7 @@ import { STATES } from '../../lambda/src/lib/state.mjs';
 import { companionRead, INSTANCE_NAME, isCompanion, statusOf } from './cloudsql.mjs';
 import { groupOf, PauseRefused } from './controller-core.mjs';
 import {
-  clusterProblems, clusterRead, giveBackOwner, gkeMapRefusal, gkeProblems, isGkeNeg, isPods, negsOfService, ownerAsVm, ownerText,
+  clusterProblems, clusterRead, giveBackOwner, gkeMapRefusal, gkeProblems, isGkeNeg, isPods, negsOfService, ownerAsVm, ownerText, pauseLeft,
 } from './gke.mjs';
 import { SWITCH_HEADER, WORKLOAD_HEADER, WORKLOAD_ID } from './names.mjs';
 import { inOneUpdate, SWAP_WAIT_MS } from './switch.mjs';
@@ -572,23 +572,28 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
 
   // A workload that cannot wake, or whose state is stuck: no wake, and all of Dormeto's goes. The backends stay as they are,
   // and those not up are named. A nap in flight finds its waker backend service gone before it would stop anything, unless
-  // it is already stopping them.
+  // it is already stopping them. What it cannot give back is named too, `notGivenBack`, in the operator's words: none, no field, and
+  // the router will not try again. `left` stays what it was for a CLI below this version.
   async function forceOff(cfg, run) {
     const { workloadId } = cfg;
     const up = await Promise.all(cfg.backends.map((backend) => isUp(backend, workloadId)));
     const left = cfg.backends.filter((_, i) => !up[i]);
+    const notGivenBack = [];
     await Promise.all((run?.autoscalers ?? []).map((a) => compute.setAutoscalerMode(a, a.mode).catch((err) => {
       log.warn('AutoscalerNotGivenBack', { workloadId, autoscaler: a.name, mode: a.mode, error: err.message });
+      notGivenBack.push(`autoscaler ${a.name} (${a.location}) is still off: set its mode back to ${a.mode}`);
     })));
+    // A give-back's failure needs a ScaledObject to give back.
     await Promise.all((run?.owners ?? []).map((record) => giveBackOwner(clients, record).catch((err) => {
       log.warn('AutoscalerNotGivenBack', { workloadId, autoscaler: record.keda?.name, error: err.message });
+      notGivenBack.push(pauseLeft(record));
     })));
     await removeFromGoogle(cfg);
     await store.deleteWorkload(workloadId);
     // An owner left at 0: what it ran goes with the run, its record.
     const replicasBefore = (run?.owners ?? []).map((record) => ({ owner: ownerText(record), replicas: record.replicas }));
     log.warn('Offboarded', { workloadId, force: true, left: left.map(backendText), ...(replicasBefore.length ? { replicasBefore } : {}) });
-    return { id: workloadId, left };
+    return { id: workloadId, left, ...(notGivenBack.length ? { notGivenBack } : {}) };
   }
 
   // An offboarding that stops keeps the documents: they name what is left to remove when it runs again.

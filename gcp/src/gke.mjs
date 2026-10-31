@@ -15,7 +15,7 @@
 import { failureError } from '../../lambda/src/lib/failures.mjs';
 import { CLUSTER_TTL_MS, createKubernetes, KubernetesError, TIMEOUTS } from '../../lambda/src/lib/k8s.mjs';
 import { askRights, GKE_RULES } from '../../lambda/src/lib/kube-access.mjs';
-import { k8sId, k8sRecord, k8sStatus, livePods, ownerOf, ready, resumeK8s, scaledObjectOf, sleepK8s, wakeK8s } from '../../lambda/src/lib/kubernetes.mjs';
+import { k8sId, k8sRecord, k8sStatus, KEDA_PAUSE, livePods, ownerOf, ready, resumeK8s, scaledObjectOf, sleepK8s, wakeK8s } from '../../lambda/src/lib/kubernetes.mjs';
 
 const CONTAINER = 'https://container.googleapis.com/v1';
 const REQUEST_MS = TIMEOUTS.connect + TIMEOUTS.idle;
@@ -259,6 +259,13 @@ export async function giveBackOwner({ kubernetesOf }, record) {
   await resumeK8s({ kubernetesOf }, record).catch((err) => {
     if (err?.status !== 404) throw err;
   });
+}
+
+// A KEDA pause no give-back reached, in the operator's words, once the router's access is going: they scale the owner back by hand, and
+// KEDA, still paused at 0, would take it down again.
+export function pauseLeft({ namespace, owner, replicas, keda }) {
+  const undo = keda.paused == null ? `remove its annotation ${KEDA_PAUSE}` : `set its annotation ${KEDA_PAUSE} back to ${keda.paused}`;
+  return `ScaledObject ${namespace}/${keda.name} is still paused at 0: ${undo}, or KEDA takes ${ownerText({ namespace, owner })} down again; it had ${replicas} replica${replicas === 1 ? '' : 's'}`;
 }
 
 // At the wake's deadline, with the Kubernetes events the wake watch last read (spec section 12).

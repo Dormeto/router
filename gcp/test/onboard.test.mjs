@@ -1127,6 +1127,18 @@ test('force: an autoscaler\'s mode goes back, and one that cannot is logged with
   assert.equal(store.configs.size, 0);
 });
 
+test('force: an autoscaler\'s mode that cannot go back is named in the answer; given back, nothing is', async () => {
+  const { w, store, onboarding } = setup((world) => { Object.assign(world.autoscalers, { good: 'OFF', bad: 'OFF' }); });
+  await onboarding.onboard(INPUT);
+  Object.assign(store.runs.get('demo'), {
+    state: STATES.FAILED,
+    autoscalers: [{ kind: 'zonal', location: ZONE, name: 'good', mode: 'ON' }, { kind: 'zonal', location: ZONE, name: 'bad', mode: 'ON' }],
+  });
+  w.fail[`PATCH zones/${ZONE}/autoscalers?autoscaler=bad`] = new GoogleError('Google: refused', { code: 500 });
+  const { notGivenBack } = await onboarding.offboard('demo', { force: true });
+  assert.deepEqual(notGivenBack, [`autoscaler bad (${ZONE}) is still off: set its mode back to ON`]);
+});
+
 test('force: what must go still must: a refused removal is a failure, the documents kept for the next run', async () => {
   const { w, store, onboarding } = await asleepVmDeleted();
   const failure = new GoogleError('Google: in use', { code: 400 });
@@ -1812,6 +1824,40 @@ test('a forced offboarding: the owner stays at 0 and is named, KEDA given back, 
 test('a forced offboarding of an awake owner names nothing as left', async () => {
   const t = await awakePods();
   assert.deepEqual((await t.onboarding.offboard('demo', { force: true })).left, []);
+});
+
+const PAUSED_LEFT = 'ScaledObject shop/web-scaler is still paused at 0';
+
+test('a forced offboarding, the cluster out of reach: the ScaledObject left paused is named, with what to remove and the replicas', async () => {
+  const t = await awakePods(withKeda);
+  assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
+  t.w.kube.down = true;
+  const { left, notGivenBack } = await t.onboarding.offboard('demo', { force: true });
+  assert.deepEqual(left, [K8S_BACKEND]);
+  assert.deepEqual(notGivenBack, [`${PAUSED_LEFT}: remove its annotation autoscaling.keda.sh/paused-replicas, or KEDA takes Deployment shop/web down again; it had 2 replicas`]);
+  assert.equal(t.store.configs.size, 0);
+});
+
+test('a forced offboarding: the customer\'s own pause is what is to be put back', async () => {
+  const t = await awakePods((w) => {
+    withKeda(w);
+    w.kube.scaledObjects[0].metadata.annotations['autoscaling.keda.sh/paused-replicas'] = '3';
+  });
+  assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
+  t.w.kube.down = true;
+  const { notGivenBack } = await t.onboarding.offboard('demo', { force: true });
+  assert.deepEqual(notGivenBack, [`${PAUSED_LEFT}: set its annotation autoscaling.keda.sh/paused-replicas back to 3, or KEDA takes Deployment shop/web down again; it had 2 replicas`]);
+});
+
+test('a forced offboarding: KEDA given back, or none to give: no field', async () => {
+  const given = await awakePods(withKeda);
+  assert.equal((await given.core.nap('demo')).state, STATES.ASLEEP);
+  assert.equal(Object.hasOwn(await given.onboarding.offboard('demo', { force: true }), 'notGivenBack'), false);
+
+  const none = await awakePods();
+  assert.equal((await none.core.nap('demo')).state, STATES.ASLEEP);
+  none.w.kube.down = true;
+  assert.equal(Object.hasOwn(await none.onboarding.offboard('demo', { force: true }), 'notGivenBack'), false);
 });
 
 test('a Workload shows its k8s backend, and hibernate has no meaning for it', async () => {

@@ -3578,3 +3578,59 @@ test('what a nap records of an owner goes through Firestore\'s fields unchanged'
   const none = await asleepPods();
   assert.deepEqual(fromFields(toFields(runOf(none).owners[0])), runOf(none).owners[0]);
 });
+
+// --- Ready pods with no endpoint: an empty NEG proves nothing of the owner -----------------------------------------------------------------------------------------------------
+
+const NOT_BEHIND = /its network endpoint groups hold no endpoint, and Deployment shop\/web has ready pods, not shown to be behind this load balancer: nothing is scaled/;
+
+test('ready pods behind an empty NEG: no scale, no switch, back awake, worded: they may serve some other way', async () => {
+  const t = await withPods();
+  t.w.negs[GKE_NEG].empty = true;
+  const out = await t.core.nap('demo');
+  assert.equal(out.state, STATES.AWAKE);
+  assert.equal(out.aborted, true);
+  assert.match(out.error, NOT_BEHIND);
+  assert.deepEqual(t.w.changes, []);
+  assert.equal(replicasOf(t), 2);
+  assert.equal(t.w.logs.find((l) => l.event === 'StateChanged' && l.to === STATES.AWAKE).cause, 'backends-changed');
+});
+
+test('a NEG emptied during the nap\'s wait, its pods still ready: back awake, nothing scaled', async () => {
+  const t = await withPods();
+  t.w.on['PUT global/urlMaps/lb'] = () => { t.w.negs[GKE_NEG].empty = true; };
+  const out = await t.core.nap('demo');
+  assert.equal(out.aborted, true);
+  assert.match(out.error, NOT_BEHIND);
+  assert.equal(replicasOf(t), 2);
+});
+
+test('a release of ready pods behind an empty NEG: nothing scaled, still failed', async () => {
+  const t = await withPods();
+  runOf(t).state = STATES.FAILED;
+  t.w.negs[GKE_NEG].empty = true;
+  const out = await t.core.release('demo');
+  assert.equal(out.state, STATES.FAILED);
+  assert.match(out.error, NOT_BEHIND);
+  assert.equal(replicasOf(t), 2);
+});
+
+test('one NEG empty, another holding the owner\'s pods: it is behind the load balancer, and naps', async () => {
+  const t = await withPods((w) => {
+    w.negs.other = { gkeOwner: OWNER, zone: 'europe-west1-c', empty: true, ...NEG_READINGS.description('shop', 'web') };
+    w.services.app.backends.push({ group: `${V1}/zones/europe-west1-c/networkEndpointGroups/other` });
+  });
+  assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
+});
+
+for (const [name, change] of [
+  ['an owner at 0', (w) => { w.kube.owners[OWNER].replicas = 0; }],
+  ['pods not ready yet', (w) => { w.kube.unschedulable = true; }],
+  ['pods only leaving, after an earlier scale to 0', (w) => { Object.assign(w.kube.owners[OWNER], { replicas: 0, leavingFrom: 2, leavingReads: 5 }); }],
+]) {
+  test(`an empty NEG with ${name}: nothing ready to lose, and it naps`, async () => {
+    const t = await withPods();
+    t.w.negs[GKE_NEG].empty = true;
+    change(t.w);
+    assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
+  });
+}

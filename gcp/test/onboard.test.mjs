@@ -1798,3 +1798,22 @@ test('a Workload shows its k8s backend, and hibernate has no meaning for it', as
   assert.equal(t.w.used.has('compute.getInstance'), false);
   assert.equal(t.w.used.has('compute.suspendInstance'), false);
 });
+
+test('ready pods behind an empty NEG are refused, worded, with nothing written: the owner named is not shown to be behind it', async () => {
+  const { w, store, onboarding } = setup((world) => {
+    onGke(world);
+    world.negs[GKE_NEG].empty = true;
+  });
+  await assert.rejects(onboarding.onboard(GKE_INPUT), refused(400, 'not-eligible', /hold no endpoint, and Deployment shop\/web has ready pods, not shown to be behind this load balancer/));
+  assert.deepEqual(w.changes, []);
+  assert.equal(store.configs.size, 0);
+});
+
+test('an empty NEG and an owner at 0 is onboarded: nothing ready to compare', async () => {
+  const { store, onboarding } = setup((world) => {
+    onGke(world, { replicas: 0 });
+    world.negs[GKE_NEG].empty = true;
+  });
+  await onboarding.onboard(GKE_INPUT);
+  assert.equal(store.configs.size, 1);
+});

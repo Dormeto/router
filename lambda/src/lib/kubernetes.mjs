@@ -31,7 +31,7 @@ export function labelSelector({ matchLabels = {}, matchExpressions = [] } = {}) 
 }
 
 const finished = (pod) => pod.status?.phase === 'Succeeded' || pod.status?.phase === 'Failed';
-const ready = (pod) => !pod.metadata?.deletionTimestamp && pod.status?.phase === 'Running'
+export const ready = (pod) => !pod.metadata?.deletionTimestamp && pod.status?.phase === 'Running'
   && (pod.status.conditions ?? []).some((c) => c.type === 'Ready' && c.status === 'True');
 
 const controllerOf = (object) => (object.metadata?.ownerReferences ?? []).find((r) => r.controller);

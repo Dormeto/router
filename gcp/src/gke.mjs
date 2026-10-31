@@ -5,7 +5,7 @@
 //
 // None of this has been run against Google yet: what it answers is read from its reference, and what the measures may change is one
 // function here each: clusterView, clusterProblem and transportOf (M11), negServiceOf and isGkeNeg (M12), gkeMapRefusal (M10),
-// foreignEndpoints (M9, M12).
+// endpointsProblem (M9, M12).
 //
 // `CALLS` is each function's permissions (test/permissions.test.mjs): the feature `gke` of gcp/access.json. They grant nothing inside a
 // cluster: that is the Role the CLI applies, kube-access.mjs's GKE_RULES.
@@ -15,7 +15,7 @@
 import { failureError } from '../../lambda/src/lib/failures.mjs';
 import { CLUSTER_TTL_MS, createKubernetes, KubernetesError, TIMEOUTS } from '../../lambda/src/lib/k8s.mjs';
 import { askRights, GKE_RULES } from '../../lambda/src/lib/kube-access.mjs';
-import { k8sId, k8sRecord, k8sStatus, livePods, ownerOf, resumeK8s, scaledObjectOf, sleepK8s, wakeK8s } from '../../lambda/src/lib/kubernetes.mjs';
+import { k8sId, k8sRecord, k8sStatus, livePods, ownerOf, ready, resumeK8s, scaledObjectOf, sleepK8s, wakeK8s } from '../../lambda/src/lib/kubernetes.mjs';
 
 const CONTAINER = 'https://container.googleapis.com/v1';
 const REQUEST_MS = TIMEOUTS.connect + TIMEOUTS.idle;
@@ -161,9 +161,10 @@ async function ownerObject(k8s, backend) {
   return object;
 }
 
-// Why the NEGs' endpoints are not the owner's pods, else null. M9, M12: a pod's endpoint carries its address (`ipAddress`, whatever `instance` says of its node). An
-// endpoint not shown to be a pod of the owner is foreign: no endpoint at all is 0 replicas, a normal thing.
-async function foreignEndpoints(compute, k8s, backend, object, negs) {
+// Why the NEGs' endpoints do not show the owner behind them, else null. M9, M12: a pod's endpoint carries its address (`ipAddress`, whatever `instance` says of its node). An
+// endpoint not shown to be a pod of the owner is foreign. No endpoint at all is 0 replicas, a normal thing, but with ready pods it proves nothing: they may serve some other
+// way, and a pod just started may not be attached yet (M9), which the next idle window asks again.
+async function endpointsProblem(compute, k8s, backend, object, negs) {
   const [pods, lists] = await Promise.all([
     livePods(k8s, backend, object),
     Promise.all(negs.map(async (neg) => ({ neg, items: await compute.listNetworkEndpoints(neg.zone, neg.name) }))),
@@ -172,9 +173,12 @@ async function foreignEndpoints(compute, k8s, backend, object, negs) {
   const foreign = lists.flatMap(({ neg, items }) => items.map((item) => item.networkEndpoint ?? {})
     .map((endpoint) => ({ neg: neg.name, address: endpoint.ipAddress ?? endpoint.ipv6Address ?? null }))
     .filter(({ address }) => !addresses.has(address)));
-  if (!foreign.length) return null;
-  const { neg, address } = foreign[0];
-  return `network endpoint group ${neg} holds ${foreign.length} endpoint${foreign.length === 1 ? '' : 's'} (${address ?? 'with no address'}) that are not pods of ${ownerText(backend)}: nothing is scaled`;
+  if (foreign.length) {
+    const { neg, address } = foreign[0];
+    return `network endpoint group ${neg} holds ${foreign.length} endpoint${foreign.length === 1 ? '' : 's'} (${address ?? 'with no address'}) that are not pods of ${ownerText(backend)}: nothing is scaled`;
+  }
+  if (lists.some(({ items }) => items.length) || !pods.some(ready)) return null;
+  return `its network endpoint groups hold no endpoint, and ${ownerText(backend)} has ready pods, not shown to be behind this load balancer: nothing is scaled`;
 }
 
 // A nap acts only on what still is the workload (the plan's ruling 16): the service's NEGs read again, each still of its Service, and their endpoints against the
@@ -189,8 +193,8 @@ export async function ownerChanged({ compute, kubernetesOf }, backend, readServi
   if (!reasons.length && !negs.length) reasons.push(`backend service ${service.name} no longer has a network endpoint group`);
   if (reasons.length) return `${reasons.join('; ')}: offboard and onboard again`;
   const k8s = await kubernetesOf(backend.cluster);
-  const foreign = await foreignEndpoints(compute, k8s, backend, await ownerObject(k8s, backend), negs);
-  return foreign && `${foreign}: offboard and onboard again, naming the owner behind them`;
+  const problem = await endpointsProblem(compute, k8s, backend, await ownerObject(k8s, backend), negs);
+  return problem && `${problem}: if this lasts, offboard and onboard again, naming the owner behind the load balancer`;
 }
 
 // What the onboarding reads in the cluster, once the rights are the CLI's: why not, as reasons. A right per rule of the Role, the owner, the NEGs' endpoints against its
@@ -202,8 +206,8 @@ export async function clusterProblems({ compute, kubernetesOf }, backend, negs) 
     if (missing.length) return [`the router lacks ${missing.join('; ')} in namespace ${backend.namespace} of GKE cluster ${clusterText(backend.cluster)}: dormeto gcp workloads access grant applies them`];
     const object = await ownerOf(k8s, backend);
     if (!object) return [`${ownerText(backend)} not found in GKE cluster ${clusterText(backend.cluster)}`];
-    const foreign = await foreignEndpoints(compute, k8s, backend, object, negs);
-    return foreign ? [foreign] : [];
+    const problem = await endpointsProblem(compute, k8s, backend, object, negs);
+    return problem ? [problem] : [];
   } catch (err) {
     if (err?.name !== 'KubernetesError' && !err?.kind) throw err;
     return [`the router cannot read GKE cluster ${clusterText(backend.cluster)}: ${err.message}`];

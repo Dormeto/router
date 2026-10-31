@@ -368,3 +368,289 @@ test('modify: another error is not retried', async () => {
 test('CALLS names the adapter\'s functions', () => {
   assert.deepEqual(Object.keys(CALLS).sort(), ['get', 'list', 'modify']);
 });
+
+// ---- The swap (S4, design section 7): regional and classic load balancers ----
+
+const { withSwap, withoutSwap, withHoldRoute, withoutHoldRoute } = await import('../src/urlmaps.mjs');
+
+const svc = (name) => `${V1}/${name}`;
+const HOLD_PATH = { paths: ['/_dormeto/backend/*'], service: svc(APP) };
+const HOLD_RULE = { priority: 0, matchRules: [{ prefixMatch: '/_dormeto/backend/' }], service: svc(APP) };
+const WAKER_RULE_1 = { ...ROUTE_RULE, priority: 1 };
+
+// Every kind of reference, in Google's usual key order and one URL form (what Google returns).
+function swapFixture() {
+  return {
+    name: 'dmt-dev',
+    fingerprint: 'abc=',
+    defaultService: svc('other'),
+    hostRules: [{ hosts: ['a.example.com'], pathMatcher: 'plain' }, { hosts: ['b.example.com'], pathMatcher: 'rules' },
+      { hosts: ['c.example.com'], pathMatcher: 'weighted' }, { hosts: ['d.example.com'], pathMatcher: 'routes' }],
+    pathMatchers: [
+      { name: 'plain', defaultService: svc(APP) },
+      { name: 'rules', defaultService: svc('other'), pathRules: [{ paths: ['/api/*'], service: svc(APP) }, { paths: ['/x'], service: svc('other') }] },
+      { name: 'weighted', defaultRouteAction: { weightedBackendServices: [{ backendService: svc(APP), weight: 100 }] } },
+      { name: 'routes', defaultService: svc('other'), routeRules: [
+        { priority: 5, matchRules: [{ prefixMatch: '/r' }], service: svc(APP) },
+        { priority: 6, matchRules: [{ prefixMatch: '/w' }], routeAction: { weightedBackendServices: [{ backendService: svc(APP), weight: 1 }] } },
+      ] },
+    ],
+  };
+}
+const swapDefault = () => ({ ...swapFixture(), defaultService: svc(APP) });
+
+test('withSwap: every reference to the application becomes the waker, the hold route aside', () => {
+  const before = swapFixture();
+  const { map, paths } = withSwap(before, APP, WAKER);
+  const expected = swapFixture();
+  expected.pathMatchers[0].defaultService = WAKER;
+  expected.pathMatchers[1].pathRules[0].service = WAKER;
+  expected.pathMatchers[2].defaultRouteAction.weightedBackendServices[0].backendService = WAKER;
+  expected.pathMatchers[3].routeRules[0].service = WAKER;
+  expected.pathMatchers[3].routeRules[1].routeAction.weightedBackendServices[0].backendService = WAKER;
+  assert.deepEqual(map, expected);
+  assert.deepEqual(paths, [
+    'pathMatchers[0].defaultService',
+    'pathMatchers[1].pathRules[0].service',
+    'pathMatchers[2].defaultRouteAction',
+    'pathMatchers[3].routeRules[0].service',
+    'pathMatchers[3].routeRules[1].routeAction',
+  ]);
+  assert.deepEqual(before, swapFixture(), 'the input is not changed');
+});
+
+test('withSwap: the map\'s own default, and its weighted default', () => {
+  assert.equal(withSwap(swapDefault(), APP, WAKER).map.defaultService, WAKER);
+  assert.deepEqual(withSwap(swapDefault(), APP, WAKER).paths[0], 'defaultService');
+  const weighted = swapFixture();
+  delete weighted.defaultService;
+  weighted.defaultRouteAction = { weightedBackendServices: [{ backendService: svc(APP), weight: 1 }] };
+  const r = withSwap(weighted, APP, WAKER);
+  assert.equal(r.map.defaultRouteAction.weightedBackendServices[0].backendService, WAKER);
+  assert.equal(r.paths[0], 'defaultRouteAction');
+});
+
+test('withSwap: a URL form of the beta or a relative one names the application as well', () => {
+  const map = { name: 'm', pathMatchers: [{ name: 'a', defaultService: `${BETA}/${APP}` }, { name: 'b', defaultService: `${REL}/${APP}` }] };
+  const r = withSwap(map, APP, WAKER);
+  assert.deepEqual(r.map.pathMatchers.map((m) => m.defaultService), [WAKER, WAKER]);
+});
+
+test('withSwap: the hold route and the /_dormeto/* route stay as they are', () => {
+  const held = withWakerRoute(withHoldRoute(swapFixture(), APP).map, APP, WAKER).map;
+  const { map } = withSwap(held, APP, WAKER);
+  assert.deepEqual(map.pathMatchers[1].pathRules.slice(-2), [HOLD_PATH, ROUTE_PATH]);
+  assert.deepEqual(map.pathMatchers[3].routeRules.filter((r) => r.priority < 2), [HOLD_RULE, WAKER_RULE_1]);
+  assert.deepEqual(map.pathMatchers[1].pathRules[0].service, WAKER);
+});
+
+test('withSwap then withoutSwap: the map back to the byte, the hold and the waker route kept', () => {
+  for (const original of [swapFixture(), swapDefault()]) {
+    const held = withWakerRoute(withHoldRoute(original, APP).map, APP, WAKER).map;
+    const swapped = withSwap(held, APP, WAKER);
+    assert.ok(swapped.paths.length > 0);
+    const back = withoutSwap(swapped.map, APP, WAKER);
+    assert.ok(back.paths.length > 0);
+    assert.equal(JSON.stringify(back.map), JSON.stringify(held));
+    assert.deepEqual(back.map, held);
+  }
+  const plain = swapFixture();
+  assert.equal(JSON.stringify(withoutSwap(withSwap(plain, APP, WAKER).map, APP, WAKER).map), JSON.stringify(plain));
+});
+
+test('withoutSwap: the app\'s URL takes the waker\'s scope, a regional one too', () => {
+  const R = 'https://compute.googleapis.com/compute/v1/projects/p/regions/europe-west1/backendServices';
+  const map = { name: 'm', pathMatchers: [{ name: 'a', defaultService: `${R}/${APP}` }] };
+  const swapped = withSwap(map, APP, `${R}/dmtr-w`);
+  assert.equal(swapped.map.pathMatchers[0].defaultService, `${R}/dmtr-w`);
+  assert.deepEqual(withoutSwap(swapped.map, APP, `${R}/dmtr-w`).map, map);
+});
+
+test('withSwap and withoutSwap: nothing to do writes nothing', () => {
+  const swapped = withSwap(swapFixture(), APP, WAKER).map;
+  assert.deepEqual(withSwap(swapped, APP, WAKER).paths, []);
+  assert.deepEqual(withSwap(swapped, APP, WAKER).map, swapped);
+  assert.deepEqual(withoutSwap(swapFixture(), APP, WAKER).paths, []);
+  assert.deepEqual(withoutSwap(swapFixture(), APP, WAKER).map, swapFixture());
+});
+
+test('withoutSwap: the /_dormeto/* route, path rule or route rule, is never swapped back', () => {
+  const routed = withWakerRoute(swapFixture(), APP, WAKER).map;
+  assert.deepEqual(withoutSwap(routed, APP, WAKER).paths, []);
+});
+
+test('withSwap: a map whose tests name the application is refused', () => {
+  const map = { ...swapFixture(), tests: [{ host: 'a.example.com', path: '/', service: svc(APP) }] };
+  assert.throws(() => withSwap(map, APP, WAKER), (e) => e instanceof UrlMapRefused && /tests/.test(e.message));
+  assert.doesNotThrow(() => withSwap({ ...swapFixture(), tests: [{ host: 'a.example.com', path: '/', service: svc('other') }] }, APP, WAKER));
+});
+
+test('withSwap: a request mirror naming the application is refused, wherever the route action is', () => {
+  const mirror = { requestMirrorPolicy: { backendService: svc(APP) } };
+  const places = [
+    (m) => { m.defaultRouteAction = mirror; },
+    (m) => { m.pathMatchers[0].defaultRouteAction = mirror; },
+    (m) => { m.pathMatchers[1].pathRules[1].routeAction = mirror; },
+    (m) => { m.pathMatchers[3].routeRules[0].routeAction = mirror; },
+  ];
+  for (const place of places) {
+    const map = swapFixture();
+    place(map);
+    assert.throws(() => withSwap(map, APP, WAKER), (e) => e instanceof UrlMapRefused && /mirror/.test(e.message));
+  }
+  const other = swapFixture();
+  other.pathMatchers[0].defaultRouteAction = { requestMirrorPolicy: { backendService: svc('other') } };
+  assert.doesNotThrow(() => withSwap(other, APP, WAKER));
+});
+
+test('withSwap: a weighted route naming the application beside another service is refused', () => {
+  const map = swapFixture();
+  map.pathMatchers[2].defaultRouteAction.weightedBackendServices.push({ backendService: svc('other'), weight: 0 });
+  assert.throws(() => withSwap(map, APP, WAKER), (e) => e instanceof UrlMapRefused && /weight/.test(e.message));
+  const route = swapFixture();
+  route.pathMatchers[3].routeRules[1].routeAction.weightedBackendServices.push({ backendService: svc('other'), weight: 1 });
+  assert.throws(() => withSwap(route, APP, WAKER), UrlMapRefused);
+  const top = swapDefault();
+  top.defaultService = undefined;
+  delete top.defaultService;
+  top.defaultRouteAction = { weightedBackendServices: [{ backendService: svc('other'), weight: 1 }, { backendService: svc(APP), weight: 1 }] };
+  assert.throws(() => withSwap(top, APP, WAKER), UrlMapRefused);
+});
+
+test('withHoldRoute: /_dormeto/backend/* to the application in each matcher naming it: a path rule, a route rule at priority 0', () => {
+  const before = swapFixture();
+  const { map, paths } = withHoldRoute(before, APP);
+  const expected = swapFixture();
+  expected.pathMatchers[0].pathRules = [HOLD_PATH];
+  expected.pathMatchers[1].pathRules.push(HOLD_PATH);
+  expected.pathMatchers[2].pathRules = [{ ...HOLD_PATH }];
+  expected.pathMatchers[3].routeRules.push(HOLD_RULE);
+  assert.deepEqual(map, expected);
+  assert.deepEqual(paths, ['pathMatchers[0].pathRules', 'pathMatchers[1].pathRules', 'pathMatchers[2].pathRules', 'pathMatchers[3].routeRules']);
+  assert.deepEqual(before, swapFixture());
+});
+
+test('withHoldRoute: idempotent, and removed again to the byte', () => {
+  for (const original of [swapFixture(), swapDefault()]) {
+    const once = withHoldRoute(original, APP);
+    assert.deepEqual(withHoldRoute(once.map, APP).paths, []);
+    const back = withoutHoldRoute(once.map, APP);
+    assert.ok(back.paths.length > 0);
+    assert.equal(JSON.stringify(back.map), JSON.stringify(original));
+    assert.deepEqual(withoutHoldRoute(original, APP).paths, []);
+  }
+});
+
+test('withHoldRoute: the map\'s default alone: the dormeto-default matcher withWakerRoute makes, either order', () => {
+  const holdFirst = withWakerRoute(withHoldRoute(swapDefault(), APP).map, APP, WAKER);
+  const wakerFirst = withHoldRoute(withWakerRoute(swapDefault(), APP, WAKER).map, APP);
+  const sorted = (map) => { const c = structuredClone(map); for (const m of c.pathMatchers) { m.pathRules?.sort((a, b) => a.paths[0].localeCompare(b.paths[0])); m.routeRules?.sort((a, b) => a.priority - b.priority); } return c; };
+  assert.deepEqual(sorted(holdFirst.map), sorted(wakerFirst.map));
+  const held = holdFirst.map.pathMatchers.at(-1);
+  assert.deepEqual(held, { name: 'dormeto-default', defaultService: svc(APP), pathRules: [HOLD_PATH, ROUTE_PATH] });
+  assert.equal(holdFirst.map.hostRules.filter((h) => h.pathMatcher === 'dormeto-default').length, 1);
+  // The waker route first removed, the matcher stays for the hold; then the hold goes and the matcher with it.
+  const noWaker = withoutWakerRoute(holdFirst.map, WAKER).map;
+  assert.deepEqual(noWaker.pathMatchers.at(-1).pathRules, [HOLD_PATH]);
+  assert.deepEqual(withoutHoldRoute(noWaker, APP).map, swapDefault());
+  assert.equal(JSON.stringify(withoutHoldRoute(noWaker, APP).map), JSON.stringify(swapDefault()));
+  const noHold = withoutHoldRoute(holdFirst.map, APP).map;
+  assert.deepEqual(noHold.pathMatchers.at(-1).pathRules, [ROUTE_PATH]);
+  assert.deepEqual(withoutWakerRoute(noHold, WAKER).map, swapDefault());
+});
+
+test('withHoldRoute: a swapped map keeps its hold, and the default alone is held by dormeto-default whose default is swapped', () => {
+  const held = withWakerRoute(withHoldRoute(swapDefault(), APP).map, APP, WAKER).map;
+  const swapped = withSwap(held, APP, WAKER).map;
+  assert.equal(swapped.defaultService, WAKER);
+  assert.deepEqual(swapped.pathMatchers.at(-1), { name: 'dormeto-default', defaultService: WAKER, pathRules: [HOLD_PATH, ROUTE_PATH] });
+  assert.deepEqual(withHoldRoute(swapped, APP).paths, []);
+});
+
+test('route rules: the hold takes priority 0 and the waker\'s route 1, whichever comes first', () => {
+  const holdFirst = withWakerRoute(withHoldRoute(swapFixture(), APP).map, APP, WAKER).map;
+  const wakerFirst = withHoldRoute(withWakerRoute(swapFixture(), APP, WAKER).map, APP).map;
+  for (const map of [holdFirst, wakerFirst]) {
+    const rules = map.pathMatchers[3].routeRules;
+    assert.deepEqual(rules.find((r) => r.priority === 0), HOLD_RULE);
+    assert.deepEqual(rules.find((r) => r.priority === 1), WAKER_RULE_1);
+  }
+  assert.deepEqual(holdFirst.pathMatchers[3].routeRules.map((r) => r.priority).sort(), [0, 1, 5, 6]);
+  // The hold removed: the waker's route is back at 0, as without a hold; a global map without hold keeps priority 0 alone.
+  const noHold = withoutHoldRoute(holdFirst, APP).map;
+  assert.deepEqual(noHold.pathMatchers[3].routeRules.find((r) => r.matchRules[0].prefixMatch === '/_dormeto/'), ROUTE_RULE);
+  assert.deepEqual(noHold, withWakerRoute(swapFixture(), APP, WAKER).map);
+});
+
+test('route rules: priority 0 and 1 must both be free, else refused', () => {
+  for (const taken of [0, 1]) {
+    const map = swapFixture();
+    map.pathMatchers[3].routeRules[0].priority = taken;
+    assert.throws(() => withHoldRoute(map, APP), (e) => e instanceof UrlMapRefused && /priority/.test(e.message));
+  }
+  const map = withHoldRoute(swapFixture(), APP).map;
+  map.pathMatchers[3].routeRules.push({ priority: 1, matchRules: [{ prefixMatch: '/q' }], service: svc('other') });
+  assert.throws(() => withWakerRoute(map, APP, WAKER), /priority 1/);
+});
+
+test('a customer\'s own /_dormeto/backend/ route stays a refusal; the two of Dormeto\'s are accepted', () => {
+  const theirs = swapFixture();
+  theirs.pathMatchers[1].pathRules.push({ paths: ['/_dormeto/backend/*'], service: svc('other') });
+  assert.throws(() => withHoldRoute(theirs, APP), /\/_dormeto\/ route/);
+  assert.throws(() => withWakerRoute(theirs, APP, WAKER), /\/_dormeto\/ route/);
+  const routes = swapFixture();
+  routes.pathMatchers[3].routeRules.push({ priority: 9, matchRules: [{ prefixMatch: '/_dormeto/backend/x' }], service: svc('other') });
+  assert.throws(() => withHoldRoute(routes, APP), /\/_dormeto\/ route/);
+  const both = withWakerRoute(withHoldRoute(swapFixture(), APP).map, APP, WAKER).map;
+  assert.doesNotThrow(() => withWakerRoute(both, APP, WAKER));
+  assert.doesNotThrow(() => withHoldRoute(both, APP));
+  assert.deepEqual(withWakerRoute(both, APP, WAKER).paths, []);
+});
+
+test('withHoldRoute: a map without the service has no path and no change', () => {
+  assert.deepEqual(withHoldRoute(swapFixture(), 'nothing').paths, []);
+  assert.deepEqual(withHoldRoute(swapFixture(), 'nothing').map, swapFixture());
+});
+
+test('withHoldRoute: a matcher named dormeto-default of the customer\'s is refused', () => {
+  const map = swapDefault();
+  map.pathMatchers.push({ name: 'dormeto-default', defaultService: svc('other') });
+  assert.throws(() => withHoldRoute(map, APP), /dormeto-default/);
+});
+
+test('withoutSwap: the unswapped map reads like the original even when the hold alone kept a matcher', () => {
+  const held = withHoldRoute(swapFixture(), APP).map;
+  const back = withoutSwap(withSwap(held, APP, WAKER).map, APP, WAKER).map;
+  assert.equal(JSON.stringify(back), JSON.stringify(held));
+});
+
+// The adapter by scope.
+test('createUrlMaps: a regional adapter reads, lists and updates under regions/<region>/urlMaps, and waits on the operation it gets', async () => {
+  const base = 'https://compute.googleapis.com/compute/v1/projects/p/regions/europe-west1/urlMaps';
+  const google = fakeGoogle((method) => (method === 'GET' ? structuredClone(swapFixture()) : { selfLink: 'https://compute.googleapis.com/compute/v1/projects/p/regions/europe-west1/operations/op-1', status: 'RUNNING' }));
+  const urlmaps = createUrlMaps({ google, project: 'p', region: 'europe-west1', scope: 'regional' });
+  await urlmaps.modify('dmt-dev', (map) => withSwap(map, APP, WAKER));
+  await urlmaps.list();
+  assert.deepEqual(google.calls.filter((c) => c.method).map((c) => `${c.method} ${c.url}`), [`GET ${base}/dmt-dev`, `PUT ${base}/dmt-dev`, `GET ${base}`]);
+  assert.match(google.calls.find((c) => c.wait).wait.selfLink, /\/regions\/europe-west1\/operations\//);
+  assert.equal(google.calls.find((c) => c.method === 'PUT').body.pathMatchers[0].defaultService, WAKER);
+});
+
+test('createUrlMaps: scope omitted is global; a regional one needs a region', () => {
+  const google = fakeGoogle(() => ({}));
+  assert.doesNotThrow(() => createUrlMaps({ google, project: 'p' }));
+  assert.doesNotThrow(() => createUrlMaps({ google, project: 'p', scope: 'global' }));
+  assert.throws(() => createUrlMaps({ google, project: 'p', scope: 'regional' }), /region/);
+  assert.throws(() => createUrlMaps({ google, project: 'p', scope: 'zonal' }), /scope/);
+});
+
+test('createUrlMaps: a global adapter still uses global/urlMaps, with a region given or not', async () => {
+  const google = fakeGoogle(() => fixture());
+  await createUrlMaps({ google, project: 'p', region: 'europe-west1' }).get('m');
+  assert.equal(google.calls[0].url, 'https://compute.googleapis.com/compute/v1/projects/p/global/urlMaps/m');
+});
+
+test('CALLS: the regional adapter\'s own', async () => {
+  const { CALLS_REGIONAL } = await import('../src/urlmaps.mjs');
+  assert.deepEqual(CALLS_REGIONAL.modify, ['compute.regionUrlMaps.get', 'compute.regionUrlMaps.update', 'compute.regionBackendServices.use', 'compute.regionOperations.get']);
+});

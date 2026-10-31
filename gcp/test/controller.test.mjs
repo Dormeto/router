@@ -83,7 +83,7 @@ test('POST /v1/workloads?dryRun=true: eligible with the VMs and the groups, or t
   const res = await call('POST', '/v1/workloads?dryRun=true', INPUT);
   assert.equal(res.status, 200);
   assert.deepEqual(res.body, {
-    eligible: true, reasons: [], vms: [{ zone: ZONE, name: 'vm-a', selfLink: `${V1}/zones/${ZONE}/instances/vm-a`, id: '1001' }], groups: [], lb: { kind: 'global' },
+    eligible: true, reasons: [], vms: [{ zone: ZONE, name: 'vm-a', selfLink: `${V1}/zones/${ZONE}/instances/vm-a`, id: '1001' }], groups: [], databases: [], lb: { kind: 'global' },
   });
   assert.deepEqual(w.changes, []);
   assert.equal(store.configs.size, 0);
@@ -497,6 +497,19 @@ test('fromEnvironment: the database, the project and the NEG of the environment'
   assert.ok(seen.includes('POST https://firestore.googleapis.com/v1/projects/p/databases/dmtr-europe-west1/documents:commit'), seen.join('\n'));
   assert.equal(created[0].backends[0].group, `${V1}/regions/${REGION}/networkEndpointGroups/dmtr-europe-west1-waker`);
   assert.deepEqual(created[0].customRequestHeaders, ['x-dormeto-workload: demo']);
+});
+
+test('fromEnvironment: Cloud SQL is read in the environment\'s project', async () => {
+  const { fetch, seen } = fakeFetch((method, url) => {
+    if (url.includes('firestore.googleapis.com')) return url.includes('/documents/workloads?') ? { documents: [] } : null;
+    if (url.includes('sqladmin.googleapis.com')) return { name: 'db', selfLink: 'https://sql/db', state: 'RUNNABLE', settings: { activationPolicy: 'ALWAYS' } };
+    return null;
+  });
+  const handler = fromEnvironment(ENV, { fetch, log: silentLog });
+  const res = await handler(request('POST', '/v1/workloads?dryRun=true', JSON.stringify({ ...INPUT, cloudSql: ['db'] })));
+  assert.equal(res.statusCode, 200, res.body);
+  assert.ok(seen.includes('GET https://sqladmin.googleapis.com/v1/projects/p/instances/db'), seen.join('\n'));
+  assert.deepEqual(JSON.parse(res.body).databases, [{ name: 'db', selfLink: 'https://sql/db' }]);
 });
 
 test('fromEnvironment: the regional URL maps are those of the environment\'s region', async () => {

@@ -160,6 +160,7 @@ test('dry run lists the VMs and the groups, with their numeric IDs, and changes 
     reasons: [],
     vms: [{ zone: ZONE, name: 'vm-a', selfLink: `${V1}/zones/${ZONE}/instances/vm-a`, id: '1001' }],
     lb: { kind: 'global' },
+    databases: [],
     groups: [
       { kind: 'zonal', location: ZONE, name: 'zonal', selfLink: `${V1}/zones/${ZONE}/instanceGroupManagers/zonal`, id: '2001' },
       { kind: 'regional', location: REGION, name: 'regional', selfLink: `${V1}/regions/${REGION}/instanceGroupManagers/regional`, id: '2002' },
@@ -192,6 +193,7 @@ test('dry run: the VMs of a zonal NEG are unmanaged VMs, as an unmanaged group\'
       { zone: ZONE, name: 'neg-vm-2', selfLink: `${V1}/zones/${ZONE}/instances/neg-vm-2`, id: '4002' },
     ],
     groups: [],
+    databases: [],
     lb: { kind: 'global' },
   });
   assert.deepEqual(w.changes, []);
@@ -1315,4 +1317,159 @@ test('the map\'s default alone names the service: eligible, it gets its matcher,
   assert.equal(w.urlMaps.lb.defaultCustomErrorResponsePolicy, undefined);
   assert.equal(w.urlMaps.lb.pathMatchers.at(-1).name, 'dormeto-default');
   assert.equal(w.urlMaps.lb.pathMatchers.at(-1).defaultCustomErrorResponsePolicy.errorService, WAKER_URL);
+});
+
+// --- Cloud SQL companions ---------------------------------------------------------------------------------------------------
+
+const withSql = (fields = { db: {} }) => (w) => { w.sql = structuredClone(fields); };
+const SQL_INPUT = { ...INPUT, cloudSql: ['db'] };
+const sqlLink = (name) => `https://sqladmin.googleapis.com/v1/projects/p/instances/${name}`;
+
+test('the dry run names the databases asked for; none asked: an empty list', async () => {
+  const { onboarding, w, store } = setup(withSql({ db: {}, second: {} }));
+  const answer = await onboarding.dryRun({ ...INPUT, cloudSql: ['db', 'second'] });
+  assert.equal(answer.eligible, true);
+  assert.deepEqual(answer.databases, [{ name: 'db', selfLink: sqlLink('db') }, { name: 'second', selfLink: sqlLink('second') }]);
+  assert.deepEqual(w.changes, []);
+  assert.equal(store.configs.size, 0);
+  assert.deepEqual((await onboarding.dryRun(INPUT)).databases, []);
+});
+
+test('an onboarding with a companion: a cloudsql backend after the application\'s, and shown', async () => {
+  const { store, onboarding } = setup(withSql());
+  const workload = await onboarding.onboard(SQL_INPUT);
+  assert.deepEqual(store.configs.get('demo').backends, [{ kind: 'vm', location: ZONE, name: 'vm-a', id: '1001' }, { kind: 'cloudsql', name: 'db' }]);
+  assert.deepEqual(workload.backends.at(-1), { kind: 'cloudsql', name: 'db' });
+});
+
+test('with no cloudSql, the configuration names no database and reads no Cloud SQL', async () => {
+  const { w, store, onboarding } = setup();
+  await onboarding.dryRun(INPUT);
+  await onboarding.onboard(INPUT);
+  assert.equal(store.configs.get('demo').backends.some((b) => b.kind === 'cloudsql'), false);
+  assert.equal([...w.used].some((name) => name.startsWith('cloudsql.')), false);
+});
+
+for (const [title, fields, words] of [
+  ['a read replica, by its primary\'s name', { masterInstanceName: 'p:primary' }, /Cloud SQL instance db is a read replica/],
+  ['a read replica, by its type', { instanceType: 'READ_REPLICA_INSTANCE' }, /Cloud SQL instance db is a read replica/],
+  ['a primary with replicas', { replicaNames: ['db-r1'] }, /Cloud SQL instance db has read replicas \(db-r1\)/],
+]) {
+  test(`${title} is refused, with its words, at the dry run and the onboarding, nothing changed`, async () => {
+    const { w, store, onboarding } = setup(withSql({ db: fields }));
+    const answer = await onboarding.dryRun(SQL_INPUT);
+    assert.equal(answer.eligible, false);
+    assert.match(answer.reasons.join('; '), words);
+    await assert.rejects(onboarding.onboard(SQL_INPUT), refused(400, 'not-eligible', words));
+    assert.deepEqual(w.changes, []);
+    assert.equal(store.configs.size, 0);
+  });
+}
+
+test('an instance not found is refused, naming it', async () => {
+  const { onboarding } = setup();
+  const answer = await onboarding.dryRun(SQL_INPUT);
+  assert.equal(answer.eligible, false);
+  assert.match(answer.reasons.join('; '), /Cloud SQL instance db not found: name an instance of this project/);
+  await assert.rejects(onboarding.onboard(SQL_INPUT), refused(400, 'not-eligible', /Cloud SQL instance db not found/));
+});
+
+test('an instance the router cannot read (403: the feature missing, or Google hiding one absent) is refused, saying both', async () => {
+  const { w, onboarding } = setup(withSql());
+  w.fail['GET sql/instances/db'] = new GoogleError('Google: GET: 403 not authorized', { code: 403, reason: 'notAuthorized' });
+  const { eligible, reasons } = await onboarding.dryRun(SQL_INPUT);
+  assert.equal(eligible, false);
+  assert.match(reasons.join('; '), /the router cannot read Cloud SQL instance db: it does not exist, or the router was installed without --with cloud-sql: .*403/);
+});
+
+test('another failure reading an instance stays a failure', async () => {
+  const { w, onboarding } = setup(withSql());
+  const failure = new GoogleError('Google: GET: 500', { code: 500 });
+  w.fail['GET sql/instances/db'] = failure;
+  await assert.rejects(onboarding.dryRun(SQL_INPUT), failure);
+});
+
+test('an instance another workload holds is refused, naming it', async () => {
+  const { store, onboarding } = setup(withSql());
+  store.configs.set('first', { workloadId: 'first', backendService: 'other', backends: [{ kind: 'cloudsql', name: 'db' }] });
+  const { reasons } = await onboarding.dryRun(SQL_INPUT);
+  assert.match(reasons.join('; '), /Cloud SQL instance db belongs to workload first/);
+});
+
+for (const [title, cloudSql, words] of [
+  ['a name asked twice', ['db', 'db'], /cloudSql: db is named twice/],
+  ['not a list', 'db', /cloudSql: must be a list of Cloud SQL instance names/],
+  ['a name that is not one', ['Bad_Name'], /cloudSql: "Bad_Name" is not a Cloud SQL instance name/],
+  ['a name that is no string', [1], /cloudSql: 1 is not a Cloud SQL instance name/],
+]) {
+  test(`cloudSql: ${title} is a 400 before any read`, async () => {
+    const { w, onboarding } = setup(withSql());
+    for (const call of [onboarding.dryRun, onboarding.onboard]) await assert.rejects(call({ ...INPUT, cloudSql }), refused(400, 'bad-request', words));
+    assert.equal(w.used.size, 0);
+  });
+}
+
+test('a companion without an application is refused: it needs the backend service, as every workload', async () => {
+  const { onboarding } = setup(withSql());
+  await assert.rejects(onboarding.dryRun({ urlMap: 'lb', id: 'demo', cloudSql: ['db'] }), refused(400, 'bad-request', /urlMap and backendService are needed/));
+});
+
+test('a companion behind a backend service with no backend is refused, as any', async () => {
+  const { onboarding } = setup((w) => {
+    withSql()(w);
+    w.services.app.backends = [];
+  });
+  assert.match((await onboarding.dryRun(SQL_INPUT)).reasons.join('; '), /has no backend/);
+});
+
+test('wakeTimeoutSeconds: 1700 by default with a companion; one set stays as it is', async () => {
+  const byDefault = setup(withSql());
+  assert.equal((await byDefault.onboarding.onboard(SQL_INPUT)).settings.wakeTimeoutSeconds, 1700);
+  const given = setup(withSql());
+  await given.onboarding.onboard({ ...SQL_INPUT, settings: { wakeTimeoutSeconds: 900 } });
+  assert.equal(given.store.configs.get('demo').wakeTimeoutSeconds, 900);
+});
+
+for (const [kind, world] of [['classic', classic], ['regional', regional]]) {
+  test(`wakeTimeoutSeconds: 1700 with a companion on a ${kind} load balancer too: SWAP_WAIT added, up to the 1700`, async () => {
+    const { onboarding } = setup((w) => {
+      world(w);
+      withSql()(w);
+    });
+    assert.equal((await onboarding.onboard(SQL_INPUT)).settings.wakeTimeoutSeconds, 1700);
+  });
+}
+
+test('offboard --force of a sleeping workload: the stopped database is named as left, the VM too; awake: nothing left', async () => {
+  const asleep = setup(withSql());
+  await asleep.onboarding.onboard(SQL_INPUT);
+  await asleep.core.nap('demo');
+  const { left } = await asleep.onboarding.offboard('demo', { force: true });
+  assert.deepEqual(left.map((b) => b.name).sort(), ['db', 'vm-a']);
+  assert.deepEqual(left.find((b) => b.name === 'db'), { kind: 'cloudsql', name: 'db' });
+  assert.equal(asleep.w.sql.db.settings.activationPolicy, 'NEVER');
+
+  const awake = setup(withSql());
+  await awake.onboarding.onboard(SQL_INPUT);
+  assert.deepEqual((await awake.onboarding.offboard('demo', { force: true })).left, []);
+});
+
+test('offboard --force: a database that cannot be read is not known to be up: named as left, logged', async () => {
+  const { w, onboarding } = setup(withSql());
+  await onboarding.onboard(SQL_INPUT);
+  w.fail['GET sql/instances/db'] = new GoogleError('Google: GET: 403 not authorized', { code: 403 });
+  assert.deepEqual((await onboarding.offboard('demo', { force: true })).left, [{ kind: 'cloudsql', name: 'db' }]);
+  assert.ok(w.logs.some((l) => l.event === 'BackendUnread' && l.backend === 'db'));
+});
+
+test('offboard of a sleeping workload: the database up, then the application, then what is Dormeto\'s goes', async () => {
+  const { w, clock, store, core, onboarding } = setup(withSql());
+  await onboarding.onboard(SQL_INPUT);
+  await core.nap('demo');
+  clock.advance(600_000);
+  w.changes.length = 0;
+  await onboarding.offboard('demo');
+  assert.equal(w.changes[0], 'sql db ALWAYS');
+  assert.equal(w.sql.db.settings.activationPolicy, 'ALWAYS');
+  assert.equal(store.configs.size, 0);
 });

@@ -2,6 +2,7 @@
 // a fake of Compute Engine's REST API and a store of several workloads. `changes`: what was changed at Google, in order.
 import { matches, STATES } from '../../lambda/src/lib/state.mjs';
 import { fakeClock } from '../../lambda/test/fakes.mjs';
+import { createCloudSql } from '../src/cloudsql.mjs';
 import { createCompute } from '../src/compute.mjs';
 import { createController } from '../src/controller-core.mjs';
 import { GoogleError } from '../src/google.mjs';
@@ -48,6 +49,12 @@ export const defaults = () => ({
   vms: { 'vm-a': { id: '1001', status: 'RUNNING' } },
   machineTypes: { 'e2-small': { name: 'e2-small', memoryMb: 2048 } },
   autoscalers: {},
+  // Cloud SQL instances by name: fields over a running primary. What the fake does is ruling 2 of task R10, not Google yet (M6).
+  sql: {},
+  // How long an operation runs, by the policy asked for.
+  sqlTakes: { ALWAYS: 300_000, NEVER: 120_000 },
+  // What the next operations end in, one each: an operation's `error`. That operation leaves the policy as it was.
+  sqlOperationErrors: [],
 });
 
 // The defaults' load balancer as a classic one: `EXTERNAL` on its forwarding rule and its backend services.
@@ -84,6 +91,7 @@ export function regional(w) {
   w.regions[REGION] = regionOf();
 }
 
+const SQLADMIN = 'https://sqladmin.googleapis.com/v1/projects/p/';
 const notFound = (what) => new GoogleError(`Google: ${what}: 404 not found`, { code: 404, status: 'NOT_FOUND', reason: 'notFound' });
 
 // Every backend service a URL map names, wherever it does: its defaults, its rules, their weights, its policies and tests.
@@ -139,7 +147,36 @@ export function setup(change = () => {}) {
     if (!running && service?.loadBalancingScheme === 'EXTERNAL') return { kind: 'compute#backendServiceGroupHealth' };
     return { healthStatus: [{ healthState: running ? 'HEALTHY' : 'UNHEALTHY' }] };
   };
+  // Cloud SQL as task R10 assumes it before M6: `state` stays RUNNABLE, stopped or not; the policy changes at once, its operation
+  // tells when it is over; another PATCH during an operation is a 409.
+  const sqlOperations = {};
+  const sqlInstance = (name) => {
+    const { operation, ...fields } = w.sql[name] ?? {};
+    if (!w.sql[name]) throw notFound(`Cloud SQL instance ${name}`);
+    return { name, selfLink: `${SQLADMIN}instances/${name}`, state: 'RUNNABLE', instanceType: 'CLOUD_SQL_INSTANCE', ...fields, settings: { activationPolicy: 'ALWAYS', ...fields.settings } };
+  };
+  const sqlOperation = (name) => {
+    const { doneAt, ...operation } = sqlOperations[name];
+    return { ...operation, status: clock.now() >= doneAt ? 'DONE' : 'RUNNING' };
+  };
+  const setActivation = (name, policy) => {
+    sqlInstance(name);
+    const running = w.sql[name].operation;
+    if (running && clock.now() < sqlOperations[running].doneAt) {
+      throw new GoogleError(`Google: PATCH instances/${name}: 409 Operation failed because another operation was already in progress.`, { code: 409, status: 'CONFLICT', reason: 'operationInProgress' });
+    }
+    const error = w.sqlOperationErrors.shift();
+    const operation = `sql-op-${Object.keys(sqlOperations).length + 1}`;
+    sqlOperations[operation] = { name: operation, doneAt: clock.now() + w.sqlTakes[policy], ...(error ? { error } : {}) };
+    w.sql[name].operation = operation;
+    if (!error) w.sql[name].settings = { ...w.sql[name].settings, activationPolicy: policy };
+    w.changes.push(`sql ${name} ${policy}`);
+    return { name: operation, status: 'PENDING' };
+  };
   const ROUTES = [
+    ['GET', /^sql\/instances\/([^/]+)$/, ([name]) => sqlInstance(name)],
+    ['PATCH', /^sql\/instances\/([^/]+)$/, ([name], body) => setActivation(name, body.settings.activationPolicy)],
+    ['GET', /^sql\/operations\/([^/]+)$/, ([name]) => sqlOperation(name)],
     ['GET', /^regions\/([^/]+)\/urlMaps$/, ([region]) => ({ items: Object.values(inRegion(region).urlMaps) })],
     ['GET', /^regions\/([^/]+)\/urlMaps\/([^/]+)$/, ([region, name]) => {
       if (!inRegion(region).urlMaps[name]) throw notFound(`URL map ${name}`);
@@ -223,7 +260,7 @@ export function setup(change = () => {}) {
   ];
   const google = {
     request: async (method, url, body) => {
-      const path = url.slice(`${V1}/`.length);
+      const path = url.startsWith(SQLADMIN) ? `sql/${url.slice(SQLADMIN.length)}` : url.slice(`${V1}/`.length);
       const failure = w.fail[`${method} ${path}`];
       if (failure) throw failure;
       w.on[`${method} ${path}`]?.();
@@ -303,11 +340,12 @@ export function setup(change = () => {}) {
       w.tasks.push(task);
     },
   };
+  const cloudsql = recorded('cloudsql', createCloudSql({ google, project: 'p', now: clock.now, sleep: clock.sleep }));
   const core = createController({
-    store, compute, urlmaps, regionalUrlmaps, monitoring: { requestCount: async () => 0 }, tasks, config, now: clock.now, sleep: clock.sleep, newId: () => 'wake-1', log,
+    store, compute, cloudsql, urlmaps, regionalUrlmaps, monitoring: { requestCount: async () => 0 }, tasks, config, now: clock.now, sleep: clock.sleep, newId: () => 'wake-1', log,
   });
-  const onboarding = createOnboarding({ store, compute, urlmaps, regionalUrlmaps, core, config, now: clock.now, log });
-  return { w, clock, store, core, onboarding, config, log, compute, urlmaps, regionalUrlmaps, google };
+  const onboarding = createOnboarding({ store, compute, cloudsql, urlmaps, regionalUrlmaps, core, config, now: clock.now, log });
+  return { w, clock, store, core, onboarding, config, log, compute, cloudsql, urlmaps, regionalUrlmaps, google };
 }
 
 // The input of an onboarding of `app` as `demo`.

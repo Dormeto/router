@@ -136,3 +136,30 @@ test('a regional workload\'s NEG decides its health, not another VM of the proje
   assert.equal(result.state, STATES.ASLEEP);
   assert.ok(t.w.logs.some((l) => l.event === 'ExternalStop'));
 });
+
+// What the fake holds of Cloud SQL is task R10's assumption, before M6: the state stays RUNNABLE, the policy says what was asked, the operation when it is over.
+test('Cloud SQL in the fake: the policy at once, the operation until its time, a 409 meanwhile, a 404 for none', async () => {
+  const { clock, cloudsql, w } = setup((world) => { world.sql.db = {}; });
+  assert.equal((await cloudsql.get('db')).settings.activationPolicy, 'ALWAYS');
+  const op = await cloudsql.setActivation('db', 'NEVER');
+  const during = await cloudsql.get('db');
+  assert.deepEqual([during.state, during.settings.activationPolicy], ['RUNNABLE', 'NEVER']);
+  assert.equal((await cloudsql.getOperation(op)).status, 'RUNNING');
+  await assert.rejects(cloudsql.setActivation('db', 'ALWAYS'), /another operation/);
+  clock.advance(w.sqlTakes.NEVER);
+  assert.equal((await cloudsql.getOperation(op)).status, 'DONE');
+  await cloudsql.setActivation('db', 'ALWAYS');
+  assert.deepEqual(w.changes, ['sql db NEVER', 'sql db ALWAYS']);
+  await assert.rejects(cloudsql.get('none'), (err) => err.code === 404);
+});
+
+test('Cloud SQL in the fake: an operation ending in an error leaves the policy as it was', async () => {
+  const { clock, cloudsql, w } = setup((world) => {
+    world.sql.db = { settings: { activationPolicy: 'NEVER' } };
+    world.sqlOperationErrors.push({ errors: [{ code: 'X', message: 'y' }] });
+  });
+  const op = await cloudsql.setActivation('db', 'ALWAYS');
+  clock.advance(w.sqlTakes.ALWAYS);
+  assert.deepEqual((await cloudsql.getOperation(op)).error, { errors: [{ code: 'X', message: 'y' }] });
+  assert.equal((await cloudsql.get('db')).settings.activationPolicy, 'NEVER');
+});

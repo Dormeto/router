@@ -8,8 +8,11 @@
 // and wait, then AWAKE.
 //
 // A workload's configuration: `{ workloadId, urlMap, backendService, wakerBackendService (names), backends: [{ kind: 'vm'
-// | 'mig', location, name }], idleMinutes, wakeTimeoutSeconds, hibernate?, lb? }`. `lb`: `{ kind: 'regional', region }` or
-// `{ kind: 'classic' }`, absent for a global load balancer. `config`: `{ project, region, controllerUrl }`.
+// | 'mig', location, name } | { kind: 'cloudsql', name }], idleMinutes, wakeTimeoutSeconds, hibernate?, lb? }`. `lb`: `{ kind: 'regional',
+// region }` or `{ kind: 'classic' }`, absent for a global load balancer. `config`: `{ project, region, controllerUrl }`.
+//
+// A `cloudsql` backend is a companion (cloudsql.mjs): the VMs and groups, the primaries, alone decide the state and serve; it goes
+// after them and comes back before them, as on AWS.
 //
 // What the run adds to AWS's: `stopped`, `suspended` (the VMs a nap acted on, names), `autoscalers` (`[{ kind, location,
 // name (the autoscaler's), mode }]`, what the wake gives back), `lastWake` (`{ durationMs }`) and `scheduleApplied` (the last
@@ -24,6 +27,7 @@ import { resolveHibernation } from '../../lambda/src/lib/hibernation.mjs';
 import { awakeStartWithin, CLOSE_START_MS, maintenanceDue, occurrenceAt } from '../../lambda/src/lib/schedule.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { createListRefresher } from '../../lambda/src/lib/list-refresh.mjs';
+import { isCompanion, startDatabase, statusOf, stopDatabase } from './cloudsql.mjs';
 import { OPERATION_NOT_DONE } from './google.mjs';
 import { inOneUpdate, switchOf } from './switch.mjs';
 import { mapBusy, references, UrlMapRefused } from './urlmaps.mjs';
@@ -67,6 +71,11 @@ const GOING = new Set(['STOPPING', 'SUSPENDING']);
 const DOWN = new Set([...GONE, ...GOING]);
 // A managed instance's status lags behind what its group is doing to it (G0: 92 s of draining while RUNNING).
 const STATUS_OF_ACTION = { STOPPING: 'STOPPING', SUSPENDING: 'SUSPENDING', STARTING: 'STAGING', RESUMING: 'STAGING' };
+// What a check does of a companion, by the state: one not as the state wants it, and what it asks.
+const COMPANION_DRIFT = {
+  [STATES.ASLEEP]: { status: 'running', policy: 'NEVER', event: 'DatabaseRestopped' },
+  [STATES.AWAKE]: { status: 'stopped', policy: 'ALWAYS', event: 'DatabaseRestarted' },
+};
 // What the shared classification cannot read in a Google error.
 const KIND_OF_CODE = { 403: 'permission', 429: 'throttled' };
 
@@ -74,6 +83,8 @@ const iso = (ms) => new Date(ms).toISOString();
 const nameOf = (url) => url.slice(url.lastIndexOf('/') + 1);
 const zoneOf = (url) => /\/zones\/([^/]+)\//.exec(url)?.[1];
 const names = (vms) => vms.map((vm) => vm.name);
+const primariesOf = (cfg) => cfg.backends.filter((b) => !isCompanion(b));
+const companionsOf = (cfg) => cfg.backends.filter(isCompanion);
 // A zone ends in its letter, a region in its number.
 export const groupOf = ({ location, name }) => ({ kind: /-[a-z]$/.test(location) ? 'zonal' : 'regional', location, name });
 
@@ -105,7 +116,7 @@ export class PauseRefused extends Error {
   }
 }
 
-export function createController({ store, compute, urlmaps, regionalUrlmaps, monitoring, tasks, config, lists = [], download, now = Date.now, sleep, newId = randomUUID, log }) {
+export function createController({ store, compute, cloudsql, urlmaps, regionalUrlmaps, monitoring, tasks, config, lists = [], download, now = Date.now, sleep, newId = randomUUID, log }) {
   const enqueue = (body) => tasks.enqueue({ url: `${config.controllerUrl}/v1/tasks`, body });
 
   async function transition(workloadId, change) {
@@ -176,7 +187,7 @@ export function createController({ store, compute, urlmaps, regionalUrlmaps, mon
       error: (m.lastAttempt?.errors?.errors ?? []).map((e) => `${e.code}: ${e.message}`).join('; '),
     }));
   }
-  const allVms = async (cfg) => (await each(cfg.backends, vmsOf)).flat();
+  const allVms = async (cfg) => (await each(primariesOf(cfg), vmsOf)).flat();
 
   async function act(backend, action, vms) {
     if (!vms.length) return;
@@ -218,7 +229,7 @@ export function createController({ store, compute, urlmaps, regionalUrlmaps, mon
   // The autoscalers get their modes back whatever a VM's start says.
   async function wakeBackends(cfg, run, deadline) {
     try {
-      await each(cfg.backends, (backend) => wakeBackend(backend, deadline));
+      await each(primariesOf(cfg), (backend) => wakeBackend(backend, deadline));
     } finally {
       await giveBackAutoscalers(run);
     }
@@ -290,19 +301,21 @@ export function createController({ store, compute, urlmaps, regionalUrlmaps, mon
     return [...kept, ...on];
   }
 
-  // Down when this returns: an operation's end says little (a managed group's VMs go after it, and its wait may run out
-  // before), so the VMs are read until they are.
+  // Down when this returns, the companions asked to go: an operation's end says little (a managed group's VMs go after it, and its
+  // wait may run out before), so the VMs are read until they are.
   async function putToSleep(cfg, autoscalers, latest) {
     const deadline = Math.min(now() + STOP_TIMEOUT_MS, latest);
     await each(autoscalers, (recorded) => setAutoscaler(recorded, 'OFF'));
     const { hibernate } = resolveHibernation({ workload: cfg.hibernate });
-    const done = await each(cfg.backends, (backend) => sleepBackend(backend, hibernate));
+    const done = await each(primariesOf(cfg), (backend) => sleepBackend(backend, hibernate));
     for (;;) {
       const up = (await allVms(cfg)).filter((vm) => !GONE.has(vm.status));
       if (!up.length) break;
       if (now() >= deadline) throw failureError('timeout', `not down in time: ${names(up).join(', ')}`);
       await sleep(POLL_MS);
     }
+    // After the application, with no wait: a stop takes minutes, and nothing depends on it.
+    await each(companionsOf(cfg), ({ name }) => stopDatabase(cloudsql, name, latest));
     return { stopped: done.flatMap((d) => d.stopped), suspended: done.flatMap((d) => d.suspended) };
   }
 
@@ -341,7 +354,16 @@ export function createController({ store, compute, urlmaps, regionalUrlmaps, mon
     }
     const since = run.wakeStartedAt ?? started;
     const deadline = Math.min(since + cfg.wakeTimeoutSeconds * 1000, started + WAKE_BUDGET_MS);
+    const isCurrent = async () => {
+      const current = await store.getRun(workloadId);
+      return current?.state === STATES.WAKING && current.wakeId === wakeId;
+    };
     try {
+      // The application needs them, whatever becomes of its VMs. Their minutes may have made this wake another's.
+      if (companionsOf(cfg).length) {
+        await each(companionsOf(cfg), ({ name }) => startDatabase(cloudsql, name, { now, sleep, deadline }));
+        if (!(await isCurrent())) return superseded();
+      }
       let givenBack = true;
       try {
         await wakeBackends(cfg, run, deadline);
@@ -359,8 +381,7 @@ export function createController({ store, compute, urlmaps, regionalUrlmaps, mon
       if (sw.kind === 'swap') {
         // The wait counts in the wake's time. It must also fit the request, and is not cut short: the map has changed.
         if (now() >= Math.min(deadline, started + WAKE_BUDGET_MS - sw.waitMs)) throw failureError('timeout', 'a VM is healthy, but the wake timed out before the URL map could change');
-        const current = await store.getRun(workloadId);
-        if (current?.state !== STATES.WAKING || current.wakeId !== wakeId) return superseded();
+        if (!(await isCurrent())) return superseded();
         await writeAwake(cfg);
         await sleep(sw.waitMs);
         if (now() >= deadline) throw failureError('timeout', 'a VM is healthy, but the wake timed out while the URL map\'s change spread');
@@ -873,7 +894,7 @@ export function createController({ store, compute, urlmaps, regionalUrlmaps, mon
         await startWake(workloadId, run, from === STATES.FAILED ? 'recovered' : 'external-start');
         return store.getRun(workloadId);
       }
-      await each(cfg.backends, (backend) => wakeBackend(backend, deadline)).catch((err) => log.warn('BackendsNotWoken', { workloadId, error: err.message }));
+      await each(primariesOf(cfg), (backend) => wakeBackend(backend, deadline)).catch((err) => log.warn('BackendsNotWoken', { workloadId, error: err.message }));
       const givenBack = await gaveBackAutoscalers(workloadId, run);
       run = (await transition(workloadId, {
         cond: { state: from },
@@ -894,6 +915,25 @@ export function createController({ store, compute, urlmaps, regionalUrlmaps, mon
       run = (await transition(workloadId, { cond: { state: STATES.AWAKE }, remove: ['autoscalers'] })) ?? run;
     }
     return run;
+  }
+
+  // The companions follow the state the primaries decided: asleep, a running one is stopped again, as AWS's that restart after 7 days;
+  // awake, a stopped one is started. No wait in a check: one try, and a refusal or another operation is for the next check. The run is
+  // read again before anything is asked: a wake or a nap since owns them.
+  async function companionsFollow(cfg, run) {
+    const drift = COMPANION_DRIFT[run?.state];
+    if (!drift) return;
+    const { workloadId } = cfg;
+    await Promise.all(companionsOf(cfg).map(async ({ name }) => {
+      try {
+        if (statusOf(await cloudsql.get(name)) !== drift.status) return;
+        if ((await store.getRun(workloadId))?.state !== run.state) return;
+        log.warn(drift.event, { workloadId, instance: name });
+        await cloudsql.setActivation(name, drift.policy);
+      } catch (err) {
+        log.warn('DatabaseNotFollowed', { workloadId, instance: name, error: err.message });
+      }
+    }));
   }
 
   // --- IP lists ------------------------------------------------------------------------------------------------------------
@@ -945,6 +985,7 @@ export function createController({ store, compute, urlmaps, regionalUrlmaps, mon
     // The nap this check just asked for may have started since the run was read: a repair on that read would remove its policy.
     if (ctx.applied.get(workloadId) === 'nap') return { state: run.state };
     run = await reconcile(cfg, run, deadline);
+    await companionsFollow(cfg, run);
     const t = now();
     const idleMs = cfg.idleMinutes * 60_000;
     // Still paying for backends that run without a healthy instance: released once its idle window has passed; a paused one

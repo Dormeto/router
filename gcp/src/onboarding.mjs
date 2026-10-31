@@ -8,8 +8,12 @@
 // Global, classic and regional load balancers (the coverage design's section 7). A workload's `lb`: `{ kind: 'regional', region }`
 // or `{ kind: 'classic' }`, under a swap, with a hold route and a second header on the waker; absent in the configuration for a
 // global one, under the policy. The router reads only its own region's regional maps.
+//
+// Cloud SQL companions (section 9): named at the onboarding, `{ kind: 'cloudsql', name }` among the backends, never without an
+// application. The router reads them at the project; the tag its update needs is the CLI's, bound before this.
 import { nextEvents, normalizeSchedule, scheduleProblems } from '../../lambda/src/lib/schedule.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
+import { companionProblem, INSTANCE_NAME, isCompanion, statusOf } from './cloudsql.mjs';
 import { groupOf, PauseRefused } from './controller-core.mjs';
 import { SWITCH_HEADER, WORKLOAD_HEADER, WORKLOAD_ID } from './names.mjs';
 import { inOneUpdate, SWAP_WAIT_MS } from './switch.mjs';
@@ -35,6 +39,8 @@ const GKE_NEG_PREFIX = 'k8s1-';
 const MANAGED_GROUP_OWNER = /\/instanceGroupManagers\/([^/]+)$/;
 const DEFAULTS = { idleMinutes: 15, failedRetrySeconds: 60, pollSeconds: 3 };
 const VMS_WAKE_SECONDS = 600;
+// AWS's 1800 s does not fit the request.
+const COMPANION_WAKE_SECONDS = 1700;
 // What an explicit wake's timeout must leave, beyond its URL map's change, under a swap: for the VMs to start at all.
 const SWAP_WAKE_ROOM_SECONDS = 60;
 // What the CLI's flags set, with AWS's ranges (lambda/src/lib/onboarding.mjs); the wake's fits the controller's request.
@@ -60,7 +66,7 @@ const isoOf = (ms) => new Date(ms).toISOString();
 const isSwapped = (lb) => Object.hasOwn(SWAP_WAIT_MS, lb.kind);
 const isRegional = (lb) => lb.kind === 'regional';
 // The map's change is included in the wake's time.
-const defaultWakeSeconds = (lb) => Math.min(VMS_WAKE_SECONDS + (isSwapped(lb) ? SWAP_WAIT_MS[lb.kind] / 1000 : 0), RANGES.wakeTimeoutSeconds[1]);
+const defaultWakeSeconds = (lb, companions) => Math.min((companions ? COMPANION_WAKE_SECONDS : VMS_WAKE_SECONDS) + (isSwapped(lb) ? SWAP_WAIT_MS[lb.kind] / 1000 : 0), RANGES.wakeTimeoutSeconds[1]);
 
 // A read's 404, as `.catch(absent)`: null.
 const absent = (err) => {
@@ -88,6 +94,14 @@ function settingsProblems(settings) {
     const [min, max] = RANGES[key];
     return Number.isInteger(value) && value >= min && value <= max ? [] : [`settings: ${key} must be an integer from ${min} to ${max}`];
   });
+}
+
+function cloudSqlProblems(cloudSql) {
+  if (!Array.isArray(cloudSql)) return ['cloudSql: must be a list of Cloud SQL instance names'];
+  return [
+    ...cloudSql.filter((name) => typeof name !== 'string' || !INSTANCE_NAME.test(name)).map((name) => `cloudSql: ${JSON.stringify(name)} is not a Cloud SQL instance name`),
+    ...[...new Set(cloudSql.filter((name, i) => cloudSql.indexOf(name) !== i))].map((name) => `cloudSql: ${name} is named twice`),
+  ];
 }
 
 // The map's change is included in the wake: a timeout that leaves it no room is a wake that always fails.
@@ -128,7 +142,7 @@ function workloadOf(cfg, run, paused) {
   };
 }
 
-export function createOnboarding({ store, compute, urlmaps, regionalUrlmaps, core, config, now = Date.now, log }) {
+export function createOnboarding({ store, compute, cloudsql, urlmaps, regionalUrlmaps, core, config, now = Date.now, log }) {
   const wakerName = (id) => `dmtr-${config.region}-${id}`;
   const wakerUrl = (name, lb) => `${COMPUTE}/projects/${config.project}/${isRegional(lb) ? `regions/${lb.region}` : 'global'}/backendServices/${name}`;
   const wakerHeaders = (id, lb) => [`${WORKLOAD_HEADER}: ${id}`, ...(isSwapped(lb) ? [`${SWITCH_HEADER}: swap`] : [])];
@@ -138,7 +152,7 @@ export function createOnboarding({ store, compute, urlmaps, regionalUrlmaps, cor
   const insertService = (body, lb) => (isRegional(lb) ? compute.insertRegionBackendService(lb.region, body) : compute.insertBackendService(body));
 
   // The request's fields, or a 400. Without an ID, the backend service's name, when it is one.
-  function requested({ urlMap, backendService, id, settings = {}, loadBalancer }) {
+  function requested({ urlMap, backendService, id, settings = {}, loadBalancer, cloudSql = [] }) {
     if (!urlMap || !backendService) throw bad('urlMap and backendService are needed');
     for (const [key, value] of Object.entries({ urlMap, backendService })) {
       if (typeof value !== 'string' || !NAME.test(value)) throw bad(`${key}: ${JSON.stringify(value)} is not a Compute Engine name`);
@@ -147,9 +161,9 @@ export function createOnboarding({ store, compute, urlmaps, regionalUrlmaps, cor
     const workloadId = checkedId(id || backendService);
     const waker = wakerName(workloadId);
     if (waker.length > NAME_MAX) throw bad(`workload ID ${workloadId} would name the waker backend service ${waker}, longer than the ${NAME_MAX} characters of a Compute Engine name: use a shorter one`);
-    const problems = settingsProblems(settings);
+    const problems = [...settingsProblems(settings), ...cloudSqlProblems(cloudSql)];
     if (problems.length) throw bad(problems.join('; '));
-    return { id: workloadId, urlMap, backendService, settings, loadBalancer };
+    return { id: workloadId, urlMap, backendService, settings, loadBalancer, cloudSql };
   }
 
   // The URL map, `{ map, regional }`, or why it is not one: `{ reason }`. A regional one elsewhere than the router's region reads as none.
@@ -307,13 +321,34 @@ export function createOnboarding({ store, compute, urlmaps, regionalUrlmaps, cor
     return { reasons, vms, groups, negs };
   }
 
-  // Section 7: why the workload cannot be onboarded, its load balancer (`lb`, none when it cannot be told), its VMs and groups. Reads only.
-  async function inspect({ id, urlMap, backendService, loadBalancer, settings }) {
+  // The companions asked for: what refuses them, and what the CLI tags. Google may answer a 403 for an instance that does not exist.
+  async function databasesOf(names, others) {
+    const found = await Promise.all(names.map(async (name) => {
+      const holder = others.find((c) => c.backends?.some((b) => isCompanion(b) && b.name === name));
+      const held = holder ? [`Cloud SQL instance ${name} belongs to workload ${holder.workloadId}`] : [];
+      try {
+        const instance = await cloudsql.get(name);
+        const problem = companionProblem({ ...instance, name });
+        return { reasons: [...held, ...(problem ? [problem] : [])], database: { name, selfLink: instance.selfLink } };
+      } catch (err) {
+        if (err?.code === 404) return { reasons: [...held, `Cloud SQL instance ${name} not found: name an instance of this project`] };
+        if (err?.code === 403) return { reasons: [...held, `the router cannot read Cloud SQL instance ${name}: it does not exist, or the router was installed without --with cloud-sql: ${err.message}`] };
+        throw err;
+      }
+    }));
+    return { reasons: found.flatMap((f) => f.reasons), databases: found.flatMap((f) => (f.database ? [f.database] : [])) };
+  }
+
+  // Section 7: why the workload cannot be onboarded, its load balancer (`lb`, none when it cannot be told), its VMs, groups and databases. Reads only.
+  async function inspect({ id, urlMap, backendService, loadBalancer, settings, cloudSql }) {
     const reasons = [];
     const configs = await store.listConfigs();
     const others = configs.filter((c) => c.workloadId !== id);
     if (others.length < configs.length) reasons.push(`workload ${id} is onboarded already`);
-    const nothing = { vms: [], groups: [], negs: {} };
+    const companions = await databasesOf(cloudSql, others);
+    reasons.push(...companions.reasons);
+    const { databases } = companions;
+    const nothing = { vms: [], groups: [], negs: {}, databases };
     const { map, regional, reason } = await findMap(urlMap, loadBalancer);
     if (!map) return { reasons: [...reasons, reason], ...nothing };
     const front = await loadBalancerOf(urlMap, regional, loadBalancer);
@@ -352,12 +387,12 @@ export function createOnboarding({ store, compute, urlmaps, regionalUrlmaps, cor
 
     const backends = await backendsOf(service, others);
     reasons.push(...backends.reasons);
-    return { reasons, ...told, vms: backends.vms, groups: backends.groups, negs: backends.negs, hosts: hostsOf(map, backendService), wakerExists: Boolean(existing) };
+    return { reasons, ...told, vms: backends.vms, groups: backends.groups, negs: backends.negs, databases, hosts: hostsOf(map, backendService), wakerExists: Boolean(existing) };
   }
 
   async function dryRun(input) {
-    const { reasons, vms, groups, lb } = await inspect(requested(input));
-    return { eligible: reasons.length === 0, reasons, vms, groups, ...(lb ? { lb } : {}) };
+    const { reasons, vms, groups, databases, lb } = await inspect(requested(input));
+    return { eligible: reasons.length === 0, reasons, vms, groups, databases, ...(lb ? { lb } : {}) };
   }
 
   // In one update, then the waker backend service: the route and the policy; under a swap, the application back wherever the map
@@ -386,9 +421,9 @@ export function createOnboarding({ store, compute, urlmaps, regionalUrlmaps, cor
   }
 
   async function onboard(input) {
-    const { id, urlMap, backendService, settings, loadBalancer } = requested(input);
+    const { id, urlMap, backendService, settings, loadBalancer, cloudSql } = requested(input);
     if (await store.getConfig(id)) throw new Refusal(409, 'exists', `workload ${id} is onboarded already`);
-    const { reasons, vms, groups, negs, hosts, wakerExists, lb } = await inspect({ id, urlMap, backendService, loadBalancer, settings });
+    const { reasons, vms, groups, negs, databases, hosts, wakerExists, lb } = await inspect({ id, urlMap, backendService, loadBalancer, settings, cloudSql });
     if (reasons.length) throw new Refusal(400, 'not-eligible', `cannot onboard ${id}: ${reasons.join('; ')}`);
     const name = wakerName(id);
     const waker = wakerUrl(name, lb);
@@ -409,9 +444,10 @@ export function createOnboarding({ store, compute, urlmaps, regionalUrlmaps, cor
           ...(negs[vm.name] ? { neg: negs[vm.name][0], ...(negs[vm.name].length > 1 ? { moreNegs: negs[vm.name].slice(1) } : {}) } : {}),
         })),
         ...groups.map((g) => ({ kind: 'mig', location: g.location, name: g.name, id: g.id })),
+        ...databases.map(({ name: database }) => ({ kind: 'cloudsql', name: database })),
       ],
       ...DEFAULTS,
-      wakeTimeoutSeconds: defaultWakeSeconds(lb),
+      wakeTimeoutSeconds: defaultWakeSeconds(lb, databases.length > 0),
       ...settings,
       onboardedAt: isoOf(now()),
     };
@@ -459,6 +495,7 @@ export function createOnboarding({ store, compute, urlmaps, regionalUrlmaps, cor
   // Running, as far as it can be read: anything else, a backend gone included, is not known to be up.
   async function isUp(backend, workloadId) {
     try {
+      if (isCompanion(backend)) return statusOf(await cloudsql.get(backend.name)) === 'running';
       const statuses = backend.kind === 'mig'
         ? (await compute.listManagedInstances(groupOf(backend))).map((m) => m.instanceStatus)
         : [(await compute.getInstance(backend.location, backend.name)).status];

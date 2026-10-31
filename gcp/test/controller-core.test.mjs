@@ -7,7 +7,7 @@ import { createController, PauseRefused } from '../src/controller-core.mjs';
 import { fromFields, toFields } from '../src/firestore.mjs';
 import { GoogleError, OPERATION_NOT_DONE } from '../src/google.mjs';
 import { createUrlMaps, withErrorPolicy, withSwap } from '../src/urlmaps.mjs';
-import { setup as worldOf } from './world.mjs';
+import { regional as regionalWorld, setup as worldOf } from './world.mjs';
 
 const V1 = 'https://compute.googleapis.com/compute/v1/projects/p';
 const ZONE = 'europe-west1-b';
@@ -2471,4 +2471,374 @@ test('a wake starts what is recorded, whatever the NEG holds by then', async () 
   await t.core.wake('demo', await t.core.beginWake('demo', STATES.ASLEEP, 'test'));
   assert.equal(t.w.vms['neg-vm'].status, 'RUNNING');
   assert.equal(t.w.vms['other-vm'].status, 'TERMINATED');
+});
+
+// --- Cloud SQL companions, over the real adapter and the fake of world.mjs (task R10's assumptions, before M6) ------------------
+
+const SQL_INPUT = { urlMap: 'lb', backendService: 'app', id: 'demo', cloudSql: ['db'] };
+const lineOf = (changes, pattern) => changes.findIndex((line) => pattern.test(line));
+const APP_DOWN = /^(stop|suspend) vm-a$/;
+const APP_UP = /^(start|resume) vm-a$/;
+const policyOf = (t, name = 'db') => t.w.sql[name].settings.activationPolicy;
+const busy = () => new GoogleError('Google: PATCH: 409 another operation', { code: 409, status: 'CONFLICT', reason: 'operationInProgress' });
+
+// A workload `demo` onboarded with the instance `db`, awake. `change(w)`: what differs from the world's defaults.
+async function withCompanion(change = () => {}) {
+  const t = worldOf((w) => {
+    w.sql.db = {};
+    change(w);
+  });
+  await t.onboarding.onboard(SQL_INPUT);
+  t.w.changes.length = 0;
+  return t;
+}
+
+// The same, asleep, with its stop's operation over.
+async function asleepWithCompanion(change) {
+  const t = await withCompanion(change);
+  assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
+  t.clock.advance(t.w.sqlTakes.NEVER);
+  t.w.changes.length = 0;
+  return t;
+}
+
+const wakeNowIn = async (t) => t.core.wake('demo', await t.core.beginWake('demo', STATES.ASLEEP, 'operator'));
+const failureOfRun = (t) => JSON.parse(t.store.runs.get('demo').failure);
+
+test('a companion\'s nap: NEVER once the application is down, with no wait for it', async () => {
+  const t = await withCompanion();
+  let opened;
+  t.w.on['PATCH sql/instances/db'] = () => { opened = t.w.changes.slice(); };
+  assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
+  assert.ok(opened.some((line) => APP_DOWN.test(line)), 'the application first');
+  assert.ok(lineOf(t.w.changes, APP_DOWN) < lineOf(t.w.changes, /^sql db NEVER$/));
+  assert.equal(t.w.changes.at(-1), 'sql db NEVER');
+  assert.equal(policyOf(t), 'NEVER');
+  // The stop's operation still runs: the nap did not wait for it, or read it.
+  assert.equal(t.w.used.has('cloudsql.getOperation'), false);
+  assert.equal((await t.cloudsql.getOperation(t.w.sql.db.operation)).status, 'RUNNING');
+});
+
+test('a companion\'s nap given up before the commit point leaves the database alone', async () => {
+  const t = await withCompanion();
+  t.store.pauses.set('demo', { by: 'x', at: t.clock.now(), reason: 'r', keepAsleep: false });
+  assert.equal((await t.core.nap('demo')).state, 'SKIPPED');
+  assert.deepEqual(t.w.changes, []);
+});
+
+test('a companion\'s wake: ALWAYS first, the application only once the database runs', async () => {
+  const t = await asleepWithCompanion();
+  const start = t.clock.now();
+  let appAt;
+  let dbAtApp;
+  for (const action of ['start', 'resume']) {
+    t.w.on[`POST zones/${ZONE}/instances/vm-a/${action}`] = () => {
+      appAt = t.clock.now();
+      dbAtApp = t.w.changes.slice();
+    };
+  }
+  assert.equal((await wakeNowIn(t)).state, STATES.AWAKE);
+  assert.equal(t.w.changes[0], 'sql db ALWAYS');
+  assert.ok(dbAtApp.includes('sql db ALWAYS'));
+  assert.ok(appAt - start >= t.w.sqlTakes.ALWAYS, `the application at ${appAt - start} ms, the database takes ${t.w.sqlTakes.ALWAYS}`);
+  assert.equal(policyOf(t), 'ALWAYS');
+});
+
+test('a wake right after a nap: the database going down is waited for, then started', async () => {
+  const t = await withCompanion();
+  assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
+  t.w.changes.length = 0;
+  const start = t.clock.now();
+  assert.equal((await wakeNowIn(t)).state, STATES.AWAKE);
+  assert.equal(t.w.changes[0], 'sql db ALWAYS');
+  assert.ok(t.clock.now() - start >= t.w.sqlTakes.NEVER + t.w.sqlTakes.ALWAYS);
+});
+
+test('a failed application start leaves the database up, the workload FAILED', async () => {
+  const t = await asleepWithCompanion();
+  for (const action of ['start', 'resume']) t.w.fail[`POST zones/${ZONE}/instances/vm-a/${action}`] = new GoogleError('Google: refused', { code: 500 });
+  assert.equal((await wakeNowIn(t)).state, STATES.FAILED);
+  assert.equal(policyOf(t), 'ALWAYS');
+  assert.equal(t.w.changes.includes('sql db NEVER'), false);
+});
+
+test('a database that does not come up fails the wake, the application not started; a timeout', async () => {
+  const t = await asleepWithCompanion((w) => { w.sqlTakes.ALWAYS = 10 * 3_600_000; });
+  const { state } = await wakeNowIn(t);
+  assert.equal(state, STATES.FAILED);
+  assert.equal(lineOf(t.w.changes, APP_UP), -1);
+  const failure = failureOfRun(t);
+  assert.equal(failure.kind, 'timeout');
+  assert.match(failure.message, /Cloud SQL instance db: not running when the wake timed out/);
+});
+
+test('a database that does not come up keeps the autoscalers off, on record for the next wake', async () => {
+  const t = await asleepWithCompanion((w) => { w.sqlTakes.ALWAYS = 10 * 3_600_000; });
+  t.store.runs.get('demo').autoscalers = [{ kind: 'zonal', location: ZONE, name: 'scaler', mode: 'ON' }];
+  await wakeNowIn(t);
+  assert.equal(t.w.changes.some((line) => line.startsWith('autoscaler')), false);
+  assert.equal(t.store.runs.get('demo').autoscalers.length, 1);
+});
+
+test('a wake moved on during the database\'s wait starts no application', async () => {
+  const t = await asleepWithCompanion();
+  t.clock.onSleep(() => {
+    const run = t.store.runs.get('demo');
+    if (run?.state === STATES.WAKING) run.wakeId = 'another';
+  });
+  assert.equal((await wakeNowIn(t)).state, 'SUPERSEDED');
+  assert.equal(lineOf(t.w.changes, APP_UP), -1);
+});
+
+test('under a swap: a database that does not come up fails the wake, even with a VM healthy', async () => {
+  const t = worldOf((w) => {
+    regionalWorld(w);
+    w.sql.db = {};
+    w.sqlTakes.ALWAYS = 10 * 3_600_000;
+  });
+  await t.onboarding.onboard(SQL_INPUT);
+  await t.core.nap('demo');
+  t.clock.advance(t.w.sqlTakes.NEVER);
+  t.w.vms['vm-a'].status = 'RUNNING';
+  assert.equal((await wakeNowIn(t)).state, STATES.FAILED);
+  assert.equal(t.w.logs.some((l) => l.event === 'BackendsNotWoken'), false);
+});
+
+test('under a swap: the nap\'s NEVER after the application, the wake\'s ALWAYS before it, then the map', async () => {
+  const t = worldOf((w) => {
+    regionalWorld(w);
+    w.sql.db = {};
+  });
+  await t.onboarding.onboard(SQL_INPUT);
+  t.w.changes.length = 0;
+  assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
+  assert.ok(lineOf(t.w.changes, /^map lb$/) < lineOf(t.w.changes, APP_DOWN));
+  assert.ok(lineOf(t.w.changes, APP_DOWN) < lineOf(t.w.changes, /^sql db NEVER$/));
+  t.clock.advance(t.w.sqlTakes.NEVER);
+  t.w.changes.length = 0;
+  assert.equal((await wakeNowIn(t)).state, STATES.AWAKE);
+  assert.deepEqual([lineOf(t.w.changes, /^sql db ALWAYS$/) < lineOf(t.w.changes, APP_UP), lineOf(t.w.changes, APP_UP) < lineOf(t.w.changes, /^map lb$/)], [true, true]);
+});
+
+test('the check, asleep: a running companion is stopped again, the state unchanged', async () => {
+  const t = await asleepWithCompanion();
+  t.w.sql.db.settings.activationPolicy = 'ALWAYS';
+  const [result] = await t.core.check();
+  assert.equal(result.state, STATES.ASLEEP);
+  assert.deepEqual(t.w.changes, ['sql db NEVER']);
+  assert.equal(policyOf(t), 'NEVER');
+  assert.ok(t.w.logs.some((l) => l.event === 'DatabaseRestopped' && l.workloadId === 'demo' && l.instance === 'db'));
+});
+
+test('the check, asleep: a stopped companion changes nothing', async () => {
+  const t = await asleepWithCompanion();
+  await t.core.check();
+  assert.deepEqual(t.w.changes, []);
+});
+
+test('the check, awake: a stopped companion is started, with no wait, the state unchanged', async () => {
+  const t = await withCompanion();
+  t.w.sql.db.settings = { activationPolicy: 'NEVER' };
+  const before = t.clock.now();
+  const [result] = await t.core.check();
+  assert.equal(result.state, STATES.AWAKE);
+  assert.deepEqual(t.w.changes, ['sql db ALWAYS']);
+  assert.equal(t.clock.now(), before);
+  assert.ok(t.w.logs.some((l) => l.event === 'DatabaseRestarted' && l.instance === 'db'));
+});
+
+test('the check, awake: a running companion changes nothing, and one read a single time', async () => {
+  const t = await withCompanion();
+  let reads = 0;
+  t.w.on['GET sql/instances/db'] = () => { reads += 1; };
+  await t.core.check();
+  assert.deepEqual(t.w.changes, []);
+  assert.equal(reads, 1);
+});
+
+test('the primaries decide the state: asleep with the database running stays asleep', async () => {
+  const t = await asleepWithCompanion();
+  t.w.sql.db.settings.activationPolicy = 'ALWAYS';
+  assert.equal((await t.core.check())[0].state, STATES.ASLEEP);
+  assert.equal(t.w.logs.some((l) => l.event === 'ExternalWake'), false);
+});
+
+test('the primaries decide the state: awake with the database stopped stays awake', async () => {
+  const t = await withCompanion();
+  t.w.sql.db.settings = { activationPolicy: 'NEVER' };
+  assert.equal((await t.core.check())[0].state, STATES.AWAKE);
+  assert.equal(t.w.logs.some((l) => l.event === 'ExternalStop'), false);
+});
+
+test('the primaries decide the state: VMs stopped by hand, the database running: asleep, and it follows', async () => {
+  const t = await withCompanion();
+  t.w.vms['vm-a'].status = 'TERMINATED';
+  assert.equal((await t.core.check())[0].state, STATES.ASLEEP);
+  assert.ok(t.w.logs.some((l) => l.event === 'ExternalStop'));
+  assert.equal(policyOf(t), 'NEVER');
+});
+
+test('the primaries decide the state: a VM started by hand, the database stopped: awake, and it follows', async () => {
+  const t = await asleepWithCompanion();
+  t.w.vms['vm-a'].status = 'RUNNING';
+  assert.equal((await t.core.check())[0].state, STATES.AWAKE);
+  assert.ok(t.w.logs.some((l) => l.event === 'ExternalWake'));
+  assert.equal(policyOf(t), 'ALWAYS');
+});
+
+test('the check, FAILED or napping or waking: the database is left as it is', async () => {
+  for (const state of [STATES.FAILED, STATES.NAPPING, STATES.WAKING]) {
+    const t = await withCompanion();
+    Object.assign(t.store.runs.get('demo'), { state, failedAt: t.clock.now(), updatedAt: t.clock.now(), wakeStartedAt: t.clock.now() });
+    await t.core.check();
+    assert.equal(t.w.changes.some((line) => line.startsWith('sql ')), false, state);
+  }
+});
+
+test('the check: a run that changed since it was read leaves the database alone', async () => {
+  const t = await asleepWithCompanion();
+  t.w.sql.db.settings.activationPolicy = 'ALWAYS';
+  // The wake asked between the check's read of the run and its read of the instance.
+  t.w.on['GET sql/instances/db'] = () => { t.store.runs.get('demo').state = STATES.WAKING; };
+  await t.core.check();
+  assert.deepEqual(t.w.changes, []);
+});
+
+test('the check: a companion that cannot be read or changed is logged, and the check goes on', async () => {
+  const t = await withCompanion();
+  t.w.fail['GET sql/instances/db'] = new GoogleError('Google: refused', { code: 500 });
+  t.clock.advance(3_600_000);
+  const [result] = await t.core.check();
+  assert.equal(result.error, undefined);
+  assert.equal(result.nap, 'requested');
+  assert.ok(t.w.logs.some((l) => l.event === 'DatabaseNotFollowed' && l.instance === 'db'));
+});
+
+test('the check: operationInProgress is not waited for, the next check tries again', async () => {
+  const t = await asleepWithCompanion();
+  t.w.sql.db.settings.activationPolicy = 'ALWAYS';
+  t.w.fail['PATCH sql/instances/db'] = busy();
+  const before = t.clock.now();
+  const [result] = await t.core.check();
+  assert.equal(result.state, STATES.ASLEEP);
+  assert.equal(t.clock.now(), before);
+  assert.ok(t.w.logs.some((l) => l.event === 'DatabaseNotFollowed'));
+  delete t.w.fail['PATCH sql/instances/db'];
+  await t.core.check();
+  assert.equal(policyOf(t), 'NEVER');
+});
+
+test('a nap\'s 409 is retried until it passes', async () => {
+  const t = await withCompanion();
+  let refusals = 3;
+  t.w.on['PATCH sql/instances/db'] = () => {
+    if (refusals > 0) {
+      refusals -= 1;
+      throw busy();
+    }
+  };
+  assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
+  assert.equal(refusals, 0);
+  assert.equal(policyOf(t), 'NEVER');
+});
+
+test('a nap\'s 409 is retried to the deadline: then FAILED, a timeout, within the nap\'s request', async () => {
+  const t = await withCompanion();
+  const start = t.clock.now();
+  t.w.fail['PATCH sql/instances/db'] = busy();
+  let tries = 0;
+  t.google.request = ((request) => (method, url, body) => {
+    if (method === 'PATCH' && url.includes('sqladmin')) tries += 1;
+    return request(method, url, body);
+  })(t.google.request);
+  assert.equal((await t.core.nap('demo')).state, STATES.FAILED);
+  assert.ok(tries > 100, `${tries} tries`);
+  assert.ok(t.clock.now() - start <= REQUEST_LIMIT);
+  const failure = failureOfRun(t);
+  assert.equal(failure.kind, 'timeout');
+  assert.match(failure.message, /Cloud SQL instance db: another operation was still running at the deadline/);
+});
+
+test('a wake\'s 409 is retried to the deadline: then FAILED, a timeout, the application not started', async () => {
+  const t = await asleepWithCompanion();
+  const start = t.clock.now();
+  t.w.fail['PATCH sql/instances/db'] = busy();
+  assert.equal((await wakeNowIn(t)).state, STATES.FAILED);
+  assert.ok(t.clock.now() - start >= 1_700_000);
+  assert.ok(t.clock.now() - start <= REQUEST_LIMIT);
+  assert.equal(lineOf(t.w.changes, APP_UP), -1);
+  assert.equal(failureOfRun(t).kind, 'timeout');
+});
+
+test('a 403 on a nap\'s PATCH: a failure of kind permission naming the tag', async () => {
+  const t = await withCompanion();
+  t.w.fail['PATCH sql/instances/db'] = new GoogleError('Google: PATCH: 403 not authorized', { code: 403, reason: 'notAuthorized' });
+  assert.equal((await t.core.nap('demo')).state, STATES.FAILED);
+  const failure = failureOfRun(t);
+  assert.equal(failure.kind, 'permission');
+  assert.match(failure.message, /tag dormeto=managed/);
+});
+
+test('a start refused for capacity gets AWS\'s retries, then the wake goes on', async () => {
+  const t = await asleepWithCompanion();
+  t.w.sqlOperationErrors.push({ errors: [{ code: 'ZONE_RESOURCE_POOL_EXHAUSTED', message: 'none left' }] });
+  const start = t.clock.now();
+  assert.equal((await wakeNowIn(t)).state, STATES.AWAKE);
+  // A first try that fails at its operation's end, 30 s, and a second that takes its time.
+  assert.ok(t.clock.now() - start >= t.w.sqlTakes.ALWAYS * 2 + 30_000);
+  assert.deepEqual(t.w.changes.filter((line) => line === 'sql db ALWAYS').length, 2);
+});
+
+test('a start refused for capacity up to the deadline: a failure of kind capacity', async () => {
+  const t = await asleepWithCompanion();
+  t.w.fail['PATCH sql/instances/db'] = new GoogleError('Google: PATCH: 503 no', { code: 503, reason: 'ZONE_RESOURCE_POOL_EXHAUSTED' });
+  assert.equal((await wakeNowIn(t)).state, STATES.FAILED);
+  assert.equal(failureOfRun(t).kind, 'capacity');
+});
+
+test('a companion among the backends: the idle check, the NEG membership and the VMs\' loops read only the application', async () => {
+  const t = await withCompanion((w) => {
+    w.negs.neg = { endpoints: ['vm-a'] };
+    w.services.app.backends = [{ group: `${V1}/zones/${ZONE}/networkEndpointGroups/neg` }];
+  });
+  t.clock.advance(3_600_000);
+  assert.equal((await t.core.check())[0].nap, 'requested');
+  assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
+  assert.equal(t.w.logs.some((l) => l.event === 'NapAborted'), false);
+  t.clock.advance(t.w.sqlTakes.NEVER);
+  assert.equal((await wakeNowIn(t)).state, STATES.AWAKE);
+});
+
+test('release: the application down, then the database', async () => {
+  const t = await withCompanion();
+  Object.assign(t.store.runs.get('demo'), { state: STATES.FAILED, failedAt: t.clock.now() });
+  assert.equal((await t.core.release('demo')).state, STATES.ASLEEP);
+  assert.ok(lineOf(t.w.changes, APP_DOWN) < lineOf(t.w.changes, /^sql db NEVER$/));
+  assert.equal(policyOf(t), 'NEVER');
+});
+
+test('two companions: both up before the application, both asked to go after it; one that fails fails the wake once the other is settled', async () => {
+  const t = worldOf((w) => {
+    w.sql.db = {};
+    w.sql.second = {};
+  });
+  await t.onboarding.onboard({ ...SQL_INPUT, cloudSql: ['db', 'second'] });
+  assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
+  assert.deepEqual([policyOf(t), policyOf(t, 'second')], ['NEVER', 'NEVER']);
+  t.clock.advance(t.w.sqlTakes.NEVER);
+  t.w.changes.length = 0;
+  assert.equal((await wakeNowIn(t)).state, STATES.AWAKE);
+  assert.ok(lineOf(t.w.changes, /^sql db ALWAYS$/) < lineOf(t.w.changes, APP_UP));
+  assert.ok(lineOf(t.w.changes, /^sql second ALWAYS$/) < lineOf(t.w.changes, APP_UP));
+
+  assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
+  t.clock.advance(t.w.sqlTakes.NEVER);
+  t.w.changes.length = 0;
+  t.w.fail['PATCH sql/instances/second'] = new GoogleError('Google: PATCH: 403 not authorized', { code: 403 });
+  const started = t.clock.now();
+  assert.equal((await wakeNowIn(t)).state, STATES.FAILED);
+  assert.ok(t.clock.now() - started >= t.w.sqlTakes.ALWAYS, 'the other settled first');
+  assert.equal(policyOf(t), 'ALWAYS');
+  assert.equal(lineOf(t.w.changes, APP_UP), -1);
+  assert.equal(failureOfRun(t).kind, 'permission');
 });

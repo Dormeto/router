@@ -115,7 +115,7 @@ node gcp/tools/measure.mjs switch --url-map dmt-dev-classic --url "http://$(addr
 node gcp/tools/measure.mjs health --backend-service dmt-demo-classic-app --for 120
 node gcp/tools/measure.mjs metric --url-map dmt-dev-classic --url "http://$(addr dmt-dev-classic)/" \
   --metric loadbalancing.googleapis.com/https/request_count
-# S5: Cloud SQL stopped and started by its activation policy, state and policy read every 10 s (M6)
+# S5: Cloud SQL stopped and started by its activation policy, until its operation is done; state and policy read every 10 s (M6)
 node gcp/tools/measure.mjs sql stop
 node gcp/tools/measure.mjs sql start
 # S6: the Deployment scaled to 0 and back through the cluster's DNS endpoint, as the owner (M9)
@@ -124,7 +124,9 @@ node gcp/tools/measure.mjs gke scale --replicas 1 --url "http://$(addr dmt-dev-g
 ```
 
 Each prints a timeline like the others. `neg` adds the NEG's endpoints (kept or dropped while the VM is stopped);
-`sql` follows `state` and `settings.activationPolicy` until `SUSPENDED` (stop) or `RUNNABLE` (start); `gke scale` reads
+`sql` follows the operation the PATCH returns until it is `DONE`, whose end is the time, and prints `state` and
+`settings.activationPolicy` on each sample: Google documents `RUNNABLE` as "running, or has been stopped by owner" and
+`SUSPENDED` as unavailable for billing and the like, so no state tells a stop; `gke scale` reads
 the cluster's DNS endpoint from the Container API, reads and puts the Deployment's scale through it with gcloud's token,
 and follows the pods, the NEG's endpoints, the backend service's health and the answers.
 

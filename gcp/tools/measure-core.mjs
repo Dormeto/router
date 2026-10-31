@@ -25,8 +25,8 @@ export const USAGE = `Usage: node gcp/tools/measure.mjs <command> [options]
                                             the VM of the zonal NEG, through Compute Engine: the NEG's endpoints,
                                             the backend service's health, the answers
          [--instance dmt-demo-neg] [--group dmt-demo-neg] [--backend-service dmt-demo-neg] [--zone europe-west1-b]
-  sql stop|start                            the Cloud SQL instance, by its activation policy (NEVER | ALWAYS):
-         [--instance dmt-demo-sql]          its state and policy read every 10 s
+  sql stop|start                            the Cloud SQL instance, by its activation policy (NEVER | ALWAYS), until
+         [--instance dmt-demo-sql]          the PATCH's operation is done: state, policy and operation read every 10 s
   gke scale --replicas <n> --url <address of the GKE load balancer>
                                             the Deployment's scale through the cluster's DNS endpoint, with the
                                             caller's token: the pods, the NEG's endpoints, the backend service's
@@ -464,18 +464,30 @@ export function endpointStates(response) {
 // Cloud SQL's instance → what the timeline follows: its state and its activation policy.
 export const sqlState = (instance) => `${instance.state ?? 'unknown'} ${instance.settings?.activationPolicy ?? 'none'}`;
 
-// The policy and the state a Cloud SQL stop or start ends on (M6 pins the state a stopped instance reads).
-const SQL_FINAL = { stop: { policy: 'NEVER', state: 'SUSPENDED' }, start: { policy: 'ALWAYS', state: 'RUNNABLE' } };
+// A Cloud SQL stop or start is the activation policy patched. No state tells that it ended: Google documents RUNNABLE as
+// "running, or has been stopped by owner", and SUSPENDED as unavailable for billing and the like. The PATCH's operation does.
+export const SQL_POLICY = { stop: 'NEVER', start: 'ALWAYS' };
 
-// Poller samples [{ t, states: { name: 'STATE POLICY' } }] → when the instance first read the new policy and then the
-// final state, from `since` on (a sample before the request does not count): { policy, reached } (ms or null).
-export function sqlSummary(action, { since, name, samples }) {
-  const final = SQL_FINAL[action];
-  const after = [...samples].filter((s) => s.t >= since).sort((a, b) => a.t - b.t);
-  const read = (s) => (s.states[name] ?? '').split(' ');
-  const policy = after.find((s) => read(s)[1] === final.policy)?.t ?? null;
-  const reached = after.find((s) => read(s)[0] === final.state && read(s)[1] === final.policy)?.t ?? null;
-  return { policy, reached };
+// operations.get's answer → its status (PENDING, RUNNING, DONE), or FAILED with Google's words.
+export function sqlOperationState(operation) {
+  if (operation.status !== 'DONE' || !operation.error) return operation.status ?? 'UNKNOWN';
+  const errors = (operation.error.errors ?? []).map((e) => `${e.code}: ${e.message}`).join('; ');
+  return `FAILED ${errors || 'no reason given'}`;
+}
+
+// The seconds Google gives a finished operation, null without its times.
+export function sqlOperationSeconds({ insertTime, endTime }) {
+  const seconds = (Date.parse(endTime) - Date.parse(insertTime)) / 1000;
+  return Number.isFinite(seconds) ? seconds : null;
+}
+
+// Poller samples [{ t, states: { instance: 'STATE POLICY', operation: sqlOperationState } }] → when the instance first read
+// the new policy, when the operation was first read as ended, and its failure: { policy, ended, failure } (ms or null).
+export function sqlSummary(action, samples) {
+  const sorted = [...samples].sort((a, b) => a.t - b.t);
+  const policy = sorted.find((s) => s.states.instance.split(' ')[1] === SQL_POLICY[action])?.t ?? null;
+  const end = sorted.find((s) => s.states.operation === 'DONE' || s.states.operation.startsWith('FAILED '));
+  return { policy, ended: end?.t ?? null, failure: end?.states.operation.match(/^FAILED (.*)$/)?.[1] ?? null };
 }
 
 // A Deployment (or its scale) → STOPPED at 0 replicas wanted and none left, RUNNING when all wanted are ready, else PENDING.

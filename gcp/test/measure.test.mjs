@@ -7,7 +7,7 @@ import http from 'node:http';
 import {
   UsageError, parseArgs, line, delta, pageOf, kindOfPort, summarize, changes, healthStates, managedStates, targets, actionSummary,
   switchService, healthLevel, changesSince, periods, tokenArgs, credentialOf, createTokens, withToken, pointsOf, metricFilter, counted,
-  USAGE, endpointStates, endpointAddresses, endpointRange, sqlState, sqlSummary, podsState, scaleAction, deploymentPath,
+  USAGE, endpointStates, endpointAddresses, endpointRange, sqlState, sqlSummary, sqlOperationState, sqlOperationSeconds, podsState, scaleAction, deploymentPath,
 } from '../tools/measure-core.mjs';
 import { probe } from '../tools/measure.mjs';
 
@@ -770,29 +770,43 @@ test('a NEG\'s endpoints: each instance with its address and port; none when the
 
 test('Cloud SQL\'s reading: the state and the activation policy', () => {
   assert.equal(sqlState({ state: 'RUNNABLE', settings: { activationPolicy: 'ALWAYS' } }), 'RUNNABLE ALWAYS');
-  assert.equal(sqlState({ state: 'SUSPENDED', settings: { activationPolicy: 'NEVER' } }), 'SUSPENDED NEVER');
+  assert.equal(sqlState({ state: 'RUNNABLE', settings: { activationPolicy: 'NEVER' } }), 'RUNNABLE NEVER');
   assert.equal(sqlState({}), 'unknown none');
 });
 
-test('a stop\'s summary: the policy read as NEVER, then the instance SUSPENDED; samples before the request do not count', () => {
-  const samples = [
-    { t: 0, states: { db: 'RUNNABLE ALWAYS' } },
-    { t: 10_000, states: { db: 'SUSPENDED NEVER' } },
-    { t: 20_000, states: { db: 'RUNNABLE NEVER' } },
-    { t: 30_000, states: { db: 'RUNNABLE NEVER' } },
-    { t: 40_000, states: { db: 'SUSPENDED NEVER' } },
-  ];
-  assert.deepEqual(sqlSummary('stop', { since: 15_000, name: 'db', samples }), { policy: 20_000, reached: 40_000 });
-  assert.deepEqual(sqlSummary('stop', { since: 50_000, name: 'db', samples }), { policy: null, reached: null });
+test('Cloud SQL\'s operation: its status, or FAILED with Google\'s words', () => {
+  assert.equal(sqlOperationState({ status: 'PENDING' }), 'PENDING');
+  assert.equal(sqlOperationState({ status: 'RUNNING' }), 'RUNNING');
+  assert.equal(sqlOperationState({ status: 'DONE' }), 'DONE');
+  assert.equal(sqlOperationState({}), 'UNKNOWN');
+  assert.equal(sqlOperationState({ status: 'DONE', error: { errors: [{ code: 'A', message: 'b' }, { code: 'C', message: 'd' }] } }), 'FAILED A: b; C: d');
+  assert.equal(sqlOperationState({ status: 'DONE', error: {} }), 'FAILED no reason given');
+  assert.equal(sqlOperationSeconds({ insertTime: '2026-11-02T10:00:00.000Z', endTime: '2026-11-02T10:01:30.500Z' }), 90.5);
+  assert.equal(sqlOperationSeconds({ status: 'RUNNING' }), null);
 });
 
-test('a start\'s summary: the policy ALWAYS, then RUNNABLE', () => {
+// RUNNABLE is "running, or has been stopped by owner" (Google), so a stop reads it all along. SUSPENDED is for billing and the
+// like: read, it ends nothing.
+const sqlSample = (t, instance, operation) => ({ t, states: { instance, operation } });
+
+test('a stop\'s summary: the policy read as NEVER, then the operation\'s end, whatever the state', () => {
   const samples = [
-    { t: 1000, states: { db: 'SUSPENDED NEVER' } },
-    { t: 11_000, states: { db: 'SUSPENDED ALWAYS' } },
-    { t: 21_000, states: { db: 'RUNNABLE ALWAYS' } },
+    sqlSample(20_000, 'RUNNABLE NEVER', 'RUNNING'),
+    sqlSample(0, 'RUNNABLE ALWAYS', 'PENDING'),
+    sqlSample(10_000, 'SUSPENDED NEVER', 'RUNNING'),
+    sqlSample(30_000, 'RUNNABLE NEVER', 'DONE'),
+    sqlSample(40_000, 'RUNNABLE NEVER', 'DONE'),
   ];
-  assert.deepEqual(sqlSummary('start', { since: 500, name: 'db', samples }), { policy: 11_000, reached: 21_000 });
+  assert.deepEqual(sqlSummary('stop', samples), { policy: 10_000, ended: 30_000, failure: null });
+  assert.deepEqual(sqlSummary('stop', samples.slice(0, 3)), { policy: 10_000, ended: null, failure: null });
+  assert.deepEqual(sqlSummary('stop', []), { policy: null, ended: null, failure: null });
+});
+
+test('a start\'s summary: the policy ALWAYS, then the operation\'s end; a failed one says why', () => {
+  const samples = [sqlSample(1000, 'RUNNABLE NEVER', 'PENDING'), sqlSample(11_000, 'RUNNABLE ALWAYS', 'RUNNING'), sqlSample(21_000, 'RUNNABLE ALWAYS', 'DONE')];
+  assert.deepEqual(sqlSummary('start', samples), { policy: 11_000, ended: 21_000, failure: null });
+  samples[2].states.operation = 'FAILED A: b';
+  assert.deepEqual(sqlSummary('start', samples), { policy: 11_000, ended: 21_000, failure: 'A: b' });
 });
 
 test('a Deployment\'s state: STOPPED at 0 replicas, RUNNING when all are ready, else PENDING', () => {

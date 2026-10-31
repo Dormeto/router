@@ -441,40 +441,48 @@ async function runNeg(ctx) {
   }
 }
 
-// sql stop|start: the activation policy patched (NEVER | ALWAYS), then the instance's state and policy read every 10 s
-// until it is SUSPENDED (stop) or RUNNABLE (start) (M6).
+// sql stop|start: the activation policy patched (NEVER | ALWAYS), then the PATCH's operation followed until it is DONE: its
+// end is the time, as no state of the instance tells a stop (core.SQL_POLICY). Each sample, every 10 s, prints the instance's
+// state and policy and the operation's status (M6).
 export async function runSql(ctx) {
   const { options: o, action, request, log } = ctx;
   const url = `${SQLADMIN}/projects/${o.project}/instances/${o.instance}`;
-  const policy = action === 'stop' ? 'NEVER' : 'ALWAYS';
+  const policy = core.SQL_POLICY[action];
   const instance = await request('GET', url);
   log('instance', `${o.instance}: ${core.sqlState(instance)}, ${instance.databaseVersion ?? '?'} ${instance.settings?.tier ?? '?'}, ${instance.settings?.dataDiskType ?? '?'} ${instance.settings?.dataDiskSizeGb ?? '?'} GB`);
   if (instance.settings?.activationPolicy === policy) throw new CheckError(`${o.instance} has the activation policy ${policy} already: nothing to ${action}`);
-  const initial = { [o.instance]: core.sqlState(instance) };
-  const poller = startPoller(ctx, SQL_EVERY_MS, async () => ({ [o.instance]: core.sqlState(await request('GET', url)) }), reporter(ctx, 'state', initial));
-  let since = null;
-  let summary = { policy: null, reached: null };
+  const since = ctx.at();
+  log(action, `sent: activationPolicy ${policy}`);
+  const operation = await request('PATCH', url, { settings: { activationPolicy: policy } });
+  log('operation', `${operation.name ?? '?'} ${operation.operationType ?? '?'} ${operation.status ?? '?'}, ${core.delta(ctx.at() - since)} after the request`);
+  let followed = operation;
+  const poller = startPoller(ctx, SQL_EVERY_MS, async () => {
+    const [read, current] = await Promise.all([
+      request('GET', `${SQLADMIN}/projects/${o.project}/operations/${operation.name}`),
+      request('GET', url),
+    ]);
+    followed = read;
+    return { instance: core.sqlState(current), operation: core.sqlOperationState(read) };
+  }, (states, t) => log('state', `${o.instance} ${states.instance}, operation ${states.operation}`, t));
+  const deadline = ctx.at() + o.timeout * 1000;
   try {
-    since = ctx.at();
-    log(action, `sent: activationPolicy ${policy}`);
-    const operation = await request('PATCH', url, { settings: { activationPolicy: policy } });
-    log('operation', `${operation.operationType ?? '?'} ${operation.status ?? '?'}, ${core.delta(ctx.at() - since)} after the request`);
-    const deadline = ctx.at() + o.timeout * 1000;
     while (!ctx.interrupted() && ctx.at() < deadline) {
-      summary = core.sqlSummary(action, { since, name: o.instance, samples: poller.samples });
-      if (summary.reached !== null) break;
+      if (core.sqlSummary(action, poller.samples).ended !== null) break;
       await ctx.wait(1000);
     }
   } finally {
     await poller.stop();
   }
-  summary = core.sqlSummary(action, { since, name: o.instance, samples: poller.samples });
+  const summary = core.sqlSummary(action, poller.samples);
   const after = (t) => `${core.delta(t - since)} after the request`;
+  const seconds = core.sqlOperationSeconds(followed);
   printSummary(log, [
     ['policy', summary.policy, `${policy}, ${after(summary.policy)}`, `no: not read as ${policy}`],
-    ['reached', summary.reached, `${action === 'stop' ? 'SUSPENDED' : 'RUNNABLE'}, ${after(summary.reached)}`, `no: not within ${o.timeout} s`],
+    summary.failure
+      ? ['done', null, null, `no: ${summary.failure}`]
+      : ['done', summary.ended, `${after(summary.ended)}${seconds === null ? '' : `; Google: ${seconds} s from insertTime to endTime`}`, `no: not within ${o.timeout} s`],
   ]);
-  return summary.reached !== null ? 0 : 1;
+  return summary.ended !== null && !summary.failure ? 0 : 1;
 }
 
 // gke scale --replicas <n>: the cluster's DNS endpoint from the Container API, the Deployment's scale read and put

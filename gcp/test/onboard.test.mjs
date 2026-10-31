@@ -805,11 +805,11 @@ for (const [kind, world, lowest] of [['regional', regional, 160], ['classic', cl
   });
 
   test(`nap now of a ${kind} workload: its task asked, as a global one's`, async () => {
-    const { w, onboarding } = setup(world);
+    const { w, clock, onboarding } = setup(world);
     await onboarding.onboard(INPUT);
     w.changes.length = 0;
     await onboarding.nap('demo');
-    assert.deepEqual(w.tasks, [{ url: `${CONTROLLER}/v1/tasks`, body: { action: 'nap', workloadId: 'demo' } }]);
+    assert.deepEqual(w.tasks, [{ url: `${CONTROLLER}/v1/tasks`, body: { action: 'nap', workloadId: 'demo', requestedAt: clock.now() } }]);
     assert.deepEqual(w.changes, []);
   });
 
@@ -1134,11 +1134,11 @@ test('list: every workload by ID, none as an empty list', async () => {
 });
 
 test('nap now: asked of the queue, in a request of its own; asleep already: nothing to do; else a 409', async () => {
-  const { w, store, onboarding } = setup();
+  const { w, store, clock, onboarding } = setup();
   await onboarding.onboard(INPUT);
   w.changes.length = 0;
   assert.equal((await onboarding.nap('demo')).id, 'demo');
-  assert.deepEqual(w.tasks, [{ url: `${CONTROLLER}/v1/tasks`, body: { action: 'nap', workloadId: 'demo' } }]);
+  assert.deepEqual(w.tasks, [{ url: `${CONTROLLER}/v1/tasks`, body: { action: 'nap', workloadId: 'demo', requestedAt: clock.now() } }]);
   assert.deepEqual(w.changes, [], 'the nap takes minutes: not in the operator\'s request');
   w.tasks.length = 0;
   store.runs.get('demo').state = STATES.ASLEEP;

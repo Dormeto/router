@@ -599,6 +599,138 @@ for (const [kind, lb, base, waitSeconds, healthScope] of SWAPS) {
     assert.equal(t.logged('NapFailed').length, 1);
   });
 
+  // --- A nap's request that dies: visitors are at the waker until a check finds it. Stuck sooner while nothing is stopped. ---
+
+  const NAPPING_RUN = (age, more = {}) => ({ state: STATES.NAPPING, updatedAt: START - age, ...more });
+
+  test(`${kind} nap dead while swapped: stuck past 15 minutes, not 35, and the recovering wake unswaps`, async () => {
+    const at = swapSetup({ run: NAPPING_RUN(15 * MINUTE), map: swappedMap() });
+    assert.deepEqual(await at.controller.check(), [{ workloadId: 'demo', state: STATES.NAPPING }]);
+    assert.equal(at.logged('NapStuck').length, 0);
+
+    const t = swapSetup({ run: NAPPING_RUN(15 * MINUTE + 1), map: swappedMap() });
+    assert.equal((await t.controller.check())[0].state, STATES.FAILED);
+    assert.equal(t.logged('NapStuck').length, 1);
+    const failure = JSON.parse(t.run().failure);
+    assert.equal(failure.kind, 'timeout');
+    assert.equal(failure.step, 'nap');
+    assert.match(failure.message, /within 15 minutes/);
+    assert.equal(t.world.vms['vm-a'].status, 'RUNNING');
+
+    // The next check finds it healthy behind the swap: a wake finishes the job, in a request of its own.
+    assert.equal((await t.controller.check())[0].state, STATES.WAKING);
+    assert.deepEqual(t.world.tasks.at(-1).body, { action: 'wake', workloadId: 'demo', wakeId: 'wake-2' });
+    assert.equal((await t.controller.wake('demo', 'wake-2')).state, STATES.AWAKE);
+    assert.deepEqual(t.world.map, { ...awakeMap(), fingerprint: 'f1' });
+    assert.equal(t.world.vms['vm-a'].status, 'RUNNING');
+  });
+
+  test(`${kind} nap stopping: its VMs are going, 35 minutes as ever`, async () => {
+    const within = swapSetup({ run: NAPPING_RUN(35 * MINUTE, { stopping: true }), map: swappedMap() });
+    assert.deepEqual(await within.controller.check(), [{ workloadId: 'demo', state: STATES.NAPPING }]);
+    const past = swapSetup({ run: NAPPING_RUN(35 * MINUTE + 1, { stopping: true }), map: swappedMap() });
+    assert.equal((await past.controller.check())[0].state, STATES.FAILED);
+    assert.match(JSON.parse(past.run().failure).message, /within 35 minutes/);
+  });
+
+  test(`${kind} slow legal nap: a lost swap and each update at its budget stay under 15 minutes, no check calls it stuck, the VMs stop`, async () => {
+    // A map's update at its worst: the operation's 120 s and the pauses of a map busy with another (urlmaps.mjs).
+    const update = kind === 'classic' ? 180_000 : 240_000;
+    const t = swapSetup();
+    t.world.on.put = async () => t.clock.advance(update);
+    const seen = [];
+    let lost = false;
+    t.clock.onSleep(async () => {
+      if (!lost) t.world.map = awakeMap();
+      else if (!seen.length) seen.push(...(await t.controller.check()));
+      lost = true;
+    });
+    assert.equal((await t.controller.nap('demo')).state, STATES.ASLEEP);
+    assert.deepEqual(seen, [{ workloadId: 'demo', state: STATES.NAPPING }]);
+    assert.equal(t.logged('NapStuck').length, 0);
+    assert.equal(t.world.vms['vm-a'].status, 'TERMINATED');
+    assert.ok(t.clock.now() - START < 15 * MINUTE, `${t.clock.now() - START} ms`);
+  });
+
+  test(`${kind} nap found stuck during its wait: it writes nothing more, whatever the recovering wake did to the map`, async () => {
+    const t = swapSetup();
+    t.clock.onSleep(async () => {
+      if (t.run().state !== STATES.NAPPING) return;
+      t.clock.advance(15 * MINUTE + 1);
+      assert.equal((await t.controller.check())[0].state, STATES.FAILED);
+      t.world.map = awakeMap();
+    });
+    const out = await t.controller.nap('demo');
+    assert.deepEqual(out, { state: 'SUPERSEDED' });
+    assert.deepEqual(t.world.calls, [`state ${STATES.NAPPING}`, 'map swapped', WAIT, `state ${STATES.FAILED}`]);
+    assert.equal(isSwapped(t.world.map), false);
+    assert.equal(t.world.vms['vm-a'].status, 'RUNNING');
+    assert.equal(t.logged('NapSuperseded').length, 1);
+    assert.equal(t.logged('NapAborted').length, 0);
+  });
+
+  test(`${kind} nap found stuck during its first write: no wait, nothing more`, async () => {
+    const t = swapSetup();
+    t.world.on.put = async () => {
+      t.clock.advance(15 * MINUTE + 1);
+      await t.controller.check();
+    };
+    assert.deepEqual(await t.controller.nap('demo'), { state: 'SUPERSEDED' });
+    assert.deepEqual(t.world.sleeps, []);
+    assert.equal(t.world.puts, 1);
+  });
+
+  test(`${kind} nap found stuck just before its commit: no unswap of its own, the VMs left, the wake's to do`, async () => {
+    const t = swapSetup();
+    const { getPauses } = t.store;
+    let reads = 0;
+    t.store.getPauses = async (...args) => {
+      reads += 1;
+      if (reads === 2) {
+        t.clock.advance(15 * MINUTE + 1);
+        await t.controller.check();
+      }
+      return getPauses(...args);
+    };
+    assert.deepEqual(await t.controller.nap('demo'), { state: 'SUPERSEDED' });
+    assert.equal(reads, 2);
+    assert.equal(t.run().state, STATES.FAILED);
+    assert.equal(t.run().stopping, undefined);
+    assert.equal(t.world.vms['vm-a'].status, 'RUNNING');
+    assert.equal(t.world.puts, 1);
+    assert.equal(isSwapped(t.world.map), true);
+  });
+
+  test(`${kind} nap found stuck during its abort's wait: not called awake, no second word on it`, async () => {
+    const t = swapSetup();
+    let waits = 0;
+    t.clock.onSleep(async () => {
+      waits += 1;
+      if (waits === 1) await t.store.setPendingWake('demo');
+      if (waits === 2) {
+        t.clock.advance(15 * MINUTE + 1);
+        await t.controller.check();
+      }
+    });
+    assert.deepEqual(await t.controller.nap('demo'), { state: 'SUPERSEDED' });
+    assert.equal(t.run().state, STATES.FAILED);
+    assert.equal(t.logged('NapAborted').length, 0);
+  });
+
+  test(`${kind} a nap's task delivered late, the state changed: it writes nothing`, async () => {
+    for (const state of [STATES.FAILED, STATES.WAKING, STATES.ASLEEP]) {
+      const t = swapSetup({ run: { state, wakeId: 'w1', failedAt: START }, map: swappedMap() });
+      assert.equal((await t.controller.nap('demo')).state, 'SKIPPED', state);
+      assert.deepEqual(t.world.calls, [], state);
+    }
+    // Woken again since the task was asked for: it was idle then, it says nothing of now.
+    const t = swapSetup({ run: { state: STATES.AWAKE, awakeSince: START - MINUTE } });
+    const out = await t.controller.nap('demo', { requestedAt: START - 30 * MINUTE });
+    assert.deepEqual(out, { state: 'SKIPPED', reason: 'woken since it was requested' });
+    assert.deepEqual(t.world.calls, []);
+    assert.equal(t.run().state, STATES.AWAKE);
+  });
+
   // --- Its wake ---
 
   test(`${kind} wake: started, healthy, unswapped, SWAP_WAIT, AWAKE with it in its duration; the map as before the nap`, async () => {
@@ -1273,7 +1405,7 @@ test('idle: the check enqueues the nap and never waits for it', async () => {
   const t = setup({ run: AWAKE_LONG, vms: { 'vm-a': { status: 'RUNNING' } } });
   const out = await t.controller.check();
   assert.deepEqual(out, [{ workloadId: 'demo', state: STATES.AWAKE, nap: 'requested' }]);
-  assert.deepEqual(t.world.tasks, [{ url: `${CONTROLLER}/v1/tasks`, body: { action: 'nap', workloadId: 'demo' } }]);
+  assert.deepEqual(t.world.tasks, [{ url: `${CONTROLLER}/v1/tasks`, body: { action: 'nap', workloadId: 'demo', requestedAt: t.clock.now() } }]);
   assert.deepEqual(t.world.sleeps, []);
   assert.deepEqual(t.world.calls, []);
   assert.deepEqual(t.world.metricReads, [{ backendService: 'app', from: START - 15 * MINUTE - 180_000, to: START }]);
@@ -1496,6 +1628,35 @@ test('stuck napping: FAILED with the kind timeout, past 35 minutes only', async 
   const late = setup({ run: { state: STATES.NAPPING, updatedAt: START - 36 * MINUTE, stopping: true }, vms: { 'vm-a': { status: 'RUNNING' } } });
   await late.controller.check();
   assert.equal(late.run().state, STATES.FAILED);
+});
+
+test('a policy\'s nap keeps 35 minutes, stopping or not: nothing sends visitors elsewhere while it runs', async () => {
+  const within = setup({ run: { state: STATES.NAPPING, updatedAt: START - 35 * MINUTE }, vms: { 'vm-a': { status: 'RUNNING' } }, map: asleepMap() });
+  assert.deepEqual(await within.controller.check(), [{ workloadId: 'demo', state: STATES.NAPPING }]);
+  assert.equal(within.logged('NapStuck').length, 0);
+  const past = setup({ run: { state: STATES.NAPPING, updatedAt: START - 35 * MINUTE - 1 }, vms: { 'vm-a': { status: 'RUNNING' } }, map: asleepMap() });
+  assert.equal((await past.controller.check())[0].state, STATES.FAILED);
+  assert.match(JSON.parse(past.run().failure).message, /within 35 minutes/);
+});
+
+test('a policy\'s nap whose run moved on during its wait: it stops there, its policy left as the new state wants it', async () => {
+  const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
+  t.clock.onSleep(() => { t.run().state = STATES.FAILED; });
+  assert.deepEqual(await t.controller.nap('demo'), { state: 'SUPERSEDED' });
+  assert.equal(hasPolicy(t.world.map), true);
+  assert.equal(t.world.vms['vm-a'].status, 'RUNNING');
+  assert.equal(t.logged('NapAborted').length, 0);
+});
+
+test('an idle nap\'s and an operator\'s task say when they were asked for, so a late delivery can tell', async () => {
+  const idle = setup({ vms: { 'vm-a': { status: 'RUNNING' } }, run: { state: STATES.AWAKE, awakeSince: START - DAY } });
+  await idle.controller.check();
+  assert.deepEqual(idle.world.tasks.map((task) => task.body), [{ action: 'nap', workloadId: 'demo', requestedAt: START }]);
+  const operator = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
+  await operator.controller.napNow('demo');
+  assert.deepEqual(operator.world.tasks.map((task) => task.body), [{ action: 'nap', workloadId: 'demo', requestedAt: START }]);
+  // Delivered in time, it naps.
+  assert.equal((await operator.controller.nap('demo', { requestedAt: START })).state, STATES.ASLEEP);
 });
 
 const FAILED_RUN = (failedAt) => ({
@@ -1749,7 +1910,7 @@ test('a schedule the router cannot read: logged, the workload as with none', asy
   const out = await check(t);
   assert.equal(t.logged('ScheduleSkipped').length, 1);
   assert.equal(out.nap, 'requested');
-  assert.deepEqual(t.world.tasks.map((task) => task.body), [{ action: 'nap', workloadId: 'demo' }]);
+  assert.deepEqual(t.world.tasks.map((task) => task.body), [{ action: 'nap', workloadId: 'demo', requestedAt: t.clock.now() }]);
 });
 
 // Twelve workloads on the same URL map, their VMs read through the world.
@@ -1859,7 +2020,7 @@ test('a pause after the task was accepted: the task refused and the occurrence c
 
   t.world.requests = 0;
   assert.equal((await check(t)).nap, 'requested');
-  assert.deepEqual(t.world.tasks.at(-1).body, { action: 'nap', workloadId: 'demo' });
+  assert.deepEqual(t.world.tasks.at(-1).body, { action: 'nap', workloadId: 'demo', requestedAt: t.clock.now() });
 });
 
 test('an awake window\'s wake with its task refused: failed, the occurrence unrecorded, the next check wakes it', async () => {

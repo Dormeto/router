@@ -43,6 +43,14 @@ const STOP_ROOM_MS = 200_000;
 const METRIC_DELAY_MS = 180_000;
 const WAKING_STUCK_GRACE_MS = 60_000;
 const NAPPING_STUCK_MS = 35 * 60_000;
+// Under a swap, while no VM has been asked to go: visitors are at the waker, so a nap whose request died is a full outage until a
+// check finds it. Its size, a legal nap's way to its commit with one lost swap and each write at its worst (urlmaps.mjs: the
+// operation's 120 s and the pauses of a map busy with another, 60 s on a global map, 120 s on a regional one, so 180 s, not 120 s,
+// on classic): classic 2 x 250 s + 2 x 180 s = 860 s, regional 2 x 100 s + 2 x 240 s = 680 s, and the seconds of its reads. 15
+// minutes holds both, classic by 40 s; the usual nap takes about 5 minutes. Past it, what is called stuck is a nap that lost its swap
+// twice or was given up after one loss (up to 430 s more on classic): nothing is stopped, the commit and the abort are conditional
+// on NAPPING, and the check's wake finishes the job.
+const NAPPING_SWAP_STUCK_MS = 15 * 60_000;
 const CHECK_BUDGET_MS = 240_000;
 const CHECK_CONCURRENCY = 8;
 const SUSPEND_MAX_MEMORY_MB = 208 * 1024;
@@ -439,18 +447,23 @@ export function createController({ store, compute, urlmaps, regionalUrlmaps, mon
 
   // --- The nap -------------------------------------------------------------------------------------------------------
 
+  const isNapping = async (workloadId) => (await store.getRun(workloadId))?.state === STATES.NAPPING;
+
   // Written, then still there after a whole wait: a check's repair or a customer's apply may have removed it meanwhile,
-  // and the VMs must not go with no way to wake. False when it was lost with no room left for another wait: for the stop, and
-  // under a swap for the wait of a nap given up after that one.
+  // and the VMs must not go with no way to wake. 'held'; 'lost' when it was lost with no room left for another wait: for the stop,
+  // and under a swap for the wait of a nap given up after that one; 'superseded' when the run moved on (a nap called stuck, whose
+  // wake may be unswapping): read around each wait, as a write now would fight that wake.
   async function asleepHeld(cfg, sw, latest) {
     const room = sw.waitMs + STOP_ROOM_MS + (sw.kind === 'swap' ? sw.waitMs : 0);
     await writeOnlyAsleep(cfg);
     for (;;) {
+      if (!(await isNapping(cfg.workloadId))) return 'superseded';
       await sleep(sw.waitMs);
+      if (!(await isNapping(cfg.workloadId))) return 'superseded';
       const { paths } = await writeOnlyAsleep(cfg);
-      if (!paths.length) return true;
+      if (!paths.length) return 'held';
       log.warn(sw.kind === 'swap' ? 'SwapLost' : 'PolicyLost', { workloadId: cfg.workloadId, paths });
-      if (now() + room > latest) return false;
+      if (now() + room > latest) return 'lost';
     }
   }
 
@@ -488,12 +501,13 @@ export function createController({ store, compute, urlmaps, regionalUrlmaps, mon
     return found.length ? found.join('; ') : null;
   }
 
-  // Why a nap's task no longer holds, else null: a pause written since it was asked for; for a nap window's (`until`, its
-  // end), a task delivered late or twice, a window ended or the workload woken since.
+  // Why a nap's task no longer holds, else null: a pause written since it was asked for; a task delivered late or twice with the
+  // workload woken since it was asked for (`requestedAt`: it was idle then, it says nothing of now), or a nap window ended (`until`,
+  // its end).
   async function napRefusal(workloadId, requestedAt, until) {
     if (await isPaused(workloadId)) return 'paused';
-    if (until === undefined) return null;
-    if (now() >= until) return 'the nap window ended';
+    if (until !== undefined && now() >= until) return 'the nap window ended';
+    if (requestedAt === undefined) return null;
     return ((await store.getRun(workloadId))?.awakeSince ?? 0) > requestedAt ? 'woken since it was requested' : null;
   }
 
@@ -509,53 +523,52 @@ export function createController({ store, compute, urlmaps, regionalUrlmaps, mon
     const napping = await transition(workloadId, { cond: { state: STATES.AWAKE }, set: { state: STATES.NAPPING }, remove: ['pendingWake'], cause });
     if (!napping) return { state: 'SKIPPED' };
     log.info('NapStarted', { workloadId });
+    // The run moved on while this request held it (a nap called stuck, a forced offboarding): the map and the state are another's.
+    const superseded = () => {
+      log.warn('NapSuperseded', { workloadId });
+      return { state: 'SUPERSEDED' };
+    };
     // Nothing is stopped yet, the application keeps serving. Under a swap, visitors are at the waker until the application's back
     // has spread: unswapped and waited for before AWAKE, a wake asked meanwhile being part of it; nothing to unswap, no wait. The
     // policy's removal follows it.
-    const giveUp = async (cause, level, fields = {}) => {
+    const giveUp = async (cause, level, { reason, error } = {}) => {
+      if (!(await isNapping(workloadId))) return superseded();
       if (sw.kind === 'swap') {
         const { paths } = await writeAwake(cfg);
         if (paths.length) await sleep(sw.waitMs);
       }
-      await transition(workloadId, {
+      const awake = await transition(workloadId, {
         cond: { state: STATES.NAPPING }, set: { state: STATES.AWAKE, awakeSince: now() }, remove: ['pendingWake', 'stopping'], cause,
       });
-      log[level]('NapAborted', { workloadId, ...fields });
+      if (!awake) return superseded();
+      log[level]('NapAborted', { workloadId, ...(reason ? { reason } : {}) });
       if (sw.kind === 'policy') await removePolicy(cfg);
+      return { state: STATES.AWAKE, aborted: true, ...(error ? { error } : {}) };
     };
     let slept;
     try {
       // Before the first write as well as after the wait: under a swap an abort after it would hold visitors at the waker for two
       // waits, at each idle period until an offboarding.
       const changedBefore = await negsChanged(cfg);
-      if (changedBefore) {
-        await giveUp('backends-changed', 'warn', { reason: changedBefore });
-        return { state: STATES.AWAKE, aborted: true, error: changedBefore };
-      }
+      if (changedBefore) return await giveUp('backends-changed', 'warn', { reason: changedBefore, error: changedBefore });
       try {
-        if (!(await asleepHeld(cfg, sw, latest))) {
-          await giveUp(`${sw.kind}-lost`, 'warn', { reason: `the ${sw.kind} was lost, no time left to wait for it again` });
-          return { state: STATES.AWAKE, aborted: true };
-        }
+        const held = await asleepHeld(cfg, sw, latest);
+        if (held === 'superseded') return superseded();
+        if (held === 'lost') return await giveUp(`${sw.kind}-lost`, 'warn', { reason: `the ${sw.kind} was lost, no time left to wait for it again` });
       } catch (err) {
         // A customer's own policy, or a service moved or named elsewhere, since the onboarding: nothing is stopped yet, the
         // application keeps serving.
         if (!(err instanceof UrlMapRefused)) throw err;
-        await giveUp('switch-failed', 'warn', { reason: err.message });
-        return { state: STATES.AWAKE, aborted: true, error: err.message };
+        return await giveUp('switch-failed', 'warn', { reason: err.message, error: err.message });
       }
       const changed = await negsChanged(cfg);
-      if (changed) {
-        await giveUp('backends-changed', 'warn', { reason: changed });
-        return { state: STATES.AWAKE, aborted: true, error: changed };
-      }
+      if (changed) return await giveUp('backends-changed', 'warn', { reason: changed, error: changed });
       const autoscalers = await autoscalersToRecord(cfg, napping);
       // Commit point: after this transition the VMs go, even if a request arrives. The modes are on the run before any
       // autoscaler is turned off. A pause written since the nap started aborts it, like a request.
       const paused = await isPaused(workloadId);
       if (paused || !(await transition(workloadId, { cond: { state: STATES.NAPPING, pendingWake: false }, set: { stopping: true, autoscalers } }))) {
-        await giveUp(paused ? 'paused' : 'pending-wake', 'info', paused ? { reason: 'paused' } : {});
-        return { state: STATES.AWAKE, aborted: true };
+        return await giveUp(paused ? 'paused' : 'pending-wake', 'info', paused ? { reason: 'paused' } : {});
       }
       slept = await putToSleep(cfg, autoscalers, latest);
     } catch (err) {
@@ -599,7 +612,7 @@ export function createController({ store, compute, urlmaps, regionalUrlmaps, mon
   }
 
   // The operator's nap, in a request of its own: it takes minutes.
-  const napNow = (workloadId) => enqueue({ action: 'nap', workloadId });
+  const napNow = (workloadId) => enqueue({ action: 'nap', workloadId, requestedAt: now() });
 
   // A failed workload whose backends run for nothing is stopped like a nap and left asleep behind the switch, its failure
   // kept (requests wake it again, backed off). The switch is there since its nap, unless the nap failed before writing it.
@@ -913,10 +926,11 @@ export function createController({ store, compute, urlmaps, regionalUrlmaps, mon
     let run = await store.getRun(workloadId);
     if (!run) return { state: 'UNKNOWN' };
     if (run.state === STATES.NAPPING) {
-      const before = now() - NAPPING_STUCK_MS;
+      const stuckMs = switchFor(cfg).kind === 'swap' && !run.stopping ? NAPPING_SWAP_STUCK_MS : NAPPING_STUCK_MS;
+      const before = now() - stuckMs;
       if ((run.updatedAt ?? 0) >= before) return { state: run.state };
       log.warn('NapStuck', { workloadId });
-      const message = `the nap did not finish within ${NAPPING_STUCK_MS / 60_000} minutes (its request stopped)`;
+      const message = `the nap did not finish within ${stuckMs / 60_000} minutes (its request stopped)`;
       return { state: (await failStuck(workloadId, { state: STATES.NAPPING, olderThan: { field: 'updatedAt', ms: before } }, 'nap', message, 'nap-stuck'))?.state };
     }
     if (run.state === STATES.WAKING) {
@@ -947,7 +961,7 @@ export function createController({ store, compute, urlmaps, regionalUrlmaps, mon
     const from = t - idleMs - METRIC_DELAY_MS;
     if ((run.awakeSince ?? 0) > from) return { state: run.state };
     if ((await monitoring.requestCount({ backendService: cfg.backendService, ...(cfg.lb ? { lb: cfg.lb } : {}), from, to: t })) > 0) return { state: run.state };
-    await enqueue({ action: 'nap', workloadId });
+    await enqueue({ action: 'nap', workloadId, requestedAt: t });
     log.info('NapRequested', { workloadId });
     return { state: run.state, nap: 'requested' };
   }

@@ -168,7 +168,7 @@ test('DELETE /v1/workloads/:id?force=true: without the wake, what was left down 
 });
 
 test('POST /v1/workloads/:id/nap and /wake: the Workload; unknown: 404; busy: 409', async () => {
-  const { call, w, store } = api();
+  const { call, w, store, clock } = api();
   for (const verb of ['nap', 'wake']) {
     assert.equal((await call('POST', `/v1/workloads/demo/${verb}`)).status, 404);
     assert.equal((await call('POST', `/v1/workloads/Bad_ID/${verb}`)).status, 400);
@@ -177,7 +177,7 @@ test('POST /v1/workloads/:id/nap and /wake: the Workload; unknown: 404; busy: 40
   const nap = await call('POST', '/v1/workloads/demo/nap');
   assert.equal(nap.status, 200);
   assert.equal(nap.body.id, 'demo');
-  assert.deepEqual(w.tasks.at(-1).body, { action: 'nap', workloadId: 'demo' });
+  assert.deepEqual(w.tasks.at(-1).body, { action: 'nap', workloadId: 'demo', requestedAt: clock.now() });
   store.runs.get('demo').state = STATES.ASLEEP;
   const wake = await call('POST', '/v1/workloads/demo/wake');
   assert.equal(wake.status, 200);

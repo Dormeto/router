@@ -12,7 +12,7 @@
 // Cloud SQL companions (section 9): named at the onboarding, `{ kind: 'cloudsql', name }` among the backends, never without an
 // application. The router reads them at the project; the tag its update needs is the CLI's, bound before this.
 //
-// GKE pods (section 8): `gke` in the request, a `k8s` backend. The dry run reads Google only, as it comes before any right in the cluster (review focus 4): it answers the
+// GKE pods (section 8): `gke` in the request, a `k8s` backend. The dry run reads Google only, as it comes before any right in the cluster: it answers the
 // namespace and the Service its NEGs name, which the CLI reads the owner of and applies the Role in. The onboarding then checks each right and reads the owner.
 import { nextEvents, normalizeSchedule, scheduleProblems } from '../../lambda/src/lib/schedule.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
@@ -583,7 +583,9 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     })));
     await removeFromGoogle(cfg);
     await store.deleteWorkload(workloadId);
-    log.warn('Offboarded', { workloadId, force: true, left: left.map(backendText) });
+    // An owner left at 0: what it ran goes with the run, its record.
+    const replicasBefore = (run?.owners ?? []).map((record) => ({ owner: ownerText(record), replicas: record.replicas }));
+    log.warn('Offboarded', { workloadId, force: true, left: left.map(backendText), ...(replicasBefore.length ? { replicasBefore } : {}) });
     return { id: workloadId, left };
   }
 

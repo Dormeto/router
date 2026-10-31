@@ -1,7 +1,7 @@
 // The router's one door to Google Cloud's REST APIs: the access token of the service account the Cloud Run service
 // runs as (from the metadata server, cached until 60 s before it expires), JSON in and out, errors with the code, the
 // status and the reason, and Compute Engine operations waited through their `wait` method. `token()` is the access
-// token itself, for gcp/tools/probe.mjs.
+// token itself, for what is not a Google API: a GKE cluster's (gke.mjs), and gcp/tools/probe.mjs.
 const TOKEN_URL = 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token';
 const TOKEN_MARGIN_MS = 60_000;
 // `wait` returns when the operation is done or after about 2 minutes.

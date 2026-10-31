@@ -149,7 +149,7 @@ test('a redirect is an answer, never followed: the token stays where it was sent
 });
 
 test('M12: a NEG names its Service in its description, or in its annotations', () => {
-  const asked = { namespace: 'shop', service: 'web' };
+  const asked = { namespace: 'shop', service: 'web', clusterUid: 'c0ffee' };
   assert.deepEqual(negServiceOf(NEG_READINGS.description('shop', 'web')), asked);
   assert.deepEqual(negServiceOf(NEG_READINGS.annotations('shop', 'web')), asked);
 });
@@ -197,4 +197,31 @@ for (const [name, gke, words] of [
   ['an owner with a path', { ...FULL, owner: { kind: 'Deployment', name: 'a/../b' } }, /gke\.owner\.name/],
 ]) {
   test(`the request's gke: ${name} is a problem`, () => assert.match(gkeProblems(gke).join('; '), words));
+}
+
+test('M12: a NEG names its cluster as `cluster-uid`, where it says so', () => {
+  assert.equal(negServiceOf(NEG_READINGS.description('shop', 'web')).clusterUid, 'c0ffee');
+  assert.equal(negServiceOf(NEG_READINGS.annotations('shop', 'web')).clusterUid, 'c0ffee');
+  assert.equal('clusterUid' in negServiceOf({ description: '{"namespace":"shop","service-name":"web"}' }), false);
+});
+
+for (const [name, answer] of [
+  ['no answer', () => { throw new TypeError('fetch failed'); }],
+  ['a 401', () => new Response('{}', { status: 401 })],
+]) {
+  test(`M11: after ${name} the cluster's view is read again: one recreated under its name has a new endpoint`, async () => {
+    const t = rig({ answer });
+    await assert.rejects((await t.gke.kubernetesOf(CLUSTER)).get('/a'));
+    await t.gke.kubernetesOf(CLUSTER);
+    assert.equal(t.reads.length, 2);
+  });
+}
+
+for (const status of [200, 403, 404, 500]) {
+  test(`M11: after a ${status} the cluster's view is kept: the endpoint answered`, async () => {
+    const t = rig({ answer: () => new Response('{}', { status }) });
+    await (await t.gke.kubernetesOf(CLUSTER)).get('/a').catch(() => {});
+    await t.gke.kubernetesOf(CLUSTER);
+    assert.equal(t.reads.length, 1);
+  });
 }

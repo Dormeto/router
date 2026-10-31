@@ -126,7 +126,7 @@ export class PauseRefused extends Error {
 }
 
 export function createController({ store, compute, cloudsql, gke, urlmaps, regionalUrlmaps, monitoring, tasks, config, lists = [], download, now = Date.now, sleep, newId = randomUUID, log }) {
-  const pods = { compute, kubernetesOf: (cluster) => gke.kubernetesOf(cluster) };
+  const clients = { compute, kubernetesOf: (cluster) => gke.kubernetesOf(cluster) };
   const enqueue = (body) => tasks.enqueue({ url: `${config.controllerUrl}/v1/tasks`, body });
 
   async function transition(workloadId, change) {
@@ -186,7 +186,7 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
 
   // A backend's VMs: `{ name, zone, status, url?, error? }`, a managed group's with its URL and its last failure.
   async function vmsOf(backend) {
-    if (isPods(backend)) return [await ownerAsVm(pods, backend)];
+    if (isPods(backend)) return [await ownerAsVm(clients, backend)];
     if (backend.kind !== 'mig') {
       return [{ name: backend.name, zone: backend.location, status: (await compute.getInstance(backend.location, backend.name)).status }];
     }
@@ -227,7 +227,7 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
   // after 60 days Compute Engine turns a suspended VM into a stopped one. An owner is read live too.
   async function wakeBackend(backend, deadline, run) {
     if (isPods(backend)) {
-      await wakeOwner(pods, backend, recordOf(run.owners, backend));
+      await wakeOwner(clients, backend, recordOf(run.owners, backend));
       return;
     }
     for (;;) {
@@ -245,7 +245,7 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
   // KEDA is an owner's autoscaler: its pause goes back with the modes, under their rules.
   const giveBackAutoscalers = async (run) => {
     await each(run.autoscalers ?? [], (recorded) => setAutoscaler(recorded, recorded.mode));
-    await each(run.owners ?? [], (record) => giveBackOwner(pods, record));
+    await each(run.owners ?? [], (record) => giveBackOwner(clients, record));
   };
 
   // The autoscalers get their modes back whatever a VM's start says.
@@ -292,7 +292,7 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
 
   async function sleepBackend(backend, hibernate, deadline, owners) {
     if (isPods(backend)) {
-      await sleepOwner(pods, backend, recordOf(owners, backend), { now, sleep, deadline });
+      await sleepOwner(clients, backend, recordOf(owners, backend), { now, sleep, deadline });
       return { stopped: [ownerText(backend)], suspended: [] };
     }
     // Only what runs: Google refuses a request naming a VM being created or started, and the whole nap with it.
@@ -330,7 +330,7 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
   }
 
   // What a nap writes on the run of its k8s backends, read now.
-  const ownersToRecord = (cfg, run) => each(cfg.backends.filter(isPods), (backend) => ownerRecord(pods, backend, recordOf(run.owners, backend)));
+  const ownersToRecord = (cfg, run) => each(cfg.backends.filter(isPods), (backend) => ownerRecord(clients, backend, recordOf(run.owners, backend)));
 
   // Down when this returns, the companions asked to go: an operation's end says little (a managed group's VMs go after it, and its
   // wait may run out before), so the VMs are read until they are. `stillGoing()`: whether the run is still the nap's or the release's:
@@ -413,7 +413,7 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
         givenBack = await gaveBackAutoscalers(workloadId, run);
       }
       // A pod that will not run ends the wake when its events say so; one the scheduler cannot place waits for the deadline (the shared code).
-      const watch = createWakeWatch(pods, primariesOf(cfg).filter(isPods).map(watchRecord), { since, now });
+      const watch = createWakeWatch(clients, primariesOf(cfg).filter(isPods).map(watchRecord), { since, now });
       while ((await healthyCount(cfg)) < 1) {
         const seen = await watch.check();
         if (seen) throw seen;
@@ -560,7 +560,7 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
       ];
       return `network endpoint group ${neg.name} changed since the onboarding (${parts.join('; ')}): offboard and onboard again`;
     });
-    const ownerChanges = await each(cfg.backends.filter(isPods), (backend) => ownerChanged(pods, backend, () => readService(cfg)));
+    const ownerChanges = await each(cfg.backends.filter(isPods), (backend) => ownerChanged(clients, backend, () => readService(cfg)));
     const found = [...changes, ...ownerChanges].filter(Boolean);
     return found.length ? found.join('; ') : null;
   }

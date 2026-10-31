@@ -3262,7 +3262,7 @@ test('an endpoint appearing during the nap\'s wait: back awake, the policy remov
   assert.equal(t.w.urlMaps.lb.pathMatchers[0].defaultCustomErrorResponsePolicy, undefined);
 });
 
-test('ruling 16: an owner\'s endpoints legitimately change: new pods, scaled up since the onboarding, are no change', async () => {
+test('an owner\'s endpoints legitimately change: new pods, scaled up since the onboarding, are no change', async () => {
   const t = await withPods();
   t.w.kube.owners[OWNER].replicas = 7;
   assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
@@ -3276,7 +3276,7 @@ for (const [name, change, words] of [
   ['every NEG taken out', (w) => { w.services.app.backends = []; }, /no longer has a network endpoint group/],
   ['the backend service deleted', (w) => { delete w.services.app; }, /its backend service no longer exists/],
 ]) {
-  test(`ruling 16: ${name} aborts a nap, before anything is written: it acts only on what still is the workload`, async () => {
+  test(`${name} aborts a nap, before anything is written: it acts only on what still is the workload`, async () => {
     const t = await withPods();
     change(t.w);
     const out = await t.core.nap('demo');
@@ -3522,7 +3522,7 @@ for (const [name, world, waits] of [
   });
 }
 
-test('review focus 4: a nap, a wake and a check call nothing outside the namespace, and no node', async () => {
+test('a nap, a wake and a check call nothing outside the namespace, and no node', async () => {
   const t = await asleepPods(withScaler());
   await wakePods(t);
   t.clock.advance(3_600_000);

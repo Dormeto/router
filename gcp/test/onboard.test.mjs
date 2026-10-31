@@ -1481,7 +1481,7 @@ test('offboard of a sleeping workload: the database up, then the application, th
 const kubeCalls = (w) => w.kube.calls;
 const ALL_READINGS = ['description', 'annotations'];
 
-test('review focus 4: the dry run makes no Kubernetes call, and needs no right in the cluster', async () => {
+test('the dry run makes no Kubernetes call, and needs no right in the cluster', async () => {
   const { w, onboarding } = setup((world) => {
     onGke(world);
     // Any call throws, were one made.
@@ -1816,4 +1816,32 @@ test('an empty NEG and an owner at 0 is onboarded: nothing ready to compare', as
   });
   await onboarding.onboard(GKE_INPUT);
   assert.equal(store.configs.size, 1);
+});
+
+test('NEGs of one Service naming two clusters are refused: a workload is one cluster\'s', async () => {
+  const change = (w) => {
+    onGke(w);
+    w.negs.second = { gkeOwner: OWNER, zone: 'europe-west1-c', description: JSON.stringify({ 'cluster-uid': 'deadbeef', namespace: 'shop', 'service-name': 'web', port: '80' }) };
+    w.services.app.backends.push({ group: `${V1}/zones/europe-west1-c/networkEndpointGroups/second` });
+  };
+  const words = /the network endpoint groups of backend service app name different clusters \(c0ffee, deadbeef\)/;
+  const { onboarding } = setup(change);
+  assert.match((await onboarding.dryRun(GKE_DRY)).reasons.join(), words);
+  await assert.rejects(setup(change).onboarding.onboard(GKE_INPUT), refused(400, 'not-eligible', words));
+});
+
+test('a NEG with no cluster-uid next to one that has it: nothing to compare, accepted', async () => {
+  const { onboarding } = setup((w) => {
+    onGke(w);
+    w.negs.second = { gkeOwner: OWNER, zone: 'europe-west1-c', annotations: { 'cluster-name': 'c', namespace: 'shop', 'service-name': 'web' } };
+    w.services.app.backends.push({ group: `${V1}/zones/europe-west1-c/networkEndpointGroups/second` });
+  });
+  assert.deepEqual((await onboarding.dryRun(GKE_DRY)).reasons, []);
+});
+
+test('a forced offboarding of an asleep owner logs the replicas it had: its record goes with the run', async () => {
+  const t = await awakePods();
+  assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
+  await t.onboarding.offboard('demo', { force: true });
+  assert.deepEqual(t.w.logs.find((l) => l.event === 'Offboarded').replicasBefore, [{ owner: 'Deployment shop/web', replicas: 2 }]);
 });

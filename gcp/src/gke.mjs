@@ -94,10 +94,13 @@ export function gkeMapRefusal(name) {
 // M12: a NEG that GKE made, its endpoints being pods.
 export const isGkeNeg = ({ name, description, annotations }) => name.startsWith(GKE_NEG_PREFIX) || GKE_NEG_FIELD.test(description ?? '') || Object.keys(annotations ?? {}).some((key) => GKE_NEG_FIELD.test(key));
 
-// M12: the Service a NEG belongs to, `{ namespace, service }`, else null: its description, JSON with `cluster-uid`, `namespace`, `service-name` and `port`,
-// or the same in its annotations. A wrong guess would scale someone else's pods: what does not read so is null, and refused.
+// M12: the Service a NEG belongs to, `{ namespace, service, clusterUid? }`, else null: its description, JSON with `cluster-uid`, `namespace`, `service-name` and `port`,
+// or the same in its annotations. A wrong guess would scale someone else's pods: what does not read so is null, and refused. `clusterUid` says only that two NEGs differ:
+// whether it can be tied to what clusters.get answers is M12's.
 export function negServiceOf({ description, annotations }) {
-  const read = (fields) => (isName(fields?.namespace) && isName(fields?.['service-name']) ? { namespace: fields.namespace, service: fields['service-name'] } : null);
+  const read = (fields) => (isName(fields?.namespace) && isName(fields?.['service-name'])
+    ? { namespace: fields.namespace, service: fields['service-name'], ...(typeof fields['cluster-uid'] === 'string' ? { clusterUid: fields['cluster-uid'] } : {}) }
+    : null);
   let described = null;
   try {
     described = JSON.parse(description ?? '');
@@ -149,6 +152,8 @@ export async function negsOfService(compute, { name: service, backends = [] }, a
   const reasons = found.flatMap((f) => (f.reason ? [f.reason] : []));
   const services = [...new Set(found.filter((f) => f.named).map((f) => serviceText(f.named)))];
   if (services.length > 1) reasons.push(`the network endpoint groups of backend service ${service} belong to different Services (${services.join(', ')}): a workload is one Service`);
+  const clusters = [...new Set(found.flatMap((f) => (f.named?.clusterUid ? [f.named.clusterUid] : [])))];
+  if (clusters.length > 1) reasons.push(`the network endpoint groups of backend service ${service} name different clusters (${clusters.join(', ')}): a workload is one cluster's`);
   return { reasons, negs: found.flatMap((f) => (f.neg ? [f.neg] : [])), named: services.length === 1 ? found.find((f) => f.named).named : null };
 }
 
@@ -181,7 +186,7 @@ async function endpointsProblem(compute, k8s, backend, object, negs) {
   return `its network endpoint groups hold no endpoint, and ${ownerText(backend)} has ready pods, not shown to be behind this load balancer: nothing is scaled`;
 }
 
-// A nap acts only on what still is the workload (the plan's ruling 16): the service's NEGs read again, each still of its Service, and their endpoints against the
+// A nap acts only on what still is the workload: the service's NEGs read again, each still of its Service, and their endpoints against the
 // owner's pods, which legitimately change. Why not, else null. An owner gone throws: the nap fails. readService() throwing a 404 is a change too.
 export async function ownerChanged({ compute, kubernetesOf }, backend, readService) {
   const service = await readService().catch((err) => {
@@ -260,16 +265,19 @@ export async function giveBackOwner({ kubernetesOf }, record) {
 export const podsUnhealthy = (backend, watch) => failureError('unhealthy', `no pod of ${ownerText(backend)} healthy when the wake timed out${watch.capacity ? `: ${watch.capacity.message}` : ''}`);
 
 // M11: a Transport (lambda/src/lib/k8s.mjs) over `fetch`: HTTPS with the public CAs, as the DNS endpoint has them, with the token as of each call. A redirect is an
-// answer, not followed: the token would go with it. No answer is a failure of kind `timeout` (spec section 12), where EKS's reads `cluster`.
-function transportOf(endpoint, { token, fetch }) {
+// answer, not followed: the token would go with it. No answer is a failure of kind `timeout` (spec section 12), where EKS's reads `cluster`. After no answer or a 401,
+// `forget()`: a cluster recreated under its name has a new endpoint.
+function transportOf(endpoint, { token, fetch, forget }) {
   return async ({ method, path, query = {}, headers, body }) => {
     const url = new URL(path, `https://${endpoint}`);
     for (const [name, value] of Object.entries(query)) url.searchParams.set(name, value);
     const authorization = `Bearer ${await token()}`;
     try {
       const res = await fetch(url.href, { method, headers: { ...headers, authorization }, body, redirect: 'manual', signal: AbortSignal.timeout(REQUEST_MS) });
+      if (res.status === 401) forget();
       return { status: res.status, contentType: res.headers.get('content-type'), body: await res.text() };
     } catch (err) {
+      forget();
       throw Object.assign(new KubernetesError(0, err?.code ?? err?.name ?? 'Network', `${method} ${url.pathname}: the GKE cluster's DNS endpoint did not answer: ${err?.message ?? err}`), { kind: 'timeout' });
     }
   };
@@ -300,7 +308,7 @@ export function createGke({ google, project, fetch = globalThis.fetch, now = Dat
       const view = await viewOf(cluster);
       const problem = clusterProblem(cluster, view);
       if (problem) throw failureError('configuration', problem);
-      return createKubernetes({ transport: transportOf(view.endpoint, { token: google.token, fetch }) });
+      return createKubernetes({ transport: transportOf(view.endpoint, { token: google.token, fetch, forget: () => kept.delete(clusterText(cluster)) }) });
     },
   };
 }

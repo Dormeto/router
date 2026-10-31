@@ -36,6 +36,8 @@ export const USAGE = `Usage: node gcp/tools/measure.mjs <command> [options]
                                             health, the answers
          [--cluster dmt-demo-gke] [--namespace default] [--deployment dmt-demo-gke] [--backend-service dmt-demo-gke]
          [--zone europe-west1-b]
+  tag bind|unbind                           the tag dormeto=managed on a Cloud SQL instance, as the owner, at its region's
+         [--instance dmt-demo-sql]          tag endpoint (M7); unbound before any uninstall, or the tag strands
   metric                                    send requests, then wait for Cloud Monitoring to count them: the URL
                                             map's series, over the points published before the requests
          [--url-map dmt-dev] [--url https://gcp.dev.dormeto.com/] [--count 20]
@@ -107,6 +109,7 @@ const COMMANDS = {
     required: ['url'],
   },
   sql: { actions: ['stop', 'start'], timeout: 1800, options: ['project', 'configuration', 'timeout', 'instance'], defaults: { instance: 'dmt-demo-sql' } },
+  tag: { actions: ['bind', 'unbind'], timeout: 120, options: ['project', 'configuration', 'timeout', 'instance'], defaults: { instance: 'dmt-demo-sql' } },
   gke: {
     actions: ['scale'],
     timeout: 900,

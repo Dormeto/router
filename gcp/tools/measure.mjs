@@ -2,8 +2,8 @@
 // G0's measuring tool (vision docs/specs/2026-10-29-google-cloud-design.md, section 12), for terraform/gcp-dev: how
 // fast a URL map switch takes effect, how fast stopped or suspended VMs come back healthy, Cloud Monitoring's request
 // count delay, and whether Google health checks a backend service out of service; and (spec 2026-10-30, section 10) a
-// VM in a zonal NEG, a Cloud SQL instance stopped and started, and a Deployment scaled behind a standalone NEG. Each command prints a timeline, one
-// line per event: `<seconds since the start>s  <what>  <value>`.
+// VM in a zonal NEG, a Cloud SQL instance stopped and started and its tag bound, and a Deployment scaled behind a standalone NEG. Each command prints a
+// timeline, one line per event: `<seconds since the start>s  <what>  <value>`.
 //
 // Google's REST APIs with gcloud's access token (`gcloud config config-helper --format=json --min-expiry=20m
 // --configuration <configuration>`: at least 20 minutes left; asked again 5 minutes before it expires, and with a
@@ -22,6 +22,7 @@ const COMPUTE = 'https://compute.googleapis.com/compute/v1';
 const MONITORING = 'https://monitoring.googleapis.com/v3';
 const SQLADMIN = 'https://sqladmin.googleapis.com/v1';
 const CONTAINER = 'https://container.googleapis.com/v1';
+const RESOURCE_MANAGER = 'https://cloudresourcemanager.googleapis.com/v3';
 const PROBE_TIMEOUT_MS = 10_000;
 const OPERATION_TIMEOUT_MS = 180_000;
 const STATUS_EVERY_MS = 1000;
@@ -49,9 +50,11 @@ export async function probe(url, { timeoutMs = PROBE_TIMEOUT_MS } = {}) {
 
 // A refusal from Google (exit 1).
 export class GoogleError extends Error {
-  constructor(status, message) {
+  // status: the HTTP status (0: none); reason: Google's (`ALREADY_EXISTS`).
+  constructor(status, message, reason = '') {
     super(`Google: ${status ? `${status} ` : ''}${message}`);
     this.status = status;
+    this.reason = reason;
   }
 }
 
@@ -80,7 +83,7 @@ export function createGoogle(tokens) {
       json = { error: { message: res.text.slice(0, 300) } };
     }
     // Kubernetes (gke scale) has its Status's `message` at the top.
-    if (!res.ok) throw new GoogleError(res.status, `${method} ${url}: ${json.error?.message ?? json.message ?? res.statusText}`);
+    if (!res.ok) throw new GoogleError(res.status, `${method} ${url}: ${json.error?.message ?? json.message ?? res.statusText}`, json.error?.status ?? '');
     return json;
   };
 }
@@ -565,6 +568,68 @@ export async function runSql(ctx) {
   return summary.ended !== null && !summary.failure ? 0 : 1;
 }
 
+// A Resource Manager operation, read until `done`; a failed one throws.
+async function waitTagOperation(ctx, base, operation) {
+  const { options: o, request } = ctx;
+  const deadline = ctx.at() + o.timeout * 1000;
+  let current = operation;
+  while (!current.done) {
+    if (ctx.interrupted() || ctx.at() >= deadline) throw new GoogleError(0, `operation ${operation.name} not done within ${o.timeout} s`);
+    await ctx.wait(1000);
+    current = await request('GET', `${base}/${operation.name}`);
+  }
+  if (current.error) throw new GoogleError(0, `operation ${operation.name}: ${current.error.code} ${current.error.message}`);
+}
+
+// tag bind|unbind: the tag dormeto=managed on a Cloud SQL instance, as the owner (a tag binding is no IAM command; C5, the CLI's
+// binding, comes after the measures). M7's condition needs it; an uninstall can't delete a tag still bound. The parent names the
+// project by its ID and the instance by its name, at the instance's region's endpoint: both confirmed live.
+export async function runTag(ctx) {
+  const { options: o, action, request, log } = ctx;
+  const parent = `//sqladmin.googleapis.com/projects/${o.project}/instances/${o.instance}`;
+  log('parent', parent);
+  const namespaced = `${o.project}/dormeto/managed`;
+  let tagValue;
+  try {
+    ({ name: tagValue } = await request('GET', `${RESOURCE_MANAGER}/tagValues/namespaced?name=${encodeURIComponent(namespaced)}`));
+  } catch (e) {
+    // Resource Manager answers 403 for a tag that does not exist.
+    if (e.status === 403 || e.status === 404) throw new CheckError(`no tag ${namespaced}: dormeto gcp install makes it (${e.message})`);
+    throw e;
+  }
+  log('tag value', `${namespaced} ${tagValue}`);
+  const { region } = await request('GET', `${SQLADMIN}/projects/${o.project}/instances/${o.instance}`);
+  if (!region) throw new CheckError(`the instance ${o.instance} has no region`);
+  const base = `https://${region}-cloudresourcemanager.googleapis.com/v3`;
+
+  if (action === 'bind') {
+    log('bind', `sent to ${base}`);
+    let operation;
+    try {
+      operation = await request('POST', `${base}/tagBindings`, { parent, tagValue });
+    } catch (e) {
+      if (e.reason !== 'ALREADY_EXISTS') throw e;
+      log('bind', `${o.instance} has dormeto=managed already: nothing done`);
+      return 0;
+    }
+    await waitTagOperation(ctx, base, operation);
+    log('bind', `done: ${o.instance} has dormeto=managed`);
+    return 0;
+  }
+  const { tagBindings = [] } = await request('GET', `${base}/tagBindings?parent=${encodeURIComponent(parent)}`);
+  const ours = tagBindings.filter((binding) => binding.tagValue === tagValue);
+  if (ours.length === 0) {
+    log('unbind', `${o.instance} has no dormeto=managed: nothing done`);
+    return 0;
+  }
+  for (const { name } of ours) {
+    log('unbind', `sent to ${base}: ${name}`);
+    await waitTagOperation(ctx, base, await request('DELETE', `${base}/${name}`));
+  }
+  log('unbind', `done: ${o.instance} no longer has dormeto=managed`);
+  return 0;
+}
+
 // gke scale --replicas <n>: the cluster's DNS endpoint from the Container API, the Deployment's scale read and put
 // through it with the caller's token (the owner is cluster-admin), then as a VM's action: the pods, the NEG's
 // endpoints, the backend service's health and the load balancer's answers (M9, M11's scale as the owner). Healthy is any
@@ -710,7 +775,7 @@ async function runMetric(ctx) {
   return complete !== null ? 0 : 1;
 }
 
-const RUN = { switch: runSwitch, vm: runVm, mig: runMig, neg: runNeg, sql: runSql, gke: runGke, metric: runMetric, health: runHealth };
+const RUN = { switch: runSwitch, vm: runVm, mig: runMig, neg: runNeg, sql: runSql, tag: runTag, gke: runGke, metric: runMetric, health: runHealth };
 
 export async function main(argv, { out = console.log, err = console.error } = {}) {
   let parsed;

@@ -149,6 +149,21 @@ with no series means it reads otherwise). `neg` adds the NEG's endpoints (kept o
 the cluster's DNS endpoint from the Container API, reads and puts the Deployment's scale through it with gcloud's token,
 and follows the pods, the NEG's endpoints, the backend service's health and the answers.
 
+### M7's tag
+
+M7 needs the tag `dormeto=managed` on the Cloud SQL instance. A tag binding is no IAM command, and the CLI's `--cloud-sql`
+comes after the measures, so the owner binds it with the measuring tool, which prints the parent, the tag value and what
+it did:
+
+```
+node gcp/tools/measure.mjs tag bind   --instance dmt-demo-sql
+node gcp/tools/measure.mjs tag unbind --instance dmt-demo-sql
+```
+
+**Unbound before any uninstall**: `dormeto gcp uninstall` can't delete a tag that is still bound, and the tag strands; the
+tool's `unbind` clears it. The parent is `//sqladmin.googleapis.com/projects/<project ID>/instances/<name>`, at the regional
+endpoint `<region>-cloudresourcemanager.googleapis.com`: both confirmed live.
+
 ### Acting as the router (M7, M11)
 
 The owner would bypass a condition or an RBAC rule, so these two calls are made as the router's service account:

@@ -167,6 +167,20 @@ test('sql: the instance dmt-demo-sql, stopped or started, 30 minutes at most', (
   }
 });
 
+test('tag: bound or unbound on the instance dmt-demo-sql by default, 2 minutes at most', () => {
+  for (const action of ['bind', 'unbind']) {
+    assert.deepEqual(parseArgs(['tag', action]), {
+      command: 'tag',
+      action,
+      options: { project: 'dormeto-dev', configuration: 'dormeto-dev', timeout: 120, instance: 'dmt-demo-sql' },
+    });
+  }
+  assert.equal(parseArgs(['tag', 'unbind', '--instance', 'other-sql']).options.instance, 'other-sql');
+  for (const argv of [['tag'], ['tag', 'list'], ['tag', 'bind', '--instance', 'a/b'], ['tag', 'bind', '--zone', 'europe-west1-b']]) {
+    assert.throws(() => parseArgs(argv), UsageError, argv.join(' '));
+  }
+});
+
 test('gke scale: the demo Deployment to a number of replicas, 0 included; the address is required', () => {
   assert.deepEqual(parseArgs(['gke', 'scale', '--replicas', '0', '--url', 'http://203.0.113.9/']), {
     command: 'gke',
@@ -190,7 +204,7 @@ test('gke scale: the demo Deployment to a number of replicas, 0 included; the ad
 });
 
 test('the usage lists the new commands', () => {
-  for (const word of ['neg stop|start', 'sql stop|start', 'gke scale', '[--hold]']) assert.ok(USAGE.includes(word), word);
+  for (const word of ['neg stop|start', 'sql stop|start', 'gke scale', '[--hold]', 'tag bind|unbind']) assert.ok(USAGE.includes(word), word);
 });
 
 test('help: --help, -h and help', () => {

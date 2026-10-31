@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { parseArgs } from '../tools/measure-core.mjs';
-import { createGoogle, runGke, runSql, runSwitch } from '../tools/measure.mjs';
+import { GoogleError, createGoogle, runGke, runSql, runSwitch, runTag } from '../tools/measure.mjs';
 
 function virtualTime() {
   let clock = 0;
@@ -452,4 +452,103 @@ test('switch without --hold: the map stays swapped, no VM is touched', async () 
   assert.deepEqual(world.events, ['map']);
   assert.equal(world.map.defaultService, service('global', CLASSIC_STANDIN));
   assert.equal(world.map.hostRules, undefined);
+});
+
+// --- tag bind|unbind: M7 ---------------------------------------------------------------------------------------------------
+
+const TAG_BASE = 'https://europe-west1-cloudresourcemanager.googleapis.com/v3';
+const TAG_VALUE = 'https://cloudresourcemanager.googleapis.com/v3/tagValues/namespaced?name=dormeto-dev%2Fdormeto%2Fmanaged';
+const PARENT = '//sqladmin.googleapis.com/projects/dormeto-dev/instances/dmt-demo-sql';
+const LISTED = `${TAG_BASE}/tagBindings?parent=${encodeURIComponent(PARENT)}`;
+const BINDING = `tagBindings/${encodeURIComponent(PARENT)}/tagValues/281`;
+
+// Resource Manager's tag endpoints, as the CLI's tests have them: a binding is a long-running operation at the regional endpoint.
+function tagWorld({ bindings = [], operationReads = 1, refuse = {} } = {}) {
+  const world = { bindings: [...bindings], changes: [] };
+  let reads = 0;
+  world.google = (method, url, body) => {
+    if (refuse[`${method} ${url}`]) throw refuse[`${method} ${url}`];
+    if (method === 'GET' && url === INSTANCE) return { name: 'dmt-demo-sql', region: 'europe-west1', state: 'RUNNABLE' };
+    if (method === 'GET' && url === TAG_VALUE) return { name: 'tagValues/281', namespacedName: 'dormeto-dev/dormeto/managed' };
+    if (method === 'POST' && url === `${TAG_BASE}/tagBindings`) {
+      assert.deepEqual(body, { parent: PARENT, tagValue: 'tagValues/281' });
+      world.changes.push('bind');
+      world.bindings.push({ name: BINDING, parent: PARENT, tagValue: 'tagValues/281' });
+      return { name: 'operations/rctb.bind-1' };
+    }
+    if (method === 'GET' && url === LISTED) return { tagBindings: world.bindings };
+    if (method === 'DELETE' && url.startsWith(`${TAG_BASE}/tagBindings/`)) {
+      const name = url.slice(`${TAG_BASE}/`.length);
+      world.changes.push(`unbind ${name}`);
+      world.bindings = world.bindings.filter((b) => b.name !== name);
+      return { name: 'operations/rcub.unbind-1' };
+    }
+    if (method === 'GET' && url.startsWith(`${TAG_BASE}/operations/`)) {
+      reads += 1;
+      return reads < operationReads ? { name: url.slice(TAG_BASE.length + 1) } : { name: url.slice(TAG_BASE.length + 1), done: true, ...world.operationResult };
+    }
+    return unexpected(method, url);
+  };
+  return world;
+}
+const tagRun = (world, action, more = []) => {
+  const run = contextOf(['tag', action, ...more], { google: world.google });
+  return { ...run, code: run.time.drive(runTag(run.ctx)) };
+};
+
+test('tag bind: dormeto=managed on the instance, at its region\'s endpoint, followed to its end, and said', async () => {
+  const world = tagWorld({ operationReads: 3 });
+  const { code, said, asked } = tagRun(world, 'bind');
+  assert.equal(await code, 0);
+  assert.deepEqual(world.changes, ['bind']);
+  assert.deepEqual(said('parent'), [PARENT]);
+  assert.deepEqual(said('tag value'), ['dormeto-dev/dormeto/managed tagValues/281']);
+  assert.deepEqual(said('bind'), [`sent to ${TAG_BASE}`, 'done: dmt-demo-sql has dormeto=managed']);
+  assert.equal(asked.filter((a) => a.url === `${TAG_BASE}/operations/rctb.bind-1`).length, 3);
+});
+
+test('tag bind: bound already says so and exits 0, nothing to undo', async () => {
+  const world = tagWorld({ refuse: { [`POST ${TAG_BASE}/tagBindings`]: new GoogleError(409, 'POST: the binding exists', 'ALREADY_EXISTS') } });
+  const { code, said } = tagRun(world, 'bind', ['--instance', 'dmt-demo-sql']);
+  assert.equal(await code, 0);
+  assert.deepEqual(said('bind').at(-1), 'dmt-demo-sql has dormeto=managed already: nothing done');
+});
+
+test('tag bind: another 409 bound nothing and stays a refusal; so does a failed operation', async () => {
+  const aborted = tagWorld({ refuse: { [`POST ${TAG_BASE}/tagBindings`]: new GoogleError(409, 'POST: aborted', 'ABORTED') } });
+  await assert.rejects(tagRun(aborted, 'bind').code, /aborted/);
+  const failed = tagWorld();
+  failed.operationResult = { error: { code: 7, message: 'refused' } };
+  await assert.rejects(tagRun(failed, 'bind').code, /operations\/rctb\.bind-1: 7 refused/);
+});
+
+test('tag bind: an operation not done in time is an error', async () => {
+  const world = tagWorld({ operationReads: Infinity });
+  await assert.rejects(tagRun(world, 'bind', ['--timeout', '10']).code, /operations\/rctb\.bind-1 not done within 10 s/);
+});
+
+test('tag unbind: only the binding of dormeto=managed goes, by the name Google gives it, escaped as it is', async () => {
+  const other = { name: `tagBindings/${encodeURIComponent(PARENT)}/tagValues/999`, parent: PARENT, tagValue: 'tagValues/999' };
+  const world = tagWorld({ bindings: [other, { name: BINDING, parent: PARENT, tagValue: 'tagValues/281' }] });
+  const { code, said } = tagRun(world, 'unbind');
+  assert.equal(await code, 0);
+  assert.deepEqual(world.changes, [`unbind ${BINDING}`]);
+  assert.deepEqual(world.bindings, [other]);
+  assert.deepEqual(said('unbind'), [`sent to ${TAG_BASE}: ${BINDING}`, 'done: dmt-demo-sql no longer has dormeto=managed']);
+});
+
+test('tag unbind: none bound says so and exits 0', async () => {
+  const world = tagWorld();
+  const { code, said } = tagRun(world, 'unbind');
+  assert.equal(await code, 0);
+  assert.deepEqual(world.changes, []);
+  assert.deepEqual(said('unbind'), ['dmt-demo-sql has no dormeto=managed: nothing done']);
+});
+
+test('tag: no such tag says what makes it: the install, not this tool', async () => {
+  for (const code of [403, 404]) {
+    const world = tagWorld({ refuse: { [`GET ${TAG_VALUE}`]: new GoogleError(code, 'GET: not there', code === 403 ? 'PERMISSION_DENIED' : 'NOT_FOUND') } });
+    await assert.rejects(tagRun(world, 'bind').code, /no tag dormeto-dev\/dormeto\/managed: dormeto gcp install makes it/);
+    assert.deepEqual(world.changes, []);
+  }
 });

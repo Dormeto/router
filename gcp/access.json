@@ -402,6 +402,8 @@
           "cluster": [
             "container.roles.delete",
             "container.roleBindings.delete",
+            "container.roleBindings.update",
+            "container.roles.bind",
             "container.clusters.connect",
             "container.clusters.get",
             "container.roles.get",

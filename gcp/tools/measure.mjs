@@ -48,7 +48,7 @@ export async function probe(url, { timeoutMs = PROBE_TIMEOUT_MS } = {}) {
 }
 
 // A refusal from Google (exit 1).
-class GoogleError extends Error {
+export class GoogleError extends Error {
   constructor(status, message) {
     super(`Google: ${status ? `${status} ` : ''}${message}`);
     this.status = status;
@@ -56,10 +56,10 @@ class GoogleError extends Error {
 }
 
 // A check that failed (exit 1): nothing to act on, a URL map without the service.
-class CheckError extends Error {}
+export class CheckError extends Error {}
 
 // A request to Google; refused with a 401, sent once more with a new token (core.withToken).
-function createGoogle(tokens) {
+export function createGoogle(tokens) {
   return async function request(method, url, body) {
     const res = await core.withToken(tokens, async (token) => {
       const answer = await fetch(url, {
@@ -111,7 +111,7 @@ function startProber(ctx, url, everyMs) {
   let lastKind = null;
   const fire = () => {
     const t = ctx.at();
-    const p = probe(url).then((answer) => {
+    const p = ctx.probe(url).then((answer) => {
       answers.push({ t, ...answer });
       if (answer.kind !== lastKind) {
         lastKind = answer.kind;
@@ -127,11 +127,11 @@ function startProber(ctx, url, everyMs) {
     p.finally(() => inflight.delete(p));
   };
   fire();
-  const timer = setInterval(fire, everyMs);
+  const stopFiring = ctx.every(fire, everyMs);
   return {
     answers,
     async stop() {
-      clearInterval(timer);
+      stopFiring();
       await Promise.all(inflight);
     },
   };
@@ -144,7 +144,7 @@ function startPoller(ctx, everyMs, read, report) {
   const samples = [];
   const loop = (async () => {
     while (!stopped) {
-      const began = Date.now();
+      const began = ctx.at();
       try {
         const t = ctx.at();
         const sample = await read();
@@ -155,7 +155,7 @@ function startPoller(ctx, everyMs, read, report) {
         if (e.message !== lastError) ctx.log('error', e.message);
         lastError = e.message;
       }
-      await ctx.wait(Math.max(0, everyMs - (Date.now() - began)));
+      await ctx.wait(Math.max(0, everyMs - (ctx.at() - began)));
     }
   })();
   return {
@@ -199,7 +199,7 @@ async function readHealth(request, backendService) {
 // backend services' health read every 2 s: Google health checks only a backend service that a forwarding rule
 // references (spec section 12, 7), so a service the switch brings back may answer 503 until its health checks pass, and
 // its health line tells that warm-up from the propagation.
-async function runSwitch(ctx) {
+export async function runSwitch(ctx) {
   const { options: o, request, log } = ctx;
   const scope = scopeOf(o);
   const [from, to] = await Promise.all([o.from, o.to].map((name) => request('GET', `${scope}/backendServices/${name}`)));
@@ -231,8 +231,8 @@ async function runSwitch(ctx) {
       await waitOperation(request, await request('PUT', mapUrl, next));
       end = ctx.at();
       log('update', `done, ${core.delta(end - sent)} after it was sent`);
-      const deadline = Date.now() + o.timeout * 1000;
-      while (!ctx.interrupted() && Date.now() < deadline) {
+      const deadline = ctx.at() + o.timeout * 1000;
+      while (!ctx.interrupted() && ctx.at() < deadline) {
         if (core.summarize(prober.answers, { old: oldKind, fresh: newKind, settle: o.settle }).settled !== null) break;
         await ctx.wait(250);
       }
@@ -280,8 +280,8 @@ async function runAction(ctx, { names, statusPoller, backendService, act, before
       await waitOperation(ctx.request, await act());
       log('operation', `done, ${core.delta(ctx.at() - since)} after the request`);
       await afterAct();
-      const deadline = Date.now() + o.timeout * 1000;
-      while (!ctx.interrupted() && Date.now() < deadline) {
+      const deadline = ctx.at() + o.timeout * 1000;
+      while (!ctx.interrupted() && ctx.at() < deadline) {
         summary = summarize();
         if (summary.done) break;
         await ctx.wait(500);
@@ -443,7 +443,7 @@ async function runNeg(ctx) {
 
 // sql stop|start: the activation policy patched (NEVER | ALWAYS), then the instance's state and policy read every 10 s
 // until it is SUSPENDED (stop) or RUNNABLE (start) (M6).
-async function runSql(ctx) {
+export async function runSql(ctx) {
   const { options: o, action, request, log } = ctx;
   const url = `${SQLADMIN}/projects/${o.project}/instances/${o.instance}`;
   const policy = action === 'stop' ? 'NEVER' : 'ALWAYS';
@@ -459,8 +459,8 @@ async function runSql(ctx) {
     log(action, `sent: activationPolicy ${policy}`);
     const operation = await request('PATCH', url, { settings: { activationPolicy: policy } });
     log('operation', `${operation.operationType ?? '?'} ${operation.status ?? '?'}, ${core.delta(ctx.at() - since)} after the request`);
-    const deadline = Date.now() + o.timeout * 1000;
-    while (!ctx.interrupted() && Date.now() < deadline) {
+    const deadline = ctx.at() + o.timeout * 1000;
+    while (!ctx.interrupted() && ctx.at() < deadline) {
       summary = core.sqlSummary(action, { since, name: o.instance, samples: poller.samples });
       if (summary.reached !== null) break;
       await ctx.wait(1000);
@@ -480,7 +480,7 @@ async function runSql(ctx) {
 // gke scale --replicas <n>: the cluster's DNS endpoint from the Container API, the Deployment's scale read and put
 // through it with the caller's token (the owner is cluster-admin), then as a VM's action: the pods, the NEG's
 // endpoints, the backend service's health and the load balancer's answers (M9, M11's scale as the owner).
-async function runGke(ctx) {
+export async function runGke(ctx) {
   const { options: o, request, log } = ctx;
   const cluster = await request('GET', `${CONTAINER}/projects/${o.project}/locations/${o.zone}/clusters/${o.cluster}`);
   const host = cluster.controlPlaneEndpointsConfig?.dnsEndpointConfig?.endpoint;
@@ -660,6 +660,11 @@ export async function main(argv, { out = console.log, err = console.error } = {}
     at,
     log: (what, value, t = at()) => out(core.line(t, what, value)),
     wait: (ms) => sleep(ms, undefined, { signal: abort.signal }).catch(() => {}),
+    every: (fn, ms) => {
+      const timer = setInterval(fn, ms);
+      return () => clearInterval(timer);
+    },
+    probe,
     interrupted: () => signal !== null,
   };
   ctx.log('start', `${[command, action].filter(Boolean).join(' ')} ${new Date(start).toISOString()} ${options.project}`);

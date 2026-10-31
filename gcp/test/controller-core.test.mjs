@@ -128,7 +128,10 @@ function setup({
       world.healthScopes.add(region);
       return health();
     },
-    listNetworkEndpoints: async (zone, name) => world.negs[name].map((vm) => ({ networkEndpoint: { instance: vm } })),
+    listNetworkEndpoints: async (zone, name) => {
+      if (!world.negs[name]) throw new GoogleError(`Google: network endpoint group ${name}: 404 not found`, { code: 404 });
+      return world.negs[name].map((vm) => ({ networkEndpoint: { instance: vm } }));
+    },
   };
   for (const [action, status] of Object.entries(STATUS)) {
     compute[`${action}Instance`] = (zone, name) => change(`${action} ${name}`, () => { world.vms[name].status = status; });
@@ -539,12 +542,48 @@ for (const [kind, lb, base, waitSeconds, healthScope] of SWAPS) {
     assert.ok(t.clock.now() - START < REQUEST_LIMIT - 30_000, `${t.clock.now() - START} ms`);
   });
 
-  test(`${kind} nap aborted by a NEG changed since the onboarding: unswapped, waited, only then AWAKE`, async () => {
+  test(`${kind} nap of a NEG changed since the onboarding: nothing written, nothing waited for, AWAKE at once`, async () => {
     const t = swapSetup({ cfg: { backends: [{ ...VM_A, neg: { zone: ZONE, name: 'neg' } }] } });
     t.world.negs.neg = ['vm-a', 'late'];
     const out = await t.controller.nap('demo');
+    assert.equal(out.aborted, true);
+    assert.match(out.error, /VMs added: late/);
+    assert.deepEqual(t.world.calls, [`state ${STATES.NAPPING}`, `state ${STATES.AWAKE}`]);
+    assert.deepEqual(t.world.sleeps, []);
+    assert.equal(t.world.puts, 0);
+    assert.equal(t.world.vms['vm-a'].status, 'RUNNING');
+    assert.equal(t.logged('StateChanged').find((l) => l.to === STATES.AWAKE).cause, 'backends-changed');
+    assert.equal(t.logged('NapAborted').length, 1);
+  });
+
+  test(`${kind} nap of a NEG deleted since the onboarding: a change, not a failure, nothing written, nothing waited for`, async () => {
+    const t = swapSetup({ cfg: { backends: [{ ...VM_A, neg: { zone: ZONE, name: 'neg' } }] } });
+    const out = await t.controller.nap('demo');
+    assert.equal(out.state, STATES.AWAKE);
+    assert.equal(out.aborted, true);
+    assert.match(out.error, /network endpoint group neg no longer exists: offboard and onboard again/);
+    assert.deepEqual(t.world.calls, [`state ${STATES.NAPPING}`, `state ${STATES.AWAKE}`]);
+    assert.deepEqual(t.world.sleeps, []);
+    assert.equal(t.logged('NapFailed').length, 0);
+    assert.equal(t.run().failure, undefined);
+  });
+
+  test(`${kind} nap of a NEG changed during its wait: the later check still holds: unswapped, waited, only then AWAKE`, async () => {
+    const t = swapSetup({ cfg: { backends: [{ ...VM_A, neg: { zone: ZONE, name: 'neg' } }] } });
+    t.world.negs.neg = ['vm-a'];
+    t.clock.onSleep(() => { t.world.negs.neg = ['vm-a', 'late']; });
+    const out = await t.controller.nap('demo');
     assert.match(out.error, /VMs added: late/);
     assert.equal(t.logged('StateChanged').find((l) => l.to === STATES.AWAKE).cause, 'backends-changed');
+    assertBackAwake(t, out);
+  });
+
+  test(`${kind} nap of a NEG deleted during its wait: the later check reads it as changed too`, async () => {
+    const t = swapSetup({ cfg: { backends: [{ ...VM_A, neg: { zone: ZONE, name: 'neg' } }] } });
+    t.world.negs.neg = ['vm-a'];
+    t.clock.onSleep(() => { delete t.world.negs.neg; });
+    const out = await t.controller.nap('demo');
+    assert.match(out.error, /network endpoint group neg no longer exists/);
     assertBackAwake(t, out);
   });
 
@@ -2209,6 +2248,40 @@ for (const [name, change, reason] of CHANGED) {
     assert.match(aborted.reason, reason);
   });
 }
+
+test('a nap of a NEG deleted: no stop, AWAKE with a warning, the release stays FAILED, each saying what to do', async () => {
+  const t = await negWorkload();
+  delete t.w.negs.neg;
+  t.w.changes.length = 0;
+  const out = await t.core.nap('demo');
+  assert.equal(out.state, STATES.AWAKE);
+  assert.equal(out.aborted, true);
+  assert.match(out.error, /network endpoint group neg no longer exists: offboard and onboard again/);
+  assert.equal(t.w.changes.some((c) => c.startsWith('stop') || c.startsWith('map')), false);
+  assert.equal((await t.store.getRun('demo')).state, STATES.AWAKE);
+
+  t.store.runs.get('demo').state = STATES.FAILED;
+  const released = await t.core.release('demo');
+  assert.equal(released.state, STATES.FAILED);
+  assert.match(released.error, /no longer exists/);
+  assert.equal(t.w.changes.some((c) => c.startsWith('stop')), false);
+});
+
+test('a NEG\'s endpoint with no VM: said by its address, not as an empty name among the VMs added', async () => {
+  const t = await negWorkload();
+  t.w.negs.neg.endpoints.push({ ipAddress: '10.0.0.9', port: 80 });
+  const out = await t.core.nap('demo');
+  assert.equal(out.aborted, true);
+  assert.doesNotMatch(out.error, /VMs added/);
+  assert.match(out.error, /network endpoint group neg changed since the onboarding \(an endpoint with no VM: 10\.0\.0\.9\): offboard and onboard again/);
+});
+
+test('the fake: listNetworkEndpoints on a NEG that is not there, or not in that zone, is a 404', async () => {
+  const t = await negWorkload();
+  await assert.rejects(t.compute.listNetworkEndpoints('europe-west1-c', 'neg'), (err) => err.code === 404);
+  delete t.w.negs.neg;
+  await assert.rejects(t.compute.listNetworkEndpoints(ZONE, 'neg'), (err) => err.code === 404);
+});
 
 test('a NEG read that fails during the nap is a nap failure, never "no change"', async () => {
   const t = await negWorkload();

@@ -203,7 +203,8 @@ export function setup(change = () => {}) {
       if (!w.negs[name] || own !== zone) throw notFound(`network endpoint group ${name}`);
       return { name, networkEndpointType: type, selfLink: `${V1}/zones/${zone}/networkEndpointGroups/${name}`, ...fields };
     }],
-    ['POST', /^zones\/([^/]+)\/networkEndpointGroups\/([^/]+)\/listNetworkEndpoints(\?pageToken=.*)?$/, ([, name, page]) => {
+    ['POST', /^zones\/([^/]+)\/networkEndpointGroups\/([^/]+)\/listNetworkEndpoints(\?pageToken=.*)?$/, ([zone, name, page]) => {
+      if (!w.negs[name] || (w.negs[name].zone ?? ZONE) !== zone) throw notFound(`network endpoint group ${name}`);
       const items = w.negs[name].endpoints.map((e) => ({ networkEndpoint: typeof e === 'string' ? { instance: e, ipAddress: '10.0.0.2', port: 80 } : e }));
       // Two pages, to show that the adapter follows the token.
       return page ? { items: items.slice(1) } : { items: items.slice(0, 1), ...(items.length > 1 ? { nextPageToken: 'second' } : {}) };

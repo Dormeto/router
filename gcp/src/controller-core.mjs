@@ -454,8 +454,9 @@ export function createController({ store, compute, urlmaps, regionalUrlmaps, mon
     }
   }
 
-  // A NEG's VMs are stopped only while they still are the NEG: one is edited more freely than a group. Why not, else null.
-  // A read that fails throws. The wake needs none of this: starting what was recorded is harmless.
+  // A NEG's VMs are stopped only while they still are the NEG: one is edited more freely than a group. Why not, else null; a NEG
+  // deleted is one more change, not a failure. A read that fails throws. The wake needs none of this: starting what was recorded
+  // is harmless.
   async function negsChanged(cfg) {
     const recorded = new Map();
     for (const backend of cfg.backends.filter((b) => b.kind === 'vm')) {
@@ -465,11 +466,22 @@ export function createController({ store, compute, urlmaps, regionalUrlmaps, mon
       }
     }
     const changes = await each([...recorded.values()], async ({ neg, vms }) => {
-      const current = (await compute.listNetworkEndpoints(neg.zone, neg.name)).map((item) => nameOf(item.networkEndpoint?.instance ?? ''));
+      const items = await compute.listNetworkEndpoints(neg.zone, neg.name).catch((err) => {
+        if (err?.code !== 404) throw err;
+        return null;
+      });
+      if (!items) return `network endpoint group ${neg.name} no longer exists: offboard and onboard again`;
+      const endpoints = items.map((item) => item.networkEndpoint ?? {});
+      const current = endpoints.filter((endpoint) => endpoint.instance).map((endpoint) => nameOf(endpoint.instance));
+      const bare = endpoints.filter((endpoint) => !endpoint.instance).map((endpoint) => endpoint.ipAddress);
       const added = [...new Set(current)].filter((name) => !vms.includes(name));
       const removed = vms.filter((name) => !current.includes(name));
-      if (!added.length && !removed.length) return null;
-      const parts = [...(added.length ? [`VMs added: ${added.join(', ')}`] : []), ...(removed.length ? [`VMs removed: ${removed.join(', ')}`] : [])];
+      if (!added.length && !removed.length && !bare.length) return null;
+      const parts = [
+        ...(added.length ? [`VMs added: ${added.join(', ')}`] : []),
+        ...(removed.length ? [`VMs removed: ${removed.join(', ')}`] : []),
+        ...(bare.length ? [`an endpoint with no VM: ${bare.join(', ')}`] : []),
+      ];
       return `network endpoint group ${neg.name} changed since the onboarding (${parts.join('; ')}): offboard and onboard again`;
     });
     const found = changes.filter(Boolean);
@@ -513,6 +525,13 @@ export function createController({ store, compute, urlmaps, regionalUrlmaps, mon
     };
     let slept;
     try {
+      // Before the first write as well as after the wait: under a swap an abort after it would hold visitors at the waker for two
+      // waits, at each idle period until an offboarding.
+      const changedBefore = await negsChanged(cfg);
+      if (changedBefore) {
+        await giveUp('backends-changed', 'warn', { reason: changedBefore });
+        return { state: STATES.AWAKE, aborted: true, error: changedBefore };
+      }
       try {
         if (!(await asleepHeld(cfg, sw, latest))) {
           await giveUp(`${sw.kind}-lost`, 'warn', { reason: `the ${sw.kind} was lost, no time left to wait for it again` });

@@ -10,6 +10,7 @@
 // A nap window: the page and `/_dormeto/wake` say when it ends. Pauses mean nothing here: `keepAsleep` holds the scheduled and
 // maintenance wakes only, and a visitor still wakes the workload (vision docs/specs/2026-10-30-google-cloud-coverage-design.md,
 // section 5).
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createListCache, parseLists } from '../../lambda/src/lib/list-cache.mjs';
 import { failureKind, nextAttemptAt } from '../../lambda/src/lib/failures.mjs';
 import { WAKE_HEADER, header, response } from '../../lambda/src/lib/http.mjs';
@@ -64,6 +65,15 @@ export function workloadIdOf(event) {
 }
 
 export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], now = Date.now, log }) {
+  // A request names one workload, and both the shared code and this file's words ask for its nap window: one read per
+  // request, a failed one included.
+  const thisRequest = new AsyncLocalStorage();
+  const getSchedule = (workloadId) => {
+    const memo = thisRequest.getStore();
+    memo.schedule ??= store.getSchedule(workloadId);
+    return memo.schedule;
+  };
+
   const core = createWaker({
     // Whatever the configuration says: no request is held, and only the page's probe and explicit wakes wake.
     store: {
@@ -72,6 +82,7 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], n
         const cfg = await store.getConfig(workloadId);
         return cfg && { ...cfg, waitSeconds: 0, wakeMode: 'browser' };
       },
+      getSchedule,
     },
     // Only the wake: the route `/_dormeto/*` stays while awake, so reaching the waker then is no drift to repair.
     invokeController: async (payload) => {
@@ -89,7 +100,7 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], n
   async function napUntilOf(workloadId, state) {
     if (!KEPT_BY_NAP.includes(state)) return null;
     try {
-      const schedule = await store.getSchedule(workloadId);
+      const schedule = await getSchedule(workloadId);
       const occurrence = occurrenceAt(schedule, now());
       if (occurrence?.kind !== 'nap') return null;
       return { at: new Date(occurrence.end).toISOString(), local: localTime(occurrence.end, schedule.timeZone), timeZone: schedule.timeZone };
@@ -157,7 +168,7 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], n
     if (!workloadId) {
       return response(400, { 'cache-control': 'no-store', 'content-type': 'application/json' }, JSON.stringify({ error: 'bad request', reason: `${WORKLOAD_HEADER} names no workload` }));
     }
-    return event.path === WAKE_PATH ? wake(event, workloadId) : waiting(event, workloadId);
+    return thisRequest.run({}, () => (event.path === WAKE_PATH ? wake(event, workloadId) : waiting(event, workloadId)));
   };
 }
 

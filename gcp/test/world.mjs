@@ -48,6 +48,7 @@ export const defaults = () => ({
 const notFound = (what) => new GoogleError(`Google: ${what}: 404 not found`, { code: 404, status: 'NOT_FOUND', reason: 'notFound' });
 
 // `change(world)`: what differs from the defaults. `fail['<method> <path>']` refuses that call, `on[...]` runs before it.
+// `world.store`: another store than the one here, such as the real one over a fake Firestore.
 export function setup(change = () => {}) {
   const clock = fakeClock();
   const w = { ...defaults(), changes: [], tasks: [], fail: {}, on: {}, logs: [], used: new Set() };
@@ -139,7 +140,7 @@ export function setup(change = () => {}) {
   const runs = new Map();
   const schedules = new Map();
   const pauses = new Map();
-  const store = {
+  const store = w.store ?? {
     configs,
     runs,
     schedules,

@@ -7,7 +7,7 @@ import http from 'node:http';
 import {
   UsageError, parseArgs, line, delta, pageOf, kindOfPort, summarize, changes, healthStates, managedStates, targets, actionSummary,
   switchService, healthLevel, changesSince, periods, tokenArgs, credentialOf, createTokens, withToken, pointsOf, metricFilter, counted,
-  USAGE, endpointStates, endpointAddresses, endpointRange, sqlState, sqlSummary, sqlOperationState, sqlOperationSeconds, endpointHealth, endpointGoneAt, podsState, scaleAction, deploymentPath,
+  USAGE, endpointStates, endpointAddresses, endpointRange, sqlState, sqlSummary, sqlOperationState, sqlOperationSeconds, endpointHealth, endpointGoneAt, podsState, withHold, holdProblem, levelAt, levelCounts, scaleAction, deploymentPath,
 } from '../tools/measure-core.mjs';
 import { probe } from '../tools/measure.mjs';
 
@@ -23,7 +23,7 @@ test('switch: the URL map, both backend services and the URL, the global load ba
     options: {
       project: 'dormeto-dev', configuration: 'dormeto-dev', timeout: 300, settle: 20, region: null,
       urlMap: 'dmt-dev', from: 'dmt-demo-app', to: 'dmt-demo-standin', url: 'https://gcp.dev.dormeto.com/', baseline: 5,
-      weighted: false,
+      weighted: false, hold: false, instance: 'dmt-demo', zone: 'europe-west1-b',
     },
   });
   assert.equal(parseArgs(['switch', '--weighted', '--from', 'dmt-demo-app', '--to', 'dmt-demo-standin']).options.weighted, true);
@@ -39,6 +39,17 @@ test('switch on the regional load balancer: its region, URL map and URL', () => 
   assert.equal(options.settle, 30);
   assert.equal(options.timeout, 120);
   assert.equal(options.baseline, 0);
+});
+
+test('switch --hold: the VM it stops and starts; not with --weighted; --instance and --zone only with it', () => {
+  const { options } = parseArgs(['switch', '--hold', '--from', 'a', '--to', 'b', '--instance', 'other', '--zone', 'europe-west1-c']);
+  assert.equal(options.hold, true);
+  assert.equal(options.instance, 'other');
+  assert.equal(options.zone, 'europe-west1-c');
+  assert.throws(() => parseArgs(['switch', '--hold', '--weighted', '--from', 'a', '--to', 'b']), /--hold.*--weighted/);
+  assert.throws(() => parseArgs(['switch', '--from', 'a', '--to', 'b', '--instance', 'other']), /--instance and --zone go with --hold/);
+  assert.throws(() => parseArgs(['switch', '--hold=yes', '--from', 'a', '--to', 'b']), UsageError);
+  assert.throws(() => parseArgs(['vm', 'start', '--hold']), UsageError);
 });
 
 test('vm: the demo VM, its unmanaged group and backend service by default', () => {
@@ -179,7 +190,7 @@ test('gke scale: the demo Deployment to a number of replicas, 0 included; the ad
 });
 
 test('the usage lists the new commands', () => {
-  for (const word of ['neg stop|start', 'sql stop|start', 'gke scale']) assert.ok(USAGE.includes(word), word);
+  for (const word of ['neg stop|start', 'sql stop|start', 'gke scale', '[--hold]']) assert.ok(USAGE.includes(word), word);
 });
 
 test('help: --help, -h and help', () => {
@@ -576,6 +587,78 @@ test('switch --weighted: a path rule\'s service in its route action; a weight Go
   const fromGoogle = { defaultRouteAction: { weightedBackendServices: [{ backendService: `${BS}/dmt-demo-standin`, weight: 1000 }, { backendService: `${BS}/dmt-demo-app` }] } };
   assert.deepEqual(switchService(fromGoogle, 'dmt-demo-app', 'dmt-demo-standin').paths, []);
   assert.deepEqual(switchService(fromGoogle, 'dmt-demo-standin', 'dmt-demo-app').map, { defaultService: `${BS}/dmt-demo-app` });
+});
+
+// --- The hold route (M3) ---
+
+const holdRule = (service) => ({ paths: ['/_dormeto/backend/*'], service: `${BS}/${service}` });
+
+test('the hold route on a map with no matcher: a host rule * and a matcher hold it, beside the swap', () => {
+  const map = { name: 'm', fingerprint: 'f', defaultService: `${BS}/app` };
+  const before = structuredClone(map);
+  const { map: next, paths, holds } = withHold(map, 'app', 'standin');
+  assert.deepEqual(next, {
+    name: 'm',
+    fingerprint: 'f',
+    defaultService: `${BS}/standin`,
+    hostRules: [{ hosts: ['*'], pathMatcher: 'dormeto-hold' }],
+    pathMatchers: [{ name: 'dormeto-hold', defaultService: `${BS}/standin`, pathRules: [holdRule('app')] }],
+  });
+  assert.deepEqual(paths, ['defaultService']);
+  assert.deepEqual(holds, ['pathMatchers[0].pathRules']);
+  assert.deepEqual(map, before);
+});
+
+test('the hold route in each matcher naming the service; the map\'s default under a host rule * stays as it is', () => {
+  const { map: next, paths, holds } = withHold({
+    defaultService: `${BS}/other`,
+    hostRules: [{ hosts: ['a.example'], pathMatcher: 'a' }, { hosts: ['*'], pathMatcher: 'b' }, { hosts: ['c.example'], pathMatcher: 'c' }],
+    pathMatchers: [
+      { name: 'a', defaultService: `${BS}/app`, pathRules: [{ paths: ['/x'], service: `${BS}/y` }] },
+      { name: 'b', defaultService: `${BS}/other`, pathRules: [{ paths: ['/z'], service: `${BS}/app` }] },
+      { name: 'c', defaultService: `${BS}/other` },
+    ],
+  }, 'app', 'standin');
+  assert.deepEqual(next.pathMatchers, [
+    { name: 'a', defaultService: `${BS}/standin`, pathRules: [{ paths: ['/x'], service: `${BS}/y` }, holdRule('app')] },
+    { name: 'b', defaultService: `${BS}/other`, pathRules: [{ paths: ['/z'], service: `${BS}/standin` }, holdRule('app')] },
+    { name: 'c', defaultService: `${BS}/other` },
+  ]);
+  assert.equal(next.hostRules.length, 3);
+  assert.deepEqual(paths, ['pathMatchers[0].defaultService', 'pathMatchers[1].pathRules[0].service']);
+  assert.deepEqual(holds, ['pathMatchers[0].pathRules', 'pathMatchers[1].pathRules']);
+});
+
+test('the hold route on the global demo map: its matcher, and the map\'s default gets its own', () => {
+  const { map: next, holds } = withHold(devMap(), 'dmt-demo-app', 'dmt-demo-standin');
+  assert.deepEqual(next.pathMatchers.map((m) => m.name), ['app', 'mig', 'dormeto-hold']);
+  assert.deepEqual(next.pathMatchers[0], { name: 'app', defaultService: `${BS}/dmt-demo-standin`, pathRules: [holdRule('dmt-demo-app')] });
+  assert.deepEqual(next.pathMatchers[1], devMap().pathMatchers[1]);
+  assert.deepEqual(next.hostRules.at(-1), { hosts: ['*'], pathMatcher: 'dormeto-hold' });
+  assert.deepEqual(holds, ['pathMatchers[0].pathRules', 'pathMatchers[2].pathRules']);
+});
+
+test('what keeps a map from a hold route: one there already, a matcher of that name, route rules on the service', () => {
+  assert.equal(holdProblem({ name: 'm', defaultService: `${BS}/app` }, 'app'), null);
+  assert.match(holdProblem({ name: 'm', pathMatchers: [{ name: 'a', defaultService: `${BS}/x`, pathRules: [holdRule('x')] }] }, 'app'), /m already has \/_dormeto\/backend\/\* at pathMatchers\[0\]/);
+  assert.match(holdProblem({ name: 'm', pathMatchers: [{ name: 'dormeto-hold', defaultService: `${BS}/x` }] }, 'app'), /m already has a path matcher dormeto-hold/);
+  assert.match(holdProblem({ name: 'm', pathMatchers: [{ name: 'a', defaultService: `${BS}/app`, routeRules: [{ priority: 1, service: `${BS}/x` }] }] }, 'app'), /pathMatchers\[0\] has route rules/);
+  assert.match(holdProblem({ name: 'm', pathMatchers: [{ name: 'a', defaultService: `${BS}/x`, routeRules: [{ priority: 1, service: `${BS}/app` }] }] }, 'app'), /pathMatchers\[0\] has route rules/);
+  assert.equal(holdProblem({ name: 'm', pathMatchers: [{ name: 'a', defaultService: `${BS}/x`, routeRules: [{ priority: 1, service: `${BS}/x` }] }] }, 'app'), null);
+});
+
+test('a service\'s health level from a time on: the first read of it, and how many of each', () => {
+  const samples = [
+    { t: 3000, states: { app: 'unhealthy' } },
+    { t: 1000, states: { app: 'healthy' } },
+    { t: 2000, states: { app: 'no status' } },
+    { t: 4000, states: { app: 'healthy', other: 'unhealthy' } },
+  ];
+  assert.equal(levelAt(samples, 'app', 1500, 'healthy'), 4000);
+  assert.equal(levelAt(samples, 'app', 0, 'unhealthy'), 3000);
+  assert.equal(levelAt(samples, 'app', 5000, 'healthy'), null);
+  assert.deepEqual(levelCounts(samples, 'app', 1500), { healthy: 1, unhealthy: 1, 'no status': 1 });
+  assert.deepEqual(levelCounts([], 'app', 0), { healthy: 0, unhealthy: 0, 'no status': 0 });
 });
 
 // --- Tokens ---

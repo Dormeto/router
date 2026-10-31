@@ -109,10 +109,17 @@ addr() { gcloud compute addresses describe "$1" --global --format='value(address
 # S3: a stopped VM in a NEG keeps its endpoint? (M1)
 node gcp/tools/measure.mjs neg stop  --url "http://$(addr dmt-dev-neg)/"
 node gcp/tools/measure.mjs neg start --url "http://$(addr dmt-dev-neg)/"
-# S4: the classic map's switch (M2), health of a service in no map (M3), the classic request count (M5)
+# S4: the classic map's switch, away from the app (its default) and back (M2), five runs
+node gcp/tools/measure.mjs switch --url-map dmt-dev-classic --url "http://$(addr dmt-dev-classic)/" \
+  --from dmt-demo-classic-app --to dmt-demo-classic-standin
 node gcp/tools/measure.mjs switch --url-map dmt-dev-classic --url "http://$(addr dmt-dev-classic)/" \
   --from dmt-demo-classic-standin --to dmt-demo-classic-app
-node gcp/tools/measure.mjs health --backend-service dmt-demo-classic-app --for 120
+# S4: a swap with the hold route written, getHealth while the VM stops and starts, the map restored (M3), classic and regional
+node gcp/tools/measure.mjs switch --hold --url-map dmt-dev-classic --url "http://$(addr dmt-dev-classic)/" \
+  --from dmt-demo-classic-app --to dmt-demo-classic-standin
+node gcp/tools/measure.mjs switch --hold --region europe-west1 --url-map dmt-dev-regional --url http://regional.gcp.dev.dormeto.com/ \
+  --from dmt-demo-regional-app --to dmt-demo-regional-standin
+# S4: the classic request count (M5)
 node gcp/tools/measure.mjs metric --url-map dmt-dev-classic --url "http://$(addr dmt-dev-classic)/" \
   --metric loadbalancing.googleapis.com/https/request_count
 # The regional request count (M5): its URL map as the metric labels it
@@ -127,7 +134,13 @@ node gcp/tools/measure.mjs gke scale --replicas 0 --url "http://$(addr dmt-dev-g
 node gcp/tools/measure.mjs gke scale --replicas 1 --url "http://$(addr dmt-dev-gke)/"
 ```
 
-Each prints a timeline like the others. `metric`'s `series` line prints every resource label as Google gives it, whose
+Each prints a timeline like the others. `switch --hold` (M3) writes beside the swap the path rule `/_dormeto/backend/*`
+to `--from`, with a host rule `*` and a matcher `dormeto-hold` where the map's default has none; once 20 answers settled it
+stops and starts the VM (`--instance`, `--zone`; the demo VM, whose stand-in goes with it), both services' `getHealth`
+printed as it changes, and puts the map back as it was, whatever became of the run. It answers whether the route keeps
+the service's health reported: `hold unhealthy` and `hold healthy` give the times, `hold reads` the reads of each level
+since the update (any `no status` is the route not doing its work), and it exits 1 without both. The route stays in the
+design whatever a read of an unreferenced service shows (spec section 7), so no command reads one here. `metric`'s `series` line prints every resource label as Google gives it, whose
 `backend_target_name` M5 reports, regional and classic (the classic one's `url_map_name` is presumed its plain name: a run
 with no series means it reads otherwise). `neg` adds the NEG's endpoints (kept or dropped while the VM is stopped);
 `sql` follows the operation the PATCH returns until it is `DONE`, whose end is the time, and prints `state` and

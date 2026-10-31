@@ -199,7 +199,8 @@ async function readHealth(request, backendService) {
 // weighted route), the load balancer probed every 250 ms until 20 answers in a row come from --to's page, and both
 // backend services' health read every 2 s: Google health checks only a backend service that a forwarding rule
 // references (spec section 12, 7), so a service the switch brings back may answer 503 until its health checks pass, and
-// its health line tells that warm-up from the propagation.
+// its health line tells that warm-up from the propagation. With --hold (M3, spec 2026-10-30, section 10), the hold route
+// beside the swap; once settled, the VM stopped and started under that health; and the map restored at the end.
 export async function runSwitch(ctx) {
   const { options: o, request, log } = ctx;
   const scope = scopeOf(o);
@@ -211,17 +212,28 @@ export async function runSwitch(ctx) {
   }
   const mapUrl = `${scope}/urlMaps/${o.urlMap}`;
   const map = await request('GET', mapUrl);
-  const { map: next, paths } = core.switchService(map, o.from, o.to, { weighted: o.weighted });
+  const problem = o.hold ? core.holdProblem(map, o.from) : null;
+  if (problem) throw new CheckError(problem);
+  const { map: next, paths, holds } = o.hold ? core.withHold(map, o.from, o.to) : core.switchService(map, o.from, o.to, { weighted: o.weighted });
   if (paths.length === 0) throw new CheckError(`the URL map ${o.urlMap} does not send traffic to ${o.from}`);
+  const vmUrl = `${COMPUTE}/projects/${o.project}/zones/${o.zone}/instances/${o.instance}`;
+  if (o.hold) {
+    const { status } = await request('GET', vmUrl);
+    if (status !== 'RUNNING') throw new CheckError(`${o.instance} is ${status}: --hold stops and starts a running VM`);
+  }
   log('url map', `${o.urlMap}: ${o.from} (${oldKind}) to ${o.to} (${newKind})${o.weighted ? ', weighted' : ''}, at ${paths.join(', ')}`);
+  if (o.hold) log('hold route', `/_dormeto/backend/* to ${o.from}, at ${holds.join(', ')}`);
 
   const readLevels = async () => Object.fromEntries(await Promise.all([from, to].map(
     async (service) => [service.name, core.healthLevel(await readHealth(request, service))],
   )));
   const health = startPoller(ctx, HEALTH_EVERY_MS, readLevels, reporter(ctx, 'health'));
   const prober = startProber(ctx, o.url, 250);
+  const settledNow = () => core.summarize(prober.answers, { old: oldKind, fresh: newKind, settle: o.settle }).settled !== null;
   let sent = null;
   let end = null;
+  let cycle = null;
+  let restored = true;
   try {
     await ctx.wait(o.baseline * 1000);
     const before = core.summarize(prober.answers, { old: oldKind, fresh: newKind });
@@ -234,12 +246,18 @@ export async function runSwitch(ctx) {
       log('update', `done, ${core.delta(end - sent)} after it was sent`);
       const deadline = ctx.at() + o.timeout * 1000;
       while (!ctx.interrupted() && ctx.at() < deadline) {
-        if (core.summarize(prober.answers, { old: oldKind, fresh: newKind, settle: o.settle }).settled !== null) break;
+        if (settledNow()) break;
         await ctx.wait(250);
       }
     }
+    if (o.hold && !ctx.interrupted() && settledNow()) {
+      // The VM down, the probes would only show that.
+      await prober.stop();
+      cycle = await holdCycle(ctx, vmUrl, health);
+    }
   } finally {
     await Promise.all([prober.stop(), health.stop()]);
+    if (o.hold && sent !== null) restored = await restoreMap(ctx, mapUrl, map);
   }
   if (end === null) return 1;
   const summary = core.summarize(prober.answers, { old: oldKind, fresh: newKind, settle: o.settle });
@@ -256,7 +274,67 @@ export async function runSwitch(ctx) {
     ['settled', summary.settled, `${o.settle} ${newKind} in a row from ${since(summary.settled)}`, `no: not ${o.settle} ${newKind} in a row within ${o.timeout} s`],
   ]);
   log('answers', `${prober.answers.length} in all`);
-  return summary.settled !== null ? 0 : 1;
+  const held = !o.hold || holdSummary(ctx, health, sent, cycle);
+  return summary.settled !== null && held && restored ? 0 : 1;
+}
+
+// M3: with the hold route written, the VM stopped, then started, each as soon as the application's service reads what it
+// should or within --timeout, its health read all along by the switch's poller. The times of the requests, null for a start
+// not asked (interrupted).
+async function holdCycle(ctx, vmUrl, health) {
+  const { options: o, request, log } = ctx;
+  const act = async (action) => {
+    const asked = ctx.at();
+    log(action, `sent: ${o.instance}`);
+    await waitOperation(request, await request('POST', `${vmUrl}/${action}`));
+    log('operation', `done, ${core.delta(ctx.at() - asked)} after the request`);
+    return asked;
+  };
+  const until = async (asked, level) => {
+    const deadline = ctx.at() + o.timeout * 1000;
+    while (!ctx.interrupted() && ctx.at() < deadline && core.levelAt(health.samples, o.from, asked, level) === null) await ctx.wait(500);
+  };
+  const stopped = await act('stop');
+  await until(stopped, 'unhealthy');
+  if (ctx.interrupted()) {
+    log('vm', `${o.instance} is still stopped: node gcp/tools/measure.mjs vm start`);
+    return { stopped, started: null };
+  }
+  const started = await act('start');
+  await until(started, 'healthy');
+  return { stopped, started };
+}
+
+// M3's answer: the application's service unhealthy after the stop and healthy after the start, and what its health read since
+// the swap (`no status`: the hold route did not keep it health checked). True when it is so.
+function holdSummary(ctx, health, sent, cycle) {
+  const { options: o, log } = ctx;
+  const after = (t, asked, what) => `${o.from} ${what}, ${core.delta(t - asked)} after the ${what === 'healthy' ? 'start' : 'stop'}`;
+  const reached = (asked, level) => (asked === null || asked === undefined ? null : core.levelAt(health.samples, o.from, asked, level));
+  const unhealthy = reached(cycle?.stopped, 'unhealthy');
+  const healthy = reached(cycle?.started, 'healthy');
+  printSummary(log, [
+    ['hold unhealthy', unhealthy, unhealthy === null ? null : after(unhealthy, cycle.stopped, 'unhealthy'), `no: ${o.from} not read as unhealthy within ${o.timeout} s of the stop`],
+    ['hold healthy', healthy, healthy === null ? null : after(healthy, cycle.started, 'healthy'), `no: ${o.from} not read as healthy within ${o.timeout} s of the start`],
+  ]);
+  const counts = core.levelCounts(health.samples, o.from, sent);
+  log('hold reads', `${o.from} since the update: ${counts.healthy} healthy, ${counts.unhealthy} unhealthy, ${counts['no status']} no status`);
+  return unhealthy !== null && healthy !== null;
+}
+
+// The URL map as it was, whatever became of the measure; false when it could not be (the command must not end on a success).
+async function restoreMap(ctx, mapUrl, map) {
+  const { options: o, request, log } = ctx;
+  try {
+    log('restore', `sent: ${o.urlMap} as it was`);
+    const { fingerprint } = await request('GET', mapUrl);
+    await waitOperation(request, await request('PUT', mapUrl, { ...map, fingerprint }));
+    log('restore', `done: ${o.urlMap} as it was`);
+    return true;
+  } catch (e) {
+    log('restore', `failed: ${e.message}: ${o.urlMap} stays swapped, with its hold route`);
+    return false;
+  }
 }
 
 // vm and mig: the action sent, then the instances' status (every second), the backend service's health (every 2 s) and

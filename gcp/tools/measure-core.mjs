@@ -1,6 +1,6 @@
 // The pure parts of G0's measuring tool (measure.mjs; vision docs/specs/2026-10-29-google-cloud-design.md, section 12):
 // the arguments, the timeline's lines, the load balancer's answers and their summary, the health and status
-// transitions, the URL map's switch (plain or weighted), the token cache and Cloud Monitoring's points. No I/O here:
+// transitions, the URL map's switch (plain, weighted or with the hold route), the token cache and Cloud Monitoring's points. No I/O here:
 // measure.mjs calls Google and the load balancer.
 import { parseArgs as parse } from 'node:util';
 
@@ -13,6 +13,9 @@ export const USAGE = `Usage: node gcp/tools/measure.mjs <command> [options]
          [--url-map dmt-dev] [--url https://gcp.dev.dormeto.com/] [--region <region>] [--baseline 5]
          [--weighted] (--to at weight 1000 and --from at 0 in a weighted route, instead of --to as the default
          service; without it, a weighted route is cleared)
+         [--hold] [--instance dmt-demo] [--zone europe-west1-b] (M3: a path rule /_dormeto/backend/* to --from written
+         beside the plain swap; once settled, the VM stopped and started under both services' getHealth, then the map
+         restored to what it was)
   health                                    a backend service's health every 2 s, each change printed
          [--backend-service dmt-demo-app] [--region <region>] [--for 120] (seconds)
   vm stop|start|suspend|resume              the demo VM, through Compute Engine
@@ -77,6 +80,7 @@ const OPTIONS = {
   filter: { flag: 'filter', kind: 'text', default: null },
   weighted: { flag: 'weighted', kind: 'boolean', default: false },
   duration: { flag: 'for', kind: 'positive', default: 120 },
+  hold: { flag: 'hold', kind: 'boolean', default: false },
   replicas: { flag: 'replicas', kind: 'count', required: true },
   cluster: { flag: 'cluster', kind: 'name', default: 'dmt-demo-gke' },
   namespace: { flag: 'namespace', kind: 'name', default: 'default' },
@@ -84,7 +88,7 @@ const OPTIONS = {
 };
 
 const COMMANDS = {
-  switch: { actions: null, timeout: 300, options: ['project', 'configuration', 'timeout', 'settle', 'region', 'urlMap', 'from', 'to', 'url', 'baseline', 'weighted'] },
+  switch: { actions: null, timeout: 300, options: ['project', 'configuration', 'timeout', 'settle', 'region', 'urlMap', 'from', 'to', 'url', 'baseline', 'weighted', 'hold', 'instance', 'zone'] },
   vm: { actions: ACTIONS, timeout: 600, options: ['project', 'configuration', 'timeout', 'settle', 'region', 'zone', 'instance', 'group', 'backendService', 'url'] },
   mig: {
     actions: ACTIONS,
@@ -176,7 +180,11 @@ export function parseArgs(argv) {
       result[key] = value(key, spec.kinds?.[key] ?? OPTIONS[key].kind, raw);
     }
   }
-  if (command === 'switch' && result.from === result.to) throw new UsageError('switch: --from and --to are the same backend service');
+  if (command === 'switch') {
+    if (result.from === result.to) throw new UsageError('switch: --from and --to are the same backend service');
+    if (result.hold && result.weighted) throw new UsageError('switch: --hold writes a plain swap, not --weighted');
+    if (!result.hold && (parsed.values.instance !== undefined || parsed.values.zone !== undefined)) throw new UsageError('switch: --instance and --zone go with --hold');
+  }
   return { command, action, options: result };
 }
 
@@ -323,13 +331,17 @@ const WEIGHT = 1000;
 // It serves `from` when it names it as its service, or gives it a weight above 0 (Google leaves a 0 out) in its
 // weighted route. Plain: `to` as its service, the weighted route cleared (only one of the two can be set). Weighted:
 // `to` at 1000 and `from` at 0, the service cleared.
-function switchHolder(holder, serviceKey, actionKey, path, { from, to, weighted }, paths) {
-  const action = holder?.[actionKey];
+function servedRef(holder, serviceKey, actionKey, from) {
   const plain = holder?.[serviceKey];
-  const ref = typeof plain === 'string' && lastSegment(plain) === from ? plain
-    : (action?.weightedBackendServices ?? [])
+  return typeof plain === 'string' && lastSegment(plain) === from ? plain
+    : (holder?.[actionKey]?.weightedBackendServices ?? [])
       .find((w) => typeof w.backendService === 'string' && lastSegment(w.backendService) === from && (w.weight ?? 0) > 0)
       ?.backendService;
+}
+
+function switchHolder(holder, serviceKey, actionKey, path, { from, to, weighted }, paths) {
+  const action = holder?.[actionKey];
+  const ref = servedRef(holder, serviceKey, actionKey, from);
   if (!ref) return;
   const toRef = `${ref.slice(0, ref.lastIndexOf('/') + 1)}${to}`;
   if (weighted) {
@@ -360,6 +372,62 @@ export function switchService(map, from, to, { weighted = false } = {}) {
     (pm.pathRules ?? []).forEach((rule, j) => switchHolder(rule, 'service', 'routeAction', `pathMatchers[${i}].pathRules[${j}].`, options, paths));
   });
   return { map: copy, paths };
+}
+
+// M3's hold route (spec 2026-10-30, section 7): a backend service no forwarding rule reaches is not health checked, so a path
+// rule keeps the application's in the map through a swap. Ours for the time of `switch --hold`, which restores the map.
+const HOLD_PATH = '/_dormeto/backend/*';
+const HOLD_MATCHER = 'dormeto-hold';
+
+const matcherRef = (matcher, from) => servedRef(matcher, 'defaultService', 'defaultRouteAction', from)
+  ?? (matcher.pathRules ?? []).map((rule) => servedRef(rule, 'service', 'routeAction', from)).find(Boolean);
+
+// Why withHold can't write on the map, else null.
+export function holdProblem(map, from) {
+  for (const [i, matcher] of (map.pathMatchers ?? []).entries()) {
+    if (matcher.name === HOLD_MATCHER) return `the URL map ${map.name} already has a path matcher ${HOLD_MATCHER}: a run that did not restore it?`;
+    if ((matcher.pathRules ?? []).some((rule) => rule.paths?.includes(HOLD_PATH))) return `the URL map ${map.name} already has ${HOLD_PATH} at pathMatchers[${i}]: a run that did not restore it?`;
+    const routed = (matcher.routeRules ?? []).some((rule) => servedRef(rule, 'service', 'routeAction', from));
+    if ((matcher.routeRules ?? []).length > 0 && (routed || matcherRef(matcher, from))) {
+      return `the URL map ${map.name}'s pathMatchers[${i}] has route rules: --hold writes path rules only`;
+    }
+  }
+  return null;
+}
+
+// switchService's plain swap, with the hold route beside it: a path rule to `from` in each matcher naming it, and for the
+// map's default a host rule `*` and a matcher of its own (unless a host rule `*` leaves it unreachable). `holds`: where.
+export function withHold(map, from, to) {
+  const { map: copy, paths } = switchService(map, from, to);
+  const holds = [];
+  (map.pathMatchers ?? []).forEach((matcher, i) => {
+    const ref = matcherRef(matcher, from);
+    if (!ref) return;
+    copy.pathMatchers[i].pathRules = [...(copy.pathMatchers[i].pathRules ?? []), { paths: [HOLD_PATH], service: ref }];
+    holds.push(`pathMatchers[${i}].pathRules`);
+  });
+  const ref = servedRef(map, 'defaultService', 'defaultRouteAction', from);
+  if (ref && !(map.hostRules ?? []).some((rule) => rule.hosts?.includes('*'))) {
+    copy.pathMatchers = [...(copy.pathMatchers ?? []), {
+      name: HOLD_MATCHER,
+      defaultService: copy.defaultService,
+      ...(copy.defaultRouteAction ? { defaultRouteAction: copy.defaultRouteAction } : {}),
+      pathRules: [{ paths: [HOLD_PATH], service: ref }],
+    }];
+    copy.hostRules = [...(copy.hostRules ?? []), { hosts: ['*'], pathMatcher: HOLD_MATCHER }];
+    holds.push(`pathMatchers[${copy.pathMatchers.length - 1}].pathRules`);
+  }
+  return { map: copy, paths, holds };
+}
+
+// A backend service's level in the health's samples: when it was first read as `level` from `since` on (null: not yet).
+export const levelAt = (samples, name, since, level) => [...samples].sort((a, b) => a.t - b.t).find((s) => s.t >= since && s.states[name] === level)?.t ?? null;
+
+// How many reads of each level, from `since` on.
+export function levelCounts(samples, name, since) {
+  const counts = { healthy: 0, unhealthy: 0, 'no status': 0 };
+  for (const s of samples) if (s.t >= since && s.states[name] in counts) counts[s.states[name]] += 1;
+  return counts;
 }
 
 // gcloud's access token. `gcloud auth print-access-token` refreshes only a token within 5 minutes of its expiry, so

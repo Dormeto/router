@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { parseArgs } from '../tools/measure-core.mjs';
-import { createGoogle, runGke, runSql } from '../tools/measure.mjs';
+import { createGoogle, runGke, runSql, runSwitch } from '../tools/measure.mjs';
 
 function virtualTime() {
   let clock = 0;
@@ -277,4 +277,179 @@ test('a refusal from the cluster shows the Kubernetes Status\'s message, at its 
   t.after(() => { server.closeAllConnections(); server.close(); });
   const request = createGoogle({ get: async () => 'token', drop: () => {} });
   await assert.rejects(request('GET', `http://127.0.0.1:${server.address().port}/`), /403 GET .*: deployments\.apps "dmt-demo-gke" is forbidden: User cannot get/);
+});
+
+// --- switch --hold: M3 ---------------------------------------------------------------------------------------------------
+
+const VM = `${COMPUTE}/zones/europe-west1-b/instances/dmt-demo`;
+const GROUP = `${COMPUTE}/zones/europe-west1-b/instanceGroups/dmt-demo`;
+const CLASSIC_APP = 'dmt-demo-classic-app';
+const CLASSIC_STANDIN = 'dmt-demo-classic-standin';
+const service = (scope, name) => `${COMPUTE}/${scope}/backendServices/${name}`;
+const classicMap = () => ({ kind: 'compute#urlMap', id: '12', name: 'dmt-dev-classic', fingerprint: 'f0=', defaultService: service('global', CLASSIC_APP) });
+
+// A VM behind both backend services of a map. Its health follows its status with a delay; `level(status, reads)` overrides.
+function holdWorld({ scope = 'global', urlMap = 'dmt-dev-classic', from = CLASSIC_APP, to = CLASSIC_STANDIN, map = classicMap(), vm = 'RUNNING', reads = null, refuse = {} } = {}) {
+  const world = { map: structuredClone(map), vm, events: [], puts: [], putAt: null, changedAt: -Infinity, versions: 0 };
+  const LAG_MS = 6000;
+  world.google = (method, url, body, t) => {
+    const refused = refuse[`${method} ${url}`];
+    if (refused) throw refused(world);
+    if (method === 'GET' && (url === service(scope, from) || url === service(scope, to))) {
+      const isFrom = url === service(scope, from);
+      return { name: isFrom ? from : to, portName: isFrom ? 'app' : 'standin', selfLink: url, backends: [{ group: GROUP }] };
+    }
+    if (method === 'POST' && (url === `${service(scope, from)}/getHealth` || url === `${service(scope, to)}/getHealth`)) {
+      assert.deepEqual(body, { group: GROUP });
+      if (reads && url.includes(`/${from}/`)) return reads(world, t);
+      const settled = t - world.changedAt >= LAG_MS ? world.vm : (world.vm === 'RUNNING' ? 'TERMINATED' : 'RUNNING');
+      return { healthStatus: [{ instance: VM, ipAddress: '10.10.0.2', port: 80, healthState: settled === 'RUNNING' ? 'HEALTHY' : 'UNHEALTHY' }] };
+    }
+    const mapUrl = `${COMPUTE}/${scope}/urlMaps/${urlMap}`;
+    if (method === 'GET' && url === mapUrl) return world.map;
+    if (method === 'PUT' && url === mapUrl) {
+      assert.equal(body.fingerprint, world.map.fingerprint, 'a stale fingerprint is refused');
+      world.versions += 1;
+      world.map = { ...structuredClone(body), fingerprint: `f${world.versions}=` };
+      world.puts.push(structuredClone(body));
+      world.putAt ??= t;
+      world.events.push('map');
+      return { status: 'DONE' };
+    }
+    if (method === 'GET' && url === VM) return { name: 'dmt-demo', status: world.vm };
+    if (method === 'POST' && (url === `${VM}/stop` || url === `${VM}/start`)) {
+      const action = url.slice(url.lastIndexOf('/') + 1);
+      world.vm = action === 'stop' ? 'TERMINATED' : 'RUNNING';
+      world.changedAt = t;
+      world.events.push(action);
+      return { status: 'DONE' };
+    }
+    return unexpected(method, url);
+  };
+  // The load balancer: the app, then the stand-in 3 s after the update, nothing while the VM is down.
+  world.answer = (t) => {
+    if (world.vm !== 'RUNNING') return { status: 503, kind: 'http 503', instance: null, boot: null, error: null };
+    return { status: 200, kind: world.putAt !== null && t - world.putAt >= 3000 ? 'stand-in' : 'app', instance: 'dmt-demo', boot: 'b', error: null };
+  };
+  return world;
+}
+
+const holdArgs = (more = []) => ['switch', '--hold', '--url-map', 'dmt-dev-classic', '--url', 'http://203.0.113.7/', '--from', CLASSIC_APP, '--to', CLASSIC_STANDIN, '--settle', '3', '--baseline', '1', ...more];
+const holdRun = (world, argv = holdArgs()) => {
+  const run = contextOf(argv, { google: world.google, answer: world.answer });
+  return { ...run, code: run.time.drive(runSwitch(run.ctx)) };
+};
+
+test('switch --hold on a classic map: the swap and the hold route written, the VM stopped and started under getHealth, the map restored', async () => {
+  const world = holdWorld();
+  const { code, said } = holdRun(world);
+  assert.equal(await code, 0);
+  assert.deepEqual(world.events, ['map', 'stop', 'start', 'map']);
+  assert.deepEqual(world.puts[0], {
+    ...classicMap(),
+    defaultService: service('global', CLASSIC_STANDIN),
+    hostRules: [{ hosts: ['*'], pathMatcher: 'dormeto-hold' }],
+    pathMatchers: [{
+      name: 'dormeto-hold',
+      defaultService: service('global', CLASSIC_STANDIN),
+      pathRules: [{ paths: ['/_dormeto/backend/*'], service: service('global', CLASSIC_APP) }],
+    }],
+  });
+  assert.deepEqual(world.puts[1], { ...classicMap(), fingerprint: 'f1=' });
+  assert.ok(said('hold route')[0].includes('/_dormeto/backend/* to dmt-demo-classic-app'), said('hold route')[0]);
+  assert.deepEqual(said('health').filter((h) => /^\S+ (un)?healthy$/.test(h) && h.startsWith(CLASSIC_APP)), [`${CLASSIC_APP} healthy`, `${CLASSIC_APP} unhealthy`, `${CLASSIC_APP} healthy`]);
+  assert.ok(secondsOf(said('hold unhealthy')[0]) >= 6 && secondsOf(said('hold unhealthy')[0]) < 9, said('hold unhealthy')[0]);
+  assert.ok(secondsOf(said('hold healthy')[0]) >= 6 && secondsOf(said('hold healthy')[0]) < 9, said('hold healthy')[0]);
+  assert.match(said('hold reads')[0], /^dmt-demo-classic-app since the update: \d+ healthy, \d+ unhealthy, 0 no status$/);
+  assert.equal(said('restore').at(-1).startsWith('done: dmt-dev-classic as it was'), true, said('restore').join(', '));
+});
+
+test('switch --hold on the regional map: the same, in its region', async () => {
+  const from = 'dmt-demo-regional-app';
+  const to = 'dmt-demo-regional-standin';
+  const scope = 'regions/europe-west1';
+  const map = { name: 'dmt-dev-regional', fingerprint: 'f0=', defaultService: service(scope, from) };
+  const world = holdWorld({ scope, urlMap: 'dmt-dev-regional', from, to, map });
+  const { code } = holdRun(world, ['switch', '--hold', '--region', 'europe-west1', '--url-map', 'dmt-dev-regional', '--url', 'http://regional.gcp.dev.dormeto.com/', '--from', from, '--to', to, '--settle', '3', '--baseline', '1']);
+  assert.equal(await code, 0);
+  assert.deepEqual(world.events, ['map', 'stop', 'start', 'map']);
+  assert.equal(world.puts[0].pathMatchers[0].pathRules[0].service, service(scope, from));
+  assert.deepEqual(world.puts[1], { ...map, fingerprint: 'f1=' });
+});
+
+test('switch --hold: a backend service with no status through the swap is M3\'s failure: exit 1, the VM back, the map restored', async () => {
+  const world = holdWorld({ reads: () => ({ kind: 'compute#backendServiceGroupHealth' }) });
+  const { code, said } = holdRun(world, holdArgs(['--timeout', '40']));
+  assert.equal(await code, 1);
+  assert.deepEqual(world.events, ['map', 'stop', 'start', 'map']);
+  assert.deepEqual(said('hold unhealthy'), ['no: dmt-demo-classic-app not read as unhealthy within 40 s of the stop']);
+  assert.deepEqual(said('hold healthy'), ['no: dmt-demo-classic-app not read as healthy within 40 s of the start']);
+  assert.match(said('hold reads')[0], /0 healthy, 0 unhealthy, [1-9]\d* no status$/);
+  assert.equal(world.vm, 'RUNNING');
+  assert.deepEqual(world.puts.at(-1), { ...classicMap(), fingerprint: 'f1=' });
+});
+
+test('switch --hold: a refused stop still restores the map, and the refusal is what the command ends on', async () => {
+  const world = holdWorld({ refuse: { [`POST ${VM}/stop`]: () => new Error('Google: 403 forbidden') } });
+  const { code } = holdRun(world);
+  await assert.rejects(code, /403 forbidden/);
+  assert.deepEqual(world.events, ['map', 'map']);
+  assert.deepEqual(world.puts.at(-1), { ...classicMap(), fingerprint: 'f1=' });
+});
+
+test('switch --hold: a swap that does not settle stops no VM, and restores the map', async () => {
+  const world = holdWorld();
+  const { answer } = world;
+  world.answer = (t) => ({ ...answer(t), kind: 'app' });
+  const { code, said } = holdRun(world, holdArgs(['--timeout', '20']));
+  assert.equal(await code, 1);
+  assert.deepEqual(world.events, ['map', 'map']);
+  assert.match(said('settled')[0], /^no: not 3 stand-in in a row within 20 s/);
+});
+
+test('switch --hold: interrupted with the VM stopped, the map restored and the VM said to be down', async () => {
+  const world = holdWorld();
+  const run = contextOf(holdArgs(), { google: world.google, answer: world.answer });
+  run.ctx.interrupted = () => world.vm === 'TERMINATED';
+  assert.equal(await run.time.drive(runSwitch(run.ctx)), 1);
+  assert.deepEqual(world.events, ['map', 'stop', 'map']);
+  assert.deepEqual(run.said('vm'), ['dmt-demo is still stopped: node gcp/tools/measure.mjs vm start']);
+});
+
+test('switch --hold: a map that cannot be restored says so, by name, and exits 1', async () => {
+  const world = holdWorld();
+  const mapUrl = `${COMPUTE}/global/urlMaps/dmt-dev-classic`;
+  const put = world.google;
+  world.google = (method, url, body, t) => {
+    if (method === 'PUT' && url === mapUrl && world.events.includes('start')) throw new Error('Google: 503 unavailable');
+    return put(method, url, body, t);
+  };
+  const { code, said } = holdRun(world);
+  assert.equal(await code, 1);
+  assert.match(said('restore').at(-1), /^failed: Google: 503 unavailable: dmt-dev-classic stays swapped/);
+});
+
+test('switch --hold refuses before any change: the VM not running, a hold route already there, or route rules', async () => {
+  const notRunning = holdWorld({ vm: 'TERMINATED' });
+  await assert.rejects(holdRun(notRunning).code, /dmt-demo is TERMINATED: --hold stops and starts a running VM/);
+  assert.deepEqual(notRunning.events, []);
+
+  const hold = { name: 'm', defaultService: service('global', CLASSIC_APP), pathRules: [{ paths: ['/_dormeto/backend/*'], service: service('global', CLASSIC_APP) }] };
+  const already = holdWorld({ map: { ...classicMap(), hostRules: [{ hosts: ['*'], pathMatcher: 'm' }], pathMatchers: [hold] } });
+  await assert.rejects(holdRun(already).code, /already has \/_dormeto\/backend\/\*/);
+  assert.deepEqual(already.events, []);
+
+  const routed = { name: 'm', defaultService: service('global', CLASSIC_APP), routeRules: [{ priority: 1, matchRules: [{ prefixMatch: '/a' }], service: service('global', CLASSIC_APP) }] };
+  const rules = holdWorld({ map: { ...classicMap(), hostRules: [{ hosts: ['a.example'], pathMatcher: 'm' }], pathMatchers: [routed] } });
+  await assert.rejects(holdRun(rules).code, /route rules/);
+  assert.deepEqual(rules.events, []);
+});
+
+test('switch without --hold: the map stays swapped, no VM is touched', async () => {
+  const world = holdWorld();
+  const { code } = holdRun(world, ['switch', '--url-map', 'dmt-dev-classic', '--url', 'http://203.0.113.7/', '--from', CLASSIC_APP, '--to', CLASSIC_STANDIN, '--settle', '3', '--baseline', '1']);
+  assert.equal(await code, 0);
+  assert.deepEqual(world.events, ['map']);
+  assert.equal(world.map.defaultService, service('global', CLASSIC_STANDIN));
+  assert.equal(world.map.hostRules, undefined);
 });

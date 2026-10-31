@@ -12,22 +12,18 @@ const ACTIONS = ['stop', 'start', 'suspend', 'resume'];
 
 export const CALLS = {
   getInstance: ['compute.instances.get'],
-  listInstances: ['compute.instances.list'],
-  getGroup: ['compute.instanceGroups.get'],
-  listGroupInstances: ['compute.instanceGroups.list'],
+  // Google's reference asks .get on the group of both list calls.
+  listGroupInstances: ['compute.instanceGroups.get', 'compute.instanceGroups.list'],
   getManagedGroup: ['compute.instanceGroupManagers.get'],
-  listManagedInstances: ['compute.instanceGroupManagers.list'],
+  listManagedInstances: ['compute.instanceGroupManagers.get', 'compute.instanceGroupManagers.list'],
   getAutoscaler: ['compute.autoscalers.get'],
   setAutoscalerMode: ['compute.autoscalers.update', 'compute.zoneOperations.get', 'compute.regionOperations.get'],
   getBackendService: ['compute.backendServices.get'],
-  listBackendServices: ['compute.backendServices.list'],
   getBackendServiceHealth: ['compute.backendServices.get'],
   insertBackendService: ['compute.backendServices.create', 'compute.backendServices.use', 'compute.regionNetworkEndpointGroups.use', 'compute.globalOperations.get'],
   deleteBackendService: ['compute.backendServices.delete', 'compute.globalOperations.get'],
-  getNetworkEndpointGroup: ['compute.regionNetworkEndpointGroups.get'],
   getZonalNetworkEndpointGroup: ['compute.networkEndpointGroups.get'],
   listNetworkEndpoints: ['compute.networkEndpointGroups.get'],
-  getHealthCheck: ['compute.healthChecks.get'],
   getMachineType: ['compute.machineTypes.get'],
   listForwardingRules: ['compute.globalForwardingRules.list'],
   listTargetHttpProxies: ['compute.targetHttpProxies.list'],
@@ -78,9 +74,7 @@ export function createCompute({ google, project, now = Date.now }) {
 
   const calls = {
     getInstance: (z, name) => google.request('GET', `${zone(z)}/instances/${e(name)}`),
-    listInstances: (z) => list(`${zone(z)}/instances`),
     // An unmanaged group's members (`instance` URLs and their `status`).
-    getGroup: (z, name) => google.request('GET', `${zone(z)}/instanceGroups/${e(name)}`),
     listGroupInstances: async (z, name) => (await google.request('POST', `${zone(z)}/instanceGroups/${e(name)}/listInstances`, { instanceState: 'ALL' })).items ?? [],
     getManagedGroup: (group) => google.request('GET', managedUrl(group)),
     listManagedInstances: async (group) => (await google.request('POST', `${managedUrl(group)}/listManagedInstances`)).managedInstances ?? [],
@@ -93,15 +87,12 @@ export function createCompute({ google, project, now = Date.now }) {
       { name: autoscaler.name, autoscalingPolicy: { mode } },
     )),
     getBackendService: (name) => google.request('GET', `${base}/global/backendServices/${e(name)}`),
-    listBackendServices: () => list(`${base}/global/backendServices`),
     getBackendServiceHealth: (name, group) => google.request('POST', `${base}/global/backendServices/${e(name)}/getHealth`, { group }),
     insertBackendService: async (body) => waited(await google.request('POST', `${base}/global/backendServices`, body)),
     deleteBackendService: async (name) => waited(await google.request('DELETE', `${base}/global/backendServices/${e(name)}`)),
-    getNetworkEndpointGroup: (region, name) => google.request('GET', `${base}/regions/${e(region)}/networkEndpointGroups/${e(name)}`),
     // A zonal NEG (`networkEndpointType`, `annotations`, `description`) and its endpoints (`networkEndpoint.instance`, `.ipAddress`, `.port`).
     getZonalNetworkEndpointGroup: (z, name) => google.request('GET', `${zone(z)}/networkEndpointGroups/${e(name)}`),
     listNetworkEndpoints: (z, name) => listEndpoints(`${zone(z)}/networkEndpointGroups/${e(name)}/listNetworkEndpoints`),
-    getHealthCheck: (name) => google.request('GET', `${base}/global/healthChecks/${e(name)}`),
     getMachineType: (z, name) => google.request('GET', `${zone(z)}/machineTypes/${e(name)}`),
     listForwardingRules: () => list(`${base}/global/forwardingRules`),
     listTargetHttpProxies: () => list(`${base}/global/targetHttpProxies`),

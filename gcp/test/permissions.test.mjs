@@ -42,12 +42,19 @@ test('dormetoRouter: every permission is named by a call of an adapter', async (
 });
 
 // What a call needs of what it names, though the call's own permission does not say so: a URL map's update needs .use on the backend
-// services it names, a backend service's insert .use on its NEG. Not to be trimmed for having no method of their own.
+// services it names, a backend service's insert .use on its NEG. Not to be trimmed for having no method of their own. An unmanaged
+// group's listInstances asks .get on the group, in Google's reference.
 test('dormetoRouter: what a call needs implicitly stays', async () => {
   const { roles } = JSON.parse(await readFile(new URL('../access.json', import.meta.url), 'utf8'));
-  for (const p of ['compute.backendServices.use', 'compute.regionBackendServices.use', 'compute.regionNetworkEndpointGroups.use', 'compute.networkEndpointGroups.get']) {
+  for (const p of ['compute.backendServices.use', 'compute.regionBackendServices.use', 'compute.regionNetworkEndpointGroups.use', 'compute.networkEndpointGroups.get', 'compute.instanceGroups.get']) {
     assert.ok(roles.dormetoRouter.permissions.includes(p), p);
   }
+});
+
+// Google's reference, for each: the group's list calls ask .get on the group, whatever their names say.
+test('a group\'s list calls name what Google\'s reference asks of them', () => {
+  assert.ok(compute.CALLS.listGroupInstances.includes('compute.instanceGroups.get'));
+  assert.ok(compute.CALLS.listManagedInstances.includes('compute.instanceGroupManagers.get'));
 });
 
 // Every call the onboarding and the offboarding make, seen by running them: one that CALLS does not name would escape the

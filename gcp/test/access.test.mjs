@@ -90,11 +90,10 @@ test('dormetoRouter holds spec section 4\'s permissions, exactly', async () => {
   const { roles } = await load();
   assert.deepEqual(sorted(roles.dormetoRouter.permissions), sorted([
     'compute.urlMaps.get', 'compute.urlMaps.list', 'compute.urlMaps.update',
-    'compute.backendServices.get', 'compute.backendServices.list', 'compute.backendServices.use', 'compute.backendServices.create', 'compute.backendServices.delete',
-    'compute.regionNetworkEndpointGroups.get', 'compute.regionNetworkEndpointGroups.use',
-    'compute.healthChecks.get',
+    'compute.backendServices.get', 'compute.backendServices.use', 'compute.backendServices.create', 'compute.backendServices.delete',
+    'compute.regionNetworkEndpointGroups.use',
     'compute.globalForwardingRules.list', 'compute.targetHttpProxies.list', 'compute.targetHttpsProxies.list',
-    'compute.instances.get', 'compute.instances.list',
+    'compute.instances.get',
     'compute.instanceGroups.get', 'compute.instanceGroups.list',
     'compute.instanceGroupManagers.get', 'compute.instanceGroupManagers.list',
     'compute.autoscalers.get', 'compute.autoscalers.update',

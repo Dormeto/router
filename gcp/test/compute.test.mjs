@@ -19,7 +19,6 @@ const REGIONAL = { kind: 'regional', location: 'europe-west1', name: 'mig' };
 // Each read: the call and the request it sends.
 const READS = [
   ['getInstance', ['europe-west1-b', 'vm'], 'GET', `${BASE}/zones/europe-west1-b/instances/vm`],
-  ['getGroup', ['europe-west1-b', 'ig'], 'GET', `${BASE}/zones/europe-west1-b/instanceGroups/ig`],
   ['listGroupInstances', ['europe-west1-b', 'ig'], 'POST', `${BASE}/zones/europe-west1-b/instanceGroups/ig/listInstances`, { instanceState: 'ALL' }],
   ['getManagedGroup', [ZONAL], 'GET', `${BASE}/zones/europe-west1-b/instanceGroupManagers/mig`],
   ['getManagedGroup', [REGIONAL], 'GET', `${BASE}/regions/europe-west1/instanceGroupManagers/mig`],
@@ -30,9 +29,7 @@ const READS = [
   ['getRegionBackendService', ['europe-west1', 'app'], 'GET', `${BASE}/regions/europe-west1/backendServices/app`],
   ['getRegionBackendServiceHealth', ['europe-west1', 'app', 'https://x/groups/ig'], 'POST', `${BASE}/regions/europe-west1/backendServices/app/getHealth`, { group: 'https://x/groups/ig' }],
   ['deleteRegionBackendService', ['europe-west1', 'waker'], 'DELETE', `${BASE}/regions/europe-west1/backendServices/waker`],
-  ['getNetworkEndpointGroup', ['europe-west1', 'neg'], 'GET', `${BASE}/regions/europe-west1/networkEndpointGroups/neg`],
   ['getZonalNetworkEndpointGroup', ['europe-west1-b', 'neg'], 'GET', `${BASE}/zones/europe-west1-b/networkEndpointGroups/neg`],
-  ['getHealthCheck', ['hc'], 'GET', `${BASE}/global/healthChecks/hc`],
   ['getMachineType', ['europe-west1-b', 'e2-small'], 'GET', `${BASE}/zones/europe-west1-b/machineTypes/e2-small`],
   ['deleteBackendService', ['waker'], 'DELETE', `${BASE}/global/backendServices/waker`],
 ];
@@ -45,10 +42,8 @@ for (const [fn, args, method, url, body] of READS) {
   });
 }
 
-test('listInstances, listBackendServices, the forwarding rules and the target proxies of both scopes page through the items', async () => {
+test('the forwarding rules and the target proxies of both scopes page through the items', async () => {
   const lists = [
-    ['listInstances', ['europe-west1-b'], `${BASE}/zones/europe-west1-b/instances`],
-    ['listBackendServices', [], `${BASE}/global/backendServices`],
     ['listForwardingRules', [], `${BASE}/global/forwardingRules`],
     ['listTargetHttpProxies', [], `${BASE}/global/targetHttpProxies`],
     ['listTargetHttpsProxies', [], `${BASE}/global/targetHttpsProxies`],
@@ -66,7 +61,7 @@ test('listInstances, listBackendServices, the forwarding rules and the target pr
 });
 
 test('a list without items is empty', async () => {
-  assert.deepEqual(await setup(() => ({})).compute.listBackendServices(), []);
+  assert.deepEqual(await setup(() => ({})).compute.listForwardingRules(), []);
 });
 
 test('listManagedInstances: the group\'s instances, zonal or regional', async () => {

@@ -100,7 +100,7 @@ const COMMANDS = {
   },
   metric: { actions: null, timeout: 900, options: ['project', 'configuration', 'timeout', 'urlMap', 'url', 'count', 'metric', 'filter'], kinds: { urlMap: 'urlMapLabel' } },
   health: { actions: null, options: ['project', 'configuration', 'region', 'backendService', 'duration'] },
-  // The NEG's VM and the GKE demo have no domain name: the address of their load balancer (terraform output optional).
+  // The NEG's VM and the GKE demo have no domain name: the address of their load balancer (the README reads it with gcloud).
   neg: {
     actions: ['stop', 'start'],
     timeout: 600,

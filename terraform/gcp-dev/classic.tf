@@ -1,5 +1,5 @@
 # A classic external Application Load Balancer (load balancing scheme EXTERNAL), HTTP only, on the demo VM's group:
-# http://<address in the outputs>/, for the measures of the swap (the classic one has no custom error response).
+# http://<its address>/ (the README reads it with gcloud), for the measures of the swap (the classic one has no custom error response).
 # Off by default (enable_classic). The backend services balance by utilization like every other of the group.
 resource "google_compute_backend_service" "classic" {
   for_each = var.enable_classic ? toset(["app", "standin"]) : toset([])

@@ -1,7 +1,7 @@
 # A VM in a zonal network endpoint group (GCE_VM_IP_PORT) behind a global backend service, for the measures of S3: does a
 # stopped VM keep its endpoint, and how it comes back healthy. A URL map of its own (the global one ignores its host
 # rules, so a host added there would not be applied), with its proxy, address and forwarding rule on port 80:
-# http://<address in the outputs>/. Off by default (enable_neg).
+# http://<its address>/ (the README reads it with gcloud). Off by default (enable_neg).
 resource "google_compute_instance" "neg" {
   count = var.enable_neg ? 1 : 0
 

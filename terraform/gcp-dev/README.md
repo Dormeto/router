@@ -99,7 +99,7 @@ hand. (1) Detach it: `gcloud compute backend-services remove-backend dmt-demo-gk
 terraform/gcp-dev/gke-demo.yaml` (the Service's NEG and the Gateway's load balancer go with it). (3) `plan -out` with
 `enable_gke` off, read it, apply the saved plan. Terraform has no dependency between the cluster and the backend service, so
 they are destroyed in parallel: a cluster deleted while the Service still exists leaves its NEG behind, and the NEG then
-blocks nothing but stays and costs nothing much; check `gcloud compute network-endpoint-groups list
+blocks nothing but stays. A leftover NEG costs nothing: check `gcloud compute network-endpoint-groups list
 --configuration=dormeto-dev` after the apply and delete a leftover `dmt-demo-gke` by hand.
 
 ### Measure the optional parts

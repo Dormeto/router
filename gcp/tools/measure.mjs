@@ -312,17 +312,16 @@ async function holdCycle(ctx, vmUrl, health) {
 // the swap (`no status`: the hold route did not keep it health checked). True when it is so.
 function holdSummary(ctx, health, sent, cycle) {
   const { options: o, log } = ctx;
-  const after = (t, asked, what) => `${o.from} ${what}, ${core.delta(t - asked)} after the ${what === 'healthy' ? 'start' : 'stop'}`;
-  const reached = (asked, level) => (asked === null || asked === undefined ? null : core.levelAt(health.samples, o.from, asked, level));
-  const unhealthy = reached(cycle?.stopped, 'unhealthy');
-  const healthy = reached(cycle?.started, 'healthy');
-  printSummary(log, [
-    ['hold unhealthy', unhealthy, unhealthy === null ? null : after(unhealthy, cycle.stopped, 'unhealthy'), `no: ${o.from} not read as unhealthy within ${o.timeout} s of the stop`],
-    ['hold healthy', healthy, healthy === null ? null : after(healthy, cycle.started, 'healthy'), `no: ${o.from} not read as healthy within ${o.timeout} s of the start`],
-  ]);
+  const row = (what, level, asked, action) => {
+    const t = asked === null ? null : core.levelAt(health.samples, o.from, asked, level);
+    const none = asked === null ? `no: the VM was not asked to ${action}` : `no: ${o.from} not read as ${level} within ${o.timeout} s of the ${action}`;
+    return [what, t, t === null ? null : `${o.from} ${level}, ${core.delta(t - asked)} after the ${action}`, none];
+  };
+  const rows = [row('hold unhealthy', 'unhealthy', cycle?.stopped ?? null, 'stop'), row('hold healthy', 'healthy', cycle?.started ?? null, 'start')];
+  printSummary(log, rows);
   const counts = core.levelCounts(health.samples, o.from, sent);
   log('hold reads', `${o.from} since the update: ${counts.healthy} healthy, ${counts.unhealthy} unhealthy, ${counts['no status']} no status`);
-  return unhealthy !== null && healthy !== null;
+  return rows.every(([, t]) => t !== null);
 }
 
 // The URL map as it was, whatever became of the measure; false when it could not be (the command must not end on a success).

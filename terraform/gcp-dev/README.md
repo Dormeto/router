@@ -134,20 +134,24 @@ node gcp/tools/measure.mjs gke scale --replicas 0 --url "http://$(addr dmt-dev-g
 node gcp/tools/measure.mjs gke scale --replicas 1 --url "http://$(addr dmt-dev-gke)/"
 ```
 
-Each prints a timeline like the others. `switch --hold` (M3) writes beside the swap the path rule `/_dormeto/backend/*`
-to `--from`, with a host rule `*` and a matcher `dormeto-hold` where the map's default has none; once 20 answers settled it
-stops and starts the VM (`--instance`, `--zone`; the demo VM, whose stand-in goes with it), both services' `getHealth`
-printed as it changes, and puts the map back as it was, whatever became of the run. It answers whether the route keeps
-the service's health reported: `hold unhealthy` and `hold healthy` give the times, `hold reads` the reads of each level
-since the update (any `no status` is the route not doing its work), and it exits 1 without both. The route stays in the
-design whatever a read of an unreferenced service shows (spec section 7), so no command reads one here. `metric`'s `series` line prints every resource label as Google gives it, whose
-`backend_target_name` M5 reports, regional and classic (the classic one's `url_map_name` is presumed its plain name: a run
-with no series means it reads otherwise). `neg` adds the NEG's endpoints (kept or dropped while the VM is stopped);
-`sql` follows the operation the PATCH returns until it is `DONE`, whose end is the time, and prints `state` and
-`settings.activationPolicy` on each sample: Google documents `RUNNABLE` as "running, or has been stopped by owner" and
-`SUSPENDED` as unavailable for billing and the like, so no state tells a stop; `gke scale` reads
-the cluster's DNS endpoint from the Container API, reads and puts the Deployment's scale through it with gcloud's token,
-and follows the pods, the NEG's endpoints, the backend service's health and the answers.
+Each prints a timeline like the others, and:
+
+- `switch --hold` (M3) writes beside the swap the path rule `/_dormeto/backend/*` to `--from`, with a host rule `*` and a
+  matcher `dormeto-hold` where the map's default has none. Once the answers settled it stops and starts the VM
+  (`--instance`, `--zone`; the demo VM's stand-in goes with it), both services' `getHealth` printed as it changes, and puts
+  the map back as it was, whatever became of the run. It answers whether the route keeps the service's health reported:
+  `hold unhealthy` and `hold healthy` give the times, `hold reads` the reads of each level since the update (any `no
+  status` is the route not doing its work), and it exits 1 without both. The route stays in the design whatever a read of
+  an unreferenced service shows (spec section 7), so no command here reads one.
+- `metric`'s `series` line prints every resource label as Google gives it, whose `backend_target_name` M5 reports, regional
+  and classic. The classic one's `url_map_name` is presumed its plain name: a run with no series means it reads otherwise.
+- `neg` adds the NEG's endpoints (kept or dropped while the VM is stopped).
+- `sql` follows the operation the PATCH returns until it is `DONE`, whose end is the time, and prints `state` and
+  `settings.activationPolicy` on each sample: Google documents `RUNNABLE` as "running, or has been stopped by owner" and
+  `SUSPENDED` as unavailable for billing and the like, so no state tells a stop.
+- `gke scale` reads the cluster's DNS endpoint from the Container API, reads and puts the Deployment's scale through it with
+  gcloud's token, and follows the pods, the NEG's endpoints, the backend service's health and the answers: healthy is any
+  pod, by its address, and a scale to 0's none healthy counts only once an endpoint has gone.
 
 ### M7's tag
 

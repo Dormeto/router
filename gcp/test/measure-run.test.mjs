@@ -405,6 +405,7 @@ test('switch --hold: a swap that does not settle stops no VM, and restores the m
   assert.equal(await code, 1);
   assert.deepEqual(world.events, ['map', 'map']);
   assert.match(said('settled')[0], /^no: not 3 stand-in in a row within 20 s/);
+  assert.deepEqual(said('hold unhealthy'), ['no: the VM was not asked to stop']);
 });
 
 test('switch --hold: interrupted with the VM stopped, the map restored and the VM said to be down', async () => {
@@ -414,6 +415,7 @@ test('switch --hold: interrupted with the VM stopped, the map restored and the V
   assert.equal(await run.time.drive(runSwitch(run.ctx)), 1);
   assert.deepEqual(world.events, ['map', 'stop', 'map']);
   assert.deepEqual(run.said('vm'), ['dmt-demo is still stopped: node gcp/tools/measure.mjs vm start']);
+  assert.deepEqual(run.said('hold healthy'), ['no: the VM was not asked to start']);
 });
 
 test('switch --hold: a map that cannot be restored says so, by name, and exits 1', async () => {

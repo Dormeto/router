@@ -330,11 +330,13 @@
           "tag": [
             "cloudsql.instances.get",
             "cloudsql.instances.listTagBindings",
-            "cloudsql.instances.createTagBinding"
+            "cloudsql.instances.createTagBinding",
+            "datastore.entities.get"
           ]
         },
         "offboard": {
           "tag": [
+            "cloudsql.instances.get",
             "cloudsql.instances.listTagBindings",
             "cloudsql.instances.deleteTagBinding"
           ]

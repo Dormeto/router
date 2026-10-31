@@ -339,11 +339,13 @@
         "onboard": {
           "tag": [
             "cloudsql.instances.get",
+            "cloudsql.instances.listTagBindings",
             "cloudsql.instances.createTagBinding"
           ]
         },
         "offboard": {
           "tag": [
+            "cloudsql.instances.listTagBindings",
             "cloudsql.instances.deleteTagBinding"
           ]
         }
@@ -391,6 +393,7 @@
             "container.pods.list",
             "container.roles.get",
             "container.roleBindings.get",
+            "datastore.databases.get",
             "datastore.entities.get",
             "datastore.entities.update"
           ]
@@ -403,6 +406,7 @@
             "container.clusters.get",
             "container.roles.get",
             "container.roleBindings.get",
+            "datastore.databases.get",
             "datastore.entities.get",
             "datastore.entities.update"
           ]

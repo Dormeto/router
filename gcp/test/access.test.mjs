@@ -295,11 +295,11 @@ test('features: every grant names a role of its feature; roles are valid and non
 test('features: the operator permissions of Cloud SQL and GKE', async () => {
   const { features } = await load();
   assert.deepEqual(features['cloud-sql'].operator, {
-    onboard: { tag: ['cloudsql.instances.get', 'cloudsql.instances.createTagBinding'] },
-    offboard: { tag: ['cloudsql.instances.deleteTagBinding'] },
+    onboard: { tag: ['cloudsql.instances.get', 'cloudsql.instances.listTagBindings', 'cloudsql.instances.createTagBinding'] },
+    offboard: { tag: ['cloudsql.instances.listTagBindings', 'cloudsql.instances.deleteTagBinding'] },
   });
   assert.deepEqual(features.gke.operator, {
-    onboard: { cluster: ['container.clusters.get', 'container.roles.create', 'container.roles.update', 'container.roleBindings.create', 'container.roleBindings.update', 'container.deployments.get', 'container.statefulSets.get', 'container.services.get', 'container.roles.escalate', 'container.roles.bind', 'container.clusters.connect', 'container.services.list', 'container.deployments.list', 'container.statefulSets.list', 'container.replicaSets.get', 'container.replicaSets.list', 'container.pods.list', 'container.roles.get', 'container.roleBindings.get', 'datastore.entities.get', 'datastore.entities.update'] },
-    offboard: { cluster: ['container.roles.delete', 'container.roleBindings.delete', 'container.clusters.connect', 'container.clusters.get', 'container.roles.get', 'container.roleBindings.get', 'datastore.entities.get', 'datastore.entities.update'] },
+    onboard: { cluster: ['container.clusters.get', 'container.roles.create', 'container.roles.update', 'container.roleBindings.create', 'container.roleBindings.update', 'container.deployments.get', 'container.statefulSets.get', 'container.services.get', 'container.roles.escalate', 'container.roles.bind', 'container.clusters.connect', 'container.services.list', 'container.deployments.list', 'container.statefulSets.list', 'container.replicaSets.get', 'container.replicaSets.list', 'container.pods.list', 'container.roles.get', 'container.roleBindings.get', 'datastore.databases.get', 'datastore.entities.get', 'datastore.entities.update'] },
+    offboard: { cluster: ['container.roles.delete', 'container.roleBindings.delete', 'container.clusters.connect', 'container.clusters.get', 'container.roles.get', 'container.roleBindings.get', 'datastore.databases.get', 'datastore.entities.get', 'datastore.entities.update'] },
   });
 });

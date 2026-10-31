@@ -220,6 +220,14 @@ test('the operator\'s permissions of spec section 4, step by step', async () => 
   includesAll(o.offboard.tag, ['compute.instances.deleteTagBinding', 'resourcemanager.tagValueBindings.delete'], 'offboard.tag');
 });
 
+// A refused or interrupted onboarding takes back what it added (the CLI's undoBindings and undoGrant), for the operator `check` approved.
+test('onboard: its step holds the deletes of its undo, each with what it undoes', async () => {
+  const { operator: { onboard }, features } = await load();
+  includesAll(onboard.tag, ['resourcemanager.tagValueBindings.delete', 'compute.instances.deleteTagBinding', 'compute.instanceGroupManagers.deleteTagBinding'], 'onboard.tag');
+  includesAll(features['cloud-sql'].operator.onboard.tag, ['cloudsql.instances.deleteTagBinding'], 'cloud-sql onboard.tag');
+  includesAll(features.gke.operator.onboard.cluster, ['container.roles.delete', 'container.roleBindings.delete'], 'gke onboard.cluster');
+});
+
 test('uninstall: the matching deletes, step by step, and the project policy', async () => {
   const { operator: { uninstall: u } } = await load();
   includesAll(u.job, ['cloudscheduler.jobs.delete'], 'uninstall.job');
@@ -293,11 +301,11 @@ test('features: every grant names a role of its feature; roles are valid and non
 test('features: the operator permissions of Cloud SQL and GKE', async () => {
   const { features } = await load();
   assert.deepEqual(features['cloud-sql'].operator, {
-    onboard: { tag: ['cloudsql.instances.get', 'cloudsql.instances.listTagBindings', 'cloudsql.instances.createTagBinding', 'datastore.entities.get'] },
+    onboard: { tag: ['cloudsql.instances.get', 'cloudsql.instances.listTagBindings', 'cloudsql.instances.createTagBinding', 'cloudsql.instances.deleteTagBinding', 'datastore.entities.get'] },
     offboard: { tag: ['cloudsql.instances.get', 'cloudsql.instances.listTagBindings', 'cloudsql.instances.deleteTagBinding'] },
   });
   assert.deepEqual(features.gke.operator, {
-    onboard: { cluster: ['container.clusters.get', 'container.roles.create', 'container.roles.update', 'container.roleBindings.create', 'container.roleBindings.update', 'container.deployments.get', 'container.statefulSets.get', 'container.services.get', 'container.roles.escalate', 'container.roles.bind', 'container.clusters.connect', 'container.services.list', 'container.deployments.list', 'container.statefulSets.list', 'container.replicaSets.get', 'container.replicaSets.list', 'container.pods.list', 'container.roles.get', 'container.roleBindings.get', 'datastore.databases.get', 'datastore.entities.get', 'datastore.entities.update'] },
+    onboard: { cluster: ['container.clusters.get', 'container.roles.create', 'container.roles.update', 'container.roleBindings.create', 'container.roleBindings.update', 'container.deployments.get', 'container.statefulSets.get', 'container.services.get', 'container.roles.escalate', 'container.roles.bind', 'container.clusters.connect', 'container.services.list', 'container.deployments.list', 'container.statefulSets.list', 'container.replicaSets.get', 'container.replicaSets.list', 'container.pods.list', 'container.roles.get', 'container.roleBindings.get', 'container.roles.delete', 'container.roleBindings.delete', 'datastore.databases.get', 'datastore.entities.get', 'datastore.entities.update'] },
     offboard: { cluster: ['container.roles.delete', 'container.roleBindings.delete', 'container.roleBindings.update', 'container.roles.bind', 'container.clusters.connect', 'container.clusters.get', 'container.roles.get', 'container.roleBindings.get', 'datastore.databases.get', 'datastore.entities.get', 'datastore.entities.update'] },
   });
 });

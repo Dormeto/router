@@ -269,10 +269,13 @@
       "tag": [
         "resourcemanager.tagValues.get",
         "resourcemanager.tagValueBindings.create",
+        "resourcemanager.tagValueBindings.delete",
         "compute.instances.listTagBindings",
         "compute.instances.createTagBinding",
+        "compute.instances.deleteTagBinding",
         "compute.instanceGroupManagers.listTagBindings",
-        "compute.instanceGroupManagers.createTagBinding"
+        "compute.instanceGroupManagers.createTagBinding",
+        "compute.instanceGroupManagers.deleteTagBinding"
       ]
     },
     "offboard": {
@@ -331,6 +334,7 @@
             "cloudsql.instances.get",
             "cloudsql.instances.listTagBindings",
             "cloudsql.instances.createTagBinding",
+            "cloudsql.instances.deleteTagBinding",
             "datastore.entities.get"
           ]
         },
@@ -385,6 +389,8 @@
             "container.pods.list",
             "container.roles.get",
             "container.roleBindings.get",
+            "container.roles.delete",
+            "container.roleBindings.delete",
             "datastore.databases.get",
             "datastore.entities.get",
             "datastore.entities.update"

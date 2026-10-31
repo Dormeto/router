@@ -102,15 +102,30 @@ test('switch on a classic load balancer: a global URL map by its name and the ad
   assert.equal(options.url, 'http://203.0.113.7/');
 });
 
-test('health of a backend service in no URL map, and the metric of the classic and regional load balancers: the existing options', () => {
+test('health of a classic backend service, and the metric of the classic and regional load balancers', () => {
   const { options } = parseArgs(['health', '--backend-service', 'dmt-demo-classic-app', '--for', '60']);
   assert.equal(options.backendService, 'dmt-demo-classic-app');
   assert.equal(options.region, null);
   assert.equal(parseArgs(['metric', '--url-map', 'dmt-dev-classic', '--url', 'http://203.0.113.7/']).options.metric,
     'loadbalancing.googleapis.com/https/request_count');
-  const regional = parseArgs(['metric', '--url-map', 'dmt-dev-regional', '--url', 'http://regional.gcp.dev.dormeto.com/',
-    '--metric', 'loadbalancing.googleapis.com/https/external/regional/request_count', '--filter', 'resource.labels.backend_target_name="dmt-demo-regional-app"']);
+  const regional = parseArgs(['metric', '--url-map', 'URL_MAP/1034397096264_dmt-dev-regional', '--url', 'http://regional.gcp.dev.dormeto.com/',
+    '--metric', 'loadbalancing.googleapis.com/https/external/regional/request_count', '--filter', 'resource.type="http_external_regional_lb_rule"']);
   assert.equal(regional.options.metric, 'loadbalancing.googleapis.com/https/external/regional/request_count');
+});
+
+test('metric on the regional load balancer: its URL map as the metric labels it, URL_MAP/<project number>_<name>', () => {
+  const { options } = parseArgs(['metric', '--url-map', 'URL_MAP/1034397096264_dmt-dev-regional', '--url', 'http://regional.gcp.dev.dormeto.com/',
+    '--metric', 'loadbalancing.googleapis.com/https/external/regional/request_count']);
+  assert.equal(options.urlMap, 'URL_MAP/1034397096264_dmt-dev-regional');
+  assert.equal(metricFilter(options), 'metric.type = "loadbalancing.googleapis.com/https/external/regional/request_count" AND resource.labels.url_map_name = "URL_MAP/1034397096264_dmt-dev-regional"');
+  for (const argv of [
+    ['metric', '--url-map', 'URL_MAP/dmt-dev-regional'],
+    ['metric', '--url-map', 'URL_MAP/x_dmt-dev-regional'],
+    ['metric', '--url-map', 'URL_MAP/1_"'],
+    ['metric', '--url-map', 'url_map/1_dmt-dev-regional'],
+    // A switch names the map in Compute Engine's URL: the name alone.
+    ['switch', '--from', 'a', '--to', 'b', '--url-map', 'URL_MAP/1_dmt-dev-regional'],
+  ]) assert.throws(() => parseArgs(argv), UsageError, argv.join(' '));
 });
 
 test('neg: the VM of the zonal NEG, its group and backend service by default; the address is required', () => {

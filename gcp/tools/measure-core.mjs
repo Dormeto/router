@@ -37,6 +37,7 @@ export const USAGE = `Usage: node gcp/tools/measure.mjs <command> [options]
                                             map's series, over the points published before the requests
          [--url-map dmt-dev] [--url https://gcp.dev.dormeto.com/] [--count 20]
          [--metric loadbalancing.googleapis.com/https/request_count] [--filter <extra filter>]
+         (--url-map as the metric labels it: a regional URL map's is URL_MAP/<project number>_<name>)
 
   Every command: [--project dormeto-dev] [--configuration dormeto-dev] (gcloud's); all but health:
   [--timeout <seconds>]; switch, vm, mig, neg, gke: [--settle 20] (answers in a row from the new backend). --region: a
@@ -46,6 +47,8 @@ const ACTIONS = ['stop', 'start', 'suspend', 'resume'];
 const AUTOSCALER_MODES = ['ON', 'OFF', 'ONLY_SCALE_OUT'];
 
 const NAME = /^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$/;
+// A regional URL map as Cloud Monitoring labels it (G0).
+const URL_MAP_LABEL = /^URL_MAP\/[0-9]+_[a-z]([-a-z0-9]{0,61}[a-z0-9])?$/;
 const PROJECT = /^[a-z][-a-z0-9]{4,28}[a-z0-9]$/;
 const REGION = /^[a-z]+-[a-z]+[0-9]+$/;
 const ZONE = /^[a-z]+-[a-z]+[0-9]+-[a-z]$/;
@@ -89,7 +92,7 @@ const COMMANDS = {
     options: ['project', 'configuration', 'timeout', 'settle', 'region', 'zone', 'group', 'autoscaler', 'autoscalerMode', 'backendService', 'url'],
     defaults: { group: 'dmt-demo-mig', backendService: 'dmt-demo-mig-app', url: 'https://mig.gcp.dev.dormeto.com/' },
   },
-  metric: { actions: null, timeout: 900, options: ['project', 'configuration', 'timeout', 'urlMap', 'url', 'count', 'metric', 'filter'] },
+  metric: { actions: null, timeout: 900, options: ['project', 'configuration', 'timeout', 'urlMap', 'url', 'count', 'metric', 'filter'], kinds: { urlMap: 'urlMapLabel' } },
   health: { actions: null, options: ['project', 'configuration', 'region', 'backendService', 'duration'] },
   // The NEG's VM and the GKE demo have no domain name: the address of their load balancer (terraform output optional).
   neg: {
@@ -127,6 +130,7 @@ function value(key, kind, raw) {
       return url.href;
     }
     case 'name': return NAME.test(raw) ? raw : fail('a Compute Engine name');
+    case 'urlMapLabel': return NAME.test(raw) || URL_MAP_LABEL.test(raw) ? raw : fail('a URL map\'s name, or a regional one\'s label, URL_MAP/<project number>_<name>');
     case 'project': return PROJECT.test(raw) ? raw : fail('a project ID');
     case 'region': return REGION.test(raw) ? raw : fail('a region such as europe-west1');
     case 'zone': return ZONE.test(raw) ? raw : fail('a zone such as europe-west1-b');
@@ -169,7 +173,7 @@ export function parseArgs(argv) {
       if (OPTIONS[key].required || spec.required?.includes(key)) throw new UsageError(`${command}: --${OPTIONS[key].flag} is required`);
       result[key] = key === 'timeout' ? spec.timeout : (spec.defaults?.[key] ?? OPTIONS[key].default ?? null);
     } else {
-      result[key] = value(key, OPTIONS[key].kind, raw);
+      result[key] = value(key, spec.kinds?.[key] ?? OPTIONS[key].kind, raw);
     }
   }
   if (command === 'switch' && result.from === result.to) throw new UsageError('switch: --from and --to are the same backend service');
@@ -445,7 +449,8 @@ export function pointsOf(response) {
   });
 }
 
-// The metric's series: its type, the URL map's (each load balancer's resource has `url_map_name`), and an extra filter.
+// The metric's series: its type, the URL map's (each load balancer's resource has `url_map_name`, a regional one's reading
+// URL_MAP/<project number>_<name>), and an extra filter.
 export const metricFilter = ({ metric, urlMap, filter }) =>
   `metric.type = "${metric}" AND resource.labels.url_map_name = "${urlMap}"${filter ? ` AND ${filter}` : ''}`;
 

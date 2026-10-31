@@ -115,6 +115,10 @@ node gcp/tools/measure.mjs switch --url-map dmt-dev-classic --url "http://$(addr
 node gcp/tools/measure.mjs health --backend-service dmt-demo-classic-app --for 120
 node gcp/tools/measure.mjs metric --url-map dmt-dev-classic --url "http://$(addr dmt-dev-classic)/" \
   --metric loadbalancing.googleapis.com/https/request_count
+# The regional request count (M5): its URL map as the metric labels it
+number="$(gcloud projects describe dormeto-dev --format='value(projectNumber)' --configuration=dormeto-dev)"
+node gcp/tools/measure.mjs metric --url-map "URL_MAP/${number}_dmt-dev-regional" --url http://regional.gcp.dev.dormeto.com/ \
+  --metric loadbalancing.googleapis.com/https/external/regional/request_count
 # S5: Cloud SQL stopped and started by its activation policy, until its operation is done; state and policy read every 10 s (M6)
 node gcp/tools/measure.mjs sql stop
 node gcp/tools/measure.mjs sql start
@@ -123,7 +127,9 @@ node gcp/tools/measure.mjs gke scale --replicas 0 --url "http://$(addr dmt-dev-g
 node gcp/tools/measure.mjs gke scale --replicas 1 --url "http://$(addr dmt-dev-gke)/"
 ```
 
-Each prints a timeline like the others. `neg` adds the NEG's endpoints (kept or dropped while the VM is stopped);
+Each prints a timeline like the others. `metric`'s `series` line prints every resource label as Google gives it, whose
+`backend_target_name` M5 reports, regional and classic (the classic one's `url_map_name` is presumed its plain name: a run
+with no series means it reads otherwise). `neg` adds the NEG's endpoints (kept or dropped while the VM is stopped);
 `sql` follows the operation the PATCH returns until it is `DONE`, whose end is the time, and prints `state` and
 `settings.activationPolicy` on each sample: Google documents `RUNNABLE` as "running, or has been stopped by owner" and
 `SUSPENDED` as unavailable for billing and the like, so no state tells a stop; `gke scale` reads
@@ -229,13 +235,18 @@ refusal, 2 on a bad flag. Run each several times (G0: five). `--help` lists ever
    default `dmt-dev`), 20 requests, then the metric read every 10 s until its points count them: the delay, and the
    series' exact metric and resource labels. Only what a point adds to the points published before the requests
    counts; a point covers a minute, so other traffic in the requests' minute would count, and nothing else should
-   probe the load balancer meanwhile. For the regional load balancer, its URL map and its own metric:
+   probe the load balancer meanwhile. For the regional load balancer, its own metric, and its URL map as that metric
+   labels it, `URL_MAP/<project number>_<name>` (G0: its plain name matches nothing):
 
    ```
    node gcp/tools/measure.mjs metric
-   node gcp/tools/measure.mjs metric --url-map dmt-dev-regional --url http://regional.gcp.dev.dormeto.com/ \
+   number="$(gcloud projects describe dormeto-dev --format='value(projectNumber)' --configuration=dormeto-dev)"
+   node gcp/tools/measure.mjs metric --url-map "URL_MAP/${number}_dmt-dev-regional" --url http://regional.gcp.dev.dormeto.com/ \
      --metric loadbalancing.googleapis.com/https/external/regional/request_count
    ```
+
+   M5 reads `backend_target_name`'s real form, regional and classic, in the timeline's `series` line, which prints every
+   resource label as Google gives it: so don't `--filter` on that label before reading it.
 
 7. **The health of a backend service out of service** (the nap): `health` reads a backend service's health every 2 s
    for `--for` seconds and prints each change, per instance and for the service, then how long each state lasted;

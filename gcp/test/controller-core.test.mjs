@@ -1614,3 +1614,25 @@ test('a second refreshLists task for a list the first just refreshed downloads n
   assert.deepEqual(await t.controller.refreshLists(['scanners']), { results: [] });
   assert.equal(downloads, 1);
 });
+
+// --- A zonal NEG's VM -----------------------------------------------------------------------------------------------------
+
+test('a zonal NEG\'s VM: healthyCount asks about the NEG, a nap stops the VM, a wake starts it', async () => {
+  const neg = `${V1}/zones/${ZONE}/networkEndpointGroups/neg`;
+  const { w, core, onboarding } = worldOf((world) => {
+    world.negs.neg = { endpoints: ['neg-vm'] };
+    world.vms['neg-vm'] = { id: '4001', status: 'RUNNING' };
+    world.services.app.backends = [{ group: neg }];
+  });
+  await onboarding.onboard({ urlMap: 'lb', backendService: 'app', id: 'demo', settings: {} });
+  const napped = await core.nap('demo');
+  assert.equal(napped.state, STATES.ASLEEP);
+  assert.equal(w.vms['neg-vm'].status, 'SUSPENDED');
+  assert.ok(w.changes.includes('suspend neg-vm') || w.changes.includes('stop neg-vm'), w.changes.join());
+  const wakeId = await core.beginWake('demo', STATES.ASLEEP, 'test');
+  const woke = await core.wake('demo', wakeId);
+  assert.equal(woke.state, STATES.AWAKE);
+  assert.equal(w.vms['neg-vm'].status, 'RUNNING');
+  assert.ok(w.healthGroups.length > 0);
+  assert.deepEqual([...new Set(w.healthGroups)], [neg]);
+});

@@ -40,6 +40,8 @@ export const defaults = () => ({
   },
   unmanaged: { ig: ['vm-a'] },
   managed: {},
+  // Zonal NEGs by name: `{ zone?, type?, endpoints: [instance name | {ipAddress}], ...fields of the NEG }`.
+  negs: {},
   vms: { 'vm-a': { id: '1001', status: 'RUNNING' } },
   machineTypes: { 'e2-small': { name: 'e2-small', memoryMb: 2048 } },
   autoscalers: {},
@@ -51,7 +53,7 @@ const notFound = (what) => new GoogleError(`Google: ${what}: 404 not found`, { c
 // `world.store`: another store than the one here, such as the real one over a fake Firestore.
 export function setup(change = () => {}) {
   const clock = fakeClock();
-  const w = { ...defaults(), changes: [], tasks: [], fail: {}, on: {}, logs: [], used: new Set() };
+  const w = { ...defaults(), changes: [], tasks: [], healthGroups: [], fail: {}, on: {}, logs: [], used: new Set() };
   change(w);
   const instance = (name) => {
     const vm = w.vms[name];
@@ -95,7 +97,9 @@ export function setup(change = () => {}) {
       delete w.services[name];
       return done(`delete ${name}`);
     }],
-    ['POST', /^global\/backendServices\/([^/]+)\/getHealth$/, () => ({
+    ['POST', /^global\/backendServices\/([^/]+)\/getHealth$/, (_, body) => ({
+      // `w.healthGroups`: the groups (or NEGs) asked about, in order.
+      ...(w.healthGroups.push(body.group), {}),
       healthStatus: [{ healthState: Object.values(w.vms).some((vm) => vm.status === 'RUNNING') ? 'HEALTHY' : 'UNHEALTHY' }],
     })],
     ['GET', /^zones\/[^/]+\/instances\/([^/]+)$/, ([name]) => instance(name)],
@@ -110,6 +114,16 @@ export function setup(change = () => {}) {
     ['POST', /^zones\/[^/]+\/instanceGroups\/([^/]+)\/listInstances$/, ([name]) => ({
       items: w.unmanaged[name].map((vm) => ({ instance: vmUrl(vm, w.vms[vm]?.zone), status: w.vms[vm]?.status })),
     })],
+    ['GET', /^zones\/([^/]+)\/networkEndpointGroups\/([^/]+)$/, ([zone, name]) => {
+      const { endpoints, zone: own = ZONE, type = 'GCE_VM_IP_PORT', ...fields } = w.negs[name] ?? {};
+      if (!w.negs[name] || own !== zone) throw notFound(`network endpoint group ${name}`);
+      return { name, networkEndpointType: type, selfLink: `${V1}/zones/${zone}/networkEndpointGroups/${name}`, ...fields };
+    }],
+    ['POST', /^zones\/([^/]+)\/networkEndpointGroups\/([^/]+)\/listNetworkEndpoints(\?pageToken=.*)?$/, ([, name, page]) => {
+      const items = w.negs[name].endpoints.map((e) => ({ networkEndpoint: typeof e === 'string' ? { instance: e, ipAddress: '10.0.0.2', port: 80 } : e }));
+      // Two pages, to show that the adapter follows the token.
+      return page ? { items: items.slice(1) } : { items: items.slice(0, 1), ...(items.length > 1 ? { nextPageToken: 'second' } : {}) };
+    }],
     ['GET', /^(zones|regions)\/([^/]+)\/instanceGroupManagers\/([^/]+)$/, ([kind, location, name]) => {
       const { members, ...group } = managed(kind, location, name);
       return { name, selfLink: `${V1}/${kind}/${location}/instanceGroupManagers/${name}`, ...group };

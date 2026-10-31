@@ -18,6 +18,12 @@ const NAME = /^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$/;
 const NAME_MAX = 63;
 const LOCAL_SSD = 'SCRATCH';
 const INSTANCE_GROUP = /\/(zones|regions)\/([^/]+)\/instanceGroups\/([^/]+)$/;
+const NEG_URL = /\/(zones|regions|global)\/(?:([^/]+)\/)?networkEndpointGroups\/([^/]+)$/;
+const NEG_OF_VMS = 'GCE_VM_IP_PORT';
+// What GKE writes in the NEGs it makes (the annotations, or the description), and the prefix of their names.
+const GKE_NEG = /cluster-(uid|name)/i;
+const GKE_NEG_PREFIX = 'k8s1-';
+const MANAGED_GROUP_OWNER = /\/instanceGroupManagers\/([^/]+)$/;
 const DEFAULTS = { idleMinutes: 15, wakeTimeoutSeconds: 600, failedRetrySeconds: 60, pollSeconds: 3 };
 // What the CLI's flags set, with AWS's ranges (lambda/src/lib/onboarding.mjs).
 const RANGES = { idleMinutes: [5, 1440], waitSeconds: [5, 120] };
@@ -143,10 +149,32 @@ export function createOnboarding({ store, compute, urlmaps, core, config, now = 
     return problems;
   }
 
-  // A backend of the service: `{ reasons, members (its VMs' URLs), group? }`, `group` when it is a managed one.
+  // A zonal NEG of VMs: `{ reasons, members (its VMs' URLs), neg: true }`. Its VMs stay in it when stopped (measure M1).
+  async function negOf(zone, name, service) {
+    const neg = await compute.getZonalNetworkEndpointGroup(zone, name).catch(absent);
+    const refused = (reason) => ({ reasons: [reason], members: [], neg: true });
+    if (!neg) return refused(`network endpoint group ${name} of backend service ${service} not found: it was deleted, take it out of the backend service`);
+    if (neg.networkEndpointType !== NEG_OF_VMS) return refused(`network endpoint group ${name} of backend service ${service} has the type ${neg.networkEndpointType}: only ${NEG_OF_VMS} is supported, take it out of the backend service`);
+    if (name.startsWith(GKE_NEG_PREFIX) || GKE_NEG.test(neg.description ?? '') || Object.keys(neg.annotations ?? {}).some((key) => GKE_NEG.test(key))) {
+      return refused(`network endpoint group ${name} of backend service ${service} was made by GKE, its endpoints are pods: it needs --gke-cluster`);
+    }
+    const endpoints = (await compute.listNetworkEndpoints(zone, name)).map((item) => item.networkEndpoint ?? {});
+    if (!endpoints.length) return refused(`network endpoint group ${name} has no endpoint: add a VM to it, then onboard again`);
+    const bare = endpoints.filter((endpoint) => !endpoint.instance);
+    if (bare.length) return refused(`network endpoint group ${name} has an endpoint with no VM (${bare.map((endpoint) => endpoint.ipAddress).join(', ')}): only endpoints naming a VM are supported, replace it with one`);
+    return { reasons: [], neg: true, members: endpoints.map((endpoint) => `${COMPUTE}/projects/${config.project}/zones/${zone}/instances/${nameOf(endpoint.instance)}`) };
+  }
+
+  // A backend of the service: `{ reasons, members (its VMs' URLs), group?, neg? }`, `group` when it is a managed one, `neg` when
+  // it is a zonal NEG.
   async function backendOf({ group: url }, service) {
     const place = INSTANCE_GROUP.exec(url ?? '');
-    if (!place) return { reasons: [`backend ${nameOf(url ?? '')} of backend service ${service} is a network endpoint group: only instance groups are supported (unmanaged, managed zonal or regional)`], members: [] };
+    if (!place) {
+      const [, scope, zone, name] = NEG_URL.exec(url ?? '') ?? [];
+      if (scope === 'zones') return negOf(zone, name, service);
+      const where = scope === 'regions' ? 'regional network endpoint group (serverless, private service connect)' : scope === 'global' ? 'global network endpoint group (internet)' : 'network endpoint group';
+      return { reasons: [`backend ${nameOf(url ?? '')} of backend service ${service} is a ${where}: only zonal network endpoint groups of VMs and instance groups are supported`], members: [] };
+    }
     const [, scope, location, name] = place;
     const group = { kind: scope === 'regions' ? 'regional' : 'zonal', location, name };
     const managed = await compute.getManagedGroup(group).catch(absent);
@@ -186,6 +214,7 @@ export function createOnboarding({ store, compute, urlmaps, core, config, now = 
       if (holder) reasons.push(`managed group ${name} belongs to workload ${holder.workloadId}`);
     }
     const unmanaged = new Set(backends.filter((b) => !b.group).flatMap((b) => b.members));
+    const ofNegs = new Set(backends.filter((b) => b.neg).flatMap((b) => b.members));
     const machineTypes = new Map();
     // One read per VM, a VM in two groups of the service being one VM. A group lists a VM it is still creating.
     const read = await Promise.all([...new Set(backends.flatMap((b) => b.members))].map(async (url) => {
@@ -196,6 +225,8 @@ export function createOnboarding({ store, compute, urlmaps, core, config, now = 
     const vms = [];
     for (const { url, zone, vm, problems } of read.filter(Boolean)) {
       reasons.push(...problems);
+      const owner = ofNegs.has(url) && MANAGED_GROUP_OWNER.exec(vm.metadata?.items?.find((item) => item.key === 'created-by')?.value ?? '')?.[1];
+      if (owner) reasons.push(`VM ${vm.name} is a member of managed group ${owner}, which would repair it once stopped: put the managed group in the backend service instead of its VM in a network endpoint group`);
       if (!unmanaged.has(url)) continue;
       const holder = holderOf('vm', zone, vm.name);
       if (holder) reasons.push(`VM ${vm.name} belongs to workload ${holder.workloadId}`);

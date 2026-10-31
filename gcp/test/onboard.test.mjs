@@ -20,6 +20,13 @@ const withMig = (w, extra) => {
   w.services.app.backends = [{ group: `${V1}/zones/${ZONE}/instanceGroups/mig` }];
 };
 
+// The service's one backend is the zonal NEG `neg` (or `name`) of the VM `neg-vm`; `vm`: fields of that VM.
+const withNeg = (w, { name = 'neg', vm = {}, endpoints = ['neg-vm'], ...fields } = {}) => {
+  w.negs[name] = { endpoints, ...fields };
+  w.vms['neg-vm'] = { id: '4001', status: 'RUNNING', ...vm };
+  w.services.app.backends = [{ group: `${V1}/zones/${ZONE}/networkEndpointGroups/${name}` }];
+};
+
 // --- Section 7's refusals -----------------------------------------------------------------------------------------------
 
 const REFUSALS = [
@@ -44,7 +51,17 @@ const REFUSALS = [
     w.urlMaps.lb.hostRules.push({ hosts: ['*'], pathMatcher: 'm' });
   }, ['backend service app is named in URL map lb only by its default, which a host rule * hides: route to it in a path matcher, then onboard again']],
   ['a service in another URL map', (w) => { w.urlMaps.second = { name: 'second', defaultService: serviceUrl('app') }; }, ['backend service app is also named in URL map second: that load balancer would lose its backends during a nap; give it a backend service of its own']],
-  ['a network endpoint group backend', (w) => { w.services.app.backends = [{ group: `${V1}/zones/${ZONE}/networkEndpointGroups/neg` }]; }, ['backend neg of backend service app is a network endpoint group: only instance groups are supported (unmanaged, managed zonal or regional)']],
+  ['a regional network endpoint group backend', (w) => { w.services.app.backends = [{ group: `${V1}/regions/${REGION}/networkEndpointGroups/neg` }]; }, ['backend neg of backend service app is a regional network endpoint group (serverless, private service connect): only zonal network endpoint groups of VMs and instance groups are supported']],
+  ['a global network endpoint group backend', (w) => { w.services.app.backends = [{ group: `${V1}/global/networkEndpointGroups/neg` }]; }, ['backend neg of backend service app is a global network endpoint group (internet): only zonal network endpoint groups of VMs and instance groups are supported']],
+  ['a zonal NEG that is not of VMs', (w) => withNeg(w, { type: 'NON_GCP_PRIVATE_IP_PORT', endpoints: [{ ipAddress: '10.0.0.9', port: 80 }] }), ['network endpoint group neg of backend service app has the type NON_GCP_PRIVATE_IP_PORT: only GCE_VM_IP_PORT is supported, take it out of the backend service']],
+  ['a NEG without an endpoint', (w) => withNeg(w, { endpoints: [] }), ['network endpoint group neg has no endpoint: add a VM to it, then onboard again']],
+  ['a NEG endpoint that is a bare address', (w) => withNeg(w, { endpoints: ['neg-vm', { ipAddress: '10.0.0.9', port: 80 }] }), ['network endpoint group neg has an endpoint with no VM (10.0.0.9): only endpoints naming a VM are supported, replace it with one']],
+  ['a NEG whose VM a managed group made', (w) => withNeg(w, { vm: { metadata: { items: [{ key: 'created-by', value: `projects/1/zones/${ZONE}/instanceGroupManagers/mig` }] } } }), ['VM neg-vm is a member of managed group mig, which would repair it once stopped: put the managed group in the backend service instead of its VM in a network endpoint group']],
+  ['a NEG that GKE made, by its annotations', (w) => withNeg(w, { annotations: { 'cluster-name': 'c1' } }), ['network endpoint group neg of backend service app was made by GKE, its endpoints are pods: it needs --gke-cluster']],
+  ['a NEG that GKE made, by its description', (w) => withNeg(w, { description: '{"cluster-uid":"u1","namespace":"default","service-name":"s","port":"80"}' }), ['network endpoint group neg of backend service app was made by GKE, its endpoints are pods: it needs --gke-cluster']],
+  ['a NEG that GKE made, by its name', (w) => withNeg(w, { name: 'k8s1-1234-default-web-80-abcd' }), ['network endpoint group k8s1-1234-default-web-80-abcd of backend service app was made by GKE, its endpoints are pods: it needs --gke-cluster']],
+  ['a NEG that is not there', (w) => { w.services.app.backends = [{ group: `${V1}/zones/${ZONE}/networkEndpointGroups/gone` }]; }, ['network endpoint group gone of backend service app not found: it was deleted, take it out of the backend service']],
+  ['a GPU VM behind a NEG', (w) => withNeg(w, { vm: { guestAccelerators: [{ acceleratorCount: 1 }] } }), ['VM neg-vm has a GPU: GPU VMs are not supported, take it out of the backend service']],
   ['a service without a backend', (w) => { w.services.app.backends = []; }, ['backend service app has no backend: add an instance group, then onboard again']],
   ['no health check', (w) => { delete w.services.app.healthChecks; }, ['backend service app has no health check: a wake waits for a healthy instance, add one']],
   ['a GPU VM', (w) => { w.vms['vm-a'].guestAccelerators = [{ acceleratorCount: 1 }]; }, ['VM vm-a has a GPU: GPU VMs are not supported, take it out of the backend service']],
@@ -162,6 +179,57 @@ test('a VM in two unmanaged groups of the service is one VM', async () => {
     world.services.app.backends.push({ group: unmanagedUrl('second') });
   });
   assert.equal((await onboarding.dryRun(INPUT)).vms.length, 1);
+});
+
+test('dry run: the VMs of a zonal NEG are unmanaged VMs, as an unmanaged group\'s, read across the NEG\'s pages', async () => {
+  const { w, store, onboarding } = setup((world) => {
+    withNeg(world, { endpoints: ['neg-vm', 'neg-vm-2'] });
+    world.vms['neg-vm-2'] = { id: '4002', status: 'TERMINATED' };
+  });
+  const answer = await onboarding.dryRun(INPUT);
+  assert.deepEqual(answer, {
+    eligible: true,
+    reasons: [],
+    vms: [
+      { zone: ZONE, name: 'neg-vm', selfLink: `${V1}/zones/${ZONE}/instances/neg-vm`, id: '4001' },
+      { zone: ZONE, name: 'neg-vm-2', selfLink: `${V1}/zones/${ZONE}/instances/neg-vm-2`, id: '4002' },
+    ],
+    groups: [],
+  });
+  assert.deepEqual(w.changes, []);
+  assert.equal(store.configs.size, 0);
+  assert.ok(w.used.has('compute.listNetworkEndpoints'));
+});
+
+test('dry run: a VM named by a NEG and by an unmanaged group, or by two endpoints, is one VM', async () => {
+  const { onboarding } = setup((world) => {
+    withNeg(world, { endpoints: ['vm-a', 'vm-a'] });
+    world.services.app.backends.push({ group: unmanagedUrl('ig') });
+  });
+  const answer = await onboarding.dryRun(INPUT);
+  assert.deepEqual(answer.reasons, []);
+  assert.deepEqual(answer.vms.map((vm) => vm.name), ['vm-a']);
+});
+
+test('dry run: a NEG\'s VM is held by another workload, or a GPU, as an unmanaged group\'s', async () => {
+  const { store, onboarding } = setup((world) => withNeg(world, { vm: { disks: [{ type: 'SCRATCH' }] } }));
+  store.configs.set('first', { workloadId: 'first', backendService: 'other', backends: [{ kind: 'vm', location: ZONE, name: 'neg-vm', id: '4001' }] });
+  assert.deepEqual((await onboarding.dryRun(INPUT)).reasons, [
+    'VM neg-vm has a local SSD: a stop would lose its data, take it out of the backend service',
+    'VM neg-vm belongs to workload first',
+  ]);
+});
+
+test('onboard: a NEG\'s VMs are the workload\'s vm backends, beside a group\'s', async () => {
+  const { store, onboarding } = setup((world) => {
+    withNeg(world);
+    world.services.app.backends.push({ group: unmanagedUrl('ig') });
+  });
+  await onboarding.onboard(INPUT);
+  assert.deepEqual((await store.getConfig('demo')).backends, [
+    { kind: 'vm', location: ZONE, name: 'neg-vm', id: '4001' },
+    { kind: 'vm', location: ZONE, name: 'vm-a', id: '1001' },
+  ]);
 });
 
 // --- Its input ----------------------------------------------------------------------------------------------------------

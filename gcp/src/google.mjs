@@ -11,7 +11,7 @@ const REQUEST_TIMEOUT_MS = 150_000;
 const READ_TRIES = 3;
 const RETRY_PAUSE_MS = 1000;
 // The POSTs that only read. Never a change or a commit: what the first try did is not known.
-const READING_POST = /(\/(operations\/[^/]+\/wait|backendServices\/[^/]+\/getHealth|instanceGroupManagers\/[^/]+\/listManagedInstances|instanceGroups\/[^/]+\/listInstances)|\/documents:batchGet)$/;
+const READING_POST = /(\/(operations\/[^/]+\/wait|backendServices\/[^/]+\/getHealth|instanceGroupManagers\/[^/]+\/listManagedInstances|instanceGroups\/[^/]+\/listInstances|networkEndpointGroups\/[^/]+\/listNetworkEndpoints(\?[^/]*)?)|\/documents:batchGet)$/;
 
 // A GoogleError's reason when `waitCompute` gives up: the operation goes on, whatever becomes of it.
 export const OPERATION_NOT_DONE = 'OPERATION_NOT_DONE';

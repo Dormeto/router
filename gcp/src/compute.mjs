@@ -24,6 +24,8 @@ export const CALLS = {
   insertBackendService: ['compute.backendServices.create', 'compute.backendServices.use', 'compute.regionNetworkEndpointGroups.use', 'compute.globalOperations.get'],
   deleteBackendService: ['compute.backendServices.delete', 'compute.globalOperations.get'],
   getNetworkEndpointGroup: ['compute.regionNetworkEndpointGroups.get'],
+  getZonalNetworkEndpointGroup: ['compute.networkEndpointGroups.get'],
+  listNetworkEndpoints: ['compute.networkEndpointGroups.get'],
   getHealthCheck: ['compute.healthChecks.get'],
   getMachineType: ['compute.machineTypes.get'],
   listForwardingRules: ['compute.globalForwardingRules.list'],
@@ -47,6 +49,17 @@ export function createCompute({ google, project, now = Date.now }) {
     let page = '';
     do {
       const answer = await google.request('GET', page ? `${url}?pageToken=${e(page)}` : url);
+      items.push(...(answer.items ?? []));
+      page = answer.nextPageToken ?? '';
+    } while (page);
+    return items;
+  };
+  // A POST that only reads (google.mjs's READING_POST): the endpoints of a zonal NEG, page after page.
+  const listEndpoints = async (url) => {
+    const items = [];
+    let page = '';
+    do {
+      const answer = await google.request('POST', page ? `${url}?pageToken=${e(page)}` : url);
       items.push(...(answer.items ?? []));
       page = answer.nextPageToken ?? '';
     } while (page);
@@ -76,6 +89,9 @@ export function createCompute({ google, project, now = Date.now }) {
     insertBackendService: async (body) => waited(await google.request('POST', `${base}/global/backendServices`, body)),
     deleteBackendService: async (name) => waited(await google.request('DELETE', `${base}/global/backendServices/${e(name)}`)),
     getNetworkEndpointGroup: (region, name) => google.request('GET', `${base}/regions/${e(region)}/networkEndpointGroups/${e(name)}`),
+    // A zonal NEG (`networkEndpointType`, `annotations`, `description`) and its endpoints (`networkEndpoint.instance`, `.ipAddress`, `.port`).
+    getZonalNetworkEndpointGroup: (z, name) => google.request('GET', `${zone(z)}/networkEndpointGroups/${e(name)}`),
+    listNetworkEndpoints: (z, name) => listEndpoints(`${zone(z)}/networkEndpointGroups/${e(name)}/listNetworkEndpoints`),
     getHealthCheck: (name) => google.request('GET', `${base}/global/healthChecks/${e(name)}`),
     getMachineType: (z, name) => google.request('GET', `${zone(z)}/machineTypes/${e(name)}`),
     listForwardingRules: () => list(`${base}/global/forwardingRules`),

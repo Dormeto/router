@@ -28,6 +28,7 @@ const READS = [
   ['getBackendService', ['app'], 'GET', `${BASE}/global/backendServices/app`],
   ['getBackendServiceHealth', ['app', 'https://x/groups/ig'], 'POST', `${BASE}/global/backendServices/app/getHealth`, { group: 'https://x/groups/ig' }],
   ['getNetworkEndpointGroup', ['europe-west1', 'neg'], 'GET', `${BASE}/regions/europe-west1/networkEndpointGroups/neg`],
+  ['getZonalNetworkEndpointGroup', ['europe-west1-b', 'neg'], 'GET', `${BASE}/zones/europe-west1-b/networkEndpointGroups/neg`],
   ['getHealthCheck', ['hc'], 'GET', `${BASE}/global/healthChecks/hc`],
   ['getMachineType', ['europe-west1-b', 'e2-small'], 'GET', `${BASE}/zones/europe-west1-b/machineTypes/e2-small`],
   ['deleteBackendService', ['waker'], 'DELETE', `${BASE}/global/backendServices/waker`],
@@ -67,6 +68,16 @@ test('listManagedInstances: the group\'s instances, zonal or regional', async ()
   assert.deepEqual(await compute.listManagedInstances(REGIONAL), [{ instance: 'u', instanceStatus: 'RUNNING' }]);
   assert.deepEqual(calls[0], { method: 'POST', url: `${BASE}/regions/europe-west1/instanceGroupManagers/mig/listManagedInstances`, body: undefined });
   assert.deepEqual(await setup(() => ({})).compute.listManagedInstances(ZONAL), []);
+});
+
+test('listNetworkEndpoints: POST, paged by the query\'s pageToken, none when the NEG is empty', async () => {
+  const url = `${BASE}/zones/europe-west1-b/networkEndpointGroups/neg/listNetworkEndpoints`;
+  const { calls, compute } = setup((m, u) => (u.includes('pageToken=next')
+    ? { items: [{ networkEndpoint: { instance: 'b' } }] }
+    : { items: [{ networkEndpoint: { instance: 'a' } }], nextPageToken: 'next' }));
+  assert.deepEqual(await compute.listNetworkEndpoints('europe-west1-b', 'neg'), [{ networkEndpoint: { instance: 'a' } }, { networkEndpoint: { instance: 'b' } }]);
+  assert.deepEqual(calls.map((c) => [c.method, c.url]), [['POST', url], ['POST', `${url}?pageToken=next`]]);
+  assert.deepEqual(await setup(() => ({})).compute.listNetworkEndpoints('europe-west1-b', 'neg'), []);
 });
 
 for (const action of ['stop', 'start', 'suspend', 'resume']) {

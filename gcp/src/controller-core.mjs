@@ -436,7 +436,9 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
         await sleep(POLL_MS);
       }
       if (sw.kind === 'swap') {
-        // The wait counts in the wake's time. It must also fit the request, and is not cut short: the map has changed.
+        // The wait counts in the wake's time, and is not cut short: the map has changed. It must also fit the request, and this reserve
+        // holds it, not the write before it: a VM healthy late in the budget, with a write at its worst (up to 240 s), ends past the
+        // request's 1800 s. That heals: Cloud Tasks' retry or the check fails it, and the next wake finishes. The band R12 documents.
         if (now() >= Math.min(deadline, started + WAKE_BUDGET_MS - sw.waitMs)) throw failureError('timeout', 'a VM is healthy, but the wake timed out before the URL map could change');
         if (!(await isCurrent())) return superseded();
         await writeAwake(cfg);

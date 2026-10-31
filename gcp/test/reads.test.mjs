@@ -116,7 +116,10 @@ test('Firestore reads: a check, one AWAKE workload, 4', async () => {
   await store.putConfig('demo', {
     workloadId: 'demo', urlMap: 'lb', backendService: 'app', wakerBackendService: WAKER, backends: [{ kind: 'vm', location: ZONE, name: 'vm-a' }], idleMinutes: 15, wakeTimeoutSeconds: 600, failedRetrySeconds: 60, pollSeconds: 3,
   });
-  const { core } = worldOf((w) => { w.store = store; });
+  const { core } = worldOf((w) => {
+    w.store = store;
+    w.services[WAKER] = { name: WAKER, backends: [] };
+  });
   const out = await core.check();
   assert.deepEqual(out.map((r) => [r.workloadId, r.state]), [['demo', STATES.AWAKE]]);
   assert.equal(reads(), 4);

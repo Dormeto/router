@@ -86,6 +86,14 @@ export function regional(w) {
 
 const notFound = (what) => new GoogleError(`Google: ${what}: 404 not found`, { code: 404, status: 'NOT_FOUND', reason: 'notFound' });
 
+// Every backend service a URL map names, wherever it does: its defaults, its rules, their weights, its policies and tests.
+const SERVICE_KEYS = new Set(['defaultService', 'service', 'backendService', 'errorService']);
+const servicesNamed = (value) => {
+  if (Array.isArray(value)) return value.flatMap(servicesNamed);
+  if (!value || typeof value !== 'object') return [];
+  return Object.entries(value).flatMap(([key, field]) => (SERVICE_KEYS.has(key) && typeof field === 'string' ? [field] : servicesNamed(field)));
+};
+
 // `change(world)`: what differs from the defaults. `fail['<method> <path>']` refuses that call, `on[...]` runs before it.
 // `world.store`: another store than the one here, such as the real one over a fake Firestore.
 export function setup(change = () => {}) {
@@ -109,16 +117,35 @@ export function setup(change = () => {}) {
     return group;
   };
   const inRegion = (region) => w.regions[region] ?? { urlMaps: {}, httpsProxies: [], httpProxies: [], forwardingRules: [], services: {} };
+  // As Google: on the fingerprint read, every service named there in the map's scope, and a new fingerprint.
+  let writes = 0;
+  const putMap = (maps, services, scope, name, body) => {
+    if (!maps[name]) throw notFound(`URL map ${name}`);
+    if (body.fingerprint !== maps[name].fingerprint) throw new GoogleError(`Google: URL map ${name}: 412 the fingerprint is stale`, { code: 412, status: 'FAILED_PRECONDITION', reason: 'conditionNotMet' });
+    for (const url of servicesNamed(body)) {
+      const [, where, service] = /\/(global|regions\/[^/]+)\/backendServices\/([^/]+)$/.exec(url) ?? [];
+      if (where !== scope || !services[service]) throw new GoogleError(`Google: URL map ${name}: 400 ${url} is no backend service of ${scope}`, { code: 400, status: 'INVALID_ARGUMENT', reason: 'invalid' });
+    }
+    writes += 1;
+    maps[name] = { ...body, fingerprint: `written-${writes}` };
+    return done(`map ${name}`);
+  };
+  // Healthy when a VM of the asked group runs: a NEG's endpoints, else any VM. A classic service reads no status while none runs (M3).
+  const healthOf = (service, { group }) => {
+    w.healthGroups.push(group);
+    const neg = /\/networkEndpointGroups\/([^/]+)$/.exec(group)?.[1];
+    const vms = neg ? (w.negs[neg]?.endpoints ?? []).map((e) => w.vms[typeof e === 'string' ? e : e.instance]).filter(Boolean) : Object.values(w.vms);
+    const running = vms.some((vm) => vm.status === 'RUNNING');
+    if (!running && service?.loadBalancingScheme === 'EXTERNAL') return { kind: 'compute#backendServiceGroupHealth' };
+    return { healthStatus: [{ healthState: running ? 'HEALTHY' : 'UNHEALTHY' }] };
+  };
   const ROUTES = [
     ['GET', /^regions\/([^/]+)\/urlMaps$/, ([region]) => ({ items: Object.values(inRegion(region).urlMaps) })],
     ['GET', /^regions\/([^/]+)\/urlMaps\/([^/]+)$/, ([region, name]) => {
       if (!inRegion(region).urlMaps[name]) throw notFound(`URL map ${name}`);
       return inRegion(region).urlMaps[name];
     }],
-    ['PUT', /^regions\/([^/]+)\/urlMaps\/([^/]+)$/, ([region, name], body) => {
-      inRegion(region).urlMaps[name] = body;
-      return done(`map ${name}`);
-    }],
+    ['PUT', /^regions\/([^/]+)\/urlMaps\/([^/]+)$/, ([region, name], body) => putMap(inRegion(region).urlMaps, inRegion(region).services, `regions/${region}`, name, body)],
     ['GET', /^regions\/([^/]+)\/targetHttpsProxies$/, ([region]) => ({ items: inRegion(region).httpsProxies })],
     ['GET', /^regions\/([^/]+)\/targetHttpProxies$/, ([region]) => ({ items: inRegion(region).httpProxies })],
     ['GET', /^regions\/([^/]+)\/forwardingRules$/, ([region]) => ({ items: inRegion(region).forwardingRules })],
@@ -126,9 +153,7 @@ export function setup(change = () => {}) {
       if (!inRegion(region).services[name]) throw notFound(`backend service ${name}`);
       return inRegion(region).services[name];
     }],
-    ['POST', /^regions\/[^/]+\/backendServices\/[^/]+\/getHealth$/, () => ({
-      healthStatus: [{ healthState: Object.values(w.vms).some((vm) => vm.status === 'RUNNING') ? 'HEALTHY' : 'UNHEALTHY' }],
-    })],
+    ['POST', /^regions\/([^/]+)\/backendServices\/([^/]+)\/getHealth$/, ([region, name], body) => healthOf(inRegion(region).services[name], body)],
     ['POST', /^regions\/([^/]+)\/backendServices$/, ([region], body) => {
       inRegion(region).services[body.name] = body;
       return done(`create ${body.name}`);
@@ -143,10 +168,7 @@ export function setup(change = () => {}) {
       if (!w.urlMaps[name]) throw notFound(`URL map ${name}`);
       return w.urlMaps[name];
     }],
-    ['PUT', /^global\/urlMaps\/([^/]+)$/, ([name], body) => {
-      w.urlMaps[name] = body;
-      return done(`map ${name}`);
-    }],
+    ['PUT', /^global\/urlMaps\/([^/]+)$/, ([name], body) => putMap(w.urlMaps, w.services, 'global', name, body)],
     ['GET', /^global\/targetHttpsProxies$/, () => ({ items: w.httpsProxies })],
     ['GET', /^global\/targetHttpProxies$/, () => ({ items: w.httpProxies })],
     ['GET', /^global\/forwardingRules$/, () => ({ items: w.forwardingRules })],
@@ -163,13 +185,7 @@ export function setup(change = () => {}) {
       delete w.services[name];
       return done(`delete ${name}`);
     }],
-    // Healthy when a VM of the asked group runs: a NEG's endpoints, else any VM.
-    ['POST', /^global\/backendServices\/([^/]+)\/getHealth$/, (_, body) => {
-      w.healthGroups.push(body.group);
-      const neg = /\/networkEndpointGroups\/([^/]+)$/.exec(body.group)?.[1];
-      const vms = neg ? (w.negs[neg]?.endpoints ?? []).map((e) => w.vms[typeof e === 'string' ? e : e.instance]).filter(Boolean) : Object.values(w.vms);
-      return { healthStatus: [{ healthState: vms.some((vm) => vm.status === 'RUNNING') ? 'HEALTHY' : 'UNHEALTHY' }] };
-    }],
+    ['POST', /^global\/backendServices\/([^/]+)\/getHealth$/, ([name], body) => healthOf(w.services[name], body)],
     ['GET', /^zones\/[^/]+\/instances\/([^/]+)$/, ([name]) => instance(name)],
     ['POST', /^zones\/[^/]+\/instances\/([^/]+)\/(start|stop|suspend|resume)$/, ([name, action]) => {
       w.vms[name].status = STATUS[action];
@@ -278,8 +294,8 @@ export function setup(change = () => {}) {
     return call(...args);
   }]));
   const compute = recorded('compute', createCompute({ google, project: 'p', now: clock.now }));
-  const urlmaps = recorded('urlmaps', createUrlMaps({ google, project: 'p', now: clock.now }));
-  const regionalUrlmaps = recorded('regionalUrlmaps', createUrlMaps({ google, project: 'p', region: config.region, scope: 'regional', now: clock.now }));
+  const urlmaps = recorded('urlmaps', createUrlMaps({ google, project: 'p', now: clock.now, sleep: clock.sleep }));
+  const regionalUrlmaps = recorded('regionalUrlmaps', createUrlMaps({ google, project: 'p', region: config.region, scope: 'regional', now: clock.now, sleep: clock.sleep }));
   const tasks = {
     enqueue: async (task) => {
       if (w.fail.enqueue) throw w.fail.enqueue;
@@ -290,7 +306,7 @@ export function setup(change = () => {}) {
     store, compute, urlmaps, regionalUrlmaps, monitoring: { requestCount: async () => 0 }, tasks, config, now: clock.now, sleep: clock.sleep, newId: () => 'wake-1', log,
   });
   const onboarding = createOnboarding({ store, compute, urlmaps, regionalUrlmaps, core, config, now: clock.now, log });
-  return { w, clock, store, core, onboarding, config, log };
+  return { w, clock, store, core, onboarding, config, log, compute, urlmaps, regionalUrlmaps, google };
 }
 
 // The input of an onboarding of `app` as `demo`.

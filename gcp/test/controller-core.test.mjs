@@ -1715,7 +1715,7 @@ test('a schedule the router cannot read: logged, the workload as with none', asy
 
 // Twelve workloads on the same URL map, their VMs read through the world.
 function crowded(schedules) {
-  const world = worldOf();
+  const world = worldOf((w) => { w.services[WAKER] = { name: WAKER, backends: [] }; });
   for (const [workloadId, schedule] of Object.entries(schedules)) {
     world.store.configs.set(workloadId, { workloadId, urlMap: 'lb', backendService: 'app', wakerBackendService: WAKER, backends: [{ kind: 'vm', location: ZONE, name: 'vm-a' }], idleMinutes: 15, wakeTimeoutSeconds: 600 });
     world.store.runs.set(workloadId, { state: STATES.AWAKE, awakeSince: world.clock.now() - DAY });

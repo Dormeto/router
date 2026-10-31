@@ -13,6 +13,9 @@ const refused = (status, reason, message) => (err) => {
   return true;
 };
 
+// A map as it was, but for its fingerprint: Google changes it at each write.
+const assertSameMap = (actual, expected) => assert.deepEqual({ ...actual, fingerprint: null }, { ...expected, fingerprint: null });
+
 const mig = (extra = {}) => ({ kind: 'zonal', location: ZONE, id: '2001', members: ['mig-1'], ...extra });
 const withMig = (w, extra) => {
   w.managed.mig = mig(extra);
@@ -389,7 +392,7 @@ test('onboard: a failure leaves nothing behind (the NEG could not be uninstalled
   store.initRun = async () => { throw failure; };
   await assert.rejects(onboarding.onboard(INPUT), failure);
   assert.deepEqual(w.changes, [`create ${WAKER}`, 'map lb', 'map lb', `delete ${WAKER}`]);
-  assert.deepEqual(w.urlMaps.lb, original);
+  assertSameMap(w.urlMaps.lb, original);
   assert.equal(w.services[WAKER], undefined);
   assert.equal(store.configs.size, 0);
   assert.ok(w.logs.some((l) => l.event === 'OnboardUndone' && l.workloadId === 'demo'));
@@ -652,7 +655,7 @@ for (const [kind, world, mapOf, wakerUrl, appUrl, lb, timeout] of ONBOARDED) {
     w.changes.length = 0;
     await onboarding.offboard('demo');
     assert.deepEqual(w.changes, ['map lb', `delete ${WAKER}`]);
-    assert.deepEqual(mapOf(w), original);
+    assertSameMap(mapOf(w), original);
     assert.equal(store.configs.size, 0);
   });
 
@@ -665,7 +668,7 @@ for (const [kind, world, mapOf, wakerUrl, appUrl, lb, timeout] of ONBOARDED) {
     w.changes.length = 0;
     await onboarding.offboard('demo', { force: true });
     assert.deepEqual(w.changes, ['map lb', `delete ${WAKER}`]);
-    assert.deepEqual(mapOf(w), original);
+    assertSameMap(mapOf(w), original);
   });
 
   test(`onboard ${kind}: a failure leaves nothing behind, map and waker`, async () => {
@@ -675,7 +678,7 @@ for (const [kind, world, mapOf, wakerUrl, appUrl, lb, timeout] of ONBOARDED) {
     store.initRun = async () => { throw failure; };
     await assert.rejects(onboarding.onboard(INPUT), failure);
     assert.deepEqual(w.changes, [`create ${WAKER}`, 'map lb', 'map lb', `delete ${WAKER}`]);
-    assert.deepEqual(mapOf(w), original);
+    assertSameMap(mapOf(w), original);
     assert.equal(store.configs.size, 0);
     assert.ok(w.logs.some((l) => l.event === 'OnboardUndone'));
   });
@@ -704,7 +707,7 @@ for (const [kind, world, mapOf, wakerUrl, appUrl, lb, timeout] of ONBOARDED) {
     assert.equal(held.name, 'dormeto-default');
     assert.deepEqual(held.pathRules, [{ paths: ['/_dormeto/*'], service: wakerUrl }, { paths: ['/_dormeto/backend/*'], service: appUrl }]);
     await onboarding.offboard('demo');
-    assert.deepEqual(mapOf(w), original);
+    assertSameMap(mapOf(w), original);
   });
 }
 
@@ -719,7 +722,7 @@ test('onboard regional: with route rules, the hold route at priority 0, the wake
   assert.deepEqual(rules.find((r) => r.priority === 0), { priority: 0, matchRules: [{ prefixMatch: '/_dormeto/backend/' }], service: regionalUrl('app') });
   assert.deepEqual(rules.find((r) => r.priority === 1), { priority: 1, matchRules: [{ prefixMatch: '/_dormeto/' }], service: REGIONAL_WAKER_URL });
   await onboarding.offboard('demo');
-  assert.deepEqual(inRegion(w).urlMaps.lb, original);
+  assertSameMap(inRegion(w).urlMaps.lb, original);
 });
 
 test('onboard global: no lb written, no hold route, one header, whether found or said', async () => {
@@ -785,7 +788,7 @@ for (const [kind, world, lowest] of [['regional', regional, 160], ['classic', cl
     const wakeId = await core.beginWake('demo', STATES.ASLEEP, 'operator');
     assert.equal((await core.wake('demo', wakeId)).state, STATES.AWAKE);
     assert.deepEqual(w.changes, ['start vm-a', 'map lb']);
-    assert.deepEqual(mapOf(), onboarded);
+    assertSameMap(mapOf(), onboarded);
     assert.equal(store.runs.get('demo').state, STATES.AWAKE);
   });
 
@@ -808,7 +811,7 @@ for (const [kind, world, lowest] of [['regional', regional, 160], ['classic', cl
     await onboarding.onboard(INPUT);
     await core.nap('demo');
     await onboarding.offboard('demo');
-    assert.deepEqual(mapOf(), original);
+    assertSameMap(mapOf(), original);
     assert.equal(store.configs.has('demo'), false);
   });
 }
@@ -830,7 +833,7 @@ test('offboard an awake workload: the route and the policy go in one update, the
   w.changes.length = 0;
   await onboarding.offboard('demo');
   assert.deepEqual(w.changes, ['map lb', `delete ${WAKER}`]);
-  assert.deepEqual(w.urlMaps.lb, original);
+  assertSameMap(w.urlMaps.lb, original);
   assert.equal(store.configs.size, 0);
   assert.equal(store.runs.size, 0);
   assert.deepEqual(w.tasks, []);
@@ -847,7 +850,7 @@ test('offboarding an asleep workload wakes it first: VMs up and healthy before a
   await onboarding.offboard('demo');
   assert.deepEqual(w.changes, ['start vm-a', 'map lb', 'map lb', `delete ${WAKER}`]);
   assert.equal(w.vms['vm-a'].status, 'RUNNING');
-  assert.deepEqual(w.urlMaps.lb, original);
+  assertSameMap(w.urlMaps.lb, original);
   assert.equal(store.runs.size, 0);
   assert.deepEqual(w.tasks, [], 'the wake runs in this request: the VMs are up when it answers');
 });
@@ -963,7 +966,7 @@ test('force: no wake; the map restored, the service and the documents gone, the 
   const { w, store, onboarding, original } = await asleepVmDeleted();
   assert.deepEqual(await onboarding.offboard('demo', { force: true }), { id: 'demo', left: [VM_A] });
   assert.deepEqual(w.changes, ['map lb', `delete ${WAKER}`]);
-  assert.deepEqual(w.urlMaps.lb, original);
+  assertSameMap(w.urlMaps.lb, original);
   assert.equal(w.services[WAKER], undefined);
   assert.equal(store.configs.size, 0);
   assert.equal(store.runs.size, 0);

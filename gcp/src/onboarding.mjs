@@ -353,7 +353,7 @@ export function createOnboarding({ store, compute, urlmaps, regionalUrlmaps, cor
     const waker = wakerUrl(name, lb);
     await mapsOf(lb).modify(urlMap, (map) => {
       const steps = isSwapped(lb)
-        ? [(m) => withoutSwap(m, backendService, waker), (m) => withoutHoldRoute(m, backendService), (m) => withoutWakerRoute(m, waker)]
+        ? [(m) => withoutSwap(m, backendService, waker), (m) => withoutHoldRoute(m, backendService, waker), (m) => withoutWakerRoute(m, waker)]
         : [(m) => withoutErrorPolicy(m, waker), (m) => withoutWakerRoute(m, waker)];
       return inOneUpdate(map, steps);
     }).catch(absent);
@@ -415,7 +415,7 @@ export function createOnboarding({ store, compute, urlmaps, regionalUrlmaps, cor
         }, lb);
       }
       await mapsOf(lb).modify(urlMap, (map) => inOneUpdate(map, isSwapped(lb)
-        ? [(m) => withWakerRoute(m, backendService, waker), (m) => withHoldRoute(m, backendService)]
+        ? [(m) => withWakerRoute(m, backendService, waker), (m) => withHoldRoute(m, backendService, waker)]
         : [(m) => withWakerRoute(m, backendService, waker)]));
       await store.putConfig(id, cfg);
       await store.initRun(id, now());

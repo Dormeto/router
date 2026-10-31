@@ -86,6 +86,7 @@ function setup({
   };
   const STATUS = { stop: 'TERMINATED', start: 'RUNNING', suspend: 'SUSPENDED', resume: 'RUNNING' };
   const health = () => {
+    if (world.healthRefused) throw world.healthRefused;
     world.healthReads += 1;
     const running = Object.values(world.vms).some((vm) => vm.status === 'RUNNING')
       || Object.values(world.groups).flat().some((m) => m.instanceStatus === 'RUNNING');
@@ -504,12 +505,20 @@ for (const [kind, lb, base, waitSeconds, healthScope] of SWAPS) {
     assert.equal(t.world.vms['vm-a'].status, 'RUNNING');
   });
 
-  test(`${kind} nap refused at its first write: nothing to unswap, the same wait all the same, then AWAKE`, async () => {
+  test(`${kind} nap refused at its first write: nothing to unswap, so no wait, AWAKE at once`, async () => {
     const t = swapSetup({ map: { ...awakeMap(), tests: [{ host: 'demo.example.com', path: '/', service: service('app') }] } });
     const out = await t.controller.nap('demo');
     assert.equal(out.aborted, true);
-    assert.deepEqual(t.world.calls, [`state ${STATES.NAPPING}`, WAIT, `state ${STATES.AWAKE}`]);
+    assert.deepEqual(t.world.calls, [`state ${STATES.NAPPING}`, `state ${STATES.AWAKE}`]);
+    assert.deepEqual(t.world.sleeps, []);
     assert.equal(t.world.puts, 0);
+  });
+
+  test(`${kind} nap refused at its first write on a map found swapped: unswapped, waited, only then AWAKE`, async () => {
+    const t = swapSetup({ map: { ...swappedMap(), tests: [{ host: 'demo.example.com', path: '/', service: service('app') }] } });
+    const out = await t.controller.nap('demo');
+    assert.equal(out.aborted, true);
+    assert.deepEqual(t.world.calls, [`state ${STATES.NAPPING}`, 'map unswapped', WAIT, `state ${STATES.AWAKE}`]);
   });
 
   test(`${kind} nap whose swap is lost with no room left: unswapped, waited, AWAKE (swap-lost), within the request`, async () => {
@@ -588,6 +597,76 @@ for (const [kind, lb, base, waitSeconds, healthScope] of SWAPS) {
     assert.equal(t.run().state, STATES.AWAKE);
     assert.equal(isSwapped(t.world.map), false);
     assert.equal(t.run().failure, undefined);
+  });
+
+  // A VM that cannot start must not keep visitors at the waker while another serves: under a swap, a wake is the only way out of FAILED.
+  const REFUSED_START = () => new GoogleError('Google: POST: 503 unavailable', { code: 503 });
+  const oneRefused = (more = {}) => {
+    const t = swapSetup({ cfg: { backends: [VM_A, VM_B] }, vms: { 'vm-a': { status: 'RUNNING' }, 'vm-b': { status: 'TERMINATED' } }, map: swappedMap(), ...more });
+    t.world.on['start vm-b'] = async () => { throw REFUSED_START(); };
+    return t;
+  };
+
+  test(`${kind} wake: a VM that cannot start while another is healthy: logged, unswapped, waited, AWAKE, and the checks leave it so`, async () => {
+    const t = oneRefused({ run: { state: STATES.FAILED, failedAt: START, consecutiveFailures: 3, failure: JSON.stringify({ kind: 'unknown' }) } });
+    assert.equal((await t.controller.check())[0].state, STATES.WAKING);
+    t.world.calls.length = 0;
+    const out = await t.controller.wake('demo', 'wake-2');
+    assert.equal(out.state, STATES.AWAKE);
+    assert.deepEqual(t.world.calls, ['start vm-b', 'map unswapped', WAIT, `state ${STATES.AWAKE}`]);
+    assert.equal(t.logged('BackendsNotWoken').length, 1);
+    assert.match(t.logged('BackendsNotWoken')[0].error, /503/);
+    assert.equal(t.logged('WakeFailed').length, 0);
+    assert.equal(t.run().failure, undefined);
+    assert.equal(t.run().consecutiveFailures, undefined);
+    assert.equal(t.run().wakeCount, 1);
+    assert.equal(isSwapped(t.world.map), false);
+
+    t.world.calls.length = 0;
+    t.clock.advance(MINUTE);
+    assert.equal((await t.controller.check())[0].state, STATES.AWAKE);
+    assert.deepEqual(t.world.calls, []);
+    assert.equal(t.world.tasks.length, 1);
+    assert.equal(t.run().wakeCount, 1);
+  });
+
+  test(`${kind} wake: a VM that cannot start with none healthy: FAILED with its error, the map left as it is, no wait`, async () => {
+    const t = swapSetup({ run: waking(START), vms: { 'vm-a': { status: 'TERMINATED' } }, map: swappedMap() });
+    t.world.on['start vm-a'] = async () => { throw REFUSED_START(); };
+    const out = await t.controller.wake('demo', 'w1');
+    assert.equal(out.state, STATES.FAILED);
+    assert.match(out.error, /503 unavailable/);
+    assert.equal(t.world.puts, 0);
+    assert.deepEqual(t.world.sleeps, []);
+    assert.equal(t.logged('BackendsNotWoken').length, 0);
+  });
+
+  test(`${kind} wake: a VM that cannot start and a health that cannot be read: FAILED with the VM's error`, async () => {
+    const t = oneRefused({ run: waking(START) });
+    t.world.healthRefused = new GoogleError('Google: POST: 500 health', { code: 500 });
+    const out = await t.controller.wake('demo', 'w1');
+    assert.equal(out.state, STATES.FAILED);
+    assert.match(out.error, /503 unavailable/);
+    assert.equal(t.world.puts, 0);
+  });
+
+  test(`${kind} wake: a VM that cannot start, the autoscaler's mode given back all the same, its record gone`, async () => {
+    const t = oneRefused({ run: waking(START, { autoscalers: [{ kind: 'zonal', location: ZONE, name: 'mig', mode: 'ON' }] }), autoscalers: { mig: 'OFF' } });
+    assert.equal((await t.controller.wake('demo', 'w1')).state, STATES.AWAKE);
+    assert.equal(t.world.autoscalers.mig, 'ON');
+    assert.equal(t.run().autoscalers, undefined);
+  });
+
+  test(`${kind} wake: a mode that cannot be given back with a VM healthy: AWAKE, the record kept, a later check gives it back`, async () => {
+    const t = swapSetup({ run: waking(START, { autoscalers: [{ kind: 'zonal', location: ZONE, name: 'mig', mode: 'ON' }] }), autoscalers: { mig: 'OFF' }, map: swappedMap() });
+    t.world.on['autoscaler mig ON'] = async () => { throw REFUSED_START(); };
+    assert.equal((await t.controller.wake('demo', 'w1')).state, STATES.AWAKE);
+    assert.deepEqual(t.run().autoscalers, [{ kind: 'zonal', location: ZONE, name: 'mig', mode: 'ON' }]);
+    assert.equal(t.logged('AutoscalersNotGivenBack').length, 1);
+    delete t.world.on['autoscaler mig ON'];
+    await t.controller.check();
+    assert.equal(t.world.autoscalers.mig, 'ON');
+    assert.equal(t.run().autoscalers, undefined);
   });
 
   test(`${kind} wake: a map that keeps changing is a failed wake, throttled`, async () => {
@@ -778,6 +857,15 @@ for (const [kind, lb, base, waitSeconds, healthScope] of SWAPS) {
     assert.deepEqual(t.world.calls, []);
   });
 }
+
+test('under the policy, a VM that cannot start with another healthy stays a failed wake, as in G1', async () => {
+  const t = setup({ run: waking(START), cfg: { backends: [VM_A, VM_B] }, vms: { 'vm-a': { status: 'RUNNING' }, 'vm-b': { status: 'TERMINATED' } }, map: asleepMap() });
+  t.world.on['start vm-b'] = async () => { throw new GoogleError('Google: POST: 503 unavailable', { code: 503 }); };
+  assert.equal((await t.controller.wake('demo', 'w1')).state, STATES.FAILED);
+  assert.equal(t.world.healthReads, 0);
+  assert.equal(hasPolicy(t.world.map), true);
+  assert.equal(t.logged('BackendsNotWoken').length, 0);
+});
 
 test('lb: { kind: \'global\' } is the policy, as no lb is', async () => {
   const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } }, cfg: { hibernate: false, lb: { kind: 'global' } } });

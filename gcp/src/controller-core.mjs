@@ -334,7 +334,16 @@ export function createController({ store, compute, urlmaps, regionalUrlmaps, mon
     const since = run.wakeStartedAt ?? started;
     const deadline = Math.min(since + cfg.wakeTimeoutSeconds * 1000, started + WAKE_BUDGET_MS);
     try {
-      await wakeBackends(cfg, run, deadline);
+      let givenBack = true;
+      try {
+        await wakeBackends(cfg, run, deadline);
+      } catch (err) {
+        // Under a swap a wake is the only way out of FAILED, and visitors stay at the waker until it ends: a backend that cannot
+        // start does not keep them from another that serves. The modes as on an external wake: a record stays until given back.
+        if (sw.kind !== 'swap' || (await healthyCount(cfg).catch(() => 0)) < 1) throw err;
+        log.warn('BackendsNotWoken', { workloadId, error: err.message });
+        givenBack = await gaveBackAutoscalers(workloadId, run);
+      }
       while ((await healthyCount(cfg)) < 1) {
         if (now() >= deadline) throw await noHealthyError(cfg);
         await sleep(POLL_MS);
@@ -352,7 +361,7 @@ export function createController({ store, compute, urlmaps, regionalUrlmaps, mon
       const awake = await transition(workloadId, {
         cond: { state: STATES.WAKING, wakeId },
         set: { state: STATES.AWAKE, awakeSince: now(), lastWake: { durationMs } },
-        remove: ['pendingWake', 'stopped', 'suspended', 'autoscalers', 'failure', 'consecutiveFailures', 'failedAt'],
+        remove: ['pendingWake', 'stopped', 'suspended', ...(givenBack ? ['autoscalers'] : []), 'failure', 'consecutiveFailures', 'failedAt'],
         event: { wakeId, durationMs },
       });
       if (!awake) return superseded();
@@ -489,11 +498,12 @@ export function createController({ store, compute, urlmaps, regionalUrlmaps, mon
     if (!napping) return { state: 'SKIPPED' };
     log.info('NapStarted', { workloadId });
     // Nothing is stopped yet, the application keeps serving. Under a swap, visitors are at the waker until the application's back
-    // has spread: unswapped and waited for before AWAKE, a wake asked meanwhile being part of it. The policy's removal follows it.
+    // has spread: unswapped and waited for before AWAKE, a wake asked meanwhile being part of it; nothing to unswap, no wait. The
+    // policy's removal follows it.
     const giveUp = async (cause, level, fields = {}) => {
       if (sw.kind === 'swap') {
-        await writeAwake(cfg);
-        await sleep(sw.waitMs);
+        const { paths } = await writeAwake(cfg);
+        if (paths.length) await sleep(sw.waitMs);
       }
       await transition(workloadId, {
         cond: { state: STATES.NAPPING }, set: { state: STATES.AWAKE, awakeSince: now() }, remove: ['pendingWake', 'stopping'], cause,

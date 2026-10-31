@@ -79,7 +79,8 @@ export function createGoogle(tokens) {
     } catch {
       json = { error: { message: res.text.slice(0, 300) } };
     }
-    if (!res.ok) throw new GoogleError(res.status, `${method} ${url}: ${json.error?.message ?? res.statusText}`);
+    // Kubernetes (gke scale) has its Status's `message` at the top.
+    if (!res.ok) throw new GoogleError(res.status, `${method} ${url}: ${json.error?.message ?? json.message ?? res.statusText}`);
     return json;
   };
 }
@@ -261,16 +262,17 @@ export async function runSwitch(ctx) {
 // vm and mig: the action sent, then the instances' status (every second), the backend service's health (every 2 s) and
 // the load balancer's answers (every 500 ms) until every instance reached the action's status, the health followed and
 // 20 answers in a row say so.
-async function runAction(ctx, { names, statusPoller, backendService, act, beforeAct = async () => {}, afterAct = async () => {}, finish = async () => {} }) {
+// `readStates`: the health's states, by instance unless said otherwise; `judge(since)`: what the summary reads them by.
+async function runAction(ctx, { names, statusPoller, backendService, act, beforeAct = async () => {}, afterAct = async () => {}, finish = async () => {}, readStates = () => readHealth(ctx.request, backendService), judge = () => ({}) }) {
   const { options: o, action, log } = ctx;
-  const health = startPoller(ctx, HEALTH_EVERY_MS, () => readHealth(ctx.request, backendService), reporter(ctx, 'health', {}, 'no status'));
+  const health = startPoller(ctx, HEALTH_EVERY_MS, readStates, reporter(ctx, 'health', {}, 'no status'));
   const prober = startProber(ctx, o.url, 500);
   await ctx.wait(1000);
 
   let since = null;
   let summary = null;
   const summarize = () => core.actionSummary(action, {
-    since, names, settle: o.settle, statuses: statusPoller.samples, health: health.samples, answers: prober.answers,
+    since, names, settle: o.settle, statuses: statusPoller.samples, health: health.samples, answers: prober.answers, ...judge(since),
   });
   try {
     if (!ctx.interrupted()) {
@@ -487,7 +489,8 @@ export async function runSql(ctx) {
 
 // gke scale --replicas <n>: the cluster's DNS endpoint from the Container API, the Deployment's scale read and put
 // through it with the caller's token (the owner is cluster-admin), then as a VM's action: the pods, the NEG's
-// endpoints, the backend service's health and the load balancer's answers (M9, M11's scale as the owner).
+// endpoints, the backend service's health and the load balancer's answers (M9, M11's scale as the owner). Healthy is any
+// pod, by its address; none healthy (a scale to 0) counts once an endpoint has gone.
 export async function runGke(ctx) {
   const { options: o, request, log } = ctx;
   const cluster = await request('GET', `${CONTAINER}/projects/${o.project}/locations/${o.zone}/clusters/${o.cluster}`);
@@ -517,6 +520,10 @@ export async function runGke(ctx) {
       names: [o.deployment],
       statusPoller,
       backendService,
+      readStates: async () => Object.assign({}, ...(await Promise.all(groups.map(
+        async (group) => core.endpointHealth(await request('POST', `${backendService.selfLink}/getHealth`, { group })),
+      )))),
+      judge: (requested) => ({ anyInstance: true, noneHealthyFrom: core.endpointGoneAt(endpoints.samples, firstEndpoints, requested) }),
       act: async () => {
         const scale = await request('GET', `${base}/scale`);
         scale.spec = { ...scale.spec, replicas: o.replicas };

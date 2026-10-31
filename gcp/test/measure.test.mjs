@@ -7,7 +7,7 @@ import http from 'node:http';
 import {
   UsageError, parseArgs, line, delta, pageOf, kindOfPort, summarize, changes, healthStates, managedStates, targets, actionSummary,
   switchService, healthLevel, changesSince, periods, tokenArgs, credentialOf, createTokens, withToken, pointsOf, metricFilter, counted,
-  USAGE, endpointStates, endpointAddresses, endpointRange, sqlState, sqlSummary, sqlOperationState, sqlOperationSeconds, podsState, scaleAction, deploymentPath,
+  USAGE, endpointStates, endpointAddresses, endpointRange, sqlState, sqlSummary, sqlOperationState, sqlOperationSeconds, endpointHealth, endpointGoneAt, podsState, scaleAction, deploymentPath,
 } from '../tools/measure-core.mjs';
 import { probe } from '../tools/measure.mjs';
 
@@ -848,6 +848,42 @@ test('the endpoints during an action: how many there were, at least, at most, an
   ];
   assert.deepEqual(endpointRange(samples, 500), { reads: 3, min: 0, max: 1, last: 1 });
   assert.deepEqual(endpointRange(samples, 9000), { reads: 0, min: null, max: null, last: null });
+});
+
+test('a GKE NEG\'s health: each pod by its address and port, the node\'s name being no key', () => {
+  assert.deepEqual(endpointHealth({
+    healthStatus: [
+      { instance: `${ZONE}/instances/gke-node-1`, ipAddress: '10.20.0.5', port: 8080, healthState: 'HEALTHY' },
+      { instance: `${ZONE}/instances/gke-node-1`, ipAddress: '10.20.0.6', port: 8080, healthState: 'UNHEALTHY' },
+    ],
+  }), { '10.20.0.5:8080': 'HEALTHY', '10.20.0.6:8080': 'UNHEALTHY' });
+  assert.deepEqual(endpointHealth({ kind: 'compute#backendServiceGroupHealth' }), {});
+});
+
+test('when an endpoint held before the action went; none to lose is at once; samples before it do not count', () => {
+  const held = { a: 'n', b: 'n' };
+  const samples = [{ t: 2000, states: { b: 'n' } }, { t: 1000, states: { a: 'n', b: 'n' } }, { t: 3000, states: {} }];
+  assert.equal(endpointGoneAt(samples, held, 500), 2000);
+  assert.equal(endpointGoneAt(samples, held, 2500), 3000);
+  assert.equal(endpointGoneAt(samples.slice(1, 2), held, 500), null);
+  assert.equal(endpointGoneAt(samples, {}, 500), 500);
+});
+
+test('a scale\'s summary reads any instance of the health, and none healthy from an endpoint gone', () => {
+  const run = {
+    since: 1000,
+    names: ['deployment'],
+    settle: 1,
+    statuses: [{ t: 2000, states: { deployment: 'STOPPED' } }],
+    health: [{ t: 1000, states: {} }, { t: 2000, states: { '10.0.0.1:8080': 'HEALTHY' } }, { t: 3000, states: {} }],
+    answers: [{ t: 1000, kind: 'app' }, { t: 3000, kind: 'http 503' }],
+    anyInstance: true,
+  };
+  assert.equal(actionSummary('stop', run).unhealthy, 1000);
+  assert.equal(actionSummary('stop', { ...run, noneHealthyFrom: 2500 }).unhealthy, 3000);
+  assert.equal(actionSummary('stop', { ...run, noneHealthyFrom: null }).unhealthy, null);
+  assert.equal(actionSummary('start', run).healthy, 2000);
+  assert.equal(actionSummary('start', { ...run, anyInstance: false }).healthy, null);
 });
 
 test('the demo pods\' page (Google\'s hello-app) is the app\'s answer, with the pod as its instance', () => {

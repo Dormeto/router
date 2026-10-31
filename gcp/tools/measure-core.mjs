@@ -297,12 +297,15 @@ export const targets = (action, states) => Object.keys(states).filter((name) => 
 // An action's run → when every instance reached its final status, when one became healthy (a start or resume) or
 // none was healthy any more (a stop or suspend), the answers' summary (new: the app's answers after a wake, any
 // other after a nap), and whether all of them happened. Samples before the action (`since`) do not count.
-export function actionSummary(action, { since, names, settle = 20, statuses, health, answers }) {
+// `anyInstance`: the health's states are read whatever they are keyed by, as a NEG's pods, which `names` does not name.
+// `noneHealthyFrom`: no "none healthy" before that time, null for none yet (default: the action).
+export function actionSummary(action, { since, names, settle = 20, statuses, health, answers, anyInstance = false, noneHealthyFrom = since }) {
   const wake = WAKES.includes(action);
   const after = (samples) => samples.filter((s) => s.t >= since).sort((a, b) => a.t - b.t);
   const reached = after(statuses).find((s) => names.every((n) => FINAL[action].includes(s.states[n])))?.t ?? null;
-  const someHealthy = (s) => names.some((n) => s.states[n] === 'HEALTHY');
-  const healthAt = after(health).find((s) => (wake ? someHealthy(s) : !someHealthy(s)))?.t ?? null;
+  const someHealthy = (s) => (anyInstance ? Object.values(s.states) : names.map((n) => s.states[n])).includes('HEALTHY');
+  const noneHealthy = (s) => noneHealthyFrom !== null && s.t >= noneHealthyFrom && !someHealthy(s);
+  const healthAt = after(health).find((s) => (wake ? someHealthy(s) : noneHealthy(s)))?.t ?? null;
   const isApp = (kind) => kind === 'app';
   const notApp = (kind) => kind !== 'app';
   const answered = summarize(answers, wake ? { old: notApp, fresh: isApp, settle } : { old: isApp, fresh: notApp, settle });
@@ -506,6 +509,19 @@ export const deploymentPath = (namespace, name) => `/apis/apps/v1/namespaces/${n
 // A GKE NEG's endpoints are pods: { 'address:port': node name }.
 export function endpointAddresses(response) {
   return Object.fromEntries((response.items ?? []).map(({ networkEndpoint: e }) => [`${e.ipAddress}:${e.port}`, lastSegment(e.instance)]));
+}
+
+// getHealth's answer on a GKE NEG → { 'address:port': healthState }: its pods, several on a node (a pod's `instance` is its node).
+export function endpointHealth(response) {
+  return Object.fromEntries((response.healthStatus ?? []).map((h) => [`${h.ipAddress}:${h.port}`, h.healthState]));
+}
+
+// When a NEG lost an endpoint it held before an action, from `since` on (null: none yet; with none to lose, `since`): getHealth
+// may read nothing while a pod still serves, and only then is that a scale to 0's "none healthy".
+export function endpointGoneAt(samples, held, since) {
+  const names = Object.keys(held);
+  if (names.length === 0) return since;
+  return [...samples].sort((a, b) => a.t - b.t).find((s) => s.t >= since && names.some((n) => !(n in s.states)))?.t ?? null;
 }
 
 // Poller samples [{ t, states }] of endpoints → how many there were from `since` on: the reads, the fewest, the most

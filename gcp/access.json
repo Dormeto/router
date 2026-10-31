@@ -388,14 +388,23 @@
             "container.statefulSets.list",
             "container.replicaSets.get",
             "container.replicaSets.list",
-            "container.pods.list"
+            "container.pods.list",
+            "container.roles.get",
+            "container.roleBindings.get",
+            "datastore.entities.get",
+            "datastore.entities.update"
           ]
         },
         "offboard": {
           "cluster": [
             "container.roles.delete",
             "container.roleBindings.delete",
-            "container.clusters.connect"
+            "container.clusters.connect",
+            "container.clusters.get",
+            "container.roles.get",
+            "container.roleBindings.get",
+            "datastore.entities.get",
+            "datastore.entities.update"
           ]
         }
       }

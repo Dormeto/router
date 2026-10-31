@@ -299,7 +299,7 @@ test('features: the operator permissions of Cloud SQL and GKE', async () => {
     offboard: { tag: ['cloudsql.instances.deleteTagBinding'] },
   });
   assert.deepEqual(features.gke.operator, {
-    onboard: { cluster: ['container.clusters.get', 'container.roles.create', 'container.roles.update', 'container.roleBindings.create', 'container.roleBindings.update', 'container.deployments.get', 'container.statefulSets.get', 'container.services.get', 'container.roles.escalate', 'container.roles.bind', 'container.clusters.connect', 'container.services.list', 'container.deployments.list', 'container.statefulSets.list', 'container.replicaSets.get', 'container.replicaSets.list', 'container.pods.list'] },
-    offboard: { cluster: ['container.roles.delete', 'container.roleBindings.delete', 'container.clusters.connect'] },
+    onboard: { cluster: ['container.clusters.get', 'container.roles.create', 'container.roles.update', 'container.roleBindings.create', 'container.roleBindings.update', 'container.deployments.get', 'container.statefulSets.get', 'container.services.get', 'container.roles.escalate', 'container.roles.bind', 'container.clusters.connect', 'container.services.list', 'container.deployments.list', 'container.statefulSets.list', 'container.replicaSets.get', 'container.replicaSets.list', 'container.pods.list', 'container.roles.get', 'container.roleBindings.get', 'datastore.entities.get', 'datastore.entities.update'] },
+    offboard: { cluster: ['container.roles.delete', 'container.roleBindings.delete', 'container.clusters.connect', 'container.clusters.get', 'container.roles.get', 'container.roleBindings.get', 'datastore.entities.get', 'datastore.entities.update'] },
   });
 });

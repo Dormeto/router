@@ -34,6 +34,22 @@ for (const [name, adapter] of Object.entries(ADAPTERS)) {
   });
 }
 
+// And the other way: what the router's role grants, some call needs, so that the acceptance proves the role that ships.
+test('dormetoRouter: every permission is named by a call of an adapter', async () => {
+  const { roles } = JSON.parse(await readFile(new URL('../access.json', import.meta.url), 'utf8'));
+  const named = new Set(Object.values(ADAPTERS).flatMap((adapter) => Object.values(adapter.CALLS).flat()));
+  assert.deepEqual(roles.dormetoRouter.permissions.filter((p) => !named.has(p)), []);
+});
+
+// What a call needs of what it names, though the call's own permission does not say so: a URL map's update needs .use on the backend
+// services it names, a backend service's insert .use on its NEG. Not to be trimmed for having no method of their own.
+test('dormetoRouter: what a call needs implicitly stays', async () => {
+  const { roles } = JSON.parse(await readFile(new URL('../access.json', import.meta.url), 'utf8'));
+  for (const p of ['compute.backendServices.use', 'compute.regionBackendServices.use', 'compute.regionNetworkEndpointGroups.use', 'compute.networkEndpointGroups.get']) {
+    assert.ok(roles.dormetoRouter.permissions.includes(p), p);
+  }
+});
+
 // Every call the onboarding and the offboarding make, seen by running them: one that CALLS does not name would escape the
 // tests above. The waits are calls too: what changes something reads its operation.
 const ONBOARDING_CALLS = [

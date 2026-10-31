@@ -101,12 +101,11 @@ test('dormetoRouter holds spec section 4\'s permissions, exactly', async () => {
     'compute.machineTypes.get',
     'compute.globalOperations.get', 'compute.zoneOperations.get', 'compute.regionOperations.get',
     'monitoring.timeSeries.list',
-    // S3: zonal NEGs of VMs (spec section 6).
-    'compute.networkEndpointGroups.get', 'compute.networkEndpointGroups.list', 'compute.networkEndpointGroups.use',
+    // S3: zonal NEGs of VMs (spec section 6): read only, the waker's backend service names the regional one.
+    'compute.networkEndpointGroups.get',
     // S4: regional and classic load balancers (spec section 7).
-    'compute.regionUrlMaps.get', 'compute.regionUrlMaps.list', 'compute.regionUrlMaps.update', 'compute.regionUrlMaps.use',
-    'compute.regionBackendServices.get', 'compute.regionBackendServices.list', 'compute.regionBackendServices.use', 'compute.regionBackendServices.create', 'compute.regionBackendServices.delete',
-    'compute.regionHealthChecks.get',
+    'compute.regionUrlMaps.get', 'compute.regionUrlMaps.list', 'compute.regionUrlMaps.update',
+    'compute.regionBackendServices.get', 'compute.regionBackendServices.use', 'compute.regionBackendServices.create', 'compute.regionBackendServices.delete',
     'compute.regionTargetHttpProxies.list', 'compute.regionTargetHttpsProxies.list', 'compute.forwardingRules.list',
   ]));
 });

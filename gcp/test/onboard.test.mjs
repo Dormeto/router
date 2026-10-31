@@ -398,6 +398,45 @@ test('onboard: a failure leaves nothing behind (the NEG could not be uninstalled
   assert.ok(w.logs.some((l) => l.event === 'OnboardUndone' && l.workloadId === 'demo'));
 });
 
+// M4's likeliest failure: Google refuses a waker on the serverless NEG for this kind of load balancer, or the router lacks a permission.
+for (const [kind, world, path] of [['global', () => {}, 'global/backendServices'], ['classic', classic, 'global/backendServices'], ['regional', regional, `regions/${REGION}/backendServices`]]) {
+  for (const code of [400, 403]) {
+    test(`onboard ${kind}: Google's ${code} on the waker's insert is a refusal in Google's words, undone`, async () => {
+      const { w, store, onboarding } = setup(world);
+      const words = `Google: POST ${path}: ${code} Invalid value for field 'resource.backends[0].group'`;
+      w.fail[`POST ${path}`] = new GoogleError(words, { code });
+      await assert.rejects(onboarding.onboard(INPUT), refused(400, 'not-eligible', new RegExp(`^cannot onboard demo: Google refused its waker backend service ${WAKER}: .*${code} Invalid value`)));
+      assert.deepEqual(w.changes, []);
+      assert.equal(store.configs.size, 0);
+      assert.equal(store.runs.size, 0);
+      assert.ok(w.logs.some((l) => l.event === 'OnboardUndone' && l.workloadId === 'demo'));
+    });
+  }
+
+  test(`onboard ${kind}: anything else on the waker's insert stays a failure`, async () => {
+    const { w, onboarding } = setup(world);
+    const failure = new GoogleError('Google: 503 unavailable', { code: 503 });
+    w.fail[`POST ${path}`] = failure;
+    await assert.rejects(onboarding.onboard(INPUT), failure);
+  });
+}
+
+test('onboard: a refused waker\'s insert reaches the operator as the refusal, not an internal error', async () => {
+  const { w, onboarding } = setup();
+  w.fail['POST global/backendServices'] = new GoogleError('Google: 403 Required compute.regionNetworkEndpointGroups.use', { code: 403 });
+  const err = await onboarding.onboard(INPUT).catch((e) => e);
+  assert.equal(err.status, 400);
+  assert.equal(err.reason, 'not-eligible');
+  assert.match(err.message, /Required compute\.regionNetworkEndpointGroups\.use/);
+});
+
+test('onboard: a waker refused at its operation\'s end is the same refusal', async () => {
+  const t = setup();
+  t.google.waitCompute = async () => { throw new GoogleError('Google: operation insert: INVALID_RESOURCE_USAGE: the NEG cannot be used here', { code: 400, reason: 'INVALID_RESOURCE_USAGE' }); };
+  await assert.rejects(t.onboarding.onboard(INPUT), refused(400, 'not-eligible', /Google refused its waker backend service .*INVALID_RESOURCE_USAGE/));
+  assert.equal(t.store.configs.size, 0);
+});
+
 test('onboard: a failure whose undo fails too still answers the failure, and says so in the logs', async () => {
   const { w, store, onboarding } = setup();
   const failure = new GoogleError('Google: refused', { code: 500 });

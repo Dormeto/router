@@ -418,7 +418,11 @@ export function createOnboarding({ store, compute, urlmaps, regionalUrlmaps, cor
           protocol: 'HTTPS',
           backends: [{ group: `${COMPUTE}/projects/${config.project}/regions/${config.region}/networkEndpointGroups/${config.wakerNeg}` }],
           customRequestHeaders: wakerHeaders(id, lb),
-        }, lb);
+        }, lb).catch((err) => {
+          // At the request or at its operation's end. Google's words say what to change, as the operator can read them.
+          if (err?.code === 400 || err?.code === 403) throw new Refusal(400, 'not-eligible', `cannot onboard ${id}: Google refused its waker backend service ${name}: ${err.message}`);
+          throw err;
+        });
       }
       await mapsOf(lb).modify(urlMap, (map) => inOneUpdate(map, isSwapped(lb)
         ? [(m) => withWakerRoute(m, backendService, waker), (m) => withHoldRoute(m, backendService, waker)]

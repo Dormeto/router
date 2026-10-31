@@ -1,5 +1,6 @@
 // Compute Engine (REST, v1): what the router reads of a workload's VMs, groups and load balancer, what it does to
-// them at a nap and a wake, and the waker backend service it creates. Global load balancer only (spec section 2).
+// them at a nap and a wake, and the waker backend service it creates. A load balancer's parts are global (a global or a classic
+// load balancer), or regional under `Region` names, which take the region first.
 //
 // `CALLS` is each function's permissions: the manifest's router grants (gcp/access.json) must hold them all
 // (test/permissions.test.mjs). Regional managed groups and autoscalers need the same permissions as zonal ones.
@@ -31,6 +32,13 @@ export const CALLS = {
   listForwardingRules: ['compute.globalForwardingRules.list'],
   listTargetHttpProxies: ['compute.targetHttpProxies.list'],
   listTargetHttpsProxies: ['compute.targetHttpsProxies.list'],
+  getRegionBackendService: ['compute.regionBackendServices.get'],
+  getRegionBackendServiceHealth: ['compute.regionBackendServices.get'],
+  insertRegionBackendService: ['compute.regionBackendServices.create', 'compute.regionBackendServices.use', 'compute.regionNetworkEndpointGroups.use', 'compute.regionOperations.get'],
+  deleteRegionBackendService: ['compute.regionBackendServices.delete', 'compute.regionOperations.get'],
+  listRegionForwardingRules: ['compute.forwardingRules.list'],
+  listRegionTargetHttpProxies: ['compute.regionTargetHttpProxies.list'],
+  listRegionTargetHttpsProxies: ['compute.regionTargetHttpsProxies.list'],
   ...Object.fromEntries(ACTIONS.map((a) => [`${a}Instance`, [`compute.instances.${a}`]])),
   ...Object.fromEntries(ACTIONS.map((a) => [`${a}Instances`, ['compute.instanceGroupManagers.update']])),
 };
@@ -66,6 +74,7 @@ export function createCompute({ google, project, now = Date.now }) {
     return items;
   };
   const zone = (z) => `${base}/zones/${e(z)}`;
+  const region = (r) => `${base}/regions/${e(r)}`;
 
   const calls = {
     getInstance: (z, name) => google.request('GET', `${zone(z)}/instances/${e(name)}`),
@@ -97,6 +106,13 @@ export function createCompute({ google, project, now = Date.now }) {
     listForwardingRules: () => list(`${base}/global/forwardingRules`),
     listTargetHttpProxies: () => list(`${base}/global/targetHttpProxies`),
     listTargetHttpsProxies: () => list(`${base}/global/targetHttpsProxies`),
+    getRegionBackendService: (r, name) => google.request('GET', `${region(r)}/backendServices/${e(name)}`),
+    getRegionBackendServiceHealth: (r, name, group) => google.request('POST', `${region(r)}/backendServices/${e(name)}/getHealth`, { group }),
+    insertRegionBackendService: async (r, body) => waited(await google.request('POST', `${region(r)}/backendServices`, body)),
+    deleteRegionBackendService: async (r, name) => waited(await google.request('DELETE', `${region(r)}/backendServices/${e(name)}`)),
+    listRegionForwardingRules: (r) => list(`${region(r)}/forwardingRules`),
+    listRegionTargetHttpProxies: (r) => list(`${region(r)}/targetHttpProxies`),
+    listRegionTargetHttpsProxies: (r) => list(`${region(r)}/targetHttpsProxies`),
   };
   for (const action of ACTIONS) {
     calls[`${action}Instance`] = async (z, name) => waited(await google.request('POST', `${zone(z)}/instances/${e(name)}/${action}`));

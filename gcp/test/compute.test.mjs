@@ -27,6 +27,9 @@ const READS = [
   ['getAutoscaler', [REGIONAL], 'GET', `${BASE}/regions/europe-west1/autoscalers/mig`],
   ['getBackendService', ['app'], 'GET', `${BASE}/global/backendServices/app`],
   ['getBackendServiceHealth', ['app', 'https://x/groups/ig'], 'POST', `${BASE}/global/backendServices/app/getHealth`, { group: 'https://x/groups/ig' }],
+  ['getRegionBackendService', ['europe-west1', 'app'], 'GET', `${BASE}/regions/europe-west1/backendServices/app`],
+  ['getRegionBackendServiceHealth', ['europe-west1', 'app', 'https://x/groups/ig'], 'POST', `${BASE}/regions/europe-west1/backendServices/app/getHealth`, { group: 'https://x/groups/ig' }],
+  ['deleteRegionBackendService', ['europe-west1', 'waker'], 'DELETE', `${BASE}/regions/europe-west1/backendServices/waker`],
   ['getNetworkEndpointGroup', ['europe-west1', 'neg'], 'GET', `${BASE}/regions/europe-west1/networkEndpointGroups/neg`],
   ['getZonalNetworkEndpointGroup', ['europe-west1-b', 'neg'], 'GET', `${BASE}/zones/europe-west1-b/networkEndpointGroups/neg`],
   ['getHealthCheck', ['hc'], 'GET', `${BASE}/global/healthChecks/hc`],
@@ -42,13 +45,16 @@ for (const [fn, args, method, url, body] of READS) {
   });
 }
 
-test('listInstances, listBackendServices, listForwardingRules, listTargetHttpProxies and listTargetHttpsProxies page through the items', async () => {
+test('listInstances, listBackendServices, the forwarding rules and the target proxies of both scopes page through the items', async () => {
   const lists = [
     ['listInstances', ['europe-west1-b'], `${BASE}/zones/europe-west1-b/instances`],
     ['listBackendServices', [], `${BASE}/global/backendServices`],
     ['listForwardingRules', [], `${BASE}/global/forwardingRules`],
     ['listTargetHttpProxies', [], `${BASE}/global/targetHttpProxies`],
     ['listTargetHttpsProxies', [], `${BASE}/global/targetHttpsProxies`],
+    ['listRegionForwardingRules', ['europe-west1'], `${BASE}/regions/europe-west1/forwardingRules`],
+    ['listRegionTargetHttpProxies', ['europe-west1'], `${BASE}/regions/europe-west1/targetHttpProxies`],
+    ['listRegionTargetHttpsProxies', ['europe-west1'], `${BASE}/regions/europe-west1/targetHttpsProxies`],
   ];
   for (const [fn, args, url] of lists) {
     const { calls, compute } = setup((m, u) => (u.includes('pageToken=next')
@@ -112,6 +118,20 @@ test('insertBackendService: POST the body, then waits', async () => {
   const body = { name: 'waker', backends: [{ group: 'neg' }] };
   await compute.insertBackendService(body);
   assert.deepEqual(calls[0], { method: 'POST', url: `${BASE}/global/backendServices`, body });
+  assert.equal(calls[1].wait.selfLink, 'op');
+});
+
+test('insertRegionBackendService: POST the body in the region, then waits', async () => {
+  const { calls, compute } = setup(() => ({ selfLink: 'op' }));
+  const body = { name: 'waker', backends: [{ group: 'neg' }] };
+  await compute.insertRegionBackendService('europe-west1', body);
+  assert.deepEqual(calls[0], { method: 'POST', url: `${BASE}/regions/europe-west1/backendServices`, body });
+  assert.equal(calls[1].wait.selfLink, 'op');
+});
+
+test('deleteRegionBackendService waits for the operation', async () => {
+  const { calls, compute } = setup(() => ({ selfLink: 'op' }));
+  await compute.deleteRegionBackendService('europe-west1', 'waker');
   assert.equal(calls[1].wait.selfLink, 'op');
 });
 

@@ -3,7 +3,8 @@
 // request of at most 1800 s; the check only enqueues the naps it decides (POST /v1/tasks), never waiting in its 240 s.
 //
 // A workload's configuration: `{ workloadId, urlMap, backendService, wakerBackendService (names), backends: [{ kind: 'vm'
-// | 'mig', location, name }], idleMinutes, wakeTimeoutSeconds, hibernate? }`. `config`: `{ project, controllerUrl }`.
+// | 'mig', location, name }], idleMinutes, wakeTimeoutSeconds, hibernate?, lb? }`. `lb`: `{ kind: 'regional', region }` or
+// `{ kind: 'classic' }`, absent for a global load balancer. `config`: `{ project, controllerUrl }`.
 //
 // What the run adds to AWS's: `stopped`, `suspended` (the VMs a nap acted on, names), `autoscalers` (`[{ kind, location,
 // name (the autoscaler's), mode }]`, what the wake gives back), `lastWake` (`{ durationMs }`) and `scheduleApplied` (the last
@@ -19,6 +20,7 @@ import { awakeStartWithin, CLOSE_START_MS, maintenanceDue, occurrenceAt } from '
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { createListRefresher } from '../../lambda/src/lib/list-refresh.mjs';
 import { OPERATION_NOT_DONE } from './google.mjs';
+import { SWAP_WAIT_MS } from './switch.mjs';
 import { mapBusy, references, UrlMapRefused, withErrorPolicy, withoutErrorPolicy, withWakerRoute } from './urlmaps.mjs';
 
 const COMPUTE = 'https://compute.googleapis.com/compute/v1';
@@ -83,6 +85,10 @@ function failedFrom(err, options) {
   const kind = err.kind ?? (err.reason === OPERATION_NOT_DONE ? 'timeout' : mapBusy(err) ? 'throttled' : KIND_OF_CODE[err.code]);
   return failedSpec(kind ? Object.assign(err, { kind }) : err, options);
 }
+
+// Until the swap is in the controller (the coverage plan's R9, which removes this): what here writes a map writes a policy, on a
+// global map, so a regional or classic workload is onboarded but does not nap, and the check leaves its map alone. Why, else null.
+export const napHeldBack = ({ lb }) => (Object.hasOwn(SWAP_WAIT_MS, lb?.kind ?? '') ? `the controller does not switch a ${lb.kind} load balancer yet` : null);
 
 // What is wrong with a pause asked for.
 export class PauseRefused extends Error {
@@ -452,7 +458,7 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
   async function nap(workloadId, { cause = 'idle', requestedAt, until } = {}) {
     const latest = now() + NAP_BUDGET_MS;
     const cfg = await getConfig(workloadId);
-    const refusal = await napRefusal(workloadId, requestedAt, until);
+    const refusal = napHeldBack(cfg) ?? await napRefusal(workloadId, requestedAt, until);
     if (refusal) {
       log.warn('NapSkipped', { workloadId, reason: refusal });
       return { state: 'SKIPPED', reason: refusal };
@@ -862,7 +868,7 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
     }
     // The nap this check just asked for may have started since the run was read: a repair on that read would remove its policy.
     if (ctx.applied.get(workloadId) === 'nap') return { state: run.state };
-    run = await reconcile(cfg, run, deadline);
+    if (!napHeldBack(cfg)) run = await reconcile(cfg, run, deadline);
     const t = now();
     const idleMs = cfg.idleMinutes * 60_000;
     // Still paying for backends that run without a healthy instance: released once its idle window has passed; a paused one
@@ -878,7 +884,7 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
     if (kept) return { state: run.state, ...kept };
     const from = t - idleMs - METRIC_DELAY_MS;
     if ((run.awakeSince ?? 0) > from) return { state: run.state };
-    if ((await monitoring.requestCount({ backendService: cfg.backendService, from, to: t })) > 0) return { state: run.state };
+    if ((await monitoring.requestCount({ backendService: cfg.backendService, ...(cfg.lb ? { lb: cfg.lb } : {}), from, to: t })) > 0) return { state: run.state };
     await enqueue({ action: 'nap', workloadId });
     log.info('NapRequested', { workloadId });
     return { state: run.state, nap: 'requested' };

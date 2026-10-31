@@ -9,9 +9,9 @@ import * as monitoring from '../src/monitoring.mjs';
 import * as tasks from '../src/tasks.mjs';
 import * as firestore from '../src/firestore.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
-import { INPUT, REGION, V1, ZONE, setup } from './world.mjs';
+import { INPUT, REGION, V1, ZONE, regional, setup } from './world.mjs';
 
-const ADAPTERS = { compute, urlmaps, monitoring, tasks, firestore };
+const ADAPTERS = { compute, urlmaps, regionalUrlmaps: { CALLS: urlmaps.CALLS_REGIONAL }, monitoring, tasks, firestore };
 
 async function granted() {
   const manifest = JSON.parse(await readFile(new URL('../access.json', import.meta.url), 'utf8'));
@@ -46,6 +46,9 @@ const WAITED = {
   'compute.deleteBackendService': ['compute.globalOperations.get'],
   'compute.setAutoscalerMode': ['compute.zoneOperations.get', 'compute.regionOperations.get'],
   'urlmaps.modify': ['compute.globalOperations.get', 'compute.backendServices.use'],
+  'compute.insertRegionBackendService': ['compute.regionOperations.get', 'compute.regionBackendServices.use', 'compute.regionNetworkEndpointGroups.use'],
+  'compute.deleteRegionBackendService': ['compute.regionOperations.get'],
+  'regionalUrlmaps.modify': ['compute.regionOperations.get', 'compute.regionBackendServices.use'],
 };
 const callsOf = (name) => {
   const [adapter, fn] = name.split('.');
@@ -69,6 +72,22 @@ test('onboarding: every call it makes is in CALLS, and in the manifest\'s router
   await onboarding.offboard('demo');
 
   for (const name of ONBOARDING_CALLS) assert.ok(w.used.has(name), `the run did not exercise ${name}`);
+  const permissions = await granted();
+  for (const name of w.used) {
+    assert.ok(callsOf(name)?.length, `${name} is not in CALLS`);
+    for (const p of callsOf(name)) assert.ok(permissions.has(p), `${name} needs ${p}`);
+  }
+});
+
+test('a regional load balancer\'s onboarding and offboarding: every call it makes is in CALLS, and in the manifest\'s router grants', async () => {
+  const { w, onboarding } = setup(regional);
+  await onboarding.dryRun(INPUT);
+  await onboarding.onboard(INPUT);
+  await onboarding.offboard('demo');
+
+  for (const name of ['compute.getRegionBackendService', 'compute.listRegionTargetHttpsProxies', 'compute.listRegionTargetHttpProxies', 'compute.listRegionForwardingRules', 'compute.insertRegionBackendService', 'compute.deleteRegionBackendService', 'regionalUrlmaps.get', 'regionalUrlmaps.list', 'regionalUrlmaps.modify']) {
+    assert.ok(w.used.has(name), `the run did not exercise ${name}`);
+  }
   const permissions = await granted();
   for (const name of w.used) {
     assert.ok(callsOf(name)?.length, `${name} is not in CALLS`);

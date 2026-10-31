@@ -49,6 +49,7 @@ test('GET /v1/workloads: none, then each as a Workload the CLI can read', async 
     backendService: 'app',
     wakerBackendService: WAKER,
     hosts: ['demo.example.com'],
+    lb: { kind: 'global' },
     settings: { idleMinutes: 15, wakeTimeoutSeconds: 600 },
     backends: [{ kind: 'vm', location: ZONE, name: 'vm-a', id: '1001' }],
     // The CLI reads it as a string: a number would fail its decoding.
@@ -82,7 +83,7 @@ test('POST /v1/workloads?dryRun=true: eligible with the VMs and the groups, or t
   const res = await call('POST', '/v1/workloads?dryRun=true', INPUT);
   assert.equal(res.status, 200);
   assert.deepEqual(res.body, {
-    eligible: true, reasons: [], vms: [{ zone: ZONE, name: 'vm-a', selfLink: `${V1}/zones/${ZONE}/instances/vm-a`, id: '1001' }], groups: [],
+    eligible: true, reasons: [], vms: [{ zone: ZONE, name: 'vm-a', selfLink: `${V1}/zones/${ZONE}/instances/vm-a`, id: '1001' }], groups: [], lb: { kind: 'global' },
   });
   assert.deepEqual(w.changes, []);
   assert.equal(store.configs.size, 0);
@@ -496,4 +497,17 @@ test('fromEnvironment: the database, the project and the NEG of the environment'
   assert.ok(seen.includes('POST https://firestore.googleapis.com/v1/projects/p/databases/dmtr-europe-west1/documents:commit'), seen.join('\n'));
   assert.equal(created[0].backends[0].group, `${V1}/regions/${REGION}/networkEndpointGroups/dmtr-europe-west1-waker`);
   assert.deepEqual(created[0].customRequestHeaders, ['x-dormeto-workload: demo']);
+});
+
+test('fromEnvironment: the regional URL maps are those of the environment\'s region', async () => {
+  const regionalMap = `${V1}/regions/${REGION}/urlMaps/lb`;
+  const { fetch, seen } = fakeFetch((method, url) => {
+    if (url.includes('firestore.googleapis.com')) return url.includes('/documents/workloads?') ? { documents: [] } : null;
+    return null;
+  });
+  const handler = fromEnvironment(ENV, { fetch, log: silentLog });
+  const res = await handler(request('POST', '/v1/workloads?dryRun=true', JSON.stringify(INPUT)));
+  assert.equal(res.statusCode, 200, res.body);
+  assert.ok(seen.includes(`GET ${regionalMap}`), seen.join('\n'));
+  assert.match(JSON.parse(res.body).reasons[0], /^URL map lb not found/);
 });

@@ -341,6 +341,27 @@ test('a wake timeout beyond the request\'s limit fails the wake before the limit
   assert.ok(t.clock.now() - START < REQUEST_LIMIT - 30_000, `${t.clock.now() - START} ms`);
 });
 
+// --- A regional or classic workload, until the swap is in the controller (the plan's R9, which removes these) ------------
+
+for (const lb of [{ kind: 'regional', region: 'europe-west1' }, { kind: 'classic' }]) {
+  test(`a ${lb.kind} workload's nap is refused: nothing written, nothing stopped, still AWAKE`, async () => {
+    const t = setup({ cfg: { lb }, vms: { 'vm-a': { status: 'RUNNING' } } });
+    const out = await t.controller.nap('demo');
+    assert.equal(out.state, 'SKIPPED');
+    assert.match(out.reason, new RegExp(`does not switch a ${lb.kind} load balancer yet`));
+    assert.deepEqual(t.world.calls, []);
+    assert.equal(t.run().state, STATES.AWAKE);
+    assert.equal(t.logged('NapSkipped').length, 1);
+  });
+
+  test(`a ${lb.kind} workload's check reads its idle signal by kind, and writes nothing in a map`, async () => {
+    const t = setup({ cfg: { lb }, vms: { 'vm-a': { status: 'RUNNING' } }, run: { state: STATES.AWAKE, awakeSince: 1 } });
+    await t.controller.check();
+    assert.deepEqual(t.world.metricReads.map((read) => read.lb), [lb]);
+    assert.deepEqual(t.world.calls, []);
+  });
+}
+
 // --- The nap -------------------------------------------------------------------------------------------------------
 
 test('the nap writes the policy, waits 300 s, then stops; ASLEEP with what it stopped', async () => {

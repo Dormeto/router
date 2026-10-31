@@ -29,6 +29,24 @@ test('requestCount: pages, and counts nothing when no series', async () => {
   assert.equal(await createMonitoring({ google: { request: async () => ({}) }, project: 'p' }).requestCount({ backendService: 'b', from: 0, to: 1000 }), 0);
 });
 
+// Review focus 1 (the plan): a filter that matches nothing reads 0 and naps a busy workload. These are M5's, read back with real
+// traffic (the design's section 7): `backend_target_name` is the plain name on both kinds.
+const GLOBAL_FILTER = 'metric.type = "loadbalancing.googleapis.com/https/request_count" AND resource.labels.backend_target_name = "app"';
+const FILTERS = [
+  ['no lb, a global workload', undefined, GLOBAL_FILTER],
+  ['global', { kind: 'global' }, GLOBAL_FILTER],
+  ['classic', { kind: 'classic' }, GLOBAL_FILTER],
+  ['regional', { kind: 'regional', region: 'europe-west1' }, 'metric.type = "loadbalancing.googleapis.com/https/external/regional/request_count" AND resource.labels.backend_target_name = "app" AND resource.labels.region = "europe-west1"'],
+];
+for (const [name, lb, filter] of FILTERS) {
+  test(`requestCount: the exact filter of ${name} (M5)`, async () => {
+    const urls = [];
+    const google = { request: async (m, url) => { urls.push(url); return { timeSeries: [{ points: [point(2)] }] }; } };
+    assert.equal(await createMonitoring({ google, project: 'p' }).requestCount({ backendService: 'app', lb, from: 0, to: 1000 }), 2);
+    assert.equal(new URL(urls[0]).searchParams.get('filter'), filter);
+  });
+}
+
 test('CALLS', () => {
   assert.deepEqual(CALLS, { requestCount: ['monitoring.timeSeries.list'] });
 });

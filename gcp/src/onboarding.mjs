@@ -4,16 +4,25 @@
 //
 // A refusal is a `Refusal`: its status and short reason are the API's, its message is what is wrong and what to change.
 // Anything else thrown is a failure, a 500 for the caller.
+//
+// Global, classic and regional load balancers (the coverage design's section 7). A workload's `lb`: `{ kind: 'regional', region }`
+// or `{ kind: 'classic' }`, under a swap, with a hold route and a second header on the waker; absent in the configuration for a
+// global one, under the policy. The router reads only its own region's regional maps.
 import { nextEvents, normalizeSchedule, scheduleProblems } from '../../lambda/src/lib/schedule.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
-import { groupOf, PauseRefused } from './controller-core.mjs';
-import { WORKLOAD_HEADER, WORKLOAD_ID } from './names.mjs';
-import { hostsOf, inMatcher, references, UrlMapRefused, withErrorPolicy, withoutErrorPolicy, withWakerRoute, withoutWakerRoute } from './urlmaps.mjs';
+import { groupOf, napHeldBack, PauseRefused } from './controller-core.mjs';
+import { SWITCH_HEADER, WORKLOAD_HEADER, WORKLOAD_ID } from './names.mjs';
+import { SWAP_WAIT_MS } from './switch.mjs';
+import {
+  hostsOf, inMatcher, references, UrlMapRefused, withErrorPolicy, withHoldRoute, withoutErrorPolicy, withoutHoldRoute, withoutSwap, withoutWakerRoute, withSwap, withWakerRoute,
+} from './urlmaps.mjs';
 
 const COMPUTE = 'https://compute.googleapis.com/compute/v1';
-const SCHEME = 'EXTERNAL_MANAGED';
-const CLASSIC = 'EXTERNAL';
-const NOT_MANAGED = `only the global external Application Load Balancer (${SCHEME}) is supported, migrate it first`;
+// A load balancer's scheme by its kind: of its forwarding rules, of its backend services, of the waker's.
+const SCHEME_OF = { global: 'EXTERNAL_MANAGED', classic: 'EXTERNAL', regional: 'EXTERNAL_MANAGED' };
+const SUPPORTED = 'only external Application Load Balancers are supported: global (EXTERNAL_MANAGED), classic (EXTERNAL) and regional (EXTERNAL_MANAGED)';
+const OTHER_ROUTERS = 'regional load balancers are onboarded on the router of their region';
+const GLOBAL_LB = { kind: 'global' };
 const NAME = /^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$/;
 const NAME_MAX = 63;
 const LOCAL_SSD = 'SCRATCH';
@@ -24,9 +33,10 @@ const NEG_OF_VMS = 'GCE_VM_IP_PORT';
 const GKE_NEG = /cluster-(uid|name)/i;
 const GKE_NEG_PREFIX = 'k8s1-';
 const MANAGED_GROUP_OWNER = /\/instanceGroupManagers\/([^/]+)$/;
-const DEFAULTS = { idleMinutes: 15, wakeTimeoutSeconds: 600, failedRetrySeconds: 60, pollSeconds: 3 };
-// What the CLI's flags set, with AWS's ranges (lambda/src/lib/onboarding.mjs).
-const RANGES = { idleMinutes: [5, 1440], waitSeconds: [5, 120] };
+const DEFAULTS = { idleMinutes: 15, failedRetrySeconds: 60, pollSeconds: 3 };
+const VMS_WAKE_SECONDS = 600;
+// What the CLI's flags set, with AWS's ranges (lambda/src/lib/onboarding.mjs); the wake's fits the controller's request.
+const RANGES = { idleMinutes: [5, 1440], waitSeconds: [5, 120], wakeTimeoutSeconds: [60, 1700] };
 // What a Workload shows of its configuration.
 const SETTINGS = ['idleMinutes', 'waitSeconds', 'wakeTimeoutSeconds', 'hibernate'];
 
@@ -45,6 +55,15 @@ const zoneOf = (url) => /\/zones\/([^/]+)\//.exec(url)?.[1];
 // A proxy's URL without what differs between Google's answers, as a forwarding rule's target names it.
 const proxyOf = (url) => url.split('/').slice(-2).join('/');
 const isoOf = (ms) => new Date(ms).toISOString();
+// The map's changes as one: `{ map, paths }`, each step on the map of the one before.
+const inOneUpdate = (map, steps) => steps.reduce(({ map: on, paths }, step) => {
+  const done = step(on);
+  return { map: done.map, paths: [...paths, ...done.paths] };
+}, { map, paths: [] });
+const isSwapped = (lb) => Object.hasOwn(SWAP_WAIT_MS, lb.kind);
+const isRegional = (lb) => lb.kind === 'regional';
+// The map's change is included in the wake's time.
+const defaultWakeSeconds = (lb) => Math.min(VMS_WAKE_SECONDS + (isSwapped(lb) ? SWAP_WAIT_MS[lb.kind] / 1000 : 0), RANGES.wakeTimeoutSeconds[1]);
 
 // A read's 404, as `.catch(absent)`: null.
 const absent = (err) => {
@@ -87,6 +106,7 @@ function workloadOf(cfg, run, paused) {
     backendService: cfg.backendService,
     wakerBackendService: cfg.wakerBackendService,
     hosts: cfg.hosts,
+    lb: cfg.lb ?? GLOBAL_LB,
     settings: Object.fromEntries(SETTINGS.filter((name) => cfg[name] !== undefined).map((name) => [name, cfg[name]])),
     backends: cfg.backends,
     ...(run?.state === STATES.AWAKE && run.awakeSince !== undefined ? { awakeSince: isoOf(run.awakeSince) } : {}),
@@ -96,42 +116,69 @@ function workloadOf(cfg, run, paused) {
   };
 }
 
-export function createOnboarding({ store, compute, urlmaps, core, config, now = Date.now, log }) {
+export function createOnboarding({ store, compute, urlmaps, regionalUrlmaps, core, config, now = Date.now, log }) {
   const wakerName = (id) => `dmtr-${config.region}-${id}`;
-  const wakerUrl = (name) => `${COMPUTE}/projects/${config.project}/global/backendServices/${name}`;
-  const wakerHeader = (id) => `${WORKLOAD_HEADER}: ${id}`;
+  const wakerUrl = (name, lb) => `${COMPUTE}/projects/${config.project}/${isRegional(lb) ? `regions/${lb.region}` : 'global'}/backendServices/${name}`;
+  const wakerHeaders = (id, lb) => [`${WORKLOAD_HEADER}: ${id}`, ...(isSwapped(lb) ? [`${SWITCH_HEADER}: swap`] : [])];
+  const mapsOf = (lb) => (isRegional(lb) ? regionalUrlmaps : urlmaps);
+  const getService = (name, lb) => (isRegional(lb) ? compute.getRegionBackendService(lb.region, name) : compute.getBackendService(name));
+  const deleteService = (name, lb) => (isRegional(lb) ? compute.deleteRegionBackendService(lb.region, name) : compute.deleteBackendService(name));
+  const insertService = (body, lb) => (isRegional(lb) ? compute.insertRegionBackendService(lb.region, body) : compute.insertBackendService(body));
 
   // The request's fields, or a 400. Without an ID, the backend service's name, when it is one.
-  function requested({ urlMap, backendService, id, settings = {} }) {
+  function requested({ urlMap, backendService, id, settings = {}, loadBalancer }) {
     if (!urlMap || !backendService) throw bad('urlMap and backendService are needed');
     for (const [key, value] of Object.entries({ urlMap, backendService })) {
       if (typeof value !== 'string' || !NAME.test(value)) throw bad(`${key}: ${JSON.stringify(value)} is not a Compute Engine name`);
     }
+    if (loadBalancer !== undefined && !['global', 'regional', 'classic'].includes(loadBalancer)) throw bad(`loadBalancer: ${JSON.stringify(loadBalancer)} is not global, regional or classic`);
     const workloadId = checkedId(id || backendService);
     const waker = wakerName(workloadId);
     if (waker.length > NAME_MAX) throw bad(`workload ID ${workloadId} would name the waker backend service ${waker}, longer than the ${NAME_MAX} characters of a Compute Engine name: use a shorter one`);
     const problems = settingsProblems(settings);
     if (problems.length) throw bad(problems.join('; '));
-    return { id: workloadId, urlMap, backendService, settings };
+    return { id: workloadId, urlMap, backendService, settings, loadBalancer };
   }
 
-  // The URL map's load balancer: one target proxy, and forwarding rules of the right scheme.
-  async function loadBalancerProblems(urlMap) {
-    const [https, http, rules] = await Promise.all([compute.listTargetHttpsProxies(), compute.listTargetHttpProxies(), compute.listForwardingRules()]);
+  // The URL map, `{ map, regional }`, or why it is not one: `{ reason }`. A regional one elsewhere than the router's region reads as none.
+  async function findMap(urlMap, asked) {
+    const [inGlobal, inRegion] = await Promise.all([
+      asked === 'regional' ? null : urlmaps.get(urlMap).catch(absent),
+      asked && asked !== 'regional' ? null : regionalUrlmaps.get(urlMap).catch(absent),
+    ]);
+    if (inGlobal && inRegion) return { reason: `URL map ${urlMap} exists globally and in region ${config.region}: say which with --load-balancer global, classic or regional` };
+    if (inGlobal || inRegion) return { map: inGlobal ?? inRegion, regional: Boolean(inRegion) };
+    if (asked === 'regional') return { reason: `URL map ${urlMap} not found in region ${config.region}: ${OTHER_ROUTERS}` };
+    if (asked) return { reason: `URL map ${urlMap} not found: name a global URL map of this project, or use --load-balancer regional` };
+    return { reason: `URL map ${urlMap} not found: name a global URL map of this project, or a regional one of ${config.region}: ${OTHER_ROUTERS}` };
+  }
+
+  // The URL map's load balancer: one target proxy, and forwarding rules whose scheme tells a global from a classic one.
+  // `{ kind, reasons }`, `kind` null when there is nothing supported to tell it from.
+  async function loadBalancerOf(urlMap, regional, asked) {
+    const [https, http, rules] = await Promise.all(regional
+      ? [compute.listRegionTargetHttpsProxies(config.region), compute.listRegionTargetHttpProxies(config.region), compute.listRegionForwardingRules(config.region)]
+      : [compute.listTargetHttpsProxies(), compute.listTargetHttpProxies(), compute.listForwardingRules()]);
+    const refused = (...reasons) => ({ kind: null, reasons });
     const proxies = [...https, ...http].filter((p) => nameOf(p.urlMap ?? '') === urlMap);
-    if (!proxies.length) return [`URL map ${urlMap} is used by no target proxy: attach it to a global external Application Load Balancer, then onboard again`];
-    if (proxies.length > 1) return [`URL map ${urlMap} is used by ${proxies.length} target proxies (${proxies.map((p) => p.name).join(', ')}): give each load balancer its own URL map`];
+    if (!proxies.length) return refused(`URL map ${urlMap} is used by no target proxy: attach it to an external Application Load Balancer, then onboard again`);
+    if (proxies.length > 1) return refused(`URL map ${urlMap} is used by ${proxies.length} target proxies (${proxies.map((p) => p.name).join(', ')}): give each load balancer its own URL map`);
     const fronts = rules.filter((r) => proxyOf(r.target ?? '') === proxyOf(proxies[0].selfLink));
-    if (!fronts.length) return [`no forwarding rule sends to the target proxy of URL map ${urlMap}: add one, then onboard again`];
-    return fronts.filter((r) => r.loadBalancingScheme !== SCHEME).map((r) => {
-      const classic = r.loadBalancingScheme === CLASSIC ? ', a classic load balancer' : '';
-      return `forwarding rule ${r.name} has the scheme ${r.loadBalancingScheme}${classic}: ${NOT_MANAGED}`;
-    });
+    if (!fronts.length) return refused(`no forwarding rule sends to the target proxy of URL map ${urlMap}: add one, then onboard again`);
+    const kinds = regional ? ['regional'] : ['global', 'classic'];
+    const kindsOf = (rule) => kinds.filter((kind) => SCHEME_OF[kind] === rule.loadBalancingScheme);
+    const unsupported = fronts.filter((r) => !kindsOf(r).length);
+    if (unsupported.length) return refused(...unsupported.map((r) => `forwarding rule ${r.name} has the scheme ${r.loadBalancingScheme}: ${SUPPORTED}`));
+    const found = new Set(fronts.flatMap(kindsOf));
+    if (found.size > 1) return refused(`URL map ${urlMap} has forwarding rules of a global and of a classic load balancer (${fronts.map((r) => `${r.name} ${r.loadBalancingScheme}`).join(', ')}): finish its migration, then onboard again`);
+    const [kind] = found;
+    return { kind, reasons: asked && asked !== kind ? [`URL map ${urlMap} belongs to a ${kind} load balancer, not a ${asked} one: onboard it with --load-balancer ${kind}`] : [] };
   }
 
   // What the route and the nap would write, tried on the map as it is, the nap's after the route: the route gives the map's
-  // default its matcher. A map that does not name the service has its reason already.
-  function mapProblems(map, backendService, waker) {
+  // default its matcher. A map that does not name the service has its reason already. Under a swap, the nap's is the swap, after
+  // the hold route too.
+  function mapProblems(map, backendService, waker, lb) {
     if (!references(map, backendService).length) return [];
     const problems = [];
     const tried = (write, on, advice) => {
@@ -143,9 +190,16 @@ export function createOnboarding({ store, compute, urlmaps, core, config, now = 
         return null;
       }
     };
-    const routed = tried(withWakerRoute, map, 'change that, then onboard again');
-    if (inMatcher(routed ?? map, backendService)) tried(withErrorPolicy, routed ?? map, 'a nap would replace it, remove it first');
-    else if (routed) problems.push(`backend service ${backendService} is named in URL map ${map.name} only by its default, which a host rule * hides: route to it in a path matcher, then onboard again`);
+    const change = 'change that, then onboard again';
+    const routed = tried(withWakerRoute, map, change);
+    if (!inMatcher(routed ?? map, backendService)) {
+      if (routed) problems.push(`backend service ${backendService} is named in URL map ${map.name} only by its default, which a host rule * hides: route to it in a path matcher, then onboard again`);
+    } else if (isSwapped(lb)) {
+      const held = routed && tried(withHoldRoute, routed, change);
+      tried(withSwap, held ?? routed ?? map, change);
+    } else {
+      tried(withErrorPolicy, routed ?? map, 'a nap would replace it, remove it first');
+    }
     return problems;
   }
 
@@ -241,23 +295,33 @@ export function createOnboarding({ store, compute, urlmaps, core, config, now = 
     return { reasons, vms, groups, negs };
   }
 
-  // Section 7: why the workload cannot be onboarded, and its VMs and groups. Reads only.
-  async function inspect({ id, urlMap, backendService }) {
+  // Section 7: why the workload cannot be onboarded, its load balancer (`lb`, none when it cannot be told), its VMs and groups. Reads only.
+  async function inspect({ id, urlMap, backendService, loadBalancer }) {
     const reasons = [];
     const configs = await store.listConfigs();
     const others = configs.filter((c) => c.workloadId !== id);
     if (others.length < configs.length) reasons.push(`workload ${id} is onboarded already`);
-    const owner = others.find((c) => c.backendService === backendService);
-    if (owner) reasons.push(`backend service ${backendService} is already workload ${owner.workloadId}`);
-    const [map, service] = await Promise.all([urlmaps.get(urlMap).catch(absent), compute.getBackendService(backendService).catch(absent)]);
-    if (!map) reasons.push(`URL map ${urlMap} not found: name a global URL map of this project`);
-    else reasons.push(...await loadBalancerProblems(urlMap));
-    if (!service) reasons.push(`backend service ${backendService} not found: name a global backend service of this project`);
-    if (!map || !service) return { reasons, vms: [], groups: [], negs: {} };
+    const nothing = { vms: [], groups: [], negs: {} };
+    const { map, regional, reason } = await findMap(urlMap, loadBalancer);
+    if (!map) return { reasons: [...reasons, reason], ...nothing };
+    const front = await loadBalancerOf(urlMap, regional, loadBalancer);
+    reasons.push(...front.reasons);
+    const kind = front.kind ?? (regional ? 'regional' : loadBalancer ?? 'global');
+    const lb = regional ? { kind, region: config.region } : { kind };
+    const told = front.kind ? { lb } : {};
 
-    if (service.loadBalancingScheme !== SCHEME) reasons.push(`backend service ${backendService} has the scheme ${service.loadBalancingScheme}: ${NOT_MANAGED}`);
+    // A backend service's name is unique in its scope.
+    const owner = others.find((c) => c.backendService === backendService && isRegional(c.lb ?? GLOBAL_LB) === regional);
+    if (owner) reasons.push(`backend service ${backendService} is already workload ${owner.workloadId}`);
+    const service = await getService(backendService, lb).catch(absent);
+    if (!service) {
+      reasons.push(`backend service ${backendService} not found: name ${regional ? `a regional backend service of ${config.region}` : 'a global backend service of this project'}`);
+      return { reasons, ...told, ...nothing };
+    }
+
+    if (front.kind && service.loadBalancingScheme !== SCHEME_OF[kind]) reasons.push(`backend service ${backendService} has the scheme ${service.loadBalancingScheme}: the backend services of a ${kind} load balancer have ${SCHEME_OF[kind]}`);
     if (!references(map, backendService).length) reasons.push(`backend service ${backendService} is not named in URL map ${urlMap}: route to it there, or name the URL map that does`);
-    for (const other of await urlmaps.list()) {
+    for (const other of await mapsOf(lb).list()) {
       if (other.name !== urlMap && references(other, backendService).length) {
         reasons.push(`backend service ${backendService} is also named in URL map ${other.name}: that load balancer would lose its backends during a nap; give it a backend service of its own`);
       }
@@ -266,54 +330,62 @@ export function createOnboarding({ store, compute, urlmaps, core, config, now = 
     if (!service.backends?.length) reasons.push(`backend service ${backendService} has no backend: add an instance group, then onboard again`);
 
     const waker = wakerName(id);
-    reasons.push(...mapProblems(map, backendService, wakerUrl(waker)));
-    const existing = await compute.getBackendService(waker).catch(absent);
-    if (existing && !existing.customRequestHeaders?.includes(wakerHeader(id))) reasons.push(`backend service ${waker} exists and is not the waker of ${id}: rename it, or onboard under another id`);
+    reasons.push(...mapProblems(map, backendService, wakerUrl(waker, lb), lb));
+    const existing = await getService(waker, lb).catch(absent);
+    const headers = wakerHeaders(id, lb);
+    if (existing && (existing.customRequestHeaders?.length !== headers.length || !headers.every((h) => existing.customRequestHeaders.includes(h)))) {
+      reasons.push(`backend service ${waker} exists and is not the waker of ${id}: rename it, or onboard under another id`);
+    }
 
     const backends = await backendsOf(service, others);
     reasons.push(...backends.reasons);
-    return { reasons, vms: backends.vms, groups: backends.groups, negs: backends.negs, hosts: hostsOf(map, backendService), wakerExists: Boolean(existing) };
+    return { reasons, ...told, vms: backends.vms, groups: backends.groups, negs: backends.negs, hosts: hostsOf(map, backendService), wakerExists: Boolean(existing) };
   }
 
   async function dryRun(input) {
-    const { reasons, vms, groups } = await inspect(requested(input));
-    return { eligible: reasons.length === 0, reasons, vms, groups };
+    const { reasons, vms, groups, lb } = await inspect(requested(input));
+    return { eligible: reasons.length === 0, reasons, vms, groups, ...(lb ? { lb } : {}) };
   }
 
-  // The route and the policy in one update, then the waker backend service. What is gone already is no failure.
-  async function removeFromGoogle({ urlMap, wakerBackendService: name }) {
-    const waker = wakerUrl(name);
-    await urlmaps.modify(urlMap, (map) => {
-      const policy = withoutErrorPolicy(map, waker);
-      const route = withoutWakerRoute(policy.map, waker);
-      return { map: route.map, paths: [...policy.paths, ...route.paths] };
+  // In one update, then the waker backend service: the route and the policy; under a swap, the application back wherever the map
+  // is still swapped, the hold route and the route. What is gone already is no failure.
+  async function removeFromGoogle({ urlMap, backendService, wakerBackendService: name, lb = GLOBAL_LB }) {
+    const waker = wakerUrl(name, lb);
+    await mapsOf(lb).modify(urlMap, (map) => {
+      const steps = isSwapped(lb)
+        ? [(m) => withoutSwap(m, backendService, waker), (m) => withoutHoldRoute(m, backendService), (m) => withoutWakerRoute(m, waker)]
+        : [(m) => withoutErrorPolicy(m, waker), (m) => withoutWakerRoute(m, waker)];
+      return inOneUpdate(map, steps);
     }).catch(absent);
-    await compute.deleteBackendService(name).catch(absent);
+    await deleteService(name, lb).catch(absent);
   }
 
   // Nothing of a failed onboarding stays: a waker backend service left would keep the NEG from being uninstalled.
-  async function undo(id, urlMap, wakerBackendService, cause) {
+  async function undo(cfg, cause) {
+    const { workloadId } = cfg;
     try {
-      await removeFromGoogle({ urlMap, wakerBackendService });
-      await store.deleteWorkload(id);
-      log.warn('OnboardUndone', { workloadId: id, error: cause.message });
+      await removeFromGoogle(cfg);
+      await store.deleteWorkload(workloadId);
+      log.warn('OnboardUndone', { workloadId, error: cause.message });
     } catch (err) {
-      log.error('OnboardNotUndone', { workloadId: id, error: err.message, cause: cause.message });
+      log.error('OnboardNotUndone', { workloadId, error: err.message, cause: cause.message });
     }
   }
 
   async function onboard(input) {
-    const { id, urlMap, backendService, settings } = requested(input);
+    const { id, urlMap, backendService, settings, loadBalancer } = requested(input);
     if (await store.getConfig(id)) throw new Refusal(409, 'exists', `workload ${id} is onboarded already`);
-    const { reasons, vms, groups, negs, hosts, wakerExists } = await inspect({ id, urlMap, backendService });
+    const { reasons, vms, groups, negs, hosts, wakerExists, lb } = await inspect({ id, urlMap, backendService, loadBalancer });
     if (reasons.length) throw new Refusal(400, 'not-eligible', `cannot onboard ${id}: ${reasons.join('; ')}`);
     const name = wakerName(id);
+    const waker = wakerUrl(name, lb);
     const cfg = {
       workloadId: id,
       urlMap,
       backendService,
       wakerBackendService: name,
       hosts,
+      ...(lb.kind === 'global' ? {} : { lb }),
       backends: [
         ...vms.map((vm) => ({
           kind: 'vm',
@@ -326,24 +398,29 @@ export function createOnboarding({ store, compute, urlmaps, core, config, now = 
         ...groups.map((g) => ({ kind: 'mig', location: g.location, name: g.name, id: g.id })),
       ],
       ...DEFAULTS,
+      wakeTimeoutSeconds: defaultWakeSeconds(lb),
       ...settings,
       onboardedAt: isoOf(now()),
     };
     try {
       if (!wakerExists) {
-        await compute.insertBackendService({
+        // M4 (the coverage design's section 10) has not been measured: a classic backend service with EXTERNAL and a regional one, on
+        // the router's serverless NEG, with two custom request headers, are as the design has them, unconfirmed by Google.
+        await insertService({
           name,
-          loadBalancingScheme: SCHEME,
+          loadBalancingScheme: SCHEME_OF[lb.kind],
           protocol: 'HTTPS',
           backends: [{ group: `${COMPUTE}/projects/${config.project}/regions/${config.region}/networkEndpointGroups/${config.wakerNeg}` }],
-          customRequestHeaders: [wakerHeader(id)],
-        });
+          customRequestHeaders: wakerHeaders(id, lb),
+        }, lb);
       }
-      await urlmaps.modify(urlMap, (map) => withWakerRoute(map, backendService, wakerUrl(name)));
+      await mapsOf(lb).modify(urlMap, (map) => inOneUpdate(map, isSwapped(lb)
+        ? [(m) => withWakerRoute(m, backendService, waker), (m) => withHoldRoute(m, backendService)]
+        : [(m) => withWakerRoute(m, backendService, waker)]));
       await store.putConfig(id, cfg);
       await store.initRun(id, now());
     } catch (err) {
-      await undo(id, urlMap, name, err);
+      await undo(cfg, err);
       if (err instanceof UrlMapRefused) throw new Refusal(400, 'not-eligible', `cannot onboard ${id}: ${err.message}`);
       throw err;
     }
@@ -430,20 +507,22 @@ export function createOnboarding({ store, compute, urlmaps, core, config, now = 
   async function move(id, { acts, there, act }) {
     const cfg = await find(id);
     const { state } = (await store.getRun(id)) ?? {};
-    if (acts.includes(state)) await act(id);
+    if (acts.includes(state)) await act(id, cfg);
     else if (state !== there) throw new Refusal(409, 'busy', `workload ${id} is ${state ?? 'UNKNOWN'}`);
     return current(cfg);
   }
 
   // Refused at once with its reason, as its task would be.
-  async function napUnlessPaused(id) {
+  async function napUnlessPaused(id, cfg) {
+    const heldBack = napHeldBack(cfg);
+    if (heldBack) throw new Refusal(409, 'swap-not-ready', `workload ${id} cannot nap yet: ${heldBack}`);
     const [paused] = await core.pausesFor(id);
     if (paused) throw new Refusal(409, 'paused', `workload ${id} is paused by ${paused.by}: ${paused.reason}`);
     await core.napNow(id);
   }
 
   const nap = (id) => move(id, { acts: [STATES.AWAKE], there: STATES.ASLEEP, act: napUnlessPaused });
-  const wake = (id) => move(id, { acts: [STATES.ASLEEP, STATES.FAILED, STATES.NAPPING], there: STATES.AWAKE, act: core.wakeNow });
+  const wake = (id) => move(id, { acts: [STATES.ASLEEP, STATES.FAILED, STATES.NAPPING], there: STATES.AWAKE, act: (workloadId) => core.wakeNow(workloadId) });
 
   // A schedule's answer. One the router cannot read (a time zone Intl refuses) is shown, with no next event.
   function scheduleView(id, schedule) {

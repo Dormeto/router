@@ -125,6 +125,7 @@ export function fromEnvironment(env = process.env, { fetch, log = logger } = {})
   const store = createFirestoreStore({ google, project, database: env.DMT_DATABASE, log });
   const compute = createCompute({ google, project });
   const urlmaps = createUrlMaps({ google, project });
+  const regionalUrlmaps = createUrlMaps({ google, project, region: env.DMT_REGION, scope: 'regional' });
   const core = createController({
     store,
     compute,
@@ -137,5 +138,5 @@ export function fromEnvironment(env = process.env, { fetch, log = logger } = {})
     sleep: (ms) => new Promise((resolve) => { setTimeout(resolve, ms); }),
     log,
   });
-  return createControllerApi({ core, onboarding: createOnboarding({ store, compute, urlmaps, core, config, log }), config });
+  return createControllerApi({ core, onboarding: createOnboarding({ store, compute, urlmaps, regionalUrlmaps, core, config, log }), config });
 }

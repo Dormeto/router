@@ -17,6 +17,7 @@ export const WAKER_URL = `${V1}/global/backendServices/${WAKER}`;
 export const CONTROLLER = 'https://dmtr-europe-west1-controller-123.europe-west1.run.app';
 
 export const serviceUrl = (name) => `${V1}/global/backendServices/${name}`;
+export const regionalUrl = (name, region = REGION) => `${V1}/regions/${region}/backendServices/${name}`;
 export const unmanagedUrl = (name) => `${V1}/zones/${ZONE}/instanceGroups/${name}`;
 const vmUrl = (name, zone = ZONE) => `${V1}/zones/${zone}/instances/${name}`;
 
@@ -40,12 +41,48 @@ export const defaults = () => ({
   },
   unmanaged: { ig: ['vm-a'] },
   managed: {},
+  // By region: `{ urlMaps, httpsProxies, httpProxies, forwardingRules, services }`.
+  regions: {},
   // Zonal NEGs by name: `{ zone?, type?, endpoints: [instance name | {ipAddress}], ...fields of the NEG }`.
   negs: {},
   vms: { 'vm-a': { id: '1001', status: 'RUNNING' } },
   machineTypes: { 'e2-small': { name: 'e2-small', memoryMb: 2048 } },
   autoscalers: {},
 });
+
+// The defaults' load balancer as a classic one: `EXTERNAL` on its forwarding rule and its backend services.
+export function classic(w) {
+  w.forwardingRules[0].loadBalancingScheme = 'EXTERNAL';
+  for (const service of Object.values(w.services)) service.loadBalancingScheme = 'EXTERNAL';
+}
+
+// The same load balancer, regional: its map, proxy, rule and services in the region, nothing of it global.
+export const regionOf = (region = REGION) => {
+  const url = `${V1}/regions/${region}`;
+  const service = (name, backends) => ({ name, loadBalancingScheme: 'EXTERNAL_MANAGED', healthChecks: [`${url}/healthChecks/hc`], backends });
+  return {
+    urlMaps: {
+      lb: {
+        name: 'lb',
+        fingerprint: 'f1',
+        defaultService: regionalUrl('other', region),
+        hostRules: [{ hosts: ['demo.example.com'], pathMatcher: 'm' }],
+        pathMatchers: [{ name: 'm', defaultService: regionalUrl('app', region) }],
+      },
+    },
+    httpsProxies: [{ name: 'lb-https', selfLink: `${url}/targetHttpsProxies/lb-https`, urlMap: `${url}/urlMaps/lb` }],
+    httpProxies: [],
+    forwardingRules: [{ name: 'lb-fr', target: `${url}/targetHttpsProxies/lb-https`, loadBalancingScheme: 'EXTERNAL_MANAGED' }],
+    services: { app: service('app', [{ group: unmanagedUrl('ig') }]), other: service('other', []) },
+  };
+};
+export function regional(w) {
+  w.urlMaps = {};
+  w.httpsProxies = [];
+  w.forwardingRules = [];
+  w.services = {};
+  w.regions[REGION] = regionOf();
+}
 
 const notFound = (what) => new GoogleError(`Google: ${what}: 404 not found`, { code: 404, status: 'NOT_FOUND', reason: 'notFound' });
 
@@ -71,7 +108,33 @@ export function setup(change = () => {}) {
     if (!group || group.location !== location || (kind === 'regions') !== (group.kind === 'regional')) throw notFound(`group ${name}`);
     return group;
   };
+  const inRegion = (region) => w.regions[region] ?? { urlMaps: {}, httpsProxies: [], httpProxies: [], forwardingRules: [], services: {} };
   const ROUTES = [
+    ['GET', /^regions\/([^/]+)\/urlMaps$/, ([region]) => ({ items: Object.values(inRegion(region).urlMaps) })],
+    ['GET', /^regions\/([^/]+)\/urlMaps\/([^/]+)$/, ([region, name]) => {
+      if (!inRegion(region).urlMaps[name]) throw notFound(`URL map ${name}`);
+      return inRegion(region).urlMaps[name];
+    }],
+    ['PUT', /^regions\/([^/]+)\/urlMaps\/([^/]+)$/, ([region, name], body) => {
+      inRegion(region).urlMaps[name] = body;
+      return done(`map ${name}`);
+    }],
+    ['GET', /^regions\/([^/]+)\/targetHttpsProxies$/, ([region]) => ({ items: inRegion(region).httpsProxies })],
+    ['GET', /^regions\/([^/]+)\/targetHttpProxies$/, ([region]) => ({ items: inRegion(region).httpProxies })],
+    ['GET', /^regions\/([^/]+)\/forwardingRules$/, ([region]) => ({ items: inRegion(region).forwardingRules })],
+    ['GET', /^regions\/([^/]+)\/backendServices\/([^/]+)$/, ([region, name]) => {
+      if (!inRegion(region).services[name]) throw notFound(`backend service ${name}`);
+      return inRegion(region).services[name];
+    }],
+    ['POST', /^regions\/([^/]+)\/backendServices$/, ([region], body) => {
+      inRegion(region).services[body.name] = body;
+      return done(`create ${body.name}`);
+    }],
+    ['DELETE', /^regions\/([^/]+)\/backendServices\/([^/]+)$/, ([region, name]) => {
+      if (!inRegion(region).services[name]) throw notFound(`backend service ${name}`);
+      delete inRegion(region).services[name];
+      return done(`delete ${name}`);
+    }],
     ['GET', /^global\/urlMaps$/, () => ({ items: Object.values(w.urlMaps) })],
     ['GET', /^global\/urlMaps\/([^/]+)$/, ([name]) => {
       if (!w.urlMaps[name]) throw notFound(`URL map ${name}`);
@@ -213,6 +276,7 @@ export function setup(change = () => {}) {
   }]));
   const compute = recorded('compute', createCompute({ google, project: 'p', now: clock.now }));
   const urlmaps = recorded('urlmaps', createUrlMaps({ google, project: 'p', now: clock.now }));
+  const regionalUrlmaps = recorded('regionalUrlmaps', createUrlMaps({ google, project: 'p', region: config.region, scope: 'regional', now: clock.now }));
   const tasks = {
     enqueue: async (task) => {
       if (w.fail.enqueue) throw w.fail.enqueue;
@@ -222,7 +286,7 @@ export function setup(change = () => {}) {
   const core = createController({
     store, compute, urlmaps, monitoring: { requestCount: async () => 0 }, tasks, config, now: clock.now, sleep: clock.sleep, newId: () => 'wake-1', log,
   });
-  const onboarding = createOnboarding({ store, compute, urlmaps, core, config, now: clock.now, log });
+  const onboarding = createOnboarding({ store, compute, urlmaps, regionalUrlmaps, core, config, now: clock.now, log });
   return { w, clock, store, core, onboarding, config, log };
 }
 

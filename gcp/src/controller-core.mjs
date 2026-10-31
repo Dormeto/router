@@ -418,6 +418,28 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
     }
   }
 
+  // A NEG's VMs are stopped only while they still are the NEG: one is edited more freely than a group. Why not, else null.
+  // A read that fails throws. The wake needs none of this: starting what was recorded is harmless.
+  async function negsChanged(cfg) {
+    const recorded = new Map();
+    for (const backend of cfg.backends.filter((b) => b.kind === 'vm')) {
+      for (const neg of [backend.neg, ...(backend.moreNegs ?? [])].filter(Boolean)) {
+        const key = `${neg.zone}/${neg.name}`;
+        recorded.set(key, { neg, vms: [...(recorded.get(key)?.vms ?? []), backend.name] });
+      }
+    }
+    const changes = await each([...recorded.values()], async ({ neg, vms }) => {
+      const current = (await compute.listNetworkEndpoints(neg.zone, neg.name)).map((item) => nameOf(item.networkEndpoint?.instance ?? ''));
+      const added = [...new Set(current)].filter((name) => !vms.includes(name));
+      const removed = vms.filter((name) => !current.includes(name));
+      if (!added.length && !removed.length) return null;
+      const parts = [...(added.length ? [`VMs added: ${added.join(', ')}`] : []), ...(removed.length ? [`VMs removed: ${removed.join(', ')}`] : [])];
+      return `network endpoint group ${neg.name} changed since the onboarding (${parts.join('; ')}): offboard and onboard again`;
+    });
+    const found = changes.filter(Boolean);
+    return found.length ? found.join('; ') : null;
+  }
+
   // Why a nap's task no longer holds, else null: a pause written since it was asked for; for a nap window's (`until`, its
   // end), a task delivered late or twice, a window ended or the workload woken since.
   async function napRefusal(workloadId, requestedAt, until) {
@@ -458,6 +480,13 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
         log.warn('NapAborted', { workloadId, reason: err.message });
         await removePolicy(cfg);
         return { state: STATES.AWAKE, aborted: true, error: err.message };
+      }
+      const changed = await negsChanged(cfg);
+      if (changed) {
+        await backToAwake('backends-changed');
+        log.warn('NapAborted', { workloadId, reason: changed });
+        await removePolicy(cfg);
+        return { state: STATES.AWAKE, aborted: true, error: changed };
       }
       const autoscalers = await autoscalersToRecord(cfg, napping);
       // Commit point: after this transition the VMs go, even if a request arrives. The modes are on the run before any
@@ -528,6 +557,11 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
         // What it records may have changed: with the old record, an autoscaler read OFF would lose its mode for good.
         run = await store.getRun(workloadId);
         if (run?.state !== STATES.FAILED) return { state: 'SUPERSEDED' };
+      }
+      const changed = await negsChanged(cfg);
+      if (changed) {
+        log.warn('ReleaseAborted', { workloadId, reason: changed });
+        return { state: STATES.FAILED, error: changed };
       }
       const autoscalers = await autoscalersToRecord(cfg, run);
       // A wake asked meanwhile takes over.

@@ -201,6 +201,7 @@ test('dry run: the VMs of a zonal NEG are unmanaged VMs, as an unmanaged group\'
   assert.ok(w.used.has('compute.listNetworkEndpoints'));
 });
 
+// Google refuses a backend service with both an instance group and a NEG; the mix only shows that one VM is one entry.
 test('dry run: a VM named by a NEG and by an unmanaged group, or by two endpoints, is one VM', async () => {
   const { onboarding } = setup((world) => {
     withNeg(world, { endpoints: ['vm-a', 'vm-a'] });
@@ -227,10 +228,37 @@ test('onboard: a NEG\'s VMs are the workload\'s vm backends, beside a group\'s',
   });
   await onboarding.onboard(INPUT);
   assert.deepEqual((await store.getConfig('demo')).backends, [
-    { kind: 'vm', location: ZONE, name: 'neg-vm', id: '4001' },
+    { kind: 'vm', location: ZONE, name: 'neg-vm', id: '4001', neg: { zone: ZONE, name: 'neg' } },
     { kind: 'vm', location: ZONE, name: 'vm-a', id: '1001' },
   ]);
 });
+
+test('onboard: a VM in two NEGs records the first and the other', async () => {
+  const { store, onboarding } = setup((world) => {
+    withNeg(world);
+    world.negs.second = { endpoints: ['neg-vm'] };
+    world.services.app.backends.push({ group: `${V1}/zones/${ZONE}/networkEndpointGroups/second` });
+  });
+  await onboarding.onboard(INPUT);
+  assert.deepEqual((await store.getConfig('demo')).backends, [
+    { kind: 'vm', location: ZONE, name: 'neg-vm', id: '4001', neg: { zone: ZONE, name: 'neg' }, moreNegs: [{ zone: ZONE, name: 'second' }] },
+  ]);
+});
+
+test('dry run: a NEG whose endpoint names a VM that is gone is refused, naming it', async () => {
+  const { onboarding } = setup((world) => withNeg(world, { endpoints: ['gone-vm'] }));
+  assert.deepEqual((await onboarding.dryRun(INPUT)).reasons.filter((r) => r.includes('gone-vm')), ['network endpoint group neg names the VM gone-vm, which does not exist: remove the endpoint, then onboard again']);
+});
+
+for (const [what, key] of [['the NEG\'s read', `GET zones/${ZONE}/networkEndpointGroups/neg`], ['its endpoints\' read', `POST zones/${ZONE}/networkEndpointGroups/neg/listNetworkEndpoints`]]) {
+  test(`dry run: a 5xx on ${what} is an error, not "not found" or "no endpoint"`, async () => {
+    const { onboarding } = setup((world) => {
+      withNeg(world);
+      world.fail[key] = new GoogleError('Google: 503', { code: 503 });
+    });
+    await assert.rejects(onboarding.dryRun(INPUT), /503/);
+  });
+}
 
 // --- Its input ----------------------------------------------------------------------------------------------------------
 

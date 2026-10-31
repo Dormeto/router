@@ -97,11 +97,13 @@ export function setup(change = () => {}) {
       delete w.services[name];
       return done(`delete ${name}`);
     }],
-    ['POST', /^global\/backendServices\/([^/]+)\/getHealth$/, (_, body) => ({
-      // `w.healthGroups`: the groups (or NEGs) asked about, in order.
-      ...(w.healthGroups.push(body.group), {}),
-      healthStatus: [{ healthState: Object.values(w.vms).some((vm) => vm.status === 'RUNNING') ? 'HEALTHY' : 'UNHEALTHY' }],
-    })],
+    // Healthy when a VM of the asked group runs: a NEG's endpoints, else any VM.
+    ['POST', /^global\/backendServices\/([^/]+)\/getHealth$/, (_, body) => {
+      w.healthGroups.push(body.group);
+      const neg = /\/networkEndpointGroups\/([^/]+)$/.exec(body.group)?.[1];
+      const vms = neg ? (w.negs[neg]?.endpoints ?? []).map((e) => w.vms[typeof e === 'string' ? e : e.instance]).filter(Boolean) : Object.values(w.vms);
+      return { healthStatus: [{ healthState: vms.some((vm) => vm.status === 'RUNNING') ? 'HEALTHY' : 'UNHEALTHY' }] };
+    }],
     ['GET', /^zones\/[^/]+\/instances\/([^/]+)$/, ([name]) => instance(name)],
     ['POST', /^zones\/[^/]+\/instances\/([^/]+)\/(start|stop|suspend|resume)$/, ([name, action]) => {
       w.vms[name].status = STATUS[action];

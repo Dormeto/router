@@ -152,7 +152,7 @@ export function createOnboarding({ store, compute, urlmaps, core, config, now = 
   // A zonal NEG of VMs: `{ reasons, members (its VMs' URLs), neg: true }`. Its VMs stay in it when stopped (measure M1).
   async function negOf(zone, name, service) {
     const neg = await compute.getZonalNetworkEndpointGroup(zone, name).catch(absent);
-    const refused = (reason) => ({ reasons: [reason], members: [], neg: true });
+    const refused = (reason) => ({ reasons: [reason], members: [], neg: { zone, name } });
     if (!neg) return refused(`network endpoint group ${name} of backend service ${service} not found: it was deleted, take it out of the backend service`);
     if (neg.networkEndpointType !== NEG_OF_VMS) return refused(`network endpoint group ${name} of backend service ${service} has the type ${neg.networkEndpointType}: only ${NEG_OF_VMS} is supported, take it out of the backend service`);
     if (name.startsWith(GKE_NEG_PREFIX) || GKE_NEG.test(neg.description ?? '') || Object.keys(neg.annotations ?? {}).some((key) => GKE_NEG.test(key))) {
@@ -162,10 +162,10 @@ export function createOnboarding({ store, compute, urlmaps, core, config, now = 
     if (!endpoints.length) return refused(`network endpoint group ${name} has no endpoint: add a VM to it, then onboard again`);
     const bare = endpoints.filter((endpoint) => !endpoint.instance);
     if (bare.length) return refused(`network endpoint group ${name} has an endpoint with no VM (${bare.map((endpoint) => endpoint.ipAddress).join(', ')}): only endpoints naming a VM are supported, replace it with one`);
-    return { reasons: [], neg: true, members: endpoints.map((endpoint) => `${COMPUTE}/projects/${config.project}/zones/${zone}/instances/${nameOf(endpoint.instance)}`) };
+    return { reasons: [], neg: { zone, name }, members: endpoints.map((endpoint) => `${COMPUTE}/projects/${config.project}/zones/${zone}/instances/${nameOf(endpoint.instance)}`) };
   }
 
-  // A backend of the service: `{ reasons, members (its VMs' URLs), group?, neg? }`, `group` when it is a managed one, `neg` when
+  // A backend of the service: `{ reasons, members (its VMs' URLs), group?, neg? }`, `group` when it is a managed one, `neg` (`{ zone, name }`) when
   // it is a zonal NEG.
   async function backendOf({ group: url }, service) {
     const place = INSTANCE_GROUP.exec(url ?? '');
@@ -214,25 +214,31 @@ export function createOnboarding({ store, compute, urlmaps, core, config, now = 
       if (holder) reasons.push(`managed group ${name} belongs to workload ${holder.workloadId}`);
     }
     const unmanaged = new Set(backends.filter((b) => !b.group).flatMap((b) => b.members));
-    const ofNegs = new Set(backends.filter((b) => b.neg).flatMap((b) => b.members));
+    // A NEG's VMs: URL -> the NEGs naming it, in the order of the service's backends.
+    const negsOf = new Map();
+    for (const b of backends.filter((x) => x.neg)) for (const url of b.members) negsOf.set(url, [...(negsOf.get(url) ?? []), b.neg]);
     const machineTypes = new Map();
     // One read per VM, a VM in two groups of the service being one VM. A group lists a VM it is still creating.
     const read = await Promise.all([...new Set(backends.flatMap((b) => b.members))].map(async (url) => {
       const zone = zoneOf(url);
       const vm = await compute.getInstance(zone, nameOf(url)).catch(absent);
+      if (!vm && negsOf.has(url)) reasons.push(`network endpoint group ${negsOf.get(url)[0].name} names the VM ${nameOf(url)}, which does not exist: remove the endpoint, then onboard again`);
       return vm && { url, zone, vm, problems: await vmProblems(vm, zone, machineTypes) };
     }));
     const vms = [];
+    // The NEGs of each VM that one names, by the VM's name: the nap checks them again.
+    const negs = {};
     for (const { url, zone, vm, problems } of read.filter(Boolean)) {
       reasons.push(...problems);
-      const owner = ofNegs.has(url) && MANAGED_GROUP_OWNER.exec(vm.metadata?.items?.find((item) => item.key === 'created-by')?.value ?? '')?.[1];
+      const owner = negsOf.has(url) && MANAGED_GROUP_OWNER.exec(vm.metadata?.items?.find((item) => item.key === 'created-by')?.value ?? '')?.[1];
       if (owner) reasons.push(`VM ${vm.name} is a member of managed group ${owner}, which would repair it once stopped: put the managed group in the backend service instead of its VM in a network endpoint group`);
       if (!unmanaged.has(url)) continue;
       const holder = holderOf('vm', zone, vm.name);
       if (holder) reasons.push(`VM ${vm.name} belongs to workload ${holder.workloadId}`);
       vms.push({ zone, name: vm.name, selfLink: vm.selfLink, id: String(vm.id) });
+      if (negsOf.has(url)) negs[vm.name] = negsOf.get(url);
     }
-    return { reasons, vms, groups };
+    return { reasons, vms, groups, negs };
   }
 
   // Section 7: why the workload cannot be onboarded, and its VMs and groups. Reads only.
@@ -247,7 +253,7 @@ export function createOnboarding({ store, compute, urlmaps, core, config, now = 
     if (!map) reasons.push(`URL map ${urlMap} not found: name a global URL map of this project`);
     else reasons.push(...await loadBalancerProblems(urlMap));
     if (!service) reasons.push(`backend service ${backendService} not found: name a global backend service of this project`);
-    if (!map || !service) return { reasons, vms: [], groups: [] };
+    if (!map || !service) return { reasons, vms: [], groups: [], negs: {} };
 
     if (service.loadBalancingScheme !== SCHEME) reasons.push(`backend service ${backendService} has the scheme ${service.loadBalancingScheme}: ${NOT_MANAGED}`);
     if (!references(map, backendService).length) reasons.push(`backend service ${backendService} is not named in URL map ${urlMap}: route to it there, or name the URL map that does`);
@@ -266,7 +272,7 @@ export function createOnboarding({ store, compute, urlmaps, core, config, now = 
 
     const backends = await backendsOf(service, others);
     reasons.push(...backends.reasons);
-    return { reasons, vms: backends.vms, groups: backends.groups, hosts: hostsOf(map, backendService), wakerExists: Boolean(existing) };
+    return { reasons, vms: backends.vms, groups: backends.groups, negs: backends.negs, hosts: hostsOf(map, backendService), wakerExists: Boolean(existing) };
   }
 
   async function dryRun(input) {
@@ -299,7 +305,7 @@ export function createOnboarding({ store, compute, urlmaps, core, config, now = 
   async function onboard(input) {
     const { id, urlMap, backendService, settings } = requested(input);
     if (await store.getConfig(id)) throw new Refusal(409, 'exists', `workload ${id} is onboarded already`);
-    const { reasons, vms, groups, hosts, wakerExists } = await inspect({ id, urlMap, backendService });
+    const { reasons, vms, groups, negs, hosts, wakerExists } = await inspect({ id, urlMap, backendService });
     if (reasons.length) throw new Refusal(400, 'not-eligible', `cannot onboard ${id}: ${reasons.join('; ')}`);
     const name = wakerName(id);
     const cfg = {
@@ -309,7 +315,14 @@ export function createOnboarding({ store, compute, urlmaps, core, config, now = 
       wakerBackendService: name,
       hosts,
       backends: [
-        ...vms.map((vm) => ({ kind: 'vm', location: vm.zone, name: vm.name, id: vm.id })),
+        ...vms.map((vm) => ({
+          kind: 'vm',
+          location: vm.zone,
+          name: vm.name,
+          id: vm.id,
+          // The NEGs naming it: a nap stops only what is still in them.
+          ...(negs[vm.name] ? { neg: negs[vm.name][0], ...(negs[vm.name].length > 1 ? { moreNegs: negs[vm.name].slice(1) } : {}) } : {}),
+        })),
         ...groups.map((g) => ({ kind: 'mig', location: g.location, name: g.name, id: g.id })),
       ],
       ...DEFAULTS,

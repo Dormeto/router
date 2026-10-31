@@ -1617,22 +1617,91 @@ test('a second refreshLists task for a list the first just refreshed downloads n
 
 // --- A zonal NEG's VM -----------------------------------------------------------------------------------------------------
 
-test('a zonal NEG\'s VM: healthyCount asks about the NEG, a nap stops the VM, a wake starts it', async () => {
-  const neg = `${V1}/zones/${ZONE}/networkEndpointGroups/neg`;
-  const { w, core, onboarding } = worldOf((world) => {
-    world.negs.neg = { endpoints: ['neg-vm'] };
+const NEG_URL = `${V1}/zones/${ZONE}/networkEndpointGroups/neg`;
+// An onboarded workload whose one backend is the zonal NEG `neg` of `neg-vm` (and `more`).
+async function negWorkload(more = []) {
+  const t = worldOf((world) => {
+    world.negs.neg = { endpoints: ['neg-vm', ...more] };
     world.vms['neg-vm'] = { id: '4001', status: 'RUNNING' };
-    world.services.app.backends = [{ group: neg }];
+    for (const name of more) world.vms[name] = { id: '4002', status: 'RUNNING' };
+    world.services.app.backends = [{ group: NEG_URL }];
   });
-  await onboarding.onboard({ urlMap: 'lb', backendService: 'app', id: 'demo', settings: {} });
-  const napped = await core.nap('demo');
-  assert.equal(napped.state, STATES.ASLEEP);
-  assert.equal(w.vms['neg-vm'].status, 'SUSPENDED');
-  assert.ok(w.changes.includes('suspend neg-vm') || w.changes.includes('stop neg-vm'), w.changes.join());
-  const wakeId = await core.beginWake('demo', STATES.ASLEEP, 'test');
-  const woke = await core.wake('demo', wakeId);
+  await t.onboarding.onboard({ urlMap: 'lb', backendService: 'app', id: 'demo', settings: { hibernate: false } });
+  return t;
+}
+const inMap = (t) => JSON.stringify(t.w.urlMaps.lb).includes('defaultCustomErrorResponsePolicy');
+
+test('a zonal NEG\'s VM: a nap stops it, a wake starts it, and the health is the NEG\'s', async () => {
+  const { w, core } = await negWorkload();
+  assert.equal((await core.nap('demo')).state, STATES.ASLEEP);
+  assert.equal(w.vms['neg-vm'].status, 'TERMINATED');
+  assert.ok(w.changes.includes('stop neg-vm'), w.changes.join());
+  w.healthGroups.length = 0;
+  const woke = await core.wake('demo', await core.beginWake('demo', STATES.ASLEEP, 'test'));
   assert.equal(woke.state, STATES.AWAKE);
   assert.equal(w.vms['neg-vm'].status, 'RUNNING');
+  assert.ok(w.changes.includes('start neg-vm'), w.changes.join());
   assert.ok(w.healthGroups.length > 0);
-  assert.deepEqual([...new Set(w.healthGroups)], [neg]);
+  assert.deepEqual([...new Set(w.healthGroups)], [NEG_URL]);
+});
+
+test('healthyCount by NEG: the NEG\'s own VMs decide, not other VMs of the project', async () => {
+  const t = await negWorkload();
+  t.w.vms['other-vm'] = { id: '9', status: 'RUNNING' };
+  // Asleep, the other VM still running: any VM of the project would make the count 1, only the NEG's own does it after the start.
+  assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
+  t.w.healthGroups.length = 0;
+  const woke = await t.core.wake('demo', await t.core.beginWake('demo', STATES.ASLEEP, 'test'));
+  assert.equal(woke.state, STATES.AWAKE);
+  assert.equal(t.w.vms['neg-vm'].status, 'RUNNING');
+});
+
+const CHANGED = [
+  ['a VM added to the NEG', (w) => { w.negs.neg.endpoints.push('late-vm'); w.vms['late-vm'] = { id: '5', status: 'RUNNING' }; }, /VMs added: late-vm/],
+  ['a VM taken out of the NEG', (w) => { w.negs.neg.endpoints = ['neg-vm-2']; }, /VMs removed: neg-vm\b/],
+];
+for (const [name, change, reason] of CHANGED) {
+  test(`a nap stops nothing after ${name}: awake again (backends-changed), NapAborted, the policy removed`, async () => {
+    const t = await negWorkload(['neg-vm-2']);
+    change(t.w);
+    const out = await t.core.nap('demo');
+    assert.equal(out.state, STATES.AWAKE);
+    assert.equal(out.aborted, true);
+    assert.match(out.error, reason);
+    assert.match(out.error, /offboard and onboard again/);
+    assert.equal(t.w.changes.some((c) => c.startsWith('stop') || c.startsWith('suspend')), false);
+    assert.equal(inMap(t), false);
+    assert.equal((await t.store.getRun('demo')).state, STATES.AWAKE);
+    const aborted = t.w.logs.find((l) => l.event === 'NapAborted');
+    assert.match(aborted.reason, reason);
+  });
+}
+
+test('a NEG read that fails during the nap is a nap failure, never "no change"', async () => {
+  const t = await negWorkload();
+  t.w.fail[`POST zones/${ZONE}/networkEndpointGroups/neg/listNetworkEndpoints`] = new GoogleError('Google: 503', { code: 503 });
+  const out = await t.core.nap('demo');
+  assert.equal(out.state, STATES.FAILED);
+  assert.equal(t.w.changes.some((c) => c.startsWith('stop')), false);
+});
+
+test('release stops nothing of a NEG that changed: the workload stays FAILED', async () => {
+  const t = await negWorkload();
+  t.store.runs.get('demo').state = STATES.FAILED;
+  t.w.negs.neg.endpoints.push('late-vm');
+  t.w.vms['late-vm'] = { id: '5', status: 'RUNNING' };
+  const out = await t.core.release('demo');
+  assert.equal(out.state, STATES.FAILED);
+  assert.match(out.error, /VMs added: late-vm/);
+  assert.equal(t.w.changes.some((c) => c.startsWith('stop')), false);
+});
+
+test('a wake starts what is recorded, whatever the NEG holds by then', async () => {
+  const t = await negWorkload();
+  await t.core.nap('demo');
+  t.w.negs.neg.endpoints = ['other-vm'];
+  t.w.vms['other-vm'] = { id: '6', status: 'TERMINATED' };
+  await t.core.wake('demo', await t.core.beginWake('demo', STATES.ASLEEP, 'test'));
+  assert.equal(t.w.vms['neg-vm'].status, 'RUNNING');
+  assert.equal(t.w.vms['other-vm'].status, 'TERMINATED');
 });

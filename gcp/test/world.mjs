@@ -175,7 +175,7 @@ function kubeFetch(w) {
     const { hostname, pathname, searchParams } = new URL(url);
     const { kube } = w;
     kube.calls.push(`${method} ${pathname}`);
-    kube.lastRequest = { url, headers };
+    if (w.kubeThrows) throw w.kubeThrows;
     if (kube.down) throw new TypeError('fetch failed');
     if (!Object.values(w.clusters).some((c) => c.controlPlaneEndpointsConfig?.dnsEndpointConfig?.endpoint === hostname)) throw new Error(`no cluster at ${hostname}`);
     if (headers.authorization !== `Bearer ${w.routerToken}`) return answered(401, { message: 'no token' });

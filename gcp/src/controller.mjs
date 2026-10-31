@@ -10,6 +10,7 @@ import { createCloudSql } from './cloudsql.mjs';
 import { createCompute } from './compute.mjs';
 import { createController } from './controller-core.mjs';
 import { createFirestoreStore } from './firestore.mjs';
+import { createGke } from './gke.mjs';
 import { createGoogle } from './google.mjs';
 import { createMonitoring } from './monitoring.mjs';
 import { createOnboarding, Refusal } from './onboarding.mjs';
@@ -126,12 +127,14 @@ export function fromEnvironment(env = process.env, { fetch, log = logger } = {})
   const store = createFirestoreStore({ google, project, database: env.DMT_DATABASE, log });
   const compute = createCompute({ google, project });
   const cloudsql = createCloudSql({ google, project });
+  const gke = createGke({ google, project, fetch });
   const urlmaps = createUrlMaps({ google, project });
   const regionalUrlmaps = createUrlMaps({ google, project, region: env.DMT_REGION, scope: 'regional' });
   const core = createController({
     store,
     compute,
     cloudsql,
+    gke,
     urlmaps,
     regionalUrlmaps,
     monitoring: createMonitoring({ google, project }),
@@ -142,5 +145,5 @@ export function fromEnvironment(env = process.env, { fetch, log = logger } = {})
     sleep: (ms) => new Promise((resolve) => { setTimeout(resolve, ms); }),
     log,
   });
-  return createControllerApi({ core, onboarding: createOnboarding({ store, compute, cloudsql, urlmaps, regionalUrlmaps, core, config, log }), config });
+  return createControllerApi({ core, onboarding: createOnboarding({ store, compute, cloudsql, gke, urlmaps, regionalUrlmaps, core, config, log }), config });
 }

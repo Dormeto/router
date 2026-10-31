@@ -512,6 +512,28 @@ test('fromEnvironment: Cloud SQL is read in the environment\'s project', async (
   assert.deepEqual(JSON.parse(res.body).databases, [{ name: 'db', selfLink: 'https://sql/db' }]);
 });
 
+test('fromEnvironment: a GKE cluster is read in the environment\'s project', async () => {
+  const { fetch, seen } = fakeFetch((method, url) => {
+    if (url.includes('firestore.googleapis.com')) return url.includes('/documents/workloads?') ? { documents: [] } : null;
+    if (url.includes('container.googleapis.com')) return { autopilot: { enabled: false }, controlPlaneEndpointsConfig: { dnsEndpointConfig: { endpoint: 'c.europe-west1-b.gke.goog', allowExternalTraffic: true } } };
+    const app = `${V1}/global/backendServices/app`;
+    if (url.endsWith('/global/urlMaps/lb')) return { name: 'lb', defaultService: app, hostRules: [{ hosts: ['demo.example.com'], pathMatcher: 'm' }], pathMatchers: [{ name: 'm', defaultService: app }] };
+    if (url.endsWith('/global/targetHttpsProxies')) return { items: [{ name: 'p', selfLink: `${V1}/global/targetHttpsProxies/p`, urlMap: `${V1}/global/urlMaps/lb` }] };
+    if (url.endsWith('/global/forwardingRules')) return { items: [{ name: 'r', target: `${V1}/global/targetHttpsProxies/p`, loadBalancingScheme: 'EXTERNAL_MANAGED' }] };
+    if (url.endsWith('/global/backendServices/app')) return { name: 'app', loadBalancingScheme: 'EXTERNAL_MANAGED', healthChecks: ['hc'], backends: [{ group: `${V1}/zones/europe-west1-b/networkEndpointGroups/k8s1-a` }] };
+    if (url.endsWith('/networkEndpointGroups/k8s1-a')) return { name: 'k8s1-a', networkEndpointType: 'GCE_VM_IP_PORT', description: '{"namespace":"shop","service-name":"web"}' };
+    if (url.endsWith('/global/urlMaps') || url.endsWith('/global/targetHttpProxies')) return { items: [] };
+    return null;
+  });
+  const handler = fromEnvironment(ENV, { fetch, log: silentLog });
+  const res = await handler(request('POST', '/v1/workloads?dryRun=true', JSON.stringify({ ...INPUT, gke: { cluster: { location: 'europe-west1-b', name: 'shop' } } })));
+  assert.equal(res.statusCode, 200, res.body);
+  assert.ok(seen.includes('GET https://container.googleapis.com/v1/projects/p/locations/europe-west1-b/clusters/shop'), seen.join('\n'));
+  assert.deepEqual(JSON.parse(res.body).reasons, []);
+  assert.deepEqual(JSON.parse(res.body).gke, { cluster: { location: 'europe-west1-b', name: 'shop' }, namespace: 'shop', service: 'web', autopilot: false });
+  assert.equal(seen.some((line) => line.includes('gke.goog')), false, 'no Kubernetes call in a dry run');
+});
+
 test('fromEnvironment: the regional URL maps are those of the environment\'s region', async () => {
   const regionalMap = `${V1}/regions/${REGION}/urlMaps/lb`;
   const { fetch, seen } = fakeFetch((method, url) => {

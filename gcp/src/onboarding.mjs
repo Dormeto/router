@@ -11,10 +11,16 @@
 //
 // Cloud SQL companions (section 9): named at the onboarding, `{ kind: 'cloudsql', name }` among the backends, never without an
 // application. The router reads them at the project; the tag its update needs is the CLI's, bound before this.
+//
+// GKE pods (section 8): `gke` in the request, a `k8s` backend. The dry run reads Google only, as it comes before any right in the cluster (review focus 4): it answers the
+// namespace and the Service its NEGs name, which the CLI reads the owner of and applies the Role in. The onboarding then checks each right and reads the owner.
 import { nextEvents, normalizeSchedule, scheduleProblems } from '../../lambda/src/lib/schedule.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { companionRead, INSTANCE_NAME, isCompanion, statusOf } from './cloudsql.mjs';
 import { groupOf, PauseRefused } from './controller-core.mjs';
+import {
+  clusterProblems, clusterRead, giveBackOwner, gkeMapRefusal, gkeProblems, isGkeNeg, isPods, negsOfService, ownerAsVm, ownerText,
+} from './gke.mjs';
 import { SWITCH_HEADER, WORKLOAD_HEADER, WORKLOAD_ID } from './names.mjs';
 import { inOneUpdate, SWAP_WAIT_MS } from './switch.mjs';
 import {
@@ -33,12 +39,10 @@ const LOCAL_SSD = 'SCRATCH';
 const INSTANCE_GROUP = /\/(zones|regions)\/([^/]+)\/instanceGroups\/([^/]+)$/;
 const NEG_URL = /\/(zones|regions|global)\/(?:([^/]+)\/)?networkEndpointGroups\/([^/]+)$/;
 const NEG_OF_VMS = 'GCE_VM_IP_PORT';
-// What GKE writes in the NEGs it makes (the annotations, or the description), and the prefix of their names.
-const GKE_NEG = /cluster-(uid|name)/i;
-const GKE_NEG_PREFIX = 'k8s1-';
 const MANAGED_GROUP_OWNER = /\/instanceGroupManagers\/([^/]+)$/;
 const DEFAULTS = { idleMinutes: 15, failedRetrySeconds: 60, pollSeconds: 3 };
 const VMS_WAKE_SECONDS = 600;
+const PODS_WAKE_SECONDS = 300;
 // AWS's 1800 s does not fit the request.
 const COMPANION_WAKE_SECONDS = 1700;
 // What an explicit wake's timeout must leave, beyond its URL map's change, under a swap: for the VMs to start at all.
@@ -66,7 +70,9 @@ const isoOf = (ms) => new Date(ms).toISOString();
 const isSwapped = (lb) => Object.hasOwn(SWAP_WAIT_MS, lb.kind);
 const isRegional = (lb) => lb.kind === 'regional';
 // The map's change is included in the wake's time.
-const defaultWakeSeconds = (lb, companions) => Math.min((companions ? COMPANION_WAKE_SECONDS : VMS_WAKE_SECONDS) + (isSwapped(lb) ? SWAP_WAIT_MS[lb.kind] / 1000 : 0), RANGES.wakeTimeoutSeconds[1]);
+const defaultWakeSeconds = (lb, companions, pods) => Math.min((companions ? COMPANION_WAKE_SECONDS : pods ? PODS_WAKE_SECONDS : VMS_WAKE_SECONDS) + (isSwapped(lb) ? SWAP_WAIT_MS[lb.kind] / 1000 : 0), RANGES.wakeTimeoutSeconds[1]);
+const backendText = (backend) => (isPods(backend) ? ownerText(backend) : backend.name);
+const sameCluster = (a, b) => a.location === b.location && a.name === b.name;
 
 // A read's 404, as `.catch(absent)`: null.
 const absent = (err) => {
@@ -142,7 +148,8 @@ function workloadOf(cfg, run, paused) {
   };
 }
 
-export function createOnboarding({ store, compute, cloudsql, urlmaps, regionalUrlmaps, core, config, now = Date.now, log }) {
+export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regionalUrlmaps, core, config, now = Date.now, log }) {
+  const clients = { compute, kubernetesOf: (cluster) => gke.kubernetesOf(cluster) };
   const wakerName = (id) => `dmtr-${config.region}-${id}`;
   const wakerUrl = (name, lb) => `${COMPUTE}/projects/${config.project}/${isRegional(lb) ? `regions/${lb.region}` : 'global'}/backendServices/${name}`;
   const wakerHeaders = (id, lb) => [`${WORKLOAD_HEADER}: ${id}`, ...(isSwapped(lb) ? [`${SWITCH_HEADER}: swap`] : [])];
@@ -151,8 +158,8 @@ export function createOnboarding({ store, compute, cloudsql, urlmaps, regionalUr
   const deleteService = (name, lb) => (isRegional(lb) ? compute.deleteRegionBackendService(lb.region, name) : compute.deleteBackendService(name));
   const insertService = (body, lb) => (isRegional(lb) ? compute.insertRegionBackendService(lb.region, body) : compute.insertBackendService(body));
 
-  // The request's fields, or a 400. Without an ID, the backend service's name, when it is one.
-  function requested({ urlMap, backendService, id, settings = {}, loadBalancer, cloudSql = [] }) {
+  // The request's fields, or a 400. Without an ID, the backend service's name, when it is one. `needsAll`: an onboarding's `gke` names all, a dry run's the cluster alone.
+  function requested({ urlMap, backendService, id, settings = {}, loadBalancer, cloudSql = [], gke: gkeAsked }, { needsAll = false } = {}) {
     if (!urlMap || !backendService) throw bad('urlMap and backendService are needed');
     for (const [key, value] of Object.entries({ urlMap, backendService })) {
       if (typeof value !== 'string' || !NAME.test(value)) throw bad(`${key}: ${JSON.stringify(value)} is not a Compute Engine name`);
@@ -161,9 +168,9 @@ export function createOnboarding({ store, compute, cloudsql, urlmaps, regionalUr
     const workloadId = checkedId(id || backendService);
     const waker = wakerName(workloadId);
     if (waker.length > NAME_MAX) throw bad(`workload ID ${workloadId} would name the waker backend service ${waker}, longer than the ${NAME_MAX} characters of a Compute Engine name: use a shorter one`);
-    const problems = [...settingsProblems(settings), ...cloudSqlProblems(cloudSql)];
+    const problems = [...settingsProblems(settings), ...cloudSqlProblems(cloudSql), ...(gkeAsked === undefined ? [] : gkeProblems(gkeAsked, { needsAll }))];
     if (problems.length) throw bad(problems.join('; '));
-    return { id: workloadId, urlMap, backendService, settings, loadBalancer, cloudSql };
+    return { id: workloadId, urlMap, backendService, settings, loadBalancer, cloudSql, gkeAsked };
   }
 
   // The URL map, `{ map, regional }`, or why it is not one: `{ reason }`. A regional one elsewhere than the router's region reads as none.
@@ -235,7 +242,7 @@ export function createOnboarding({ store, compute, cloudsql, urlmaps, regionalUr
     const refused = (reason) => ({ reasons: [reason], members: [], neg: { zone, name } });
     if (!neg) return refused(`network endpoint group ${name} of backend service ${service} not found: it was deleted, take it out of the backend service`);
     if (neg.networkEndpointType !== NEG_OF_VMS) return refused(`network endpoint group ${name} of backend service ${service} has the type ${neg.networkEndpointType}: only ${NEG_OF_VMS} is supported, take it out of the backend service`);
-    if (name.startsWith(GKE_NEG_PREFIX) || GKE_NEG.test(neg.description ?? '') || Object.keys(neg.annotations ?? {}).some((key) => GKE_NEG.test(key))) {
+    if (isGkeNeg({ ...neg, name })) {
       return refused(`network endpoint group ${name} of backend service ${service} was made by GKE, its endpoints are pods: it needs --gke-cluster`);
     }
     const endpoints = (await compute.listNetworkEndpoints(zone, name)).map((item) => item.networkEndpoint ?? {});
@@ -331,8 +338,32 @@ export function createOnboarding({ store, compute, cloudsql, urlmaps, regionalUr
     return { reasons: found.flatMap((f) => f.reasons), databases: found.flatMap((f) => (f.database ? [f.database] : [])) };
   }
 
-  // Section 7: why the workload cannot be onboarded, its load balancer (`lb`, none when it cannot be told), its VMs, groups and databases. Reads only.
-  async function inspect({ id, urlMap, backendService, loadBalancer, settings, cloudSql }) {
+  // Section 8: what --gke-cluster says of the service's NEGs and of the cluster, from Google alone: what refuses them, `gke` the dry run's answer (with the cluster read) and `podNegs`.
+  async function podsOf(service, asked, others) {
+    const { cluster, owner } = asked;
+    const [{ view, problem }, { reasons, negs, named }] = await Promise.all([clusterRead(gke, cluster), negsOfService(compute, service, asked)]);
+    const place = { namespace: named?.namespace ?? asked.namespace ?? null, service: named?.service ?? asked.service ?? null };
+    const inCluster = others.flatMap((c) => (c.backends ?? []).filter((b) => isPods(b) && sameCluster(b.cluster, cluster)).map((b) => ({ holder: c.workloadId, ...b })));
+    const where = `GKE cluster ${cluster.location}/${cluster.name}`;
+    const holdsService = inCluster.find((b) => b.namespace === place.namespace && b.service === place.service);
+    const holdsOwner = owner && inCluster.find((b) => b.namespace === place.namespace && b.owner.kind === owner.kind && b.owner.name === owner.name);
+    return {
+      reasons: [
+        ...(problem ? [problem] : []),
+        ...reasons,
+        ...(holdsService ? [`Service ${place.namespace}/${place.service} of ${where} belongs to workload ${holdsService.holder}`] : []),
+        ...(holdsOwner ? [`${owner.kind} ${place.namespace}/${owner.name} of ${where} belongs to workload ${holdsOwner.holder}`] : []),
+      ],
+      vms: [],
+      groups: [],
+      negs: {},
+      podNegs: negs,
+      ...(view ? { gke: { cluster, ...place, autopilot: view.autopilot } } : {}),
+    };
+  }
+
+  // Section 7: why the workload cannot be onboarded, its load balancer (`lb`, none when it cannot be told), its VMs, groups and databases, and with `gkeAsked` the NEGs. Reads only.
+  async function inspect({ id, urlMap, backendService, loadBalancer, settings, cloudSql, gkeAsked }) {
     const reasons = [];
     const configs = await store.listConfigs();
     const others = configs.filter((c) => c.workloadId !== id);
@@ -341,6 +372,9 @@ export function createOnboarding({ store, compute, cloudsql, urlmaps, regionalUr
     reasons.push(...companions.reasons);
     const { databases } = companions;
     const nothing = { vms: [], groups: [], negs: {}, databases };
+    // Refused by its name, with nothing read or tried on it.
+    const gkeMap = gkeMapRefusal(urlMap);
+    if (gkeMap) return { reasons: [...reasons, gkeMap], ...nothing };
     const { map, regional, reason } = await findMap(urlMap, loadBalancer);
     if (!map) return { reasons: [...reasons, reason], ...nothing };
     const front = await loadBalancerOf(urlMap, regional, loadBalancer);
@@ -377,14 +411,36 @@ export function createOnboarding({ store, compute, cloudsql, urlmaps, regionalUr
       reasons.push(`backend service ${waker} exists and is not the waker of ${id}: rename it, or onboard under another id`);
     }
 
-    const backends = await backendsOf(service, others);
+    const backends = await (gkeAsked ? podsOf(service, gkeAsked, others) : backendsOf(service, others));
     reasons.push(...backends.reasons);
-    return { reasons, ...told, vms: backends.vms, groups: backends.groups, negs: backends.negs, databases, hosts: hostsOf(map, backendService), wakerExists: Boolean(existing) };
+    return {
+      reasons,
+      ...told,
+      vms: backends.vms,
+      groups: backends.groups,
+      negs: backends.negs,
+      podNegs: backends.podNegs,
+      ...(backends.gke ? { gke: backends.gke } : {}),
+      databases,
+      hosts: hostsOf(map, backendService),
+      wakerExists: Boolean(existing),
+    };
   }
 
+  // `warnings`: what does not refuse it, but its operator should know: spec section 8's limit of a Standard cluster.
   async function dryRun(input) {
-    const { reasons, vms, groups, databases, lb } = await inspect(requested(input));
-    return { eligible: reasons.length === 0, reasons, vms, groups, databases, ...(lb ? { lb } : {}) };
+    const { reasons, vms, groups, databases, lb, gke: pods } = await inspect(requested(input));
+    const standard = pods && !pods.autopilot;
+    return {
+      eligible: reasons.length === 0,
+      reasons,
+      vms,
+      groups,
+      databases,
+      ...(lb ? { lb } : {}),
+      ...(pods ? { gke: pods } : {}),
+      ...(standard ? { warnings: [`GKE cluster ${pods.cluster.location}/${pods.cluster.name} is a Standard cluster: scaling pods saves money only on Autopilot, or with the node autoscaler freeing a node; its fixed nodes are paid all the same`] } : {}),
+    };
   }
 
   // In one update, then the waker backend service: the route and the policy; under a swap, the application back wherever the map
@@ -413,10 +469,22 @@ export function createOnboarding({ store, compute, cloudsql, urlmaps, regionalUr
   }
 
   async function onboard(input) {
-    const { id, urlMap, backendService, settings, loadBalancer, cloudSql } = requested(input);
+    const { id, urlMap, backendService, settings, loadBalancer, cloudSql, gkeAsked } = requested(input, { needsAll: true });
     if (await store.getConfig(id)) throw new Refusal(409, 'exists', `workload ${id} is onboarded already`);
-    const { reasons, vms, groups, negs, databases, hosts, wakerExists, lb } = await inspect({ id, urlMap, backendService, loadBalancer, settings, cloudSql });
+    const { reasons, vms, groups, negs, podNegs, databases, hosts, wakerExists, lb } = await inspect({ id, urlMap, backendService, loadBalancer, settings, cloudSql, gkeAsked });
     if (reasons.length) throw new Refusal(400, 'not-eligible', `cannot onboard ${id}: ${reasons.join('; ')}`);
+    // Spec section 8's shape, whatever else the request carried. The cluster last, and before anything is written: refused, the CLI takes back its RBAC.
+    const pods = gkeAsked && {
+      kind: 'k8s',
+      cluster: { location: gkeAsked.cluster.location, name: gkeAsked.cluster.name },
+      namespace: gkeAsked.namespace,
+      service: gkeAsked.service,
+      owner: { kind: gkeAsked.owner.kind, name: gkeAsked.owner.name },
+    };
+    if (pods) {
+      const problems = await clusterProblems(clients, pods, podNegs);
+      if (problems.length) throw new Refusal(400, 'not-eligible', `cannot onboard ${id}: ${problems.join('; ')}`);
+    }
     const name = wakerName(id);
     const waker = wakerUrl(name, lb);
     const cfg = {
@@ -436,10 +504,11 @@ export function createOnboarding({ store, compute, cloudsql, urlmaps, regionalUr
           ...(negs[vm.name] ? { neg: negs[vm.name][0], ...(negs[vm.name].length > 1 ? { moreNegs: negs[vm.name].slice(1) } : {}) } : {}),
         })),
         ...groups.map((g) => ({ kind: 'mig', location: g.location, name: g.name, id: g.id })),
+        ...(pods ? [pods] : []),
         ...databases.map(({ name: database }) => ({ kind: 'cloudsql', name: database })),
       ],
       ...DEFAULTS,
-      wakeTimeoutSeconds: defaultWakeSeconds(lb, databases.length > 0),
+      wakeTimeoutSeconds: defaultWakeSeconds(lb, databases.length > 0, Boolean(pods)),
       ...settings,
       onboardedAt: isoOf(now()),
     };
@@ -488,12 +557,13 @@ export function createOnboarding({ store, compute, cloudsql, urlmaps, regionalUr
   async function isUp(backend, workloadId) {
     try {
       if (isCompanion(backend)) return statusOf(await cloudsql.get(backend.name)) === 'running';
+      if (isPods(backend)) return (await ownerAsVm(clients, backend)).status === 'RUNNING';
       const statuses = backend.kind === 'mig'
         ? (await compute.listManagedInstances(groupOf(backend))).map((m) => m.instanceStatus)
         : [(await compute.getInstance(backend.location, backend.name)).status];
       return statuses.length > 0 && statuses.every((status) => status === 'RUNNING');
     } catch (err) {
-      log.warn('BackendUnread', { workloadId, backend: backend.name, error: err.message });
+      log.warn('BackendUnread', { workloadId, backend: backendText(backend), error: err.message });
       return false;
     }
   }
@@ -508,9 +578,12 @@ export function createOnboarding({ store, compute, cloudsql, urlmaps, regionalUr
     await Promise.all((run?.autoscalers ?? []).map((a) => compute.setAutoscalerMode(a, a.mode).catch((err) => {
       log.warn('AutoscalerNotGivenBack', { workloadId, autoscaler: a.name, mode: a.mode, error: err.message });
     })));
+    await Promise.all((run?.owners ?? []).map((record) => giveBackOwner(clients, record).catch((err) => {
+      log.warn('AutoscalerNotGivenBack', { workloadId, autoscaler: record.keda?.name, error: err.message });
+    })));
     await removeFromGoogle(cfg);
     await store.deleteWorkload(workloadId);
-    log.warn('Offboarded', { workloadId, force: true, left: left.map((backend) => backend.name) });
+    log.warn('Offboarded', { workloadId, force: true, left: left.map(backendText) });
     return { id: workloadId, left };
   }
 
@@ -525,7 +598,7 @@ export function createOnboarding({ store, compute, cloudsql, urlmaps, regionalUr
       run = await store.getRun(id);
     }
     // A mode the checks could not give back yet: its record goes with the run.
-    await Promise.all((run?.autoscalers ?? []).map((a) => compute.setAutoscalerMode(a, a.mode)));
+    await Promise.all([...(run?.autoscalers ?? []).map((a) => compute.setAutoscalerMode(a, a.mode)), ...(run?.owners ?? []).map((record) => giveBackOwner(clients, record))]);
     await removeFromGoogle(cfg);
     await store.deleteWorkload(id);
     log.info('Offboarded', { workloadId: id });

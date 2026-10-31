@@ -2,7 +2,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { STATES } from '../../lambda/src/lib/state.mjs';
-import { INPUT, REGION, V1, WAKER, ZONE, classic, regional, regionalUrl, serviceUrl, setup, unmanagedUrl } from './world.mjs';
+import {
+  CLUSTER, GKE_NEG, INPUT, REGION, V1, WAKER, ZONE, classic, onGke, regional, regionalUrl, serviceUrl, setup, unmanagedUrl,
+} from './world.mjs';
 
 const GROUP = unmanagedUrl('ig');
 const SCOPES = [
@@ -191,4 +193,45 @@ test('Cloud SQL in the fake: an operation ending in an error leaves the policy a
   clock.advance(w.sqlTakes.ALWAYS);
   assert.deepEqual((await cloudsql.getOperation(op)).error, { errors: [{ code: 'X', message: 'y' }] });
   assert.equal((await cloudsql.get('db')).settings.activationPolicy, 'NEVER');
+});
+
+// --- GKE: what the fake assumes (task R11, before M9 to M12), with each reading a verdict depends on -----------------------------------------
+
+test('the fake of GKE: at 0 replicas a NEG holds no endpoint and is kept, and reads no healthy endpoint, whichever M9 tells', async () => {
+  for (const healthAtZero of ['none', 'unhealthy']) {
+    const { compute } = setup((w) => {
+      onGke(w, { replicas: 0 });
+      w.gkeReading.healthAtZero = healthAtZero;
+    });
+    assert.deepEqual(await compute.listNetworkEndpoints(ZONE, GKE_NEG), []);
+    assert.equal((await compute.getZonalNetworkEndpointGroup(ZONE, GKE_NEG)).name, GKE_NEG);
+    const { healthStatus = [] } = await compute.getBackendServiceHealth('app', `${V1}/zones/${ZONE}/networkEndpointGroups/${GKE_NEG}`);
+    assert.equal(healthStatus.filter((h) => h.healthState === 'HEALTHY').length, 0);
+  }
+});
+
+test('the fake of GKE: a scale moves the NEG\'s endpoints and its health; a pod\'s endpoint names its node or does not', async () => {
+  for (const endpointNames of ['node', 'none']) {
+    const t = setup((w) => {
+      onGke(w, { replicas: 1 });
+      w.gkeReading.endpointNames = endpointNames;
+    });
+    const k8s = await t.gke.kubernetesOf(CLUSTER);
+    const [{ networkEndpoint }] = await t.compute.listNetworkEndpoints(ZONE, GKE_NEG);
+    assert.equal(networkEndpoint.ipAddress, '10.8.0.1');
+    assert.equal(networkEndpoint.instance !== undefined, endpointNames === 'node');
+    await k8s.patch('/apis/apps/v1/namespaces/shop/deployments/web/scale', { spec: { replicas: 3 } });
+    assert.equal((await t.compute.listNetworkEndpoints(ZONE, GKE_NEG)).length, 3);
+    const { healthStatus } = await t.compute.getBackendServiceHealth('app', `${V1}/zones/${ZONE}/networkEndpointGroups/${GKE_NEG}`);
+    assert.equal(healthStatus[0].healthState, 'HEALTHY');
+  }
+});
+
+test('the fake of GKE: outside the Role a 403, and a review answers as the Role does, only in a namespace', async () => {
+  const t = setup(onGke);
+  const k8s = await t.gke.kubernetesOf(CLUSTER);
+  await assert.rejects(k8s.get('/api/v1/nodes/n'), (err) => err.status === 403);
+  assert.equal(await k8s.accessReview({ namespace: 'shop', verb: 'get', group: 'apps', resource: 'deployments' }), true);
+  assert.equal(await k8s.accessReview({ namespace: 'shop', verb: 'delete', group: 'apps', resource: 'deployments' }), false);
+  assert.equal(await k8s.accessReview({ verb: 'get', group: '', resource: 'nodes' }), false);
 });

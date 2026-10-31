@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { GoogleError } from '../src/google.mjs';
 import { Refusal } from '../src/onboarding.mjs';
-import { INPUT, NEG, REGION, V1, WAKER, WAKER_URL, ZONE, CONTROLLER, classic, regionOf, regional, regionalUrl, serviceUrl, setup, unmanagedUrl } from './world.mjs';
+import {
+  CLUSTER, CONTROLLER, GKE_DRY, GKE_INPUT, GKE_NEG, INPUT, K8S_BACKEND, NEG, NEG_READINGS, OWNER, REGION, V1, WAKER, WAKER_URL, ZONE, classic, onGke, regionOf, regional, regionalUrl, serviceUrl, setup, unmanagedUrl,
+} from './world.mjs';
 
 const refused = (status, reason, message) => (err) => {
   assert.ok(err instanceof Refusal, err.stack);
@@ -1472,4 +1474,270 @@ test('offboard of a sleeping workload: the database up, then the application, th
   assert.equal(w.changes[0], 'sql db ALWAYS');
   assert.equal(w.sql.db.settings.activationPolicy, 'ALWAYS');
   assert.equal(store.configs.size, 0);
+});
+
+// --- GKE pods behind standalone NEGs (the coverage design's section 8, over the fake of world.mjs: task R11's assumptions before M9 to M12) ------------------------
+
+const kubeCalls = (w) => w.kube.calls;
+const ALL_READINGS = ['description', 'annotations'];
+
+test('review focus 4: the dry run makes no Kubernetes call, and needs no right in the cluster', async () => {
+  const { w, onboarding } = setup((world) => {
+    onGke(world);
+    // Any call throws, were one made.
+    world.kubeThrows = new Error('a Kubernetes call in a dry run');
+    world.kube.denied = ['get deployments', 'list pods'];
+  });
+  const answer = await onboarding.dryRun(GKE_DRY);
+  assert.deepEqual(answer.reasons, []);
+  assert.equal(answer.eligible, true);
+  assert.deepEqual(kubeCalls(w), []);
+  assert.equal(w.used.has('gke.kubernetesOf'), false);
+  assert.deepEqual(w.changes, []);
+});
+
+for (const reading of ALL_READINGS) {
+  test(`the dry run, the NEG read by its ${reading}: names the cluster alone, answers the namespace, the Service and autopilot, as a boolean`, async () => {
+    const { onboarding } = setup((w) => onGke(w, { reading }));
+    const answer = await onboarding.dryRun(GKE_DRY);
+    assert.deepEqual(answer.gke, { cluster: CLUSTER, namespace: 'shop', service: 'web', autopilot: true });
+    assert.deepEqual(answer.vms, []);
+    assert.deepEqual(answer.groups, []);
+    assert.equal(answer.warnings, undefined);
+  });
+}
+
+test('a dry run with no gke has no gke in its answer, no warnings, and reads no cluster', async () => {
+  const { w, onboarding } = setup();
+  const answer = await onboarding.dryRun(INPUT);
+  assert.equal('gke' in answer, false);
+  assert.equal('warnings' in answer, false);
+  assert.equal(w.used.has('gke.getCluster'), false);
+});
+
+for (const [name, autopilot] of [['autopilot.enabled false', { enabled: false }], ['no autopilot in the answer', undefined]]) {
+  test(`a Standard cluster, ${name}: eligible, the warning in its words, gke.autopilot false`, async () => {
+    const { onboarding } = setup((w) => {
+      onGke(w);
+      w.clusters[`${CLUSTER.location}/${CLUSTER.name}`].autopilot = autopilot;
+    });
+    const answer = await onboarding.dryRun(GKE_DRY);
+    assert.equal(answer.eligible, true);
+    assert.equal(answer.gke.autopilot, false);
+    assert.equal(answer.warnings.length, 1);
+    assert.match(answer.warnings[0], /europe-west1-b\/shop is a Standard cluster: scaling pods saves money only on Autopilot, or with the node autoscaler freeing a node/);
+  });
+}
+
+const GKE_REFUSALS = [
+  ['a cluster that does not exist', (w) => { delete w.clusters[`${CLUSTER.location}/${CLUSTER.name}`]; }, /GKE cluster europe-west1-b\/shop not found/],
+  ['a cluster with no DNS endpoint', (w) => { w.clusters[`${CLUSTER.location}/${CLUSTER.name}`].controlPlaneEndpointsConfig = {}; }, /no DNS endpoint open to traffic.*--enable-dns-access/],
+  ['a DNS endpoint closed to the outside', (w) => { w.clusters[`${CLUSTER.location}/${CLUSTER.name}`].controlPlaneEndpointsConfig.dnsEndpointConfig.allowExternalTraffic = false; }, /no DNS endpoint open to traffic.*--enable-dns-access/],
+  ['a router installed without the feature', (w) => { w.fail[`GET gke/locations/${CLUSTER.location}/clusters/${CLUSTER.name}`] = new GoogleError('Google: 403 denied', { code: 403 }); }, /installed without --with gke/],
+  ['a NEG whose Service cannot be read', (w) => onGke(w, { reading: 'none' }), /cannot read which namespace and Service network endpoint group k8s1-.* belongs to.*a wrong guess would scale someone else's pods/],
+  ['a VM NEG next to the GKE NEG', (w) => {
+    w.negs.vms = { endpoints: ['neg-vm'] };
+    w.vms['neg-vm'] = { id: '4001', status: 'RUNNING' };
+    w.services.app.backends.push({ group: `${V1}/zones/${ZONE}/networkEndpointGroups/vms` });
+  }, /network endpoint group vms of backend service app was not made by GKE, its endpoints are VMs/],
+  ['an instance group next to the GKE NEG', (w) => { w.services.app.backends.push({ group: unmanagedUrl('ig') }); }, /backend ig of backend service app is an instance group/],
+  ['a serverless NEG next to the GKE NEG', (w) => { w.services.app.backends.push({ group: `${V1}/regions/${REGION}/networkEndpointGroups/run` }); }, /backend run of backend service app is a regional network endpoint group \(serverless/],
+  ['a NEG of another Service next to the first', (w) => {
+    w.negs.second = { gkeOwner: OWNER, zone: 'europe-west1-c', ...NEG_READINGS.description('shop', 'admin') };
+    w.services.app.backends.push({ group: `${V1}/zones/europe-west1-c/networkEndpointGroups/second` });
+  }, /belong to different Services \(shop\/web, shop\/admin\)|belongs to Service shop\/admin, not shop\/web/],
+  ['a NEG that is not of pods\' type', (w) => { w.negs[GKE_NEG].type = 'NON_GCP_PRIVATE_IP_PORT'; }, /has the type NON_GCP_PRIVATE_IP_PORT/],
+  ['a NEG that is not there', (w) => { delete w.negs[GKE_NEG]; }, /not found: it was deleted/],
+];
+
+for (const [name, change, words] of GKE_REFUSALS) {
+  test(`dry run and onboarding refuse ${name}, worded, with no Kubernetes call`, async () => {
+    const { w, store, onboarding } = setup((world) => {
+      onGke(world);
+      change(world);
+    });
+    const answer = await onboarding.dryRun(GKE_DRY);
+    assert.equal(answer.eligible, false);
+    assert.match(answer.reasons.join('; '), words);
+    await assert.rejects(onboarding.onboard(GKE_INPUT), refused(400, 'not-eligible', words));
+    assert.deepEqual(kubeCalls(w), []);
+    assert.deepEqual(w.changes, []);
+    assert.equal(store.configs.size, 0);
+  });
+}
+
+test('a GKE NEG with no --gke-cluster stays refused, and a VM NEG with --gke-cluster, alone, is refused', async () => {
+  const neg = setup(onGke);
+  assert.match((await neg.onboarding.dryRun(INPUT)).reasons.join(), /was made by GKE, its endpoints are pods: it needs --gke-cluster/);
+  const vms = setup((w) => {
+    onGke(w);
+    delete w.negs[GKE_NEG];
+    w.negs.vms = { endpoints: ['neg-vm'] };
+    w.vms['neg-vm'] = { id: '4001', status: 'RUNNING' };
+    w.services.app.backends = [{ group: `${V1}/zones/${ZONE}/networkEndpointGroups/vms` }];
+  });
+  assert.match((await vms.onboarding.dryRun(GKE_DRY)).reasons.join(), /was not made by GKE/);
+});
+
+test('--gke-cluster on a mix, the VM NEG first and with no --gke-cluster: refused both ways', async () => {
+  const mix = (w) => {
+    onGke(w);
+    w.negs.vms = { endpoints: ['neg-vm'] };
+    w.vms['neg-vm'] = { id: '4001', status: 'RUNNING' };
+    w.services.app.backends.unshift({ group: `${V1}/zones/${ZONE}/networkEndpointGroups/vms` });
+  };
+  assert.match((await setup(mix).onboarding.dryRun(INPUT)).reasons.join(), /it needs --gke-cluster/);
+  assert.match((await setup(mix).onboarding.dryRun(GKE_DRY)).reasons.join(), /was not made by GKE/);
+});
+
+for (const [name, map] of [['k8s2-', 'k8s2-um-abc-shop-web'], ['gkegw1-', 'gkegw1-abc-shop-gw'], ['gkemcg1-', 'gkemcg1-abc-shop-gw']]) {
+  test(`GKE's own map ${name}: refused, saying how to use a standalone NEG, with nothing written or tried`, async () => {
+    const input = { ...INPUT, urlMap: map };
+    const { w, onboarding, store } = setup((world) => {
+      world.urlMaps[map] = { ...world.urlMaps.lb, name: map };
+      world.httpsProxies[0].urlMap = `${V1}/global/urlMaps/${map}`;
+      delete world.urlMaps.lb;
+    });
+    const words = /belongs to a load balancer GKE owns \(a Gateway or an Ingress\).*standalone network endpoint group with the annotation cloud\.google\.com\/neg/;
+    const answer = await onboarding.dryRun(input);
+    assert.equal(answer.eligible, false);
+    assert.match(answer.reasons.join(), words);
+    await assert.rejects(onboarding.onboard(input), refused(400, 'not-eligible', words));
+    assert.deepEqual(w.changes, []);
+    assert.equal(store.configs.size, 0);
+  });
+}
+
+test('the onboarding: a review per right, the owner read, a k8s backend of the design\'s shape, and pods\' wake timeout', async () => {
+  const { w, store, onboarding } = setup(onGke);
+  const workload = await onboarding.onboard(GKE_INPUT);
+  const backend = { kind: 'k8s', cluster: CLUSTER, namespace: 'shop', service: 'web', owner: { kind: 'Deployment', name: 'web' } };
+  assert.deepEqual(store.configs.get('demo').backends, [backend]);
+  assert.deepEqual(workload.backends, [backend]);
+  assert.equal(store.configs.get('demo').wakeTimeoutSeconds, 300);
+  const reviews = kubeCalls(w).filter((call) => call.endsWith('/selfsubjectaccessreviews'));
+  assert.equal(reviews.length, 26);
+  assert.ok(kubeCalls(w).includes('GET /apis/apps/v1/namespaces/shop/deployments/web'), 'the owner read');
+  assert.deepEqual(w.changes, [`create ${WAKER}`, 'map lb']);
+  assert.ok(kubeCalls(w).every((call) => call.endsWith('/selfsubjectaccessreviews') || call.includes('/namespaces/shop/')), 'nothing outside the namespace');
+});
+
+test('the onboarding of a StatefulSet at 0 replicas: no endpoint is normal', async () => {
+  const { store, onboarding } = setup((w) => {
+    onGke(w, { replicas: 0 });
+    w.kube.owners['StatefulSet shop/db'] = { replicas: 0 };
+  });
+  await onboarding.onboard({ ...GKE_INPUT, gke: { ...GKE_INPUT.gke, owner: { kind: 'StatefulSet', name: 'db' } } });
+  assert.deepEqual(store.configs.get('demo').backends[0].owner, { kind: 'StatefulSet', name: 'db' });
+});
+
+const WAKE_TIMEOUTS = [
+  ['a global load balancer', {}, () => {}, 300],
+  ['a regional one, with SWAP_WAIT', {}, (w) => {
+    const backends = w.services.app.backends;
+    regional(w);
+    w.regions[REGION].services.app.backends = backends;
+  }, 400],
+  ['a classic one, with SWAP_WAIT', {}, classic, 550],
+  ['a companion', { cloudSql: ['db'] }, (w) => { w.sql.db = {}; }, 1700],
+  ['a companion on a classic one: 1700 still wins', { cloudSql: ['db'] }, (w) => {
+    classic(w);
+    w.sql.db = {};
+  }, 1700],
+  ['an explicit one', { settings: { wakeTimeoutSeconds: 123 } }, () => {}, 123],
+];
+for (const [name, extra, change, seconds] of WAKE_TIMEOUTS) {
+  test(`pods' wake timeout: ${name}, ${seconds} s`, async () => {
+    const { store, onboarding } = setup((w) => {
+      onGke(w);
+      change(w);
+    });
+    await onboarding.onboard({ ...GKE_INPUT, ...extra });
+    assert.equal(store.configs.get('demo').wakeTimeoutSeconds, seconds);
+  });
+}
+
+test('a missing right is refused, naming it, with nothing written; the onboarding reads no owner', async () => {
+  const { w, store, onboarding } = setup((world) => {
+    onGke(world);
+    world.kube.denied = ['patch deployments/scale', 'list events'];
+  });
+  await assert.rejects(onboarding.onboard(GKE_INPUT), refused(400, 'not-eligible', /the router lacks patch deployments\/scale \(apps\); list events in namespace shop of GKE cluster europe-west1-b\/shop/));
+  assert.deepEqual(w.changes, []);
+  assert.equal(store.configs.size, 0);
+  assert.equal(kubeCalls(w).includes('GET /apis/apps/v1/namespaces/shop/deployments/web'), false);
+});
+
+test('an owner that does not exist is refused, named', async () => {
+  const { w, onboarding } = setup(onGke);
+  await assert.rejects(onboarding.onboard({ ...GKE_INPUT, gke: { ...GKE_INPUT.gke, owner: { kind: 'Deployment', name: 'gone' } } }), refused(400, 'not-eligible', /Deployment shop\/gone not found in GKE cluster europe-west1-b\/shop/));
+  assert.deepEqual(w.changes, []);
+});
+
+test('an owner not behind the NEG is refused: its endpoints are another\'s pods', async () => {
+  const { w, onboarding } = setup((world) => {
+    onGke(world);
+    world.kube.owners['Deployment shop/admin'] = { replicas: 1 };
+  });
+  await assert.rejects(onboarding.onboard({ ...GKE_INPUT, gke: { ...GKE_INPUT.gke, owner: { kind: 'Deployment', name: 'admin' } } }), refused(400, 'not-eligible', /that are not pods of Deployment shop\/admin/));
+  assert.deepEqual(w.changes, []);
+});
+
+for (const [name, change, words] of [
+  ['another namespace', { namespace: 'admin' }, /belongs to Service shop\/web, not admin\/web/],
+  ['another Service', { service: 'api' }, /belongs to Service shop\/web, not shop\/api/],
+]) {
+  test(`the request naming ${name} than the NEG's: refused, before the cluster`, async () => {
+    const { w, onboarding } = setup(onGke);
+    await assert.rejects(onboarding.onboard({ ...GKE_INPUT, gke: { ...GKE_INPUT.gke, ...change } }), refused(400, 'not-eligible', words));
+    assert.deepEqual(kubeCalls(w), []);
+  });
+}
+
+for (const [name, change] of [
+  ['refuses the reviews with a 403', (w) => { w.kube.answers['POST /apis/authorization.k8s.io/v1/selfsubjectaccessreviews'] = { status: 403, body: { message: 'container.clusters.connect' } }; }],
+  ['cannot be reached', (w) => { w.kube.down = true; }],
+]) {
+  test(`a cluster that ${name}: a refusal in its words, not a 500, nothing written`, async () => {
+    const { w, onboarding } = setup((world) => {
+      onGke(world);
+      change(world);
+    });
+    await assert.rejects(onboarding.onboard(GKE_INPUT), refused(400, 'not-eligible', /the router cannot read GKE cluster europe-west1-b\/shop: /));
+    assert.deepEqual(w.changes, []);
+  });
+}
+
+test('an onboarding needs all of gke, a dry run the cluster alone; a bad field is a 400 before any read', async () => {
+  const { w, onboarding } = setup(onGke);
+  await assert.rejects(onboarding.onboard(GKE_DRY), refused(400, 'bad-request', /an onboarding names its namespace, service and owner/));
+  await assert.rejects(onboarding.dryRun({ ...INPUT, gke: { cluster: { location: 'a/b', name: 'shop' } } }), refused(400, 'bad-request', /gke\.cluster\.location/));
+  await assert.rejects(onboarding.onboard({ ...GKE_INPUT, gke: { ...GKE_INPUT.gke, namespace: '../x' } }), refused(400, 'bad-request', /gke\.namespace/));
+  assert.equal(w.used.size, 0);
+});
+
+test('another workload\'s Service or owner is refused', async () => {
+  const { store, onboarding } = setup(onGke);
+  store.configs.set('first', { workloadId: 'first', backendService: 'other', backends: [K8S_BACKEND] });
+  assert.match((await onboarding.dryRun(GKE_DRY)).reasons.join(), /Service shop\/web of GKE cluster europe-west1-b\/shop belongs to workload first/);
+  store.configs.set('first', { workloadId: 'first', backendService: 'other', backends: [{ ...K8S_BACKEND, service: 'admin' }] });
+  await assert.rejects(onboarding.onboard(GKE_INPUT), refused(400, 'not-eligible', /Deployment shop\/web of GKE cluster europe-west1-b\/shop belongs to workload first/));
+  // Another cluster's, of the same names, is no one's.
+  store.configs.set('first', { workloadId: 'first', backendService: 'other', backends: [{ ...K8S_BACKEND, cluster: { location: ZONE, name: 'elsewhere' } }] });
+  await onboarding.onboard(GKE_INPUT);
+});
+
+test('a regional load balancer\'s NEGs are read through its regional backend service', async () => {
+  const { store, onboarding } = setup((w) => {
+    onGke(w);
+    const { backends } = w.services.app;
+    regional(w);
+    w.regions[REGION].services.app.backends = backends;
+  });
+  const answer = await onboarding.dryRun(GKE_DRY);
+  assert.deepEqual(answer.reasons, []);
+  assert.deepEqual(answer.lb, { kind: 'regional', region: REGION });
+  assert.equal(answer.gke.service, 'web');
+  await onboarding.onboard(GKE_INPUT);
+  assert.deepEqual(store.configs.get('demo').lb, { kind: 'regional', region: REGION });
 });

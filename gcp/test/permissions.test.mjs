@@ -54,8 +54,8 @@ test('dormetoRouter: what a call needs implicitly stays', async () => {
 
 // Google's reference, for each: the group's list calls ask .get on the group, whatever their names say.
 test('a group\'s list calls name what Google\'s reference asks of them', () => {
-  assert.ok(compute.CALLS.listGroupInstances.includes('compute.instanceGroups.get'));
-  assert.ok(compute.CALLS.listManagedInstances.includes('compute.instanceGroupManagers.get'));
+  assert.deepEqual(compute.CALLS.listGroupInstances, ['compute.instanceGroups.get']);
+  assert.deepEqual(compute.CALLS.listManagedInstances, ['compute.instanceGroupManagers.get']);
 });
 
 // Every call the onboarding and the offboarding make, seen by running them: one that CALLS does not name would escape the

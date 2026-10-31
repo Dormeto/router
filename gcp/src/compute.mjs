@@ -13,9 +13,9 @@ const ACTIONS = ['stop', 'start', 'suspend', 'resume'];
 export const CALLS = {
   getInstance: ['compute.instances.get'],
   // Google's reference asks .get on the group of both list calls.
-  listGroupInstances: ['compute.instanceGroups.get', 'compute.instanceGroups.list'],
+  listGroupInstances: ['compute.instanceGroups.get'],
   getManagedGroup: ['compute.instanceGroupManagers.get'],
-  listManagedInstances: ['compute.instanceGroupManagers.get', 'compute.instanceGroupManagers.list'],
+  listManagedInstances: ['compute.instanceGroupManagers.get'],
   getAutoscaler: ['compute.autoscalers.get'],
   setAutoscalerMode: ['compute.autoscalers.update', 'compute.zoneOperations.get', 'compute.regionOperations.get'],
   getBackendService: ['compute.backendServices.get'],

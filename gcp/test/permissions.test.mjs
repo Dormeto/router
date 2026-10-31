@@ -11,7 +11,7 @@ import * as monitoring from '../src/monitoring.mjs';
 import * as tasks from '../src/tasks.mjs';
 import * as firestore from '../src/firestore.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
-import { INPUT, REGION, V1, ZONE, regional, setup } from './world.mjs';
+import { GKE_DRY, GKE_INPUT, INPUT, REGION, V1, ZONE, onGke, regional, setup } from './world.mjs';
 
 const ADAPTERS = { cloudsql, compute, gke, urlmaps, regionalUrlmaps: { CALLS: urlmaps.CALLS_REGIONAL }, monitoring, tasks, firestore };
 
@@ -185,6 +185,26 @@ test('GKE: its calls are the feature\'s role, exactly, and nothing of it is in t
   const needed = [...new Set(Object.values(gke.CALLS).flat())].sort();
   assert.deepEqual(Object.values(features.gke.roles).flatMap((r) => r.permissions).sort(), needed);
   assert.deepEqual(needed.filter((p) => roles.dormetoRouter.permissions.includes(p)), []);
+});
+
+test('a GKE workload, its onboarding, nap, wake, check and offboarding: every call it makes is in CALLS, and in the manifest\'s router grants', async () => {
+  const { w, core, onboarding, store } = setup(onGke);
+  await onboarding.dryRun(GKE_DRY);
+  await onboarding.onboard(GKE_INPUT);
+  assert.equal((await core.nap('demo')).state, STATES.ASLEEP);
+  const wakeId = await core.beginWake('demo', STATES.ASLEEP, 'operator');
+  assert.equal((await core.wake('demo', wakeId)).state, STATES.AWAKE);
+  await core.check();
+  store.runs.get('demo').state = STATES.FAILED;
+  assert.equal((await core.release('demo')).state, STATES.ASLEEP);
+  await onboarding.offboard('demo', { force: true });
+
+  for (const name of ['gke.getCluster', 'gke.kubernetesOf', 'compute.getZonalNetworkEndpointGroup', 'compute.listNetworkEndpoints']) assert.ok(w.used.has(name), `the run did not exercise ${name}`);
+  const permissions = await granted();
+  for (const name of w.used) {
+    assert.ok(callsOf(name)?.length, `${name} is not in CALLS`);
+    for (const p of callsOf(name)) assert.ok(permissions.has(p), `${name} needs ${p}`);
+  }
 });
 
 test('onboarding: a call that waits or names a backend service asks what that takes', () => {

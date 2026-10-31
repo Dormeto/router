@@ -8,14 +8,19 @@
 // and wait, then AWAKE.
 //
 // A workload's configuration: `{ workloadId, urlMap, backendService, wakerBackendService (names), backends: [{ kind: 'vm'
-// | 'mig', location, name } | { kind: 'cloudsql', name }], idleMinutes, wakeTimeoutSeconds, hibernate?, lb? }`. `lb`: `{ kind: 'regional',
+// | 'mig', location, name } | { kind: 'cloudsql', name } | { kind: 'k8s', cluster, namespace, service, owner }], idleMinutes, wakeTimeoutSeconds, hibernate?, lb? }`. `lb`: `{ kind: 'regional',
 // region }` or `{ kind: 'classic' }`, absent for a global load balancer. `config`: `{ project, region, controllerUrl }`.
 //
 // A `cloudsql` backend is a companion (cloudsql.mjs): the VMs and groups, the primaries, alone decide the state and serve; it goes
 // after them and comes back before them, as on AWS.
 //
+// A `k8s` backend is a primary (gke.mjs, section 8 of the coverage design): a GKE owner behind standalone NEGs, its one primary, as a mix with VMs is refused. Read as a VM
+// where the state is decided, its replicas stand for the VM's status. Scaled to 0, its NEG holds no endpoint and none is healthy: the switch, the idle check and the wake's
+// health are the VMs'. `hibernate` means nothing to it.
+//
 // What the run adds to AWS's: `stopped`, `suspended` (the VMs a nap acted on, names), `autoscalers` (`[{ kind, location,
-// name (the autoscaler's), mode }]`, what the wake gives back), `lastWake` (`{ durationMs }`) and `scheduleApplied` (the last
+// name (the autoscaler's), mode }]`, what the wake gives back), `owners` (k8sRecord's: what a nap read of its k8s backends, replicas and KEDA, for
+// the wake), `lastWake` (`{ durationMs }`) and `scheduleApplied` (the last
 // nap or awake window's occurrence applied). The cause and the event of a state change are logged (`StateChanged`): the
 // state history in the manager comes with G2.
 //
@@ -27,7 +32,11 @@ import { resolveHibernation } from '../../lambda/src/lib/hibernation.mjs';
 import { awakeStartWithin, CLOSE_START_MS, maintenanceDue, occurrenceAt } from '../../lambda/src/lib/schedule.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { createListRefresher } from '../../lambda/src/lib/list-refresh.mjs';
+import { createWakeWatch } from '../../lambda/src/lib/wake-watch.mjs';
 import { isCompanion, startDatabase, statusOf, stopDatabase } from './cloudsql.mjs';
+import {
+  giveBackOwner, isPods, ownerAsVm, ownerChanged, ownerRecord, ownerText, podsUnhealthy, recordOf, sleepOwner, wakeOwner, watchRecord,
+} from './gke.mjs';
 import { OPERATION_NOT_DONE } from './google.mjs';
 import { inOneUpdate, switchOf } from './switch.mjs';
 import { mapBusy, references, UrlMapRefused } from './urlmaps.mjs';
@@ -116,7 +125,8 @@ export class PauseRefused extends Error {
   }
 }
 
-export function createController({ store, compute, cloudsql, urlmaps, regionalUrlmaps, monitoring, tasks, config, lists = [], download, now = Date.now, sleep, newId = randomUUID, log }) {
+export function createController({ store, compute, cloudsql, gke, urlmaps, regionalUrlmaps, monitoring, tasks, config, lists = [], download, now = Date.now, sleep, newId = randomUUID, log }) {
+  const pods = { compute, kubernetesOf: (cluster) => gke.kubernetesOf(cluster) };
   const enqueue = (body) => tasks.enqueue({ url: `${config.controllerUrl}/v1/tasks`, body });
 
   async function transition(workloadId, change) {
@@ -176,6 +186,7 @@ export function createController({ store, compute, cloudsql, urlmaps, regionalUr
 
   // A backend's VMs: `{ name, zone, status, url?, error? }`, a managed group's with its URL and its last failure.
   async function vmsOf(backend) {
+    if (isPods(backend)) return [await ownerAsVm(pods, backend)];
     if (backend.kind !== 'mig') {
       return [{ name: backend.name, zone: backend.location, status: (await compute.getInstance(backend.location, backend.name)).status }];
     }
@@ -199,10 +210,13 @@ export function createController({ store, compute, cloudsql, urlmaps, regionalUr
 
   const setAutoscaler = ({ kind, location, name }, mode) => compute.setAutoscalerMode({ kind, location, name }, mode).catch(stillUnderWay);
 
-  // In the service's scope. A service a classic load balancer holds reads no status while its VM is down (M3): none healthy.
+  const readService = ({ backendService, lb }) => (lb?.kind === 'regional' ? compute.getRegionBackendService(lb.region, backendService) : compute.getBackendService(backendService));
+
+  // In the service's scope. A service a classic load balancer holds reads no status while its VM is down (M3): none healthy. M9: a NEG at 0 replicas, whichever it answers,
+  // none healthy either.
   async function healthyCount({ backendService, lb }) {
     const regional = lb?.kind === 'regional';
-    const { backends = [] } = await (regional ? compute.getRegionBackendService(lb.region, backendService) : compute.getBackendService(backendService));
+    const { backends = [] } = await readService({ backendService, lb });
     const answers = await each(backends, ({ group }) => (regional
       ? compute.getRegionBackendServiceHealth(lb.region, backendService, group)
       : compute.getBackendServiceHealth(backendService, group)));
@@ -210,8 +224,12 @@ export function createController({ store, compute, cloudsql, urlmaps, regionalUr
   }
 
   // A VM still going down is waited for (a wake right after a stop); the others are read live, not from the nap's record:
-  // after 60 days Compute Engine turns a suspended VM into a stopped one.
-  async function wakeBackend(backend, deadline) {
+  // after 60 days Compute Engine turns a suspended VM into a stopped one. An owner is read live too.
+  async function wakeBackend(backend, deadline, run) {
+    if (isPods(backend)) {
+      await wakeOwner(pods, backend, recordOf(run.owners, backend));
+      return;
+    }
     for (;;) {
       const vms = await vmsOf(backend);
       if (!vms.some((vm) => GOING.has(vm.status))) {
@@ -224,12 +242,16 @@ export function createController({ store, compute, cloudsql, urlmaps, regionalUr
     }
   }
 
-  const giveBackAutoscalers = (run) => each(run.autoscalers ?? [], (recorded) => setAutoscaler(recorded, recorded.mode));
+  // KEDA is an owner's autoscaler: its pause goes back with the modes, under their rules.
+  const giveBackAutoscalers = async (run) => {
+    await each(run.autoscalers ?? [], (recorded) => setAutoscaler(recorded, recorded.mode));
+    await each(run.owners ?? [], (record) => giveBackOwner(pods, record));
+  };
 
   // The autoscalers get their modes back whatever a VM's start says.
   async function wakeBackends(cfg, run, deadline) {
     try {
-      await each(primariesOf(cfg), (backend) => wakeBackend(backend, deadline));
+      await each(primariesOf(cfg), (backend) => wakeBackend(backend, deadline, run));
     } finally {
       await giveBackAutoscalers(run);
     }
@@ -242,8 +264,10 @@ export function createController({ store, compute, cloudsql, urlmaps, regionalUr
     return false;
   });
 
-  // At the wake's deadline: what a managed group failed on (it keeps trying on its own), else why none is healthy.
-  async function noHealthyError(cfg) {
+  // At the wake's deadline: what a managed group failed on (it keeps trying on its own), else why none is healthy. An owner's pods: with the events the watch read.
+  async function noHealthyError(cfg, watch) {
+    const owner = primariesOf(cfg).find(isPods);
+    if (owner) return podsUnhealthy(owner, watch);
     const vms = await allVms(cfg);
     const refused = vms.find((vm) => vm.error);
     if (refused) return new Error(`${refused.name}: ${refused.error}`);
@@ -266,7 +290,11 @@ export function createController({ store, compute, cloudsql, urlmaps, regionalUr
     }
   }
 
-  async function sleepBackend(backend, hibernate) {
+  async function sleepBackend(backend, hibernate, deadline, owners) {
+    if (isPods(backend)) {
+      await sleepOwner(pods, backend, recordOf(owners, backend), { now, sleep, deadline });
+      return { stopped: [ownerText(backend)], suspended: [] };
+    }
     // Only what runs: Google refuses a request naming a VM being created or started, and the whole nap with it.
     const vms = (await vmsOf(backend)).filter((vm) => vm.status === 'RUNNING');
     const fits = hibernate ? await Promise.all(vms.map(canSuspend)) : vms.map(() => false);
@@ -301,14 +329,17 @@ export function createController({ store, compute, cloudsql, urlmaps, regionalUr
     return [...kept, ...on];
   }
 
+  // What a nap writes on the run of its k8s backends, read now.
+  const ownersToRecord = (cfg, run) => each(cfg.backends.filter(isPods), (backend) => ownerRecord(pods, backend, recordOf(run.owners, backend)));
+
   // Down when this returns, the companions asked to go: an operation's end says little (a managed group's VMs go after it, and its
   // wait may run out before), so the VMs are read until they are. `stillGoing()`: whether the run is still the nap's or the release's:
   // a wake taken over, or asked and kept, needs its database, which is then left alone.
-  async function putToSleep(cfg, autoscalers, latest, stillGoing) {
+  async function putToSleep(cfg, { autoscalers, owners }, latest, stillGoing) {
     const deadline = Math.min(now() + STOP_TIMEOUT_MS, latest);
     await each(autoscalers, (recorded) => setAutoscaler(recorded, 'OFF'));
     const { hibernate } = resolveHibernation({ workload: cfg.hibernate });
-    const done = await each(primariesOf(cfg), (backend) => sleepBackend(backend, hibernate));
+    const done = await each(primariesOf(cfg), (backend) => sleepBackend(backend, hibernate, deadline, owners));
     for (;;) {
       const up = (await allVms(cfg)).filter((vm) => !GONE.has(vm.status));
       if (!up.length) break;
@@ -381,8 +412,12 @@ export function createController({ store, compute, cloudsql, urlmaps, regionalUr
         log.warn('BackendsNotWoken', { workloadId, error: err.message });
         givenBack = await gaveBackAutoscalers(workloadId, run);
       }
+      // A pod that will not run ends the wake when its events say so; one the scheduler cannot place waits for the deadline (the shared code).
+      const watch = createWakeWatch(pods, primariesOf(cfg).filter(isPods).map(watchRecord), { since, now });
       while ((await healthyCount(cfg)) < 1) {
-        if (now() >= deadline) throw await noHealthyError(cfg);
+        const seen = await watch.check();
+        if (seen) throw seen;
+        if (now() >= deadline) throw await noHealthyError(cfg, watch);
         await sleep(POLL_MS);
       }
       if (sw.kind === 'swap') {
@@ -397,7 +432,7 @@ export function createController({ store, compute, cloudsql, urlmaps, regionalUr
       const awake = await transition(workloadId, {
         cond: { state: STATES.WAKING, wakeId },
         set: { state: STATES.AWAKE, awakeSince: now(), lastWake: { durationMs } },
-        remove: ['pendingWake', 'stopped', 'suspended', ...(givenBack ? ['autoscalers'] : []), 'failure', 'consecutiveFailures', 'failedAt'],
+        remove: ['pendingWake', 'stopped', 'suspended', ...(givenBack ? ['autoscalers', 'owners'] : []), 'failure', 'consecutiveFailures', 'failedAt'],
         event: { wakeId, durationMs },
       });
       if (!awake) return superseded();
@@ -497,7 +532,7 @@ export function createController({ store, compute, cloudsql, urlmaps, regionalUr
 
   // A NEG's VMs are stopped only while they still are the NEG: one is edited more freely than a group. Why not, else null; a NEG
   // deleted is one more change, not a failure. A read that fails throws. The wake needs none of this: starting what was recorded
-  // is harmless.
+  // is harmless. An owner's pods legitimately change: what must hold of its NEGs is gke.mjs's, and its being gone throws.
   async function negsChanged(cfg) {
     const recorded = new Map();
     for (const backend of cfg.backends.filter((b) => b.kind === 'vm')) {
@@ -525,7 +560,8 @@ export function createController({ store, compute, cloudsql, urlmaps, regionalUr
       ];
       return `network endpoint group ${neg.name} changed since the onboarding (${parts.join('; ')}): offboard and onboard again`;
     });
-    const found = changes.filter(Boolean);
+    const ownerChanges = await each(cfg.backends.filter(isPods), (backend) => ownerChanged(pods, backend, () => readService(cfg)));
+    const found = [...changes, ...ownerChanges].filter(Boolean);
     return found.length ? found.join('; ') : null;
   }
 
@@ -592,13 +628,14 @@ export function createController({ store, compute, cloudsql, urlmaps, regionalUr
       const changed = await negsChanged(cfg);
       if (changed) return await giveUp('backends-changed', 'warn', { reason: changed, error: changed });
       const autoscalers = await autoscalersToRecord(cfg, napping);
-      // Commit point: after this transition the VMs go, even if a request arrives. The modes are on the run before any
-      // autoscaler is turned off. A pause written since the nap started aborts it, like a request.
+      const owners = await ownersToRecord(cfg, napping);
+      // Commit point: after this transition the VMs go, even if a request arrives. The modes and the replicas are on the run before any
+      // autoscaler is turned off or any owner scaled. A pause written since the nap started aborts it, like a request.
       const paused = await isPaused(workloadId);
-      if (paused || !(await transition(workloadId, { cond: { state: STATES.NAPPING, pendingWake: false }, set: { stopping: true, autoscalers } }))) {
+      if (paused || !(await transition(workloadId, { cond: { state: STATES.NAPPING, pendingWake: false }, set: { stopping: true, autoscalers, ...(owners.length ? { owners } : {}) } }))) {
         return await giveUp(paused ? 'paused' : 'pending-wake', 'info', paused ? { reason: 'paused' } : {});
       }
-      slept = await putToSleep(cfg, autoscalers, latest, async () => {
+      slept = await putToSleep(cfg, { autoscalers, owners }, latest, async () => {
         const current = await store.getRun(workloadId);
         return current?.state === STATES.NAPPING && !current.pendingWake;
       });
@@ -667,9 +704,10 @@ export function createController({ store, compute, cloudsql, urlmaps, regionalUr
         return { state: STATES.FAILED, error: changed };
       }
       const autoscalers = await autoscalersToRecord(cfg, run);
+      const owners = await ownersToRecord(cfg, run);
       // A wake asked meanwhile takes over.
-      if (!(await transition(workloadId, { cond: { state: STATES.FAILED }, set: { autoscalers } }))) return { state: 'SUPERSEDED' };
-      const slept = await putToSleep(cfg, autoscalers, latest, async () => (await store.getRun(workloadId))?.state === STATES.FAILED);
+      if (!(await transition(workloadId, { cond: { state: STATES.FAILED }, set: { autoscalers, ...(owners.length ? { owners } : {}) } }))) return { state: 'SUPERSEDED' };
+      const slept = await putToSleep(cfg, { autoscalers, owners }, latest, async () => (await store.getRun(workloadId))?.state === STATES.FAILED);
       const asleep = await transition(workloadId, { cond: { state: STATES.FAILED }, set: { state: STATES.ASLEEP, ...slept }, cause: 'failed-released', event: slept });
       if (!asleep) return { state: 'SUPERSEDED' };
       log.warn('FailedReleased', { workloadId, ...slept });
@@ -904,12 +942,12 @@ export function createController({ store, compute, cloudsql, urlmaps, regionalUr
         await startWake(workloadId, run, from === STATES.FAILED ? 'recovered' : 'external-start');
         return store.getRun(workloadId);
       }
-      await each(primariesOf(cfg), (backend) => wakeBackend(backend, deadline)).catch((err) => log.warn('BackendsNotWoken', { workloadId, error: err.message }));
+      await each(primariesOf(cfg), (backend) => wakeBackend(backend, deadline, run)).catch((err) => log.warn('BackendsNotWoken', { workloadId, error: err.message }));
       const givenBack = await gaveBackAutoscalers(workloadId, run);
       run = (await transition(workloadId, {
         cond: { state: from },
         set: { state: STATES.AWAKE, awakeSince: now() },
-        remove: ['stopped', 'suspended', ...(givenBack ? ['autoscalers'] : []), 'failure', 'consecutiveFailures', 'failedAt'],
+        remove: ['stopped', 'suspended', ...(givenBack ? ['autoscalers', 'owners'] : []), 'failure', 'consecutiveFailures', 'failedAt'],
         cause: from === STATES.FAILED ? 'recovered' : 'external-start',
       })) ?? (await store.getRun(workloadId));
     } else if (from !== STATES.ASLEEP && vms.length > 0 && vms.every((vm) => DOWN.has(vm.status)) && (await healthyCount(cfg)) < 1) {
@@ -921,8 +959,8 @@ export function createController({ store, compute, cloudsql, urlmaps, regionalUr
       })) ?? store.getRun(workloadId);
     }
     if ([STATES.AWAKE, STATES.ASLEEP, STATES.FAILED].includes(run?.state)) await repair(cfg, run.state);
-    if (from === STATES.AWAKE && run.autoscalers?.length && (await gaveBackAutoscalers(workloadId, run))) {
-      run = (await transition(workloadId, { cond: { state: STATES.AWAKE }, remove: ['autoscalers'] })) ?? run;
+    if (from === STATES.AWAKE && (run.autoscalers?.length || run.owners?.length) && (await gaveBackAutoscalers(workloadId, run))) {
+      run = (await transition(workloadId, { cond: { state: STATES.AWAKE }, remove: ['autoscalers', 'owners'] })) ?? run;
     }
     return run;
   }

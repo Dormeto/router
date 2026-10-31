@@ -1741,3 +1741,60 @@ test('a regional load balancer\'s NEGs are read through its regional backend ser
   await onboarding.onboard(GKE_INPUT);
   assert.deepEqual(store.configs.get('demo').lb, { kind: 'regional', region: REGION });
 });
+
+// --- The offboarding of pods -------------------------------------------------------------------------------------------------
+
+const awakePods = async (change = () => {}) => {
+  const t = setup((w) => {
+    onGke(w);
+    change(w);
+  });
+  await t.onboarding.onboard(GKE_INPUT);
+  return t;
+};
+const KEDA = { metadata: { namespace: 'shop', name: 'web-scaler', annotations: {} }, spec: { scaleTargetRef: { name: 'web' } } };
+const withKeda = (w) => { w.kube.scaledObjects.push(structuredClone(KEDA)); };
+
+test('an offboarding wakes an asleep owner back to its replicas, KEDA given back, and removes what is Dormeto\'s', async () => {
+  const t = await awakePods(withKeda);
+  assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
+  assert.equal(t.w.kube.owners[OWNER].replicas, 0);
+  await t.onboarding.offboard('demo');
+  assert.equal(t.w.kube.owners[OWNER].replicas, 2);
+  assert.deepEqual(t.w.kube.scaledObjects[0].metadata.annotations, {});
+  assert.equal(t.store.configs.size, 0);
+  assert.equal(t.w.services[WAKER], undefined);
+});
+
+test('a forced offboarding: the owner stays at 0 and is named, KEDA given back, the cluster\'s failure no obstacle', async () => {
+  const t = await awakePods(withKeda);
+  assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
+  const { left } = await t.onboarding.offboard('demo', { force: true });
+  assert.deepEqual(left, [K8S_BACKEND]);
+  assert.equal(t.w.kube.owners[OWNER].replicas, 0);
+  assert.deepEqual(t.w.kube.scaledObjects[0].metadata.annotations, {});
+  assert.equal(t.store.configs.size, 0);
+
+  const down = await awakePods(withKeda);
+  assert.equal((await down.core.nap('demo')).state, STATES.ASLEEP);
+  down.w.kube.down = true;
+  assert.deepEqual((await down.onboarding.offboard('demo', { force: true })).left, [K8S_BACKEND]);
+  assert.equal(down.store.configs.size, 0);
+  assert.ok(down.w.logs.some((l) => l.event === 'BackendUnread' && /Deployment shop\/web/.test(l.backend)));
+  assert.ok(down.w.logs.some((l) => l.event === 'AutoscalerNotGivenBack'));
+});
+
+test('a forced offboarding of an awake owner names nothing as left', async () => {
+  const t = await awakePods();
+  assert.deepEqual((await t.onboarding.offboard('demo', { force: true })).left, []);
+});
+
+test('a Workload shows its k8s backend, and hibernate has no meaning for it', async () => {
+  const t = setup(onGke);
+  await t.onboarding.onboard({ ...GKE_INPUT, settings: { hibernate: true } });
+  const shown = await t.onboarding.show('demo');
+  assert.deepEqual(shown.backends, [K8S_BACKEND]);
+  assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
+  assert.equal(t.w.used.has('compute.getInstance'), false);
+  assert.equal(t.w.used.has('compute.suspendInstance'), false);
+});

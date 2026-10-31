@@ -7,7 +7,9 @@ import { createController, PauseRefused } from '../src/controller-core.mjs';
 import { fromFields, toFields } from '../src/firestore.mjs';
 import { GoogleError, OPERATION_NOT_DONE } from '../src/google.mjs';
 import { createUrlMaps, withErrorPolicy, withSwap } from '../src/urlmaps.mjs';
-import { regional as regionalWorld, setup as worldOf } from './world.mjs';
+import {
+  CLUSTER, GKE_INPUT, GKE_NEG, NEG_READINGS, OWNER, classic, onGke, regional as regionalWorld, setup as worldOf,
+} from './world.mjs';
 
 const V1 = 'https://compute.googleapis.com/compute/v1/projects/p';
 const ZONE = 'europe-west1-b';
@@ -3038,4 +3040,541 @@ test('a wake begun during a release\'s 409s: no other try', async () => {
   })(t.google.request);
   assert.equal((await t.core.release('demo')).state, 'SUPERSEDED');
   assert.equal(tries, 2);
+});
+
+// --- GKE pods behind standalone NEGs, over the real adapters and the fake of world.mjs (task R11's assumptions, before M9 to M12) ----------------------------------------
+
+const KEDA_PAUSE = 'autoscaling.keda.sh/paused-replicas';
+const scaler = (annotations = {}) => ({ metadata: { namespace: 'shop', name: 'web-scaler', annotations }, spec: { scaleTargetRef: { name: 'web' } } });
+const withScaler = (annotations) => (w) => { w.kube.scaledObjects.push(scaler(annotations)); };
+const scalerAnnotations = (t) => t.w.kube.scaledObjects[0].metadata.annotations;
+const replicasOf = (t) => t.w.kube.owners[OWNER]?.replicas;
+const SCALE_0 = 'scale shop/web 0';
+const runOf = (t) => t.store.runs.get('demo');
+const logged = (t, event) => t.w.logs.filter((l) => l.event === event);
+const event = (t, reason, message, pod = 'web-0') => ({ type: 'Warning', reason, message, involvedObject: { kind: 'Pod', name: pod }, lastTimestamp: new Date(t).toISOString() });
+
+// A workload `demo`, its Deployment shop/web at 2 replicas behind a standalone NEG, onboarded and awake.
+async function withPods(change = () => {}, input = GKE_INPUT) {
+  const t = worldOf((w) => {
+    onGke(w);
+    change(w);
+  });
+  await t.onboarding.onboard(input);
+  t.w.changes.length = 0;
+  t.w.kube.calls.length = 0;
+  return t;
+}
+const asleepPods = async (change, input) => {
+  const t = await withPods(change, input);
+  assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
+  t.w.changes.length = 0;
+  return t;
+};
+const wakePods = async (t, from = STATES.ASLEEP) => t.core.wake('demo', await t.core.beginWake('demo', from, 'operator'));
+// As each reading M9 and M12 may give: where a NEG names its Service, what a NEG at 0 replicas answers, and whether an endpoint names its node.
+const POD_READINGS = [
+  { reading: 'description', healthAtZero: 'none', endpointNames: 'node' },
+  { reading: 'annotations', healthAtZero: 'unhealthy', endpointNames: 'none' },
+  { reading: 'description', healthAtZero: 'unhealthy', endpointNames: 'node' },
+  { reading: 'annotations', healthAtZero: 'none', endpointNames: 'none' },
+];
+const inPodReading = ({ reading, healthAtZero, endpointNames }) => (w) => {
+  onGke(w, { reading });
+  Object.assign(w.gkeReading, { healthAtZero, endpointNames });
+};
+
+for (const reading of POD_READINGS) {
+  test(`a nap at 0 with the replicas recorded, a wake back to them (${JSON.stringify(reading)})`, async () => {
+    const t = await withPods(inPodReading(reading));
+    assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
+    assert.equal(replicasOf(t), 0);
+    assert.deepEqual(t.w.changes, ['map lb', SCALE_0]);
+    assert.equal(runOf(t).owners[0].replicas, 2);
+    assert.equal(runOf(t).owners[0].keda, null);
+    assert.deepEqual(runOf(t).stopped, ['Deployment shop/web']);
+    t.w.changes.length = 0;
+    assert.equal((await wakePods(t)).state, STATES.AWAKE);
+    assert.equal(replicasOf(t), 2);
+    assert.deepEqual(t.w.changes, ['scale shop/web 2', 'map lb']);
+    assert.equal(runOf(t).owners, undefined);
+    assert.equal(runOf(t).stopped, undefined);
+  });
+}
+
+test('a nap reads the replicas at each nap, not those of the onboarding, nor of the nap before', async () => {
+  const t = await withPods();
+  t.w.kube.owners[OWNER].replicas = 5;
+  await t.core.nap('demo');
+  assert.equal(runOf(t).owners[0].replicas, 5);
+  await wakePods(t);
+  assert.equal(replicasOf(t), 5);
+  t.w.kube.owners[OWNER].replicas = 3;
+  await t.core.nap('demo');
+  await wakePods(t);
+  assert.equal(replicasOf(t), 3);
+});
+
+test('a nap of an owner already at 0: no endpoint is normal, its wake brings 1', async () => {
+  const t = await withPods((w) => { w.kube.owners[OWNER].replicas = 0; });
+  assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
+  assert.equal(runOf(t).owners[0].replicas, 0);
+  assert.equal((await wakePods(t)).state, STATES.AWAKE);
+  assert.equal(replicasOf(t), 1);
+});
+
+test('a nap waits for the pods to go, within its stop timeout', async () => {
+  const t = await withPods((w) => { w.kube.leaving = 3; });
+  assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
+  assert.equal(t.w.kube.owners[OWNER].leavingFrom, undefined);
+  const stuck = await withPods((w) => { w.kube.leaving = 1_000_000; });
+  const out = await stuck.core.nap('demo');
+  assert.equal(out.state, STATES.FAILED);
+  assert.equal(failureOfRun(stuck).kind, 'timeout');
+  assert.match(failureOfRun(stuck).message, /timeout waiting for the pods of Deployment shop\/web to stop/);
+  assert.equal(runOf(stuck).owners[0].replicas, 2);
+});
+
+test('KEDA is paused at 0 before the scale, and given back after the wake\'s: none there before, none after', async () => {
+  const t = await withPods(withScaler());
+  await t.core.nap('demo');
+  assert.deepEqual(t.w.changes, ['map lb', `keda web-scaler {"${KEDA_PAUSE}":"0"}`, SCALE_0]);
+  assert.equal(scalerAnnotations(t)[KEDA_PAUSE], '0');
+  assert.deepEqual(runOf(t).owners[0].keda, { name: 'web-scaler', paused: null });
+  t.w.changes.length = 0;
+  assert.equal((await wakePods(t)).state, STATES.AWAKE);
+  assert.deepEqual(t.w.changes.slice(0, 2), ['scale shop/web 2', `keda web-scaler {"${KEDA_PAUSE}":null}`]);
+  assert.deepEqual(scalerAnnotations(t), {});
+});
+
+test('the customer\'s own KEDA pause is given back as it was', async () => {
+  const t = await withPods(withScaler({ [KEDA_PAUSE]: '4' }));
+  await t.core.nap('demo');
+  assert.equal(scalerAnnotations(t)[KEDA_PAUSE], '0');
+  assert.equal(runOf(t).owners[0].keda.paused, '4');
+  await wakePods(t);
+  assert.equal(scalerAnnotations(t)[KEDA_PAUSE], '4');
+});
+
+test('a cluster without KEDA\'s API: none, nothing asked of it', async () => {
+  const t = await withPods((w) => { w.kube.keda = false; });
+  assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
+  assert.equal(runOf(t).owners[0].keda, null);
+  assert.equal(t.w.changes.some((line) => line.startsWith('keda')), false);
+});
+
+test('a ScaledObject deleted while asleep is nothing to give back, and fails no wake', async () => {
+  const t = await asleepPods(withScaler());
+  t.w.kube.scaledObjects.length = 0;
+  assert.equal((await wakePods(t)).state, STATES.AWAKE);
+});
+
+test('a nap that failed after its scale keeps its record: its release and its wake give back what the first nap read', async () => {
+  const t = await withPods((w) => {
+    w.kube.scaledObjects.push(scaler({ [KEDA_PAUSE]: '4' }));
+    w.kube.leaving = 1_000_000;
+  });
+  assert.equal((await t.core.nap('demo')).state, STATES.FAILED);
+  assert.equal(replicasOf(t), 0);
+  t.w.kube.leaving = 0;
+  delete t.w.kube.owners[OWNER].leavingFrom;
+  assert.equal((await t.core.release('demo')).state, STATES.ASLEEP);
+  assert.equal(runOf(t).owners[0].replicas, 2);
+  assert.equal(runOf(t).owners[0].keda.paused, '4');
+  assert.equal((await wakePods(t)).state, STATES.AWAKE);
+  assert.equal(replicasOf(t), 2);
+  assert.equal(scalerAnnotations(t)[KEDA_PAUSE], '4');
+});
+
+// --- An owner gone, an endpoint not its own ---------------------------------------------------------------------------------------------------------------------------------
+
+test('a nap of an owner gone: failed, worded, before anything is written', async () => {
+  const t = await withPods();
+  delete t.w.kube.owners[OWNER];
+  const out = await t.core.nap('demo');
+  assert.equal(out.state, STATES.FAILED);
+  assert.match(out.error, /Deployment shop\/web not found in GKE cluster europe-west1-b\/shop/);
+  assert.equal(failureOfRun(t).kind, 'configuration');
+  assert.deepEqual(t.w.changes, []);
+});
+
+test('a wake of an owner gone: failed, worded, the switch kept', async () => {
+  const t = await asleepPods();
+  delete t.w.kube.owners[OWNER];
+  const out = await wakePods(t);
+  assert.equal(out.state, STATES.FAILED);
+  assert.match(out.error, /Deployment shop\/web not found in GKE cluster europe-west1-b\/shop/);
+  assert.equal(failureOfRun(t).step, 'wake');
+  assert.deepEqual(t.w.changes, []);
+});
+
+test('an owner gone during the nap\'s wait: failed, worded, nothing scaled', async () => {
+  const t = await withPods();
+  t.w.on['PUT global/urlMaps/lb'] = () => { delete t.w.kube.owners[OWNER]; };
+  const out = await t.core.nap('demo');
+  assert.equal(out.state, STATES.FAILED);
+  assert.match(out.error, /not found in GKE cluster/);
+  assert.equal(t.w.changes.includes(SCALE_0), false);
+});
+
+test('a NEG\'s endpoints belonging to another owner: no scale, no switch, a worded failure, and it keeps serving', async () => {
+  const t = await withPods();
+  t.w.negs[GKE_NEG].foreign = ['10.9.9.9'];
+  const out = await t.core.nap('demo');
+  assert.equal(out.state, STATES.AWAKE);
+  assert.equal(out.aborted, true);
+  assert.match(out.error, new RegExp(`network endpoint group ${GKE_NEG} holds 1 endpoint \\(10\\.9\\.9\\.9\\) that are not pods of Deployment shop/web: nothing is scaled`));
+  assert.deepEqual(t.w.changes, []);
+  assert.equal(replicasOf(t), 2);
+  assert.equal(runOf(t).owners, undefined);
+  assert.equal(logged(t, 'NapAborted')[0].reason, out.error);
+  assert.equal(t.w.logs.find((l) => l.event === 'StateChanged' && l.to === STATES.AWAKE).cause, 'backends-changed');
+});
+
+test('another owner\'s pods behind the NEG, of the same selector: no scale', async () => {
+  const t = await withPods();
+  t.w.kube.pods.push({
+    metadata: { name: 'canary-0', namespace: 'shop', labels: { app: 'web' }, ownerReferences: [{ kind: 'ReplicaSet', name: 'canary-1', controller: true }] },
+    status: { phase: 'Running', podIP: '10.8.0.77', conditions: [{ type: 'Ready', status: 'True' }] },
+  });
+  t.w.negs[GKE_NEG].foreign = ['10.8.0.77'];
+  const out = await t.core.nap('demo');
+  assert.equal(out.aborted, true);
+  assert.equal(replicasOf(t), 2);
+});
+
+test('an endpoint with no address cannot be shown to be a pod: no scale', async () => {
+  const t = await withPods();
+  t.w.negs[GKE_NEG].foreign = [undefined];
+  const out = await t.core.nap('demo');
+  assert.equal(out.aborted, true);
+  assert.match(out.error, /with no address/);
+  assert.equal(replicasOf(t), 2);
+});
+
+test('an endpoint appearing during the nap\'s wait: back awake, the policy removed, nothing scaled', async () => {
+  const t = await withPods();
+  t.w.on['PUT global/urlMaps/lb'] = () => { t.w.negs[GKE_NEG].foreign = ['10.9.9.9']; };
+  const out = await t.core.nap('demo');
+  assert.equal(out.aborted, true);
+  assert.equal(replicasOf(t), 2);
+  assert.equal(runOf(t).state, STATES.AWAKE);
+  assert.equal(t.w.urlMaps.lb.pathMatchers[0].defaultCustomErrorResponsePolicy, undefined);
+});
+
+test('ruling 16: an owner\'s endpoints legitimately change: new pods, scaled up since the onboarding, are no change', async () => {
+  const t = await withPods();
+  t.w.kube.owners[OWNER].replicas = 7;
+  assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
+});
+
+for (const [name, change, words] of [
+  ['a NEG deleted', (w) => { delete w.negs[GKE_NEG]; }, /not found: it was deleted/],
+  ['a NEG now of another Service', (w) => { Object.assign(w.negs[GKE_NEG], NEG_READINGS.description('shop', 'admin')); }, /belongs to Service shop\/admin, not shop\/web/],
+  ['a NEG whose Service no longer reads', (w) => { w.negs[GKE_NEG].description = 'by hand'; }, /cannot read which namespace and Service/],
+  ['a VM group put next to the NEG', (w) => { w.services.app.backends.push({ group: `${V1}/zones/${ZONE}/instanceGroups/ig` }); }, /is an instance group/],
+  ['every NEG taken out', (w) => { w.services.app.backends = []; }, /no longer has a network endpoint group/],
+  ['the backend service deleted', (w) => { delete w.services.app; }, /its backend service no longer exists/],
+]) {
+  test(`ruling 16: ${name} aborts a nap, before anything is written: it acts only on what still is the workload`, async () => {
+    const t = await withPods();
+    change(t.w);
+    const out = await t.core.nap('demo');
+    assert.equal(out.aborted, true);
+    assert.match(out.error, words);
+    assert.match(out.error, /offboard and onboard again/);
+    assert.deepEqual(t.w.changes, []);
+    assert.equal(replicasOf(t), 2);
+  });
+}
+
+test('a release with an endpoint not the owner\'s: nothing scaled, still failed', async () => {
+  const t = await withPods();
+  runOf(t).state = STATES.FAILED;
+  t.w.negs[GKE_NEG].foreign = ['10.9.9.9'];
+  const out = await t.core.release('demo');
+  assert.equal(out.state, STATES.FAILED);
+  assert.match(out.error, /not pods of Deployment shop\/web/);
+  assert.equal(replicasOf(t), 2);
+});
+
+// --- The wake's health --------------------------------------------------------------------------------------------------------------------------------------------------------
+
+test('a wake waits for a healthy endpoint: scaled, not ready for a while, then AWAKE, its policy removed last', async () => {
+  const t = await asleepPods();
+  t.w.kube.unschedulable = true;
+  let polls = 0;
+  t.w.on['GET global/backendServices/app'] = () => {
+    polls += 1;
+    if (polls > 5) t.w.kube.unschedulable = false;
+  };
+  assert.equal((await wakePods(t)).state, STATES.AWAKE);
+  assert.ok(polls > 5);
+  assert.equal(t.w.urlMaps.lb.pathMatchers[0].defaultCustomErrorResponsePolicy, undefined);
+});
+
+test('a pod that stays unschedulable: unhealthy at the deadline, with the Kubernetes events, at 300 s', async () => {
+  const t = await asleepPods();
+  t.w.kube.unschedulable = true;
+  t.w.kube.events.push(event(t.clock.now() + 1000, 'FailedScheduling', '0/3 nodes are available: 3 Insufficient cpu.'));
+  const started = t.clock.now();
+  const out = await wakePods(t);
+  assert.equal(out.state, STATES.FAILED);
+  assert.equal(failureOfRun(t).kind, 'unhealthy');
+  assert.match(failureOfRun(t).message, /^no pod of Deployment shop\/web healthy when the wake timed out: pod web-0: FailedScheduling: 0\/3 nodes are available/);
+  assert.ok(t.clock.now() - started >= 300_000);
+  assert.ok(t.clock.now() - started < 310_000);
+  assert.equal(replicasOf(t), 2);
+});
+
+test('no event read, unhealthy all the same at the deadline', async () => {
+  const t = await asleepPods();
+  t.w.kube.unschedulable = true;
+  assert.equal((await wakePods(t)).state, STATES.FAILED);
+  assert.equal(failureOfRun(t).kind, 'unhealthy');
+  assert.match(failureOfRun(t).message, /^no pod of Deployment shop\/web healthy when the wake timed out$/);
+});
+
+test('an image that cannot be pulled ends the wake when its event says so, not at the deadline', async () => {
+  const t = await asleepPods();
+  t.w.kube.unschedulable = true;
+  t.w.kube.events.push(event(t.clock.now() + 1000, 'Failed', 'ErrImagePull: not found'));
+  const started = t.clock.now();
+  const out = await wakePods(t);
+  assert.equal(out.state, STATES.FAILED);
+  assert.equal(failureOfRun(t).kind, 'configuration');
+  assert.match(failureOfRun(t).message, /ErrImagePull/);
+  assert.ok(t.clock.now() - started < 60_000);
+});
+
+// --- Failures -----------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+test('a Kubernetes 403 reads permission, an unreachable API timeout, at a nap and at a wake', async () => {
+  const forbidden = await withPods();
+  forbidden.w.kube.denied = ['get deployments'];
+  assert.equal((await forbidden.core.nap('demo')).state, STATES.FAILED);
+  assert.equal(failureOfRun(forbidden).kind, 'permission');
+  assert.deepEqual(forbidden.w.changes, []);
+
+  const unreachable = await withPods();
+  unreachable.w.kube.down = true;
+  assert.equal((await unreachable.core.nap('demo')).state, STATES.FAILED);
+  assert.equal(failureOfRun(unreachable).kind, 'timeout');
+  assert.deepEqual(unreachable.w.changes, []);
+
+  const scale = await asleepPods();
+  scale.w.kube.denied = ['patch deployments/scale'];
+  assert.equal((await wakePods(scale)).state, STATES.FAILED);
+  assert.equal(failureOfRun(scale).kind, 'permission');
+
+  const down = await asleepPods();
+  down.w.kube.down = true;
+  assert.equal((await wakePods(down)).state, STATES.FAILED);
+  assert.equal(failureOfRun(down).kind, 'timeout');
+});
+
+test('a 403 on the scale at a nap\'s commit: failed, permission, the record on the run for the wake', async () => {
+  const t = await withPods(withScaler());
+  t.w.kube.denied = ['patch deployments/scale'];
+  assert.equal((await t.core.nap('demo')).state, STATES.FAILED);
+  assert.equal(failureOfRun(t).kind, 'permission');
+  assert.equal(runOf(t).owners[0].replicas, 2);
+  assert.equal(scalerAnnotations(t)[KEDA_PAUSE], '0');
+  t.w.kube.denied = [];
+  // Its pods never left: at the check it is what it is, awake, and KEDA is given back.
+  await t.core.check();
+  assert.equal(runOf(t).state, STATES.AWAKE);
+  assert.deepEqual(scalerAnnotations(t), {});
+  assert.equal(runOf(t).owners, undefined);
+});
+
+// --- The check ----------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+for (const [name, world] of [['a policy', () => {}], ['a swap', classic]]) {
+  test(`the check, under ${name}: asleep with replicas up is as a VM started by hand: AWAKE, the replicas kept, KEDA given back`, async () => {
+    const t = await asleepPods((w) => {
+      world(w);
+      w.kube.scaledObjects.push(scaler());
+    });
+    t.w.kube.owners[OWNER].replicas = 3;
+    await t.core.check();
+    assert.equal(logged(t, 'ExternalWake').length, 1);
+    if (name === 'a swap') {
+      // As a VM's: a wake finishes the job, in a request of its own.
+      assert.equal(runOf(t).state, STATES.WAKING);
+      assert.equal(t.w.tasks.at(-1).body.action, 'wake');
+      assert.equal((await t.core.wake('demo', runOf(t).wakeId)).state, STATES.AWAKE);
+    }
+    assert.equal(runOf(t).state, STATES.AWAKE);
+    assert.equal(replicasOf(t), 3);
+    assert.deepEqual(scalerAnnotations(t), {});
+    assert.equal(runOf(t).owners, undefined);
+  });
+}
+
+test('the check: asleep with replicas up, none healthy yet: left asleep, as a VM starting', async () => {
+  const t = await asleepPods();
+  t.w.kube.unschedulable = true;
+  t.w.kube.owners[OWNER].replicas = 2;
+  await t.core.check();
+  assert.equal(runOf(t).state, STATES.ASLEEP);
+  assert.equal(logged(t, 'ExternalWake').length, 0);
+});
+
+test('the check: KEDA that could not be given back stays recorded, and the next check tries again', async () => {
+  const t = await asleepPods(withScaler());
+  t.w.kube.owners[OWNER].replicas = 2;
+  t.w.kube.denied = ['patch scaledobjects'];
+  await t.core.check();
+  assert.equal(runOf(t).state, STATES.AWAKE);
+  assert.equal(runOf(t).owners.length, 1);
+  assert.equal(logged(t, 'AutoscalersNotGivenBack').length, 1);
+  t.w.kube.denied = [];
+  await t.core.check();
+  assert.equal(runOf(t).owners, undefined);
+  assert.deepEqual(scalerAnnotations(t), {});
+});
+
+for (const healthAtZero of ['none', 'unhealthy']) {
+  test(`the check: awake at 0 is as a VM stopped by hand: the switch, then ASLEEP (a NEG at 0 reads ${healthAtZero})`, async () => {
+    const t = await withPods((w) => { w.gkeReading.healthAtZero = healthAtZero; });
+    t.w.kube.owners[OWNER].replicas = 0;
+    await t.core.check();
+    assert.equal(logged(t, 'ExternalStop').length, 1);
+    assert.equal(runOf(t).state, STATES.ASLEEP);
+    assert.ok(t.w.urlMaps.lb.pathMatchers[0].defaultCustomErrorResponsePolicy, 'the switch');
+    assert.equal(t.w.logs.find((l) => l.event === 'StateChanged' && l.to === STATES.ASLEEP).cause, 'external-stop');
+    // Nothing recorded: its wake brings 1.
+    assert.equal((await wakePods(t)).state, STATES.AWAKE);
+    assert.equal(replicasOf(t), 1);
+  });
+}
+
+test('the check: an owner gone or rolling is left as it is; the state unchanged, nothing scaled', async () => {
+  const t = await withPods();
+  delete t.w.kube.owners[OWNER];
+  await t.core.check();
+  assert.equal(runOf(t).state, STATES.AWAKE);
+  assert.deepEqual(t.w.changes, []);
+  const asleep = await asleepPods();
+  delete asleep.w.kube.owners[OWNER];
+  await asleep.core.check();
+  assert.equal(runOf(asleep).state, STATES.ASLEEP);
+});
+
+test('the check: a cluster out of reach stops only that workload\'s check, and changes nothing', async () => {
+  const t = await withPods();
+  t.w.kube.down = true;
+  const [result] = await t.core.check();
+  assert.match(result.error, /did not answer/);
+  assert.equal(runOf(t).state, STATES.AWAKE);
+  assert.deepEqual(t.w.changes, []);
+});
+
+test('the check: an idle owner is napped, as a VM: the backend service\'s requests decide', async () => {
+  const t = await withPods();
+  t.clock.advance(3_600_000);
+  const [result] = await t.core.check();
+  assert.equal(result.nap, 'requested');
+  assert.equal(t.w.tasks.at(-1).body.action, 'nap');
+});
+
+// --- With the rest ------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+test('a companion with an owner as its primary: down after the pods, up before them', async () => {
+  const t = await withPods((w) => { w.sql.db = {}; }, { ...GKE_INPUT, cloudSql: ['db'] });
+  assert.equal(t.store.configs.get('demo').wakeTimeoutSeconds, 1700);
+  assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
+  assert.deepEqual(t.w.changes, ['map lb', SCALE_0, 'sql db NEVER']);
+  t.clock.advance(t.w.sqlTakes.NEVER);
+  t.w.changes.length = 0;
+  assert.equal((await wakePods(t)).state, STATES.AWAKE);
+  assert.deepEqual(t.w.changes, ['sql db ALWAYS', 'scale shop/web 2', 'map lb']);
+});
+
+test('the companion follows the owner\'s state at the check', async () => {
+  const t = await asleepPods((w) => { w.sql.db = {}; }, { ...GKE_INPUT, cloudSql: ['db'] });
+  t.clock.advance(t.w.sqlTakes.NEVER);
+  t.w.sql.db.settings = { activationPolicy: 'ALWAYS' };
+  await t.core.check();
+  assert.equal(runOf(t).state, STATES.ASLEEP);
+  assert.ok(t.w.changes.includes('sql db NEVER'));
+});
+
+for (const [name, world, waits] of [
+  ['regional', (w) => {
+    const { backends } = w.services.app;
+    regionalWorld(w);
+    w.regions['europe-west1'].services.app.backends = backends;
+  }, 100_000],
+  ['classic', classic, 250_000],
+]) {
+  test(`pods under a ${name} load balancer's swap: swapped, waited, scaled; scaled, healthy, unswapped, waited`, async () => {
+    const t = await withPods(world);
+    assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
+    assert.deepEqual(t.w.changes, ['map lb', SCALE_0]);
+    assert.equal(runOf(t).owners[0].replicas, 2);
+    t.w.changes.length = 0;
+    const before = t.clock.now();
+    assert.equal((await wakePods(t)).state, STATES.AWAKE);
+    assert.deepEqual(t.w.changes, ['scale shop/web 2', 'map lb']);
+    assert.ok(t.clock.now() - before >= waits);
+  });
+}
+
+test('review focus 4: a nap, a wake and a check call nothing outside the namespace, and no node', async () => {
+  const t = await asleepPods(withScaler());
+  await wakePods(t);
+  t.clock.advance(3_600_000);
+  await t.core.check();
+  assert.ok(t.w.kube.calls.length > 0);
+  for (const call of t.w.kube.calls) assert.match(call, /^(GET|PATCH) \/(api\/v1|apis\/[^/]+\/[^/]+)\/namespaces\/shop\//, call);
+});
+
+test('the fake refuses what the Role does not hold: a node\'s read is a 403, so that passing above says something', async () => {
+  const t = await withPods();
+  await assert.rejects((await t.gke.kubernetesOf(CLUSTER)).get('/api/v1/nodes/gke-shop-node-1'), (err) => err.status === 403);
+  await assert.rejects((await t.gke.kubernetesOf(CLUSTER)).list('/apis/apps/v1/deployments'), (err) => err.status === 403);
+});
+
+test('a VM workload reads no cluster, whatever is done to it', async () => {
+  const t = worldOf();
+  await t.onboarding.onboard({ urlMap: 'lb', backendService: 'app', id: 'demo' });
+  await t.core.nap('demo');
+  await t.core.check();
+  await wakePods(t);
+  assert.deepEqual(t.w.kube.calls, []);
+  assert.equal(runOf(t).owners, undefined);
+  assert.equal([...t.w.used].some((name) => name.startsWith('gke.')), false);
+});
+
+test('a StatefulSet naps and wakes as a Deployment: its pods are its own, with no ReplicaSet', async () => {
+  const STATEFUL = 'StatefulSet shop/db';
+  const t = await withPods((w) => {
+    delete w.kube.owners[OWNER];
+    w.kube.owners[STATEFUL] = { replicas: 3 };
+    w.negs[GKE_NEG].gkeOwner = STATEFUL;
+  }, { ...GKE_INPUT, gke: { ...GKE_INPUT.gke, owner: { kind: 'StatefulSet', name: 'db' } } });
+  assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
+  assert.equal(t.w.kube.owners[STATEFUL].replicas, 0);
+  assert.equal(t.w.kube.calls.some((call) => call.includes('replicasets')), false);
+  assert.equal((await wakePods(t)).state, STATES.AWAKE);
+  assert.equal(t.w.kube.owners[STATEFUL].replicas, 3);
+});
+
+test('what a nap records of an owner goes through Firestore\'s fields unchanged', async () => {
+  const t = await asleepPods(withScaler({ [KEDA_PAUSE]: '4' }));
+  const [record] = runOf(t).owners;
+  assert.deepEqual(record, {
+    kind: 'k8s',
+    id: 'europe-west1-b/shop/shop/Deployment/web',
+    cluster: CLUSTER,
+    namespace: 'shop',
+    owner: { kind: 'Deployment', name: 'web' },
+    replicas: 2,
+    keda: { name: 'web-scaler', paused: '4' },
+  });
+  assert.deepEqual(fromFields(toFields(record)), record);
+  const none = await asleepPods();
+  assert.deepEqual(fromFields(toFields(runOf(none).owners[0])), runOf(none).owners[0]);
 });

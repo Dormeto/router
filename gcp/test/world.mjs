@@ -5,6 +5,7 @@ import { fakeClock } from '../../lambda/test/fakes.mjs';
 import { createCloudSql } from '../src/cloudsql.mjs';
 import { createCompute } from '../src/compute.mjs';
 import { createController } from '../src/controller-core.mjs';
+import { createGke } from '../src/gke.mjs';
 import { GoogleError } from '../src/google.mjs';
 import { createOnboarding } from '../src/onboarding.mjs';
 import { createUrlMaps } from '../src/urlmaps.mjs';
@@ -58,6 +59,15 @@ export const defaults = () => ({
   // What M6 has not told yet, where a test's verdict depends on it: when the policy reads as asked ('at-once', 'at-end'), what an
   // operation in error leaves ('kept', 'changed'), what `state` reads during an operation, and how long an operation stays out of the list.
   sqlReading: { policy: 'at-once', failedPolicy: 'kept', stateDuring: 'RUNNABLE', listLagMs: 0 },
+  // GKE clusters by `<location>/<name>`: what clusters.get answers (M11).
+  clusters: {},
+  // A cluster's Kubernetes API, as task R11 assumes it before M9, M11 and M12. `owners`: by `<kind> <namespace>/<name>`, `{ replicas }`, its pods
+  // following them; `pods`: others, as the API shows them. `denied`: rights the Role lacks here, as `<verb> <resource>`. `calls`: each one, `<METHOD> <path>`.
+  // `unschedulable`: pods stay Pending, with no address. `leaving`: lists of pods during which those scaled away are still there.
+  kube: { owners: {}, pods: [], scaledObjects: [], events: [], denied: [], calls: [], answers: {}, keda: true, down: false, unschedulable: false, leaving: 0 },
+  // What M9 and M12 have not told yet, where a test's verdict depends on it: what `getHealth` says of a NEG with no endpoint ('none', 'unhealthy'),
+  // and whether a pod's endpoint names its node ('node', 'none').
+  gkeReading: { healthAtZero: 'none', endpointNames: 'node' },
 });
 
 // The defaults' load balancer as a classic one: `EXTERNAL` on its forwarding rule and its backend services.
@@ -95,6 +105,7 @@ export function regional(w) {
 }
 
 const SQLADMIN = 'https://sqladmin.googleapis.com/v1/projects/p/';
+const CONTAINER = 'https://container.googleapis.com/v1/projects/p/';
 const notFound = (what) => new GoogleError(`Google: ${what}: 404 not found`, { code: 404, status: 'NOT_FOUND', reason: 'notFound' });
 
 // Every backend service a URL map names, wherever it does: its defaults, its rules, their weights, its policies and tests.
@@ -105,11 +116,145 @@ const servicesNamed = (value) => {
   return Object.entries(value).flatMap(([key, field]) => (SERVICE_KEYS.has(key) && typeof field === 'string' ? [field] : servicesNamed(field)));
 };
 
+// --- A GKE cluster's API, over `fetch` -------------------------------------------------------------------------------------
+
+// The Role the CLI applies (cli/internal/gcponboard/rbac.go), a copy of its own: `<group> <resource>`: verbs. Anything else is a 403, as RBAC
+// answers: a call outside the namespace, such as a node's, fails the code here as it would there.
+const ROLE = {
+  'apps deployments': ['get', 'list', 'watch'],
+  'apps statefulsets': ['get', 'list', 'watch'],
+  'apps replicasets': ['get', 'list', 'watch'],
+  'apps deployments/scale': ['get', 'patch'],
+  'apps statefulsets/scale': ['get', 'patch'],
+  ' pods': ['get', 'list', 'watch'],
+  ' services': ['get', 'list', 'watch'],
+  ' events': ['get', 'list', 'watch'],
+  'keda.sh scaledobjects': ['get', 'list', 'watch', 'patch'],
+};
+const KINDS = { deployments: 'Deployment', statefulsets: 'StatefulSet' };
+const answered = (status, body) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+const kubeStatus = (status, reason, message) => answered(status, { kind: 'Status', status: 'Failure', reason, message, code: status });
+
+const selects = (selector, labels = {}) => !selector || selector.split(',').every((term) => {
+  const [key, value] = term.split('=');
+  return labels[key] === value;
+});
+
+// The owner's pods as the API lists them, named and addressed by their index.
+const podsOfOwner = (kube, key) => {
+  const owner = kube.owners[key];
+  const [kind, ref] = key.split(' ');
+  const [namespace, name] = ref.split('/');
+  const count = Math.max(owner.replicas, owner.leavingFrom ?? 0);
+  return Array.from({ length: count }, (_, i) => {
+    const leaving = i >= owner.replicas;
+    return {
+      metadata: {
+        name: `${name}-${i}`,
+        namespace,
+        labels: { app: name },
+        ownerReferences: [{ kind: kind === 'Deployment' ? 'ReplicaSet' : kind, name: kind === 'Deployment' ? `${name}-5d4f8` : name, controller: true }],
+        ...(leaving ? { deletionTimestamp: '2026-11-02T00:00:00Z' } : {}),
+      },
+      status: kube.unschedulable
+        ? { phase: 'Pending', conditions: [{ type: 'PodScheduled', status: 'False' }] }
+        : { phase: 'Running', podIP: `10.8.0.${i + 1}`, conditions: [{ type: 'Ready', status: 'True' }] },
+    };
+  });
+};
+const allPods = (kube) => [...Object.keys(kube.owners).flatMap((key) => podsOfOwner(kube, key)), ...kube.pods];
+const readyPods = (kube, key) => podsOfOwner(kube, key).filter((pod) => !pod.metadata.deletionTimestamp && pod.status.phase === 'Running');
+
+// What the NEG of an owner holds: its ready pods, and `foreign` addresses.
+const endpointsOfNeg = (w, { gkeOwner, foreign = [], empty }) => [...(empty ? [] : readyPods(w.kube, gkeOwner).map((pod) => pod.status.podIP)), ...foreign].map((ipAddress) => ({
+  ...(w.gkeReading.endpointNames === 'node' ? { instance: 'gke-shop-node-1' } : {}), ipAddress, port: 8080,
+}));
+
+function kubeFetch(w) {
+  return async (url, { method = 'GET', headers = {}, body } = {}) => {
+    const { hostname, pathname, searchParams } = new URL(url);
+    const { kube } = w;
+    kube.calls.push(`${method} ${pathname}`);
+    kube.lastRequest = { url, headers };
+    if (kube.down) throw new TypeError('fetch failed');
+    if (!Object.values(w.clusters).some((c) => c.controlPlaneEndpointsConfig?.dnsEndpointConfig?.endpoint === hostname)) throw new Error(`no cluster at ${hostname}`);
+    if (headers.authorization !== `Bearer ${w.routerToken}`) return answered(401, { message: 'no token' });
+    const canned = kube.answers[`${method} ${pathname}`];
+    if (canned) return answered(canned.status, canned.body);
+    if (pathname === '/apis/authorization.k8s.io/v1/selfsubjectaccessreviews') {
+      const { namespace, verb, group, resource, subresource } = JSON.parse(body).spec.resourceAttributes;
+      const full = subresource ? `${resource}/${subresource}` : resource;
+      return answered(201, { status: { allowed: Boolean(namespace) && (ROLE[`${group} ${full}`] ?? []).includes(verb) && !kube.denied.includes(`${verb} ${full}`) } });
+    }
+    const allowed = (group, resource, verb, words) => {
+      if ((ROLE[`${group} ${resource}`] ?? []).includes(verb) && !kube.denied.includes(`${verb} ${resource}`)) return null;
+      return kubeStatus(403, 'Forbidden', `${words} is forbidden: User cannot ${verb} resource ${resource}`);
+    };
+    const owner = /^\/apis\/apps\/v1\/namespaces\/([^/]+)\/(deployments|statefulsets)\/([^/]+)(\/scale)?$/.exec(pathname);
+    if (owner) {
+      const [, namespace, resource, name, scale] = owner;
+      const refused = allowed('apps', `${resource}${scale ?? ''}`, method === 'PATCH' ? 'patch' : 'get', `${resource}.apps "${name}"`);
+      if (refused) return refused;
+      const found = kube.owners[`${KINDS[resource]} ${namespace}/${name}`];
+      if (!found) return kubeStatus(404, 'NotFound', `${resource}.apps "${name}" not found`);
+      if (method === 'PATCH') {
+        const next = JSON.parse(body).spec.replicas;
+        if (next < found.replicas && kube.leaving) Object.assign(found, { leavingFrom: found.replicas, leavingReads: kube.leaving });
+        found.replicas = next;
+        w.changes.push(`scale ${namespace}/${name} ${next}`);
+      }
+      return answered(200, { metadata: { name, namespace }, spec: { replicas: found.replicas, selector: { matchLabels: { app: name } } } });
+    }
+    const sets = /^\/apis\/apps\/v1\/namespaces\/([^/]+)\/replicasets$/.exec(pathname);
+    if (sets) {
+      const refused = allowed('apps', 'replicasets', 'list', 'replicasets.apps');
+      if (refused) return refused;
+      const items = Object.keys(kube.owners).filter((key) => key.startsWith(`Deployment ${sets[1]}/`)).map((key) => {
+        const name = key.slice(key.indexOf('/') + 1);
+        return { metadata: { name: `${name}-5d4f8`, ownerReferences: [{ kind: 'Deployment', name, controller: true }] } };
+      });
+      return answered(200, { items });
+    }
+    const pods = /^\/api\/v1\/namespaces\/([^/]+)\/pods$/.exec(pathname);
+    if (pods) {
+      const refused = allowed('', 'pods', 'list', 'pods');
+      if (refused) return refused;
+      const items = allPods(kube).filter((pod) => pod.metadata.namespace === pods[1] && selects(searchParams.get('labelSelector'), pod.metadata.labels));
+      for (const found of Object.values(kube.owners).filter((o) => o.leavingFrom !== undefined)) {
+        found.leavingReads -= 1;
+        if (found.leavingReads < 0) delete found.leavingFrom;
+      }
+      return answered(200, { items });
+    }
+    if (/^\/api\/v1\/namespaces\/[^/]+\/events$/.test(pathname)) {
+      const refused = allowed('', 'events', 'list', 'events');
+      return refused ?? answered(200, { items: kube.events });
+    }
+    const scaled = /^\/apis\/keda\.sh\/v1alpha1\/namespaces\/([^/]+)\/scaledobjects(?:\/([^/]+))?$/.exec(pathname);
+    if (scaled) {
+      const [, namespace, name] = scaled;
+      const refused = allowed('keda.sh', 'scaledobjects', name ? 'patch' : 'list', 'scaledobjects.keda.sh');
+      if (refused) return refused;
+      if (!kube.keda) return answered(404, { message: 'the server could not find the requested resource' });
+      if (!name) return answered(200, { items: kube.scaledObjects.filter((o) => o.metadata.namespace === namespace) });
+      const found = kube.scaledObjects.find((o) => o.metadata.namespace === namespace && o.metadata.name === name);
+      if (!found) return kubeStatus(404, 'NotFound', `scaledobjects.keda.sh "${name}" not found`);
+      const asked = JSON.parse(body).metadata.annotations;
+      const annotations = { ...found.metadata.annotations, ...asked };
+      for (const [key, value] of Object.entries(asked)) if (value === null) delete annotations[key];
+      found.metadata.annotations = annotations;
+      w.changes.push(`keda ${name} ${JSON.stringify(asked)}`);
+      return answered(200, found);
+    }
+    return kubeStatus(403, 'Forbidden', `${method} ${pathname} is forbidden: no rule of the Role allows it`);
+  };
+}
+
 // `change(world)`: what differs from the defaults. `fail['<method> <path>']` refuses that call, `on[...]` runs before it.
 // `world.store`: another store than the one here, such as the real one over a fake Firestore.
 export function setup(change = () => {}) {
   const clock = fakeClock();
-  const w = { ...defaults(), changes: [], tasks: [], healthGroups: [], fail: {}, on: {}, logs: [], used: new Set() };
+  const w = { ...defaults(), changes: [], tasks: [], healthGroups: [], fail: {}, on: {}, logs: [], used: new Set(), routerToken: 'router-token' };
   change(w);
   const instance = (name) => {
     const vm = w.vms[name];
@@ -145,6 +290,10 @@ export function setup(change = () => {}) {
   const healthOf = (service, { group }) => {
     w.healthGroups.push(group);
     const neg = /\/networkEndpointGroups\/([^/]+)$/.exec(group)?.[1];
+    if (w.negs[neg]?.gkeOwner) {
+      if (readyPods(w.kube, w.negs[neg].gkeOwner).length && !w.negs[neg].empty && !w.kube.unhealthy) return { healthStatus: [{ healthState: 'HEALTHY' }] };
+      return w.gkeReading.healthAtZero === 'none' || service?.loadBalancingScheme === 'EXTERNAL' ? { kind: 'compute#backendServiceGroupHealth' } : { healthStatus: [{ healthState: 'UNHEALTHY' }] };
+    }
     const vms = neg ? (w.negs[neg]?.endpoints ?? []).map((e) => w.vms[typeof e === 'string' ? e : e.instance]).filter(Boolean) : Object.values(w.vms);
     const running = vms.some((vm) => vm.status === 'RUNNING');
     if (!running && service?.loadBalancingScheme === 'EXTERNAL') return { kind: 'compute#backendServiceGroupHealth' };
@@ -188,6 +337,10 @@ export function setup(change = () => {}) {
     return { name: op.name, status: 'PENDING' };
   };
   const ROUTES = [
+    ['GET', /^gke\/locations\/([^/]+)\/clusters\/([^/]+)$/, ([location, name]) => {
+      if (!w.clusters[`${location}/${name}`]) throw notFound(`cluster ${name}`);
+      return { name, location, ...w.clusters[`${location}/${name}`] };
+    }],
     ['GET', /^sql\/instances\/([^/]+)$/, ([name]) => sqlInstance(name)],
     ['PATCH', /^sql\/instances\/([^/]+)$/, ([name], body) => setActivation(name, body.settings.activationPolicy)],
     ['GET', /^sql\/operations\/([^/?]+)$/, ([name]) => sqlOperationView(sqlOperations.find((op) => op.name === name))],
@@ -254,12 +407,13 @@ export function setup(change = () => {}) {
       items: w.unmanaged[name].map((vm) => ({ instance: vmUrl(vm, w.vms[vm]?.zone), status: w.vms[vm]?.status })),
     })],
     ['GET', /^zones\/([^/]+)\/networkEndpointGroups\/([^/]+)$/, ([zone, name]) => {
-      const { endpoints, zone: own = ZONE, type = 'GCE_VM_IP_PORT', ...fields } = w.negs[name] ?? {};
+      const { endpoints, zone: own = ZONE, type = 'GCE_VM_IP_PORT', gkeOwner, foreign, empty, ...fields } = w.negs[name] ?? {};
       if (!w.negs[name] || own !== zone) throw notFound(`network endpoint group ${name}`);
       return { name, networkEndpointType: type, selfLink: `${V1}/zones/${zone}/networkEndpointGroups/${name}`, ...fields };
     }],
     ['POST', /^zones\/([^/]+)\/networkEndpointGroups\/([^/]+)\/listNetworkEndpoints(\?pageToken=.*)?$/, ([zone, name, page]) => {
       if (!w.negs[name] || (w.negs[name].zone ?? ZONE) !== zone) throw notFound(`network endpoint group ${name}`);
+      if (w.negs[name].gkeOwner) return { items: endpointsOfNeg(w, w.negs[name]).map((networkEndpoint) => ({ networkEndpoint })) };
       const items = w.negs[name].endpoints.map((e) => ({ networkEndpoint: typeof e === 'string' ? { instance: e, ipAddress: '10.0.0.2', port: 80 } : e }));
       // Two pages, to show that the adapter follows the token.
       return page ? { items: items.slice(1) } : { items: items.slice(0, 1), ...(items.length > 1 ? { nextPageToken: 'second' } : {}) };
@@ -278,7 +432,7 @@ export function setup(change = () => {}) {
   ];
   const google = {
     request: async (method, url, body) => {
-      const path = url.startsWith(SQLADMIN) ? `sql/${url.slice(SQLADMIN.length)}` : url.slice(`${V1}/`.length);
+      const path = url.startsWith(SQLADMIN) ? `sql/${url.slice(SQLADMIN.length)}` : url.startsWith(CONTAINER) ? `gke/${url.slice(CONTAINER.length)}` : url.slice(`${V1}/`.length);
       const failure = w.fail[`${method} ${path}`];
       if (failure) throw failure;
       w.on[`${method} ${path}`]?.();
@@ -289,6 +443,7 @@ export function setup(change = () => {}) {
       throw new Error(`no route in the fake for ${method} ${url}`);
     },
     waitCompute: async () => {},
+    token: async () => w.routerToken,
   };
   const configs = new Map();
   const runs = new Map();
@@ -359,12 +514,44 @@ export function setup(change = () => {}) {
     },
   };
   const cloudsql = recorded('cloudsql', createCloudSql({ google, project: 'p', now: clock.now, sleep: clock.sleep }));
+  const gke = recorded('gke', createGke({ google, project: 'p', fetch: kubeFetch(w), now: clock.now }));
   const core = createController({
-    store, compute, cloudsql, urlmaps, regionalUrlmaps, monitoring: { requestCount: async () => 0 }, tasks, config, now: clock.now, sleep: clock.sleep, newId: () => 'wake-1', log,
+    store, compute, cloudsql, gke, urlmaps, regionalUrlmaps, monitoring: { requestCount: async () => 0 }, tasks, config, now: clock.now, sleep: clock.sleep, newId: () => 'wake-1', log,
   });
-  const onboarding = createOnboarding({ store, compute, cloudsql, urlmaps, regionalUrlmaps, core, config, now: clock.now, log });
-  return { w, clock, store, core, onboarding, config, log, compute, cloudsql, urlmaps, regionalUrlmaps, google };
+  const onboarding = createOnboarding({ store, compute, cloudsql, gke, urlmaps, regionalUrlmaps, core, config, now: clock.now, log });
+  return { w, clock, store, core, onboarding, config, log, compute, cloudsql, gke, urlmaps, regionalUrlmaps, google };
 }
 
 // The input of an onboarding of `app` as `demo`.
 export const INPUT = { urlMap: 'lb', backendService: 'app', id: 'demo' };
+
+// --- A GKE workload ----------------------------------------------------------------------------------------------------------
+
+export const CLUSTER = { location: ZONE, name: 'shop' };
+export const GKE_NEG = 'k8s1-0a1b2c3d-shop-web-80-e4f5a6b7';
+export const OWNER = 'Deployment shop/web';
+export const GKE_ENDPOINT = 'shop-abcd.europe-west1-b.gke.goog';
+// The CLI's dry run names the cluster alone, its onboarding all of it.
+export const GKE_DRY = { ...INPUT, gke: { cluster: CLUSTER } };
+export const GKE_INPUT = { ...INPUT, gke: { cluster: CLUSTER, namespace: 'shop', service: 'web', owner: { kind: 'Deployment', name: 'web' } } };
+export const K8S_BACKEND = { kind: 'k8s', cluster: CLUSTER, namespace: 'shop', service: 'web', owner: { kind: 'Deployment', name: 'web' } };
+
+// What M12 assumes a GKE NEG carries, by where it says so: its description, its annotations, or nothing the router can read.
+export const NEG_READINGS = {
+  description: (namespace, service) => ({ description: JSON.stringify({ 'cluster-uid': 'c0ffee', namespace, 'service-name': service, port: '80' }) }),
+  annotations: (namespace, service) => ({ annotations: { 'cluster-uid': 'c0ffee', namespace, 'service-name': service, port: '80' } }),
+  none: () => ({}),
+};
+
+// The service's one backend is the standalone NEG of Deployment shop/web, 2 replicas, on an Autopilot cluster with its DNS endpoint open.
+export function onGke(w, { reading = 'description', namespace = 'shop', service = 'web', neg = GKE_NEG, replicas = 2 } = {}) {
+  w.negs[neg] = { gkeOwner: OWNER, ...NEG_READINGS[reading](namespace, service) };
+  w.services.app.backends = [{ group: `${V1}/zones/${ZONE}/networkEndpointGroups/${neg}` }];
+  w.kube.owners[OWNER] = { replicas };
+  w.clusters[`${CLUSTER.location}/${CLUSTER.name}`] = {
+    id: 'cluster-id',
+    autopilot: { enabled: true },
+    controlPlaneEndpointsConfig: { dnsEndpointConfig: { endpoint: GKE_ENDPOINT, allowExternalTraffic: true } },
+  };
+  delete w.vms['vm-a'];
+}

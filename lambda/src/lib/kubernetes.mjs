@@ -39,7 +39,7 @@ const controllerOf = (object) => (object.metadata?.ownerReferences ?? []).find((
 // The owner's pods still there (finished ones are gone for good): those it controls, a Deployment through its ReplicaSets.
 // Its selector may match another owner's pods (a canary selecting the same labels): never waited for, foreign behind
 // the target group.
-async function livePods(k8s, ref, object) {
+export async function livePods(k8s, ref, object) {
   const query = { labelSelector: labelSelector(object.spec?.selector) };
   const [pods, sets] = await Promise.all([
     k8s.list(`/api/v1/namespaces/${ref.namespace}/pods`, query),
@@ -52,7 +52,7 @@ async function livePods(k8s, ref, object) {
 }
 
 // The owner, or null when it does not exist.
-async function ownerOf(k8s, ref) {
+export async function ownerOf(k8s, ref) {
   try {
     return await k8s.get(ownerPath(ref));
   } catch (err) {
@@ -69,7 +69,7 @@ export async function ownerPods(k8s, ref) {
 
 // The owner's ScaledObject: its name and the customer's own pause, if any. A pause at 0 is Dormeto's (a nap in progress
 // or interrupted): a wake never gives it back. Without KEDA's API, none.
-async function scaledObjectOf(k8s, ref) {
+export async function scaledObjectOf(k8s, ref) {
   let objects;
   try {
     objects = await k8s.list(scaledObjects(ref.namespace));

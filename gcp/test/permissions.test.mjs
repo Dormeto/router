@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import * as cloudsql from '../src/cloudsql.mjs';
 import * as compute from '../src/compute.mjs';
+import * as gke from '../src/gke.mjs';
 import * as urlmaps from '../src/urlmaps.mjs';
 import * as monitoring from '../src/monitoring.mjs';
 import * as tasks from '../src/tasks.mjs';
@@ -12,7 +13,7 @@ import * as firestore from '../src/firestore.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { INPUT, REGION, V1, ZONE, regional, setup } from './world.mjs';
 
-const ADAPTERS = { cloudsql, compute, urlmaps, regionalUrlmaps: { CALLS: urlmaps.CALLS_REGIONAL }, monitoring, tasks, firestore };
+const ADAPTERS = { cloudsql, compute, gke, urlmaps, regionalUrlmaps: { CALLS: urlmaps.CALLS_REGIONAL }, monitoring, tasks, firestore };
 
 async function granted() {
   const manifest = JSON.parse(await readFile(new URL('../access.json', import.meta.url), 'utf8'));
@@ -177,6 +178,13 @@ test('a workload with a companion, its onboarding, nap, wake, check and offboard
     assert.ok(callsOf(name)?.length, `${name} is not in CALLS`);
     for (const p of callsOf(name)) assert.ok(permissions.has(p), `${name} needs ${p}`);
   }
+});
+
+test('GKE: its calls are the feature\'s role, exactly, and nothing of it is in the base role', async () => {
+  const { features, roles } = JSON.parse(await readFile(new URL('../access.json', import.meta.url), 'utf8'));
+  const needed = [...new Set(Object.values(gke.CALLS).flat())].sort();
+  assert.deepEqual(Object.values(features.gke.roles).flatMap((r) => r.permissions).sort(), needed);
+  assert.deepEqual(needed.filter((p) => roles.dormetoRouter.permissions.includes(p)), []);
 });
 
 test('onboarding: a call that waits or names a backend service asks what that takes', () => {

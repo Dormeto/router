@@ -153,6 +153,35 @@ test('Cloud SQL in the fake: the policy at once, the operation until its time, a
   await assert.rejects(cloudsql.get('none'), (err) => err.code === 404);
 });
 
+test('Cloud SQL in the fake: the list is the instance\'s, newest first, from when the reading shows it', async () => {
+  const { clock, cloudsql, w } = setup((world) => {
+    world.sql.db = {};
+    world.sql.other = {};
+    world.sqlReading.listLagMs = 5_000;
+  });
+  await cloudsql.setActivation('other', 'NEVER');
+  const first = await cloudsql.setActivation('db', 'NEVER');
+  assert.deepEqual(await cloudsql.listOperations('db'), []);
+  clock.advance(w.sqlTakes.NEVER);
+  const second = await cloudsql.setActivation('db', 'ALWAYS');
+  clock.advance(5_000);
+  assert.deepEqual((await cloudsql.listOperations('db')).map((op) => [op.name, op.status]), [[second, 'RUNNING'], [first, 'DONE']]);
+});
+
+test('Cloud SQL in the fake: a second reading: the policy at the operation\'s end, the state during it, an error changing it', async () => {
+  const { clock, cloudsql, w } = setup((world) => {
+    world.sql.db = {};
+    world.sqlReading = { ...world.sqlReading, policy: 'at-end', stateDuring: 'MAINTENANCE', failedPolicy: 'changed' };
+    world.sqlOperationErrors.push({ errors: [{ code: 'X', message: 'y' }] });
+  });
+  await cloudsql.setActivation('db', 'NEVER');
+  const during = await cloudsql.get('db');
+  assert.deepEqual([during.state, during.settings.activationPolicy], ['MAINTENANCE', 'ALWAYS']);
+  clock.advance(w.sqlTakes.NEVER);
+  const after = await cloudsql.get('db');
+  assert.deepEqual([after.state, after.settings.activationPolicy], ['RUNNABLE', 'NEVER']);
+});
+
 test('Cloud SQL in the fake: an operation ending in an error leaves the policy as it was', async () => {
   const { clock, cloudsql, w } = setup((world) => {
     world.sql.db = { settings: { activationPolicy: 'NEVER' } };

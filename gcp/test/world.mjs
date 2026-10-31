@@ -53,8 +53,11 @@ export const defaults = () => ({
   sql: {},
   // How long an operation runs, by the policy asked for.
   sqlTakes: { ALWAYS: 300_000, NEVER: 120_000 },
-  // What the next operations end in, one each: an operation's `error`. That operation leaves the policy as it was.
+  // What the next operations end in, one each: an operation's `error`.
   sqlOperationErrors: [],
+  // What M6 has not told yet, where a test's verdict depends on it: when the policy reads as asked ('at-once', 'at-end'), what an
+  // operation in error leaves ('kept', 'changed'), what `state` reads during an operation, and how long an operation stays out of the list.
+  sqlReading: { policy: 'at-once', failedPolicy: 'kept', stateDuring: 'RUNNABLE', listLagMs: 0 },
 });
 
 // The defaults' load balancer as a classic one: `EXTERNAL` on its forwarding rule and its backend services.
@@ -147,36 +150,51 @@ export function setup(change = () => {}) {
     if (!running && service?.loadBalancingScheme === 'EXTERNAL') return { kind: 'compute#backendServiceGroupHealth' };
     return { healthStatus: [{ healthState: running ? 'HEALTHY' : 'UNHEALTHY' }] };
   };
-  // Cloud SQL as task R10 assumes it before M6: `state` stays RUNNABLE, stopped or not; the policy changes at once, its operation
-  // tells when it is over; another PATCH during an operation is a 409.
-  const sqlOperations = {};
+  // Cloud SQL as task R10 assumes it before M6, under `sqlReading`: another PATCH during an operation is a 409, and the list is newest first.
+  const sqlOperations = [];
+  const sqlRunning = (name) => sqlOperations.find((op) => op.instance === name && clock.now() < op.doneAt);
+  const applyPolicy = (name, { policy, error }) => {
+    if (!error || w.sqlReading.failedPolicy === 'changed') w.sql[name].settings = { ...w.sql[name].settings, activationPolicy: policy };
+  };
   const sqlInstance = (name) => {
-    const { operation, ...fields } = w.sql[name] ?? {};
     if (!w.sql[name]) throw notFound(`Cloud SQL instance ${name}`);
-    return { name, selfLink: `${SQLADMIN}instances/${name}`, state: 'RUNNABLE', instanceType: 'CLOUD_SQL_INSTANCE', ...fields, settings: { activationPolicy: 'ALWAYS', ...fields.settings } };
+    for (const op of sqlOperations.filter((o) => o.instance === name && !o.applied && clock.now() >= o.doneAt)) {
+      op.applied = true;
+      applyPolicy(name, op);
+    }
+    const running = sqlRunning(name);
+    return {
+      name,
+      selfLink: `${SQLADMIN}instances/${name}`,
+      instanceType: 'CLOUD_SQL_INSTANCE',
+      ...w.sql[name],
+      state: running ? w.sqlReading.stateDuring : w.sql[name].state ?? 'RUNNABLE',
+      settings: { activationPolicy: 'ALWAYS', ...w.sql[name].settings },
+    };
   };
-  const sqlOperation = (name) => {
-    const { doneAt, ...operation } = sqlOperations[name];
-    return { ...operation, status: clock.now() >= doneAt ? 'DONE' : 'RUNNING' };
-  };
+  const sqlOperationView = ({ name, error, doneAt }) => ({ name, operationType: 'UPDATE', status: clock.now() >= doneAt ? 'DONE' : 'RUNNING', ...(error && clock.now() >= doneAt ? { error } : {}) });
   const setActivation = (name, policy) => {
     sqlInstance(name);
-    const running = w.sql[name].operation;
-    if (running && clock.now() < sqlOperations[running].doneAt) {
-      throw new GoogleError(`Google: PATCH instances/${name}: 409 Operation failed because another operation was already in progress.`, { code: 409, status: 'CONFLICT', reason: 'operationInProgress' });
-    }
+    if (sqlRunning(name)) throw new GoogleError(`Google: PATCH instances/${name}: 409 Operation failed because another operation was already in progress.`, { code: 409, status: 'CONFLICT', reason: 'operationInProgress' });
+    const op = { name: `sql-op-${sqlOperations.length + 1}`, instance: name, policy, startedAt: clock.now(), doneAt: clock.now() + w.sqlTakes[policy] };
     const error = w.sqlOperationErrors.shift();
-    const operation = `sql-op-${Object.keys(sqlOperations).length + 1}`;
-    sqlOperations[operation] = { name: operation, doneAt: clock.now() + w.sqlTakes[policy], ...(error ? { error } : {}) };
-    w.sql[name].operation = operation;
-    if (!error) w.sql[name].settings = { ...w.sql[name].settings, activationPolicy: policy };
+    if (error) op.error = error;
+    sqlOperations.unshift(op);
+    if (w.sqlReading.policy === 'at-once') {
+      op.applied = true;
+      applyPolicy(name, op);
+    }
     w.changes.push(`sql ${name} ${policy}`);
-    return { name: operation, status: 'PENDING' };
+    return { name: op.name, status: 'PENDING' };
   };
   const ROUTES = [
     ['GET', /^sql\/instances\/([^/]+)$/, ([name]) => sqlInstance(name)],
     ['PATCH', /^sql\/instances\/([^/]+)$/, ([name], body) => setActivation(name, body.settings.activationPolicy)],
-    ['GET', /^sql\/operations\/([^/]+)$/, ([name]) => sqlOperation(name)],
+    ['GET', /^sql\/operations\/([^/?]+)$/, ([name]) => sqlOperationView(sqlOperations.find((op) => op.name === name))],
+    ['GET', /^sql\/operations\?instance=([^&]+)&maxResults=10$/, ([name]) => ({
+      kind: 'sql#operationsList',
+      items: sqlOperations.filter((op) => op.instance === name && clock.now() >= op.startedAt + w.sqlReading.listLagMs).slice(0, 10).map(sqlOperationView),
+    })],
     ['GET', /^regions\/([^/]+)\/urlMaps$/, ([region]) => ({ items: Object.values(inRegion(region).urlMaps) })],
     ['GET', /^regions\/([^/]+)\/urlMaps\/([^/]+)$/, ([region, name]) => {
       if (!inRegion(region).urlMaps[name]) throw notFound(`URL map ${name}`);

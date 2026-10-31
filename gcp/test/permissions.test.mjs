@@ -154,7 +154,11 @@ test('Cloud SQL: its calls are the feature\'s roles, exactly: the read on the pr
 });
 
 test('a workload with a companion, its onboarding, nap, wake, check and offboarding: every call it makes is in CALLS, and in the manifest\'s router grants', async () => {
-  const { w, clock, core, onboarding, store } = setup((world) => { world.sql.db = {}; });
+  const { w, clock, core, onboarding, store } = setup((world) => {
+    world.sql.db = {};
+    // So that what was asked is also read by its name.
+    world.sqlReading.listLagMs = 15_000;
+  });
   const input = { ...INPUT, cloudSql: ['db'] };
   await onboarding.dryRun(input);
   await onboarding.onboard(input);
@@ -167,7 +171,7 @@ test('a workload with a companion, its onboarding, nap, wake, check and offboard
   assert.equal((await core.release('demo')).state, STATES.ASLEEP);
   await onboarding.offboard('demo', { force: true });
 
-  for (const name of ['cloudsql.get', 'cloudsql.getOperation', 'cloudsql.setActivation']) assert.ok(w.used.has(name), `the run did not exercise ${name}`);
+  for (const name of ['cloudsql.get', 'cloudsql.listOperations', 'cloudsql.getOperation', 'cloudsql.setActivation']) assert.ok(w.used.has(name), `the run did not exercise ${name}`);
   const permissions = await granted();
   for (const name of w.used) {
     assert.ok(callsOf(name)?.length, `${name} is not in CALLS`);

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { fakeClock } from '../../lambda/test/fakes.mjs';
-import { CALLS, createCloudSql, companionProblem, isCompanion, POLL_MS, startDatabase, statusOf, stopDatabase } from '../src/cloudsql.mjs';
+import { CALLS, createCloudSql, companionProblem, companionRead, isCompanion, POLL_MS, startDatabase, statusOf, stopDatabase } from '../src/cloudsql.mjs';
 import { GoogleError } from '../src/google.mjs';
 
 const BASE = 'https://sqladmin.googleapis.com/v1/projects/p';
@@ -26,20 +26,28 @@ function setup(answer = () => ({})) {
 
 const instance = (activationPolicy, state = 'RUNNABLE') => ({ state, settings: { activationPolicy } });
 
-// M6 pins this reading (ruling 2 of the task): the state may stay RUNNABLE while stopped.
-for (const [title, read, operation, status] of [
-  ['ALWAYS and RUNNABLE, no operation', instance('ALWAYS'), undefined, 'running'],
-  ['ALWAYS and RUNNABLE, our operation done', instance('ALWAYS'), { status: 'DONE' }, 'running'],
-  ['ALWAYS and RUNNABLE, our operation pending', instance('ALWAYS'), { status: 'PENDING' }, 'transitioning'],
-  ['ALWAYS and RUNNABLE, our operation running', instance('ALWAYS'), { status: 'RUNNING' }, 'transitioning'],
-  ['ALWAYS, in maintenance', instance('ALWAYS', 'MAINTENANCE'), undefined, 'transitioning'],
+const done = (extra = {}) => ({ name: 'op', status: 'DONE', ...extra });
+const failed = done({ error: { errors: [{ code: 'X', message: 'y' }] } });
+
+// M6 pins this reading: the state may stay RUNNABLE while stopped, and through a start.
+for (const [title, read, operations, status] of [
+  ['ALWAYS and RUNNABLE, none listed', instance('ALWAYS'), undefined, 'running'],
+  ['ALWAYS and RUNNABLE, an empty list', instance('ALWAYS'), [], 'running'],
+  ['ALWAYS and RUNNABLE, all done', instance('ALWAYS'), [done(), done()], 'running'],
+  ['ALWAYS and RUNNABLE, one pending', instance('ALWAYS'), [{ status: 'PENDING' }], 'transitioning'],
+  ['ALWAYS and RUNNABLE, one running', instance('ALWAYS'), [{ status: 'RUNNING' }], 'transitioning'],
+  ['ALWAYS and RUNNABLE, an older one still running', instance('ALWAYS'), [done(), { status: 'RUNNING' }], 'transitioning'],
+  ['ALWAYS and RUNNABLE, the newest in error', instance('ALWAYS'), [failed, done()], 'transitioning'],
+  ['ALWAYS and RUNNABLE, an older one in error', instance('ALWAYS'), [done(), failed], 'running'],
+  ['ALWAYS, in maintenance', instance('ALWAYS', 'MAINTENANCE'), [], 'transitioning'],
   ['ALWAYS, suspended by Google', instance('ALWAYS', 'SUSPENDED'), undefined, 'transitioning'],
-  ['NEVER, though RUNNABLE, no operation', instance('NEVER'), undefined, 'stopped'],
-  ['NEVER, our operation done', instance('NEVER'), { status: 'DONE' }, 'stopped'],
-  ['NEVER, our operation running', instance('NEVER'), { status: 'RUNNING' }, 'transitioning'],
+  ['NEVER, though RUNNABLE, none listed', instance('NEVER'), undefined, 'stopped'],
+  ['NEVER, all done', instance('NEVER'), [done()], 'stopped'],
+  ['NEVER, the newest in error', instance('NEVER'), [failed], 'stopped'],
+  ['NEVER, one running', instance('NEVER'), [{ status: 'RUNNING' }], 'transitioning'],
   ['no policy read', { state: 'RUNNABLE' }, undefined, 'transitioning'],
 ]) {
-  test(`statusOf: ${title}: ${status}`, () => assert.equal(statusOf(read, operation), status));
+  test(`statusOf: ${title}: ${status}`, () => assert.equal(statusOf(read, operations), status));
 }
 
 test('isCompanion: a cloudsql backend, and no VM or group', () => {
@@ -51,9 +59,21 @@ test('isCompanion: a cloudsql backend, and no VM or group', () => {
 test('companionProblem: a replica by its primary\'s name or its type, a primary with replicas, else none', () => {
   assert.match(companionProblem({ name: 'r', masterInstanceName: 'p:db' }), /^Cloud SQL instance r is a read replica/);
   assert.match(companionProblem({ name: 'r', instanceType: 'READ_REPLICA_INSTANCE' }), /^Cloud SQL instance r is a read replica/);
-  assert.match(companionProblem({ name: 'db', replicaNames: ['r1', 'r2'] }), /^Cloud SQL instance db has read replicas \(r1, r2\)/);
+  assert.match(companionProblem({ name: 'db', replicaNames: ['r1', 'r2'] }), /^Cloud SQL instance db has read replicas \(r1, r2\): .*assumed/);
   assert.equal(companionProblem({ name: 'db', replicaNames: [], instanceType: 'CLOUD_SQL_INSTANCE' }), null);
   assert.equal(companionProblem({ name: 'db' }), null);
+});
+
+test('companionRead: a database, its problem, 404 and 403 in words; anything else thrown', async () => {
+  const of = (answer) => companionRead(setup(answer).cloudsql, 'db');
+  assert.deepEqual(await of(() => ({ selfLink: 'https://sql/db' })), { database: { name: 'db', selfLink: 'https://sql/db' } });
+  const replica = await of(() => ({ selfLink: 'https://sql/db', masterInstanceName: 'p:x' }));
+  assert.match(replica.problem, /is a read replica/);
+  assert.deepEqual(replica.database, { name: 'db', selfLink: 'https://sql/db' });
+  const thrower = (code) => () => { throw new GoogleError(`Google: GET: ${code} no`, { code }); };
+  assert.deepEqual(await of(thrower(404)), { problem: 'Cloud SQL instance db not found: name an instance of this project' });
+  assert.match((await of(thrower(403))).problem, /^the router cannot read Cloud SQL instance db: it does not exist, or the router was installed without --with cloud-sql: .*403/);
+  await assert.rejects(of(thrower(500)), /500/);
 });
 
 test('get: GET the instance, its name encoded', async () => {
@@ -68,6 +88,15 @@ test('getOperation: GET the operation of the project', async () => {
   const { calls, cloudsql } = setup(() => ({ name: 'op', status: 'RUNNING' }));
   assert.deepEqual(await cloudsql.getOperation('op'), { name: 'op', status: 'RUNNING' });
   assert.deepEqual(calls[0], { method: 'GET', url: `${BASE}/operations/op`, body: undefined });
+});
+
+test('listOperations: the instance\'s, the newest ten, as Google lists them; none: empty', async () => {
+  const { calls, cloudsql } = setup(() => ({ items: [{ name: 'b' }, { name: 'a' }] }));
+  assert.deepEqual(await cloudsql.listOperations('db'), [{ name: 'b' }, { name: 'a' }]);
+  assert.deepEqual(calls[0], { method: 'GET', url: `${BASE}/operations?instance=db&maxResults=10`, body: undefined });
+  await cloudsql.listOperations('a/b');
+  assert.equal(calls[1].url, `${BASE}/operations?instance=a%2Fb&maxResults=10`);
+  assert.deepEqual(await setup(() => ({})).cloudsql.listOperations('db'), []);
 });
 
 for (const policy of ['ALWAYS', 'NEVER']) {
@@ -130,7 +159,7 @@ test('setActivation: a refusal for capacity is of kind capacity; another 5xx has
   await assert.rejects(other.cloudsql.setActivation('db', 'ALWAYS', other.clock.now() + 60_000), (err) => err.kind === undefined);
 });
 
-// The instance as read, in turn; then as the last.
+// The instance as read, in turn; then as the last. `operation`: the status of the last one asked for, which the list shows.
 const reads = (...answers) => {
   const operations = [];
   let i = 0;
@@ -139,7 +168,10 @@ const reads = (...answers) => {
       operations.push(url);
       return { name: `op-${operations.length}` };
     }
-    if (url.includes('/operations/')) return { name: 'op', status: answers[Math.min(i - 1, answers.length - 1)].operation ?? 'DONE' };
+    if (url.includes('/operations?')) {
+      const { operation = 'DONE' } = answers[Math.min(i - 1, answers.length - 1)];
+      return { items: operations.length ? [{ name: `op-${operations.length}`, status: operation }] : [] };
+    }
     const read = answers[Math.min(i, answers.length - 1)];
     i += 1;
     return read;
@@ -147,35 +179,103 @@ const reads = (...answers) => {
   return { answer, operations };
 };
 
-test('startDatabase: a stopped one: ALWAYS, then every 10 s until it runs, reading the operation', async () => {
-  const { answer, operations } = reads(
-    instance('NEVER'),
-    { ...instance('ALWAYS'), operation: 'RUNNING' },
-    { ...instance('ALWAYS'), operation: 'RUNNING' },
-    { ...instance('ALWAYS'), operation: 'DONE' },
-  );
+test('startDatabase: a stopped one: ALWAYS, then every 10 s until it runs, reading the list', async () => {
+  const running = { ...instance('ALWAYS'), operation: 'RUNNING' };
+  const { answer, operations } = reads(instance('NEVER'), running, running, { ...instance('ALWAYS'), operation: 'DONE' });
   const { calls, clock, sleeps, sleep, cloudsql } = setup(answer);
   await startDatabase(cloudsql, 'db', { now: clock.now, sleep, deadline: clock.now() + 600_000 });
   assert.equal(operations.length, 1);
   assert.deepEqual(sleeps, [POLL_MS, POLL_MS, POLL_MS]);
-  assert.ok(calls.some((c) => c.url === `${BASE}/operations/op-1`));
+  assert.ok(calls.some((c) => c.url === `${BASE}/operations?instance=db&maxResults=10`));
+  assert.equal(calls.some((c) => c.url === `${BASE}/operations/op-1`), false, 'the list showed it');
 });
 
 test('startDatabase: one running changes nothing and does not wait', async () => {
   const { calls, clock, sleeps, sleep, cloudsql } = setup(() => instance('ALWAYS'));
   await startDatabase(cloudsql, 'db', { now: clock.now, sleep, deadline: clock.now() + 600_000 });
-  assert.deepEqual(calls.map((c) => c.method), ['GET']);
+  assert.equal(calls.some((c) => c.method !== 'GET'), false);
   assert.deepEqual(sleeps, []);
 });
 
-test('startDatabase in a new request: no operation known, the state and the policy decide; nothing asked twice', async () => {
-  const { calls, clock, sleep, cloudsql } = setup(((n) => () => {
-    n += 1;
-    return n < 3 ? instance('ALWAYS', 'MAINTENANCE') : instance('ALWAYS');
-  })(0));
+test('startDatabase in a new request, a start under way, the state RUNNABLE: waited for, nothing asked', async () => {
+  let listed = 0;
+  const { calls, clock, sleeps, sleep, cloudsql } = setup((method, url) => {
+    if (url.includes('/operations?')) {
+      listed += 1;
+      return { items: [{ name: 'earlier', status: listed < 4 ? 'RUNNING' : 'DONE' }] };
+    }
+    return instance('ALWAYS');
+  });
   await startDatabase(cloudsql, 'db', { now: clock.now, sleep, deadline: clock.now() + 600_000 });
-  assert.deepEqual([...new Set(calls.map((c) => c.method))], ['GET']);
-  assert.equal(calls.some((c) => c.url.includes('/operations/')), false);
+  assert.deepEqual(sleeps, [POLL_MS, POLL_MS, POLL_MS]);
+  assert.equal(calls.some((c) => c.method === 'PATCH'), false);
+});
+
+test('startDatabase: the newest operation in error, the policy ALWAYS, the state RUNNABLE: asked again, not read as running', async () => {
+  let patches = 0;
+  const { calls, clock, sleep, cloudsql } = setup((method, url) => {
+    if (method === 'PATCH') {
+      patches += 1;
+      return { name: 'new' };
+    }
+    if (url.includes('/operations?')) return { items: [...(patches ? [{ name: 'new', status: 'DONE' }] : []), { name: 'old', status: 'DONE', error: { errors: [{ code: 'X', message: 'y' }] } }] };
+    return instance('ALWAYS');
+  });
+  await startDatabase(cloudsql, 'db', { now: clock.now, sleep, deadline: clock.now() + 600_000 });
+  assert.equal(patches, 1);
+  assert.equal(calls.at(-1).method, 'GET');
+});
+
+test('startDatabase: what was asked and the list does not show yet is read by its name', async () => {
+  let states = 0;
+  const { calls, clock, sleeps, sleep, cloudsql } = setup((method, url) => {
+    if (method === 'PATCH') return { name: 'op-1' };
+    if (url.includes('/operations?')) return { items: [] };
+    if (url.includes('/operations/')) {
+      states += 1;
+      return { name: 'op-1', status: states < 3 ? 'RUNNING' : 'DONE' };
+    }
+    return states ? instance('ALWAYS') : instance('NEVER');
+  });
+  await startDatabase(cloudsql, 'db', { now: clock.now, sleep, deadline: clock.now() + 600_000 });
+  assert.equal(calls.filter((c) => c.url === `${BASE}/operations/op-1`).length, 3);
+  assert.deepEqual(sleeps, [POLL_MS, POLL_MS, POLL_MS]);
+});
+
+const refusal = () => new GoogleError('Google: GET: 403 not authorized', { code: 403, reason: 'notAuthorized' });
+
+test('startDatabase: the list refused with a 403: the state and the policy decide, it says so at each read, the wake goes on', async () => {
+  const unread = [];
+  const { clock, sleep, cloudsql } = setup((method, url) => {
+    if (url.includes('/operations')) throw refusal();
+    return instance('ALWAYS');
+  });
+  await startDatabase(cloudsql, 'db', { now: clock.now, sleep, deadline: clock.now() + 600_000, unread: (err) => unread.push(err) });
+  assert.equal(unread.length, 1);
+  assert.equal(unread[0].code, 403);
+});
+
+test('startDatabase: the list and the operation refused with a 403 after asking: not a failed wake', async () => {
+  let patched = false;
+  const { clock, sleep, cloudsql } = setup((method, url) => {
+    if (method === 'PATCH') {
+      patched = true;
+      return { name: 'op-1' };
+    }
+    if (url.includes('/operations')) throw refusal();
+    return patched ? instance('ALWAYS') : instance('NEVER');
+  });
+  await startDatabase(cloudsql, 'db', { now: clock.now, sleep, deadline: clock.now() + 600_000, unread: () => {} });
+  assert.equal(patched, true);
+});
+
+test('startDatabase: another failure of the list stays a failure', async () => {
+  const failure = new GoogleError('Google: GET: 500', { code: 500 });
+  const { clock, sleep, cloudsql } = setup((method, url) => {
+    if (url.includes('/operations')) throw failure;
+    return instance('ALWAYS');
+  });
+  await assert.rejects(startDatabase(cloudsql, 'db', { now: clock.now, sleep, deadline: clock.now() + 600_000, unread: () => {} }), failure);
 });
 
 test('startDatabase: never running: a timeout at the deadline, naming the instance', async () => {
@@ -196,10 +296,14 @@ test('startDatabase: stopped again during the wait: asked again', async () => {
   assert.equal(operations.length, 2);
 });
 
-test('startDatabase: an operation that ends in an error fails the wake in Google\'s words, at once', async () => {
+test('startDatabase: what it asked ending in an error fails the wake in Google\'s words, at once', async () => {
+  let asked = false;
   const { clock, sleeps, sleep, cloudsql } = setup((method, url) => {
-    if (method === 'PATCH') return { name: 'op-1' };
-    if (url.includes('/operations/')) return { name: 'op-1', status: 'DONE', error: { errors: [{ code: 'INTERNAL_ERROR', message: 'it broke' }] } };
+    if (method === 'PATCH') {
+      asked = true;
+      return { name: 'op-1' };
+    }
+    if (url.includes('/operations?')) return { items: asked ? [{ name: 'op-1', status: 'DONE', error: { errors: [{ code: 'INTERNAL_ERROR', message: 'it broke' }] } }] : [] };
     return instance('NEVER');
   });
   await assert.rejects(startDatabase(cloudsql, 'db', { now: clock.now, sleep, deadline: clock.now() + 600_000 }), { message: 'Cloud SQL instance db: operation op-1 failed: INTERNAL_ERROR: it broke' });
@@ -209,6 +313,7 @@ test('startDatabase: an operation that ends in an error fails the wake in Google
 test('startDatabase: a start refused for capacity gets AWS\'s retries: 30 s, 60 s, then every 120 s', async () => {
   let patches = 0;
   const { clock, sleeps, sleep, cloudsql } = setup((method, url) => {
+    if (url.includes('/operations?')) return { items: [] };
     if (url.includes('/operations/')) return { name: 'op', status: 'DONE' };
     if (method === 'GET') return patches > 4 ? instance('ALWAYS') : instance('NEVER');
     patches += 1;
@@ -227,12 +332,36 @@ test('startDatabase: an operation failed for capacity gets the same retries; pas
       patches += 1;
       return { name: `op-${patches}` };
     }
-    if (url.includes('/operations/')) return { name: 'op', status: 'DONE', error: { errors: [{ code: 'ZONE_RESOURCE_POOL_EXHAUSTED', message: 'none left' }] } };
+    if (url.includes('/operations?')) return { items: patches ? [{ name: `op-${patches}`, status: 'DONE', error: { errors: [{ code: 'ZONE_RESOURCE_POOL_EXHAUSTED', message: 'none left' }] } }] : [] };
     return instance('NEVER');
   });
   await assert.rejects(startDatabase(cloudsql, 'db', { now: clock.now, sleep, deadline: clock.now() + 200_000 }), (err) => err.kind === 'capacity' && /none left/.test(err.message));
   assert.deepEqual(sleeps.filter((ms) => ms !== POLL_MS), [30_000, 60_000]);
   assert.ok(patches >= 2);
+});
+
+test('setActivation: no longer wanted: nothing sent, null', async () => {
+  const { calls, clock, cloudsql } = setup();
+  assert.equal(await cloudsql.setActivation('db', 'NEVER', clock.now() + 60_000, async () => false), null);
+  assert.deepEqual(calls, []);
+});
+
+test('setActivation: no longer wanted after a 409: no other try, no timeout, null', async () => {
+  let asks = 0;
+  const { calls, clock, sleeps, cloudsql } = setup(() => { throw busy(); });
+  const wanted = async () => {
+    asks += 1;
+    return asks < 3;
+  };
+  assert.equal(await cloudsql.setActivation('db', 'NEVER', clock.now() + 600_000, wanted), null);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(sleeps, [POLL_MS, POLL_MS]);
+});
+
+test('stopDatabase: no longer wanted: nothing sent', async () => {
+  const { calls, clock, cloudsql } = setup(() => instance('ALWAYS'));
+  await stopDatabase(cloudsql, 'db', clock.now() + 60_000, async () => false);
+  assert.equal(calls.some((c) => c.method === 'PATCH'), false);
 });
 
 test('stopDatabase: one that runs gets NEVER, no wait; one stopped nothing; one starting NEVER too', async () => {
@@ -248,7 +377,9 @@ test('CALLS: one entry per function, each with permissions', () => {
   const { cloudsql } = setup();
   assert.deepEqual(Object.keys(CALLS).sort(), Object.keys(cloudsql).sort());
   for (const permissions of Object.values(CALLS)) assert.ok(permissions.length > 0);
-  assert.deepEqual(CALLS.setActivation, ['cloudsql.instances.update']);
+  // Google's table of permissions, method by method. Its row for operations.list also names cloudsql.instances.list, not held: M6.
+  assert.deepEqual(CALLS.setActivation, ['cloudsql.instances.get', 'cloudsql.instances.update']);
   assert.deepEqual(CALLS.get, ['cloudsql.instances.get']);
   assert.deepEqual(CALLS.getOperation, ['cloudsql.instances.get']);
+  assert.deepEqual(CALLS.listOperations, ['cloudsql.instances.get']);
 });

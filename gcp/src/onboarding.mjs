@@ -13,7 +13,7 @@
 // application. The router reads them at the project; the tag its update needs is the CLI's, bound before this.
 import { nextEvents, normalizeSchedule, scheduleProblems } from '../../lambda/src/lib/schedule.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
-import { companionProblem, INSTANCE_NAME, isCompanion, statusOf } from './cloudsql.mjs';
+import { companionRead, INSTANCE_NAME, isCompanion, statusOf } from './cloudsql.mjs';
 import { groupOf, PauseRefused } from './controller-core.mjs';
 import { SWITCH_HEADER, WORKLOAD_HEADER, WORKLOAD_ID } from './names.mjs';
 import { inOneUpdate, SWAP_WAIT_MS } from './switch.mjs';
@@ -321,20 +321,12 @@ export function createOnboarding({ store, compute, cloudsql, urlmaps, regionalUr
     return { reasons, vms, groups, negs };
   }
 
-  // The companions asked for: what refuses them, and what the CLI tags. Google may answer a 403 for an instance that does not exist.
+  // The companions asked for: what refuses them, and what the CLI tags.
   async function databasesOf(names, others) {
     const found = await Promise.all(names.map(async (name) => {
       const holder = others.find((c) => c.backends?.some((b) => isCompanion(b) && b.name === name));
-      const held = holder ? [`Cloud SQL instance ${name} belongs to workload ${holder.workloadId}`] : [];
-      try {
-        const instance = await cloudsql.get(name);
-        const problem = companionProblem({ ...instance, name });
-        return { reasons: [...held, ...(problem ? [problem] : [])], database: { name, selfLink: instance.selfLink } };
-      } catch (err) {
-        if (err?.code === 404) return { reasons: [...held, `Cloud SQL instance ${name} not found: name an instance of this project`] };
-        if (err?.code === 403) return { reasons: [...held, `the router cannot read Cloud SQL instance ${name}: it does not exist, or the router was installed without --with cloud-sql: ${err.message}`] };
-        throw err;
-      }
+      const { database, problem } = await companionRead(cloudsql, name);
+      return { database, reasons: [...(holder ? [`Cloud SQL instance ${name} belongs to workload ${holder.workloadId}`] : []), ...(problem ? [problem] : [])] };
     }));
     return { reasons: found.flatMap((f) => f.reasons), databases: found.flatMap((f) => (f.database ? [f.database] : [])) };
   }

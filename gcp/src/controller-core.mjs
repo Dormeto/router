@@ -302,8 +302,9 @@ export function createController({ store, compute, cloudsql, urlmaps, regionalUr
   }
 
   // Down when this returns, the companions asked to go: an operation's end says little (a managed group's VMs go after it, and its
-  // wait may run out before), so the VMs are read until they are.
-  async function putToSleep(cfg, autoscalers, latest) {
+  // wait may run out before), so the VMs are read until they are. `stillGoing()`: whether the run is still the nap's or the release's:
+  // a wake taken over, or asked and kept, needs its database, which is then left alone.
+  async function putToSleep(cfg, autoscalers, latest, stillGoing) {
     const deadline = Math.min(now() + STOP_TIMEOUT_MS, latest);
     await each(autoscalers, (recorded) => setAutoscaler(recorded, 'OFF'));
     const { hibernate } = resolveHibernation({ workload: cfg.hibernate });
@@ -315,7 +316,7 @@ export function createController({ store, compute, cloudsql, urlmaps, regionalUr
       await sleep(POLL_MS);
     }
     // After the application, with no wait: a stop takes minutes, and nothing depends on it.
-    await each(companionsOf(cfg), ({ name }) => stopDatabase(cloudsql, name, latest));
+    await each(companionsOf(cfg), ({ name }) => stopDatabase(cloudsql, name, latest, stillGoing));
     return { stopped: done.flatMap((d) => d.stopped), suspended: done.flatMap((d) => d.suspended) };
   }
 
@@ -358,10 +359,16 @@ export function createController({ store, compute, cloudsql, urlmaps, regionalUr
       const current = await store.getRun(workloadId);
       return current?.state === STATES.WAKING && current.wakeId === wakeId;
     };
+    let saidUnread = false;
+    const unread = (err) => {
+      if (saidUnread) return;
+      saidUnread = true;
+      log.warn('DatabaseOperationsUnread', { workloadId, wakeId, error: err.message });
+    };
     try {
       // The application needs them, whatever becomes of its VMs. Their minutes may have made this wake another's.
       if (companionsOf(cfg).length) {
-        await each(companionsOf(cfg), ({ name }) => startDatabase(cloudsql, name, { now, sleep, deadline }));
+        await each(companionsOf(cfg), ({ name }) => startDatabase(cloudsql, name, { now, sleep, deadline, unread }));
         if (!(await isCurrent())) return superseded();
       }
       let givenBack = true;
@@ -591,7 +598,10 @@ export function createController({ store, compute, cloudsql, urlmaps, regionalUr
       if (paused || !(await transition(workloadId, { cond: { state: STATES.NAPPING, pendingWake: false }, set: { stopping: true, autoscalers } }))) {
         return await giveUp(paused ? 'paused' : 'pending-wake', 'info', paused ? { reason: 'paused' } : {});
       }
-      slept = await putToSleep(cfg, autoscalers, latest);
+      slept = await putToSleep(cfg, autoscalers, latest, async () => {
+        const current = await store.getRun(workloadId);
+        return current?.state === STATES.NAPPING && !current.pendingWake;
+      });
     } catch (err) {
       log.error('NapFailed', { workloadId, error: err.message });
       const at = now();
@@ -659,7 +669,7 @@ export function createController({ store, compute, cloudsql, urlmaps, regionalUr
       const autoscalers = await autoscalersToRecord(cfg, run);
       // A wake asked meanwhile takes over.
       if (!(await transition(workloadId, { cond: { state: STATES.FAILED }, set: { autoscalers } }))) return { state: 'SUPERSEDED' };
-      const slept = await putToSleep(cfg, autoscalers, latest);
+      const slept = await putToSleep(cfg, autoscalers, latest, async () => (await store.getRun(workloadId))?.state === STATES.FAILED);
       const asleep = await transition(workloadId, { cond: { state: STATES.FAILED }, set: { state: STATES.ASLEEP, ...slept }, cause: 'failed-released', event: slept });
       if (!asleep) return { state: 'SUPERSEDED' };
       log.warn('FailedReleased', { workloadId, ...slept });
@@ -919,7 +929,9 @@ export function createController({ store, compute, cloudsql, urlmaps, regionalUr
 
   // The companions follow the state the primaries decided: asleep, a running one is stopped again, as AWS's that restart after 7 days;
   // awake, a stopped one is started. No wait in a check: one try, and a refusal or another operation is for the next check. The run is
-  // read again before anything is asked: a wake or a nap since owns them.
+  // read again before anything is asked: a wake or a nap since owns them. What is left is a wake begun in that PATCH's round trip, whose
+  // read of the database may have come first: it then goes on with the database going down, and no later read of its own sees that.
+  // The next check, once it is awake, starts it again.
   async function companionsFollow(cfg, run) {
     const drift = COMPANION_DRIFT[run?.state];
     if (!drift) return;

@@ -2479,7 +2479,7 @@ const SQL_INPUT = { urlMap: 'lb', backendService: 'app', id: 'demo', cloudSql: [
 const lineOf = (changes, pattern) => changes.findIndex((line) => pattern.test(line));
 const APP_DOWN = /^(stop|suspend) vm-a$/;
 const APP_UP = /^(start|resume) vm-a$/;
-const policyOf = (t, name = 'db') => t.w.sql[name].settings.activationPolicy;
+const policyOf = (t, name = 'db') => t.w.sql[name].settings?.activationPolicy ?? 'ALWAYS';
 const busy = () => new GoogleError('Google: PATCH: 409 another operation', { code: 409, status: 'CONFLICT', reason: 'operationInProgress' });
 
 // A workload `demo` onboarded with the instance `db`, awake. `change(w)`: what differs from the world's defaults.
@@ -2516,7 +2516,8 @@ test('a companion\'s nap: NEVER once the application is down, with no wait for i
   assert.equal(policyOf(t), 'NEVER');
   // The stop's operation still runs: the nap did not wait for it, or read it.
   assert.equal(t.w.used.has('cloudsql.getOperation'), false);
-  assert.equal((await t.cloudsql.getOperation(t.w.sql.db.operation)).status, 'RUNNING');
+  assert.equal(t.w.used.has('cloudsql.listOperations'), false);
+  assert.equal((await t.cloudsql.listOperations('db'))[0].status, 'RUNNING');
 });
 
 test('a companion\'s nap given up before the commit point leaves the database alone', async () => {
@@ -2841,4 +2842,200 @@ test('two companions: both up before the application, both asked to go after it;
   assert.equal(policyOf(t), 'ALWAYS');
   assert.equal(lineOf(t.w.changes, APP_UP), -1);
   assert.equal(failureOfRun(t).kind, 'permission');
+});
+
+// --- What must hold under each reading M6 may give: the fake's choice does not decide these ------------------------------------
+
+const READINGS = [
+  ['as assumed', {}],
+  ['the policy reading as asked only at the operation\'s end', { policy: 'at-end' }],
+  ['the state leaving RUNNABLE during an operation', { stateDuring: 'MAINTENANCE' }],
+  ['an operation in error changing the policy all the same', { failedPolicy: 'changed' }],
+  ['the list showing an operation late', { listLagMs: 15_000 }],
+];
+const inReading = (reading) => (w) => { w.sqlReading = { ...w.sqlReading, ...reading }; };
+// When the application started.
+function watchApplication(t) {
+  const seen = { at: null };
+  for (const action of ['start', 'resume']) {
+    t.w.on[`POST zones/${ZONE}/instances/vm-a/${action}`] = () => {
+      seen.at ??= t.clock.now();
+    };
+  }
+  return seen;
+}
+
+for (const [title, reading] of READINGS) {
+  test(`a wake right after a nap, ${title}: the stop waited for, the start waited for, then the application`, async () => {
+    const t = await withCompanion(inReading(reading));
+    assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
+    const seen = watchApplication(t);
+    const start = t.clock.now();
+    t.w.changes.length = 0;
+    assert.equal((await wakeNowIn(t)).state, STATES.AWAKE);
+    assert.equal(t.w.changes[0], 'sql db ALWAYS');
+    assert.ok(seen.at - start >= t.w.sqlTakes.NEVER + t.w.sqlTakes.ALWAYS, `the application after ${seen.at - start} ms`);
+  });
+
+  test(`a task delivered again mid-start, ${title}: the start under way waited for, not asked again`, async () => {
+    const t = await asleepWithCompanion(inReading(reading));
+    const wakeId = await t.core.beginWake('demo', STATES.ASLEEP, 'operator');
+    // The first attempt asked, and its request died.
+    await t.cloudsql.setActivation('db', 'ALWAYS');
+    t.clock.advance(reading.listLagMs ?? 0);
+    const seen = watchApplication(t);
+    const start = t.clock.now();
+    assert.equal((await t.core.wake('demo', wakeId)).state, STATES.AWAKE);
+    assert.ok(seen.at - start >= t.w.sqlTakes.ALWAYS - (reading.listLagMs ?? 0), `the application after ${seen.at - start} ms`);
+    assert.equal(t.w.changes.filter((line) => line === 'sql db ALWAYS').length, 1);
+  });
+
+  test(`a start failed for capacity, ${title}: asked again, the application only after one that succeeded`, async () => {
+    const t = await asleepWithCompanion(inReading(reading));
+    t.w.sqlOperationErrors.push({ errors: [{ code: 'ZONE_RESOURCE_POOL_EXHAUSTED', message: 'none left' }] });
+    const seen = watchApplication(t);
+    const start = t.clock.now();
+    assert.equal((await wakeNowIn(t)).state, STATES.AWAKE);
+    assert.equal(t.w.changes.filter((line) => line === 'sql db ALWAYS').length, 2);
+    assert.ok(seen.at - start >= t.w.sqlTakes.ALWAYS * 2 + 30_000, `the application after ${seen.at - start} ms`);
+  });
+
+  test(`the wake after one that timed out, the start still under way, ${title}: waited for`, async () => {
+    const t = await asleepWithCompanion(inReading(reading));
+    t.store.configs.get('demo').wakeTimeoutSeconds = 60;
+    assert.equal((await wakeNowIn(t)).state, STATES.FAILED);
+    t.store.configs.get('demo').wakeTimeoutSeconds = 1700;
+    t.clock.advance(reading.listLagMs ?? 0);
+    const seen = watchApplication(t);
+    const start = t.clock.now();
+    const wakeId = await t.core.beginWake('demo', STATES.FAILED, 'request');
+    assert.equal((await t.core.wake('demo', wakeId)).state, STATES.AWAKE);
+    assert.ok(seen.at > start, 'not at once');
+    assert.ok(seen.at - start >= t.w.sqlTakes.ALWAYS - 60_000 - 10_000 - (reading.listLagMs ?? 0), `the application after ${seen.at - start} ms`);
+    assert.equal(t.w.changes.filter((line) => line === 'sql db ALWAYS').length, 1);
+  });
+}
+
+test('the operations refused with a 403: the wake goes on by the state and the policy, said once, whatever the polls and the companions', async () => {
+  const t = worldOf((w) => {
+    w.sql.db = {};
+    w.sql.second = {};
+    // The state tells, here: the wake polls.
+    w.sqlReading.stateDuring = 'MAINTENANCE';
+  });
+  await t.onboarding.onboard({ ...SQL_INPUT, cloudSql: ['db', 'second'] });
+  await t.core.nap('demo');
+  t.clock.advance(t.w.sqlTakes.NEVER);
+  const refusal = new GoogleError('Google: GET: 403 not authorized', { code: 403, reason: 'notAuthorized' });
+  t.google.request = ((request) => async (method, url, body) => {
+    if (url.includes('/operations')) throw refusal;
+    return request(method, url, body);
+  })(t.google.request);
+  assert.equal((await wakeNowIn(t)).state, STATES.AWAKE);
+  const said = t.w.logs.filter((l) => l.event === 'DatabaseOperationsUnread');
+  assert.equal(said.length, 1);
+  assert.equal(said[0].workloadId, 'demo');
+  assert.equal(said[0].wakeId, 'wake-1');
+});
+
+test('another operation running as a wake reads the database up: waited for, whatever it is', async () => {
+  const t = await asleepWithCompanion();
+  await t.cloudsql.setActivation('db', 'ALWAYS');
+  t.clock.advance(t.w.sqlTakes.ALWAYS);
+  // As a backup, for this reading.
+  t.w.sqlTakes.ALWAYS = 40_000;
+  await t.cloudsql.setActivation('db', 'ALWAYS');
+  t.w.changes.length = 0;
+  const seen = watchApplication(t);
+  const start = t.clock.now();
+  assert.equal((await wakeNowIn(t)).state, STATES.AWAKE);
+  assert.ok(seen.at - start >= 40_000);
+  assert.deepEqual(t.w.changes.filter((line) => line.startsWith('sql ')), []);
+});
+
+// --- Nothing asked of a database once the nap or the release no longer holds the run -------------------------------------------
+
+test('a wake asked during a nap\'s stop: the database is left alone, and the wake follows', async () => {
+  const t = await withCompanion();
+  for (const action of ['stop', 'suspend']) {
+    t.w.on[`POST zones/${ZONE}/instances/vm-a/${action}`] = () => { t.store.setPendingWake('demo'); };
+  }
+  const answer = await t.core.nap('demo');
+  assert.equal(answer.state, STATES.WAKING);
+  assert.equal(t.w.changes.includes('sql db NEVER'), false);
+  assert.equal(policyOf(t), 'ALWAYS');
+  assert.equal(t.w.tasks.at(-1).body.action, 'wake');
+});
+
+test('a wake asked while a nap reads the database: nothing sent', async () => {
+  const t = await withCompanion();
+  t.w.on['GET sql/instances/db'] = () => { t.store.setPendingWake('demo'); };
+  assert.equal((await t.core.nap('demo')).state, STATES.WAKING);
+  assert.equal(t.w.changes.includes('sql db NEVER'), false);
+});
+
+test('a wake asked during a nap\'s 409s: no other try, the wake in about one poll, not at the nap\'s budget', async () => {
+  const t = await withCompanion();
+  t.w.fail['PATCH sql/instances/db'] = busy();
+  let tries = 0;
+  t.google.request = ((request) => (method, url, body) => {
+    if (method === 'PATCH' && url.includes('sqladmin')) {
+      tries += 1;
+      if (tries === 3) t.store.setPendingWake('demo');
+    }
+    return request(method, url, body);
+  })(t.google.request);
+  let refused;
+  t.w.on['GET sql/instances/db'] = () => { refused ??= t.clock.now(); };
+  const answer = await t.core.nap('demo');
+  assert.equal(answer.state, STATES.WAKING);
+  assert.equal(tries, 3);
+  assert.ok(t.clock.now() - refused <= 3 * 10_000, `${t.clock.now() - refused} ms`);
+  assert.equal(t.w.tasks.at(-1).body.action, 'wake');
+  assert.equal(t.store.runs.get('demo').state, STATES.WAKING);
+});
+
+test('a forced offboarding during a nap\'s 409s: nothing more is sent', async () => {
+  const t = await withCompanion();
+  t.w.fail['PATCH sql/instances/db'] = busy();
+  let tries = 0;
+  t.google.request = ((request) => (method, url, body) => {
+    if (method === 'PATCH' && url.includes('sqladmin')) {
+      tries += 1;
+      if (tries === 2) {
+        t.store.runs.delete('demo');
+        t.store.configs.delete('demo');
+      }
+    }
+    return request(method, url, body);
+  })(t.google.request);
+  await t.core.nap('demo');
+  assert.equal(tries, 2);
+});
+
+test('a wake begun during a release\'s stop: the database is left alone, the release gives way', async () => {
+  const t = await withCompanion();
+  Object.assign(t.store.runs.get('demo'), { state: STATES.FAILED, failedAt: t.clock.now() });
+  for (const action of ['stop', 'suspend']) {
+    t.w.on[`POST zones/${ZONE}/instances/vm-a/${action}`] = () => { Object.assign(t.store.runs.get('demo'), { state: STATES.WAKING, wakeId: 'visitor' }); };
+  }
+  assert.equal((await t.core.release('demo')).state, 'SUPERSEDED');
+  assert.equal(t.w.changes.includes('sql db NEVER'), false);
+  assert.equal(policyOf(t), 'ALWAYS');
+});
+
+test('a wake begun during a release\'s 409s: no other try', async () => {
+  const t = await withCompanion();
+  Object.assign(t.store.runs.get('demo'), { state: STATES.FAILED, failedAt: t.clock.now() });
+  t.w.fail['PATCH sql/instances/db'] = busy();
+  let tries = 0;
+  t.google.request = ((request) => (method, url, body) => {
+    if (method === 'PATCH' && url.includes('sqladmin')) {
+      tries += 1;
+      if (tries === 2) Object.assign(t.store.runs.get('demo'), { state: STATES.WAKING, wakeId: 'visitor' });
+    }
+    return request(method, url, body);
+  })(t.google.request);
+  assert.equal((await t.core.release('demo')).state, 'SUPERSEDED');
+  assert.equal(tries, 2);
 });

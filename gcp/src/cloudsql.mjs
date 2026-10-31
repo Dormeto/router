@@ -25,9 +25,9 @@ export const CALLS = {
   get: ['cloudsql.instances.get'],
   setActivation: ['cloudsql.instances.get', 'cloudsql.instances.update'],
   getOperation: ['cloudsql.instances.get'],
-  // The table's rows for this method also name `cloudsql.instances.list`, which the router does not hold, without saying that both are
-  // needed. Assumed readable with `get` alone; refused, a wake goes by the state and the policy (operationsOf). M6.
-  listOperations: ['cloudsql.instances.get'],
+  // Google's table names both for this method without saying that both are needed: held both; M6 tells whether `list` can go. Refused,
+  // a wake goes by the state and the policy (operationsOf).
+  listOperations: ['cloudsql.instances.get', 'cloudsql.instances.list'],
 };
 
 export const isCompanion = (backend) => backend.kind === 'cloudsql';

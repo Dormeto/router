@@ -297,9 +297,10 @@
       "roles": {
         "dormetoRouterDatabasesRead": {
           "title": "Dormeto router databases (read)",
-          "description": "Lets a Dormeto router read its workloads' Cloud SQL instances: whether they run and their activation policy. Granted on the whole project; it changes nothing.",
+          "description": "Lets a Dormeto router read its workloads' Cloud SQL instances: whether they run, their activation policy and their operations. Granted on the whole project; it changes nothing.",
           "permissions": [
-            "cloudsql.instances.get"
+            "cloudsql.instances.get",
+            "cloudsql.instances.list"
           ]
         },
         "dormetoRouterDatabases": {

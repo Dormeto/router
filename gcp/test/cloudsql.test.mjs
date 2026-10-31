@@ -377,9 +377,9 @@ test('CALLS: one entry per function, each with permissions', () => {
   const { cloudsql } = setup();
   assert.deepEqual(Object.keys(CALLS).sort(), Object.keys(cloudsql).sort());
   for (const permissions of Object.values(CALLS)) assert.ok(permissions.length > 0);
-  // Google's table of permissions, method by method. Its row for operations.list also names cloudsql.instances.list, not held: M6.
+  // Google's table of permissions, method by method.
   assert.deepEqual(CALLS.setActivation, ['cloudsql.instances.get', 'cloudsql.instances.update']);
   assert.deepEqual(CALLS.get, ['cloudsql.instances.get']);
   assert.deepEqual(CALLS.getOperation, ['cloudsql.instances.get']);
-  assert.deepEqual(CALLS.listOperations, ['cloudsql.instances.get']);
+  assert.deepEqual(CALLS.listOperations, ['cloudsql.instances.get', 'cloudsql.instances.list']);
 });

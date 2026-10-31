@@ -265,7 +265,7 @@ test('features: the cloudsql.instances.update grant carries the tag condition, g
   const { features, router } = await load();
   const roles = features['cloud-sql'].roles;
   assert.deepEqual(Object.keys(roles), ['dormetoRouterDatabasesRead', 'dormetoRouterDatabases']);
-  assert.deepEqual(roles.dormetoRouterDatabasesRead.permissions, ['cloudsql.instances.get']);
+  assert.deepEqual(roles.dormetoRouterDatabasesRead.permissions, ['cloudsql.instances.get', 'cloudsql.instances.list']);
   assert.deepEqual(roles.dormetoRouterDatabases.permissions, ['cloudsql.instances.update']);
   const tagCondition = router.find((g) => g.role.endsWith('/dormetoRouterBackends')).condition;
   assert.deepEqual(features['cloud-sql'].router, [

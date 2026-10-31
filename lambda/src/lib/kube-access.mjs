@@ -14,10 +14,11 @@ export const ROUTER_RULES = [
 // On GKE (vision docs/specs/2026-10-30-google-cloud-coverage-design.md, section 8): the Role the CLI applies in the workload's
 // namespace (cli/internal/gcponboard/rbac.go), nothing a namespace cannot hold.
 export const GKE_RULES = [
-  { group: 'apps', resources: ['deployments', 'statefulsets', 'replicasets'], verbs: ['get', 'list', 'watch'] },
-  { group: 'apps', resources: ['deployments/scale', 'statefulsets/scale'], verbs: ['get', 'patch'] },
-  { group: '', resources: ['pods', 'services', 'events'], verbs: ['get', 'list', 'watch'] },
-  { group: 'keda.sh', resources: ['scaledobjects'], verbs: ['get', 'list', 'watch', 'patch'] },
+  { group: 'apps', resources: ['deployments', 'statefulsets'], verbs: ['get'] },
+  { group: 'apps', resources: ['replicasets'], verbs: ['list'] },
+  { group: 'apps', resources: ['deployments/scale', 'statefulsets/scale'], verbs: ['patch'] },
+  { group: '', resources: ['pods', 'events'], verbs: ['list'] },
+  { group: 'keda.sh', resources: ['scaledobjects'], verbs: ['list', 'patch'] },
 ];
 
 const has = (list = [], value) => list.includes('*') || list.includes(value);

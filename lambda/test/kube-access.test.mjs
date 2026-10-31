@@ -35,10 +35,11 @@ test('each right missing is named: verbs, resource and API group', () => {
 
 test('GKE_RULES: what the CLI\'s Role holds (cli/internal/gcponboard/rbac.go), nothing cluster-wide', () => {
   assert.deepEqual(GKE_RULES, [
-    { group: 'apps', resources: ['deployments', 'statefulsets', 'replicasets'], verbs: ['get', 'list', 'watch'] },
-    { group: 'apps', resources: ['deployments/scale', 'statefulsets/scale'], verbs: ['get', 'patch'] },
-    { group: '', resources: ['pods', 'services', 'events'], verbs: ['get', 'list', 'watch'] },
-    { group: 'keda.sh', resources: ['scaledobjects'], verbs: ['get', 'list', 'watch', 'patch'] },
+    { group: 'apps', resources: ['deployments', 'statefulsets'], verbs: ['get'] },
+    { group: 'apps', resources: ['replicasets'], verbs: ['list'] },
+    { group: 'apps', resources: ['deployments/scale', 'statefulsets/scale'], verbs: ['patch'] },
+    { group: '', resources: ['pods', 'events'], verbs: ['list'] },
+    { group: 'keda.sh', resources: ['scaledobjects'], verbs: ['list', 'patch'] },
   ]);
 });
 
@@ -74,6 +75,6 @@ test('askRights: one review per verb of each rule, whatever a rules review would
     },
   };
   assert.deepEqual(await askRights(k8s, 'shop', GKE_RULES), ['patch deployments/scale (apps)', 'patch statefulsets/scale (apps)']);
-  assert.equal(asked.length, 26);
+  assert.equal(asked.length, 9);
   assert.ok(asked.every((attributes) => attributes.namespace === 'shop'), 'each in the namespace');
 });

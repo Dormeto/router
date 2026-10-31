@@ -1653,7 +1653,7 @@ test('the onboarding: a review per right, the owner read, a k8s backend of the d
   assert.deepEqual(workload.backends, [backend]);
   assert.equal(store.configs.get('demo').wakeTimeoutSeconds, 300);
   const reviews = kubeCalls(w).filter((call) => call.endsWith('/selfsubjectaccessreviews'));
-  assert.equal(reviews.length, 26);
+  assert.equal(reviews.length, 9);
   assert.ok(kubeCalls(w).includes('GET /apis/apps/v1/namespaces/shop/deployments/web'), 'the owner read');
   assert.deepEqual(w.changes, [`create ${WAKER}`, 'map lb']);
   assert.ok(kubeCalls(w).every((call) => call.endsWith('/selfsubjectaccessreviews') || call.includes('/namespaces/shop/')), 'nothing outside the namespace');

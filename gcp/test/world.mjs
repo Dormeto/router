@@ -121,15 +121,14 @@ const servicesNamed = (value) => {
 // The Role the CLI applies (cli/internal/gcponboard/rbac.go), a copy of its own: `<group> <resource>`: verbs. Anything else is a 403, as RBAC
 // answers: a call outside the namespace, such as a node's, fails the code here as it would there.
 const ROLE = {
-  'apps deployments': ['get', 'list', 'watch'],
-  'apps statefulsets': ['get', 'list', 'watch'],
-  'apps replicasets': ['get', 'list', 'watch'],
-  'apps deployments/scale': ['get', 'patch'],
-  'apps statefulsets/scale': ['get', 'patch'],
-  ' pods': ['get', 'list', 'watch'],
-  ' services': ['get', 'list', 'watch'],
-  ' events': ['get', 'list', 'watch'],
-  'keda.sh scaledobjects': ['get', 'list', 'watch', 'patch'],
+  'apps deployments': ['get'],
+  'apps statefulsets': ['get'],
+  'apps replicasets': ['list'],
+  'apps deployments/scale': ['patch'],
+  'apps statefulsets/scale': ['patch'],
+  ' pods': ['list'],
+  ' events': ['list'],
+  'keda.sh scaledobjects': ['list', 'patch'],
 };
 const KINDS = { deployments: 'Deployment', statefulsets: 'StatefulSet' };
 const answered = (status, body) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });

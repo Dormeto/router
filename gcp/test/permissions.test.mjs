@@ -37,10 +37,12 @@ for (const [name, adapter] of Object.entries(ADAPTERS)) {
 }
 
 // And the other way: what the router's role grants, some call needs, so that the acceptance proves the role that ships.
-test('dormetoRouter: every permission is named by a call of an adapter', async () => {
-  const { roles } = JSON.parse(await readFile(new URL('../access.json', import.meta.url), 'utf8'));
+test('every custom role: every permission is named by a call of an adapter', async () => {
+  const { roles, features } = JSON.parse(await readFile(new URL('../access.json', import.meta.url), 'utf8'));
   const named = new Set(Object.values(ADAPTERS).flatMap((adapter) => Object.values(adapter.CALLS).flat()));
-  assert.deepEqual(roles.dormetoRouter.permissions.filter((p) => !named.has(p)), []);
+  for (const [id, role] of Object.entries({ ...roles, ...Object.assign({}, ...Object.values(features).map((f) => f.roles)) })) {
+    assert.deepEqual(role.permissions.filter((p) => !named.has(p)), [], id);
+  }
 });
 
 // What a call needs of what it names, though the call's own permission does not say so: a URL map's update needs .use on the backend

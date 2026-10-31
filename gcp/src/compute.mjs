@@ -17,7 +17,8 @@ export const CALLS = {
   getManagedGroup: ['compute.instanceGroupManagers.get'],
   listManagedInstances: ['compute.instanceGroupManagers.get'],
   getAutoscaler: ['compute.autoscalers.get'],
-  setAutoscalerMode: ['compute.autoscalers.update', 'compute.zoneOperations.get', 'compute.regionOperations.get'],
+  // `.use`: on the group it targets, though the call's own permission does not say so. Assumed from Google's reference, not measured.
+  setAutoscalerMode: ['compute.autoscalers.update', 'compute.instanceGroupManagers.use', 'compute.zoneOperations.get', 'compute.regionOperations.get'],
   getBackendService: ['compute.backendServices.get'],
   getBackendServiceHealth: ['compute.backendServices.get'],
   insertBackendService: ['compute.backendServices.create', 'compute.backendServices.use', 'compute.regionNetworkEndpointGroups.use', 'compute.globalOperations.get'],

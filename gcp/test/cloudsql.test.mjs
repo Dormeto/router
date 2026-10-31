@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { fakeClock } from '../../lambda/test/fakes.mjs';
-import { CALLS, createCloudSql, companionProblem, companionRead, isCompanion, POLL_MS, startDatabase, statusOf, stopDatabase } from '../src/cloudsql.mjs';
+import { CALLS, createCloudSql, companionLost, companionProblem, companionRead, COMPANION_GONE, isCompanion, POLL_MS, startDatabase, statusOf, stopDatabase } from '../src/cloudsql.mjs';
 import { GoogleError } from '../src/google.mjs';
 
 const BASE = 'https://sqladmin.googleapis.com/v1/projects/p';
@@ -71,8 +71,19 @@ test('companionRead: a database, its problem, 404 and 403 in words; anything els
   assert.match(replica.problem, /is a read replica/);
   assert.deepEqual(replica.database, { name: 'db', selfLink: 'https://sql/db' });
   const thrower = (code) => () => { throw new GoogleError(`Google: GET: ${code} no`, { code }); };
-  assert.deepEqual(await of(thrower(404)), { problem: 'Cloud SQL instance db not found: name an instance of this project' });
+  assert.deepEqual(await of(thrower(404)), { gone: true, problem: 'Cloud SQL instance db not found: name an instance of this project' });
   assert.match((await of(thrower(403))).problem, /^the router cannot read Cloud SQL instance db: it does not exist, or the router was installed without --with cloud-sql: .*403/);
+  assert.equal((await of(thrower(403))).gone, undefined);
+  await assert.rejects(of(thrower(500)), /500/);
+});
+
+test('companionLost: why a nap must not count on an instance: gone, or not to be read; a replica or a running one is no reason; anything else thrown', async () => {
+  const of = (answer) => companionLost(setup(answer).cloudsql, 'db');
+  const thrower = (code) => () => { throw new GoogleError(`Google: GET: ${code} no`, { code }); };
+  assert.equal(await of(() => instance('ALWAYS')), null);
+  assert.equal(await of(() => ({ ...instance('NEVER'), replicaNames: ['r'] })), null);
+  assert.match(await of(thrower(404)), /^Cloud SQL instance db no longer exists: offboard and onboard again$/);
+  assert.match(await of(thrower(403)), /^the router cannot read Cloud SQL instance db: .*: nothing is stopped, give the router its role back, or offboard and onboard again$/);
   await assert.rejects(of(thrower(500)), /500/);
 });
 
@@ -356,6 +367,43 @@ test('setActivation: no longer wanted after a 409: no other try, no timeout, nul
   assert.equal(await cloudsql.setActivation('db', 'NEVER', clock.now() + 600_000, wanted), null);
   assert.equal(calls.length, 2);
   assert.deepEqual(sleeps, [POLL_MS, POLL_MS]);
+});
+
+const absentInstance = () => { throw new GoogleError('Google: GET: 404 The Cloud SQL instance does not exist.', { code: 404, status: 'NOT_FOUND' }); };
+
+test('startDatabase: an instance gone: answered as gone, nothing asked, no wait', async () => {
+  const { calls, clock, sleeps, sleep, cloudsql } = setup((method, url) => (url.includes('/operations') ? { items: [] } : absentInstance()));
+  assert.equal(await startDatabase(cloudsql, 'db', { now: clock.now, sleep, deadline: clock.now() + 600_000 }), COMPANION_GONE);
+  assert.equal(calls.some((c) => c.method === 'PATCH'), false);
+  assert.deepEqual(sleeps, []);
+});
+
+test('startDatabase: an instance gone, its operations 404 as well: gone, whichever answers first', async () => {
+  const { clock, sleep, cloudsql } = setup(() => absentInstance());
+  assert.equal(await startDatabase(cloudsql, 'db', { now: clock.now, sleep, deadline: clock.now() + 600_000 }), COMPANION_GONE);
+});
+
+test('startDatabase: an instance deleted between its read and its PATCH: gone', async () => {
+  const { clock, sleep, cloudsql } = setup((method, url) => {
+    if (method === 'PATCH') absentInstance();
+    return url.includes('/operations') ? { items: [] } : instance('NEVER');
+  });
+  assert.equal(await startDatabase(cloudsql, 'db', { now: clock.now, sleep, deadline: clock.now() + 600_000 }), COMPANION_GONE);
+});
+
+test('startDatabase: the operations alone answering 404 say nothing of the instance: it goes by its state', async () => {
+  const { clock, sleep, cloudsql } = setup((method, url) => (url.includes('/operations') ? absentInstance() : instance('ALWAYS')));
+  assert.notEqual(await startDatabase(cloudsql, 'db', { now: clock.now, sleep, deadline: clock.now() + 600_000 }), COMPANION_GONE);
+});
+
+test('stopDatabase: an instance gone: answered as gone, nothing sent; deleted before its PATCH too', async () => {
+  const first = setup(() => absentInstance());
+  assert.equal(await stopDatabase(first.cloudsql, 'db', first.clock.now() + 60_000), COMPANION_GONE);
+  assert.equal(first.calls.some((c) => c.method === 'PATCH'), false);
+  const second = setup((method) => (method === 'PATCH' ? absentInstance() : instance('ALWAYS')));
+  assert.equal(await stopDatabase(second.cloudsql, 'db', second.clock.now() + 60_000), COMPANION_GONE);
+  const running = setup((method) => (method === 'GET' ? instance('ALWAYS') : { name: 'op' }));
+  assert.notEqual(await stopDatabase(running.cloudsql, 'db', running.clock.now() + 60_000), COMPANION_GONE);
 });
 
 test('stopDatabase: no longer wanted: nothing sent', async () => {

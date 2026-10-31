@@ -4,7 +4,7 @@
 //
 // None of this has been run against Google yet: what it answers is read from its reference, and what the measures may change is one
 // function here each: statusOf, operationsOf and operationFailure (M6), isBusy (M6), refusedForCapacity (M6), tagRefusal (M7),
-// companionRead (M6, M7), companionProblem (M8).
+// companionGone and companionRead (M6, M7), companionProblem (M8).
 //
 // `CALLS` is each function's permissions (test/permissions.test.mjs): the feature `cloud-sql` of gcp/access.json. `update` needs the
 // tag, `get` does not: it is granted on the project.
@@ -19,6 +19,8 @@ const REPLICA = 'READ_REPLICA_INSTANCE';
 export const INSTANCE_NAME = /^[a-z]([-a-z0-9]{0,96}[a-z0-9])?$/;
 // As lib/failures.mjs reads Compute Engine's stockout, and not a 429's RESOURCE_EXHAUSTED: that is a rate.
 const CAPACITY = /resource_pool_exhausted|stockout|insufficient.?capacity|not enough capacity|no capacity/i;
+// What startDatabase and stopDatabase answer of an instance that no longer exists.
+export const COMPANION_GONE = 'gone';
 
 // Google's table of permissions, method by method.
 export const CALLS = {
@@ -69,18 +71,31 @@ export function companionProblem({ name, masterInstanceName, instanceType, repli
   return null;
 }
 
-// The onboarding's read of an instance: `{ database?: { name, selfLink }, problem? }`. M6, M7: a 404 for one absent, and perhaps a 403:
-// Cloud SQL may hide one the caller cannot see, and a router without the feature reads the same.
+// M6, M7: Google's answer of a read or a change of an instance that no longer exists, for a caller holding `get` on the project. Only
+// that answer means gone. Assumed from its reference: if Google answers a 403 instead, a wake's refusal keeps visitors out as a role
+// removed does, and this is the one line to change.
+export const companionGone = (err) => err?.code === 404;
+
+// The onboarding's read of an instance: `{ database?: { name, selfLink }, problem?, gone? }`, `gone` for one that does not exist. M6, M7: a
+// 403 may be one too: Cloud SQL may hide one the caller cannot see, and a router without the feature reads the same.
 export async function companionRead(cloudsql, name) {
   try {
     const instance = await cloudsql.get(name);
     const problem = companionProblem({ ...instance, name });
     return { database: { name, selfLink: instance.selfLink }, ...(problem ? { problem } : {}) };
   } catch (err) {
-    if (err?.code === 404) return { problem: `Cloud SQL instance ${name} not found: name an instance of this project` };
+    if (companionGone(err)) return { gone: true, problem: `Cloud SQL instance ${name} not found: name an instance of this project` };
     if (err?.code === 403) return { problem: `the router cannot read Cloud SQL instance ${name}: it does not exist, or the router was installed without --with cloud-sql: ${err.message}` };
     throw err;
   }
+}
+
+// Why a nap must not count on an instance, else null, as a NEG gone stops one: nothing is stopped for an instance no wake could then
+// read. What the onboarding refused an instance for is not asked again: that it has replicas now is M8's. Anything else thrown.
+export async function companionLost(cloudsql, name) {
+  const { database, gone, problem } = await companionRead(cloudsql, name);
+  if (database) return null;
+  return gone ? `Cloud SQL instance ${name} no longer exists: offboard and onboard again` : `${problem}: nothing is stopped, give the router its role back, or offboard and onboard again`;
 }
 
 const pause = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
@@ -115,8 +130,10 @@ export function createCloudSql({ google, project, now = Date.now, sleep = pause 
 
 // M6: what a wake reads of an instance's operations, whoever asked them and whichever request: a list, and what this request asked if
 // the list does not show it yet. Refused with a 403 (`unread(err)` says so), the state and the policy alone decide, and the wake goes on.
+// A 404 here says nothing of the instance: its own read decides that.
 async function operationsOf(cloudsql, name, asked, unread) {
   const refused = (err) => {
+    if (companionGone(err)) return null;
     if (err?.code !== 403) throw err;
     unread?.(err);
     return null;
@@ -145,11 +162,23 @@ async function startOnce(cloudsql, name, { now, sleep, deadline, unread }) {
   }
 }
 
-// `timing`: `{ now, sleep, deadline, unread? }`. A start refused for capacity gets AWS's retries (lambda/src/lib/capacity.mjs).
-export const startDatabase = (cloudsql, name, timing) => retryCapacity(() => startOnce(cloudsql, name, timing), timing);
+// What an instance gone answers COMPANION_GONE, not to be thrown: no wake and no nap fails for it.
+const unlessGone = (err) => {
+  if (!companionGone(err)) throw err;
+  return COMPANION_GONE;
+};
+
+// `timing`: `{ now, sleep, deadline, unread? }`. A start refused for capacity gets AWS's retries (lambda/src/lib/capacity.mjs). COMPANION_GONE, for
+// an instance that no longer exists: there is nothing to wait for.
+export const startDatabase = (cloudsql, name, timing) => retryCapacity(() => startOnce(cloudsql, name, timing), timing).catch(unlessGone);
 
 // Asked to go, with no wait for it: a stop takes minutes and nothing depends on it. `stillGoing()`: asked before each try, false once
-// the run is no longer the nap's, and nothing is sent.
+// the run is no longer the nap's, and nothing is sent. COMPANION_GONE, for an instance that no longer exists.
 export async function stopDatabase(cloudsql, name, deadline, stillGoing) {
-  if (statusOf(await cloudsql.get(name)) !== 'stopped') await cloudsql.setActivation(name, 'NEVER', deadline, stillGoing);
+  try {
+    if (statusOf(await cloudsql.get(name)) !== 'stopped') await cloudsql.setActivation(name, 'NEVER', deadline, stillGoing);
+    return null;
+  } catch (err) {
+    return unlessGone(err);
+  }
 }

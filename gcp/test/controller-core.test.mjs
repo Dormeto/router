@@ -2955,6 +2955,157 @@ test('another operation running as a wake reads the database up: waited for, wha
   assert.deepEqual(t.w.changes.filter((line) => line.startsWith('sql ')), []);
 });
 
+// --- A companion deleted while it is the workload's: no nap goes down for it, and no wake stays down for it -----------------------
+
+const goneReason = /^Cloud SQL instance db no longer exists: offboard and onboard again$/;
+// `then(reads)` at each read of the instance, before it is answered.
+const atEachRead = (t, then) => {
+  let reads = 0;
+  t.w.on['GET sql/instances/db'] = () => {
+    reads += 1;
+    then(reads);
+  };
+};
+const logsOf = (t, event) => t.w.logs.filter((l) => l.event === event);
+
+test('a companion gone, a nap: back to AWAKE in words, nothing stopped, nothing written', async () => {
+  const t = await withCompanion();
+  delete t.w.sql.db;
+  const answer = await t.core.nap('demo');
+  assert.equal(answer.state, STATES.AWAKE);
+  assert.equal(answer.aborted, true);
+  assert.match(answer.error, goneReason);
+  assert.equal(t.store.runs.get('demo').state, STATES.AWAKE);
+  assert.deepEqual(t.w.changes, []);
+  assert.equal(t.w.vms['vm-a'].status, 'RUNNING');
+  assert.ok(logsOf(t, 'NapAborted').some((l) => goneReason.test(l.reason)));
+  assert.ok(logsOf(t, 'StateChanged').some((l) => l.to === STATES.AWAKE && l.cause === 'backends-changed'));
+});
+
+test('a companion gone during the nap\'s wait: the policy taken back, nothing stopped', async () => {
+  const t = await withCompanion();
+  atEachRead(t, (reads) => { if (reads === 2) delete t.w.sql.db; });
+  const answer = await t.core.nap('demo');
+  assert.equal(answer.state, STATES.AWAKE);
+  assert.match(answer.error, goneReason);
+  assert.equal(t.w.vms['vm-a'].status, 'RUNNING');
+  assert.equal(t.w.changes.some((line) => APP_DOWN.test(line)), false);
+  assert.equal(JSON.stringify(t.w.urlMaps.lb).includes('defaultCustomErrorResponsePolicy'), false);
+});
+
+test('a companion the router cannot read any more, a nap: back to AWAKE, nothing stopped', async () => {
+  const t = await withCompanion();
+  t.w.fail['GET sql/instances/db'] = new GoogleError('Google: GET: 403 not authorized', { code: 403, status: 'PERMISSION_DENIED' });
+  const answer = await t.core.nap('demo');
+  assert.equal(answer.state, STATES.AWAKE);
+  assert.match(answer.error, /^the router cannot read Cloud SQL instance db/);
+  assert.deepEqual(t.w.changes, []);
+});
+
+// A failure here would hold visitors at the waker, and each wake would refuse them: the visitors come back first.
+test('under a swap, a companion gone or refused at the read after the wait: unswapped and waited for, AWAKE, nothing stopped', async () => {
+  const refused = new GoogleError('Google: GET: 403 not authorized', { code: 403, status: 'PERMISSION_DENIED' });
+  // A read answers what w.fail holds before it runs w.on: the second read is the one to refuse, from the first.
+  for (const [at, lost] of [[2, (t) => { delete t.w.sql.db; }], [1, (t) => { t.w.fail['GET sql/instances/db'] = refused; }]]) {
+    const t = await withCompanion(regionalWorld);
+    atEachRead(t, (reads) => { if (reads === at) lost(t); });
+    const answer = await t.core.nap('demo');
+    assert.equal(answer.state, STATES.AWAKE);
+    assert.equal(answer.aborted, true);
+    assert.equal(t.store.runs.get('demo').state, STATES.AWAKE);
+    assert.equal(t.w.vms['vm-a'].status, 'RUNNING');
+    assert.equal(t.w.changes.some((line) => APP_DOWN.test(line)), false);
+  }
+});
+
+test('a companion deleted after a nap\'s last read: the nap ends, said; the application is down as asked, and a wake finds it', async () => {
+  const t = await withCompanion();
+  atEachRead(t, (reads) => { if (reads === 3) delete t.w.sql.db; });
+  assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
+  assert.ok(logsOf(t, 'CompanionGone').some((l) => l.workloadId === 'demo' && l.instance === 'db'));
+  t.clock.advance(600_000);
+  assert.equal((await wakeNowIn(t)).state, STATES.AWAKE);
+});
+
+test('a companion gone, a wake: the application starts all the same, said in the log and on the run, and no failure', async () => {
+  const t = await asleepWithCompanion();
+  delete t.w.sql.db;
+  const answer = await wakeNowIn(t);
+  assert.equal(answer.state, STATES.AWAKE);
+  assert.ok(t.w.changes.some((line) => APP_UP.test(line)));
+  assert.equal(t.w.vms['vm-a'].status, 'RUNNING');
+  assert.ok(logsOf(t, 'CompanionGone').some((l) => l.workloadId === 'demo' && l.instance === 'db'));
+  const run = t.store.runs.get('demo');
+  assert.deepEqual(run.companionsGone, ['db']);
+  assert.equal(run.failure, undefined);
+});
+
+test('two companions, one gone, a wake: the other still comes first, the application next', async () => {
+  const t = worldOf((w) => { Object.assign(w.sql, { db: {}, second: {} }); });
+  await t.onboarding.onboard({ ...SQL_INPUT, cloudSql: ['db', 'second'] });
+  assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
+  t.clock.advance(t.w.sqlTakes.NEVER);
+  t.w.changes.length = 0;
+  delete t.w.sql.db;
+  assert.equal((await wakeNowIn(t)).state, STATES.AWAKE);
+  assert.ok(lineOf(t.w.changes, /^sql second ALWAYS$/) < lineOf(t.w.changes, APP_UP));
+  assert.deepEqual(t.store.runs.get('demo').companionsGone, ['db']);
+});
+
+test('the story of a review: a companion deleted while awake: the check asks its nap, the nap aborts, the application serves on', async () => {
+  const t = await withCompanion();
+  delete t.w.sql.db;
+  t.clock.advance(3_600_000);
+  const [result] = await t.core.check();
+  assert.equal(result.nap, 'requested');
+  assert.equal(result.error, undefined);
+  assert.equal((await t.core.nap('demo', { requestedAt: t.clock.now() })).state, STATES.AWAKE);
+  const [next] = await t.core.check();
+  assert.equal(next.state, STATES.AWAKE);
+  assert.equal(t.w.vms['vm-a'].status, 'RUNNING');
+});
+
+for (const [state, arrange] of [[STATES.AWAKE, withCompanion], [STATES.ASLEEP, asleepWithCompanion]]) {
+  test(`the check, ${state}: a companion gone is said and kept on the run, with no failure and no change; back, it is no longer`, async () => {
+    const t = await arrange();
+    delete t.w.sql.db;
+    const [result] = await t.core.check();
+    assert.equal(result.error, undefined);
+    assert.equal(result.state, state);
+    assert.deepEqual(t.store.runs.get('demo').companionsGone, ['db']);
+    assert.ok(logsOf(t, 'CompanionGone').some((l) => l.instance === 'db'));
+    assert.deepEqual(logsOf(t, 'DatabaseNotFollowed'), []);
+    assert.deepEqual(t.w.changes.filter((line) => line.startsWith('sql ')), []);
+    // Said at each check, written once.
+    const { version } = t.store.runs.get('demo');
+    await t.core.check();
+    assert.equal(logsOf(t, 'CompanionGone').length, 2);
+    assert.equal(t.store.runs.get('demo').version, version);
+    t.w.sql.db = { settings: { activationPolicy: state === STATES.AWAKE ? 'ALWAYS' : 'NEVER' } };
+    await t.core.check();
+    assert.equal(t.store.runs.get('demo').companionsGone, undefined);
+  });
+}
+
+test('the check: another failure on a companion is no gone one', async () => {
+  const t = await withCompanion();
+  t.w.fail['GET sql/instances/db'] = new GoogleError('Google: refused', { code: 500 });
+  await t.core.check();
+  assert.deepEqual(logsOf(t, 'CompanionGone'), []);
+  assert.equal(t.store.runs.get('demo').companionsGone, undefined);
+});
+
+test('a wake with a companion back since: the run no longer says it is gone', async () => {
+  const t = await asleepWithCompanion();
+  const { settings } = t.w.sql.db;
+  delete t.w.sql.db;
+  await t.core.check();
+  assert.deepEqual(t.store.runs.get('demo').companionsGone, ['db']);
+  t.w.sql.db = { settings };
+  assert.equal((await wakeNowIn(t)).state, STATES.AWAKE);
+  assert.equal(t.store.runs.get('demo').companionsGone, undefined);
+});
+
 // --- Nothing asked of a database once the nap or the release no longer holds the run -------------------------------------------
 
 test('a wake asked during a nap\'s stop: the database is left alone, and the wake follows', async () => {
@@ -2971,7 +3122,8 @@ test('a wake asked during a nap\'s stop: the database is left alone, and the wak
 
 test('a wake asked while a nap reads the database: nothing sent', async () => {
   const t = await withCompanion();
-  t.w.on['GET sql/instances/db'] = () => { t.store.setPendingWake('demo'); };
+  // Its third: the two before the commit point are read for the nap's own sake.
+  atEachRead(t, (reads) => { if (reads === 3) t.store.setPendingWake('demo'); });
   assert.equal((await t.core.nap('demo')).state, STATES.WAKING);
   assert.equal(t.w.changes.includes('sql db NEVER'), false);
 });
@@ -2987,8 +3139,9 @@ test('a wake asked during a nap\'s 409s: no other try, the wake in about one pol
     }
     return request(method, url, body);
   })(t.google.request);
+  // The last read before the tries is the stop's: those before it are the nap's own, before its commit point.
   let refused;
-  t.w.on['GET sql/instances/db'] = () => { refused ??= t.clock.now(); };
+  t.w.on['GET sql/instances/db'] = () => { refused = t.clock.now(); };
   const answer = await t.core.nap('demo');
   assert.equal(answer.state, STATES.WAKING);
   assert.equal(tries, 3);

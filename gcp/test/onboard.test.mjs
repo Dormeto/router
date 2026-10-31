@@ -1456,6 +1456,31 @@ test('offboard --force of a sleeping workload: the stopped database is named as 
   assert.deepEqual((await awake.onboarding.offboard('demo', { force: true })).left, []);
 });
 
+test('a companion gone: a plain offboarding of an awake or asleep workload goes through, the application up', async () => {
+  const awake = setup(withSql());
+  await awake.onboarding.onboard(SQL_INPUT);
+  delete awake.w.sql.db;
+  assert.deepEqual(await awake.onboarding.offboard('demo'), {});
+  assert.equal(awake.store.configs.size, 0);
+
+  const asleep = setup(withSql());
+  await asleep.onboarding.onboard(SQL_INPUT);
+  assert.equal((await asleep.core.nap('demo')).state, STATES.ASLEEP);
+  delete asleep.w.sql.db;
+  assert.deepEqual(await asleep.onboarding.offboard('demo'), {});
+  assert.equal(asleep.store.configs.size, 0);
+  assert.equal(asleep.w.vms['vm-a'].status, 'RUNNING');
+});
+
+test('show: a companion gone, once the check or a wake saw it; none, no field', async () => {
+  const { w, core, onboarding } = setup(withSql());
+  await onboarding.onboard(SQL_INPUT);
+  assert.equal((await onboarding.show('demo')).companionsGone, undefined);
+  delete w.sql.db;
+  await core.check();
+  assert.deepEqual((await onboarding.show('demo')).companionsGone, ['db']);
+});
+
 test('offboard --force: a database that cannot be read is not known to be up: named as left, logged', async () => {
   const { w, onboarding } = setup(withSql());
   await onboarding.onboard(SQL_INPUT);

@@ -12,7 +12,9 @@
 // region }` or `{ kind: 'classic' }`, absent for a global load balancer. `config`: `{ project, region, controllerUrl }`.
 //
 // A `cloudsql` backend is a companion (cloudsql.mjs): the VMs and groups, the primaries, alone decide the state and serve; it goes
-// after them and comes back before them, as on AWS.
+// after them and comes back before them, as on AWS. One deleted without an offboarding is the customer's own state: a nap does not go
+// for it, as a NEG gone, and a wake or a check goes on without it, said in `CompanionGone` and on the run's `companionsGone`, until an
+// offboarding, as whether the application runs without it is its health check's to say.
 //
 // A `k8s` backend is a primary (gke.mjs, section 8 of the coverage design): a GKE owner behind standalone NEGs, its one primary, as a mix with VMs is refused. Read as a VM
 // where the state is decided, its replicas stand for the VM's status. Scaled to 0, its NEG holds no endpoint and none is healthy: the switch, the idle check and the wake's
@@ -33,7 +35,7 @@ import { awakeStartWithin, CLOSE_START_MS, maintenanceDue, occurrenceAt } from '
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { createListRefresher } from '../../lambda/src/lib/list-refresh.mjs';
 import { createWakeWatch } from '../../lambda/src/lib/wake-watch.mjs';
-import { isCompanion, startDatabase, statusOf, stopDatabase } from './cloudsql.mjs';
+import { COMPANION_GONE, companionGone, companionLost, isCompanion, startDatabase, statusOf, stopDatabase } from './cloudsql.mjs';
 import {
   giveBackOwner, isPods, ownerAsVm, ownerChanged, ownerRecord, ownerText, podsUnhealthy, recordOf, sleepOwner, wakeOwner, watchRecord,
 } from './gke.mjs';
@@ -346,9 +348,20 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
       if (now() >= deadline) throw failureError('timeout', `not down in time: ${names(up).join(', ')}`);
       await sleep(POLL_MS);
     }
-    // After the application, with no wait: a stop takes minutes, and nothing depends on it.
-    await each(companionsOf(cfg), ({ name }) => stopDatabase(cloudsql, name, latest, stillGoing));
+    // After the application, with no wait: a stop takes minutes, and nothing depends on it. One deleted since the nap's last read
+    // holds nothing to stop, and its wake goes on without it.
+    await each(companionsOf(cfg), async ({ name }) => {
+      if ((await stopDatabase(cloudsql, name, latest, stillGoing)) === COMPANION_GONE) log.warn('CompanionGone', { workloadId: cfg.workloadId, instance: name });
+    });
     return { stopped: done.flatMap((d) => d.stopped), suspended: done.flatMap((d) => d.suspended) };
+  }
+
+  // The companions found gone, said each time and kept on the run while they are, for whoever reads the workload. `cond`: the run as read.
+  async function saidGone(workloadId, run, cond, gone) {
+    for (const instance of gone) log.warn('CompanionGone', { workloadId, instance });
+    const recorded = run.companionsGone ?? [];
+    if (gone.length === recorded.length && gone.every((name) => recorded.includes(name))) return;
+    await transition(workloadId, gone.length ? { cond, set: { companionsGone: gone } } : { cond, remove: ['companionsGone'] });
   }
 
   // --- The wake ------------------------------------------------------------------------------------------------------
@@ -397,9 +410,11 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
       log.warn('DatabaseOperationsUnread', { workloadId, wakeId, error: err.message });
     };
     try {
-      // The application needs them, whatever becomes of its VMs. Their minutes may have made this wake another's.
+      // The application needs them, whatever becomes of its VMs. Their minutes may have made this wake another's. One gone is no
+      // reason to keep visitors out: the application starts, and its health check says what it can do without it.
       if (companionsOf(cfg).length) {
-        await each(companionsOf(cfg), ({ name }) => startDatabase(cloudsql, name, { now, sleep, deadline, unread }));
+        const gone = await each(companionsOf(cfg), async ({ name }) => ((await startDatabase(cloudsql, name, { now, sleep, deadline, unread })) === COMPANION_GONE ? name : null));
+        await saidGone(workloadId, run, { state: STATES.WAKING, wakeId }, gone.filter(Boolean));
         if (!(await isCurrent())) return superseded();
       }
       let givenBack = true;
@@ -532,8 +547,9 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
 
   // A NEG's VMs are stopped only while they still are the NEG: one is edited more freely than a group. Why not, else null; a NEG
   // deleted is one more change, not a failure. A read that fails throws. The wake needs none of this: starting what was recorded
-  // is harmless. An owner's pods legitimately change: what must hold of its NEGs is gke.mjs's, and its being gone throws.
-  async function negsChanged(cfg) {
+  // is harmless. An owner's pods legitimately change: what must hold of its NEGs is gke.mjs's, and its being gone throws. A companion
+  // gone or no longer to be read is one more change: the application stays up rather than go down for it (cloudsql.mjs).
+  async function backendsChanged(cfg) {
     const recorded = new Map();
     for (const backend of cfg.backends.filter((b) => b.kind === 'vm')) {
       for (const neg of [backend.neg, ...(backend.moreNegs ?? [])].filter(Boolean)) {
@@ -561,7 +577,8 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
       return `network endpoint group ${neg.name} changed since the onboarding (${parts.join('; ')}): offboard and onboard again`;
     });
     const ownerChanges = await each(cfg.backends.filter(isPods), (backend) => ownerChanged(clients, backend, () => readService(cfg)));
-    const found = [...changes, ...ownerChanges].filter(Boolean);
+    const companionChanges = await each(companionsOf(cfg), ({ name }) => companionLost(cloudsql, name));
+    const found = [...changes, ...ownerChanges, ...companionChanges].filter(Boolean);
     return found.length ? found.join('; ') : null;
   }
 
@@ -613,7 +630,7 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
     try {
       // Before the first write as well as after the wait: under a swap an abort after it would hold visitors at the waker for two
       // waits, at each idle period until an offboarding.
-      const changedBefore = await negsChanged(cfg);
+      const changedBefore = await backendsChanged(cfg);
       if (changedBefore) return await giveUp('backends-changed', 'warn', { reason: changedBefore, error: changedBefore });
       try {
         const held = await asleepHeld(cfg, sw, latest);
@@ -625,7 +642,7 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
         if (!(err instanceof UrlMapRefused)) throw err;
         return await giveUp('switch-failed', 'warn', { reason: err.message, error: err.message });
       }
-      const changed = await negsChanged(cfg);
+      const changed = await backendsChanged(cfg);
       if (changed) return await giveUp('backends-changed', 'warn', { reason: changed, error: changed });
       const autoscalers = await autoscalersToRecord(cfg, napping);
       const owners = await ownersToRecord(cfg, napping);
@@ -698,7 +715,7 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
         run = await store.getRun(workloadId);
         if (run?.state !== STATES.FAILED) return { state: 'SUPERSEDED' };
       }
-      const changed = await negsChanged(cfg);
+      const changed = await backendsChanged(cfg);
       if (changed) {
         log.warn('ReleaseAborted', { workloadId, reason: changed });
         return { state: STATES.FAILED, error: changed };
@@ -969,21 +986,24 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
   // awake, a stopped one is started. No wait in a check: one try, and a refusal or another operation is for the next check. The run is
   // read again before anything is asked: a wake or a nap since owns them. What is left is a wake begun in that PATCH's round trip, whose
   // read of the database may have come first: it then goes on with the database going down, and no later read of its own sees that.
-  // The next check, once it is awake, starts it again.
+  // The next check, once it is awake, starts it again. One gone is said, and no failure.
   async function companionsFollow(cfg, run) {
     const drift = COMPANION_DRIFT[run?.state];
-    if (!drift) return;
+    if (!drift || !companionsOf(cfg).length) return;
     const { workloadId } = cfg;
-    await Promise.all(companionsOf(cfg).map(async ({ name }) => {
+    const followed = await Promise.all(companionsOf(cfg).map(async ({ name }) => {
       try {
-        if (statusOf(await cloudsql.get(name)) !== drift.status) return;
-        if ((await store.getRun(workloadId))?.state !== run.state) return;
+        if (statusOf(await cloudsql.get(name)) !== drift.status) return null;
+        if ((await store.getRun(workloadId))?.state !== run.state) return null;
         log.warn(drift.event, { workloadId, instance: name });
         await cloudsql.setActivation(name, drift.policy);
       } catch (err) {
+        if (companionGone(err)) return name;
         log.warn('DatabaseNotFollowed', { workloadId, instance: name, error: err.message });
       }
+      return null;
     }));
+    await saidGone(workloadId, run, { state: run.state }, followed.filter(Boolean));
   }
 
   // --- IP lists ------------------------------------------------------------------------------------------------------------

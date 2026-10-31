@@ -15,6 +15,7 @@ export const CALLS = {
 
 function filterOf(backendService, lb) {
   if (lb?.kind !== 'regional') return `metric.type = "${METRIC}" AND resource.labels.backend_target_name = "${backendService}"`;
+  if (!lb.region) throw new Error(`backend service ${backendService}: a regional load balancer with no region reads no request count`);
   return `metric.type = "${REGIONAL_METRIC}" AND resource.labels.backend_target_name = "${backendService}" AND resource.labels.region = "${lb.region}"`;
 }
 

@@ -130,6 +130,7 @@ export function fromEnvironment(env = process.env, { fetch, log = logger } = {})
     store,
     compute,
     urlmaps,
+    regionalUrlmaps,
     monitoring: createMonitoring({ google, project }),
     tasks: createTasks({ google, project, region: env.DMT_REGION, queue: env.DMT_QUEUE, serviceAccount: env.DMT_SERVICE_ACCOUNT }),
     config,

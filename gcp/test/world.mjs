@@ -126,6 +126,9 @@ export function setup(change = () => {}) {
       if (!inRegion(region).services[name]) throw notFound(`backend service ${name}`);
       return inRegion(region).services[name];
     }],
+    ['POST', /^regions\/[^/]+\/backendServices\/[^/]+\/getHealth$/, () => ({
+      healthStatus: [{ healthState: Object.values(w.vms).some((vm) => vm.status === 'RUNNING') ? 'HEALTHY' : 'UNHEALTHY' }],
+    })],
     ['POST', /^regions\/([^/]+)\/backendServices$/, ([region], body) => {
       inRegion(region).services[body.name] = body;
       return done(`create ${body.name}`);
@@ -284,7 +287,7 @@ export function setup(change = () => {}) {
     },
   };
   const core = createController({
-    store, compute, urlmaps, monitoring: { requestCount: async () => 0 }, tasks, config, now: clock.now, sleep: clock.sleep, newId: () => 'wake-1', log,
+    store, compute, urlmaps, regionalUrlmaps, monitoring: { requestCount: async () => 0 }, tasks, config, now: clock.now, sleep: clock.sleep, newId: () => 'wake-1', log,
   });
   const onboarding = createOnboarding({ store, compute, urlmaps, regionalUrlmaps, core, config, now: clock.now, log });
   return { w, clock, store, core, onboarding, config, log };

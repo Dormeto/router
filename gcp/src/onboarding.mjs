@@ -10,9 +10,9 @@
 // global one, under the policy. The router reads only its own region's regional maps.
 import { nextEvents, normalizeSchedule, scheduleProblems } from '../../lambda/src/lib/schedule.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
-import { groupOf, napHeldBack, PauseRefused } from './controller-core.mjs';
+import { groupOf, PauseRefused } from './controller-core.mjs';
 import { SWITCH_HEADER, WORKLOAD_HEADER, WORKLOAD_ID } from './names.mjs';
-import { SWAP_WAIT_MS } from './switch.mjs';
+import { inOneUpdate, SWAP_WAIT_MS } from './switch.mjs';
 import {
   hostsOf, inMatcher, references, UrlMapRefused, withErrorPolicy, withHoldRoute, withoutErrorPolicy, withoutHoldRoute, withoutSwap, withoutWakerRoute, withSwap, withWakerRoute,
 } from './urlmaps.mjs';
@@ -35,6 +35,8 @@ const GKE_NEG_PREFIX = 'k8s1-';
 const MANAGED_GROUP_OWNER = /\/instanceGroupManagers\/([^/]+)$/;
 const DEFAULTS = { idleMinutes: 15, failedRetrySeconds: 60, pollSeconds: 3 };
 const VMS_WAKE_SECONDS = 600;
+// What an explicit wake's timeout must leave, beyond its URL map's change, under a swap: for the VMs to start at all.
+const SWAP_WAKE_ROOM_SECONDS = 60;
 // What the CLI's flags set, with AWS's ranges (lambda/src/lib/onboarding.mjs); the wake's fits the controller's request.
 const RANGES = { idleMinutes: [5, 1440], waitSeconds: [5, 120], wakeTimeoutSeconds: [60, 1700] };
 // What a Workload shows of its configuration.
@@ -55,11 +57,6 @@ const zoneOf = (url) => /\/zones\/([^/]+)\//.exec(url)?.[1];
 // A proxy's URL without what differs between Google's answers, as a forwarding rule's target names it.
 const proxyOf = (url) => url.split('/').slice(-2).join('/');
 const isoOf = (ms) => new Date(ms).toISOString();
-// The map's changes as one: `{ map, paths }`, each step on the map of the one before.
-const inOneUpdate = (map, steps) => steps.reduce(({ map: on, paths }, step) => {
-  const done = step(on);
-  return { map: done.map, paths: [...paths, ...done.paths] };
-}, { map, paths: [] });
 const isSwapped = (lb) => Object.hasOwn(SWAP_WAIT_MS, lb.kind);
 const isRegional = (lb) => lb.kind === 'regional';
 // The map's change is included in the wake's time.
@@ -84,6 +81,14 @@ function settingsProblems(settings) {
     const [min, max] = RANGES[key];
     return Number.isInteger(value) && value >= min && value <= max ? [] : [`settings: ${key} must be an integer from ${min} to ${max}`];
   });
+}
+
+// The map's change is included in the wake: a timeout that leaves it no room is a wake that always fails.
+function swapTimeoutProblems({ wakeTimeoutSeconds: asked }, lb) {
+  if (asked === undefined || !isSwapped(lb)) return [];
+  const change = SWAP_WAIT_MS[lb.kind] / 1000;
+  const lowest = change + SWAP_WAKE_ROOM_SECONDS;
+  return asked > lowest ? [] : [`settings: wakeTimeoutSeconds ${asked} is too short for a ${lb.kind} load balancer: its wake includes the URL map's change, ${change} s: use more than ${lowest}`];
 }
 
 function failureOf(run) {
@@ -296,7 +301,7 @@ export function createOnboarding({ store, compute, urlmaps, regionalUrlmaps, cor
   }
 
   // Section 7: why the workload cannot be onboarded, its load balancer (`lb`, none when it cannot be told), its VMs and groups. Reads only.
-  async function inspect({ id, urlMap, backendService, loadBalancer }) {
+  async function inspect({ id, urlMap, backendService, loadBalancer, settings }) {
     const reasons = [];
     const configs = await store.listConfigs();
     const others = configs.filter((c) => c.workloadId !== id);
@@ -309,6 +314,7 @@ export function createOnboarding({ store, compute, urlmaps, regionalUrlmaps, cor
     const kind = front.kind ?? (regional ? 'regional' : loadBalancer ?? 'global');
     const lb = regional ? { kind, region: config.region } : { kind };
     const told = front.kind ? { lb } : {};
+    if (front.kind) reasons.push(...swapTimeoutProblems(settings, lb));
 
     // A backend service's name is unique in its scope.
     const owner = others.find((c) => c.backendService === backendService && isRegional(c.lb ?? GLOBAL_LB) === regional);
@@ -375,7 +381,7 @@ export function createOnboarding({ store, compute, urlmaps, regionalUrlmaps, cor
   async function onboard(input) {
     const { id, urlMap, backendService, settings, loadBalancer } = requested(input);
     if (await store.getConfig(id)) throw new Refusal(409, 'exists', `workload ${id} is onboarded already`);
-    const { reasons, vms, groups, negs, hosts, wakerExists, lb } = await inspect({ id, urlMap, backendService, loadBalancer });
+    const { reasons, vms, groups, negs, hosts, wakerExists, lb } = await inspect({ id, urlMap, backendService, loadBalancer, settings });
     if (reasons.length) throw new Refusal(400, 'not-eligible', `cannot onboard ${id}: ${reasons.join('; ')}`);
     const name = wakerName(id);
     const waker = wakerUrl(name, lb);
@@ -513,9 +519,7 @@ export function createOnboarding({ store, compute, urlmaps, regionalUrlmaps, cor
   }
 
   // Refused at once with its reason, as its task would be.
-  async function napUnlessPaused(id, cfg) {
-    const heldBack = napHeldBack(cfg);
-    if (heldBack) throw new Refusal(409, 'swap-not-ready', `workload ${id} cannot nap yet: ${heldBack}`);
+  async function napUnlessPaused(id) {
     const [paused] = await core.pausesFor(id);
     if (paused) throw new Refusal(409, 'paused', `workload ${id} is paused by ${paused.by}: ${paused.reason}`);
     await core.napNow(id);

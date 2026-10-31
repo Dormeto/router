@@ -95,6 +95,30 @@ test('a regional load balancer\'s onboarding and offboarding: every call it make
   }
 });
 
+test('a regional workload\'s nap, wake and check: every call they make is in CALLS, and in the manifest\'s router grants', async () => {
+  const { w, core, onboarding, store } = setup(regional);
+  await onboarding.onboard(INPUT);
+  w.used.clear();
+  assert.equal((await core.nap('demo')).state, STATES.ASLEEP);
+  await core.check();
+  const wakeId = await core.beginWake('demo', STATES.ASLEEP, 'operator');
+  assert.equal((await core.wake('demo', wakeId)).state, STATES.AWAKE);
+  store.runs.get('demo').state = STATES.FAILED;
+  assert.equal((await core.release('demo')).state, STATES.ASLEEP);
+
+  for (const name of ['compute.getRegionBackendService', 'compute.getRegionBackendServiceHealth', 'regionalUrlmaps.list', 'regionalUrlmaps.modify']) {
+    assert.ok(w.used.has(name), `the run did not exercise ${name}`);
+  }
+  for (const name of ['compute.getBackendService', 'compute.getBackendServiceHealth', 'urlmaps.list', 'urlmaps.modify']) {
+    assert.equal(w.used.has(name), false, `${name} is the global scope's`);
+  }
+  const permissions = await granted();
+  for (const name of w.used) {
+    assert.ok(callsOf(name)?.length, `${name} is not in CALLS`);
+    for (const p of callsOf(name)) assert.ok(permissions.has(p), `${name} needs ${p}`);
+  }
+});
+
 test('onboarding: a call that waits or names a backend service asks what that takes', () => {
   for (const [name, needed] of Object.entries(WAITED)) {
     for (const p of needed) assert.ok(callsOf(name).includes(p), `${name} needs ${p}`);

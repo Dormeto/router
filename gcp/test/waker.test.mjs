@@ -149,6 +149,112 @@ test('the waiting page when Firestore cannot be read: the page all the same, 200
   }
 });
 
+// --- Under a swap (the coverage design's section 7): the waker gets the visitor's real request, with no policy to override its code --
+
+const SWAPPED = { 'x-dormeto-switch': 'swap' };
+const visitor = ({ headers = {}, ...rest } = {}) => request({ url: '/orders?id=1', ...rest, headers: { ...SWAPPED, ...headers } });
+
+test('under a swap, a POST with a body to an application path → the page, 503, Retry-After, and no wake', async () => {
+  const { handler, store, created } = setup();
+  const res = await handler({ ...visitor({ method: 'POST', headers: { 'content-type': 'application/json', 'content-length': '11' } }), body: '{"order":1}' });
+  assert.equal(res.statusCode, 503);
+  assert.equal(res.statusDescription, '503 Service Unavailable');
+  assert.equal(headerOf(res, 'retry-after'), '3');
+  assert.equal(headerOf(res, 'cache-control'), 'no-store');
+  assert.equal(headerOf(res, 'x-dormeto-state'), STATES.ASLEEP);
+  assert.match(headerOf(res, 'content-type'), /text\/html/);
+  assert.match(res.body, /Waking up the application/);
+  assert.match(res.body, /fetch\("\/_dormeto\/wake", /);
+  assert.equal(created.length, 0);
+  assert.equal(store.state.run.state, STATES.ASLEEP);
+});
+
+test('under a swap, a plain GET → the page, 503, and no wake', async () => {
+  const { handler, store, created } = setup();
+  const res = await handler(visitor({ headers: { accept: 'text/html' } }));
+  assert.equal(res.statusCode, 503);
+  assert.match(res.body, /Waking up the application/);
+  assert.equal(created.length, 0);
+  assert.equal(store.state.run.state, STATES.ASLEEP);
+});
+
+test('under a swap, the page is a 503 whatever the method, and an explicit wake\'s headers wake nothing there', async () => {
+  const { handler, created } = setup();
+  for (const method of ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']) {
+    const res = await handler(visitor({ method, headers: { 'x-dormeto-wake': '1', 'x-dormeto-probe': '1' } }));
+    assert.equal(res.statusCode, 503, method);
+    assert.match(res.body, /Waking up the application/, method);
+  }
+  const head = await handler(visitor({ method: 'HEAD' }));
+  assert.equal(head.statusCode, 503);
+  assert.equal(head.body, '');
+  assert.equal(headerOf(head, 'retry-after'), '3');
+  assert.equal(created.length, 0);
+});
+
+test('x-dormeto-switch: its last value says, as x-dormeto-workload\'s; none, or another, is the policy\'s 200', async () => {
+  const { handler } = setup();
+  for (const [value, status] of [['swap', 503], ['other, swap', 503], ['swap, other', 200], ['other', 200], ['', 200], [undefined, 200]]) {
+    const res = await handler(request({ url: '/orders', headers: { 'x-dormeto-switch': value } }));
+    assert.equal(res.statusCode, status, String(value));
+  }
+});
+
+test('under a swap, Firestore unreadable: still the page, 503, Retry-After, no state claimed, no wake', async () => {
+  for (const broken of ['getConfig', 'getRun']) {
+    const { handler, store, logged, created } = setup();
+    store[broken] = async () => { throw new Error('Google: 503 firestore'); };
+    const res = await handler(visitor({ method: 'POST' }));
+    assert.equal(res.statusCode, 503, broken);
+    assert.equal(headerOf(res, 'retry-after'), '10');
+    assert.equal(headerOf(res, 'x-dormeto-state'), 'UNKNOWN');
+    assert.match(res.body, /Waking up the application/);
+    assert.equal(logged[0].event, 'WaitingPageUnread');
+    assert.equal(created.length, 0);
+  }
+});
+
+test('under a swap, a workload not configured, and a failed one: the page says so, 503', async () => {
+  const clock = fakeClock();
+  const unknown = await setup().handler(visitor({ headers: { 'x-dormeto-workload': 'other' } }));
+  assert.equal(unknown.statusCode, 503);
+  assert.equal(headerOf(unknown, 'x-dormeto-state'), STATES.FAILED);
+  const failed = await setup({ run: { state: STATES.FAILED, failedAt: clock.now(), consecutiveFailures: 1, failure: JSON.stringify({ kind: 'capacity' }) } }).handler(visitor());
+  assert.equal(failed.statusCode, 503);
+  assert.match(failed.body, /Google Cloud has no capacity/);
+});
+
+test('under a swap, /_dormeto/wake as with the policy: 202 and one task for a probe or a POST, 200 once awake, never a 503', async () => {
+  const asleep = setup();
+  const probed = await asleep.handler(probe(SWAPPED));
+  assert.equal(probed.statusCode, 202);
+  assert.equal(headerOf(probed, 'x-dormeto-state'), STATES.WAKING);
+  assert.equal(asleep.created.length, 1);
+  assert.equal((await asleep.handler(probe(SWAPPED))).statusCode, 202, 'waking, its wait included');
+
+  const posted = setup();
+  const res = await posted.handler(request({ method: 'POST', url: '/_dormeto/wake', headers: SWAPPED }));
+  assert.equal(res.statusCode, 202);
+  assert.equal(posted.created.length, 1);
+
+  const plain = setup();
+  assert.equal((await plain.handler(request({ url: '/_dormeto/wake', headers: { ...SWAPPED, accept: 'text/html' } }))).statusCode, 202);
+  assert.equal(plain.created.length, 0);
+
+  const awake = setup({ run: { state: STATES.AWAKE, awakeSince: fakeClock().now() } });
+  assert.equal((await awake.handler(probe(SWAPPED))).statusCode, 200);
+  const unknown = setup();
+  assert.equal((await unknown.handler(probe({ ...SWAPPED, 'x-dormeto-workload': 'other' }))).statusCode, 202);
+});
+
+test('under a swap, the namespace is not the application: another /_dormeto/ path is the 200 it always was; /_dormeto alone is a visitor\'s', async () => {
+  const { handler, created } = setup();
+  assert.equal((await handler(request({ url: '/_dormeto/waiting', headers: SWAPPED }))).statusCode, 200);
+  assert.equal((await handler(request({ url: '/_dormeto', headers: SWAPPED }))).statusCode, 503);
+  assert.equal((await handler(request({ url: '/_dormetofoo', headers: SWAPPED }))).statusCode, 503);
+  assert.equal(created.length, 0);
+});
+
 test('the waiting page of a failed workload says why and when, in Google Cloud\'s words', async () => {
   const clock = fakeClock();
   const run = { state: STATES.FAILED, failedAt: clock.now(), consecutiveFailures: 1, failure: JSON.stringify({ kind: 'capacity' }) };

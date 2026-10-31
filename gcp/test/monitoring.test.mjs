@@ -47,6 +47,11 @@ for (const [name, lb, filter] of FILTERS) {
   });
 }
 
+test('requestCount: a regional load balancer with no region throws, nothing read: a filter without it would read 0 and nap a busy workload', async () => {
+  const google = { request: async () => assert.fail('nothing to read') };
+  await assert.rejects(createMonitoring({ google, project: 'p' }).requestCount({ backendService: 'app', lb: { kind: 'regional' }, from: 0, to: 1000 }), /regional load balancer with no region/);
+});
+
 test('CALLS', () => {
   assert.deepEqual(CALLS, { requestCount: ['monitoring.timeSeries.list'] });
 });

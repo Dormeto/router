@@ -6,7 +6,7 @@ import { fakeClock, fakeStore } from '../../lambda/test/fakes.mjs';
 import { createController, PauseRefused } from '../src/controller-core.mjs';
 import { fromFields, toFields } from '../src/firestore.mjs';
 import { GoogleError, OPERATION_NOT_DONE } from '../src/google.mjs';
-import { createUrlMaps, withErrorPolicy } from '../src/urlmaps.mjs';
+import { createUrlMaps, withErrorPolicy, withSwap } from '../src/urlmaps.mjs';
 import { setup as worldOf } from './world.mjs';
 
 const V1 = 'https://compute.googleapis.com/compute/v1/projects/p';
@@ -62,6 +62,12 @@ function setup({
     tasks: [],
     sleeps: [],
     logs: [],
+    // Where the health was read from, the URLs the maps were written at, the other maps a scope's list shows (by its URL) and
+    // a NEG's VMs (by its name).
+    healthScopes: new Set(),
+    mapWrites: new Set(),
+    mapLists: {},
+    negs: {},
   };
   const config = {
     workloadId: 'demo', urlMap: 'lb', backendService: 'app', wakerBackendService: WAKER, backends: [VM_A], idleMinutes: 15, wakeTimeoutSeconds: 600, failedRetrySeconds: 60, pollSeconds: 3, ...cfg,
@@ -79,6 +85,12 @@ function setup({
     if ((await world.on[line]?.()) !== 'under way') apply();
   };
   const STATUS = { stop: 'TERMINATED', start: 'RUNNING', suspend: 'SUSPENDED', resume: 'RUNNING' };
+  const health = () => {
+    world.healthReads += 1;
+    const running = Object.values(world.vms).some((vm) => vm.status === 'RUNNING')
+      || Object.values(world.groups).flat().some((m) => m.instanceStatus === 'RUNNING');
+    return { healthStatus: [{ healthState: running && world.healthReads > world.unhealthyPolls ? 'HEALTHY' : 'UNHEALTHY' }] };
+  };
   const compute = {
     getInstance: async (zone, name) => structuredClone(world.vms[name]),
     getMachineType: async (zone, name) => {
@@ -99,13 +111,23 @@ function setup({
       return { name, autoscalingPolicy: { mode: world.autoscalers[name] } };
     },
     setAutoscalerMode: ({ name }, mode) => change(`autoscaler ${name} ${mode}`, () => { world.autoscalers[name] = mode; }),
-    getBackendService: async () => ({ backends: [{ group: 'ig-url' }] }),
-    getBackendServiceHealth: async () => {
-      world.healthReads += 1;
-      const running = Object.values(world.vms).some((vm) => vm.status === 'RUNNING')
-        || Object.values(world.groups).flat().some((m) => m.instanceStatus === 'RUNNING');
-      return { healthStatus: [{ healthState: running && world.healthReads > world.unhealthyPolls ? 'HEALTHY' : 'UNHEALTHY' }] };
+    getBackendService: async () => {
+      world.healthScopes.add('global');
+      return { backends: [{ group: 'ig-url' }] };
     },
+    getBackendServiceHealth: async () => {
+      world.healthScopes.add('global');
+      return health();
+    },
+    getRegionBackendService: async (region) => {
+      world.healthScopes.add(region);
+      return { backends: [{ group: 'ig-url' }] };
+    },
+    getRegionBackendServiceHealth: async (region) => {
+      world.healthScopes.add(region);
+      return health();
+    },
+    listNetworkEndpoints: async (zone, name) => world.negs[name].map((vm) => ({ networkEndpoint: { instance: vm } })),
   };
   for (const [action, status] of Object.entries(STATUS)) {
     compute[`${action}Instance`] = (zone, name) => change(`${action} ${name}`, () => { world.vms[name].status = status; });
@@ -115,6 +137,7 @@ function setup({
   }
   const google = {
     request: async (method, url, body) => {
+      if (method === 'GET' && url.endsWith('/urlMaps')) return { items: structuredClone(world.mapLists[url] ?? []) };
       if (method === 'GET') return structuredClone(world.map);
       if (world.conflicts > 0) {
         world.conflicts -= 1;
@@ -123,7 +146,8 @@ function setup({
       await world.on.put?.();
       world.puts += 1;
       world.map = structuredClone(body);
-      world.calls.push(`map ${hasPolicy(body) ? 'policy' : 'no policy'}`);
+      world.mapWrites.add(url);
+      world.calls.push(world.mapLine?.(body) ?? `map ${hasPolicy(body) ? 'policy' : 'no policy'}`);
       return { status: 'DONE' };
     },
     waitCompute: async () => {},
@@ -138,6 +162,7 @@ function setup({
     store,
     compute,
     urlmaps: createUrlMaps({ google, project: 'p', now: clock.now, sleep }),
+    regionalUrlmaps: createUrlMaps({ google, project: 'p', region: 'europe-west1', scope: 'regional', now: clock.now, sleep }),
     monitoring: {
       requestCount: async (query) => {
         world.metricReads.push(query);
@@ -151,7 +176,7 @@ function setup({
         world.onTask?.(task);
       },
     },
-    config: { project: 'p', controllerUrl: CONTROLLER },
+    config: { project: 'p', region: 'europe-west1', controllerUrl: CONTROLLER },
     lists,
     download,
     now: clock.now,
@@ -341,26 +366,425 @@ test('a wake timeout beyond the request\'s limit fails the wake before the limit
   assert.ok(t.clock.now() - START < REQUEST_LIMIT - 30_000, `${t.clock.now() - START} ms`);
 });
 
-// --- A regional or classic workload, until the swap is in the controller (the plan's R9, which removes these) ------------
+// --- A regional or classic workload: the swap (the coverage design's section 7) ------------------------------------------
 
-for (const lb of [{ kind: 'regional', region: 'europe-west1' }, { kind: 'classic' }]) {
-  test(`a ${lb.kind} workload's nap is refused: nothing written, nothing stopped, still AWAKE`, async () => {
-    const t = setup({ cfg: { lb }, vms: { 'vm-a': { status: 'RUNNING' } } });
+const SWAPS = [
+  ['regional', { kind: 'regional', region: 'europe-west1' }, `${V1}/regions/europe-west1`, 100, 'europe-west1'],
+  ['classic', { kind: 'classic' }, `${V1}/global`, 250, 'global'],
+];
+
+for (const [kind, lb, base, waitSeconds, healthScope] of SWAPS) {
+  const service = (name) => `${base}/backendServices/${name}`;
+  const WAIT = `wait ${waitSeconds} s`;
+  const WAIT_MS = waitSeconds * 1000;
+  const awakeMap = () => ({
+    name: 'lb',
+    fingerprint: 'f1',
+    defaultService: service('other'),
+    hostRules: [{ hosts: ['demo.example.com'], pathMatcher: 'm' }],
+    pathMatchers: [{
+      name: 'm',
+      defaultService: service('app'),
+      pathRules: [{ paths: ['/_dormeto/*'], service: service(WAKER) }, { paths: ['/_dormeto/backend/*'], service: service('app') }],
+    }],
+  });
+  const swappedMap = () => withSwap(awakeMap(), 'app', service(WAKER)).map;
+  const isSwapped = (map) => map.pathMatchers[0].defaultService === service(WAKER);
+  // `calls` also says the state changes, between what changes the map and the VMs.
+  const swapSetup = ({ cfg = {}, vms = { 'vm-a': { status: 'RUNNING' } }, map = awakeMap(), ...rest } = {}) => {
+    const t = setup({ cfg: { lb, hibernate: false, ...cfg }, vms, map, ...rest });
+    t.world.mapLine = (body) => `map ${isSwapped(body) ? 'swapped' : 'unswapped'}`;
+    const { transition } = t.store;
+    t.store.transition = async (id, change) => {
+      const next = await transition(id, change);
+      if (next && change.set?.state) t.world.calls.push(`state ${change.set.state}`);
+      return next;
+    };
+    return t;
+  };
+
+  // --- Its nap ---
+
+  test(`${kind} nap: the swap, SWAP_WAIT, the VMs, in that order, at the map's scope`, async () => {
+    const t = swapSetup();
     const out = await t.controller.nap('demo');
-    assert.equal(out.state, 'SKIPPED');
-    assert.match(out.reason, new RegExp(`does not switch a ${lb.kind} load balancer yet`));
-    assert.deepEqual(t.world.calls, []);
-    assert.equal(t.run().state, STATES.AWAKE);
-    assert.equal(t.logged('NapSkipped').length, 1);
+    assert.equal(out.state, STATES.ASLEEP);
+    assert.deepEqual(t.world.calls, [`state ${STATES.NAPPING}`, 'map swapped', WAIT, 'stop vm-a', `state ${STATES.ASLEEP}`]);
+    assert.deepEqual(t.world.sleeps.filter((ms) => ms >= MINUTE), [WAIT_MS]);
+    assert.deepEqual(t.world.map, { ...swappedMap(), fingerprint: 'f1' });
+    assert.deepEqual([...t.world.mapWrites], [`${base}/urlMaps/lb`]);
+    assert.deepEqual(t.run().stopped, ['vm-a']);
   });
 
-  test(`a ${lb.kind} workload's check reads its idle signal by kind, and writes nothing in a map`, async () => {
-    const t = setup({ cfg: { lb }, vms: { 'vm-a': { status: 'RUNNING' } }, run: { state: STATES.AWAKE, awakeSince: 1 } });
+  test(`${kind} nap: written again after the wait, a lost swap with a fresh wait before the VMs go`, async () => {
+    const t = swapSetup();
+    let lost = false;
+    t.clock.onSleep(() => {
+      if (!lost) t.world.map = awakeMap();
+      lost = true;
+    });
+    assert.equal((await t.controller.nap('demo')).state, STATES.ASLEEP);
+    assert.deepEqual(t.world.calls, [`state ${STATES.NAPPING}`, 'map swapped', WAIT, 'map swapped', WAIT, 'stop vm-a', `state ${STATES.ASLEEP}`]);
+    assert.equal(t.logged('SwapLost').length, 1);
+    assert.equal(t.logged('PolicyLost').length, 0);
+  });
+
+  test(`${kind} nap: a map of another scope naming the service is no refusal; one of its own scope is`, async () => {
+    const own = `${base}/urlMaps`;
+    const elsewhere = kind === 'regional' ? `${V1}/global/urlMaps` : `${V1}/regions/europe-west1/urlMaps`;
+    const second = { name: 'second', defaultService: service('app') };
+    const free = swapSetup();
+    free.world.mapLists[elsewhere] = [second];
+    assert.equal((await free.controller.nap('demo')).state, STATES.ASLEEP);
+    const named = swapSetup();
+    named.world.mapLists[own] = [second];
+    const out = await named.controller.nap('demo');
+    assert.equal(out.aborted, true);
+    assert.match(out.error, /also named in URL map second/);
+    assert.equal(named.world.vms['vm-a'].status, 'RUNNING');
+  });
+
+  // --- An aborted nap: review focus 2. Visitors are at the waker until the application's back has spread. ---
+
+  const ABORTED = [`state ${STATES.NAPPING}`, 'map swapped', WAIT, 'map unswapped', WAIT, `state ${STATES.AWAKE}`];
+
+  const assertBackAwake = (t, out) => {
+    assert.equal(out.state, STATES.AWAKE);
+    assert.equal(out.aborted, true);
+    assert.deepEqual(t.world.calls, ABORTED);
+    assert.equal(t.run().state, STATES.AWAKE);
+    assert.equal(t.run().awakeSince, t.clock.now());
+    assert.equal(t.run().pendingWake, undefined);
+    assert.equal(t.run().stopping, undefined);
+    assert.equal(t.world.vms['vm-a'].status, 'RUNNING');
+    assert.deepEqual(t.world.map, { ...awakeMap(), fingerprint: 'f1' });
+    assert.equal(t.logged('NapAborted').length, 1);
+  };
+
+  test(`${kind} nap aborted by a wake asked during its wait: unswapped, waited, only then AWAKE`, async () => {
+    const t = swapSetup();
+    t.clock.onSleep(() => t.store.setPendingWake('demo'));
+    assertBackAwake(t, await t.controller.nap('demo'));
+    assert.equal(t.logged('StateChanged').find((l) => l.to === STATES.AWAKE).cause, 'pending-wake');
+  });
+
+  test(`${kind} nap aborted, and a wake asked during the unswap's wait: part of it, the workload AWAKE`, async () => {
+    const t = swapSetup();
+    let waits = 0;
+    t.clock.onSleep(async () => {
+      waits += 1;
+      if (waits === 1) await t.controller.pause('demo', { by: 'me', reason: 'why', keepAsleep: true });
+      else assert.equal(await t.store.setPendingWake('demo'), true);
+    });
+    assertBackAwake(t, await t.controller.nap('demo'));
+    assert.equal(waits, 2);
+  });
+
+  test(`${kind} nap aborted by a pause at the commit point: unswapped, waited, only then AWAKE`, async () => {
+    const t = swapSetup();
+    let paused = false;
+    t.clock.onSleep(async () => {
+      if (!paused) await t.controller.pause('demo', { by: 'me', reason: 'why', keepAsleep: true });
+      paused = true;
+    });
+    assertBackAwake(t, await t.controller.nap('demo'));
+    assert.equal(t.logged('StateChanged').find((l) => l.to === STATES.AWAKE).cause, 'paused');
+  });
+
+  test(`${kind} nap aborted by a map refused at the second write: unswapped, waited, only then AWAKE`, async () => {
+    const t = swapSetup();
+    t.clock.onSleep(() => {
+      if (isSwapped(t.world.map)) t.world.map.tests = [{ host: 'demo.example.com', path: '/', service: service('app') }];
+    });
+    const out = await t.controller.nap('demo');
+    assert.match(out.error, /has tests naming backend service app/);
+    assert.equal(t.logged('StateChanged').find((l) => l.to === STATES.AWAKE).cause, 'switch-failed');
+    assert.deepEqual(t.world.calls, ABORTED);
+    assert.equal(t.run().state, STATES.AWAKE);
+    assert.equal(t.world.vms['vm-a'].status, 'RUNNING');
+  });
+
+  test(`${kind} nap refused at its first write: nothing to unswap, the same wait all the same, then AWAKE`, async () => {
+    const t = swapSetup({ map: { ...awakeMap(), tests: [{ host: 'demo.example.com', path: '/', service: service('app') }] } });
+    const out = await t.controller.nap('demo');
+    assert.equal(out.aborted, true);
+    assert.deepEqual(t.world.calls, [`state ${STATES.NAPPING}`, WAIT, `state ${STATES.AWAKE}`]);
+    assert.equal(t.world.puts, 0);
+  });
+
+  test(`${kind} nap whose swap is lost with no room left: unswapped, waited, AWAKE (swap-lost), within the request`, async () => {
+    const t = swapSetup();
+    t.clock.onSleep(() => {
+      if (t.run().state === STATES.NAPPING && t.world.calls.at(-1)?.startsWith('wait') && isSwapped(t.world.map)) t.world.map = awakeMap();
+    });
+    let slowed = false;
+    t.world.on.put = async () => {
+      if (!slowed) t.clock.advance(1_100_000);
+      slowed = true;
+    };
+    const out = await t.controller.nap('demo');
+    assert.deepEqual(out, { state: STATES.AWAKE, aborted: true });
+    assert.deepEqual(t.world.calls.slice(-3), ['map unswapped', WAIT, `state ${STATES.AWAKE}`]);
+    assert.equal(t.logged('StateChanged').find((l) => l.to === STATES.AWAKE).cause, 'swap-lost');
+    assert.equal(t.world.vms['vm-a'].status, 'RUNNING');
+    assert.ok(t.clock.now() - START < REQUEST_LIMIT - 30_000, `${t.clock.now() - START} ms`);
+  });
+
+  test(`${kind} nap aborted by a NEG changed since the onboarding: unswapped, waited, only then AWAKE`, async () => {
+    const t = swapSetup({ cfg: { backends: [{ ...VM_A, neg: { zone: ZONE, name: 'neg' } }] } });
+    t.world.negs.neg = ['vm-a', 'late'];
+    const out = await t.controller.nap('demo');
+    assert.match(out.error, /VMs added: late/);
+    assert.equal(t.logged('StateChanged').find((l) => l.to === STATES.AWAKE).cause, 'backends-changed');
+    assertBackAwake(t, out);
+  });
+
+  test(`${kind} nap whose abort cannot unswap: FAILED, nothing stopped, the map left as it is`, async () => {
+    const t = swapSetup();
+    t.clock.onSleep(() => t.store.setPendingWake('demo'));
+    t.world.on.put = async () => { if (t.world.puts === 1) throw new GoogleError('Google: PUT: 500 oops', { code: 500 }); };
+    const out = await t.controller.nap('demo');
+    assert.equal(out.state, STATES.FAILED);
+    assert.deepEqual(t.world.calls, [`state ${STATES.NAPPING}`, 'map swapped', WAIT, `state ${STATES.FAILED}`]);
+    assert.equal(isSwapped(t.world.map), true);
+    assert.equal(t.world.vms['vm-a'].status, 'RUNNING');
+    assert.equal(t.logged('NapFailed').length, 1);
+  });
+
+  // --- Its wake ---
+
+  test(`${kind} wake: started, healthy, unswapped, SWAP_WAIT, AWAKE with it in its duration; the map as before the nap`, async () => {
+    const t = swapSetup({ run: waking(START - 5000), vms: { 'vm-a': { status: 'TERMINATED' } }, map: swappedMap(), unhealthyPolls: 2 });
+    let readsAtUnswap;
+    t.world.on.put = async () => { readsAtUnswap = t.world.healthReads; };
+    const out = await t.controller.wake('demo', 'w1');
+    assert.equal(out.state, STATES.AWAKE);
+    assert.deepEqual(t.world.calls, ['start vm-a', 'map unswapped', WAIT, `state ${STATES.AWAKE}`]);
+    assert.deepEqual(t.world.sleeps, [2000, 2000, WAIT_MS]);
+    assert.equal(readsAtUnswap, 3);
+    assert.equal(out.durationMs, 9000 + WAIT_MS);
+    assert.deepEqual(t.run().lastWake, { durationMs: 9000 + WAIT_MS });
+    assert.equal(t.run().awakeSince, t.clock.now());
+    assert.deepEqual(t.world.map, { ...awakeMap(), fingerprint: 'f1' });
+    assert.deepEqual([...t.world.mapWrites], [`${base}/urlMaps/lb`]);
+    assert.deepEqual([...t.world.healthScopes], [healthScope]);
+    assert.equal(t.logged('WakeCompleted').length, 1);
+  });
+
+  test(`${kind} wake: an unswap that fails is a failed wake, the map left as it is; the next check finishes the job`, async () => {
+    const t = swapSetup({ run: waking(START), map: swappedMap() });
+    t.world.on.put = async () => { throw new GoogleError('Google: PUT: 500 oops', { code: 500 }); };
+    const out = await t.controller.wake('demo', 'w1');
+    assert.equal(out.state, STATES.FAILED);
+    assert.equal(t.run().state, STATES.FAILED);
+    assert.equal(JSON.parse(t.run().failure).step, 'wake');
+    assert.equal(isSwapped(t.world.map), true);
+    assert.deepEqual(t.world.sleeps, []);
+    assert.equal(t.logged('WakeFailed').length, 1);
+    delete t.world.on.put;
     await t.controller.check();
+    assert.equal(t.run().state, STATES.WAKING);
+    await t.controller.wake('demo', 'wake-2');
+    assert.equal(t.run().state, STATES.AWAKE);
+    assert.equal(isSwapped(t.world.map), false);
+    assert.equal(t.run().failure, undefined);
+  });
+
+  test(`${kind} wake: a map that keeps changing is a failed wake, throttled`, async () => {
+    const t = swapSetup({ run: waking(START), map: swappedMap() });
+    t.world.conflicts = 100;
+    await t.controller.wake('demo', 'w1');
+    assert.equal(JSON.parse(t.run().failure).kind, 'throttled');
+  });
+
+  test(`${kind} wake: superseded while it waited for health, it does not unswap`, async () => {
+    const t = swapSetup({ run: waking(START), vms: { 'vm-a': { status: 'TERMINATED' } }, map: swappedMap(), unhealthyPolls: 2 });
+    t.clock.onSleep(() => { t.run().wakeId = 'other'; });
+    assert.deepEqual(await t.controller.wake('demo', 'w1'), { state: 'SUPERSEDED' });
+    assert.equal(t.world.puts, 0);
+    assert.equal(t.logged('WakeSuperseded').length, 1);
+  });
+
+  test(`${kind} wake: superseded during its wait, it does not write AWAKE`, async () => {
+    const t = swapSetup({ run: waking(START), map: swappedMap() });
+    t.clock.onSleep(() => { t.run().wakeId = 'other'; });
+    assert.deepEqual(await t.controller.wake('demo', 'w1'), { state: 'SUPERSEDED' });
+    assert.equal(t.run().state, STATES.WAKING);
+  });
+
+  test(`${kind} wake: healthy past the deadline, nothing unswapped: FAILED with the kind timeout`, async () => {
+    const t = swapSetup({ run: waking(START - 600_000), map: swappedMap() });
+    await t.controller.wake('demo', 'w1');
+    assert.equal(t.run().state, STATES.FAILED);
+    assert.equal(JSON.parse(t.run().failure).kind, 'timeout');
+    assert.equal(t.world.puts, 0);
+    assert.equal(isSwapped(t.world.map), true);
+  });
+
+  test(`${kind} wake: SWAP_WAIT counts in wakeTimeoutSeconds; past it after the wait, not cut short, FAILED; the next check finishes the job`, async () => {
+    const t = swapSetup({ run: waking(START - 600_000 + WAIT_MS - 1000), map: swappedMap() });
+    await t.controller.wake('demo', 'w1');
+    assert.equal(t.clock.now(), START + WAIT_MS);
+    assert.equal(t.run().state, STATES.FAILED);
+    assert.equal(JSON.parse(t.run().failure).kind, 'timeout');
+    assert.equal(isSwapped(t.world.map), false);
+    await t.controller.check();
+    assert.equal(t.run().state, STATES.WAKING);
+    await t.controller.wake('demo', 'wake-2');
+    assert.equal(t.run().state, STATES.AWAKE);
+  });
+
+  test(`${kind} wake: done just within wakeTimeoutSeconds, SWAP_WAIT in it`, async () => {
+    const t = swapSetup({ run: waking(START - 600_000 + WAIT_MS + 1), map: swappedMap() });
+    assert.equal((await t.controller.wake('demo', 'w1')).state, STATES.AWAKE);
+  });
+
+  test(`${kind} wake: the longest timeout still fits the request, with SWAP_WAIT in it`, async () => {
+    const polls = (ms) => ms / 2000;
+    const slow = swapSetup({ run: waking(START), cfg: { wakeTimeoutSeconds: 1700 }, vms: { 'vm-a': { status: 'TERMINATED' } }, map: swappedMap(), unhealthyPolls: polls(1_400_000) });
+    assert.equal((await slow.controller.wake('demo', 'w1')).state, STATES.AWAKE);
+    assert.ok(slow.clock.now() - START < REQUEST_LIMIT - 30_000, `${slow.clock.now() - START} ms`);
+    const late = swapSetup({ run: waking(START), cfg: { wakeTimeoutSeconds: 1700 }, vms: { 'vm-a': { status: 'TERMINATED' } }, map: swappedMap(), unhealthyPolls: polls(1_690_000) });
+    assert.equal((await late.controller.wake('demo', 'w1')).state, STATES.FAILED);
+    assert.equal(late.world.puts, 0);
+    assert.equal(JSON.parse(late.run().failure).kind, 'timeout');
+  });
+
+  test(`${kind} wake: in its wait past the timeout, it is not called stuck; past the wait too, it is`, async () => {
+    const age = 600_000 + 60_000 + WAIT_MS;
+    const within = swapSetup({ run: waking(START - age), map: swappedMap() });
+    assert.deepEqual(await within.controller.check(), [{ workloadId: 'demo', state: STATES.WAKING }]);
+    const stuck = swapSetup({ run: waking(START - age - 1), map: swappedMap() });
+    assert.equal((await stuck.controller.check())[0].state, STATES.FAILED);
+    assert.equal(stuck.logged('WakeStuck').length, 1);
+  });
+
+  // --- The release ---
+
+  test(`${kind} release: the swap written, SWAP_WAIT, the VMs, ASLEEP; a swap already there is not waited for`, async () => {
+    const failed = { state: STATES.FAILED, failedAt: 1, failure: JSON.stringify({ kind: 'unhealthy' }) };
+    const fresh = swapSetup({ run: failed });
+    assert.equal((await fresh.controller.release('demo')).state, STATES.ASLEEP);
+    assert.deepEqual(fresh.world.calls, ['map swapped', WAIT, 'stop vm-a', `state ${STATES.ASLEEP}`]);
+    const there = swapSetup({ run: failed, map: swappedMap() });
+    assert.equal((await there.controller.release('demo')).state, STATES.ASLEEP);
+    assert.deepEqual(there.world.calls, ['stop vm-a', `state ${STATES.ASLEEP}`]);
+  });
+
+  // --- The check ---
+
+  test(`${kind} check: the idle signal read by kind, an idle workload's nap asked; the map as it should be, nothing written`, async () => {
+    const t = swapSetup({ run: { state: STATES.AWAKE, awakeSince: 1 } });
+    assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.AWAKE, nap: 'requested' }]);
     assert.deepEqual(t.world.metricReads.map((read) => read.lb), [lb]);
+    assert.deepEqual(t.world.calls, []);
+    assert.equal(t.logged('RouteDrift').length, 0);
+  });
+
+  test(`${kind} repair, awake and swapped: unswapped, RouteDrift, no wait`, async () => {
+    const t = swapSetup({ run: { state: STATES.AWAKE, awakeSince: START }, map: swappedMap() });
+    await t.controller.check();
+    assert.deepEqual(t.world.calls, ['map unswapped']);
+    assert.deepEqual(t.world.sleeps, []);
+    assert.deepEqual(t.world.map, { ...awakeMap(), fingerprint: 'f1' });
+    assert.equal(t.logged('RouteDrift').length, 1);
+    assert.equal(t.logged('RouteDrift')[0].state, STATES.AWAKE);
+    assert.equal(t.run().state, STATES.AWAKE);
+  });
+
+  test(`${kind} repair, asleep and unswapped: swapped, RouteDrift, no wait`, async () => {
+    const t = swapSetup({ run: { state: STATES.ASLEEP }, vms: { 'vm-a': { status: 'TERMINATED' } } });
+    await t.controller.check();
+    assert.deepEqual(t.world.calls, ['map swapped']);
+    assert.deepEqual(t.world.sleeps, []);
+    assert.equal(t.logged('RouteDrift')[0].state, STATES.ASLEEP);
+  });
+
+  test(`${kind} repair, failed and not healthy: swapped, as asleep`, async () => {
+    const t = swapSetup({ run: { state: STATES.FAILED, failedAt: START }, unhealthyPolls: Infinity });
+    await t.controller.check();
+    assert.deepEqual(t.world.calls, ['map swapped']);
+    assert.equal(t.run().state, STATES.FAILED);
+  });
+
+  test(`${kind} repair: the two routes lost come back in the same update, awake or swapped`, async () => {
+    const bare = awakeMap();
+    delete bare.pathMatchers[0].pathRules;
+    const awake = swapSetup({ run: { state: STATES.AWAKE, awakeSince: START }, map: bare });
+    await awake.controller.check();
+    assert.equal(awake.world.puts, 1);
+    const byPath = (map) => map.pathMatchers[0].pathRules.toSorted((a, b) => a.paths[0].localeCompare(b.paths[0]));
+    assert.deepEqual(byPath(awake.world.map), byPath(awakeMap()));
+    assert.deepEqual(awake.logged('RouteDrift')[0].paths.length, 2);
+
+    const swapped = swappedMap();
+    delete swapped.pathMatchers[0].pathRules;
+    const asleep = swapSetup({ run: { state: STATES.ASLEEP }, vms: { 'vm-a': { status: 'TERMINATED' } }, map: swapped });
+    await asleep.controller.check();
+    assert.equal(asleep.world.puts, 1);
+    assert.deepEqual(byPath(asleep.world.map), byPath(awakeMap()));
+    assert.equal(isSwapped(asleep.world.map), true);
+  });
+
+  test(`${kind} repair: as the state wants it, nothing written`, async () => {
+    const asleep = swapSetup({ run: { state: STATES.ASLEEP }, vms: { 'vm-a': { status: 'TERMINATED' } }, map: swappedMap() });
+    await asleep.controller.check();
+    assert.equal(asleep.world.puts, 0);
+    assert.equal(asleep.logged('RouteDrift').length, 0);
+  });
+
+  test(`${kind} external stop: the swap with no wait, ASLEEP (external-stop)`, async () => {
+    const t = swapSetup({ run: { state: STATES.AWAKE, awakeSince: START }, vms: { 'vm-a': { status: 'TERMINATED' } } });
+    assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.ASLEEP }]);
+    assert.deepEqual(t.world.calls, ['map swapped', `state ${STATES.ASLEEP}`]);
+    assert.deepEqual(t.world.sleeps, []);
+    assert.equal(t.logged('ExternalStop').length, 1);
+    assert.equal(t.logged('StateChanged')[0].cause, 'external-stop');
+  });
+
+  for (const [from, cause, event] of [[STATES.ASLEEP, 'external-start', 'ExternalWake'], [STATES.FAILED, 'recovered', 'FailedRecovered']]) {
+    test(`${kind} external start, from ${from}: WAKING with a task, no wait in the check; the task unswaps, waits, AWAKE`, async () => {
+      const t = swapSetup({ run: { state: from, failedAt: START, failure: JSON.stringify({ kind: 'unhealthy' }), consecutiveFailures: 1 }, map: swappedMap() });
+      assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.WAKING }]);
+      assert.deepEqual(t.world.calls, [`state ${STATES.WAKING}`]);
+      assert.deepEqual(t.world.sleeps, []);
+      assert.equal(t.clock.now(), START);
+      assert.equal(isSwapped(t.world.map), true);
+      assert.equal(t.logged(event).length, 1);
+      assert.equal(t.logged('StateChanged')[0].cause, cause);
+      assert.deepEqual(t.world.tasks, [{ url: `${CONTROLLER}/v1/tasks`, body: { action: 'wake', workloadId: 'demo', wakeId: 'wake-2' } }]);
+
+      t.world.calls.length = 0;
+      assert.equal((await t.controller.wake('demo', 'wake-2')).state, STATES.AWAKE);
+      assert.deepEqual(t.world.calls, ['map unswapped', WAIT, `state ${STATES.AWAKE}`]);
+      assert.equal(t.run().failure, undefined);
+      assert.equal(t.run().consecutiveFailures, undefined);
+    });
+  }
+
+  test(`${kind} external start with its task refused: FAILED (invoke-failed), the next check asks again`, async () => {
+    const t = swapSetup({ run: { state: STATES.ASLEEP }, map: swappedMap() });
+    t.world.taskRefused = new GoogleError('Google: POST: 503 tasks', { code: 503 });
+    assert.equal((await t.controller.check())[0].state, STATES.FAILED);
+    assert.deepEqual(t.world.sleeps, []);
+    assert.equal(t.logged('WakeInvokeFailed').length, 1);
+    delete t.world.taskRefused;
+    assert.equal((await t.controller.check())[0].state, STATES.WAKING);
+  });
+
+  test(`${kind} external start, a VM running but not healthy yet: still asleep, its swap kept`, async () => {
+    const t = swapSetup({ run: { state: STATES.ASLEEP }, map: swappedMap(), unhealthyPolls: Infinity });
+    assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.ASLEEP }]);
     assert.deepEqual(t.world.calls, []);
   });
 }
+
+test('lb: { kind: \'global\' } is the policy, as no lb is', async () => {
+  const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } }, cfg: { hibernate: false, lb: { kind: 'global' } } });
+  assert.equal((await t.controller.nap('demo')).state, STATES.ASLEEP);
+  assert.deepEqual(t.world.calls, ['map policy', 'wait 300 s', 'stop vm-a']);
+  assert.deepEqual([...t.world.mapWrites], [`${V1}/global/urlMaps/lb`]);
+});
 
 // --- The nap -------------------------------------------------------------------------------------------------------
 

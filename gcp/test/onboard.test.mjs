@@ -641,8 +641,8 @@ for (const [kind, world, mapOf, wakerUrl, appUrl, lb, timeout] of ONBOARDED) {
     assert.equal((await byDefault.onboarding.onboard(INPUT)).settings.wakeTimeoutSeconds, timeout);
     assert.equal(byDefault.store.configs.get('demo').wakeTimeoutSeconds, timeout);
     const given = setup(world);
-    await given.onboarding.onboard({ ...INPUT, settings: { wakeTimeoutSeconds: 300 } });
-    assert.equal(given.store.configs.get('demo').wakeTimeoutSeconds, 300);
+    await given.onboarding.onboard({ ...INPUT, settings: { wakeTimeoutSeconds: 400 } });
+    assert.equal(given.store.configs.get('demo').wakeTimeoutSeconds, 400);
   });
 
   test(`offboard ${kind}: the route and the hold route in one update, then the waker`, async () => {
@@ -742,29 +742,82 @@ test('wakeTimeoutSeconds: 600 by default on a global load balancer; 60 and 1700 
   }
 });
 
-// Until the swap is in the controller (the plan's R9, which removes these two).
-for (const [kind, world] of [['regional', regional], ['classic', classic]]) {
-  test(`nap now of a ${kind} workload: refused at once, as its task would be`, async () => {
+// The map's change is included in the wake: an explicit timeout must leave room for it (the ruling of R9).
+for (const [kind, world, lowest] of [['regional', regional, 160], ['classic', classic, 310]]) {
+  test(`${kind}: a wakeTimeoutSeconds not above SWAP_WAIT plus 60 s is refused, with the words, at the dry run and the onboarding`, async () => {
+    const { w, store, onboarding } = setup(world);
+    const input = { ...INPUT, settings: { wakeTimeoutSeconds: lowest } };
+    const words = new RegExp(`settings: wakeTimeoutSeconds ${lowest} is too short for a ${kind} load balancer: its wake includes the URL map's change, ${lowest - 60} s: use more than ${lowest}`);
+    const { eligible, reasons } = await onboarding.dryRun(input);
+    assert.equal(eligible, false);
+    assert.match(reasons.join(), words);
+    await assert.rejects(onboarding.onboard(input), refused(400, 'not-eligible', words));
+    assert.deepEqual(w.changes, []);
+    assert.equal(store.configs.has('demo'), false);
+  });
+
+  test(`${kind}: a wakeTimeoutSeconds just above SWAP_WAIT plus 60 s is taken`, async () => {
+    const { store, onboarding } = setup(world);
+    await onboarding.onboard({ ...INPUT, settings: { wakeTimeoutSeconds: lowest + 1 } });
+    assert.equal(store.configs.get('demo').wakeTimeoutSeconds, lowest + 1);
+  });
+
+  test(`nap now of a ${kind} workload: its task asked, as a global one's`, async () => {
     const { w, onboarding } = setup(world);
     await onboarding.onboard(INPUT);
     w.changes.length = 0;
-    await assert.rejects(onboarding.nap('demo'), refused(409, 'swap-not-ready', new RegExp(`workload demo cannot nap yet: the controller does not switch a ${kind} load balancer yet`)));
-    assert.deepEqual(w.tasks, []);
+    await onboarding.nap('demo');
+    assert.deepEqual(w.tasks, [{ url: `${CONTROLLER}/v1/tasks`, body: { action: 'nap', workloadId: 'demo' } }]);
     assert.deepEqual(w.changes, []);
   });
 
-  test(`the nap task of a ${kind} workload stops nothing and writes nothing, and the check leaves its map alone`, async () => {
+  test(`a ${kind} workload onboarded, napped and woken: the VM down in between, its map at the end as onboarded`, async () => {
+    const { w, store, core, onboarding } = setup(world);
+    const mapOf = () => (kind === 'regional' ? w.regions[REGION].urlMaps.lb : w.urlMaps.lb);
+    await onboarding.onboard({ ...INPUT, settings: { hibernate: false } });
+    const onboarded = structuredClone(mapOf());
+    w.changes.length = 0;
+    assert.equal((await core.nap('demo')).state, STATES.ASLEEP);
+    assert.equal(w.vms['vm-a'].status, 'TERMINATED');
+    assert.equal(mapOf().pathMatchers[0].defaultService.endsWith(`/${WAKER}`), true);
+    assert.deepEqual(w.changes, ['map lb', 'stop vm-a']);
+    w.changes.length = 0;
+    const wakeId = await core.beginWake('demo', STATES.ASLEEP, 'operator');
+    assert.equal((await core.wake('demo', wakeId)).state, STATES.AWAKE);
+    assert.deepEqual(w.changes, ['start vm-a', 'map lb']);
+    assert.deepEqual(mapOf(), onboarded);
+    assert.equal(store.runs.get('demo').state, STATES.AWAKE);
+  });
+
+  test(`a ${kind} workload stopped by hand: the check writes the swap, and the next one nothing`, async () => {
     const { w, store, core, onboarding } = setup(world);
     await onboarding.onboard(INPUT);
     w.changes.length = 0;
-    assert.equal((await core.nap('demo')).state, 'SKIPPED');
-    assert.equal(store.runs.get('demo').state, STATES.AWAKE);
     w.vms['vm-a'].status = 'TERMINATED';
     await core.check();
-    assert.equal(store.runs.get('demo').state, STATES.AWAKE);
-    assert.deepEqual(w.changes, []);
+    assert.equal(store.runs.get('demo').state, STATES.ASLEEP);
+    assert.deepEqual(w.changes, ['map lb']);
+    await core.check();
+    assert.deepEqual(w.changes, ['map lb']);
+  });
+
+  test(`an asleep ${kind} workload offboarded: its wake unswaps, the offboarding removes the routes, the map as it was`, async () => {
+    const { w, store, core, onboarding } = setup(world);
+    const mapOf = () => (kind === 'regional' ? w.regions[REGION].urlMaps.lb : w.urlMaps.lb);
+    const original = structuredClone(mapOf());
+    await onboarding.onboard(INPUT);
+    await core.nap('demo');
+    await onboarding.offboard('demo');
+    assert.deepEqual(mapOf(), original);
+    assert.equal(store.configs.has('demo'), false);
   });
 }
+
+test('a global load balancer: a wakeTimeoutSeconds of 60 stays allowed', async () => {
+  const { store, onboarding } = setup();
+  await onboarding.onboard({ ...INPUT, settings: { wakeTimeoutSeconds: 60 } });
+  assert.equal(store.configs.get('demo').wakeTimeoutSeconds, 60);
+});
 
 // --- The offboarding ----------------------------------------------------------------------------------------------------
 

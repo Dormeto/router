@@ -3,9 +3,14 @@
 // that the page probes, after the shared request filters. It holds nothing and redirects nothing: once the VMs are
 // healthy, the load balancer sends the next request to them.
 //
-// It never answers a 503. The fetch must succeed for the load balancer to serve the page (Google: a failed fetch gets a
-// generic error), and its policy's override gives the visitor the 503. On `/_dormeto/wake`, a 503 would be replaced by the
-// page: the nap's policy applies to all the matcher's traffic, and the waker is a backend of it.
+// Behind a policy (a global load balancer) it never answers a 503. The fetch must succeed for the load balancer to serve the
+// page (Google: a failed fetch gets a generic error), and its policy's override gives the visitor the 503. On `/_dormeto/wake`,
+// a 503 would be replaced by the page: the nap's policy applies to all the matcher's traffic, and the waker is a backend of it.
+//
+// Behind a swap (a regional or classic one, which `x-dormeto-switch: swap` says, as Firestore may not be readable), it gets the
+// visitor's real request with no policy to override its code, and a 200 would tell an API client it succeeded: the page is a 503,
+// whatever the method and for any path but `/_dormeto/*`. It does not wake there either, as a scanner's request would.
+// `/_dormeto/wake` is as behind a policy; `/_dormeto/backend/*` goes to the application and never comes here.
 //
 // A nap window: the page and `/_dormeto/wake` say when it ends. Pauses mean nothing here: `keepAsleep` holds the scheduled and
 // maintenance wakes only, and a visitor still wakes the workload (vision docs/specs/2026-10-30-google-cloud-coverage-design.md,
@@ -21,10 +26,11 @@ import { STATES } from '../../lambda/src/lib/state.mjs';
 import { createWaker } from '../../lambda/src/lib/waker-core.mjs';
 import { createFirestoreStore } from './firestore.mjs';
 import { createGoogle } from './google.mjs';
-import { WORKLOAD_HEADER, WORKLOAD_ID } from './names.mjs';
+import { SWITCH_HEADER, WORKLOAD_HEADER, WORKLOAD_ID } from './names.mjs';
 import { createTasks } from './tasks.mjs';
 
 const WAKE_PATH = '/_dormeto/wake';
+const NAMESPACE = '/_dormeto/';
 const CLOUD = 'Google Cloud';
 const UNKNOWN_POLL_SECONDS = 10;
 // The run could not be read: nothing is claimed, the page says it wakes.
@@ -63,6 +69,9 @@ export function workloadIdOf(event) {
   const id = (header(event, WORKLOAD_HEADER) ?? '').split(',').at(-1).trim();
   return WORKLOAD_ID.test(id) ? id : undefined;
 }
+
+// As the workload's: the header's last value is the load balancer's.
+const underSwap = (event) => (header(event, SWITCH_HEADER) ?? '').split(',').at(-1).trim() === 'swap';
 
 export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], now = Date.now, log }) {
   // A request names one workload, and both the shared code and this file's words ask for its nap window: one read per
@@ -140,9 +149,10 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], n
     return event.httpMethod === 'HEAD' ? response(200, headers) : response(200, headers, JSON.stringify({ status: 'awake' }));
   }
 
-  // The error response's fetch, which may carry nothing of the visitor's request: the page whatever the path, method and
-  // headers, never a wake (every scanner's request would wake the workload).
+  // The error response's fetch, which may carry nothing of the visitor's request, or under a swap that request itself: the page
+  // whatever the path, method and headers, never a wake (every scanner's request would wake the workload).
   async function waiting(event, workloadId) {
+    const statusCode = underSwap(event) && !event.path.startsWith(NAMESPACE) ? 503 : 200;
     const read = await Promise.all([store.getConfig(workloadId), store.getRun(workloadId)]).catch((err) => {
       log.error('WaitingPageUnread', { workloadId, error: err.message });
       return null;
@@ -158,8 +168,8 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], n
       ...(napUntil ? { [NAP_UNTIL_HEADER]: napUntil.at } : {}),
       'cache-control': 'no-store', 'retry-after': String(pollSeconds), 'x-dormeto-state': state, 'content-type': 'text/html; charset=utf-8',
     };
-    if (event.httpMethod === 'HEAD') return response(200, headers);
-    return response(200, headers, renderPage({ state, pollSeconds, ...failed, napUntil, probeUrl: WAKE_PATH, cloud: CLOUD }));
+    if (event.httpMethod === 'HEAD') return response(statusCode, headers);
+    return response(statusCode, headers, renderPage({ state, pollSeconds, ...failed, napUntil, probeUrl: WAKE_PATH, cloud: CLOUD }));
   }
 
   return async function handler(request) {

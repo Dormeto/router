@@ -2,9 +2,14 @@
 // the check, with AWS's states, causes and event names (lambda/src/lib/controller-core.mjs). Each action runs within one
 // request of at most 1800 s; the check only enqueues the naps it decides (POST /v1/tasks), never waiting in its 240 s.
 //
+// The map goes through the workload's switch (switch.mjs): the policy of a global load balancer, the swap of a regional or classic
+// one. The order differs: the policy lets visitors reach the application as soon as it is healthy, so AWAKE comes first and its
+// removal follows. Under a swap they are at the waker until the application's back has spread, so a wake and a nap given up unswap
+// and wait, then AWAKE.
+//
 // A workload's configuration: `{ workloadId, urlMap, backendService, wakerBackendService (names), backends: [{ kind: 'vm'
 // | 'mig', location, name }], idleMinutes, wakeTimeoutSeconds, hibernate?, lb? }`. `lb`: `{ kind: 'regional', region }` or
-// `{ kind: 'classic' }`, absent for a global load balancer. `config`: `{ project, controllerUrl }`.
+// `{ kind: 'classic' }`, absent for a global load balancer. `config`: `{ project, region, controllerUrl }`.
 //
 // What the run adds to AWS's: `stopped`, `suspended` (the VMs a nap acted on, names), `autoscalers` (`[{ kind, location,
 // name (the autoscaler's), mode }]`, what the wake gives back), `lastWake` (`{ durationMs }`) and `scheduleApplied` (the last
@@ -20,17 +25,15 @@ import { awakeStartWithin, CLOSE_START_MS, maintenanceDue, occurrenceAt } from '
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { createListRefresher } from '../../lambda/src/lib/list-refresh.mjs';
 import { OPERATION_NOT_DONE } from './google.mjs';
-import { SWAP_WAIT_MS } from './switch.mjs';
-import { mapBusy, references, UrlMapRefused, withErrorPolicy, withoutErrorPolicy, withWakerRoute } from './urlmaps.mjs';
+import { inOneUpdate, switchOf } from './switch.mjs';
+import { mapBusy, references, UrlMapRefused } from './urlmaps.mjs';
 
-const COMPUTE = 'https://compute.googleapis.com/compute/v1';
 const POLL_MS = 2000;
-// The nap's policy reaching the load balancer (G0: 163 to 215 s), which is also the application's drain.
-const POLICY_WAIT_MS = 300_000;
 // Until the VMs are down, from the moment they are asked to go. G0: 106 s, 96 s suspended, 198 s for a managed group's.
 const STOP_TIMEOUT_MS = 300_000;
 // Within the request's 1800 s: what is left removes the policy after the wake, or records a nap's failure. The nap's fits
-// a lost policy's second wait: two writes (G0: 25 s), twice 300 s and a managed group's stop.
+// a lost policy's second wait: two writes (G0: 25 s), twice 300 s and a managed group's stop. A swap's wait comes out of the wake's
+// budget, as it comes before AWAKE.
 const WAKE_BUDGET_MS = 1_740_000;
 const NAP_BUDGET_MS = 1_770_000;
 // A fresh wait for a lost policy needs this left after it: a managed group's stop (G0: 198 s).
@@ -86,10 +89,6 @@ function failedFrom(err, options) {
   return failedSpec(kind ? Object.assign(err, { kind }) : err, options);
 }
 
-// Until the swap is in the controller (the coverage plan's R9, which removes this): what here writes a map writes a policy, on a
-// global map, so a regional or classic workload is onboarded but does not nap, and the check leaves its map alone. Why, else null.
-export const napHeldBack = ({ lb }) => (Object.hasOwn(SWAP_WAIT_MS, lb?.kind ?? '') ? `the controller does not switch a ${lb.kind} load balancer yet` : null);
-
 // What is wrong with a pause asked for.
 export class PauseRefused extends Error {
   constructor(message) {
@@ -98,7 +97,7 @@ export class PauseRefused extends Error {
   }
 }
 
-export function createController({ store, compute, urlmaps, monitoring, tasks, config, lists = [], download, now = Date.now, sleep, newId = randomUUID, log }) {
+export function createController({ store, compute, urlmaps, regionalUrlmaps, monitoring, tasks, config, lists = [], download, now = Date.now, sleep, newId = randomUUID, log }) {
   const enqueue = (body) => tasks.enqueue({ url: `${config.controllerUrl}/v1/tasks`, body });
 
   async function transition(workloadId, change) {
@@ -118,34 +117,39 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
 
   // --- The URL map ---------------------------------------------------------------------------------------------------
 
-  const wakerUrl = (cfg) => `${COMPUTE}/projects/${config.project}/global/backendServices/${cfg.wakerBackendService}`;
-  const writePolicy = (cfg) => urlmaps.modify(cfg.urlMap, (map) => withErrorPolicy(map, cfg.backendService, wakerUrl(cfg)));
+  const switchFor = (cfg) => switchOf(cfg, { urlmaps, regionalUrlmaps, project: config.project, region: config.region });
 
-  // Before VMs go: the map must be the only one naming the service. Another load balancer would keep its visitors with no
-  // policy and no way to wake (spec section 7, checked at the onboarding and true only then).
-  async function writeOnlyPolicy(cfg) {
-    const other = (await urlmaps.list()).find((map) => map.name !== cfg.urlMap && references(map, cfg.backendService).length);
+  const writeAsleep = (cfg) => {
+    const sw = switchFor(cfg);
+    return sw.urlmaps.modify(cfg.urlMap, sw.asleep);
+  };
+  const writeAwake = (cfg) => {
+    const sw = switchFor(cfg);
+    return sw.urlmaps.modify(cfg.urlMap, sw.awake);
+  };
+
+  // Before VMs go: the map must be the only one of its scope naming the service. Another load balancer would keep its visitors
+  // with no switch and no way to wake (spec section 7, checked at the onboarding and true only then).
+  async function writeOnlyAsleep(cfg) {
+    const other = (await switchFor(cfg).urlmaps.list()).find((map) => map.name !== cfg.urlMap && references(map, cfg.backendService).length);
     if (other) throw new UrlMapRefused(`backend service ${cfg.backendService} is also named in URL map ${other.name}: that load balancer would lose its backends during a nap`);
-    return writePolicy(cfg);
+    return writeAsleep(cfg);
   }
 
-  // After the state changed to AWAKE: a removal that fails is drift the check repairs.
+  // The policy's, after the state changed to AWAKE: a removal that fails is drift the check repairs.
   async function removePolicy(cfg) {
     try {
-      await urlmaps.modify(cfg.urlMap, (map) => withoutErrorPolicy(map, wakerUrl(cfg)));
+      await writeAwake(cfg);
     } catch (err) {
       log.warn('PolicyNotRemoved', { workloadId: cfg.workloadId, error: err.message });
     }
   }
 
-  // The map as the state wants it, in one read (nothing written when it is): the route for good, and the policy but awake.
+  // The map as the state wants it, in one read (nothing written when it is), with no wait: the route for good, and awake or
+  // asleep. A swap's route is the hold route too.
   async function repair(cfg, state) {
-    const waker = wakerUrl(cfg);
-    const { paths } = await urlmaps.modify(cfg.urlMap, (map) => {
-      const route = withWakerRoute(map, cfg.backendService, waker);
-      const policy = state === STATES.AWAKE ? withoutErrorPolicy(route.map, waker) : withErrorPolicy(route.map, cfg.backendService, waker);
-      return { map: policy.map, paths: [...route.paths, ...policy.paths] };
-    });
+    const sw = switchFor(cfg);
+    const { paths } = await sw.urlmaps.modify(cfg.urlMap, (map) => inOneUpdate(map, [sw.route, state === STATES.AWAKE ? sw.awake : sw.asleep]));
     if (paths.length) log.warn('RouteDrift', { workloadId: cfg.workloadId, state, paths });
   }
 
@@ -176,9 +180,13 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
 
   const setAutoscaler = ({ kind, location, name }, mode) => compute.setAutoscalerMode({ kind, location, name }, mode).catch(stillUnderWay);
 
-  async function healthyCount(cfg) {
-    const { backends = [] } = await compute.getBackendService(cfg.backendService);
-    const answers = await each(backends, ({ group }) => compute.getBackendServiceHealth(cfg.backendService, group));
+  // In the service's scope. A service a classic load balancer holds reads no status while its VM is down (M3): none healthy.
+  async function healthyCount({ backendService, lb }) {
+    const regional = lb?.kind === 'regional';
+    const { backends = [] } = await (regional ? compute.getRegionBackendService(lb.region, backendService) : compute.getBackendService(backendService));
+    const answers = await each(backends, ({ group }) => (regional
+      ? compute.getRegionBackendServiceHealth(lb.region, backendService, group)
+      : compute.getBackendServiceHealth(backendService, group)));
     return answers.flatMap((a) => a.healthStatus ?? []).filter((h) => h.healthState === 'HEALTHY').length;
   }
 
@@ -313,11 +321,13 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
     };
     let run;
     let cfg;
+    let sw;
     try {
       run = await store.getRun(workloadId);
       // A delayed or duplicated task must not touch anything once its wake is no longer the current one.
       if (run?.state !== STATES.WAKING || run.wakeId !== wakeId) return superseded();
       cfg = await getConfig(workloadId);
+      sw = switchFor(cfg);
     } catch (err) {
       return fail(err);
     }
@@ -329,6 +339,15 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
         if (now() >= deadline) throw await noHealthyError(cfg);
         await sleep(POLL_MS);
       }
+      if (sw.kind === 'swap') {
+        // The wait counts in the wake's time. It must also fit the request, and is not cut short: the map has changed.
+        if (now() >= Math.min(deadline, started + WAKE_BUDGET_MS - sw.waitMs)) throw failureError('timeout', 'a VM is healthy, but the wake timed out before the URL map could change');
+        const current = await store.getRun(workloadId);
+        if (current?.state !== STATES.WAKING || current.wakeId !== wakeId) return superseded();
+        await writeAwake(cfg);
+        await sleep(sw.waitMs);
+        if (now() >= deadline) throw failureError('timeout', 'a VM is healthy, but the wake timed out while the URL map\'s change spread');
+      }
       const durationMs = now() - since;
       const awake = await transition(workloadId, {
         cond: { state: STATES.WAKING, wakeId },
@@ -338,7 +357,7 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
       });
       if (!awake) return superseded();
       log.info('WakeCompleted', { workloadId, wakeId, durationMs });
-      await removePolicy(cfg);
+      if (sw.kind === 'policy') await removePolicy(cfg);
       return { state: STATES.AWAKE, durationMs };
     } catch (err) {
       return fail(err);
@@ -412,15 +431,17 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
   // --- The nap -------------------------------------------------------------------------------------------------------
 
   // Written, then still there after a whole wait: a check's repair or a customer's apply may have removed it meanwhile,
-  // and the VMs must not go with no way to wake. False when it was lost with no room left for another wait.
-  async function policyHeld(cfg, latest) {
-    await writeOnlyPolicy(cfg);
+  // and the VMs must not go with no way to wake. False when it was lost with no room left for another wait: for the stop, and
+  // under a swap for the wait of a nap given up after that one.
+  async function asleepHeld(cfg, sw, latest) {
+    const room = sw.waitMs + STOP_ROOM_MS + (sw.kind === 'swap' ? sw.waitMs : 0);
+    await writeOnlyAsleep(cfg);
     for (;;) {
-      await sleep(POLICY_WAIT_MS);
-      const { paths } = await writeOnlyPolicy(cfg);
+      await sleep(sw.waitMs);
+      const { paths } = await writeOnlyAsleep(cfg);
       if (!paths.length) return true;
-      log.warn('PolicyLost', { workloadId: cfg.workloadId, paths });
-      if (now() + POLICY_WAIT_MS + STOP_ROOM_MS > latest) return false;
+      log.warn(sw.kind === 'swap' ? 'SwapLost' : 'PolicyLost', { workloadId: cfg.workloadId, paths });
+      if (now() + room > latest) return false;
     }
   }
 
@@ -458,7 +479,8 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
   async function nap(workloadId, { cause = 'idle', requestedAt, until } = {}) {
     const latest = now() + NAP_BUDGET_MS;
     const cfg = await getConfig(workloadId);
-    const refusal = napHeldBack(cfg) ?? await napRefusal(workloadId, requestedAt, until);
+    const sw = switchFor(cfg);
+    const refusal = await napRefusal(workloadId, requestedAt, until);
     if (refusal) {
       log.warn('NapSkipped', { workloadId, reason: refusal });
       return { state: 'SKIPPED', reason: refusal };
@@ -466,32 +488,36 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
     const napping = await transition(workloadId, { cond: { state: STATES.AWAKE }, set: { state: STATES.NAPPING }, remove: ['pendingWake'], cause });
     if (!napping) return { state: 'SKIPPED' };
     log.info('NapStarted', { workloadId });
-    const backToAwake = (reason) => transition(workloadId, {
-      cond: { state: STATES.NAPPING }, set: { state: STATES.AWAKE, awakeSince: now() }, remove: ['pendingWake', 'stopping'], cause: reason,
-    });
+    // Nothing is stopped yet, the application keeps serving. Under a swap, visitors are at the waker until the application's back
+    // has spread: unswapped and waited for before AWAKE, a wake asked meanwhile being part of it. The policy's removal follows it.
+    const giveUp = async (cause, level, fields = {}) => {
+      if (sw.kind === 'swap') {
+        await writeAwake(cfg);
+        await sleep(sw.waitMs);
+      }
+      await transition(workloadId, {
+        cond: { state: STATES.NAPPING }, set: { state: STATES.AWAKE, awakeSince: now() }, remove: ['pendingWake', 'stopping'], cause,
+      });
+      log[level]('NapAborted', { workloadId, ...fields });
+      if (sw.kind === 'policy') await removePolicy(cfg);
+    };
     let slept;
     try {
       try {
-        if (!(await policyHeld(cfg, latest))) {
-          await backToAwake('policy-lost');
-          log.warn('NapAborted', { workloadId, reason: 'the policy was lost, no time left to wait for it again' });
-          await removePolicy(cfg);
+        if (!(await asleepHeld(cfg, sw, latest))) {
+          await giveUp(`${sw.kind}-lost`, 'warn', { reason: `the ${sw.kind} was lost, no time left to wait for it again` });
           return { state: STATES.AWAKE, aborted: true };
         }
       } catch (err) {
         // A customer's own policy, or a service moved or named elsewhere, since the onboarding: nothing is stopped yet, the
         // application keeps serving.
         if (!(err instanceof UrlMapRefused)) throw err;
-        await backToAwake('switch-failed');
-        log.warn('NapAborted', { workloadId, reason: err.message });
-        await removePolicy(cfg);
+        await giveUp('switch-failed', 'warn', { reason: err.message });
         return { state: STATES.AWAKE, aborted: true, error: err.message };
       }
       const changed = await negsChanged(cfg);
       if (changed) {
-        await backToAwake('backends-changed');
-        log.warn('NapAborted', { workloadId, reason: changed });
-        await removePolicy(cfg);
+        await giveUp('backends-changed', 'warn', { reason: changed });
         return { state: STATES.AWAKE, aborted: true, error: changed };
       }
       const autoscalers = await autoscalersToRecord(cfg, napping);
@@ -499,9 +525,7 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
       // autoscaler is turned off. A pause written since the nap started aborts it, like a request.
       const paused = await isPaused(workloadId);
       if (paused || !(await transition(workloadId, { cond: { state: STATES.NAPPING, pendingWake: false }, set: { stopping: true, autoscalers } }))) {
-        await backToAwake(paused ? 'paused' : 'pending-wake');
-        log.info('NapAborted', { workloadId, ...(paused ? { reason: 'paused' } : {}) });
-        await removePolicy(cfg);
+        await giveUp(paused ? 'paused' : 'pending-wake', 'info', paused ? { reason: 'paused' } : {});
         return { state: STATES.AWAKE, aborted: true };
       }
       slept = await putToSleep(cfg, autoscalers, latest);
@@ -548,8 +572,8 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
   // The operator's nap, in a request of its own: it takes minutes.
   const napNow = (workloadId) => enqueue({ action: 'nap', workloadId });
 
-  // A failed workload whose backends run for nothing is stopped like a nap and left asleep behind the policy, its failure
-  // kept (requests wake it again, backed off). The policy is there since its nap, unless the nap failed before writing it.
+  // A failed workload whose backends run for nothing is stopped like a nap and left asleep behind the switch, its failure
+  // kept (requests wake it again, backed off). The switch is there since its nap, unless the nap failed before writing it.
   async function release(workloadId) {
     const latest = now() + NAP_BUDGET_MS;
     let run = await store.getRun(workloadId);
@@ -557,9 +581,9 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
     if (await isPaused(workloadId)) return { state: 'SKIPPED', reason: 'paused' };
     const cfg = await getConfig(workloadId);
     try {
-      const { paths } = await writeOnlyPolicy(cfg);
+      const { paths } = await writeOnlyAsleep(cfg);
       if (paths.length) {
-        await sleep(POLICY_WAIT_MS);
+        await sleep(switchFor(cfg).waitMs);
         // What it records may have changed: with the old record, an autoscaler read OFF would lose its mode for good.
         run = await store.getRun(workloadId);
         if (run?.state !== STATES.FAILED) return { state: 'SUPERSEDED' };
@@ -801,6 +825,12 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
       // Started by hand: the others too, and the autoscalers given back, as a wake would. One that cannot start does not
       // keep the workload from being what it is, awake.
       log.warn(from === STATES.FAILED ? 'FailedRecovered' : 'ExternalWake', { workloadId });
+      // Under a swap, AWAKE comes only once unswapped and waited for, and a wait does not fit a check: a wake finishes the job, in a
+      // request of its own.
+      if (switchFor(cfg).kind === 'swap') {
+        await startWake(workloadId, run, from === STATES.FAILED ? 'recovered' : 'external-start');
+        return store.getRun(workloadId);
+      }
       await each(cfg.backends, (backend) => wakeBackend(backend, deadline)).catch((err) => log.warn('BackendsNotWoken', { workloadId, error: err.message }));
       const givenBack = await gaveBackAutoscalers(workloadId, run);
       run = (await transition(workloadId, {
@@ -810,7 +840,7 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
         cause: from === STATES.FAILED ? 'recovered' : 'external-start',
       })) ?? (await store.getRun(workloadId));
     } else if (from !== STATES.ASLEEP && vms.length > 0 && vms.every((vm) => DOWN.has(vm.status)) && (await healthyCount(cfg)) < 1) {
-      // Stopped by hand: the policy first, with no wait, they are already down.
+      // Stopped by hand: the switch first, with no wait, they are already down.
       log.warn(from === STATES.FAILED ? 'FailedRecovered' : 'ExternalStop', { workloadId });
       await repair(cfg, STATES.ASLEEP);
       return (await transition(workloadId, {
@@ -861,14 +891,17 @@ export function createController({ store, compute, urlmaps, monitoring, tasks, c
       return { state: (await failStuck(workloadId, { state: STATES.NAPPING, olderThan: { field: 'updatedAt', ms: before } }, 'nap', message, 'nap-stuck'))?.state };
     }
     if (run.state === STATES.WAKING) {
-      if ((run.wakeStartedAt ?? 0) >= now() - cfg.wakeTimeoutSeconds * 1000 - WAKING_STUCK_GRACE_MS) return { state: run.state };
+      // A swap's wait is not cut short at the wake's timeout: a wake in it is no stuck one.
+      const sw = switchFor(cfg);
+      const grace = WAKING_STUCK_GRACE_MS + (sw.kind === 'swap' ? sw.waitMs : 0);
+      if ((run.wakeStartedAt ?? 0) >= now() - cfg.wakeTimeoutSeconds * 1000 - grace) return { state: run.state };
       log.warn('WakeStuck', { workloadId, wakeId: run.wakeId });
       const message = `the wake did not finish within ${cfg.wakeTimeoutSeconds} s (its request stopped)`;
       return { state: (await failStuck(workloadId, { state: STATES.WAKING, wakeId: run.wakeId }, 'wake', message, 'wake-stuck'))?.state };
     }
     // The nap this check just asked for may have started since the run was read: a repair on that read would remove its policy.
     if (ctx.applied.get(workloadId) === 'nap') return { state: run.state };
-    if (!napHeldBack(cfg)) run = await reconcile(cfg, run, deadline);
+    run = await reconcile(cfg, run, deadline);
     const t = now();
     const idleMs = cfg.idleMinutes * 60_000;
     // Still paying for backends that run without a healthy instance: released once its idle window has passed; a paused one

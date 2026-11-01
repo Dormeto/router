@@ -182,3 +182,98 @@ test('AccessDenied is never set only when the catalog reads; else the last value
   await t.settings.refresh();
   assert.deepEqual(await t.settings.current(), { hibernate: true, readAt: t.clock.now(), error: null });
 });
+
+// --- The organization's waiting page (branded waiting page design §5) -------------------------------------------------
+
+const ORG = { mode: 'template', icon: 'none', title: 'Acme', description: 'Sleeps at night.' };
+const pageWrites = (s) => {
+  const writes = [];
+  const [put, remove] = [s.store.putWaitingPage, s.store.deleteWaitingPage];
+  s.store.putWaitingPage = async (...args) => { writes.push(['put', args[0]]); return put(...args); };
+  s.store.deleteWaitingPage = async (...args) => { writes.push(['delete', args[0]]); return remove(...args); };
+  return writes;
+};
+
+test('the refresh copies settings.json\'s waitingPage into ROUTER/ORGANIZATION-PAGE, once per change; a 304 and an identical new object write nothing', async () => {
+  const s = setup();
+  const writes = pageWrites(s);
+  s.s3.put('settings.json', { workloads: { hibernate: false }, waitingPage: ORG });
+  await s.settings.refresh();
+  assert.deepEqual(s.store.state.pages.organization, { page: ORG, by: 'settings.json', at: s.clock.now() });
+  assert.deepEqual((await s.settings.current()).hibernate, false);
+  s.clock.advance(5 * MIN);
+  await s.settings.refresh();
+  s.s3.put('settings.json', { workloads: { hibernate: false }, waitingPage: ORG, other: 1 });
+  s.clock.advance(5 * MIN);
+  await s.settings.refresh();
+  assert.deepEqual(writes, [['put', 'organization']]);
+  s.s3.put('settings.json', { workloads: { hibernate: false }, waitingPage: { ...ORG, title: 'Acme 2' } });
+  s.clock.advance(5 * MIN);
+  await s.settings.refresh();
+  assert.equal(s.store.state.pages.organization.page.title, 'Acme 2');
+});
+
+test('an absent waitingPage, a bad one or a missing settings.json removes the copy; a bad field is dropped, the rest kept', async () => {
+  const s = setup();
+  s.store.state.pages.organization = { page: ORG, by: 'settings.json', at: 1 };
+  s.s3.put('settings.json', { workloads: { hibernate: true } });
+  await s.settings.refresh();
+  assert.equal('organization' in s.store.state.pages, false, 'absent');
+
+  s.s3.put('settings.json', { waitingPage: { mode: 'template', title: 'x'.repeat(100), description: 'ok' } });
+  s.clock.advance(5 * MIN);
+  await s.settings.refresh();
+  assert.deepEqual(s.store.state.pages.organization.page, { mode: 'template', description: 'ok' });
+
+  for (const bad of ['text', 7, [], { mode: 'custom' }, { mode: 'pdf' }]) {
+    s.s3.put('settings.json', { waitingPage: bad });
+    s.clock.advance(5 * MIN);
+    await s.settings.refresh();
+    assert.equal('organization' in s.store.state.pages, false, JSON.stringify(bad));
+  }
+
+  s.s3.put('settings.json', { waitingPage: ORG });
+  s.clock.advance(5 * MIN);
+  await s.settings.refresh();
+  s.s3.objects.delete('settings.json');
+  s.clock.advance(5 * MIN);
+  await s.settings.refresh();
+  assert.equal('organization' in s.store.state.pages, false, 'never set');
+});
+
+test('the two keys parse apart: a bad waitingPage leaves hibernate read, a bad hibernate leaves the page copied, a file that is not JSON touches neither copy', async () => {
+  const s = setup();
+  s.s3.put('settings.json', { workloads: { hibernate: false }, waitingPage: 'nonsense' });
+  await s.settings.refresh();
+  assert.deepEqual(await s.settings.current(), { hibernate: false, readAt: s.clock.now(), error: null });
+
+  s.s3.put('settings.json', { workloads: { hibernate: 'maybe' }, waitingPage: ORG });
+  s.clock.advance(5 * MIN);
+  await s.settings.refresh();
+  const current = await s.settings.current();
+  assert.deepEqual([current.hibernate, current.error], [false, 'settings.json is invalid: settings.json: workloads.hibernate must be true or false']);
+  assert.deepEqual(s.store.state.pages.organization.page, ORG);
+
+  s.s3.put('settings.json', '{"waitingPage":');
+  s.clock.advance(5 * MIN);
+  await s.settings.refresh();
+  assert.deepEqual(s.store.state.pages.organization.page, ORG, 'kept');
+  assert.match((await s.settings.current()).error, /^settings.json is invalid/);
+});
+
+test('a copy that cannot be written is logged and tried again at the next read (the ETag is not kept); hibernate is stored all the same', async () => {
+  const s = setup();
+  const warned = [];
+  const settings = createManagerSettings({ s3: s.s3, url: URL, catalogUrl: CATALOG, store: s.store, now: s.clock.now, log: { ...silentLog, warn: (event, fields) => warned.push([event, fields.error]) } });
+  s.s3.put('settings.json', { workloads: { hibernate: false }, waitingPage: ORG });
+  const put = s.store.putWaitingPage;
+  s.store.putWaitingPage = async () => { throw new Error('throttled'); };
+  await settings.refresh();
+  assert.deepEqual(warned, [['WaitingPageNotCopied', 'throttled']]);
+  assert.deepEqual([(await settings.current()).hibernate, s.store.state.managerSettings.etag], [false, null]);
+  s.store.putWaitingPage = put;
+  s.clock.advance(5 * MIN);
+  await settings.refresh();
+  assert.deepEqual(s.store.state.pages.organization.page, ORG);
+  assert.equal(s.store.state.managerSettings.etag, '"e1"');
+});

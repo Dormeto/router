@@ -39,14 +39,23 @@ test('on Google Cloud the failure message promises no notification: nothing send
   assert.doesNotMatch(other, /notified/);
 });
 
-test('renderPage probes probeUrl, and only then reloads once AWAKE; without it the page keeps probing its own address', () => {
+test('renderPage probes probeUrl, and only then reloads once AWAKE; without it the page keeps probing its own address', async () => {
   const page = renderPage({ state: 'WAKING', pollSeconds: 3 });
   assert.match(page, /fetch\(location\.href, /);
-  assert.doesNotMatch(page, /state === 'AWAKE'/);
   const elsewhere = renderPage({ state: 'WAKING', pollSeconds: 3, probeUrl: '/_dormeto/wake' });
   assert.match(elsewhere, /fetch\("\/_dormeto\/wake", /);
   assert.doesNotMatch(elsewhere, /fetch\(location\.href/);
-  assert.match(elsewhere, /state === 'AWAKE'/);
+  // By behavior: AWAKE reloads only with probeUrl, one poll after the page was opened.
+  const own = runScript(page, [{ state: 'AWAKE' }]);
+  await own.settle();
+  await own.next();
+  assert.equal(own.context.reloaded, false, 'a page probing its own address does not reload on AWAKE');
+  const probing = runScript(elsewhere, [{ state: 'AWAKE' }]);
+  await probing.settle();
+  assert.equal(probing.context.reloaded, false, 'not at once: paced');
+  assert.equal(probing.delays[0], 3000, 'one poll after the page was opened');
+  await probing.next();
+  assert.equal(probing.context.reloaded, true);
 });
 
 test('renderPage names the cloud that has no capacity, in the page and in its script; AWS by default', () => {
@@ -225,50 +234,73 @@ test('no bar without usable progress, and none in FAILED, AWAKE, ASLEEP, NAPPING
 });
 
 const CUSTOM = '<!doctype html><html lang="de"><head><title>Meins</title></head><body><h1>Gleich</h1><p data-dormeto="status"></p></body></html>';
-const custom = (html) => renderPage({ ...waking, page: { mode: 'custom', html } });
+const custom = (html, more = {}) => renderPage({ ...waking, page: { mode: 'custom', html }, ...more });
 const NOSCRIPT = '<noscript><meta http-equiv="refresh" content="6"></noscript>';
-// The injected parts taken out, what is left is the customer's page, byte for byte.
-const without = (html) => html.replace(NOSCRIPT, '').replace(/<script>[\s\S]*<\/script>/, '');
+const SCRIPT_END = '})();\n</script>';
+// The injected parts taken out (they are one block), what is left is the customer's page, byte for byte.
+function without(html) {
+  const at = html.indexOf(NOSCRIPT);
+  assert.ok(at >= 0, 'the refresh is there');
+  const end = html.indexOf(SCRIPT_END, at) + SCRIPT_END.length;
+  assert.ok(end > at + NOSCRIPT.length, 'the script follows it');
+  return html.slice(0, at) + html.slice(end);
+}
+const injectedAt = (html) => html.indexOf(NOSCRIPT);
 
-test('custom: the customer\'s page, with the refresh after <head> and the script before </body>, and nothing else changed', () => {
+test('custom: the refresh and the script go at the very start, and the page is otherwise byte for byte its own', () => {
   const html = custom(CUSTOM);
   assert.equal(without(html), CUSTOM);
-  assert.ok(html.includes(`<head>${NOSCRIPT}<title>Meins</title>`));
-  assert.match(html, /<\/script><\/body><\/html>$/);
+  assert.equal(injectedAt(html), '<!doctype html>'.length, 'after the doctype, so standards mode holds');
   assert.match(html, /<html lang="de">/, 'its language is its own');
   assert.doesNotMatch(html, /Waking up…|class="dot"|:root\{/, 'none of the template');
   assert.match(html, /const pollMs = 3000;/);
 });
 
-test('custom: <HEAD> with attributes, any case; <header> is not a head; no head means no refresh', () => {
-  const upper = custom('<HTML><HEAD lang=x data-a="1">\n<TITLE>t</TITLE></HEAD><BODY>x</BODY></HTML>');
-  assert.ok(upper.includes(`<HEAD lang=x data-a="1">${NOSCRIPT}\n<TITLE>`));
-  assert.ok(/<script>[\s\S]*<\/script><\/BODY>/.test(upper), 'before </BODY>');
-  const header = custom('<header>top</header><p>x</p></body>');
-  assert.equal(header.includes('<noscript>'), false);
-  assert.equal(without(header), '<header>top</header><p>x</p></body>');
-  const none = custom('<p data-dormeto="status"></p>');
-  assert.equal(none.includes('<noscript>'), false);
-  assert.match(none, /^<p data-dormeto="status"><\/p><script>/);
-  assert.match(none, /<\/script>$/, 'without a body end, at the end');
+test('custom: after a BOM, white space, comments and the doctype when they come first; before anything else', () => {
+  const cases = {
+    plain: ['<p>x</p>', 0],
+    bom: ['﻿<p>x</p>', 1],
+    space: [' \n\t\r\f<p>x</p>', 5],
+    comment: ['<!-- a --><p>x</p>', 10],
+    doctype: ['<!DOCTYPE html><p>x</p>', 15],
+    lower: ['<!doctype html>\n<p>x</p>', 16],
+    all: ['﻿ \n<!-- one -->\n<!-- two --> <!DOCTYPE html>\n<!-- three -->\n<html><p>x</p></html>', 60],
+    'comment holding a doctype': ['<!-- <!DOCTYPE html> --><p>x</p>', 24],
+    'comment holding </body> and <head>': ['<!-- </body><head> --><html><head></head><body></body></html>', 22],
+    'doctype with a public id': ['<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0//EN" "http://x/y.dtd"><html></html>', 67],
+    'only a comment': ['<!-- c -->', 10],
+    'unclosed comment': ['<p>a</p><!-- todo', 0],
+    'unclosed comment first': ['<!-- todo </body>', 0],
+    'unclosed doctype': ['<!DOCTYPE html', 0],
+    'text after a doctype': ['<!DOCTYPE html>text', 15],
+  };
+  for (const [name, [page, at]] of Object.entries(cases)) {
+    const html = custom(page);
+    assert.equal(injectedAt(html), at, name);
+    assert.equal(without(html), page, name);
+  }
 });
 
-test('custom: two </body> take the script before the last; the first head only gets the refresh', () => {
-  const html = custom('<head></head><body><pre>&lt;/body></pre></body><!-- </body> --></body>');
-  assert.equal(html.match(/<noscript>/g).length, 1);
-  assert.equal(html.match(/<script>/g).length, 1);
-  assert.ok(html.indexOf('<script>') > html.indexOf('<!-- </body> -->'));
-  assert.match(html, /<\/script><\/body>$/);
-  const two = custom('<head></head><head></head>');
-  assert.equal(two.match(/<noscript>/g).length, 1);
-  assert.equal(without(two), '<head></head><head></head>');
-  assert.equal(without(custom('<p>a</p></body>\n</BODY >')), '<p>a</p></body>\n</BODY >');
-  assert.match(custom('<p>a</p></body>\n</BODY >'), /<\/script><\/BODY >$/);
-});
-
-test('custom: dollar signs and other replacement patterns in the page survive', () => {
-  const page = '<head></head><body>$& $1 $` $\' $$</body>';
-  assert.equal(without(custom(page)), page);
+test('custom: what the page holds cannot leave the script inert or change a byte of the page', () => {
+  const pages = [
+    '<html><body><p>x</p></body><!-- old footer </body> --></html>',
+    '<html><body><p>x</p><!-- todo',
+    '<html><body></body><script>var tail = "</body>"; window.mine = 1;</script></html>',
+    '<html><body><template><body>t</body></template></html>',
+    '<html><body><p>x</p><textarea>draft',
+    '<html><head></head><frameset><frame></frameset></html>',
+    '<html><!-- <head> --><head><title>t</title></head>',
+    '<html><head data-x=">"><title>t</title>',
+    '<script>var h = "<head>"; window.mine = 1;</script><body>',
+    '<head></head><head></head><body></body></body>',
+    "<head>$& $1 $` $' $$</head>",
+    '<p>é€\u{1F600}</p>',
+  ];
+  for (const page of pages) {
+    const html = custom(page);
+    assert.equal(without(html), page, page);
+    assert.equal(injectedAt(html), 0, page);
+  }
 });
 
 test('custom: the largest page, and the template with the largest icon, stay under 1 MB', () => {
@@ -280,10 +312,25 @@ test('custom: the largest page, and the template with the largest icon, stay und
   assert.ok(Buffer.byteLength(html) < 150_000, String(Buffer.byteLength(html)));
 });
 
+test('a hostile 256 KiB custom page is answered quickly: no search for a tag in it', () => {
+  const hostile = ['<head '.repeat(43_690), '<!--'.repeat(65_536), '<!---->'.repeat(37_000), `${' '.repeat(262_000)}<p>`, '<!DOCTYPE'.repeat(29_000), '﻿'.repeat(100_000), '</body '.repeat(32_000)];
+  for (const page of hostile.map((p) => `${p}<p>`)) {
+    const started = performance.now();
+    const html = custom(page);
+    assert.ok(performance.now() - started < 200, `${page.slice(0, 10)}: ${performance.now() - started} ms`);
+    assert.equal(without(html), page);
+  }
+});
+
 // The page's script, run in a vm with a small fake of the document, fetch and the timers.
 function runScript(html, answers) {
+  const body = html.replace(/<script>[\s\S]*<\/script>/, '');
   const elements = {};
+  const byId = {};
   const events = [];
+  const created = [];
+  const later = [];
+  const delays = [];
   const make = (name) => ({
     name, textContent: '', attrs: {}, style: {}, hidden: false, className: '', parentNode: null, children: [],
     setAttribute(k, v) { this.attrs[k] = v; },
@@ -292,39 +339,45 @@ function runScript(html, answers) {
   });
   const document = {
     inserted: [],
-    getElementById: (id) => elements[id] ?? null,
+    getElementById: (id) => byId[id] ?? null,
     querySelector: (selector) => elements[/data-dormeto="(\w+)"/.exec(selector)?.[1]] ?? null,
-    createElement: () => make('new'),
+    createElement: () => { const el = make('new'); created.push(el); return el; },
     dispatchEvent: (event) => { events.push(event); return true; },
   };
-  const hooks = (names) => names.forEach((n) => { elements[n] = make(n); });
+  const addHook = (name) => { elements[name] = make(name); return elements[name]; };
+  for (const name of new Set([...body.matchAll(/data-dormeto="(status|elapsed|progress)"/g)].map((m) => m[1]))) addHook(name);
+  for (const id of ['message', 'elapsed', 'reload']) {
+    const tag = new RegExp(`<[^>]* id="${id}"[^>]*>([^<]*)`).exec(body);
+    if (!tag) continue;
+    const hooked = /data-dormeto="(status|elapsed)"/.exec(tag[0])?.[1];
+    byId[id] = hooked ? elements[hooked] : make(id);
+    if (id === 'reload') { byId.reload.textContent = tag[1]; byId.reload.parentNode = { before(n) { document.inserted.push(n); } }; }
+    else byId[id].textContent ||= tag[1];
+  }
+  elements.reload = byId.reload;
   const server = bar(html);
-  if (/data-dormeto="status"/.test(html)) hooks(['status']);
-  if (/data-dormeto="elapsed"/.test(html)) hooks(['elapsed']);
-  if (/id="reload"/.test(html)) { elements.reload = make('reload'); elements.reload.parentNode = { before(n) { document.inserted.push(n); } }; elements.reload.textContent = /<span id="reload">([^<]*)</.exec(html)[1]; }
-  if (!server && /data-dormeto="progress"/.test(html)) hooks(['progress']);
-  if (server) { hooks(['progress']); elements.progress.style.width = `${server[2]}%`; elements.progress.attrs['aria-valuenow'] = server[1]; elements.progress.parentNode = make('track'); elements.progress.parentNode.className = 'track'; }
+  if (server) { elements.progress.style.width = `${server[2]}%`; elements.progress.attrs['aria-valuenow'] = server[1]; elements.progress.parentNode = make('track'); elements.progress.parentNode.className = 'track'; }
   const timers = [];
-  const later = [];
   const clock = { now: 1_000_000 };
   const queue = [...answers];
   const context = {
     document, location: { href: 'https://app.example/', reload() { context.reloaded = true; } }, reloaded: false,
     Date: { now: () => clock.now, parse: Date.parse }, Math, Number, Promise, JSON, isFinite,
     CustomEvent: class { constructor(type, init) { this.type = type; this.detail = init?.detail; } },
-    setInterval: (fn) => timers.push(fn), setTimeout: (fn) => later.push(fn),
+    setInterval: (fn) => timers.push(fn),
+    setTimeout: (fn, ms) => { later.push(fn); delays.push(ms); },
     fetch: async () => { const a = queue.shift() ?? { state: 'WAKING' }; return { type: 'basic', headers: { get: (name) => a.headers?.[name] ?? (name === 'x-dormeto-state' ? a.state : null) } }; },
   };
   vm.runInNewContext(scriptOf(html), context);
   return {
-    elements, document, context, events,
+    elements, byId, document, context, events, created, delays, addHook,
     settle: async () => { for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r)); },
     next: async () => { later.splice(0).forEach((fn) => fn()); for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r)); },
     tick: (ms) => { clock.now += ms; timers.forEach((fn) => fn()); },
-    fill: () => elements.progress ?? document.inserted[0]?.children[0],
   };
 }
-const headers = (elapsed, typical) => ({ 'x-dormeto-wake-elapsed': String(elapsed), 'x-dormeto-wake-typical': String(typical) });
+const headers = (elapsed, typical) => ({ 'x-dormeto-wake-elapsed': String(elapsed), ...(typical === undefined ? {} : { 'x-dormeto-wake-typical': String(typical) }) });
+const shown = { ...waking, progress: { elapsedMs: 5000, typicalMs: 10_000 } };
 
 test('script: a probe answer with the headers turns the bar on, one without leaves it', async () => {
   const run = runScript(renderPage(waking), [{ state: 'WAKING', headers: headers(5000, 10_000) }, { state: 'WAKING' }]);
@@ -340,74 +393,236 @@ test('script: a probe answer with the headers turns the bar on, one without leav
   assert.equal(fill.style.width, '80%', 'it moves with the clock');
   assert.equal(fill.attrs['aria-valuenow'], '80');
   assert.equal(run.elements.elapsed.textContent, '8 s', 'the counter now counts from the wake');
+  await run.next();
+  run.tick(1000);
+  assert.equal(fill.style.width, '90%', 'a WAKING answer without the headers leaves it as it was');
   assert.equal(run.document.inserted.length, 1);
   assert.equal(track.hidden, false);
 });
 
-test('script: an answer without the headers leaves a bar as it was; a page without one has none', async () => {
+test('script: a page without a bar has none, and counts from the page', async () => {
   const none = runScript(renderPage(waking), [{ state: 'WAKING' }]);
   await none.settle();
   none.tick(5000);
   assert.equal(none.document.inserted.length, 0);
   assert.equal(none.elements.elapsed.textContent, '5 s', 'since the page opened');
-  const served = runScript(renderPage({ ...waking, progress: { elapsedMs: 5000, typicalMs: 10_000 } }), [{ state: 'WAKING' }]);
+});
+
+test('script: the server\'s bar is used, none is added, and it moves', async () => {
+  const served = runScript(renderPage(shown), [{ state: 'WAKING' }]);
   await served.settle();
   served.tick(2000);
   assert.equal(served.elements.progress.style.width, '70%');
   assert.equal(served.elements.progress.parentNode.hidden, false);
-  assert.equal(served.document.inserted.length, 0, 'the server\'s bar is used, none is added');
+  assert.equal(served.document.inserted.length, 0);
+  assert.equal(served.created.length, 0);
 });
 
-test('script: past the typical time the bar stops at 95% and the "longer" sentence replaces the reload one', async () => {
+test('script: past the typical time the bar stops at 95% and "longer" replaces the reload sentence, only past it', async () => {
   const run = runScript(renderPage({ ...waking, progress: { elapsedMs: 9000, typicalMs: 10_000 } }), [{ state: 'WAKING' }]);
   await run.settle();
-  run.tick(500);
-  assert.notEqual(run.elements.reload.textContent, 'This is taking longer than usual.');
+  run.tick(1000);
+  assert.equal(run.elements.reload.textContent, 'This page reloads by itself as soon as the application is ready.', 'at the typical time exactly, not yet');
+  run.tick(1);
   run.tick(1000);
   assert.equal(run.elements.progress.style.width, '95%');
   assert.equal(run.elements.reload.textContent, 'This is taking longer than usual.');
 });
 
-test('script: AWAKE fills the bar it has, FAILED and a nap hide it', async () => {
-  const progress = { elapsedMs: 5000, typicalMs: 10_000 };
-  const awake = runScript(renderPage({ ...waking, progress }), [{ state: 'AWAKE' }]);
+test('script: AWAKE fills the bar it has and freezes the sentence; a page opened at AWAKE has none', async () => {
+  const awake = runScript(renderPage({ ...waking, progress: { elapsedMs: 9000, typicalMs: 10_000 } }), [{ state: 'AWAKE' }]);
   await awake.settle();
   assert.equal(awake.elements.progress.style.width, '100%');
   assert.equal(awake.elements.progress.attrs['aria-valuenow'], '100');
   awake.tick(60_000);
   assert.equal(awake.elements.progress.style.width, '100%', 'it stays full');
+  assert.equal(awake.elements.reload.textContent, 'This page reloads by itself as soon as the application is ready.', 'unchanged, even past the typical time');
   const opened = runScript(renderPage(waking), [{ state: 'AWAKE' }]);
   await opened.settle();
-  assert.equal(opened.document.inserted.length, 0, 'a page opened at AWAKE has none');
-  const failed = runScript(renderPage({ ...waking, progress }), [{ state: 'FAILED', headers: { 'x-dormeto-failure': 'other' } }]);
-  await failed.settle();
-  assert.equal(failed.elements.progress.parentNode.hidden, true);
-  failed.tick(5000);
-  assert.equal(failed.elements.progress.parentNode.hidden, true, 'and stays hidden');
-  const nap = runScript(renderPage({ ...waking, progress }), [{ state: 'ASLEEP', headers: { 'x-dormeto-nap-until': '2026-11-02T07:00:00Z' } }]);
-  await nap.settle();
-  assert.equal(nap.elements.progress.parentNode.hidden, true);
+  assert.equal(opened.document.inserted.length, 0);
+});
+
+test('script: FAILED and a nap take the bar and "longer" away, and the seconds count from the page again', async () => {
+  const old = { ...waking, progress: { elapsedMs: 120_000, typicalMs: 10_000 } };
+  for (const answer of [
+    { state: 'FAILED', headers: { 'x-dormeto-failure': 'other' } },
+    { state: 'ASLEEP', headers: { 'x-dormeto-nap-until': '2026-11-02T07:00:00Z' } },
+    { state: 'WAKING', headers: { 'x-dormeto-nap-until': '2026-11-02T07:00:00Z' } },
+    { state: 'NAPPING' },
+  ]) {
+    const run = runScript(renderPage(old), [answer]);
+    assert.equal(run.elements.reload.textContent, 'This is taking longer than usual.');
+    await run.settle();
+    assert.equal(run.elements.progress.parentNode.hidden, true, JSON.stringify(answer));
+    assert.equal(run.elements.reload.textContent, 'This page reloads by itself as soon as the application is ready.', JSON.stringify(answer));
+    run.tick(3000);
+    assert.equal(run.elements.elapsed.textContent, '3 s', 'since the page opened');
+    assert.equal(run.elements.progress.parentNode.hidden, true, 'and stays hidden');
+  }
+});
+
+test('script: a new WAKING starts the bar afresh, after AWAKE and after FAILED', async () => {
+  for (const between of [{ state: 'AWAKE' }, { state: 'FAILED', headers: { 'x-dormeto-failure': 'other' } }]) {
+    const run = runScript(renderPage(shown), [between, { state: 'WAKING', headers: headers(1000, 10_000) }]);
+    await run.settle();
+    await run.next();
+    assert.equal(run.elements.progress.style.width, '10%', between.state);
+    assert.equal(run.elements.progress.parentNode.hidden, false, 'the bar is back');
+    run.tick(1000);
+    assert.equal(run.elements.progress.style.width, '20%', 'and moves');
+    assert.equal(run.elements.elapsed.textContent, '2 s');
+  }
+  const bare = runScript(renderPage(shown), [{ state: 'AWAKE' }, { state: 'WAKING' }]);
+  await bare.settle();
+  await bare.next();
+  assert.equal(bare.elements.progress.parentNode.hidden, true, 'a new WAKING with no headers has no bar');
+});
+
+test('script: the elapsed header alone gives the seconds since the wake started; the bar needs both', async () => {
+  const run = runScript(renderPage(waking), [{ state: 'WAKING', headers: headers(60_000) }]);
+  await run.settle();
+  assert.equal(run.elements.elapsed.textContent, '60 s');
+  assert.equal(run.document.inserted.length, 0);
+  run.tick(2000);
+  assert.equal(run.elements.elapsed.textContent, '62 s');
+  assert.match(renderPage({ ...waking, progress: { elapsedMs: 60_000 } }), /<span id="elapsed" data-dormeto="elapsed">60 s<\/span>/);
+  assert.doesNotMatch(bodyOf(renderPage({ ...waking, progress: { elapsedMs: 60_000, typicalMs: null } })), /progressbar/);
+  assert.match(renderPage({ ...waking, progress: { elapsedMs: 60_000, typicalMs: null } }), /60 s/);
 });
 
 test('script: unusable headers are ignored', async () => {
-  for (const bad of [headers('x', 10_000), headers(5000, 0), headers(5000, -1), headers('', ''), headers(-1, 5000), { 'x-dormeto-wake-elapsed': '5000' }]) {
+  for (const bad of [headers('x', 10_000), headers(5000, 0), headers(5000, -1), headers('', ''), headers(-1, 5000), { 'x-dormeto-wake-typical': '5000' }]) {
     const run = runScript(renderPage(waking), [{ state: 'WAKING', headers: bad }]);
     await run.settle();
     assert.equal(run.document.inserted.length, 0, JSON.stringify(bad));
   }
-});
-
-test('script: the failure sentences are built in the visitor\'s language', async () => {
-  const run = runScript(renderPage({ ...waking, language: 'fr' }), [{ state: 'FAILED', headers: { 'x-dormeto-failure': 'capacity', 'x-dormeto-retry-at': new Date(1_000_000 + 4 * 60_000).toISOString() } }]);
+  const run = runScript(renderPage(waking), [{ state: 'WAKING', headers: headers(-1, 5000) }]);
   await run.settle();
-  assert.match(run.elements.status.textContent, /^AWS n'a plus de capacité .* retenté, prochain essai dans [34] minutes\.$/);
+  run.tick(4000);
+  assert.equal(run.elements.elapsed.textContent, '4 s', 'a negative elapsed does not move the start');
 });
 
-test('custom hooks: the status, the seconds and the bar of the customer\'s page, and the dormeto:state event', async () => {
-  const html = custom('<head></head><body><p data-dormeto="status"></p><i data-dormeto="elapsed"></i><div data-dormeto="progress" hidden></div></body>');
-  const retryAt = new Date(1_000_000 + 4 * 60_000).toISOString();
-  const run = runScript(html, [{ state: 'WAKING', headers: headers(2000, 8000) }, { state: 'FAILED', headers: { 'x-dormeto-failure': 'capacity', 'x-dormeto-retry-at': retryAt } }]);
+test('script: the failure sentences, with their next attempt, are built in the visitor\'s language', async () => {
+  const retryAt = (ms) => new Date(1_000_000 + ms).toISOString();
+  const cases = [
+    ['en', 'capacity', 4 * 60_000, /^AWS has no capacity for this application right now: the start is retried, next attempt in [34] minutes\.$/],
+    ['en', 'unhealthy', 4 * 60_000, /^The application could not be started; its team is notified\. Next attempt in [34] minutes\.$/],
+    ['en', 'unhealthy', 30_000, /^The application could not be started; its team is notified\. Next attempt in less than a minute\.$/],
+    ['fr', 'capacity', 4 * 60_000, /^AWS n'a plus de capacité .* retenté, prochain essai dans [34] minutes\.$/],
+    ['fr', 'unhealthy', 4 * 60_000, /^L'application n'a pas pu démarrer ; son équipe est prévenue\. Prochain essai dans [34] minutes\.$/],
+    ['fr', 'unhealthy', 61_000, /Prochain essai dans 1 minute\.$/],
+    ['fr', 'unhealthy', 10_000, /Prochain essai dans moins d'une minute\.$/],
+  ];
+  for (const [language, failure, ms, expected] of cases) {
+    const run = runScript(renderPage({ ...waking, language }), [{ state: 'FAILED', headers: { 'x-dormeto-failure': failure, 'x-dormeto-retry-at': retryAt(ms) } }]);
+    await run.settle();
+    assert.match(run.elements.status.textContent, expected, `${language} ${failure} ${ms}`);
+  }
+  const inherited = runScript(renderPage(waking), [{ state: 'constructor' }, { state: 'FAILED', headers: { 'x-dormeto-failure': 'constructor' } }]);
+  await inherited.settle();
+  await inherited.next();
+  assert.equal(inherited.elements.status.textContent, 'The application could not be started; its team is notified.', 'a failure that is no kind of ours is "other"');
+});
+
+test('script: nothing the page is given can end the script element', () => {
+  const html = renderPage({ ...waking, probeUrl: '/w?</script><b>', napUntil: { at: 'x', local: 'Mon 08:00', timeZone: '</script><i>' }, cloud: '</script><u>' });
+  assert.equal(html.match(/<\/script>/g).length, 1);
+  assert.equal(custom('<p></p>', { napUntil: { at: 'x', local: 'Mon 08:00', timeZone: '</script><i>' } }).match(/<\/script>/g).length, 1);
+});
+
+test('script: a negative elapsed time is a bar at 0, not below it', () => {
+  assert.equal(bar(renderPage({ ...waking, progress: { elapsedMs: -5000, typicalMs: 10_000 } }))[2], '0');
+  assert.match(renderPage({ ...waking, progress: { elapsedMs: -5000, typicalMs: 10_000 } }), /<span id="elapsed" data-dormeto="elapsed">0 s<\/span>/);
+});
+
+test('script: on a page with only getElementById, the counter and the message are still served', async () => {
+  const messageEl = {};
+  const elapsedEl = {};
+  const timers = [];
+  const context = {
+    location: { href: 'x', reload() {} }, Date: { now: () => 5000, parse: Date.parse }, Math, isFinite,
+    document: { getElementById: (id) => (id === 'message' ? messageEl : id === 'elapsed' ? elapsedEl : {}) },
+    setInterval: (fn) => timers.push(fn), setTimeout: () => 0,
+    fetch: async () => ({ type: 'basic', headers: { get: (n) => (n === 'x-dormeto-state' ? 'AWAKE' : null) } }),
+  };
+  vm.runInNewContext(scriptOf(renderPage(waking)), context);
+  timers.forEach((fn) => fn());
+  assert.equal(elapsedEl.textContent, '0 s');
+  for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+  assert.equal(messageEl.textContent, 'Almost there…');
+});
+
+test('the language is en or fr in the page, whatever is passed', () => {
+  for (const language of ['de', 'constructor', '"><x', undefined, null, 5, {}]) {
+    const html = renderPage({ ...waking, language });
+    assert.match(html, /<html lang="en">/, String(language));
+    assert.match(html, /Waking up the application…/);
+  }
+  assert.match(renderPage({ state: 'constructor', pollSeconds: 3 }), /Waking up the application…/, 'a state that is no state of ours is WAKING');
+  assert.equal(failureMessage('constructor', undefined, 'AWS', 'constructor'), 'The application could not be started; its team is notified.');
+});
+
+test('languageOf: q=1.0, 20 entries and 500 characters are the limits', () => {
+  assert.equal(languageOf('fr;q=1.0,en;q=0.5'), 'fr');
+  assert.equal(languageOf('fr;q=1,en;q=0.5'), 'fr');
+  assert.equal(languageOf('en;q=0.5,fr;q=0.6'), 'fr');
+  assert.equal(languageOf('fr;q=1.5'), 'en');
+  assert.equal(languageOf('fr;q=-1'), 'en');
+  const twenty = Array.from({ length: 20 }, () => 'de').join(',');
+  assert.equal(languageOf(`${twenty},fr`), 'en', 'the 21st entry is not read');
+  assert.equal(languageOf(`${Array.from({ length: 19 }, () => 'de').join(',')},fr`), 'fr', 'the 20th is');
+  assert.equal(languageOf(`${' '.repeat(500)}fr`), 'en', 'past 500 characters nothing is read');
+  assert.equal(languageOf(`${' '.repeat(496)}fr`), 'fr');
+});
+
+test('custom hooks: only the data-dormeto elements are touched, never ids, and no element is added', async () => {
+  const html = custom('<div id="message">Our own message</div><button id="reload">Reload now</button><span id="elapsed">x</span><div class="track"><div id="f" data-dormeto="progress" hidden></div></div><p data-dormeto="status"></p><i data-dormeto="elapsed"></i>');
+  const run = runScript(html, [{ state: 'WAKING', headers: headers(5000, 10_000) }]);
   run.elements.progress.hidden = true;
+  run.elements.progress.parentNode = make2('track');
+  await run.settle();
+  assert.equal(run.byId.message.textContent, 'Our own message');
+  assert.equal(run.byId.reload.textContent, 'Reload now');
+  assert.equal(run.byId.elapsed.textContent, 'x');
+  assert.equal(run.created.length, 0);
+  assert.equal(run.document.inserted.length, 0);
+  assert.equal(run.elements.progress.hidden, false, 'hidden comes off the hook itself, not off its parent');
+  assert.equal(run.elements.progress.style.width, '50%');
+  assert.equal(run.elements.progress.parentNode.hidden, false);
+  assert.equal(run.elements.elapsed.textContent, '5 s');
+  assert.equal(run.elements.status.textContent, 'Waking up the application…');
+  assert.deepEqual(run.elements.progress.attrs, {}, 'only the width is set on a customer\'s element');
+});
+function make2(className) { return { className, hidden: false }; }
+
+test('custom hooks: a page without the status hook and without a bar still probes and is left alone', async () => {
+  const run = runScript(custom('<p>mine</p>'), [{ state: 'WAKING', headers: headers(5000, 10_000) }]);
+  await run.settle();
+  assert.equal(run.events.length, 1);
+  assert.equal(run.created.length, 0);
+  run.tick(1000);
+  const gone = runScript(custom('<p>mine</p>'), [{ state: null }]);
+  await gone.settle();
+  assert.equal(gone.context.reloaded, true, 'an answer that is not the waker\'s reloads the visitor');
+});
+
+test('custom hooks: the hooks are looked up at each update, so a page that renders them later is served', async () => {
+  const run = runScript(custom('<div id="app"></div>'), [{ state: 'WAKING', headers: headers(2000, 8000) }, { state: 'WAKING', headers: headers(3000, 8000) }]);
+  await run.settle();
+  run.addHook('status');
+  run.addHook('elapsed');
+  const bar = run.addHook('progress');
+  bar.hidden = true;
+  run.tick(1000);
+  assert.equal(run.elements.status.textContent, 'Waking up the application…');
+  assert.equal(run.elements.elapsed.textContent, '3 s');
+  assert.equal(bar.hidden, false);
+  assert.equal(bar.style.width, '38%');
+});
+
+test('custom hooks: the dormeto:state event, at each probe', async () => {
+  const retryAt = new Date(1_000_000 + 4 * 60_000).toISOString();
+  const run = runScript(custom('<p data-dormeto="status"></p>'), [{ state: 'WAKING', headers: headers(2000, 8000) }, { state: 'FAILED', headers: { 'x-dormeto-failure': 'capacity', 'x-dormeto-retry-at': retryAt } }]);
   assert.equal(run.elements.status.textContent, 'Waking up the application…', 'the sentence is there at once');
   await run.settle();
   await run.next();
@@ -417,28 +632,12 @@ test('custom hooks: the status, the seconds and the bar of the customer\'s page,
   assert.equal(run.events[1].detail.failure, 'capacity');
   assert.equal(run.events[1].detail.retryAt, retryAt);
   assert.match(run.elements.status.textContent, /^AWS has no capacity .*next attempt in [34] minutes\.$/);
-  assert.equal(run.document.inserted.length, 0, 'the customer\'s element is used, none is created');
 });
 
-test('custom hooks: the bar element gets its width, and hidden comes off once a bar applies', async () => {
-  const html = custom('<head></head><body><p data-dormeto="status"></p><div data-dormeto="progress" hidden></div></body>');
-  const run = runScript(html, [{ state: 'WAKING', headers: headers(2000, 8000) }]);
-  run.elements.progress.hidden = true;
-  assert.equal(run.elements.progress.hidden, true);
-  await run.settle();
-  assert.equal(run.elements.progress.hidden, false);
-  assert.equal(run.elements.progress.style.width, '25%');
-  run.tick(2000);
-  assert.equal(run.elements.progress.style.width, '50%');
-  assert.equal(run.elements.elapsed, undefined);
-});
-
-test('custom: a page with no hook still probes, wakes and reloads', async () => {
-  const run = runScript(custom('<head></head><body><p>mine</p></body>'), [{ state: 'WAKING' }]);
-  await run.settle();
-  assert.equal(run.events.length, 1);
-  run.tick(1000);
-  const gone = runScript(custom('<p>mine</p>'), [{ type: 'x', state: null }]);
-  await gone.settle();
-  assert.equal(gone.context.reloaded, true, 'an answer that is not the waker\'s reloads the visitor');
+test('custom: with probeUrl, the reload keeps its one-per-poll pacing even with wake headers', async () => {
+  for (const html of [renderPage({ ...waking, probeUrl: '/_dormeto/wake', progress: { elapsedMs: 60_000, typicalMs: 10_000 } }), custom('<p>x</p>', { probeUrl: '/_dormeto/wake', progress: { elapsedMs: 60_000, typicalMs: 10_000 } })]) {
+    const run = runScript(html, [{ state: 'AWAKE', headers: headers(60_000, 10_000) }]);
+    await run.settle();
+    assert.equal(run.delays[0], 3000);
+  }
 });

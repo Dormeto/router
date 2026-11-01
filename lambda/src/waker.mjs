@@ -8,9 +8,8 @@ import { memoizeAsync } from './lib/memo.mjs';
 import { parseRules } from './lib/no-wake.mjs';
 import { createListCache, parseLists } from './lib/list-cache.mjs';
 import { createStore } from './lib/state.mjs';
-import { createWaitingPages } from './lib/waiting-pages.mjs';
 import { sleep } from './lib/time.mjs';
-import { createWaker } from './lib/waker-core.mjs';
+import { createAwsWaker } from './lib/waker-aws.mjs';
 
 // Optional CloudWatch metrics (router metrics_enabled), dimension Router = the router name.
 const logger = createLogger({
@@ -64,7 +63,7 @@ const catalog = process.env.DMT_IP_LISTS_CATALOG
   ? createCatalog({ s3: { getObjectIf: async (input) => (await getS3()).getObjectIf(input) }, url: process.env.DMT_IP_LISTS_CATALOG, own: lists.map((l) => l.name), log: logger })
   : null;
 
-export const handler = createWaker({
+export const handler = createAwsWaker({
   store,
   invokeController,
   prefix: process.env.DMT_TG_PREFIX,
@@ -73,7 +72,5 @@ export const handler = createWaker({
   getAdmin,
   // Router defaults for every workload (Terraform router module no_wake_rules).
   defaultRules: parseRules(process.env.DMT_NO_WAKE_RULES, (error) => logger.error('NoWakeRulesUnreadable', { error })),
-  // The branded waiting page: the three levels' settings and the cached favicon, read only when a page is answered.
-  waitingPages: createWaitingPages({ store, log: logger }),
   listCache: lists.length || catalog ? createListCache({ store, lists, catalog, log: logger }) : null,
 });

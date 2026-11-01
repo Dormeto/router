@@ -485,3 +485,17 @@ test('an unconfigured workload answers with the two upper levels only; without w
   assert.match(built.body, /Waking up the application/);
   assert.equal(headerOf(built, 'content-security-policy'), undefined);
 });
+
+test('the route grace and the redirect limit answer the workload\'s page, and a page that could not be read keeps our policy', async () => {
+  const waitingPages = pagesOf();
+  const grace = setup({ run: { state: STATES.AWAKE }, cfg: testConfig({ waitSeconds: 0 }), waitingPages });
+  grace.store.state.run.awakeSince = grace.clock.now();
+  assert.equal(headerOf(await grace.handler(albEvent()), 'x-dormeto-state'), STATES.AWAKE);
+  const loop = setup({ run: { state: STATES.AWAKE, awakeSince: 0 }, waitingPages });
+  const looping = albEvent({ headers: { cookie: 'dmt_r=2' } });
+  assert.equal(headerOf(await loop.handler(looping), 'x-dormeto-state'), STATES.AWAKE);
+  assert.deepEqual(waitingPages.asked, ['demo', 'demo']);
+
+  const unread = setup({ run: { state: STATES.ASLEEP }, cfg: testConfig({ waitSeconds: 0 }), waitingPages: { pageOf: async () => { throw new Error('x'); } } });
+  assert.equal(headerOf(await unread.handler(albEvent()), 'content-security-policy'), PAGE_CSP);
+});

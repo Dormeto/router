@@ -127,3 +127,41 @@ test('without a workload (WorkloadNotConfigured) only the two upper levels are r
   assert.deepEqual(await s.waiting.pageOf(null), { page: { mode: 'template', title: 'Org' }, icon: null });
   assert.deepEqual(s.reads.map(([kind, key]) => `${kind}:${key}`).sort(), ['page:organization', 'page:router']);
 });
+
+// --- Fix round 1 --------------------------------------------------------------------------------------------------------
+
+test('a store that never answers holds the page for readMs at most, then the last value or none; the read fills the cache when it comes', async () => {
+  let release;
+  const s = setup({ pages: { router: { mode: 'template', title: 'Late' } }, readMs: 40 });
+  const getPage = s.store.getWaitingPage;
+  s.store.getWaitingPage = (...args) => new Promise((resolve) => { release = () => resolve(getPage(...args)); });
+  const started = Date.now();
+  assert.deepEqual(await s.waiting.pageOf('shop'), { page: { mode: 'template' }, icon: null });
+  assert.ok(Date.now() - started < 500, `${Date.now() - started} ms`);
+  assert.ok(s.warned.some(([event, fields]) => event === 'WaitingPageUnread' && /no answer/.test(fields.error)));
+  // Not asked again for the same time: no new wait.
+  const again = Date.now();
+  await s.waiting.pageOf('shop');
+  assert.ok(Date.now() - again < 30);
+});
+
+test('a read that stays pending for ever is replaced by a new one after a while', async () => {
+  const s = setup({ readMs: 20 });
+  let calls = 0;
+  s.store.getWaitingPage = () => { calls += 1; return new Promise(() => {}); };
+  await s.waiting.pageOf('shop');
+  const first = calls;
+  s.clock.advance(61_000);
+  await s.waiting.pageOf('shop');
+  assert.ok(calls > first, 'asked again');
+});
+
+test('the default keeps 200 workloads', async () => {
+  const s = setup();
+  for (let i = 0; i < 201; i += 1) await s.waiting.pageOf(`w${i}`);
+  s.reads.length = 0;
+  await s.waiting.pageOf('w1');
+  assert.deepEqual(s.reads, [], 'w1 is kept');
+  await s.waiting.pageOf('w0');
+  assert.ok(s.reads.length > 0, 'w0 went out');
+});

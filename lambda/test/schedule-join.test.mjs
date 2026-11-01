@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  awakeStartWithin, isJoinMinutes, JOIN_DEFAULT_MINUTES, nextEvents, normalizeSchedule, occurrenceAt, resolveJoin, scheduleProblems,
+  awakeStartWithin, isJoinMinutes, JOIN_DEFAULT_MINUTES, localTime, napEndHeader, napEndOf, nextEvents, normalizeSchedule, occurrenceAt, resolveJoin, scheduleProblems,
 } from '../src/lib/schedule.mjs';
 
 const t = (text) => Date.parse(text);
@@ -257,6 +257,66 @@ const RESOLVED = [
 for (const [levels, joinMinutes, from] of RESOLVED) {
   test(`resolveJoin ${JSON.stringify(levels)}: ${joinMinutes} from ${from}`, () => assert.deepEqual(resolveJoin(levels), { joinMinutes, from }));
 }
+
+// --- An end that is only the horizon -----------------------------------------------------------------------------------
+
+// A daily nap 00:00–23:45, joined at the default: it never actually ends. Wednesday 13 January 2027, 11:00 in Paris.
+const ENDLESS = { kind: 'nap', start: '00:00', end: '23:45', repeat: { pattern: 'daily' } };
+const WEDNESDAY = t('2027-01-13T11:00:00+01:00');
+
+test('occurrenceAt says when its end is only the horizon', () => {
+  const o = occurrenceAt(paris([ENDLESS]), WEDNESDAY);
+  assert.equal(o.endKnown, false);
+  assert.equal(o.kind, 'nap');
+  assert.equal(iso(o.end), '2027-01-21T23:00:00.000Z', 'where the reading stopped: the controller\'s until');
+});
+
+test('endKnown false: every shape of a chain that goes on past the horizon', () => {
+  const every = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
+  for (const [name, s, options] of [
+    ['touching days, joining nothing', utc([nap(every, '00:00', '00:00')]), { joinMinutes: 0 }],
+    ['*/15 lasting 5', utc([cron('*/15 * * * *', 5, 'nap')]), {}],
+    ['a week long, each week', utc([cron('0 8 * * MON', 10080, 'nap')]), { joinMinutes: 0 }],
+    ['a week long, joined to the next', utc([cron('0 8 * * MON', 10075, 'nap')]), {}],
+    ['awake too', utc([awake(every, '00:00', '00:00')]), {}],
+  ]) assert.equal(occurrenceAt(s, WEDNESDAY, options).endKnown, false, name);
+});
+
+test('a known end says nothing more: no endKnown key, whatever its distance', () => {
+  const known = [
+    ['one nap', paris([nap(['wed'], '08:00', '20:00')])],
+    ['the chain at 0', paris([ENDLESS], { joinMinutes: 0 })],
+    ['an exception in 5 days', paris([ENDLESS], { exceptions: ['2027-01-18'] })],
+    ['an exception on the last day read', paris([ENDLESS], { exceptions: ['2027-01-22'] })],
+    ['until in 7 days', paris([{ ...ENDLESS, until: '2027-01-20' }])],
+    ['ending just past the last day read', paris([{ ...ENDLESS, end: '00:00', until: '2027-01-21' }])],
+  ];
+  for (const [name, s] of known) assert.equal('endKnown' in occurrenceAt(s, WEDNESDAY), false, name);
+  // Long, but its true end: the week a cron lasts, read on its first day.
+  assert.equal('endKnown' in occurrenceAt(utc([cron('0 8 13 1 *', 10080, 'nap')]), t('2027-01-13T09:00:00Z')), false);
+  assert.equal(iso(occurrenceAt(paris([ENDLESS], { exceptions: ['2027-01-18'] }), WEDNESDAY).end), '2027-01-17T22:45:00.000Z');
+});
+
+test('localTime prints the date of an end more than 6 days from now; without now, as ever', () => {
+  const end = t('2027-01-19T23:45:00+01:00');
+  assert.equal(localTime(end, 'Europe/Paris'), 'Tue 23:45');
+  assert.equal(localTime(end, 'Europe/Paris', { now: WEDNESDAY }), 'Tue 2027-01-19 23:45');
+  const sixDays = 6 * 86_400_000;
+  assert.equal(localTime(WEDNESDAY + sixDays, 'Europe/Paris', { now: WEDNESDAY }), 'Tue 11:00', 'exactly 6 days');
+  assert.equal(localTime(WEDNESDAY + sixDays + MINUTE, 'Europe/Paris', { now: WEDNESDAY }), 'Tue 2027-01-19 11:01');
+  // The local date, not the UTC one.
+  assert.equal(localTime(t('2027-01-24T23:30:00Z'), 'Europe/Paris', { now: WEDNESDAY }), 'Mon 2027-01-25 00:30');
+});
+
+test('napEndOf: the end as the page and the JSON say it, none when it is only the horizon', () => {
+  const zone = 'Europe/Paris';
+  assert.deepEqual(napEndOf({ end: t('2027-01-13T20:00:00+01:00') }, zone, WEDNESDAY), { at: '2027-01-13T19:00:00.000Z', local: 'Wed 20:00', timeZone: zone });
+  assert.deepEqual(napEndOf({ end: t('2027-01-25T08:00:00+01:00') }, zone, WEDNESDAY), { at: '2027-01-25T07:00:00.000Z', local: 'Mon 2027-01-25 08:00', timeZone: zone });
+  const none = napEndOf(occurrenceAt(paris([ENDLESS]), WEDNESDAY), zone, WEDNESDAY);
+  assert.deepEqual(none, { at: null, local: null, timeZone: zone });
+  assert.equal(napEndHeader(none), 'unknown');
+  assert.equal(napEndHeader({ at: '2027-01-13T19:00:00.000Z', local: 'Wed 20:00', timeZone: zone }), '2027-01-13T19:00:00.000Z');
+});
 
 // --- Time limits (section 4) ----------------------------------------------------------------------------------------
 

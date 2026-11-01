@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createManagerSettings, joinLevels, settingsUrlOf } from '../src/lib/manager-settings.mjs';
+import { createJoinLevelsCache, createManagerSettings, joinLevels, settingsUrlOf } from '../src/lib/manager-settings.mjs';
 import { fakeClock, fakeStore, silentLog, testConfig } from './fakes.mjs';
 
 const URL = 's3://dmt-dev-manager-ip-lists-1/settings.json';
@@ -246,4 +246,40 @@ test('joinLevels: each level\'s value; one that cannot be read is logged once an
     { event: 'JoinLevelUnreadable', workloadId: 'demo', level: 'router', error: 'ThrottlingException' },
     { event: 'JoinLevelUnreadable', level: 'organization', error: 'ThrottlingException' },
   ]);
+});
+
+test('createJoinLevelsCache: a value 60 seconds, unset too, a failure 5 seconds as unset, a reader missing as unset', async () => {
+  const clock = fakeClock();
+  const warnings = [];
+  const log = { warn: (event, fields) => warnings.push({ event, ...fields }) };
+  const answers = { router: { joinMinutes: 10 }, manager: null };
+  const reads = { router: 0, manager: 0 };
+  const cache = createJoinLevelsCache({
+    router: () => { reads.router++; if (answers.router === 'fail') throw new Error('sync'); return answers.router; },
+    manager: async () => { reads.manager++; if (answers.manager === 'fail') throw new Error('async'); return answers.manager; },
+    now: clock.now, log,
+  });
+  assert.deepEqual(await cache.levels(), { router: 10, manager: null });
+  answers.router = { joinMinutes: 20 };
+  clock.advance(60_000 - 1);
+  assert.deepEqual(await cache.levels(), { router: 10, manager: null });
+  assert.deepEqual(reads, { router: 1, manager: 1 }, 'an unset level is a value: not read again');
+  clock.advance(1);
+  assert.deepEqual(await cache.levels(), { router: 20, manager: null });
+  answers.router = 'fail';
+  answers.manager = 'fail';
+  clock.advance(60_000);
+  assert.deepEqual(await cache.levels({ workloadId: 'demo' }), { router: null, manager: null });
+  assert.deepEqual(await cache.levels({ workloadId: 'demo' }), { router: null, manager: null });
+  assert.deepEqual(reads, { router: 3, manager: 3 });
+  assert.deepEqual(warnings, [
+    { event: 'JoinLevelUnreadable', workloadId: 'demo', level: 'router', error: 'sync' },
+    { event: 'JoinLevelUnreadable', workloadId: 'demo', level: 'organization', error: 'async' },
+  ]);
+  // A reader that throws at once is tried again as well: nothing stays pending.
+  answers.router = { joinMinutes: 5 };
+  clock.advance(5_000);
+  assert.equal((await cache.levels()).router, 5);
+  const none = createJoinLevelsCache({ now: clock.now, log });
+  assert.deepEqual(await none.levels(), { router: null, manager: null });
 });

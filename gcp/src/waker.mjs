@@ -21,7 +21,7 @@ import { failureKind, nextAttemptAt } from '../../lambda/src/lib/failures.mjs';
 import { WAKE_HEADER, header, response } from '../../lambda/src/lib/http.mjs';
 import { logger } from '../../lambda/src/lib/log.mjs';
 import { renderPage } from '../../lambda/src/lib/page.mjs';
-import { localTime, occurrenceAt } from '../../lambda/src/lib/schedule.mjs';
+import { napEndHeader, napEndOf, occurrenceAt } from '../../lambda/src/lib/schedule.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { createWaker } from '../../lambda/src/lib/waker-core.mjs';
 import { createFirestoreStore } from './firestore.mjs';
@@ -110,9 +110,10 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], n
     if (!KEPT_BY_NAP.includes(state)) return null;
     try {
       const schedule = await getSchedule(workloadId);
-      const occurrence = occurrenceAt(schedule, now());
+      const t = now();
+      const occurrence = occurrenceAt(schedule, t);
       if (occurrence?.kind !== 'nap') return null;
-      return { at: new Date(occurrence.end).toISOString(), local: localTime(occurrence.end, schedule.timeZone), timeZone: schedule.timeZone };
+      return napEndOf(occurrence, schedule.timeZone, t);
     } catch (err) {
       log.warn('ScheduleSkipped', { workloadId, error: err.message });
       return null;
@@ -128,7 +129,7 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], n
     if (!napUntil) return res;
     return {
       ...res,
-      multiValueHeaders: { ...res.multiValueHeaders, [NAP_UNTIL_HEADER]: [napUntil.at] },
+      multiValueHeaders: { ...res.multiValueHeaders, [NAP_UNTIL_HEADER]: [napEndHeader(napUntil)] },
       ...(res.body ? { body: JSON.stringify({ ...JSON.parse(res.body), napUntil }) } : {}),
     };
   }
@@ -165,7 +166,7 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], n
     const failed = retryAt === null ? {} : { failure: failureKind(run), retryInMs: Math.max(0, retryAt - now()) };
     const napUntil = cfg && run ? await napUntilOf(workloadId, state) : null;
     const headers = {
-      ...(napUntil ? { [NAP_UNTIL_HEADER]: napUntil.at } : {}),
+      ...(napUntil ? { [NAP_UNTIL_HEADER]: napEndHeader(napUntil) } : {}),
       'cache-control': 'no-store', 'retry-after': String(pollSeconds), 'x-dormeto-state': state, 'content-type': 'text/html; charset=utf-8',
     };
     if (event.httpMethod === 'HEAD') return response(statusCode, headers);

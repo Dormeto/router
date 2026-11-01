@@ -199,3 +199,131 @@ test('the waker reads the levels only for a workload not awake with a schedule, 
   await up.handler(albEvent());
   assert.equal(up.reads, 0);
 });
+
+// An end that is only the horizon: a daily nap 00:00–23:45, joined at the default, never actually ends.
+const WEDNESDAY = Date.parse('2027-01-13T11:00:00+01:00');
+const endless = (more = {}) => ({ timeZone: 'Europe/Paris', by: 'ops', at: WEDNESDAY, windows: [{ kind: 'nap', start: '00:00', end: '23:45', repeat: { pattern: 'daily' } }], ...more });
+
+test('a nap with no end known: the page and the JSON say so, with no date to believe', async () => {
+  const s = setup({ schedule: endless(), now: WEDNESDAY });
+  const page = await s.handler(albEvent());
+  assert.equal(page.statusCode, 503);
+  assert.deepEqual(s.invocations, []);
+  assert.match(page.body, />Napping on schedule\.</);
+  assert.doesNotMatch(page.body, /Napping on schedule until/);
+  // The probe keeps saying it is a nap, by the header's presence.
+  assert.equal(page.multiValueHeaders['x-dormeto-nap-until'][0], 'unknown');
+  const answer = await s.handler(albEvent({ headers: json }));
+  assert.deepEqual(JSON.parse(answer.body), { status: 'asleep', retryAfter: testConfig().pollSeconds, napUntil: { at: null, local: null, timeZone: 'Europe/Paris' } });
+});
+
+test('a known end more than 6 days away reads with its date, a nearer one as a weekday', async () => {
+  const ending = async (exception) => {
+    const s = setup({ schedule: endless({ exceptions: [exception] }), now: WEDNESDAY });
+    return JSON.parse((await s.handler(albEvent({ headers: json }))).body).napUntil;
+  };
+  assert.deepEqual(await ending('2027-01-20'), { at: '2027-01-19T22:45:00.000Z', local: 'Tue 2027-01-19 23:45', timeZone: 'Europe/Paris' });
+  assert.deepEqual(await ending('2027-01-18'), { at: '2027-01-17T22:45:00.000Z', local: 'Sun 23:45', timeZone: 'Europe/Paris' });
+});
+
+// The levels of joinMinutes, kept 60 seconds per instance: they sit on the partition of the check and the health.
+function counting(options) {
+  const s = setup(options);
+  s.reads = { getRouterSettings: 0, getManagerSettings: 0 };
+  for (const name of Object.keys(s.reads)) {
+    const read = s.store[name];
+    s.store[name] = async () => { s.reads[name]++; return read(); };
+  }
+  s.burst = async (n = 20) => { for (let i = 0; i < n; i++) await s.handler(albEvent()); };
+  return s;
+}
+const SECOND = 1000;
+
+test('a burst reads each level once, and a read again only after 60 seconds', async () => {
+  const s = counting({ schedule: joined(), now: GAP });
+  await s.burst();
+  assert.deepEqual(s.reads, { getRouterSettings: 1, getManagerSettings: 1 });
+  s.clock.advance(60 * SECOND - 1);
+  await s.burst();
+  assert.deepEqual(s.reads, { getRouterSettings: 1, getManagerSettings: 1 });
+  s.clock.advance(1);
+  await s.burst();
+  assert.deepEqual(s.reads, { getRouterSettings: 2, getManagerSettings: 2 });
+});
+
+test('requests at once share the read', async () => {
+  const s = counting({ schedule: joined(), now: GAP });
+  await Promise.all(Array.from({ length: 10 }, () => s.handler(albEvent())));
+  assert.deepEqual(s.reads, { getRouterSettings: 1, getManagerSettings: 1 });
+});
+
+test('a change at a level takes effect within 60 seconds', async () => {
+  for (const change of [
+    (s) => s.store.putRouterSettings({ joinMinutes: 0, by: 'ana', at: 1 }),
+    (s) => s.store.putManagerSettings({ hibernate: true, joinMinutes: 0, etag: null, readAt: 1, error: null }),
+  ]) {
+    const s = counting({ schedule: joined(), now: GAP - 59 * SECOND });
+    await s.handler(albEvent());
+    await change(s);
+    s.clock.advance(59 * SECOND);
+    await s.handler(albEvent());
+    assert.equal(s.invocations.length, 0, 'still the value read: 15 joins the gap');
+    s.clock.advance(SECOND);
+    await s.handler(albEvent());
+    assert.equal(s.invocations.length, 1, 'read again: 0 joins nothing');
+  }
+});
+
+test('a failed read is no value: unset for that request, tried again soon, not at every request of a burst', async () => {
+  // The router's 0 would wake on the request: unread, the default of 15 joins the gap and the page answers.
+  const s = counting({ schedule: joined(), now: GAP });
+  await s.store.putRouterSettings({ joinMinutes: 0, by: 'ana', at: 1 });
+  const read = s.store.getRouterSettings;
+  let failing = true;
+  s.store.getRouterSettings = async () => {
+    if (!failing) return read();
+    s.reads.getRouterSettings++;
+    throw new Error('ThrottlingException');
+  };
+  const unreadable = () => s.logs.filter((l) => l.event === 'JoinLevelUnreadable').length;
+  await s.burst(10);
+  assert.equal(s.reads.getRouterSettings, 1, 'one read in the burst');
+  assert.equal(unreadable(), 1, 'logged once');
+  assert.deepEqual(s.invocations, []);
+  // Soon, not in 60 seconds, and the other level stays kept.
+  s.clock.advance(5 * SECOND - 1);
+  await s.handler(albEvent());
+  assert.equal(s.reads.getRouterSettings, 1);
+  s.clock.advance(1);
+  await s.handler(albEvent());
+  assert.equal(s.reads.getRouterSettings, 2);
+  assert.equal(unreadable(), 2);
+  assert.equal(s.reads.getManagerSettings, 1);
+  assert.deepEqual(s.invocations, []);
+  // Back: its value applies at the next try.
+  failing = false;
+  s.clock.advance(5 * SECOND);
+  await s.handler(albEvent());
+  assert.equal(s.reads.getRouterSettings, 3);
+  assert.equal(s.invocations.length, 1, 'the router\'s 0 joins nothing');
+});
+
+test('a value that a failed read replaced is not kept: a level unread is unset', async () => {
+  const s = counting({ schedule: joined(), now: GAP - 60 * SECOND });
+  await s.store.putRouterSettings({ joinMinutes: 30, by: 'ana', at: 1 });
+  await s.store.putManagerSettings({ hibernate: true, joinMinutes: 0, etag: null, readAt: 1, error: null });
+  await s.handler(albEvent());
+  assert.equal(s.reads.getRouterSettings, 1);
+  s.store.getRouterSettings = async () => { throw new Error('ThrottlingException'); };
+  s.clock.advance(60 * SECOND);
+  await s.handler(albEvent());
+  assert.equal(s.invocations.length, 1, 'the organization\'s 0');
+});
+
+test('a schedule with its own value reads no level, over a burst too', async () => {
+  const s = counting({ schedule: joined({ joinMinutes: 15 }), now: GAP });
+  await s.burst();
+  s.clock.advance(120 * SECOND);
+  await s.burst();
+  assert.deepEqual(s.reads, { getRouterSettings: 0, getManagerSettings: 0 });
+});

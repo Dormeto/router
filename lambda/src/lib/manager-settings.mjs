@@ -33,6 +33,35 @@ export async function joinLevels({ router, manager, log, fields = {} }) {
   return { router: routerValue, manager: managerValue };
 }
 
+// The same levels for the waker, kept in its instance: they sit on the partition of the check and the health, and a request
+// must not read them each time. levels(fields) → { router, manager }. A value (unset is one) is kept ttlMs from the moment
+// it was asked for, so a change shows within ttlMs. A failed read is no value: unset, logged once, and tried again after
+// retryMs, not at each request of a burst. Requests at once share a read.
+export function createJoinLevelsCache({ router, manager, now = Date.now, log, ttlMs = 60_000, retryMs = 5_000 }) {
+  const slots = { router: { reader: router, value: null, until: -Infinity }, organization: { reader: manager, value: null, until: -Infinity } };
+  const read = async (level, fields) => {
+    const slot = slots[level];
+    if (now() < slot.until) return slot.value;
+    const asked = now();
+    slot.loading ??= Promise.resolve().then(() => slot.reader?.()).then((record) => {
+      slot.value = record?.joinMinutes ?? null;
+      slot.until = asked + ttlMs;
+    }, (err) => {
+      log.warn('JoinLevelUnreadable', { ...fields, level, error: err.message });
+      slot.value = null;
+      slot.until = asked + retryMs;
+    }).finally(() => { slot.loading = null; });
+    await slot.loading;
+    return slot.value;
+  };
+  return {
+    async levels(fields = {}) {
+      const [routerValue, managerValue] = await Promise.all([read('router', fields), read('organization', fields)]);
+      return { router: routerValue, manager: managerValue };
+    },
+  };
+}
+
 // s3.getObjectIf({ bucket, key, etag }) → { notModified: true } | { body: Buffer, etag }: the S3 port of lib/catalog.mjs.
 // catalogUrl: the catalog the router reads, which proves an AccessDenied on settings.json means "missing".
 export function createManagerSettings({ s3, url, catalogUrl = null, store, now = Date.now, log, checkMs = CHECK_MS }) {

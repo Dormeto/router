@@ -20,6 +20,7 @@ const TEXTS = {
     one: '1 minute',
     many: ' minutes',
     nap: (local, zone) => `Napping on schedule until ${local} (${zone}).`,
+    napOpen: 'Napping on schedule.',
     days: {},
     reload: 'This page reloads by itself as soon as the application is ready.',
     longer: 'This is taking longer than usual.',
@@ -42,6 +43,7 @@ const TEXTS = {
     one: '1 minute',
     many: ' minutes',
     nap: (local, zone) => `En pause programmée jusqu'à ${local} (${zone}).`,
+    napOpen: 'En pause programmée.',
     days: { Mon: 'lun.', Tue: 'mar.', Wed: 'mer.', Thu: 'jeu.', Fri: 'ven.', Sat: 'sam.', Sun: 'dim.' },
     reload: "Cette page se recharge d'elle-même dès que l'application est prête.",
     longer: "Le démarrage prend plus de temps que d'habitude.",
@@ -220,9 +222,11 @@ export function failureMessage(failure, retryInMs, cloud = 'AWS', language = 'en
   return failure === 'capacity' ? text + t.nextCapacity.replace('{when}', when) : `${text} ${t.nextOther.replace('{when}', when)}`;
 }
 
-// napUntil.local stays as lib/schedule.mjs writes it ('Mon 08:00'); its day is translated here.
+// napUntil.local stays as lib/schedule.mjs writes it ('Mon 08:00', 'Mon 2027-01-25 08:00'); its day is translated here. No
+// local: no end is known, and none is said.
 export function napMessage(napUntil, language = 'en') {
   const t = textsOf(language);
+  if (!napUntil.local) return t.napOpen;
   const local = String(napUntil.local).replace(/^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)(?= )/, (day) => t.days[day] ?? day);
   return t.nap(local, napUntil.timeZone);
 }
@@ -461,7 +465,7 @@ ${script}
 }
 
 // wakeHeader: in browser mode, tells API clients how to wake the workload.
-// napUntil: { at, local, timeZone }, while a nap window keeps the workload asleep.
+// napUntil: { at, local, timeZone }, while a nap window keeps the workload asleep; at and local null when no end is known.
 export const renderJson = ({ state, pollSeconds, wakeHeader, napUntil }) => JSON.stringify({
   status: String(state).toLowerCase(), retryAfter: pollSeconds, ...(wakeHeader ? { wakeHeader } : {}), ...(napUntil ? { napUntil } : {}),
 });

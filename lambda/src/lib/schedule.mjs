@@ -20,6 +20,7 @@ const REPEAT_HORIZON_DAYS = 400;
 const OVERLAP_DAYS = 400;
 // At least what a clock change moves a wall time by: how far a joined gap's local day can be from its minutes.
 const CLOCK_CHANGE_MINUTES = 120;
+const END_DATED_MS = 6 * DAY;
 const INTERVAL_MAX = 99;
 const CRON_LENGTH_MAX = 200;
 const CRON_MINUTES_MAX = WEEK;
@@ -363,9 +364,10 @@ function occurrencesOn(plan, day, kind) {
 }
 
 // The window occurrence active at t, or null. Windows of one kind may overlap, or join across a short gap: the occurrence
-// is the one that started last (its id changes only when a window starts), `end` is where their union ends (within 8 days:
-// when the nap actually ends), and a nap's `wake` is `never` when any active nap window says so. `joinMinutes`: the value
-// the levels resolve to (resolveJoin).
+// is the one that started last (its id changes only when a window starts), `end` is where their union ends (when the nap
+// actually ends), and a nap's `wake` is `never` when any active nap window says so. Read for 8 days at most: when the union
+// goes on past them, `endKnown: false` says `end` is only where the reading stopped. `joinMinutes`: the value the levels
+// resolve to (resolveJoin).
 export function occurrenceAt(s, t, { joinMinutes } = {}) {
   const plan = prepare(s, { joinMinutes });
   if (!plan) return null;
@@ -377,14 +379,21 @@ export function occurrenceAt(s, t, { joinMinutes } = {}) {
   const { kind, window, start } = active.reduce((a, b) => (b.start > a.start ? b : a));
   const same = active.filter((o) => o.kind === kind);
   let end = same.reduce((latest, o) => Math.max(latest, o.end), 0);
+  let endKnown = true;
   // Extend it through the occurrences of this kind that start before it ends, or as it ends, a day at a time.
   for (let day = today + 1; ; day++) {
     for (const o of near.filter((n) => n.kind === kind).sort(byStart)) if (o.start <= end && o.end > end) end = o.end;
-    if (day > today + HORIZON_DAYS || localDay(end, plan.timeZone) < day) break;
+    const lastDay = localDay(end, plan.timeZone);
+    if (lastDay < day) break;
+    if (day > today + HORIZON_DAYS) {
+      // Stopped by the horizon: its end is a true one unless an occurrence not read holds it.
+      for (let unread = day; unread <= lastDay && endKnown; unread++) endKnown = !occurrencesOn(plan, unread, kind).some((o) => o.start <= end && o.end > end);
+      break;
+    }
     near = occurrencesOn(plan, day, kind);
   }
   return {
-    kind, window, id: `${window}@${iso(start)}`, start, end,
+    kind, window, id: `${window}@${iso(start)}`, start, end, ...(endKnown ? {} : { endKnown: false }),
     ...(kind === 'nap' ? { wake: same.some((o) => o.wake === 'never') ? 'never' : 'header' } : {}),
   };
 }
@@ -454,11 +463,23 @@ export function maintenanceDue(s, asleepSince) {
   return s?.maxNapDays && Number.isFinite(asleepSince) ? asleepSince + s.maxNapDays * DAY : null;
 }
 
-// The local weekday and time at t, "Tue 07:00".
-export function localTime(t, timeZone) {
+// The local weekday and time at t, "Tue 07:00". More than 6 days after `now`, a weekday alone would read as the next one:
+// with its date, "Tue 2027-01-19 07:00".
+export function localTime(t, timeZone, { now } = {}) {
   const wall = wallClock(t, timeZone);
-  return `${LABELS[weekday(Math.floor(wall / DAY))]} ${iso(wall).slice(11, 16)}`;
+  const date = now !== undefined && t - now > END_DATED_MS ? `${iso(wall).slice(0, 10)} ` : '';
+  return `${LABELS[weekday(Math.floor(wall / DAY))]} ${date}${iso(wall).slice(11, 16)}`;
 }
+
+// A nap occurrence's end as the page and the JSON say it: { at, local, timeZone }, at and local null when it is only the
+// horizon (endKnown), so nothing shows a date the nap will not end on.
+export function napEndOf({ end, endKnown }, timeZone, now) {
+  if (endKnown === false) return { at: null, local: null, timeZone };
+  return { at: iso(end), local: localTime(end, timeZone, { now }), timeZone };
+}
+
+// The x-dormeto-nap-until header: the page's probe knows a nap by its presence, so a nap with no end known has one too.
+export const napEndHeader = (napEnd) => napEnd.at ?? 'unknown';
 
 const isDayList = (days) => Array.isArray(days) && !!days.length && new Set(days).size === days.length && days.every((d) => DAYS.includes(d));
 

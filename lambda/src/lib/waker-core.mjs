@@ -7,8 +7,8 @@ import { medianOf } from './page-settings.mjs';
 import { ADMIN_PREFIX, parseAdminPath } from './admin.mjs';
 import { compileRules, describeRules } from './no-wake.mjs';
 import { STATS_DAYS } from './summary.mjs';
-import { joinLevels } from './manager-settings.mjs';
-import { isJoinMinutes, localTime, occurrenceAt, resolveJoin } from './schedule.mjs';
+import { createJoinLevelsCache } from './manager-settings.mjs';
+import { isJoinMinutes, napEndHeader, napEndOf, occurrenceAt, resolveJoin } from './schedule.mjs';
 
 const POLL_MS = 1000;
 const STUCK_GRACE_MS = 60_000;
@@ -165,7 +165,7 @@ export function createWaker({ store, invokeController, prefix, workloadIdOf = (e
   }
 
   // failed: { kind, retryAt } of a failed workload (R7a): the page says why and when the next attempt is.
-  // napUntil: { at, local, timeZone } of the nap window that keeps the workload asleep.
+  // napUntil: { at, local, timeZone } of the nap window that keeps the workload asleep (at and local null: no end known).
   // workloadId: whose settings the page reads (null: the two upper levels only); run: for the wake's elapsed and typical time.
   // The settings are read only for the HTML page, which is answered after the wake was triggered and the hold ended.
   async function waiter(event, pollSeconds, state, wakeHeader, failed = null, napUntil = null, { workloadId = null, run = null } = {}) {
@@ -174,7 +174,7 @@ export function createWaker({ store, invokeController, prefix, workloadIdOf = (e
       ? { elapsedMs: Math.max(0, now() - run.wakeStartedAt), typicalMs: typicalWake(run) }
       : null;
     const headers = {
-      ...(napUntil ? { 'x-dormeto-nap-until': napUntil.at } : {}),
+      ...(napUntil ? { 'x-dormeto-nap-until': napEndHeader(napUntil) } : {}),
       'cache-control': 'no-store', 'retry-after': String(pollSeconds), 'x-dormeto-state': state,
       ...(failed?.kind ? { 'x-dormeto-failure': failed.kind } : {}),
       ...(failed?.retryAt ? { 'x-dormeto-retry-at': new Date(failed.retryAt).toISOString() } : {}),
@@ -195,22 +195,22 @@ export function createWaker({ store, invokeController, prefix, workloadIdOf = (e
     return response(503, { ...headers, 'content-type': 'application/json' }, renderJson({ state, pollSeconds, wakeHeader, napUntil }));
   }
 
+  const joinCache = createJoinLevelsCache({ router: () => store.getRouterSettings?.(), manager: () => store.getManagerSettings?.(), now, log });
+
   // The nap window active now for a workload that is not awake, or null. A bad stored schedule counts as none. The levels
-  // of joinMinutes are read only here, and not when the schedule sets its own.
+  // of joinMinutes are read only here, kept 60 seconds, and not when the schedule sets its own.
   async function napWindow(workloadId, run) {
     if (![STATES.ASLEEP, STATES.NAPPING, STATES.FAILED].includes(run.state)) return null;
     try {
       const schedule = await store.getSchedule(workloadId);
       if (!schedule) return null;
-      const joins = isJoinMinutes(schedule.joinMinutes) ? {} : await joinLevels({
-        router: () => store.getRouterSettings?.(), manager: () => store.getManagerSettings?.(), log, fields: { workloadId },
-      });
+      const joins = isJoinMinutes(schedule.joinMinutes) ? {} : await joinCache.levels({ workloadId });
       const t = now();
       const occurrence = occurrenceAt(schedule, t, { joinMinutes: resolveJoin({ workload: schedule.joinMinutes, ...joins }).joinMinutes });
       if (occurrence?.kind !== 'nap') return null;
       return {
         wake: occurrence.wake ?? 'never',
-        until: { at: new Date(occurrence.end).toISOString(), local: localTime(occurrence.end, schedule.timeZone), timeZone: schedule.timeZone },
+        until: napEndOf(occurrence, schedule.timeZone, t),
       };
     } catch (err) {
       log.warn('ScheduleSkipped', { workloadId, error: err.message });

@@ -125,6 +125,22 @@ test('English with nothing set is what it was; the failure and nap helpers keep 
   assert.doesNotMatch(bodyOf(html), /progressbar|<img/);
 });
 
+test('a nap with no end known says so, in both languages, with no until', () => {
+  const none = { at: null, local: null, timeZone: 'Europe/Paris' };
+  assert.equal(napMessage(none), 'Napping on schedule.');
+  assert.equal(napMessage(none, 'fr'), 'En pause programmée.');
+  assert.equal(status(renderPage({ ...waking, napUntil: none })), 'Napping on schedule.');
+  assert.equal(status(renderPage({ ...waking, language: 'fr', napUntil: none })), 'En pause programmée.');
+  assert.doesNotMatch(bodyOf(renderPage({ ...waking, napUntil: none })), /progressbar/);
+  assert.deepEqual(JSON.parse(renderJson({ state: 'ASLEEP', pollSeconds: 5, napUntil: none })), { status: 'asleep', retryAfter: 5, napUntil: none });
+});
+
+test('a nap\'s end with its date: the day is translated, the date stays', () => {
+  const far = { at: 'x', local: 'Mon 2027-01-25 08:00', timeZone: 'Europe/Paris' };
+  assert.equal(napMessage(far), 'Napping on schedule until Mon 2027-01-25 08:00 (Europe/Paris).');
+  assert.equal(napMessage(far, 'fr'), "En pause programmée jusqu'à lun. 2027-01-25 08:00 (Europe/Paris).");
+});
+
 test('a nap window names its day in French; the time and the zone stay', () => {
   const days = { Mon: 'lun.', Tue: 'mar.', Wed: 'mer.', Thu: 'jeu.', Fri: 'ven.', Sat: 'sam.', Sun: 'dim.' };
   for (const [en, fr] of Object.entries(days)) {

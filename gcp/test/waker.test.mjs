@@ -533,6 +533,30 @@ test('the page says no nap when none keeps the workload: waking or awake in the 
   assert.match(awakeWindow.body, /<h1[^>]*>Waking up/);
 });
 
+test('a nap with no end known: the page and the probe say so, with no date', async () => {
+  // A nap every day that joins the next: 22:13 UTC on the fake clock, in Tuesday's occurrence, going on past the horizon.
+  const schedule = { timeZone: 'UTC', windows: [{ kind: 'nap', start: '00:00', end: '23:45', repeat: { pattern: 'daily' } }], by: 'ops', at: 1 };
+  const { handler } = napping({ schedule });
+  const page = await handler(request());
+  assert.match(page.body, /<h1[^>]*>Napping on schedule\.<\/h1>/);
+  assert.equal(headerOf(page, 'x-dormeto-nap-until'), 'unknown');
+  const head = await handler(request({ method: 'HEAD' }));
+  assert.equal(headerOf(head, 'x-dormeto-nap-until'), 'unknown');
+  const probed = await handler(probe());
+  assert.equal(headerOf(probed, 'x-dormeto-nap-until'), 'unknown');
+  assert.deepEqual(JSON.parse(probed.body).napUntil, { at: null, local: null, timeZone: 'UTC' });
+  // A probe a filter settles before the shared code reads the window.
+  const bot = await handler(probe({ 'user-agent': 'Googlebot/2.1' }));
+  assert.equal(headerOf(bot, 'x-dormeto-nap-until'), 'unknown');
+  assert.deepEqual(JSON.parse(bot.body).napUntil, { at: null, local: null, timeZone: 'UTC' });
+});
+
+test('a known end more than 6 days away reads with its date at the fetch', async () => {
+  const schedule = { timeZone: 'UTC', windows: [{ kind: 'nap', repeat: { pattern: 'cron', cron: '0 22 14 11 *', minutes: 10080 } }], by: 'ops', at: 1 };
+  const page = await napping({ schedule }).handler(request());
+  assert.match(page.body, /<h1[^>]*>Napping on schedule until Tue 2023-11-21 22:00 \(UTC\)\.<\/h1>/);
+});
+
 test('a HEAD at the fetch says the end in its headers', async () => {
   const res = await napping().handler(request({ method: 'HEAD' }));
   assert.equal(res.statusCode, 200);

@@ -293,6 +293,7 @@ aws lambda invoke --function-name dmt-dev-controller --cli-binary-format raw-in-
   - The most specific level that sets it wins: `joinMinutes` on the workload's schedule, the router's (the controller's
     `settings` action), the organization's (`workloads.joinMinutes` in the manager's `settings.json`, within 5 minutes), else
     15. A level that cannot be read counts as unset, logged `JoinLevelUnreadable`. On Google Cloud: the workload's, else 15.
+    The waker keeps the router's and the organization's values for 60 seconds, so a change there reaches it within a minute.
   - Not joined: two kinds, a gap where the other kind starts, a start an exception date or a range removes. The overlap
     check on save compares windows as written.
   - `status` and the `schedule` action answer `joinMinutes`, `joinFrom` (`workload`, `router`, `organization` or `default`) and
@@ -314,8 +315,10 @@ aws lambda invoke --function-name dmt-dev-controller --cli-binary-format raw-in-
   hold ends if the window is still active.
 - **The waker in a nap window:** a request that would wake gets the waiter page instead (nothing starts, nothing is
   held), unless the window's `wake` is `header` and the request carries `x-dormeto-wake: 1`. No-wake rules still apply
-  first. The page tells when the nap ends, and the JSON body has `napUntil` (`{at, local, timeZone}`); the response also
-  carries `x-dormeto-nap-until`. Refused requests count as `ignored:schedule`. The manager's Wake still wakes (cause
+  first. The page tells when the nap ends, with its date when that is more than 6 days away, and the JSON body has `napUntil`
+  (`{at, local, timeZone}`); the response also carries `x-dormeto-nap-until`. A nap that goes on past the 8 days read, such as
+  windows that keep joining, has no end to tell: the page says "Napping on schedule.", `at` and `local` are null, and the header
+  is `unknown`. Refused requests count as `ignored:schedule`. The manager's Wake still wakes (cause
   `manager`).
 - **Maximum nap:** an asleep workload that has slept more than `maxNapDays` (from its run item's `stateAt`) is woken
   for maintenance (cause `maintenance`, counted `wake:maintenance`, never as traffic) and napped again by the idle

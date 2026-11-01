@@ -70,7 +70,8 @@ export function createManagerSettings({ s3, url, catalogUrl = null, store, now =
     // The page to copy (null: none), or undefined: leave the copy as it is.
     let page;
     try {
-      const out = await s3.getObjectIf({ bucket: where.bucket, key: where.key, etag: last.etag });
+      // A copy stored before this router read the page (pageRead) has an ETag of an object whose page nobody copied: read it afresh once.
+      const out = await s3.getObjectIf({ bucket: where.bucket, key: where.key, etag: last.pageRead ? last.etag : null });
       if (out.notModified) next = { ...last, readAt: at, error: null };
       else {
         page = waitingPageOf(out.body.toString('utf8'));
@@ -96,10 +97,11 @@ export function createManagerSettings({ s3, url, catalogUrl = null, store, now =
     if (page !== undefined) {
       try {
         await copyPage(page);
+        next = { ...next, pageRead: true };
       } catch (err) {
         // Not copied: the ETag is not kept, so the next read brings the object again. Hibernate is stored all the same.
         log.warn('WaitingPageNotCopied', { error: err.message });
-        next = { ...next, etag: last.etag };
+        next = { ...next, etag: last.etag, pageRead: false };
       }
     }
     await store.putManagerSettings(next);

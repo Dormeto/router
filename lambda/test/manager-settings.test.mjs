@@ -47,7 +47,7 @@ test('the first refresh stores the value, its ETag and the time', async () => {
   s.s3.put('settings.json', { workloads: { hibernate: false } });
   await s.settings.refresh();
   assert.deepEqual(await s.settings.current(), { hibernate: false, readAt: s.clock.now(), error: null });
-  assert.deepEqual(s.store.state.managerSettings, { hibernate: false, etag: '"e1"', readAt: s.clock.now(), error: null });
+  assert.deepEqual(s.store.state.managerSettings, { hibernate: false, etag: '"e1"', readAt: s.clock.now(), error: null, pageRead: true });
   assert.deepEqual(s.s3.calls, [{ bucket: 'dmt-dev-manager-ip-lists-1', key: 'settings.json', etag: null }]);
 });
 
@@ -276,4 +276,31 @@ test('a copy that cannot be written is logged and tried again at the next read (
   await settings.refresh();
   assert.deepEqual(s.store.state.pages.organization.page, ORG);
   assert.equal(s.store.state.managerSettings.etag, '"e1"');
+});
+
+test('a settings item stored before the page was read (an upgraded router) ignores its ETag once, so the page is copied; then a 304 is a 304', async () => {
+  const s = setup();
+  s.s3.put('settings.json', { workloads: { hibernate: false }, waitingPage: ORG });
+  // What 0.34.0 left: the ETag of the very object, no mark that the page was read.
+  s.store.state.managerSettings = { hibernate: false, etag: '"e1"', readAt: s.clock.now() - 10 * MIN, error: null };
+  await s.settings.refresh();
+  assert.deepEqual(s.s3.calls.map((c) => c.etag), [null]);
+  assert.deepEqual(s.store.state.pages.organization.page, ORG);
+  assert.equal(s.store.state.managerSettings.pageRead, true);
+  s.clock.advance(5 * MIN);
+  await s.settings.refresh();
+  assert.deepEqual(s.s3.calls.map((c) => c.etag), [null, '"e1"']);
+  assert.equal(s.store.state.managerSettings.pageRead, true, 'kept by a 304');
+});
+
+test('the page is not marked read while its copy fails or the file cannot be parsed', async () => {
+  const s = setup();
+  s.s3.put('settings.json', '{"waitingPage":');
+  await s.settings.refresh();
+  assert.notEqual(s.store.state.managerSettings.pageRead, true);
+  s.s3.put('settings.json', { waitingPage: ORG });
+  s.store.putWaitingPage = async () => { throw new Error('throttled'); };
+  s.clock.advance(5 * MIN);
+  await s.settings.refresh();
+  assert.notEqual(s.store.state.managerSettings.pageRead, true);
 });

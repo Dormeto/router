@@ -462,7 +462,7 @@ test('the waiting page levels have their own items: WL#<id>/PAGE and ROUTER/PAGE
     { pk: { S: 'WL#shop' }, sk: { S: 'PAGE' } }, { pk: { S: 'ROUTER' }, sk: { S: 'PAGE' } }
   ]);
   const [, put] = dynamo.calls[0];
-  assert.equal(put.UpdateExpression, 'SET #mode = :mode, #title = :title, #description = :description, #by = :by, #at = :at REMOVE #icon, #html, #page');
+  assert.equal(put.UpdateExpression, 'SET #mode = :mode, #title = :title, #description = :description, #by = :by, #at = :at REMOVE #icon, #html');
   const values = put.ExpressionAttributeValues;
   assert.deepEqual([values[':mode'], values[':title'], values[':description'], values[':by'], values[':at']],
     [{ S: 'template' }, { S: 'Acme' }, { S: 'Sleeps.\nWakes.' }, { S: 'ana' }, { N: '5' }]);
@@ -491,6 +491,14 @@ test('the largest page, with the characters that used to expand, stays under Dyn
     const size = sizeOf(dynamo.calls[0][1]);
     assert.ok(size > 255 * 1024 && size < 257 * 1024 + 512, `${JSON.stringify(filler)}: ${size} bytes`);
   }
+});
+
+test('putWaitingPage leaves no trace of a nested `page` attribute: no such item exists', async () => {
+  const dynamo = fakeDynamo({ updateItem: async () => ({}) });
+  await createStore({ dynamo, table: 't' }).putWaitingPage({ workloadId: 'shop' }, { mode: 'template', title: 'T' }, { by: 'ana', at: 5 });
+  const input = dynamo.calls[0][1];
+  assert.ok(!/#page\b/.test(input.UpdateExpression), input.UpdateExpression);
+  assert.ok(!('#page' in input.ExpressionAttributeNames));
 });
 
 test('getWaitingPage reads { page, by, at } from the attributes (no by: written by Terraform), eventually consistent on request; an item with no mode reads as none', async () => {

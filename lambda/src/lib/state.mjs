@@ -405,15 +405,14 @@ export function createStore({ dynamo, table, now = Date.now, log = null }) {
     async putWaitingPage(level, page, { by, at }) {
       const present = PAGE_FIELDS.filter((field) => typeof page[field] === 'string');
       const absent = PAGE_FIELDS.filter((field) => !present.includes(field));
-      const names = { '#by': 'by', '#at': 'at', '#page': 'page' };
+      const names = { '#by': 'by', '#at': 'at' };
       const values = { ':by': { S: String(by ?? '') }, ':at': { N: String(at) } };
       for (const field of PAGE_FIELDS) names[`#${field}`] = field;
       for (const field of present) values[`:${field}`] = { S: page[field] };
       await dynamo.updateItem({
         TableName: table, Key: pageKey(level),
-        // #page: the nested JSON of a first draft, removed with the rest.
-        UpdateExpression: `SET ${[...present.map((f) => `#${f} = :${f}`), '#by = :by', '#at = :at'].join(', ')} REMOVE ${[...absent.map((f) => `#${f}`), '#page'].join(', ')}`,
-        ExpressionAttributeNames: Object.fromEntries(Object.entries(names).filter(([name]) => name === '#by' || name === '#at' || name === '#page' || present.includes(name.slice(1)) || absent.includes(name.slice(1)))),
+        UpdateExpression: `SET ${[...present.map((f) => `#${f} = :${f}`), '#by = :by', '#at = :at'].join(', ')}${absent.length ? ` REMOVE ${absent.map((f) => `#${f}`).join(', ')}` : ''}`,
+        ExpressionAttributeNames: Object.fromEntries(Object.entries(names).filter(([name]) => name === '#by' || name === '#at' || present.includes(name.slice(1)) || absent.includes(name.slice(1)))),
         ExpressionAttributeValues: values,
       });
     },

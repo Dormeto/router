@@ -216,6 +216,50 @@ variable "hibernate" {
   default     = null
 }
 
+variable "waiting_page" {
+  description = "The workload's waiting page (router 0.35.0), written to its own item (never to the configuration), same limits as the manager's: mode \"template\" (icon, title, description) or \"custom\" (html, the customer's own full page; set by an administrator in the manager, here by whoever applies). icon: \"auto\" (the application's favicon, read while it was awake; the default when nothing is set), \"none\", or a data:image/png|jpeg|webp|svg+xml|x-icon;base64 URI of at most 64 KiB, for example \"data:image/png;base64,$${filebase64(\"logo.png\")}\". title: plain text, at most 80 characters, one line. description: plain text, at most 500 characters, line breaks kept. html: UTF-8 of at most 256 KiB, for example file(\"waiting.html\"). The workload then refuses changes from the manager. HCL checks what it can; the router checks the rest (an image's type from its bytes, the page's size in bytes) and shows the built-in value for a field that is not valid. null: nothing written, and removing it removes the item it created."
+  type = object({
+    mode        = string
+    icon        = optional(string)
+    title       = optional(string)
+    description = optional(string)
+    html        = optional(string)
+  })
+  default = null
+  validation {
+    condition     = var.waiting_page == null ? true : contains(["template", "custom"], var.waiting_page.mode)
+    error_message = "waiting_page.mode must be template or custom."
+  }
+  validation {
+    condition     = var.waiting_page == null ? true : (var.waiting_page.mode != "template" || var.waiting_page.html == null)
+    error_message = "waiting_page: html belongs to a custom page, not to a template."
+  }
+  validation {
+    condition     = var.waiting_page == null ? true : (var.waiting_page.mode != "custom" || (var.waiting_page.icon == null && var.waiting_page.title == null && var.waiting_page.description == null))
+    error_message = "waiting_page: a custom page is its html alone, without icon, title or description."
+  }
+  validation {
+    condition     = var.waiting_page == null ? true : (var.waiting_page.icon == null ? true : (contains(["auto", "none"], var.waiting_page.icon) || (length(var.waiting_page.icon) <= 100000 && can(regex("^data:image/(png|jpeg|webp|svg\\+xml|x-icon);base64,[A-Za-z0-9+/]+={0,2}$", var.waiting_page.icon)))))
+    error_message = "waiting_page.icon must be auto, none, or a data:image/png, jpeg, webp, svg+xml or x-icon base64 URI of at most 64 KiB."
+  }
+  validation {
+    condition     = var.waiting_page == null ? true : (var.waiting_page.title == null ? true : (trimspace(var.waiting_page.title) != "" && can(regex("^[^\\x00-\\x1f\\x7f\\x{2028}\\x{2029}]{1,80}$", var.waiting_page.title))))
+    error_message = "waiting_page.title must be one line of text of at most 80 characters."
+  }
+  validation {
+    condition     = var.waiting_page == null ? true : (var.waiting_page.description == null ? true : (trimspace(var.waiting_page.description) != "" && can(regex("^[^\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f]{1,500}$", var.waiting_page.description))))
+    error_message = "waiting_page.description must be text of at most 500 characters."
+  }
+  validation {
+    condition     = var.waiting_page == null ? true : (var.waiting_page.mode != "custom" || (var.waiting_page.html != null && trimspace(coalesce(var.waiting_page.html, " ")) != ""))
+    error_message = "waiting_page: a custom page needs its html, not blank."
+  }
+  validation {
+    condition     = var.waiting_page == null ? true : (var.waiting_page.html == null ? true : (length(var.waiting_page.html) <= 262144 && length(base64encode(var.waiting_page.html)) <= 349528))
+    error_message = "waiting_page.html must be at most 256 KiB."
+  }
+}
+
 variable "tags" {
   description = "Dormeto's own labels of the workload, key and value (for example { team = \"payments\", env = \"staging\" }), never AWS tags: the manager groups and grants access by them (router 0.30.0, manager 0.14.0). At most 50; a key of 1 to 128 characters and a value of at most 256, in letters, digits, spaces and _ . : / = + - @; keys are case-sensitive; the prefix dormeto: is reserved."
   type        = map(string)

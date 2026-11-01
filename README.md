@@ -334,6 +334,42 @@ refuses becomes a stop, so it never fails a nap.
 - **Access: nothing to apply again.** `ec2:StopInstances` and `ec2:DescribeInstances` were already granted, and the routers
   already read the catalog's prefix.
 
+**Waiting page (router 0.35.0):** the page a visitor sees while a workload wakes takes a template (icon, title, description) or
+the customer's own full HTML, at three levels, each overriding the one above: the workload, the router, the organization.
+Dormeto's own sentences are English or French by the visitor's `Accept-Language` (the answer says `vary: accept-language`),
+and a progress bar follows the workload's real wake times.
+
+- **The document:** `{ "mode": "template", "icon": "auto", "title": "Acme portal", "description": "..." }` or
+  `{ "mode": "custom", "html": "<!doctype html>..." }`. `icon` is `auto` (the application's favicon), `none`, or a
+  `data:image/...;base64` URI of at most 64 KiB (PNG, JPEG, WebP, SVG, ICO, checked by the bytes); `title` at most 80
+  characters; `description` at most 500; `html` at most 256 KiB. The most specific level with a document decides the mode; a
+  template takes each field from the most specific template that has it (nothing set is a template with `icon: auto`). A
+  stored value no check saw (Terraform, a hand-edited `settings.json`) is read through the same rules: a bad field is
+  dropped, a custom page with no valid `html` is no document, and the page still answers.
+- **Where each level lives:** the workload's in its own item `WL#<id> / PAGE` (written by the `workload` module's
+  `waiting_page`, with no `by`, or by the manager), the router's at `ROUTER / PAGE` (the controller's `waiting-page`
+  action), the organization's in the `waitingPage` key of the manager's `settings.json`, which the check copies to
+  `ROUTER / ORGANIZATION-PAGE` apart from `hibernate` (a bad one never unreads the other). Never fields of the
+  configuration: the check scans it, and a page weighs up to 256 KiB. `deleteWorkload` removes the item and the favicon's.
+- **Terraform:** `waiting_page = { mode = "template", icon = "data:image/png;base64,${filebase64("logo.png")}", title = "..." }`
+  or `{ mode = "custom", html = file("waiting.html") }`; null writes nothing. The workload then refuses changes from the
+  manager (a delete too, of an item without `by`).
+- **The favicon:** a nap reads the application's home page (`https://<first literal host of its rules>/`, certificates
+  checked, `dormeto-router`, at most 3 redirects on the same host, 256 KiB), takes its `icon`, `shortcut icon` or
+  `apple-touch-icon` link, else `/favicon.ico`, and keeps it (at most 64 KiB, its type from its bytes) in `WL#<id> / FAVICON`.
+  It runs only when the page is a template with `icon: auto`, at most once in 24 hours whatever the outcome, inside a 3 s
+  budget, after every check of the nap passed and just before the route switches; it never fails or changes the nap. An
+  internal load balancer, a wildcard or host-less rule, an `http:`-only listener or a favicon behind a login gives no
+  icon: upload one.
+- **The progress bar:** a wake that reaches `AWAKE` adds its duration to the run's `recentWakes` (the last 10); the page
+  uses their median. Answers in `WAKING` carry `x-dormeto-wake-elapsed` (ms) and, with a recorded wake,
+  `x-dormeto-wake-typical`. A custom page gets the probe at the very start of its document and its `data-dormeto`
+  hooks (`status`, `elapsed`, `progress`) and the `dormeto:state` event; a template answer carries a content security policy,
+  a custom one none.
+- **The waker reads these settings** only when it answers an HTML page, after the wake was triggered, cached 60 seconds per
+  warm instance (200 workloads at most); a read that fails keeps the last value and logs `WaitingPageUnread`.
+- **Access: nothing to apply again.**
+
 **Health** (`router` action, manager Routers view): the last scheduled idle check (late after three periods: an error,
 workloads do not nap), Lambda errors and throttles of the controller and the waker over 24 hours and the waker's peak
 concurrency, messages waiting in the `check-failures` and `controller-failures` queues, IP lists' last download, failed

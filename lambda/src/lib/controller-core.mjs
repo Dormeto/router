@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { STATES } from './state.mjs';
 import { checkName } from './names.mjs';
 import { currentTarget, hostOf, setRoute } from './route.mjs';
+import { readFavicon } from './favicon.mjs';
 import { dormetoTargetGroup, ingressDrift, routeIngress } from './kube-route.mjs';
 import { checkRights } from './kube-access.mjs';
 import { pingProxy } from './k8s.mjs';
@@ -31,6 +32,9 @@ const STOP_TIMEOUT_MS = 5 * 60_000;
 // Longest wait for the target group to drop the stopped backends (deregistration delay included).
 const RELEASE_TIMEOUT_MS = 2 * 60_000;
 const NAPPING_STUCK_MS = 15 * 60_000;
+// The application's favicon (waiting page design §6): read at a nap at most once in this time, within this budget.
+const FAVICON_EVERY_MS = 86_400_000;
+const FAVICON_BUDGET_MS = 3000;
 const WAKING_STUCK_GRACE_MS = 60_000;
 // Stop working this long before the Lambda timeout, so that a failure is recorded instead of a silent kill.
 const TIMEOUT_MARGIN_MS = 30_000;
@@ -69,6 +73,8 @@ export function createController({
   // The drift queue: the check's repair requests, read with the drift events by the onboarder (2 at a time).
   queueRepair = null,
   publisher = { enabled: false, checked: async () => {}, stateChanged: async () => {} },
+  // The favicon read of a nap (lib/favicon.mjs): the network and its time budget, injected for the tests.
+  fetch = globalThis.fetch, faviconBudgetMs = FAVICON_BUDGET_MS,
 }) {
   const clients = { ec2, elbv2, autoscaling, ecs, tagging, appscaling, rds, kubernetesOf };
   let budgetEnd = Infinity;
@@ -210,11 +216,13 @@ export function createController({
       return { state: 'SKIPPED', reason: 'no-instances' };
     }
     // A rule the router cannot switch would send traffic to the stopped backend: no nap until it is fixed.
-    const { issues } = await rulesFor(cfg);
+    const { issues, rules } = await rulesFor(cfg);
     if (issues.length) {
       log.warn('NapSkipped', { workloadId, reason: 'rules not instrumented', issues: reasons(issues) });
       return { state: 'SKIPPED', reason: 'rules not instrumented', issues: reasons(issues) };
     }
+    // The nap is decided, and the route still reaches the application: the only moment its home page can be read.
+    await cacheFavicon(cfg, rules);
     const napping = await store.transition(workloadId, {
       cond: { state: STATES.AWAKE },
       set: { state: STATES.NAPPING, napBackends: JSON.stringify(backends.map(toRecord)) },
@@ -292,6 +300,34 @@ export function createController({
     if (!waking) return { state: 'UNKNOWN' };
     log.info('WakeRequested', { workloadId, wakeId, reason: 'pendingWake' });
     return wake(workloadId, wakeId, cfg);
+  }
+
+  // The application's favicon for the waiting page (design §6), when the page would show it (a template with icon auto) and the
+  // last read, successful or not, is over 24 hours old. The FAVICON item is read first, the levels only when due. Never fails,
+  // holds longer than its budget or changes the nap: whatever goes wrong is logged and the nap goes on.
+  async function cacheFavicon(cfg, rules) {
+    const { workloadId } = cfg;
+    let timer;
+    const work = (async () => {
+      const last = await store.getFavicon(workloadId);
+      if (last?.fetchedAt > now() - FAVICON_EVERY_MS) return;
+      const [organization, router_, workload] = await Promise.all([store.getWaitingPage('organization'), store.getWaitingPage('router'), store.getWaitingPage({ workloadId })]);
+      const page = resolvePage(organization?.page, router_?.page, workload?.page);
+      if (page.mode !== 'template' || page.icon !== 'auto') return;
+      // The first host name of the rules that has no wildcard.
+      const host = (rules ?? []).map(hostOf).find((h) => h && !/[*?]/.test(h));
+      const { icon, error } = await readFavicon(host, { fetch, now, budgetMs: faviconBudgetMs });
+      await store.putFavicon(workloadId, { icon: icon ?? last?.icon ?? null, fetchedAt: now(), error });
+    })();
+    // The store's calls are inside the budget too: one that hangs ends the wait, and its late result is nobody's.
+    work.catch(() => {});
+    try {
+      await Promise.race([work, new Promise((resolve) => { timer = setTimeout(resolve, faviconBudgetMs + 500); })]);
+    } catch (err) {
+      log.warn('FaviconSkipped', { workloadId, error: err.message });
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   // A wake that completes after the run was hibernated HIBERNATION_MAX_DAYS or more (whatever woke it: a schedule's

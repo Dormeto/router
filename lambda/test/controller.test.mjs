@@ -32,11 +32,14 @@ function setup({ run, instance = 'running', target = 'app', healthy = 1, metric 
   const log = { ...silentLog };
   // managerSettings: a fake, or ({ store, clock }) → the real reader on this store (lib/manager-settings.mjs).
   const settings = typeof managerSettings === 'function' ? managerSettings({ store, clock }) : managerSettings;
+  // The favicon's network: none unless a test sets network.fetch, so that no test reaches one.
+  const network = { fetch: async () => { throw new Error('no network in tests'); }, calls: [] };
   const handler = createController({
+    fetch: (...args) => { network.calls.push(args[0]); return network.fetch(...args); }, faviconBudgetMs: 50,
     store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, kubernetesOf: kubernetesOf ?? (k8s ? async () => k8s : undefined), lambda,
     invokeSelf: async (payload) => { invocations.push(payload); }, now: clock.now, sleep: clock.sleep, newId: () => `wake-${++ids}`, log, managerSettings: settings,
   });
-  return { handler, store, ec2, elbv2, cloudwatch, autoscaling, ecs, appscaling, rds, clock, cfg, invocations, log, settings };
+  return { handler, store, ec2, elbv2, cloudwatch, autoscaling, ecs, appscaling, rds, clock, cfg, invocations, log, settings, network };
 }
 
 test('wake: starts the instance, waits for health, switches the route and becomes AWAKE', async () => {
@@ -2223,4 +2226,146 @@ test('a 256 KiB page and a recentWakes list reach neither the list, the status n
     assert.ok(!out.includes('zzzzzzzz') && !out.includes('AAAAAAAA'), event.action);
     assert.ok(out.length < 20_000, `${event.action}: ${out.length}`);
   }
+});
+
+// --- The favicon read in nap() (design §6) -------------------------------------------------------------------------------
+
+const PNG_BYTES = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+const PNG_URI = `data:image/png;base64,${PNG_BYTES.toString('base64')}`;
+const DAY = 86_400_000;
+// A fetch for demo.example.com: its home page links /f.png.
+const app = (s, { onPage } = {}) => {
+  s.network.fetch = async (url) => {
+    if (url === 'https://demo.example.com/') { onPage?.(); return new Response('<link rel="icon" href="/f.png">', { status: 200 }); }
+    if (url === 'https://demo.example.com/f.png') return new Response(PNG_BYTES, { status: 200 });
+    return new Response('', { status: 404 });
+  };
+};
+const hostRule = (s, ...hosts) => { s.elbv2.state.rules.get(s.cfg.ruleArn).conditions = hosts.map(host); };
+const napped = async (s) => (await s.handler({ action: 'nap', workloadId: 'demo' })).state;
+
+test('nap: the favicon is read once every check passed and just before the NAPPING transition, while the route still goes to the application; cached with its date', async () => {
+  const s = setup({ run: { state: STATES.AWAKE } });
+  hostRule(s, 'demo.example.com');
+  const seen = [];
+  app(s, { onPage: () => seen.push([s.store.state.run.state, routeOf(s.elbv2, s.cfg)]) });
+  const at = s.clock.now();
+  assert.equal(await napped(s), STATES.ASLEEP);
+  assert.deepEqual(seen, [[STATES.AWAKE, 'app']]);
+  assert.deepEqual(s.network.calls, ['https://demo.example.com/', 'https://demo.example.com/f.png']);
+  assert.deepEqual(s.store.state.favicons.demo, { icon: PNG_URI, fetchedAt: at, error: null });
+});
+
+test('nap: the favicon is due once in 24 hours, successful or not; the FAVICON item is read first and the levels only when due', async () => {
+  const s = setup({ run: { state: STATES.AWAKE } });
+  hostRule(s, 'demo.example.com');
+  app(s);
+  const levels = [];
+  const getPage = s.store.getWaitingPage;
+  s.store.getWaitingPage = async (level, ...rest) => { levels.push(level); return getPage(level, ...rest); };
+  s.store.state.favicons.demo = { icon: null, fetchedAt: s.clock.now() - DAY + 60_000, error: 'the page answered 401' };
+  assert.equal(await napped(s), STATES.ASLEEP);
+  assert.deepEqual([s.network.calls, levels], [[], []], 'read less than a day ago, even when it failed: nothing read');
+
+  s.store.state.run.state = STATES.AWAKE;
+  s.store.state.favicons.demo.fetchedAt = s.clock.now() - DAY - 1;
+  assert.equal(await napped(s), STATES.ASLEEP);
+  assert.equal(s.network.calls.length, 2);
+  assert.equal(levels.length, 3, 'organization, router, workload');
+});
+
+test('nap: the read happens only for a template with icon auto: not for none, an upload or a custom page, at any level', async () => {
+  for (const [name, pages] of [
+    ['none at the organization', { organization: { mode: 'template', icon: 'none' } }],
+    ['an upload at the router', { router: { mode: 'template', icon: PNG_URI } }],
+    ['a custom page at the workload', { 'WL#demo': { mode: 'custom', html: '<p data-dormeto="status"></p>' } }],
+    ['a custom page above an auto template', { organization: { mode: 'template', icon: 'auto' }, router: { mode: 'custom', html: '<p>x</p>' } }],
+  ]) {
+    const s = setup({ run: { state: STATES.AWAKE } });
+    hostRule(s, 'demo.example.com');
+    app(s);
+    for (const [level, page] of Object.entries(pages)) s.store.state.pages[level] = { page, by: 'ana', at: 1 };
+    assert.equal(await napped(s), STATES.ASLEEP, name);
+    assert.deepEqual([name, s.network.calls, s.store.state.favicons], [name, [], {}]);
+  }
+  const auto = setup({ run: { state: STATES.AWAKE } });
+  hostRule(auto, 'demo.example.com');
+  app(auto);
+  auto.store.state.pages.organization = { page: { mode: 'template', icon: 'auto', title: 'Org' }, by: 'ana', at: 1 };
+  await napped(auto);
+  assert.equal(auto.network.calls.length, 2, 'auto explicitly');
+});
+
+test('nap: a read that throws, hangs or finds nothing leaves the nap going; a failed read keeps the last icon, records the error and waits 24 hours', async () => {
+  const boom = setup({ run: { state: STATES.AWAKE } });
+  hostRule(boom, 'demo.example.com');
+  boom.network.fetch = async () => { throw new TypeError('fetch failed'); };
+  assert.equal(await napped(boom), STATES.ASLEEP);
+  assert.deepEqual([boom.store.state.favicons.demo.icon, boom.store.state.favicons.demo.error], [null, 'fetch failed']);
+
+  const hang = setup({ run: { state: STATES.AWAKE } });
+  hostRule(hang, 'demo.example.com');
+  hang.network.fetch = () => new Promise(() => {});
+  const started = Date.now();
+  assert.equal(await napped(hang), STATES.ASLEEP);
+  assert.ok(Date.now() - started < 1500);
+  assert.match(hang.store.state.favicons.demo.error, /time budget/);
+
+  const kept = setup({ run: { state: STATES.AWAKE } });
+  hostRule(kept, 'demo.example.com');
+  kept.network.fetch = async () => new Response('', { status: 401 });
+  kept.store.state.favicons.demo = { icon: PNG_URI, fetchedAt: kept.clock.now() - DAY - 1, error: null };
+  const at = kept.clock.now();
+  assert.equal(await napped(kept), STATES.ASLEEP);
+  assert.deepEqual(kept.store.state.favicons.demo, { icon: PNG_URI, fetchedAt: at, error: 'the page answered 401' });
+});
+
+test('nap: a store that cannot read or write the favicon, or the levels, changes nothing about the nap', async () => {
+  for (const method of ['getFavicon', 'putFavicon', 'getWaitingPage']) {
+    const s = setup({ run: { state: STATES.AWAKE } });
+    hostRule(s, 'demo.example.com');
+    app(s);
+    s.store[method] = async () => { throw new Error('ProvisionedThroughputExceeded'); };
+    assert.equal(await napped(s), STATES.ASLEEP, method);
+    assert.equal(routeOf(s.elbv2, s.cfg), 'waker');
+  }
+});
+
+test('nap: no host name (no rule with a literal host) is recorded as the reason and waits 24 hours; the first literal host of the rules is used', async () => {
+  const none = setup({ run: { state: STATES.AWAKE } });
+  const at = none.clock.now();
+  assert.equal(await napped(none), STATES.ASLEEP);
+  assert.deepEqual(none.store.state.favicons.demo, { icon: null, fetchedAt: at, error: 'no host name' });
+  assert.deepEqual(none.network.calls, []);
+
+  const wild = setup({ run: { state: STATES.AWAKE } });
+  hostRule(wild, '*.example.com');
+  wild.elbv2.state.rules.set('arn:rule/second', { actions: wild.elbv2.state.forward(1, 0), conditions: [host('demo.example.com')], priority: '30', tags: { 'dormeto:workload': 'demo' } });
+  app(wild);
+  await napped(wild);
+  assert.equal(wild.network.calls[0], 'https://demo.example.com/');
+});
+
+test('nap: a nap that is skipped (paused, nothing to stop, a rule the router cannot switch) reads no favicon', async () => {
+  const paused = setup({ run: { state: STATES.AWAKE } });
+  hostRule(paused, 'demo.example.com');
+  app(paused);
+  await paused.store.putPause('demo', { by: 'ana', at: 1, reason: 'x', keepAsleep: false });
+  assert.equal(await napped(paused), 'SKIPPED');
+  const rule = setup({ run: { state: STATES.AWAKE } });
+  hostRule(rule, 'demo.example.com');
+  app(rule);
+  rule.elbv2.state.rules.set('arn:rule/new', { actions: appOnly(rule.cfg), priority: '30', conditions: [path('/new/*')], tags: {} });
+  assert.equal(await napped(rule), 'SKIPPED');
+  for (const s of [paused, rule]) assert.deepEqual([s.network.calls, s.store.state.favicons], [[], {}]);
+});
+
+test('nap of a Kubernetes workload: the host comes from the rules the load balancer holds for its target group', async () => {
+  const s = k8sSetup({ state: STATES.AWAKE });
+  hostRule(s, 'web.example.com');
+  app(s);
+  s.network.fetch = async (url) => (url === 'https://web.example.com/' ? new Response('<link rel="icon" href="/f.png">') : new Response(PNG_BYTES));
+  assert.equal(await napped(s), STATES.ASLEEP);
+  assert.equal(s.network.calls[0], 'https://web.example.com/');
+  assert.equal(s.store.state.favicons.demo.icon, PNG_URI);
 });

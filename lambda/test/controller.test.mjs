@@ -8,7 +8,7 @@ import { asgGroup, ecsService, fakeAppScaling, fakeEcs, fakeKubernetes, fakeRds,
 import { dormetoIngress, weightsOf } from '../src/lib/kube-route.mjs';
 import { ROUTER_RULES } from '../src/lib/kube-access.mjs';
 
-function setup({ run, instance = 'running', target = 'app', healthy = 1, metric = [], metricAt = [], cfg = testConfig(), groups = [], services = [], databases, k8s, managerSettings = null, kubernetesOf, lambda = null } = {}) {
+function setup({ run, instance = 'running', target = 'app', healthy = 1, metric = [], metricAt = [], cfg = testConfig(), groups = [], services = [], databases, k8s, managerSettings = null, kubernetesOf, lambda = null, faviconBudgetMs = 50 } = {}) {
   const clock = fakeClock();
   const store = fakeStore({ config: cfg, run, clock });
   const ec2 = fakeEc2(cfg.instanceIds, { state: instance });
@@ -38,7 +38,7 @@ function setup({ run, instance = 'running', target = 'app', healthy = 1, metric 
   const organization = { page: null, reads: 0, signals: [], async read({ signal } = {}) { organization.reads += 1; organization.signals.push(signal); if (organization.failure) throw organization.failure; return structuredClone(organization.page); } };
   const handler = createController({
     organizationPage: organization,
-    fetch: (...args) => { network.calls.push(args[0]); return network.fetch(...args); }, faviconBudgetMs: 50,
+    fetch: (...args) => { network.calls.push(args[0]); return network.fetch(...args); }, ...(faviconBudgetMs === 'default' ? {} : { faviconBudgetMs }),
     store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, kubernetesOf: kubernetesOf ?? (k8s ? async () => k8s : undefined), lambda,
     invokeSelf: async (payload) => { invocations.push(payload); }, now: clock.now, sleep: clock.sleep, newId: () => `wake-${++ids}`, log, managerSettings: settings,
   });
@@ -2476,4 +2476,51 @@ test('waiting-page: a Terraform workload with no item can be deleted from (nothi
   const s = setup({ run: { state: STATES.AWAKE } });
   const view = await waitingPage(s, 'delete');
   assert.equal(view.own, null);
+});
+
+// --- Pinned: the favicon step's 3 s budget, and the one budget for the whole step ------------------------------------------
+
+// Lets the promises that are ready run (the timers are the test's).
+const settle = async () => { for (let i = 0; i < 20; i += 1) await new Promise((resolve) => setImmediate(resolve)); };
+
+test('nap: the favicon step\'s budget is 3 s by default: aborted at 3000 ms, not before', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const s = setup({ run: { state: STATES.AWAKE }, faviconBudgetMs: 'default' });
+  hostRule(s, 'demo.example.com');
+  app(s);
+  let signal;
+  s.organization.read = async (options) => { signal = options.signal; return new Promise(() => {}); };
+  const nap = napped(s);
+  await settle();
+  t.mock.timers.tick(2999);
+  await settle();
+  assert.equal(signal.aborted, false, 'still within 3 s');
+  t.mock.timers.tick(1);
+  await settle();
+  assert.equal(signal.aborted, true, 'spent at 3 s');
+  t.mock.timers.tick(10_000);
+  assert.equal(await nap, STATES.ASLEEP);
+});
+
+test('nap: the read of the icon runs on the step\'s budget, not on a fresh one: what the levels\' read spent is not given again', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const s = setup({ run: { state: STATES.AWAKE }, faviconBudgetMs: 200 });
+  hostRule(s, 'demo.example.com');
+  let signal;
+  s.network.fetch = async (url, options) => { signal = options.signal; return new Promise(() => {}); };
+  s.organization.read = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    return { mode: 'template', icon: 'auto' };
+  };
+  const nap = napped(s);
+  await settle();
+  t.mock.timers.tick(150);
+  await settle();
+  assert.ok(signal, 'the read went out');
+  assert.equal(signal.aborted, false);
+  t.mock.timers.tick(50);
+  await settle();
+  assert.equal(signal.aborted, true, 'aborted at 200 ms of the step (50 ms after it started), not at 350');
+  t.mock.timers.tick(10_000);
+  assert.equal(await nap, STATES.ASLEEP);
 });

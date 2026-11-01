@@ -242,6 +242,7 @@ test('hostOfRules: the first literal host value of the rules that are all host o
   assert.equal(hostOfRules([rule(host('shop.a.com'), path('/api/*'))]), null, 'a path other than /*');
   assert.equal(hostOfRules([rule(host('shop.a.com'), { Field: 'http-header', HttpHeaderConfig: { HttpHeaderName: 'x', Values: ['y'] } })]), null);
   assert.equal(hostOfRules([rule(path('/*'))]), null);
+  assert.equal(hostOfRules([rule(host('shop.a.com'), path('/*', '/x'))]), null, 'a rule with two paths is not all the host');
   assert.equal(hostOfRules([]), null);
   assert.equal(hostOfRules(undefined), null);
 });

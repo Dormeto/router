@@ -173,3 +173,36 @@ test('the default keeps 200 workloads', async () => {
   await s.waiting.pageOf('w0');
   assert.ok(s.reads.length > 0, 'w0 went out');
 });
+
+// --- Pinned defaults ----------------------------------------------------------------------------------------------------------
+
+test('the default wait for a read is 1 s: the page answers at 1000 ms, not before', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const s = setup();
+  s.store.getWaitingPage = () => new Promise(() => {});
+  let answered = false;
+  const answer = s.waiting.pageOf('shop').then((out) => { answered = true; return out; });
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+  await settle();
+  t.mock.timers.tick(999);
+  await settle();
+  assert.equal(answered, false, 'still waiting at 999 ms');
+  t.mock.timers.tick(1);
+  await settle();
+  assert.equal(answered, true, 'answered at 1000 ms');
+  assert.deepEqual(await answer, { page: { mode: 'template' }, icon: null });
+});
+
+test('a read still pending after 10 s is replaced by a new one, not before (the cache time over, the read not stuck)', async () => {
+  const s = setup({ readMs: 5, ttlMs: 1000 });
+  let calls = 0;
+  s.store.getWaitingPage = () => { calls += 1; return new Promise(() => {}); };
+  await s.waiting.pageOf('shop');
+  const first = calls;
+  s.clock.advance(10_000);
+  await s.waiting.pageOf('shop');
+  assert.equal(calls, first, 'pending for 10 s: still the same read');
+  s.clock.advance(1001);
+  await s.waiting.pageOf('shop');
+  assert.ok(calls > first, 'pending for more than 10 s: asked again');
+});

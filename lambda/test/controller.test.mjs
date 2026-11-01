@@ -2369,3 +2369,54 @@ test('nap of a Kubernetes workload: the host comes from the rules the load balan
   assert.equal(s.network.calls[0], 'https://web.example.com/');
   assert.equal(s.store.state.favicons.demo.icon, PNG_URI);
 });
+
+// --- Fix round 1: one budget for the favicon step ----------------------------------------------------------------------
+
+const later = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test('nap: a store that hangs or answers late spends the favicon\'s one budget: the nap goes on, nothing goes out afterwards, and it is logged', async () => {
+  for (const delay of [Infinity, 200]) {
+    const s = setup({ run: { state: STATES.AWAKE } });
+    hostRule(s, 'demo.example.com');
+    app(s);
+    const warned = [];
+    s.log.warn = (event, fields) => warned.push([event, fields.workloadId]);
+    s.store.getFavicon = () => (delay === Infinity ? new Promise(() => {}) : later(delay).then(() => null));
+    const started = Date.now();
+    assert.equal(await napped(s), STATES.ASLEEP);
+    assert.ok(Date.now() - started < 1000, `${Date.now() - started} ms`);
+    await later(delay === Infinity ? 100 : 400);
+    assert.deepEqual(s.network.calls, [], 'nothing goes out once the budget is spent');
+    assert.deepEqual(s.store.state.favicons, {});
+    assert.deepEqual(warned.filter(([event]) => event === 'FaviconGaveUp'), [['FaviconGaveUp', 'demo']]);
+  }
+});
+
+test('nap: a nap on a workload that is not awake reads no favicon', async () => {
+  const s = setup({ run: { state: STATES.ASLEEP }, instance: 'stopped', target: 'waker' });
+  hostRule(s, 'demo.example.com');
+  app(s);
+  assert.equal(await napped(s), 'SKIPPED');
+  assert.deepEqual([s.network.calls, s.store.state.favicons, s.store.state.run.state], [[], {}, STATES.ASLEEP]);
+});
+
+test('nap: the host comes only from rules that are all host (or the path /*): a path, a header or a wildcard alone gives no host name', async () => {
+  const path = (p) => ({ Field: 'path-pattern', PathPatternConfig: { Values: [p] } });
+  const shared = setup({ run: { state: STATES.AWAKE } });
+  shared.elbv2.state.rules.get(shared.cfg.ruleArn).conditions = [host('shop.example.com'), path('/api/*')];
+  app(shared);
+  assert.equal(await napped(shared), STATES.ASLEEP);
+  assert.deepEqual([shared.network.calls, shared.store.state.favicons.demo.error], [[], 'no host name']);
+
+  const header = setup({ run: { state: STATES.AWAKE } });
+  header.elbv2.state.rules.get(header.cfg.ruleArn).conditions = [host('shop.example.com'), { Field: 'http-header', HttpHeaderConfig: { HttpHeaderName: 'x-env', Values: ['a'] } }];
+  app(header);
+  await napped(header);
+  assert.deepEqual(header.network.calls, []);
+
+  const wild = setup({ run: { state: STATES.AWAKE } });
+  wild.elbv2.state.rules.get(wild.cfg.ruleArn).conditions = [{ Field: 'host-header', HostHeaderConfig: { Values: ['*.example.com', 'demo.example.com'] } }, path('/*')];
+  app(wild);
+  await napped(wild);
+  assert.equal(wild.network.calls[0], 'https://demo.example.com/');
+});

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFavicon } from '../src/lib/favicon.mjs';
+import { hostOfRules, readFavicon } from '../src/lib/favicon.mjs';
 import { iconTypeOf } from '../src/lib/page-settings.mjs';
 
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
@@ -141,11 +141,11 @@ test('the page is read up to 256 KiB: a link beyond it is not seen, and the read
   assert.equal(inside.icon, PNG_URI);
 });
 
-test('an icon over 64 KiB, or not an image whatever its content-type says, is refused and recorded', async () => {
-  const over = await read({ ...page('<link rel="icon" href="/big.png">'), [`https://${HOST}/big.png`]: [200, { 'content-type': 'image/png' }, Buffer.concat([PNG, Buffer.alloc(64 * 1024)])] });
+test('an icon over 32 KiB, or not an image whatever its content-type says, is refused and recorded', async () => {
+  const over = await read({ ...page('<link rel="icon" href="/big.png">'), [`https://${HOST}/big.png`]: [200, { 'content-type': 'image/png' }, Buffer.concat([PNG, Buffer.alloc(32 * 1024)])] });
   assert.equal(over.icon, null);
-  assert.match(over.error, /64 KiB/);
-  const exact = await read({ ...page('<link rel="icon" href="/ok.png">'), [`https://${HOST}/ok.png`]: [200, {}, Buffer.concat([PNG, Buffer.alloc(64 * 1024 - PNG.length)])] });
+  assert.match(over.error, /32 KiB/);
+  const exact = await read({ ...page('<link rel="icon" href="/ok.png">'), [`https://${HOST}/ok.png`]: [200, {}, Buffer.concat([PNG, Buffer.alloc(32 * 1024 - PNG.length)])] });
   assert.ok(exact.icon);
   const wrong = await read({ ...page('<link rel="icon" href="/login">'), [`https://${HOST}/login`]: [200, { 'content-type': 'image/png' }, '<html>sign in</html>'], [`https://${HOST}/favicon.ico`]: [404, {}, ''] });
   assert.equal(wrong.icon, null);
@@ -180,4 +180,61 @@ test('never throws: no host, a wildcard, a bad host, a fetch that throws or answ
   assert.equal(nonsense.icon, null);
   const noFetch = await readFavicon(HOST, { fetch: 'nope', now: Date.now });
   assert.equal(noFetch.icon, null);
+});
+
+// --- Fix round 1 ------------------------------------------------------------------------------------------------------
+
+test('a page of repeated <link is scanned in linear time, with or without a > at its end', async () => {
+  for (const body of ['<link'.repeat(52428), '<link '.repeat(43690), `${'<link '.repeat(43000)}>`, `<link${'x'.repeat(2000)}>`.repeat(100)]) {
+    const started = Date.now();
+    const out = await read({ [`https://${HOST}/`]: [200, {}, body] });
+    assert.equal(out.icon, null);
+    assert.ok(Date.now() - started < 500, `${Date.now() - started} ms`);
+  }
+});
+
+test('an icon read is at most 32 KiB, a page\'s inline data: icon alike', async () => {
+  const at = (n) => Buffer.concat([PNG, Buffer.alloc(n - PNG.length)]);
+  const ok = await read({ ...page('<link rel="icon" href="/a.png">'), [`https://${HOST}/a.png`]: [200, {}, at(32 * 1024)] });
+  assert.ok(ok.icon);
+  const over = await read({ ...page('<link rel="icon" href="/a.png">'), [`https://${HOST}/a.png`]: [200, {}, at(32 * 1024 + 1)] });
+  assert.deepEqual([over.icon, over.error], [null, 'the icon is larger than 32 KiB']);
+  const inline = await read(page(`<link rel="icon" href="data:image/png;base64,${at(32 * 1024 + 1).toString('base64')}">`));
+  assert.equal(inline.icon, null);
+  assert.match(inline.error, /32 KiB/);
+});
+
+test('an address with credentials is refused before any request, and the credentials never reach the error', async () => {
+  const out = await read(page('<link rel="icon" href="https://u:secret@cdn.example.net/f.png">'));
+  assert.equal(out.icon, null);
+  assert.ok(!out.calls.some((url) => url.includes('secret')));
+  assert.ok(!String(out.error).includes('secret'), out.error);
+});
+
+test('a signal that is aborted, or aborts meanwhile, ends the read and nothing more goes out', async () => {
+  const control = new AbortController();
+  control.abort();
+  const f = fakeFetch(page('<link rel="icon" href="/f.png">'));
+  const done = await readFavicon(HOST, { fetch: f.fetch, now: Date.now, budgetMs: 3000, signal: control.signal });
+  assert.equal(done.icon, null);
+  assert.equal(f.calls.length, 0);
+  const later = new AbortController();
+  const g = fakeFetch({ [`https://${HOST}/`]: () => { later.abort(); return new Response('<link rel="icon" href="/f.png">'); } });
+  const mid = await readFavicon(HOST, { fetch: g.fetch, now: Date.now, budgetMs: 3000, signal: later.signal });
+  assert.equal(mid.icon, null);
+  assert.deepEqual(g.calls.map((c) => c.url), [`https://${HOST}/`]);
+});
+
+test('hostOfRules: the first literal host value of the rules that are all host or path /*, nothing otherwise', () => {
+  const host = (...values) => ({ Field: 'host-header', HostHeaderConfig: { Values: values } });
+  const path = (...values) => ({ Field: 'path-pattern', PathPatternConfig: { Values: values } });
+  const rule = (...Conditions) => ({ Conditions });
+  assert.equal(hostOfRules([rule(host('*.a.com', 'app.a.com'))]), 'app.a.com');
+  assert.equal(hostOfRules([rule(host('*.a.com')), rule(host('b.a.com'), path('/*'))]), 'b.a.com');
+  assert.equal(hostOfRules([rule({ Field: 'host-header', Values: ['legacy.a.com'] })]), 'legacy.a.com');
+  assert.equal(hostOfRules([rule(host('shop.a.com'), path('/api/*'))]), null, 'a path other than /*');
+  assert.equal(hostOfRules([rule(host('shop.a.com'), { Field: 'http-header', HttpHeaderConfig: { HttpHeaderName: 'x', Values: ['y'] } })]), null);
+  assert.equal(hostOfRules([rule(path('/*'))]), null);
+  assert.equal(hostOfRules([]), null);
+  assert.equal(hostOfRules(undefined), null);
 });

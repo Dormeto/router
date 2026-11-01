@@ -4,7 +4,8 @@
 import { iconTypeOf } from './page-settings.mjs';
 
 const PAGE_BYTES = 256 * 1024;
-const ICON_BYTES = 64 * 1024;
+// What a read icon may weigh (uploads may be 64 KiB): it travels in every waiting page.
+const ICON_BYTES = 32 * 1024;
 const REDIRECTS = 3;
 const AGENT = 'dormeto-router';
 const LIMITS = 'the icon is not a PNG, JPEG, WebP, SVG or ICO image';
@@ -29,6 +30,7 @@ async function get(url, ctx, { sameHost }) {
   let current = url;
   for (let followed = 0; ; followed += 1) {
     if (current.protocol !== 'https:') throw new Refused('only https addresses are read');
+    if (current.username || current.password) throw new Refused('the address holds credentials');
     ctx.check();
     const res = await ctx.fetch(current.href, { method: 'GET', redirect: 'manual', credentials: 'omit', signal: ctx.signal, headers: { 'user-agent': AGENT, accept: '*/*' } });
     if (!REDIRECT.has(res?.status)) return { res, url: current };
@@ -55,7 +57,7 @@ async function bytesOf(res, max, { truncate }) {
     total += value.length;
     if (total > max) {
       await reader.cancel().catch(() => {});
-      if (!truncate) throw new Refused('the icon is larger than 64 KiB');
+      if (!truncate) throw new Refused('the icon is larger than 32 KiB');
       return Buffer.concat(chunks).subarray(0, max);
     }
   }
@@ -64,8 +66,9 @@ async function bytesOf(res, max, { truncate }) {
 
 // A data URI of the bytes' own type (from their signature, never from a header); the bytes are checked.
 function iconOf(bytes) {
+  if (bytes.length > ICON_BYTES) throw new Refused('the icon is larger than 32 KiB');
   const type = iconTypeOf(bytes);
-  if (!type || bytes.length > ICON_BYTES) throw new Refused(LIMITS);
+  if (!type) throw new Refused(LIMITS);
   return `data:image/${type};base64,${Buffer.from(bytes).toString('base64')}`;
 }
 
@@ -90,17 +93,29 @@ function withoutComments(text) {
   }
 }
 
-const ATTRIBUTE = /([^\s"'<>/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'<>`]+)))?/g;
+const ATTRIBUTE = /([^\s"'<>/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'<>`]+))?)?/g;
 const RANKS = [(tokens) => tokens.length === 1 && tokens[0] === 'icon', (tokens) => tokens.includes('icon') && tokens.includes('shortcut'),
   (tokens) => tokens.includes('apple-touch-icon') || tokens.includes('apple-touch-icon-precomposed')];
+// A tag may hold an inline icon (32 KiB, as base64 or percent-encoded).
+const TAG_MAX = 128 * 1024;
 
 // The page's icon address: the first link of rel icon, then shortcut icon, then apple-touch-icon, resolved against the page;
-// a data: href as it is. null when there is none.
+// a data: href as it is. null when there is none. One pass:
+// a "<link" inside a tag already read is not a tag, so a page of nothing but "<link" is read in linear time.
 function linkOf(html, base) {
   const found = [[], [], []];
-  for (const [, inner] of withoutComments(html).matchAll(/<link\b([^>]*)>/gi)) {
+  const text = withoutComments(html);
+  const opening = /<link\b/gi;
+  let end = -1;
+  for (let match = opening.exec(text); match; match = opening.exec(text)) {
+    const from = match.index + 5;
+    // Inside the tag just read (or skipped): not a tag of its own, so each character is read once.
+    if (from <= end) continue;
+    end = text.indexOf('>', from);
+    if (end < 0) break;
+    if (end - from > TAG_MAX) continue;
     const attributes = {};
-    for (const [, name, double, single, bare] of inner.matchAll(ATTRIBUTE)) attributes[name.toLowerCase()] ??= double ?? single ?? bare ?? '';
+    for (const [, name, double, single, bare] of text.slice(from, end).matchAll(ATTRIBUTE)) attributes[name.toLowerCase()] ??= double ?? single ?? bare ?? '';
     const tokens = String(attributes.rel ?? '').toLowerCase().split(/\s+/).filter(Boolean);
     const rank = RANKS.findIndex((is) => is(tokens));
     if (rank >= 0 && attributes.href) found[rank].push(attributes.href.replaceAll('&amp;', '&').trim());
@@ -108,7 +123,8 @@ function linkOf(html, base) {
   for (const href of found.flat()) {
     if (/^data:/i.test(href)) return href;
     try {
-      return new URL(href, base).href;
+      const url = new URL(href, base);
+      if (!url.username && !url.password) return url.href;
     } catch {
       // Not an address: the next link.
     }
@@ -154,10 +170,13 @@ async function find(name, ctx) {
 const sentence = (err) => (err instanceof Refused ? err.message : `${String(err?.message ?? err)}${err?.cause?.code ? ` (${err.cause.code})` : ''}`.slice(0, 200));
 
 // host: a literal host name. -> { icon: a data URI or null, error: a sentence or null }. Never throws.
-export async function readFavicon(host, { fetch: fetcher = globalThis.fetch, now = Date.now, budgetMs = 3000 } = {}) {
+// signal: the caller's own budget; once it aborts, nothing more goes out.
+export async function readFavicon(host, { fetch: fetcher = globalThis.fetch, now = Date.now, budgetMs = 3000, signal = null } = {}) {
   const name = hostName(host);
   if (!name) return { icon: null, error: 'no host name' };
   const control = new AbortController();
+  if (signal?.aborted) control.abort();
+  else signal?.addEventListener?.('abort', () => control.abort(), { once: true });
   let timer;
   try {
     if (typeof fetcher !== 'function') throw new Refused('no way to read the page');
@@ -165,13 +184,17 @@ export async function readFavicon(host, { fetch: fetcher = globalThis.fetch, now
     const ctx = {
       fetch: fetcher, signal: control.signal,
       check() {
-        if (now() >= deadline) throw new OutOfTime();
+        if (control.signal.aborted || now() >= deadline) throw new OutOfTime();
       },
     };
     const timeout = new Promise((_, reject) => {
-      timer = setTimeout(() => { control.abort(); reject(new OutOfTime()); }, budgetMs);
+      control.signal.addEventListener('abort', () => reject(new OutOfTime()), { once: true });
+      if (control.signal.aborted) reject(new OutOfTime());
+      timer = setTimeout(() => control.abort(), budgetMs);
     });
     // The read may end after the budget did (a fetch that ignores the signal): its late error is nobody's.
+    timeout.catch(() => {});
+    ctx.check();
     const work = find(name, ctx);
     work.catch(() => {});
     return { icon: await Promise.race([work, timeout]), error: null };
@@ -180,4 +203,21 @@ export async function readFavicon(host, { fetch: fetcher = globalThis.fetch, now
   } finally {
     clearTimeout(timer);
   }
+}
+
+const literal = (host) => typeof host === 'string' && !/[*?]/.test(host);
+const hostsOf = (condition) => condition.HostHeaderConfig?.Values ?? condition.Values ?? [];
+const pathsOf = (condition) => condition.PathPatternConfig?.Values ?? condition.Values ?? [];
+
+// The host to read: the first literal host value among the rules whose every condition is a host or the path /* (a rule with a
+// path, a header or a method is a part of the host's traffic, maybe another workload's: reading / there could wake it). null: none.
+export function hostOfRules(rules) {
+  for (const rule of Array.isArray(rules) ? rules : []) {
+    const conditions = rule?.Conditions ?? [];
+    const plain = conditions.every((c) => c.Field === 'host-header' || (c.Field === 'path-pattern' && pathsOf(c).length === 1 && pathsOf(c)[0] === '/*'));
+    if (!plain) continue;
+    const host = conditions.filter((c) => c.Field === 'host-header').flatMap(hostsOf).find(literal);
+    if (host) return host;
+  }
+  return null;
 }

@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { STATES } from './state.mjs';
 import { checkName } from './names.mjs';
 import { currentTarget, hostOf, setRoute } from './route.mjs';
-import { readFavicon } from './favicon.mjs';
+import { hostOfRules, readFavicon } from './favicon.mjs';
 import { dormetoTargetGroup, ingressDrift, routeIngress } from './kube-route.mjs';
 import { checkRights } from './kube-access.mjs';
 import { pingProxy } from './k8s.mjs';
@@ -35,6 +35,7 @@ const NAPPING_STUCK_MS = 15 * 60_000;
 // The application's favicon (waiting page design §6): read at a nap at most once in this time, within this budget.
 const FAVICON_EVERY_MS = 86_400_000;
 const FAVICON_BUDGET_MS = 3000;
+const FAVICON_GRACE_MS = 200;
 const WAKING_STUCK_GRACE_MS = 60_000;
 // Stop working this long before the Lambda timeout, so that a failure is recorded instead of a silent kill.
 const TIMEOUT_MARGIN_MS = 30_000;
@@ -303,30 +304,38 @@ export function createController({
   }
 
   // The application's favicon for the waiting page (design §6), when the page would show it (a template with icon auto) and the
-  // last read, successful or not, is over 24 hours old. The FAVICON item is read first, the levels only when due. Never fails,
-  // holds longer than its budget or changes the nap: whatever goes wrong is logged and the nap goes on.
+  // last read, successful or not, is over 24 hours old. The workload must be awake (the route reaches it only then), the
+  // FAVICON item is read first, the levels only when due. One budget for all of it, store calls included: once it is spent
+  // nothing more is read or sent (a late store answer ends here), the nap goes on and the give-up is logged. Whatever
+  // goes wrong is logged and never changes the nap. The grace after the budget lets the result be written.
   async function cacheFavicon(cfg, rules) {
     const { workloadId } = cfg;
-    let timer;
+    const budget = new AbortController();
+    const spent = () => budget.signal.aborted;
+    let timers = [];
     const work = (async () => {
+      if ((await store.getRun(workloadId))?.state !== STATES.AWAKE || spent()) return spent() ? 'gave up' : 'done';
       const last = await store.getFavicon(workloadId);
-      if (last?.fetchedAt > now() - FAVICON_EVERY_MS) return;
+      if (spent()) return 'gave up';
+      if (last?.fetchedAt > now() - FAVICON_EVERY_MS) return 'done';
       const [organization, router_, workload] = await Promise.all([store.getWaitingPage('organization'), store.getWaitingPage('router'), store.getWaitingPage({ workloadId })]);
+      if (spent()) return 'gave up';
       const page = resolvePage(organization?.page, router_?.page, workload?.page);
-      if (page.mode !== 'template' || page.icon !== 'auto') return;
-      // The first host name of the rules that has no wildcard.
-      const host = (rules ?? []).map(hostOf).find((h) => h && !/[*?]/.test(h));
-      const { icon, error } = await readFavicon(host, { fetch, now, budgetMs: faviconBudgetMs });
+      if (page.mode !== 'template' || page.icon !== 'auto') return 'done';
+      const { icon, error } = await readFavicon(hostOfRules(rules), { fetch, now, budgetMs: faviconBudgetMs, signal: budget.signal });
       await store.putFavicon(workloadId, { icon: icon ?? last?.icon ?? null, fetchedAt: now(), error });
+      return 'done';
     })();
-    // The store's calls are inside the budget too: one that hangs ends the wait, and its late result is nobody's.
     work.catch(() => {});
     try {
-      await Promise.race([work, new Promise((resolve) => { timer = setTimeout(resolve, faviconBudgetMs + 500); })]);
+      const timeout = new Promise((resolve) => {
+        timers = [setTimeout(() => budget.abort(), faviconBudgetMs), setTimeout(() => resolve('gave up'), faviconBudgetMs + FAVICON_GRACE_MS)];
+      });
+      if ((await Promise.race([work, timeout])) === 'gave up') log.warn('FaviconGaveUp', { workloadId, budgetMs: faviconBudgetMs });
     } catch (err) {
       log.warn('FaviconSkipped', { workloadId, error: err.message });
     } finally {
-      clearTimeout(timer);
+      timers.forEach(clearTimeout);
     }
   }
 

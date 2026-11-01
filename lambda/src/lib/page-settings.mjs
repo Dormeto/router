@@ -1,13 +1,11 @@
-// The waiting page's setting (spec 2026-11-01-branded-waiting-page §4 and §5): its rules, its levels' merge, and the
-// recent wake times the progress bar is drawn from. Terraform and a hand-edited settings.json bypass the write's check,
-// so every read goes through cleanPage.
-const LANGUAGES = ['en', 'fr'];
-const TOP = ['logo', 'accent', 'background', 'texts'];
-const TEXTS = ['title', 'message', 'links'];
-const LOGO_BYTES = 64 * 1024;
-const LOGO_TYPES = { png: 'png', jpeg: 'jpeg', webp: 'webp', 'svg+xml': 'svg' };
-const MAX_LINKS = 3;
+// The waiting page's setting (spec 2026-11-01-branded-waiting-page §4 and §5): its rules, the resolution of its three
+// levels, and the recent wake times the progress bar is drawn from. Terraform and a hand-edited settings.json bypass the
+// write's check, so every read goes through cleanPage.
+const FIELDS = { template: ['icon', 'title', 'description'], custom: ['html'] };
+const ICON_BYTES = 64 * 1024;
+const HTML_BYTES = 256 * 1024;
 const WAKES_KEPT = 10;
+const LEVELS = ['workload', 'router', 'organization'];
 
 const isObject = (value) => typeof value === 'object' && value !== null && !Array.isArray(value)
   && [Object.prototype, null].includes(Object.getPrototypeOf(value));
@@ -20,127 +18,89 @@ const SIGNATURES = {
   png: (bytes) => startsWith(bytes, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
   jpeg: (bytes) => startsWith(bytes, [0xff, 0xd8, 0xff]),
   webp: (bytes) => startsWith(bytes, [0x52, 0x49, 0x46, 0x46]) && startsWith(bytes, [0x57, 0x45, 0x42, 0x50], 8),
+  'x-icon': (bytes) => startsWith(bytes, [0, 0, 1, 0]),
   // The first element: after a byte order mark, blanks, an XML declaration and comments.
-  svg: (bytes) => /^(?:﻿|\s|<\?xml[^>]*\?>|<!--[\s\S]*?-->)*<svg[\s/>]/.test(bytes.toString('utf8')),
+  'svg+xml': (bytes) => /^(?:﻿|\s|<\?xml[^>]*\?>|<!--[\s\S]*?-->)*<svg[\s/>]/.test(Buffer.from(bytes).toString('utf8')),
 };
 
-function checkLogo(logo) {
-  const found = typeof logo === 'string' && /^data:image\/(png|jpeg|webp|svg\+xml);base64,([A-Za-z0-9+/]*={0,2})$/.exec(logo);
-  if (!found) return 'logo must be a data:image/png, jpeg, webp or svg+xml base64 URI';
-  const bytes = Buffer.from(found[2], 'base64');
-  if (bytes.toString('base64') !== found[2] || bytes.length === 0) return 'logo is not valid base64';
-  if (bytes.length > LOGO_BYTES) return 'logo must be at most 64 KiB once decoded';
-  if (!SIGNATURES[LOGO_TYPES[found[1]]](bytes)) return `logo is not a ${found[1]} image`;
-  return null;
+// The image type of some bytes, from their signature; null when none of the five.
+export function iconTypeOf(bytes) {
+  if (!(bytes instanceof Uint8Array)) return null;
+  return Object.keys(SIGNATURES).find((type) => SIGNATURES[type](bytes)) ?? null;
 }
 
-const checkColor = (name) => (value) => (typeof value === 'string' && /^#[0-9a-fA-F]{6}$/.test(value) ? null : `${name} must be a color like #0b5fff`);
+function checkIcon(icon) {
+  if (icon === 'auto' || icon === 'none') return null;
+  const found = typeof icon === 'string' && /^data:image\/(png|jpeg|webp|svg\+xml|x-icon);base64,([A-Za-z0-9+/]*={0,2})$/.exec(icon);
+  if (!found) return 'icon must be auto, none, or a data:image/png, jpeg, webp, svg+xml or x-icon base64 URI';
+  const bytes = Buffer.from(found[2], 'base64');
+  if (bytes.toString('base64') !== found[2] || bytes.length === 0) return 'icon is not valid base64';
+  if (bytes.length > ICON_BYTES) return 'icon must be at most 64 KiB once decoded';
+  if (!SIGNATURES[found[1]](bytes)) return `icon is not a ${found[1]} image`;
+  return null;
+}
 
 function checkTitle(title) {
   if (typeof title !== 'string' || !title.trim() || SINGLE_LINE.test(title)) return 'title must be one line of text';
   return size(title) > 80 ? 'title must be at most 80 characters' : null;
 }
 
-function checkMessage(message) {
-  if (typeof message !== 'string' || !message.trim() || MULTI_LINE.test(message)) return 'message must be text';
-  return size(message) > 500 ? 'message must be at most 500 characters' : null;
+function checkDescription(description) {
+  if (typeof description !== 'string' || !description.trim() || MULTI_LINE.test(description)) return 'description must be text';
+  return size(description) > 500 ? 'description must be at most 500 characters' : null;
 }
 
-function checkLink(link) {
-  if (!isObject(link)) return 'a link must be { label, url }';
-  const unknown = Object.keys(link).filter((key) => !['label', 'url'].includes(key));
-  if (unknown.length) return `a link has no ${unknown.join(', ')}`;
-  const { label, url } = link;
-  if (typeof label !== 'string' || !label.trim() || SINGLE_LINE.test(label)) return 'a link label must be one line of text';
-  if (size(label) > 40) return 'a link label must be at most 40 characters';
-  if (typeof url !== 'string' || !/^(https:\/\/|mailto:)[^\s\u0000-\u001f\u007f]+$/i.test(url)) return 'a link url must start with https: or mailto:';
-  if (url.length > 300) return 'a link url must be at most 300 characters';
-  try {
-    if (!['https:', 'mailto:'].includes(new URL(url).protocol)) return 'a link url must start with https: or mailto:';
-  } catch {
-    return 'a link url is not a valid address';
-  }
-  return null;
+function checkHtml(html) {
+  if (typeof html !== 'string' || !html.trim()) return 'html must be a page, not blank';
+  return Buffer.byteLength(html) > HTML_BYTES ? 'html must be at most 256 KiB' : null;
 }
 
-const FIELDS = { logo: checkLogo, accent: checkColor('accent'), background: checkColor('background') };
-const TEXT_FIELDS = { title: checkTitle, message: checkMessage };
-
-function validateTexts(texts, problems) {
-  if (!isObject(texts)) return void problems.push('texts must be an object with en and fr');
-  for (const [language, text] of Object.entries(texts)) {
-    if (!LANGUAGES.includes(language)) { problems.push(`texts has no language ${language}: only en and fr`); continue; }
-    if (!isObject(text)) { problems.push(`texts.${language} must be an object`); continue; }
-    for (const [key, value] of Object.entries(text)) {
-      const at = `texts.${language}.${key}`;
-      if (!TEXTS.includes(key)) problems.push(`${at} is not a field of the page`);
-      else if (key === 'links') {
-        if (!Array.isArray(value)) problems.push(`${at} must be a list`);
-        else {
-          if (value.length > MAX_LINKS) problems.push(`${at} holds at most 3 links`);
-          value.forEach((link, i) => { const problem = checkLink(link); if (problem) problems.push(`${at}[${i}]: ${problem}`); });
-        }
-      } else { const problem = TEXT_FIELDS[key](value); if (problem) problems.push(`texts.${language}.${problem}`); }
-    }
-  }
-}
+const CHECKS = { icon: checkIcon, title: checkTitle, description: checkDescription, html: checkHtml };
 
 // Every problem of a document, as sentences; [] when it is fine.
 export function validatePage(doc) {
   if (!isObject(doc)) return ['the page must be an object'];
+  if (!FIELDS[doc.mode]) return ['mode must be template or custom'];
   const problems = [];
-  for (const [key, value] of Object.entries(doc)) {
-    if (!TOP.includes(key)) problems.push(`${key} is not a field of the page`);
-    else if (key === 'texts') validateTexts(value, problems);
-    else { const problem = FIELDS[key](value); if (problem) problems.push(problem); }
+  for (const key of Object.keys(doc)) if (key !== 'mode' && !FIELDS[doc.mode].includes(key)) problems.push(`${key} is not a field of a ${doc.mode} page`);
+  for (const key of FIELDS[doc.mode]) {
+    if (key in doc) { const problem = CHECKS[key](doc[key]); if (problem) problems.push(problem); }
+    else if (key === 'html') problems.push('html is required in a custom page');
   }
   return problems;
 }
 
-// The valid fields only; never throws, whatever the value. Links: the first 3 valid ones.
+// The valid document, or null: a custom one with no valid html is no document. Never throws, whatever the value.
 export function cleanPage(doc) {
-  const page = {};
-  if (!isObject(doc)) return page;
-  for (const key of Object.keys(FIELDS)) if (key in doc && !FIELDS[key](doc[key])) page[key] = doc[key];
-  if (!isObject(doc.texts)) return page;
-  const texts = {};
-  for (const language of LANGUAGES) {
-    const text = doc.texts[language];
-    if (!isObject(text)) continue;
-    const kept = {};
-    for (const key of Object.keys(TEXT_FIELDS)) if (key in text && !TEXT_FIELDS[key](text[key])) kept[key] = text[key];
-    if (Array.isArray(text.links)) kept.links = text.links.filter((link) => !checkLink(link)).slice(0, MAX_LINKS).map(({ label, url }) => ({ label, url }));
-    if (Object.keys(kept).length) texts[language] = kept;
-  }
-  if (Object.keys(texts).length) page.texts = texts;
-  return page;
+  if (!isObject(doc) || !FIELDS[doc.mode]) return null;
+  const page = { mode: doc.mode };
+  for (const key of FIELDS[doc.mode]) if (key in doc && !CHECKS[key](doc[key])) page[key] = doc[key];
+  return doc.mode === 'custom' && !('html' in page) ? null : page;
 }
 
-const FLAT = (page) => {
-  const out = {};
-  for (const key of Object.keys(FIELDS)) if (key in page) out[key] = page[key];
-  for (const language of LANGUAGES) for (const key of TEXTS) if (key in (page.texts?.[language] ?? {})) out[`${language}.${key}`] = page.texts[language][key];
-  return out;
-};
-const LEVELS = ['manager', 'router', 'workload'];
-
-// The most specific field wins; a language's links are replaced as a whole.
-export function mergePage(manager, router, workload) {
-  const flat = Object.assign({}, ...[manager, router, workload].map((level) => FLAT(cleanPage(level))));
-  const page = {};
-  for (const [key, value] of Object.entries(flat)) {
-    const [language, field] = key.split('.');
-    if (field) ((page.texts ??= {})[language] ??= {})[field] = value;
-    else page[key] = value;
-  }
-  return page;
+// What a custom page should fix, without being refused.
+export function pageWarnings(doc) {
+  const page = cleanPage(doc);
+  if (page?.mode !== 'custom') return [];
+  const warnings = [];
+  if (!/data-dormeto\s*=\s*(["']?)status\1[\s>/]/i.test(page.html)) warnings.push('the page has no element data-dormeto="status": the visitor will not read why it waits');
+  if (/<meta\b[^>]*http-equiv\s*=\s*["']?content-security-policy/i.test(page.html)) warnings.push('a Content-Security-Policy meta tag may block the script Dormeto adds, and the wake with it in browser mode');
+  return warnings;
 }
 
-// For each field of the merged page, the level it came from: { logo: 'router', 'en.title': 'workload', … }.
-export function fromOf(manager, router, workload) {
-  const from = {};
-  [manager, router, workload].forEach((level, i) => { for (const key of Object.keys(FLAT(cleanPage(level)))) from[key] = LEVELS[i]; });
-  return from;
+// The effective page: the most specific level with a document decides the mode. A custom page is that level's html, whole;
+// a template takes each field from the most specific template that has it. `from` names the level of each.
+export function resolvePage(organization, router, workload) {
+  const documents = [workload, router, organization].map((level, i) => [LEVELS[i], cleanPage(level)]).filter(([, page]) => page);
+  if (!documents.length) return { mode: 'template', icon: 'auto', from: { mode: 'default', icon: 'default' } };
+  const [deciding, first] = documents[0];
+  if (first.mode === 'custom') return { mode: 'custom', html: first.html, from: { mode: deciding, html: deciding } };
+  const page = { mode: 'template', from: { mode: deciding } };
+  for (const key of FIELDS.template) {
+    const found = documents.find(([, candidate]) => candidate.mode === 'template' && key in candidate);
+    if (found) { page[key] = found[1][key]; page.from[key] = found[0]; } else if (key === 'icon') { page.icon = 'auto'; page.from.icon = 'default'; }
+  }
+  return { mode: page.mode, icon: page.icon, ...(page.title ? { title: page.title } : {}), ...(page.description ? { description: page.description } : {}), from: page.from };
 }
 
 const usable = (value) => typeof value === 'number' && Number.isFinite(value) && value >= 0;

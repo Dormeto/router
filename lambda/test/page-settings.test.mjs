@@ -1,184 +1,213 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { cleanPage, fromOf, medianOf, mergePage, validatePage, withWake } from '../src/lib/page-settings.mjs';
+import { cleanPage, iconTypeOf, medianOf, pageWarnings, resolvePage, validatePage, withWake } from '../src/lib/page-settings.mjs';
 
 const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(32)]);
 const JPEG = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(32)]);
 const WEBP = Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WEBP'), Buffer.alloc(32)]);
+const ICO = Buffer.concat([Buffer.from([0, 0, 1, 0, 1, 0]), Buffer.alloc(32)]);
 const SVG = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"></svg>');
 const uri = (type, bytes) => `data:image/${type};base64,${bytes.toString('base64')}`;
 const padded = (head, size) => Buffer.concat([head, Buffer.alloc(size - head.length)]);
+const template = (fields) => ({ mode: 'template', ...fields });
+const custom = (html = '<!doctype html><p>hi</p>') => ({ mode: 'custom', html });
 
-test('an empty document and every valid field are fine', () => {
-  assert.deepEqual(validatePage({}), []);
-  const doc = {
-    logo: uri('png', PNG), accent: '#0b5fff', background: '#FFFFFF',
-    texts: { en: { title: 'Acme', message: 'a\nb', links: [{ label: 'Status', url: 'https://status.acme.com' }, { label: 'Mail', url: 'mailto:ops@acme.com' }] }, fr: { title: 'Portail' } },
-  };
-  assert.deepEqual(validatePage(doc), []);
-  assert.deepEqual(cleanPage(doc), doc);
+test('both shapes and every valid field are fine', () => {
+  const full = { mode: 'template', icon: uri('png', PNG), title: 'Acme portal', description: 'a\nb' };
+  assert.deepEqual(validatePage(full), []);
+  assert.deepEqual(cleanPage(full), full);
+  for (const icon of ['auto', 'none']) assert.deepEqual(validatePage(template({ icon })), []);
+  assert.deepEqual(validatePage({ mode: 'template' }), []);
+  assert.deepEqual(validatePage(custom()), []);
+  assert.deepEqual(cleanPage(custom()), custom());
 });
 
-test('anything but a plain object is refused, and cleans to {}', () => {
+test('anything but a plain object is refused, and cleans to null', () => {
   for (const bad of [null, undefined, 'x', 3, true, [], [{}]]) {
     assert.equal(validatePage(bad).length, 1, String(bad));
-    assert.deepEqual(cleanPage(bad), {});
+    assert.equal(cleanPage(bad), null);
   }
 });
 
-test('unknown keys are refused, at the top, in texts, in a language and in a link', () => {
-  assert.match(validatePage({ colour: '#000000' }).join(), /colour/);
-  assert.match(validatePage({ texts: { de: { title: 'x' } } }).join(), /de/);
-  assert.match(validatePage({ texts: { en: { subtitle: 'x' } } }).join(), /subtitle/);
-  assert.match(validatePage({ texts: { en: { links: [{ label: 'a', url: 'https://a.io', rel: 'x' }] } } }).join(), /rel/);
-  assert.deepEqual(cleanPage({ colour: '#000000', accent: '#000000', texts: { de: { title: 'x' }, en: { subtitle: 'x', title: 'y' } } }), { accent: '#000000', texts: { en: { title: 'y' } } });
-});
-
-test('colors are #rrggbb only', () => {
-  for (const ok of ['#000000', '#abcdef', '#ABCDEF']) assert.deepEqual(validatePage({ accent: ok, background: ok }), []);
-  for (const bad of ['#fff', '#12345g', '000000', '#0000000', 'red', 'rgb(0,0,0)', '#000000;x', 5, null]) {
-    assert.equal(validatePage({ accent: bad }).length, 1, String(bad));
-    assert.equal(validatePage({ background: bad }).length, 1, String(bad));
-    assert.deepEqual(cleanPage({ accent: bad, background: bad }), {});
+test('the mode is required and is template or custom', () => {
+  for (const bad of [{}, { mode: 'html' }, { mode: 5 }, { mode: null }, { title: 'x' }]) {
+    assert.equal(validatePage(bad).length, 1, JSON.stringify(bad));
+    assert.equal(cleanPage(bad), null);
   }
 });
 
-test('title: 80 characters, one line', () => {
-  assert.deepEqual(validatePage({ texts: { en: { title: 'a'.repeat(80) } } }), []);
-  assert.equal(validatePage({ texts: { en: { title: 'a'.repeat(81) } } }).length, 1);
-  assert.equal(validatePage({ texts: { en: { title: 'a\nb' } } }).length, 1);
-  assert.equal(validatePage({ texts: { en: { title: 'a\rb' } } }).length, 1);
-  assert.equal(validatePage({ texts: { en: { title: '' } } }).length, 1);
-  assert.equal(validatePage({ texts: { en: { title: '   ' } } }).length, 1);
-  assert.equal(validatePage({ texts: { en: { title: 4 } } }).length, 1);
-  assert.deepEqual(validatePage({ texts: { en: { title: '😀'.repeat(80) } } }), [], 'characters, not UTF-16 units');
+test('unknown keys and a field of the other mode are refused', () => {
+  assert.match(validatePage(template({ colour: '#000000' })).join(), /colour/);
+  assert.match(validatePage(template({ html: '<p>x</p>' })).join(), /html/);
+  assert.match(validatePage({ ...custom(), title: 'x' }).join(), /title/);
+  assert.match(validatePage({ ...custom(), icon: 'auto' }).join(), /icon/);
+  assert.match(validatePage({ ...custom(), description: 'x' }).join(), /description/);
+  assert.match(validatePage(template({ accent: '#000000' })).join(), /accent/);
+  assert.match(validatePage(template({ texts: {} })).join(), /texts/);
 });
 
-test('message: 500 characters, line breaks kept', () => {
-  assert.deepEqual(validatePage({ texts: { fr: { message: 'a'.repeat(500) } } }), []);
-  assert.equal(validatePage({ texts: { fr: { message: 'a'.repeat(501) } } }).length, 1);
-  assert.deepEqual(cleanPage({ texts: { fr: { message: 'a\nb\r\nc' } } }), { texts: { fr: { message: 'a\nb\r\nc' } } });
-  assert.equal(validatePage({ texts: { fr: { message: 'a\u0000b' } } }).length, 1);
-  assert.equal(validatePage({ texts: { fr: { message: ['x'] } } }).length, 1);
+test('cleanPage keeps what is valid and drops the rest', () => {
+  assert.deepEqual(cleanPage(template({ colour: 'x', html: '<p>', title: 'ok', description: '', icon: 'blue' })), { mode: 'template', title: 'ok' });
+  assert.deepEqual(cleanPage({ ...custom(), title: 'x', icon: 'auto' }), custom());
+  assert.deepEqual(cleanPage({ mode: 'template' }), { mode: 'template' });
 });
 
-test('links: 3 at most, label 40, url 300, https or mailto only', () => {
-  const link = (url, label = 'x') => ({ label, url });
-  const links = (...l) => ({ texts: { en: { links: l } } });
-  assert.deepEqual(validatePage(links()), []);
-  assert.deepEqual(validatePage(links(link('https://a.io'), link('https://b.io'), link('https://c.io'))), []);
-  assert.equal(validatePage(links(link('https://a.io'), link('https://b.io'), link('https://c.io'), link('https://d.io'))).length, 1);
-  assert.deepEqual(validatePage(links(link('https://a.io', 'a'.repeat(40)))), []);
-  assert.equal(validatePage(links(link('https://a.io', 'a'.repeat(41)))).length, 1);
-  assert.equal(validatePage(links(link('https://a.io', ''))).length, 1);
-  const long = `https://a.io/${'a'.repeat(287)}`;
-  assert.equal(long.length, 300);
-  assert.deepEqual(validatePage(links(link(long))), []);
-  assert.equal(validatePage(links(link(`${long}a`))).length, 1);
-  for (const bad of ['javascript:alert(1)', 'JavaScript:alert(1)', ' javascript:alert(1)', 'data:text/html,x', 'http://a.io', 'ftp://a.io', '//a.io', '/a', 'a.io', 'https://', 'https://a.io/ b', 'https://a.io/\nb', 'https:\\\\a.io', 5, null]) {
-    assert.equal(validatePage(links(link(bad))).length, 1, String(bad));
+test('title: 80 characters, one line, not blank', () => {
+  assert.deepEqual(validatePage(template({ title: 'a'.repeat(80) })), []);
+  assert.equal(validatePage(template({ title: 'a'.repeat(81) })).length, 1);
+  for (const bad of ['a\nb', 'a\rb', '', '   ', 4, null, ['x'], 'a\u0000b']) assert.equal(validatePage(template({ title: bad })).length, 1, String(bad));
+  assert.deepEqual(validatePage(template({ title: '\u{1F600}'.repeat(80) })), [], 'characters, not UTF-16 units');
+  assert.equal(validatePage(template({ title: '\u{1F600}'.repeat(81) })).length, 1);
+});
+
+test('description: 500 characters, line breaks kept, not blank', () => {
+  assert.deepEqual(validatePage(template({ description: 'a'.repeat(500) })), []);
+  assert.equal(validatePage(template({ description: 'a'.repeat(501) })).length, 1);
+  assert.deepEqual(cleanPage(template({ description: 'a\nb\r\nc' })), template({ description: 'a\nb\r\nc' }));
+  for (const bad of ['', '  \n ', 'a\u0000b', ['x'], 5, null]) assert.equal(validatePage(template({ description: bad })).length, 1, String(bad));
+});
+
+test('icon: png, jpeg, webp, svg and ico by their content', () => {
+  for (const [type, bytes] of [['png', PNG], ['jpeg', JPEG], ['webp', WEBP], ['svg+xml', SVG], ['x-icon', ICO]]) {
+    assert.deepEqual(validatePage(template({ icon: uri(type, bytes) })), [], type);
   }
-  assert.deepEqual(validatePage(links(link('HTTPS://A.io'))), []);
-  assert.equal(validatePage({ texts: { en: { links: 'x' } } }).length, 1);
-  assert.equal(validatePage({ texts: { en: { links: ['x'] } } }).length, 1);
+  assert.deepEqual(validatePage(template({ icon: uri('svg+xml', Buffer.from('\ufeff <?xml version="1.0"?>\n<!-- c -->\n<svg></svg>')) })), []);
 });
 
-test('cleanPage keeps the good links, the first 3, and an empty list', () => {
-  const good = (n) => ({ label: `l${n}`, url: `https://a.io/${n}` });
-  const out = cleanPage({ texts: { en: { links: [good(1), { label: 'bad', url: 'javascript:1' }, good(2), good(3), good(4)] }, fr: { links: [] } } });
-  assert.deepEqual(out.texts.en.links, [good(1), good(2), good(3)]);
-  assert.deepEqual(out.texts.fr.links, []);
+test('icon: a type that does not match its content is refused', () => {
+  assert.equal(validatePage(template({ icon: uri('png', SVG) })).length, 1, 'svg as png');
+  assert.equal(validatePage(template({ icon: uri('svg+xml', PNG) })).length, 1, 'png as svg');
+  assert.equal(validatePage(template({ icon: uri('x-icon', PNG) })).length, 1, 'png as ico');
+  assert.equal(validatePage(template({ icon: uri('png', ICO) })).length, 1, 'ico as png');
+  assert.equal(validatePage(template({ icon: uri('jpeg', PNG) })).length, 1);
+  assert.equal(validatePage(template({ icon: uri('webp', JPEG) })).length, 1);
+  assert.equal(validatePage(template({ icon: uri('png', Buffer.from('RIFF')) })).length, 1);
+  assert.equal(validatePage(template({ icon: uri('svg+xml', Buffer.from('<html><svg></svg></html>')) })).length, 1);
+  assert.equal(validatePage(template({ icon: uri('svg+xml', Buffer.from('<script>1</script><svg></svg>')) })).length, 1);
+  assert.equal(validatePage(template({ icon: uri('svg+xml', Buffer.from('<svgx></svgx>')) })).length, 1);
+  assert.equal(validatePage(template({ icon: uri('png', Buffer.alloc(0)) })).length, 1);
 });
 
-test('logo: png, jpeg, webp and svg by their content', () => {
-  for (const [type, bytes] of [['png', PNG], ['jpeg', JPEG], ['webp', WEBP], ['svg+xml', SVG]]) {
-    assert.deepEqual(validatePage({ logo: uri(type, bytes) }), [], type);
-  }
-  assert.deepEqual(validatePage({ logo: uri('svg+xml', Buffer.from('﻿ <?xml version="1.0"?>\n<!-- c -->\n<svg></svg>')) }), []);
+test('icon: 64 KiB decoded, not one byte more', () => {
+  assert.deepEqual(validatePage(template({ icon: uri('png', padded(PNG, 65536)) })), []);
+  assert.equal(validatePage(template({ icon: uri('png', padded(PNG, 65537)) })).length, 1);
+  assert.deepEqual(validatePage(template({ icon: uri('x-icon', padded(ICO, 65536)) })), []);
+  assert.equal(validatePage(template({ icon: uri('x-icon', padded(ICO, 65537)) })).length, 1);
 });
 
-test('logo: a type that does not match its content is refused', () => {
-  assert.equal(validatePage({ logo: uri('png', SVG) }).length, 1, 'svg as png');
-  assert.equal(validatePage({ logo: uri('svg+xml', PNG) }).length, 1, 'png as svg');
-  assert.equal(validatePage({ logo: uri('jpeg', PNG) }).length, 1);
-  assert.equal(validatePage({ logo: uri('webp', JPEG) }).length, 1);
-  assert.equal(validatePage({ logo: uri('png', Buffer.from('RIFF')) }).length, 1);
-  assert.equal(validatePage({ logo: uri('svg+xml', Buffer.from('<html><svg></svg></html>')) }).length, 1);
-  assert.equal(validatePage({ logo: uri('svg+xml', Buffer.from('<script>1</script><svg></svg>')) }).length, 1);
-  assert.equal(validatePage({ logo: uri('svg+xml', Buffer.from('<svgx></svgx>')) }).length, 1);
-  assert.equal(validatePage({ logo: uri('png', Buffer.alloc(0)) }).length, 1);
-});
-
-test('logo: 64 KiB decoded, not one byte more', () => {
-  assert.deepEqual(validatePage({ logo: uri('png', padded(PNG, 65536)) }), []);
-  assert.equal(validatePage({ logo: uri('png', padded(PNG, 65537)) }).length, 1);
-  assert.deepEqual(validatePage({ logo: uri('png', padded(PNG, 65535)) }), []);
-});
-
-test('logo: other types, other encodings and bad base64 are refused', () => {
+test('icon: other values, other encodings and bad base64 are refused', () => {
   const b64 = PNG.toString('base64');
   for (const bad of [
-    `data:image/gif;base64,${b64}`, `data:text/html;base64,${b64}`, `data:image/png,${b64}`, `data:image/png;charset=utf-8;base64,${b64}`,
-    `https://a.io/logo.png`, `data:image/png;base64,${b64}!`, `data:image/png;base64,${b64.slice(1)}`, `data:image/png;base64,${b64}=`,
-    `data:image/png;base64,`, ` data:image/png;base64,${b64}`, `data:image/png;base64,${b64}\n`, `data:image/PNG;base64,${b64}`, 5, null, '',
-  ]) assert.equal(validatePage({ logo: bad }).length, 1, String(bad).slice(0, 40));
-  assert.deepEqual(cleanPage({ logo: `data:image/gif;base64,${b64}`, accent: '#000000' }), { accent: '#000000' });
+    'AUTO', 'Auto', 'default', 'data:image/gif;base64,' + b64, 'data:text/html;base64,' + b64, 'data:image/png,' + b64,
+    'data:image/png;charset=utf-8;base64,' + b64, 'https://a.io/logo.png', 'data:image/png;base64,' + b64 + '!', 'data:image/png;base64,' + b64.slice(1),
+    'data:image/png;base64,' + b64 + '=', 'data:image/png;base64,', ' data:image/png;base64,' + b64, 'data:image/png;base64,' + b64 + '\n',
+    'data:image/PNG;base64,' + b64, 'data:image/vnd.microsoft.icon;base64,' + ICO.toString('base64'), 5, null, '',
+  ]) assert.equal(validatePage(template({ icon: bad })).length, 1, String(bad).slice(0, 40));
+  assert.deepEqual(cleanPage(template({ icon: 'data:image/gif;base64,' + b64, title: 'x' })), template({ title: 'x' }));
+});
+
+test('html: 256 KiB in bytes, not blank, text', () => {
+  const html = (bytes) => `<p>${'a'.repeat(bytes - 7)}</p>`;
+  assert.deepEqual(validatePage(custom(html(256 * 1024))), []);
+  assert.equal(validatePage(custom(html(256 * 1024 + 1))).length, 1);
+  const wide = '\u00e9'.repeat(128 * 1024);
+  assert.equal(wide.length, 128 * 1024);
+  assert.deepEqual(validatePage(custom(wide)), [], '128 Ki characters of 2 bytes are exactly 256 KiB');
+  assert.equal(validatePage(custom(`${wide}\u00e9`)).length, 1, 'bytes, not characters');
+  assert.equal(validatePage(custom('\u20ac'.repeat(90_000))).length, 1, '270000 bytes in 90000 characters');
+  for (const bad of ['', '   ', '\n\t ', 5, null, ['<p>'], {}, undefined]) assert.equal(validatePage({ mode: 'custom', html: bad }).length, 1, String(bad));
+  assert.equal(validatePage({ mode: 'custom' }).length, 1, 'html is required');
+  assert.equal(cleanPage({ mode: 'custom', html: '  ' }), null, 'a custom document with no valid html reads as no document');
+  assert.equal(cleanPage({ mode: 'custom' }), null);
+  assert.equal(cleanPage(custom('x'.repeat(256 * 1024 + 1))), null);
 });
 
 test('a problem is a sentence naming the field, and every problem is returned', () => {
-  const problems = validatePage({ accent: 'red', background: 'blue', logo: 'x', texts: { en: { title: '' } } });
-  assert.equal(problems.length, 4);
+  const problems = validatePage(template({ icon: 'red', title: '', description: '', html: 'x', colour: 1 }));
+  assert.equal(problems.length, 5);
   assert.ok(problems.every((p) => typeof p === 'string' && p.length > 10));
-  assert.match(problems[0], /accent/);
+  assert.match(problems.join('\n'), /icon[\s\S]*title|title[\s\S]*icon/);
 });
 
-test('cleanPage keeps the good fields beside the bad ones, and never throws on any JSON value', () => {
-  const out = cleanPage({ accent: '#112233', background: 'nope', logo: 7, texts: { en: { title: 'ok', message: 'x'.repeat(501), links: 'nope' }, fr: 'nope', de: {} } });
-  assert.deepEqual(out, { accent: '#112233', texts: { en: { title: 'ok' } } });
-  const odd = [0, 1.5, '', 'x', true, false, null, [], [1, [2]], {}, { texts: null }, { texts: [] }, { texts: { en: null } }, { texts: { en: [] } },
-    { texts: { en: { links: [null, 1, 'x', [], { label: {}, url: {} }] } } }, JSON.parse('{"__proto__": {"a": 1}, "texts": {"__proto__": {}}}'), { logo: {} }, { accent: [] }];
+test('cleanPage never throws on any JSON value, and what it returns validates', () => {
+  const odd = [0, 1.5, '', 'x', true, false, null, [], [1, [2]], {}, { mode: [] }, { mode: 'template', title: {} }, { mode: 'template', icon: [] }, { mode: 'custom', html: {} },
+    JSON.parse('{"__proto__": {"a": 1}, "mode": "template"}'), { mode: 'template', description: 'x'.repeat(1e6) }, { mode: 'custom', html: 'x'.repeat(1e6) }];
   for (const value of odd) {
     assert.doesNotThrow(() => validatePage(value));
     const cleaned = cleanPage(value);
-    assert.deepEqual(validatePage(cleaned), []);
+    if (cleaned !== null) assert.deepEqual(validatePage(cleaned), []);
   }
   assert.equal(({}).a, undefined, 'no prototype pollution');
-  assert.deepEqual(cleanPage({ texts: { en: {}, fr: { title: 'x' } } }), { texts: { fr: { title: 'x' } } }, 'empty language dropped');
-  assert.deepEqual(cleanPage({ texts: {} }), {});
 });
 
-test('mergePage: the most specific field wins, the others stay', () => {
-  const manager = { logo: uri('png', PNG), accent: '#111111', background: '#222222', texts: { en: { title: 'M', message: 'mm' }, fr: { title: 'Mf' } } };
-  const router = { accent: '#333333', texts: { en: { title: 'R' } } };
-  const workload = { background: '#444444', texts: { fr: { message: 'Wm' } } };
-  assert.deepEqual(mergePage(manager, router, workload), {
-    logo: manager.logo, accent: '#333333', background: '#444444',
-    texts: { en: { title: 'R', message: 'mm' }, fr: { title: 'Mf', message: 'Wm' } },
+test('pageWarnings: what a custom page should fix, without refusing it', () => {
+  assert.deepEqual(pageWarnings(custom('<p data-dormeto="status"></p>')), []);
+  assert.deepEqual(pageWarnings(custom("<DIV DATA-DORMETO='status'>")), []);
+  assert.deepEqual(pageWarnings(custom('<p data-dormeto=status>')), []);
+  assert.equal(pageWarnings(custom('<p>no place</p>')).length, 1);
+  assert.match(pageWarnings(custom('<p>no place</p>'))[0], /data-dormeto="status"/);
+  assert.equal(pageWarnings(custom('<p data-dormeto="elapsed">')).length, 1, 'another hook is not the status');
+  const csp = pageWarnings(custom('<meta http-equiv="Content-Security-Policy" content="default-src \'self\'"><p data-dormeto="status">'));
+  assert.equal(csp.length, 1);
+  assert.match(csp[0], /Content-Security-Policy/);
+  assert.equal(pageWarnings(custom("<META content='x' HTTP-EQUIV=content-security-policy><p>")).length, 2);
+  assert.deepEqual(pageWarnings(template({ title: 'x' })), []);
+  for (const odd of [null, 'x', 5, [], {}, { mode: 'custom' }]) assert.deepEqual(pageWarnings(odd), []);
+});
+
+test('iconTypeOf reads the type from the bytes', () => {
+  assert.equal(iconTypeOf(PNG), 'png');
+  assert.equal(iconTypeOf(JPEG), 'jpeg');
+  assert.equal(iconTypeOf(WEBP), 'webp');
+  assert.equal(iconTypeOf(SVG), 'svg+xml');
+  assert.equal(iconTypeOf(ICO), 'x-icon');
+  assert.equal(iconTypeOf(new Uint8Array(PNG)), 'png');
+  for (const bad of [Buffer.alloc(0), Buffer.from('GIF89a'), Buffer.from('<html>'), Buffer.from('<script></script><svg>'), 'x', null, undefined, 5, {}]) assert.equal(iconTypeOf(bad), null, String(bad));
+});
+
+const T = (fields) => ({ mode: 'template', ...fields });
+
+test('resolvePage: nothing anywhere is a template with the favicon', () => {
+  assert.deepEqual(resolvePage(), { mode: 'template', icon: 'auto', from: { mode: 'default', icon: 'default' } });
+  assert.deepEqual(resolvePage(null, 'x', []).mode, 'template');
+});
+
+test('resolvePage: the most specific level with a document decides the mode', () => {
+  const org = T({ title: 'Org' });
+  const html = '<p>mine</p>';
+  assert.equal(resolvePage(org, null, custom(html)).mode, 'custom');
+  assert.equal(resolvePage(custom(html), null, T({ title: 'W' })).mode, 'template');
+  assert.equal(resolvePage(custom(html), T({ title: 'R' }), null).mode, 'template');
+  assert.deepEqual(resolvePage(org, custom(html), null), { mode: 'custom', html, from: { mode: 'router', html: 'router' } });
+  assert.deepEqual(resolvePage(custom('<p>org</p>'), null, null), { mode: 'custom', html: '<p>org</p>', from: { mode: 'organization', html: 'organization' } });
+  assert.equal(resolvePage(custom('<p>org</p>'), custom('<p>router</p>'), custom('<p>wl</p>')).html, '<p>wl</p>', 'whole, never merged');
+});
+
+test('resolvePage: a template takes each field from the most specific template document that has it', () => {
+  const org = T({ icon: uri('png', PNG), title: 'Org', description: 'org text' });
+  const router = T({ title: 'Router' });
+  const workload = T({ description: 'wl text' });
+  assert.deepEqual(resolvePage(org, router, workload), {
+    mode: 'template', icon: uri('png', PNG), title: 'Router', description: 'wl text',
+    from: { mode: 'workload', icon: 'organization', title: 'router', description: 'workload' },
   });
+  assert.deepEqual(resolvePage(null, router, null), { mode: 'template', icon: 'auto', title: 'Router', from: { mode: 'router', icon: 'default', title: 'router' } });
 });
 
-test('mergePage: links are replaced as a whole, and [] removes the inherited ones', () => {
-  const a = [{ label: 'a', url: 'https://a.io' }, { label: 'b', url: 'https://b.io' }];
-  const c = [{ label: 'c', url: 'https://c.io' }];
-  assert.deepEqual(mergePage({ texts: { en: { links: a } } }, { texts: { en: { links: c } } }, null).texts.en.links, c);
-  assert.deepEqual(mergePage({ texts: { en: { links: a } } }, null, { texts: { en: { links: [] } } }).texts.en.links, []);
-  assert.deepEqual(mergePage({ texts: { en: { links: a } } }, { texts: { fr: { links: c } } }, null).texts, { en: { links: a }, fr: { links: c } });
+test('resolvePage: a custom page above a template is skipped for the fields; icon none is kept', () => {
+  const result = resolvePage(T({ icon: 'none', title: 'Org' }), custom(), T({ description: 'wl' }));
+  assert.equal(result.mode, 'template');
+  assert.equal(result.icon, 'none');
+  assert.equal(result.title, 'Org');
+  assert.equal(result.description, 'wl');
+  assert.deepEqual(result.from, { mode: 'workload', icon: 'organization', title: 'organization', description: 'workload' });
+  assert.equal(resolvePage(T({ icon: 'none' }), T({ title: 'x' }), null).icon, 'none');
 });
 
-test('mergePage: nothing, undefined and junk give {}; bad stored fields never get through', () => {
-  assert.deepEqual(mergePage(), {});
-  assert.deepEqual(mergePage(null, 'x', []), {});
-  assert.deepEqual(mergePage({ accent: 'red', texts: { en: { title: 'ok' } } }, { accent: '#123456' }, { logo: 'javascript:1' }), { accent: '#123456', texts: { en: { title: 'ok' } } });
-});
-
-test('fromOf names the level of each merged field', () => {
-  const manager = { logo: uri('png', PNG), accent: '#111111', texts: { en: { title: 'M', message: 'mm' } } };
-  const router = { accent: '#333333', texts: { en: { title: 'R', links: [] } } };
-  const workload = { texts: { fr: { message: 'Wm' }, en: { title: 'W' } } };
-  assert.deepEqual(fromOf(manager, router, workload), {
-    logo: 'manager', accent: 'router', 'en.title': 'workload', 'en.message': 'manager', 'en.links': 'router', 'fr.message': 'workload',
-  });
-  assert.deepEqual(fromOf(), {});
+test('resolvePage: bad stored values never get through', () => {
+  const result = resolvePage(T({ title: 'ok', icon: 'javascript:1' }), { mode: 'custom', html: ' ' }, { mode: 'template', title: 5, description: 'd' });
+  assert.deepEqual(result, { mode: 'template', icon: 'auto', title: 'ok', description: 'd', from: { mode: 'workload', icon: 'default', title: 'organization', description: 'workload' } });
+  assert.equal(resolvePage('x', 5, [{}]).mode, 'template');
 });
 
 test('medianOf: odd, even, one outlier ignored, nothing', () => {

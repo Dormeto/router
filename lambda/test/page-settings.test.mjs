@@ -210,6 +210,123 @@ test('resolvePage: bad stored values never get through', () => {
   assert.equal(resolvePage('x', 5, [{}]).mode, 'template');
 });
 
+const quick = (fn, limit = 250) => {
+  const started = performance.now();
+  const result = fn();
+  assert.ok(performance.now() - started < limit, `${Math.round(performance.now() - started)} ms`);
+  return result;
+};
+const svgUri = (text) => uri('svg+xml', Buffer.from(text));
+
+test('a mode that is not one of the two own names is refused, and nothing throws', () => {
+  for (const mode of ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'valueOf', { toString: 1 }, ['custom'], ['template'], [], {}, null, 5, true, 'Template', 'CUSTOM']) {
+    for (const doc of [{ mode }, { mode, title: 'x' }, { mode, html: '<p>x</p>' }]) {
+      const label = JSON.stringify(doc);
+      assert.equal(quick(() => validatePage(doc)).length, 1, label);
+      assert.equal(cleanPage(doc), null, label);
+      assert.deepEqual(pageWarnings(doc), [], label);
+      assert.deepEqual(resolvePage(doc, doc, doc), { mode: 'template', icon: 'auto', from: { mode: 'default', icon: 'default' } }, label);
+    }
+  }
+  assert.equal(validatePage(JSON.parse('{"mode":"template","__proto__":{"title":"x"}}')).length, 1, 'an own __proto__ key is an unknown key');
+  assert.deepEqual(cleanPage(JSON.parse('{"mode":"template","__proto__":{"title":"x"}}')), { mode: 'template' });
+  assert.equal(resolvePage(template({ title: 'T' }), { mode: ['custom'], html: '<p>x</p>' }, null).title, 'T');
+});
+
+test('fields are own properties: nothing inherited counts', () => {
+  const inherited = Object.assign(Object.create({ title: 'x' }), { mode: 'template' });
+  assert.equal(validatePage(inherited).length, 1, 'not a plain object');
+  assert.equal(cleanPage(inherited), null);
+});
+
+test('svg: the first element is found in linear time, whatever precedes it', () => {
+  const hostile = ['﻿'.repeat(21_000), '<!---->'.repeat(9_000), '<!--'.repeat(16_000), '<?xml '.repeat(9_000), '<!DOCTYPE '.repeat(5_000), ' '.repeat(64_000), '<!DOCTYPE x [ "'.repeat(4_000), '<!-- -->﻿'.repeat(5_000)];
+  for (const text of hostile) {
+    const bytes = Buffer.from(`${text}x`);
+    assert.equal(quick(() => iconTypeOf(bytes)), null, text.slice(0, 12));
+    assert.equal(quick(() => validatePage(template({ icon: uri('svg+xml', bytes) }))).length, 1);
+    assert.equal(quick(() => cleanPage(template({ icon: uri('svg+xml', bytes) }))).icon, undefined);
+  }
+  assert.equal(quick(() => iconTypeOf(Buffer.from(`${'﻿'.repeat(5_000)}<svg>`))), 'svg+xml');
+  assert.equal(quick(() => iconTypeOf(Buffer.from(`${'<!---->'.repeat(5_000)}<svg>`))), 'svg+xml');
+});
+
+test('svg: the first element may follow a BOM, white space, an XML declaration, comments and a DOCTYPE', () => {
+  const doctype = '<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">\n<svg xmlns="http://www.w3.org/2000/svg"></svg>';
+  assert.equal(iconTypeOf(Buffer.from(doctype)), 'svg+xml');
+  assert.deepEqual(validatePage(template({ icon: svgUri(doctype) })), []);
+  assert.equal(iconTypeOf(Buffer.from('<!DOCTYPE svg [ <!ENTITY a "x>y"> ]><svg/>')), 'svg+xml', 'an internal subset, a > inside quotes');
+  assert.equal(iconTypeOf(Buffer.from('<!doctype svg><svg/>')), 'svg+xml');
+  assert.equal(iconTypeOf(Buffer.from('<svg/>')), 'svg+xml');
+  assert.equal(iconTypeOf(Buffer.from('<svg\n>')), 'svg+xml');
+  assert.equal(iconTypeOf(Buffer.from('﻿\n <!-- a -- b --> <?xml version="1.0"?> <!-- c --><svg>')), 'svg+xml');
+  for (const bad of ['<svg', '<svgx>', '<svg:g>', '<SVG>', '<g><svg>', '<!-- <svg> -->', '<!-- a <svg>', '<?xml version="1.0"?', '<!DOCTYPE svg <svg>', '<?php <svg>', 'x<svg>', '<!DOCTYPE svg [ <svg>', '<?xmlx ?><svg>']) {
+    assert.equal(iconTypeOf(Buffer.from(bad)), null, bad);
+  }
+});
+
+test('a long string is over its limit without being walked', () => {
+  const huge = 'x'.repeat(50_000_000);
+  assert.equal(quick(() => validatePage(template({ title: huge })), 100).length, 1);
+  assert.equal(quick(() => validatePage(template({ description: huge })), 100).length, 1);
+  assert.equal(quick(() => validatePage(custom(huge)), 100).length, 1);
+  assert.equal(quick(() => validatePage(template({ icon: `data:image/png;base64,${huge}` })), 100).length, 1);
+  assert.equal(quick(() => cleanPage(template({ title: huge, description: huge })), 100).title, undefined);
+  assert.equal(validatePage(template({ title: '\u{1F600}'.repeat(80) })).length, 0, 'at the limit, counted by characters');
+  assert.equal(validatePage(template({ title: `${'a'.repeat(79)}\u{1F600}` })).length, 0);
+  assert.equal(validatePage(template({ title: `${'a'.repeat(80)}\u{1F600}` })).length, 1);
+});
+
+test('icon: partial signatures and non-canonical base64 are refused', () => {
+  assert.equal(validatePage(template({ icon: uri('webp', Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WAVE'), Buffer.alloc(8)])) })).length, 1, 'a wave file');
+  assert.equal(validatePage(template({ icon: uri('webp', Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4)])) })).length, 1);
+  assert.equal(validatePage(template({ icon: uri('png', Buffer.from([0x89, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])) })).length, 1, 'two bytes of a png');
+  assert.equal(validatePage(template({ icon: uri('jpeg', Buffer.from([0xff, 0xd8, 0x00])) })).length, 1);
+  assert.equal(validatePage(template({ icon: uri('x-icon', Buffer.from([0, 0, 1, 1])) })).length, 1);
+  assert.equal(validatePage(template({ icon: uri('x-icon', Buffer.from([0, 0, 1])) })).length, 1);
+  const canonical = uri('x-icon', Buffer.from([0, 0, 1, 0, 1]));
+  assert.deepEqual(validatePage(template({ icon: canonical })), []);
+  assert.equal(validatePage(template({ icon: canonical.replace(/E=$/, 'F=') })).length, 1, 'the unused bits are not zero');
+  assert.equal(validatePage(template({ icon: canonical.replace(/=$/, '') })).length, 1, 'unpadded');
+});
+
+test('a title is one line: U+2028 and U+2029 end it too', () => {
+  assert.equal(validatePage(template({ title: 'a b' })).length, 1);
+  assert.equal(validatePage(template({ title: 'a b' })).length, 1);
+  assert.deepEqual(validatePage(template({ description: 'a b' })), []);
+});
+
+test('pageWarnings: the status hook as the script finds it, and the CSP meta tag only', () => {
+  const statusless = (html) => pageWarnings(custom(html)).filter((w) => /data-dormeto="status"/.test(w)).length;
+  assert.equal(statusless('<p DATA-DORMETO="status">'), 0, 'attribute names are not case sensitive');
+  assert.equal(statusless('<p DATA-DORMETO="STATUS">'), 1, 'its value is');
+  assert.equal(statusless('<p data-dormeto="Status">'), 1);
+  assert.equal(statusless('<p data-dormeto="status"class=x>'), 0);
+  assert.equal(statusless("<p data-dormeto = 'status'>"), 0);
+  assert.equal(statusless('<p data-dormeto=status>'), 0);
+  assert.equal(statusless('<p data-dormeto=status class=x>'), 0);
+  assert.equal(statusless('<p data-dormeto=status/>'), 0);
+  assert.equal(statusless('<p data-dormeto=statusbar>'), 1);
+  assert.equal(statusless('<p data-dormeto="statusbar">'), 1);
+  assert.equal(statusless('<p data-dormeto="elapsed">'), 1);
+  const cspWarnings = (html) => pageWarnings(custom(`<p data-dormeto="status"></p>${html}`)).length;
+  assert.equal(cspWarnings('<meta http-equiv="Content-Security-Policy" content="x">'), 1);
+  assert.equal(cspWarnings('<META CONTENT="x" HTTP-EQUIV=\'content-security-policy\'>'), 1);
+  assert.equal(cspWarnings('<meta\nhttp-equiv = content-security-policy content=x>'), 1);
+  assert.equal(cspWarnings('<p>Content-Security-Policy</p>'), 0);
+  assert.equal(cspWarnings('<p>http-equiv="content-security-policy"</p>'), 0);
+  assert.equal(cspWarnings('<meta http-equiv="refresh" content="1"><p>content-security-policy</p>'), 0);
+  assert.equal(cspWarnings('<meta charset="utf-8">'), 0);
+  assert.equal(cspWarnings('<metadata http-equiv="content-security-policy">'), 0);
+});
+
+test('pageWarnings: a hostile 256 KiB page is read in linear time', () => {
+  for (const html of ['<meta '.repeat(43_690), '<meta http-equiv '.repeat(15_000), 'data-dormeto '.repeat(20_000), 'data-dormeto'.repeat(21_000) + ' '.repeat(10_000), 'data-dormeto=  '.repeat(17_000), '<meta '.repeat(20_000) + '>']) {
+    assert.ok(Buffer.byteLength(html) <= 256 * 1024);
+    assert.equal(quick(() => pageWarnings(custom(html)).length, 250) >= 1, true);
+  }
+});
+
 test('medianOf: odd, even, one outlier ignored, nothing', () => {
   assert.equal(medianOf([3, 1, 2]), 2);
   assert.equal(medianOf([4, 1, 3, 2]), 2.5);

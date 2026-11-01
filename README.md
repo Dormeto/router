@@ -275,7 +275,8 @@ aws lambda invoke --function-name dmt-dev-controller --cli-binary-format raw-in-
   - A `cron` is crontab's five fields, `minute hour day-of-month month day-of-week`, at most 200 characters. Each field is
     `*`, a number, a range `a-b`, a step `*/s` or `a-b/s`, or a comma list of those. Months also take `JAN` to `DEC`, weekdays
     `SUN` to `SAT`, in any case. Weekdays are 0 to 7, 0 and 7 both Sunday. `?` is `*`, as a whole day field. With both day
-    fields restricted (anything but `*` or `?`), either one matches.
+    fields restricted (anything but `*` or `?`), either one matches. A day field starting with `*`, such as `*/2`, goes alone:
+    beside the other day field it is refused, because cron versions read that differently.
   - Every minute of a `cron` must be a multiple of 5: `*` is refused, `*/5` and `0,30` are accepted. An expression that never
     matches (`0 8 31 2 *`) is refused. `cron(...)`, six fields, `L`, `W` and `#` are refused: EventBridge's weekday 1 is Sunday,
     so its expressions do not read the same here.

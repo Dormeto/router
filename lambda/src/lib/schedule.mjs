@@ -190,6 +190,8 @@ function cronValues(text, { low, high, days, names }) {
 function parseCron(text) {
   if (typeof text !== 'string') return { problem: CRON_WORDING };
   if (text.length > CRON_LENGTH_MAX) return { problem: `at most ${CRON_LENGTH_MAX} characters` };
+  // eslint-disable-next-line no-control-regex
+  if (/[\0-\x08\x0a-\x1f\x7f]/.test(text)) return { problem: 'one line, without control characters' };
   const fields = text.trim().split(/\s+/);
   if (fields.length !== CRON_FIELDS.length || CRON_FOREIGN.test(text.trim())) return { problem: CRON_WORDING };
   const values = [];
@@ -204,6 +206,9 @@ function parseCron(text) {
   const [minutes, hours, days, months, weekdays] = values;
   if ([...minutes].some((m) => m % 5 !== 0)) return { problem: 'minutes must be multiples of 5, as schedule times are: * is every minute, */5 every five' };
   const open = (i) => fields[i] === '*' || fields[i] === '?';
+  // Crontab's manual and its implementations disagree on whether */2 restricts a day field: refused beside the other one.
+  const starred = (i) => fields[i].startsWith('*') && !open(i);
+  if ((starred(2) && !open(4)) || (starred(4) && !open(2))) return { problem: 'a day field starting with * goes alone: cron versions read */2 with the other day field differently, so give a list or a range' };
   // A weekday comes in every month, so only a day of the month alone can never match.
   if (open(4) && ![...months].some((m) => [...days].some((d) => d <= MONTH_DAYS[m]))) return { problem: 'never matches: no such date in that month' };
   return {

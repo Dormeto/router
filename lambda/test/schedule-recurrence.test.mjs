@@ -54,6 +54,8 @@ test('valid: each of from and until alone, on weekly days too, one day long, and
 
 const DAYS_LIST = 'one or more of mon, tue, wed, thu, fri, sat, sun, each once';
 const FIVE_FIELDS = 'five fields: minute hour day-of-month month day-of-week';
+const STAR_DAY = 'a day field starting with * goes alone: cron versions read */2 with the other day field differently, so give a list or a range';
+const ONE_LINE = 'one line, without control characters';
 const WINDOW_PROBLEMS = [
   ['from not a date', awake({ days: ['mon'], from: '2027-1-4' }), 'windows[0].from: a date YYYY-MM-DD'],
   ['from not in the calendar', awake({ days: ['mon'], from: '2027-02-30' }), 'windows[0].from: a date YYYY-MM-DD'],
@@ -220,7 +222,7 @@ const CRON_STARTS = [
   ['? in the day of the month', '0 8 ? * 1', at8('2027-01-04', '2027-01-11')],
   ['? in the day of the week', '0 8 15 * ?', at8('2027-01-15', '2027-02-15')],
   ['both day fields restricted: either matches', '0 8 15 * MON', at8('2027-01-04', '2027-01-11', '2027-01-15', '2027-01-18', '2027-01-25', '2027-02-01')],
-  ['either matches for a step too', '0 8 */10 * MON', at8('2027-01-01', '2027-01-04', '2027-01-11', '2027-01-18', '2027-01-21', '2027-01-25')],
+  ['a day step alone', '0 8 */10 * *', at8('2027-01-01', '2027-01-11', '2027-01-21', '2027-01-31', '2027-02-01', '2027-02-11')],
   ['? in both', '0 8 ? * ?', at8('2027-01-01', '2027-01-02')],
   ['extra spaces', '  0   8 15 *  * ', at8('2027-01-15', '2027-02-15')],
   ['a day only a month can have', '0 8 31 1,2 *', at8('2027-01-31', '2028-01-31')],
@@ -246,6 +248,13 @@ const CRON_PROBLEMS = [
   ['a step from a minute not on 5', '1-59/5 8 * * *', /multiples of 5/],
   ['cron(...)', 'cron(0 8 * * ? *)', FIVE_FIELDS],
   ['cron(...) with five fields', 'cron(0 8 * * 1)', FIVE_FIELDS],
+  ['a day step with a weekday', '0 8 */2 * 1', STAR_DAY],
+  ['a weekday step with a day', '0 8 15 * */2', STAR_DAY],
+  ['a star list with a weekday', '0 8 *,5 * MON', STAR_DAY],
+  ['both day fields stepped', '0 8 */2 * */3', STAR_DAY],
+  ['a line feed at the end', '0 8 * * 1\n', ONE_LINE],
+  ['a carriage return between fields', '0\r8 * * 1', ONE_LINE],
+  ['a line feed between fields', '0 8\n* * 1', ONE_LINE],
   ['six fields', '0 8 * * ? *', FIVE_FIELDS],
   ['four fields', '0 8 * *', FIVE_FIELDS],
   ['an alias', '@daily', FIVE_FIELDS],

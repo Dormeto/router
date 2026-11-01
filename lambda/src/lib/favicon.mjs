@@ -173,7 +173,7 @@ const sentence = (err) => (err instanceof Refused ? err.message : `${String(err?
 // signal: the caller's own budget; once it aborts, nothing more goes out.
 export async function readFavicon(host, { fetch: fetcher = globalThis.fetch, now = Date.now, budgetMs = 3000, signal = null } = {}) {
   const name = hostName(host);
-  if (!name) return { icon: null, error: 'no host name' };
+  if (!name) return { icon: null, error: 'no rule for the whole of a host name' };
   const control = new AbortController();
   if (signal?.aborted) control.abort();
   else signal?.addEventListener?.('abort', () => control.abort(), { once: true });

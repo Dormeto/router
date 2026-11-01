@@ -178,7 +178,7 @@ test('the whole read is inside its budget: a server that hangs ends it with an e
 test('never throws: no host, a wildcard, a bad host, a fetch that throws or answers nonsense', async () => {
   for (const host of [null, undefined, '', '*.example.com', 'a b', 'ex?mple.com', 'http://x', 'a/b', 42]) {
     const f = fakeFetch({});
-    assert.deepEqual(await readFavicon(host, { fetch: f.fetch, now: Date.now, budgetMs: 100 }), { icon: null, error: 'no host name' }, String(host));
+    assert.deepEqual(await readFavicon(host, { fetch: f.fetch, now: Date.now, budgetMs: 100 }), { icon: null, error: 'no rule for the whole of a host name' }, String(host));
     assert.equal(f.calls.length, 0);
   }
   const boom = await readFavicon(HOST, { fetch: async () => { throw new TypeError('fetch failed'); }, now: Date.now, budgetMs: 100 });

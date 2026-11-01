@@ -641,3 +641,52 @@ test('custom: with probeUrl, the reload keeps its one-per-poll pacing even with 
     assert.equal(run.delays[0], 3000);
   }
 });
+
+// --- Final review: the scan follows the HTML parser ----------------------------------------------------------------------
+
+test('custom: a comment ends as the HTML parser ends it: <!-->, <!--->, the first --> or --!>; an unterminated one holds the rest', () => {
+  const decl = '<?xml version="1.0"?>';
+  const cases = {
+    'empty comment': ['<!--><p>x</p>', 5],
+    'dash comment': ['<!---><p>x</p>', 6],
+    'empty comment, then the doctype': ['<!--><!doctype html><p>x</p>', 5 + 15],
+    'dash comment, then the doctype': ['<!---><!doctype html><p>x</p>', 6 + 15],
+    'bang end': ['<!-- c --!><p>x</p>', 11],
+    'bang end, then a dash end that is text': ['<!-- c --!>--><p>x</p>', 11],
+    'first end wins': ['<!-- a --> b --!> c --><p>x</p>', 11],
+    'the usual end': ['<!----><p>x</p>', 7],
+    'conditional': ['<!--[if !IE]><!--><p>x</p>', 18],
+    'half an end': ['<!-- a --!', 0],
+    'a dash end after a bang': ['<!-- a -- >', 0],
+    'unterminated after a doctype': ['<!doctype html><!-- <p>x</p>', 15],
+    'an xml declaration': [`${decl}<!DOCTYPE html><p>x</p>`, decl.length + 15],
+    'an xml declaration ends at its first >': ['<?a > b ?><!DOCTYPE html>', 6],
+    'an xml declaration after a comment and white space': [`<!-- c -->\n${decl}\n<!DOCTYPE html>x`, 11 + decl.length + 1 + 15],
+    'an unterminated xml declaration': ['<?xml version="1.0"', 0],
+    'an xml declaration holding a comment start': ['<?a <!-- ?><!DOCTYPE html>', 11 + 15],
+  };
+  for (const [name, [page, at]] of Object.entries(cases)) {
+    const html = custom(page);
+    assert.equal(injectedAt(html), at, name);
+    assert.equal(without(html), page, name);
+  }
+});
+
+test('custom: the new forms stay linear on a hostile 256 KiB page', () => {
+  const hostile = ['<!-->'.repeat(52_000), '<!--->'.repeat(43_000), '<?'.repeat(131_000), '<!-- -->'.repeat(32_000), '<!-- a -->'.repeat(26_000), '<?a>'.repeat(65_000), `<!--${'-->'.repeat(87_000)}`];
+  for (const page of hostile.map((p) => `${p}<p>`)) {
+    const started = performance.now();
+    const html = custom(page);
+    assert.ok(performance.now() - started < 200, `${page.slice(0, 10)}: ${performance.now() - started} ms`);
+    assert.equal(without(html), page);
+  }
+});
+
+test('script: its own reference to fetch is taken at its start, so a page that replaces fetch does not strand the visitor', async () => {
+  const run = runScript(custom('<p>x</p>'), [{ state: 'WAKING' }, {}]);
+  await run.settle();
+  assert.equal(run.context.reloaded, false);
+  run.context.fetch = async () => { throw new Error('the customer\'s'); };
+  await run.next();
+  assert.equal(run.context.reloaded, true, 'the later probe used the script\'s own fetch and saw the workload awake');
+});

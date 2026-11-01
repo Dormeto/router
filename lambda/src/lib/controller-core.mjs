@@ -907,7 +907,7 @@ export function createController({
         if (problems.length) return { problems };
         await store.putWaitingPage(level, page, { by, at: now() });
         const bytes = page.mode === 'custom' ? Buffer.byteLength(page.html) : undefined;
-        log.info('WaitingPageSet', { level: workloadId ? 'workload' : 'router', workloadId, mode: page.mode, bytes, sha256: createHash('sha256').update(JSON.stringify(page)).digest('hex'), by });
+        log.info('WaitingPageSet', { level: workloadId ? 'workload' : 'router', workloadId, mode: page.mode, bytes, sha256: page.mode === 'custom' ? createHash('sha256').update(page.html).digest('hex') : undefined, by });
         break;
       }
       case 'delete': {

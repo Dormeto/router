@@ -12,9 +12,10 @@ export function createWaitingPages({ store, organizationPage = null, now = Date.
   const workloads = new Map();
 
   // The slot's value, read again when it is older than ttlMs. One read at a time per slot; a failed one keeps the value. The
-  // caller waits for it until `expiry` (one per page): after that the last value (or none) is used, the read goes on and
-  // fills the slot when it comes. A read pending for longer than STUCK_MS is replaced.
-  async function fresh(slot, what, load, expiry) {
+  // caller waits for it readMs at most (a bound of this read alone, so a slow level costs only its own page): after that the
+  // last value (or none) is used, the read goes on and fills the slot when it comes. A read pending for longer than STUCK_MS
+  // is replaced.
+  async function fresh(slot, what, load) {
     if (slot.at !== undefined && now() - slot.at < ttlMs) return slot.value;
     if (!slot.loading || now() - slot.startedAt > STUCK_MS) {
       slot.startedAt = now();
@@ -32,9 +33,15 @@ export function createWaitingPages({ store, organizationPage = null, now = Date.
       })();
       slot.loading = loading;
     }
-    if ((await Promise.race([slot.loading.then(() => 'read'), expiry])) !== 'read') {
-      slot.at = now();
-      log.warn('WaitingPageUnread', { ...what, error: `no answer within ${readMs} ms` });
+    let timer;
+    try {
+      const expiry = new Promise((resolve) => { timer = setTimeout(() => resolve('late'), readMs); });
+      if ((await Promise.race([slot.loading.then(() => 'read'), expiry])) !== 'read') {
+        slot.at = now();
+        log.warn('WaitingPageUnread', { ...what, error: `no answer within ${readMs} ms` });
+      }
+    } finally {
+      clearTimeout(timer);
     }
     return slot.value;
   }
@@ -53,18 +60,17 @@ export function createWaitingPages({ store, organizationPage = null, now = Date.
 
   // -> { page: { mode, title?, description?, html? }, icon: a data URI or null }, for renderPage.
   async function pageOf(workloadId) {
-    let timer;
     try {
-      const expiry = new Promise((resolve) => { timer = setTimeout(() => resolve('late'), readMs); });
-      const [organization, router] = await Promise.all([
-        fresh(shared.organization, { level: 'organization' }, async () => (organizationPage ? await organizationPage.read() : null), expiry),
-        fresh(shared.router, { level: 'router' }, () => pageOfLevel('router'), expiry),
-      ]);
       const entry = workloadId ? entryOf(workloadId) : null;
-      const workload = entry ? await fresh(entry.page, { level: 'workload', workloadId }, () => pageOfLevel({ workloadId }), expiry) : null;
+      // The three levels are read together, each within its own bound.
+      const [organization, router, workload] = await Promise.all([
+        fresh(shared.organization, { level: 'organization' }, async () => (organizationPage ? await organizationPage.read() : null)),
+        fresh(shared.router, { level: 'router' }, () => pageOfLevel('router')),
+        entry ? fresh(entry.page, { level: 'workload', workloadId }, () => pageOfLevel({ workloadId })) : null,
+      ]);
       const { mode, icon, title, description, html } = resolvePage(organization, router, workload);
       const shown = icon === 'auto' && entry
-        ? await fresh(entry.favicon, { level: 'favicon', workloadId }, async () => (await store.getFavicon(workloadId, { eventual: true }))?.icon ?? null, expiry)
+        ? await fresh(entry.favicon, { level: 'favicon', workloadId }, async () => (await store.getFavicon(workloadId, { eventual: true }))?.icon ?? null)
         : icon;
       return {
         page: mode === 'custom' ? { mode, html } : { mode, ...(title ? { title } : {}), ...(description ? { description } : {}) },
@@ -74,8 +80,6 @@ export function createWaitingPages({ store, organizationPage = null, now = Date.
       // Not expected (the reads are guarded): the built-in page.
       log.warn('WaitingPageUnread', { error: String(err?.message ?? err).slice(0, 200) });
       return { page: { mode: 'template' }, icon: null };
-    } finally {
-      clearTimeout(timer);
     }
   }
 

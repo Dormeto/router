@@ -106,6 +106,8 @@ export function napMessage(napUntil, language = 'en') {
 function scriptFor({ t, cloud, initial, pollMs, probeUrl, wake, last, custom }) {
   return `<script>
 (() => {
+  // Our own reference, before the page's code can replace fetch.
+  const fetch = globalThis.fetch;
   const pollMs = ${pollMs};
   const openedAt = Date.now();
   const tpl = ${custom ? 'false' : 'true'};
@@ -219,17 +221,30 @@ const textOf = (value) => (typeof value === 'string' && value.trim() ? value : n
 const finite = (value) => typeof value === 'number' && Number.isFinite(value);
 const BLANKS = new Set([' ', '\t', '\n', '\r', '\f', '﻿']);
 
-// Where the injected block goes in a custom page: the very start, after a BOM, white space, comments and the doctype when
-// they come first (so the doctype stays first and standards mode holds), whatever the rest holds. A linear scan, no search for
-// a tag the page can hold in a comment, a string or a template: the probe starts at once, whatever the page does.
+// Where the injected block goes in a custom page: the very start, after a BOM, white space, comments, an XML declaration and
+// the doctype when they come first (so the doctype stays first and standards mode holds), whatever the rest holds. A linear
+// scan, no search for a tag the page can hold in a comment, a string or a template: the probe starts at once, whatever the
+// page does. A comment ends as the HTML parser ends it: `<!-->` and `<!--->` at once, otherwise at the first `-->` or `--!>`;
+// an unterminated one holds the rest of the document, and the block goes before it. `<?...>` is a bogus comment to the parser,
+// ending at its first `>`.
+const COMMENT_END = /--!?>/g;
 function startOf(html) {
   let at = 0;
   for (let doctype = false; ;) {
     while (at < html.length && BLANKS.has(html[at])) at += 1;
     if (html.startsWith('<!--', at)) {
-      const end = html.indexOf('-->', at + 4);
+      if (html[at + 4] === '>') at += 5;
+      else if (html.startsWith('->', at + 4)) at += 6;
+      else {
+        COMMENT_END.lastIndex = at + 4;
+        const end = COMMENT_END.exec(html);
+        if (!end) return at;
+        at = end.index + end[0].length;
+      }
+    } else if (html.startsWith('<?', at)) {
+      const end = html.indexOf('>', at + 2);
       if (end < 0) return at;
-      at = end + 3;
+      at = end + 1;
     } else if (!doctype && html.slice(at, at + 9).toLowerCase() === '<!doctype') {
       const end = html.indexOf('>', at);
       if (end < 0) return at;

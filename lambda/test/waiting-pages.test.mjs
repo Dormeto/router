@@ -50,7 +50,7 @@ test('the icon: an upload is shown as it is, none shows none, and the favicon it
   assert.equal((await s.waiting.pageOf('a')).icon, UPLOAD);
   assert.equal((await s.waiting.pageOf('b')).icon, null);
   assert.deepEqual(s.reads.filter(([kind]) => kind === 'favicon'), [], 'no favicon item read for an upload or none');
-  const auto = setup({ favicons: { b: { icon: PNG }, c: { icon: null, error: 'no host name' }, d: { icon: 42 } } });
+  const auto = setup({ favicons: { b: { icon: PNG }, c: { icon: null, error: 'no rule for the whole of a host name' }, d: { icon: 42 } } });
   assert.equal((await auto.waiting.pageOf('b')).icon, PNG);
   assert.equal((await auto.waiting.pageOf('c')).icon, null);
   assert.equal((await auto.waiting.pageOf('d')).icon, null);
@@ -205,4 +205,19 @@ test('a read still pending after 10 s is replaced by a new one, not before (the 
   s.clock.advance(1001);
   await s.waiting.pageOf('shop');
   assert.ok(calls > first, 'pending for more than 10 s: asked again');
+});
+
+// --- Final review: each level's read has its own bound -------------------------------------------------------------
+
+test('an organization read that never answers costs only the organization level, never the workload\'s own page', async () => {
+  const s = setup({ pages: { router: { mode: 'template', title: 'Router' }, shop: { mode: 'custom', html: '<p>Mine</p>' } }, favicons: { shop: { icon: PNG } }, readMs: 40 });
+  s.organization.read = () => new Promise(() => {});
+  const started = Date.now();
+  assert.deepEqual(await s.waiting.pageOf('shop'), { page: { mode: 'custom', html: '<p>Mine</p>' }, icon: null });
+  assert.ok(Date.now() - started < 500, `${Date.now() - started} ms`);
+  const unread = s.warned.filter(([event]) => event === 'WaitingPageUnread').map(([, fields]) => fields.level);
+  assert.deepEqual(unread, ['organization'], 'only the organization level was late');
+  const template = setup({ pages: { router: { mode: 'template', title: 'Router' }, shop: { mode: 'template', description: 'Shop.' } }, favicons: { shop: { icon: PNG } }, readMs: 40 });
+  template.organization.read = () => new Promise(() => {});
+  assert.deepEqual(await template.waiting.pageOf('shop'), { page: { mode: 'template', title: 'Router', description: 'Shop.' }, icon: PNG });
 });

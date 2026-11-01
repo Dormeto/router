@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { createController } from '../src/lib/controller-core.mjs';
 import { currentTarget } from '../src/lib/route.mjs';
 import { STATES } from '../src/lib/state.mjs';
@@ -2173,7 +2174,7 @@ test('waiting-page: bad pages answer the problems and write nothing; a 256 KiB p
   assert.equal(view.effective.html, html);
   const line = logged.find((l) => l.event === 'WaitingPageSet');
   assert.deepEqual([line.level, line.mode, line.bytes], ['workload', 'custom', Buffer.byteLength(html)]);
-  assert.match(line.sha256, /^[0-9a-f]{64}$/);
+  assert.equal(line.sha256, createHash('sha256').update(html).digest('hex'), 'the hash of the HTML alone, as the audit\'s');
   assert.ok(logged.every((l) => !JSON.stringify(l).includes('aaaaaaaa')));
 });
 
@@ -2341,7 +2342,7 @@ test('nap: no host name (no rule with a literal host) is recorded as the reason 
   const none = setup({ run: { state: STATES.AWAKE } });
   const at = none.clock.now();
   assert.equal(await napped(none), STATES.ASLEEP);
-  assert.deepEqual(none.store.state.favicons.demo, { icon: null, fetchedAt: at, error: 'no host name' });
+  assert.deepEqual(none.store.state.favicons.demo, { icon: null, fetchedAt: at, error: 'no rule for the whole of a host name' });
   assert.deepEqual(none.network.calls, []);
 
   const wild = setup({ run: { state: STATES.AWAKE } });
@@ -2412,7 +2413,7 @@ test('nap: the host comes only from rules that are all host (or the path /*): a 
   shared.elbv2.state.rules.get(shared.cfg.ruleArn).conditions = [host('shop.example.com'), path('/api/*')];
   app(shared);
   assert.equal(await napped(shared), STATES.ASLEEP);
-  assert.deepEqual([shared.network.calls, shared.store.state.favicons.demo.error], [[], 'no host name']);
+  assert.deepEqual([shared.network.calls, shared.store.state.favicons.demo.error], [[], 'no rule for the whole of a host name']);
 
   const header = setup({ run: { state: STATES.AWAKE } });
   header.elbv2.state.rules.get(header.cfg.ruleArn).conditions = [host('shop.example.com'), { Field: 'http-header', HttpHeaderConfig: { HttpHeaderName: 'x-env', Values: ['a'] } }];

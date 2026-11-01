@@ -227,7 +227,8 @@ operational record like a pause, stored in the state table (`WL#<id> / SCHEDULE`
 CLI) for any workload whatever wrote its configuration; the `workload` Terraform module does not carry it. The
 controller's `schedule` action validates and writes it (`{problems}` and nothing written when invalid, else the stored
 schedule, `next` and `maintenanceDue`), `clear-schedule` removes it, and `status` answers `schedule` (null without),
-`next` (the next 5 events within 8 days: `awake-start`, `awake-end`, `nap-start`, `nap-end`, with their window) and
+`next` (the next 5 events within 8 days, or 400 when a window has a `repeat` or a `from`: `awake-start`, `awake-end`,
+`nap-start`, `nap-end`, with their window) and
 `maintenanceDue` (ISO, when `maxNapDays` applies and the workload is asleep). The summary carries `scheduled: true`.
 
 ```json
@@ -257,6 +258,33 @@ aws lambda invoke --function-name dmt-dev-controller --cli-binary-format raw-in-
   is 1 to 60. A schedule holds windows, `maxNapDays`, or both. Unknown fields are refused; `by` and `at` in a submitted
   schedule are ignored (the router stores who and when itself). Times are local wall times: a start in a skipped hour
   applies at the first valid minute after it, a start in a repeated hour at its first occurrence.
+- **Recurrences (router 0.36.0):** a window can repeat on more than weekdays, within a range of dates. A window without
+  the new fields reads as before, and a router before 0.36.0 refuses them as unknown.
+  - `from` and `until` are local dates `YYYY-MM-DD`, both included and each optional. No occurrence starts outside them.
+    One started on `until` runs to its end.
+  - `repeat` replaces `days`: a window has one or the other. `interval` is 1 to 99, 1 by default. Above 1, `from` is
+    required: it anchors the count.
+  - `{ "pattern": "daily", "interval": 3 }` counts days from `from`.
+  - `{ "pattern": "weekly", "interval": 2, "days": ["mon", "thu"] }` counts weeks, Monday to Sunday, from the week of `from`.
+  - `{ "pattern": "monthly", "interval": 3, "day": 15 }` counts months from the month of `from`. A `day` past the month's
+    end falls on its last day. `{ "pattern": "monthly", "nth": 1, "weekday": "mon" }` takes `nth` 1 to 4, or -1 for the last,
+    instead of `day`.
+  - Yearly is monthly with `interval` 12: `from` gives its month.
+  - `{ "pattern": "cron", "cron": "30 8 * * 1-5", "minutes": 630 }` replaces `start` and `end` too, and takes no `interval`.
+    `minutes` is how long each occurrence lasts in wall time: a multiple of 5, from 5 to 10080 (7 days).
+  - A `cron` is crontab's five fields, `minute hour day-of-month month day-of-week`, at most 200 characters. Each field is
+    `*`, a number, a range `a-b`, a step `*/s` or `a-b/s`, or a comma list of those. Months also take `JAN` to `DEC`, weekdays
+    `SUN` to `SAT`, in any case. Weekdays are 0 to 7, 0 and 7 both Sunday. `?` is `*`, as a whole day field. With both day
+    fields restricted (anything but `*` or `?`), either one matches.
+  - Every minute of a `cron` must be a multiple of 5: `*` is refused, `*/5` and `0,30` are accepted. An expression that never
+    matches (`0 8 31 2 *`) is refused. `cron(...)`, six fields, `L`, `W` and `#` are refused: EventBridge's weekday 1 is Sunday,
+    so its expressions do not read the same here.
+  - Exception dates, the wake modes and clock changes apply to these occurrences as to weekly ones.
+  - Overlaps: two plain weekly windows are compared over the week, as above. As soon as either has `from`, `until` or
+    `repeat`, the pair is compared day by day in wall time, over the next 400 local days from the later of today and their
+    `from` dates. An exception date has no occurrence to compare. The refusal gives the first date:
+    `windows[1]: the nap window overlaps the awake window windows[0] (2027-03-15 08:00–12:00)`. Beyond those 400 days an overlap
+    is not refused, and the occurrence that started last applies.
 - **The check applies it** on the clock's 5-minute marks: the `check_schedule` of the `router` module is
   `cron(0/5 * * * ? *)` (not `rate(5 minutes)`), so 08:45 is met at the 08:45 check, within its latency. Each occurrence
   of a window is applied once (the run item records the last one, `scheduleApplied`), so a missed check or a deploy

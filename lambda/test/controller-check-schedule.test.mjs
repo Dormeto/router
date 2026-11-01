@@ -473,3 +473,46 @@ test('status: maintenanceDue is the earlier of the schedule\'s and the hibernati
   s.store.state.run.state = STATES.AWAKE;
   assert.equal(await due(), null);
 });
+
+// Recurrences (schedule recurrence design): the check treats their occurrences as it does weekly ones.
+test('a cron awake window wakes at each of its starts, once per occurrence', async () => {
+  const s = setup({ run: { state: STATES.ASLEEP }, schedule: stored({ windows: [{ kind: 'awake', repeat: { pattern: 'cron', cron: '0 8,14 19 10 *', minutes: 60 } }] }) });
+  await s.checkAt('19T07:55');
+  assert.equal(s.wakes(), 0);
+  await s.checkAt('19T08:00');
+  assert.equal(s.wakes(), 1);
+  assert.equal(s.store.state.run.scheduleApplied, occurrence(0, '19T08:00'));
+  s.putAsleep();
+  await s.checkAt('19T08:30');
+  assert.equal(s.wakes(), 1);
+  await s.checkAt('19T14:00');
+  assert.equal(s.wakes(), 2);
+  assert.equal(s.store.state.run.scheduleApplied, occurrence(0, '19T14:00'));
+});
+
+test('every other day from a date, up to a date: the days of the pattern, not those around it', async () => {
+  const window = { kind: 'awake', start: '08:00', end: '18:00', repeat: { pattern: 'daily', interval: 2 }, from: '2026-10-20', until: '2026-10-22' };
+  const s = setup({ run: { state: STATES.ASLEEP }, schedule: stored({ windows: [window] }) });
+  await s.checkAt('19T08:00');
+  assert.equal(s.wakes(), 0, 'before from');
+  await s.checkAt('20T08:00');
+  assert.equal(s.wakes(), 1);
+  s.putAsleep();
+  await s.checkAt('21T08:00');
+  assert.equal(s.wakes(), 1, 'the day between');
+  await s.checkAt('22T08:00');
+  assert.equal(s.wakes(), 2, 'on until');
+  s.putAsleep();
+  await s.checkAt('24T08:00');
+  assert.equal(s.wakes(), 2, 'after until');
+});
+
+test('a monthly nap window naps an awake workload at its start, and not on the exception date', async () => {
+  const window = { kind: 'nap', start: '12:00', end: '13:00', repeat: { pattern: 'monthly', nth: 3, weekday: 'mon' } };
+  const napped = setup({ run: { state: STATES.AWAKE }, schedule: stored({ windows: [window] }) });
+  const [result] = await napped.checkAt('19T12:00');
+  assert.equal(result.schedule, 'nap');
+  const excepted = setup({ run: { state: STATES.AWAKE }, schedule: stored({ windows: [window], exceptions: ['2026-10-19'] }) });
+  const [none] = await excepted.checkAt('19T12:00');
+  assert.equal(none.schedule, undefined);
+});

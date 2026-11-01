@@ -301,6 +301,26 @@ test('PUT /v1/workloads/:id/schedule: stored as normalized, answered with its ne
   assert.deepEqual(again.body, res.body);
 });
 
+test('PUT /v1/workloads/:id/schedule: a recurrence is stored as sent, a bad cron is refused, the overlap counts from its clock', async () => {
+  const { call, store } = api();
+  await call('POST', '/v1/workloads', INPUT);
+  const windows = [{ kind: 'awake', repeat: { pattern: 'cron', cron: '30 8 1 * *', minutes: 630 }, from: '2023-12-01', until: '2030-12-31' }];
+  const res = await call('PUT', '/v1/workloads/demo/schedule', { timeZone: 'Europe/Paris', windows });
+  assert.equal(res.status, 200);
+  assert.deepEqual(store.schedules.get('demo').windows, windows);
+  assert.deepEqual(res.body.nextEvents[0], { at: '2023-12-01T07:30:00.000Z', kind: 'awake-start', window: 0 });
+  const bad = await call('PUT', '/v1/workloads/demo/schedule', { timeZone: 'UTC', windows: [{ kind: 'awake', repeat: { pattern: 'cron', cron: 'cron(0 8 * * ? *)', minutes: 60 } }] });
+  assert.equal(bad.status, 400);
+  assert.equal(bad.body.error, 'windows[0].repeat.cron: five fields: minute hour day-of-month month day-of-week');
+  // Overlapping up to 2025 only: still to come at the world's clock, past on any real date.
+  const overlapping = await call('PUT', '/v1/workloads/demo/schedule', {
+    timeZone: 'UTC',
+    windows: [{ kind: 'awake', days: ['mon'], start: '08:00', end: '12:00', until: '2025-01-06' }, { kind: 'nap', days: ['mon'], start: '08:00', end: '12:00' }],
+  });
+  assert.equal(overlapping.status, 400);
+  assert.match(overlapping.body.error, /^windows\[1\]: the nap window overlaps the awake window windows\[0\] \(2023-/);
+});
+
 test('PUT /v1/workloads/:id/schedule: a bad schedule → 400 with scheduleProblems\' words, nothing stored', async () => {
   const { call, store } = api();
   await call('POST', '/v1/workloads', INPUT);

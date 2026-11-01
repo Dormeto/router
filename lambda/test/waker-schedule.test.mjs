@@ -114,3 +114,19 @@ test('browser mode: the JSON advertises the wake header only outside a nap windo
   assert.ok(await hint(null), 'no schedule: hint');
   assert.ok(await hint(night(), Date.parse('2026-10-20T10:00:00+02:00')), 'outside the window: hint');
 });
+
+test('a cron nap window: the waiter page until its end, in wall time', async () => {
+  const schedule = { timeZone: 'Europe/Paris', windows: [{ kind: 'nap', repeat: { pattern: 'cron', cron: '0 20 19 10 *', minutes: 660 } }], by: 'ops', at: NOW };
+  const { handler, invocations } = setup({ schedule });
+  const res = await handler(albEvent());
+  assert.equal(res.statusCode, 503);
+  assert.deepEqual(invocations, []);
+  assert.match(res.body, /Napping on schedule until Tue 07:00 \(Europe\/Paris\)\./);
+});
+
+test('a nap window past its until wakes as if there were none', async () => {
+  const schedule = { timeZone: 'Europe/Paris', windows: [{ kind: 'nap', start: '20:00', end: '07:00', repeat: { pattern: 'daily' }, until: '2026-10-18' }], by: 'ops', at: NOW };
+  const { handler, invocations } = setup({ schedule });
+  await handler(albEvent());
+  assert.equal(invocations.length, 1);
+});

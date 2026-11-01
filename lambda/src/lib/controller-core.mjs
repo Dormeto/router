@@ -943,7 +943,7 @@ export function createController({
 
   async function setSchedule({ workloadId, schedule, by }) {
     await config(workloadId);
-    const problems = scheduleProblems(schedule);
+    const problems = scheduleProblems(schedule, { now: now() });
     if (problems.length) return { problems };
     const stored = { ...normalizeSchedule(schedule), by, at: now() };
     await store.putSchedule(workloadId, stored);

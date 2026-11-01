@@ -1698,6 +1698,29 @@ test('schedule: valid is stored with who and when, its zone canonical, and answe
   assert.deepEqual(s.store.state.schedules.demo, { ...weekly(), timeZone: 'Europe/Paris', by: 'me', at: s.clock.now() });
 });
 
+test('schedule: a recurrence is stored as sent, and its next events reach beyond 8 days', async () => {
+  const s = setup({ run: { state: STATES.AWAKE } });
+  const windows = [
+    { kind: 'nap', start: '00:00', end: '00:00', repeat: { pattern: 'monthly', interval: 12, day: 25 }, from: '2026-12-01', until: '2030-12-31' },
+    { kind: 'awake', repeat: { pattern: 'cron', cron: '30 8 1 * *', minutes: 630 } },
+  ];
+  const result = await s.handler({ action: 'schedule', workloadId: 'demo', schedule: { timeZone: 'Europe/Paris', windows }, by: 'me' });
+  assert.equal(result.problems, undefined);
+  assert.deepEqual(s.store.state.schedules.demo.windows, windows);
+  assert.deepEqual(result.next[0], { at: '2023-12-01T07:30:00.000Z', kind: 'awake-start', window: 1 });
+});
+
+test('schedule: the overlap of recurrences counts from the controller\'s clock', async () => {
+  // Overlapping every Monday up to 2025 only: still to come at the fake clock's 2023, past on any real date.
+  const s = setup({ run: { state: STATES.AWAKE } });
+  const windows = [
+    { kind: 'awake', days: ['mon'], start: '08:00', end: '12:00', until: '2025-01-06' },
+    { kind: 'nap', days: ['mon'], start: '08:00', end: '12:00' },
+  ];
+  const result = await s.handler({ action: 'schedule', workloadId: 'demo', schedule: { timeZone: 'UTC', windows }, by: 'me' });
+  assert.deepEqual(result.problems, ['windows[1]: the nap window overlaps the awake window windows[0] (2023-11-20 08:00–12:00)']);
+});
+
 test('schedule: the maintenance time is the asleep time plus maxNapDays', async () => {
   const stateAt = Date.UTC(2026, 9, 1);
   const s = setup({ run: { state: STATES.ASLEEP, stateAt } });

@@ -665,7 +665,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   // The body is the schedule, as on AWS; `by` says who sets it.
   async function setSchedule(id, schedule) {
     await find(id);
-    const problems = scheduleProblems(schedule);
+    const problems = scheduleProblems(schedule, { now: now() });
     if (problems.length) throw bad(problems.join('; '));
     const stored = { ...normalizeSchedule(schedule), by: schedule.by ?? 'unknown', at: now() };
     await store.putSchedule(id, stored);

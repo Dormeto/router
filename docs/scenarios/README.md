@@ -1,6 +1,6 @@
 # Supported scenarios
 
-What the router naps and wakes, as of router 0.34.0. A **workload** is an Application Load Balancer target group and
+What the router naps and wakes, as of router 0.35.0. A **workload** is an Application Load Balancer target group and
 the backends behind it: the router naps them together once the target group has had no request for the idle window, and
 wakes them on the next request. Each page below gives the scenario's diagram, the services it uses, its measured wake
 time, its behavior and its limits.

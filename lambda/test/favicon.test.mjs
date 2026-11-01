@@ -238,3 +238,8 @@ test('hostOfRules: the first literal host value of the rules that are all host o
   assert.equal(hostOfRules([]), null);
   assert.equal(hostOfRules(undefined), null);
 });
+
+test('an icon answered with an error status is not the icon, whatever its body', async () => {
+  const out = await read({ ...page('<link rel="icon" href="/f.png">'), [`https://${HOST}/f.png`]: [404, { 'content-type': 'image/png' }, PNG], [`https://${HOST}/favicon.ico`]: [500, {}, PNG] });
+  assert.deepEqual([out.icon, out.error], [null, 'the icon answered 404']);
+});

@@ -554,3 +554,8 @@ test('offboarding reads every page of the workload\'s items: a custom page and t
   assert.deepEqual(dynamo.calls.filter(([name]) => name === 'deleteItem').map(([, input]) => input.Key.sk.S), ['CFG', 'DRIFT#1', 'FAVICON', 'PAGE', 'PAUSE', 'RUN', 'SCHEDULE']);
   assert.deepEqual(dynamo.calls.filter(([name]) => name === 'query').map(([, input]) => input.ExclusiveStartKey), [undefined, { pk, sk: { S: 'FAVICON' } }]);
 });
+
+test('a favicon item that cannot be parsed reads as none', async () => {
+  const dynamo = fakeDynamo({ getItem: async () => ({ Item: { favicon: { S: '{"icon":' } } }) });
+  assert.equal(await createStore({ dynamo, table: 't' }).getFavicon('shop'), null);
+});

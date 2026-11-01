@@ -2471,3 +2471,9 @@ test('waiting-page refuses what would widen its target: an empty or odd workload
   // Absent or null is the router's level.
   for (const workloadId of [undefined, null]) assert.equal((await s.handler({ action: 'waiting-page', op: 'get', workloadId })).terraform, false);
 });
+
+test('waiting-page: a Terraform workload with no item can be deleted from (nothing to refuse)', async () => {
+  const s = setup({ run: { state: STATES.AWAKE } });
+  const view = await waitingPage(s, 'delete');
+  assert.equal(view.own, null);
+});

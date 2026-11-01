@@ -7,7 +7,8 @@ import { medianOf } from './page-settings.mjs';
 import { ADMIN_PREFIX, parseAdminPath } from './admin.mjs';
 import { compileRules, describeRules } from './no-wake.mjs';
 import { STATS_DAYS } from './summary.mjs';
-import { localTime, occurrenceAt } from './schedule.mjs';
+import { joinLevels } from './manager-settings.mjs';
+import { isJoinMinutes, localTime, occurrenceAt, resolveJoin } from './schedule.mjs';
 
 const POLL_MS = 1000;
 const STUCK_GRACE_MS = 60_000;
@@ -194,14 +195,18 @@ export function createWaker({ store, invokeController, prefix, workloadIdOf = (e
     return response(503, { ...headers, 'content-type': 'application/json' }, renderJson({ state, pollSeconds, wakeHeader, napUntil }));
   }
 
-  // The nap window active now for a workload that is not awake, or null. A bad stored schedule counts as none.
+  // The nap window active now for a workload that is not awake, or null. A bad stored schedule counts as none. The levels
+  // of joinMinutes are read only here, and not when the schedule sets its own.
   async function napWindow(workloadId, run) {
     if (![STATES.ASLEEP, STATES.NAPPING, STATES.FAILED].includes(run.state)) return null;
     try {
       const schedule = await store.getSchedule(workloadId);
       if (!schedule) return null;
+      const joins = isJoinMinutes(schedule.joinMinutes) ? {} : await joinLevels({
+        router: () => store.getRouterSettings?.(), manager: () => store.getManagerSettings?.(), log, fields: { workloadId },
+      });
       const t = now();
-      const occurrence = occurrenceAt(schedule, t);
+      const occurrence = occurrenceAt(schedule, t, { joinMinutes: resolveJoin({ workload: schedule.joinMinutes, ...joins }).joinMinutes });
       if (occurrence?.kind !== 'nap') return null;
       return {
         wake: occurrence.wake ?? 'never',

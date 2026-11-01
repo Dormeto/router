@@ -99,7 +99,10 @@ export function fakeStore({ config, run, clock }) {
     async getKubeProxies() { return structuredClone(state.kubeProxies ?? {}); },
     async putKubeProxies(item) { state.kubeProxies = structuredClone(item); },
     async getRouterSettings() { return structuredClone(state.routerSettings ?? null); },
-    async putRouterSettings(item) { if (typeof item.hibernate === 'boolean') state.routerSettings = structuredClone(item); else delete state.routerSettings; },
+    async putRouterSettings(item) {
+      const set = Object.fromEntries(Object.entries(item).filter(([, value]) => value !== null && value !== undefined));
+      if ('hibernate' in set || 'joinMinutes' in set) state.routerSettings = structuredClone(set); else delete state.routerSettings;
+    },
     async getWaitingPage(level) { return structuredClone(state.pages[pageKey(level)] ?? null); },
     async putWaitingPage(level, page, { by, at }) { state.pages[pageKey(level)] = { page: structuredClone(page), by: by ?? null, at: at ?? null }; },
     async deleteWaitingPage(level) { const had = pageKey(level) in state.pages; delete state.pages[pageKey(level)]; return had; },

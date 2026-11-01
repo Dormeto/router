@@ -130,3 +130,72 @@ test('a nap window past its until wakes as if there were none', async () => {
   await handler(albEvent());
   assert.equal(invocations.length, 1);
 });
+
+// Joined windows (design, section 11): Monday's nap ends at 23:55, Tuesday's starts at 00:05; 23:58 is the gap between them.
+const GAP = Date.parse('2026-10-19T23:58:00+02:00');
+const joined = (more = {}) => ({
+  timeZone: 'Europe/Paris', by: 'ops', at: NOW, ...more,
+  windows: [{ kind: 'nap', days: ['mon'], start: '20:00', end: '23:55' }, { kind: 'nap', days: ['tue'], start: '00:05', end: '07:00' }],
+});
+
+test('a request in a joined gap gets the waiter page until the union ends', async () => {
+  const { handler, invocations } = setup({ schedule: joined(), now: GAP });
+  const res = await handler(albEvent());
+  assert.equal(res.statusCode, 503);
+  assert.deepEqual(invocations, []);
+  assert.match(res.body, /Napping on schedule until Tue 07:00 \(Europe\/Paris\)\./);
+});
+
+test('the waker follows the levels: the schedule\'s, the router\'s, the organization\'s', async () => {
+  const wakes = async (schedule, levels = {}) => {
+    const s = setup({ schedule, now: GAP });
+    if (levels.router !== undefined) await s.store.putRouterSettings({ joinMinutes: levels.router, by: 'ana', at: 1 });
+    if (levels.manager !== undefined) await s.store.putManagerSettings({ hibernate: true, joinMinutes: levels.manager, etag: null, readAt: 1, error: null });
+    await s.handler(albEvent());
+    return s.invocations.length;
+  };
+  assert.equal(await wakes(joined()), 0, 'the default');
+  assert.equal(await wakes(joined(), { manager: 0 }), 1, 'the organization');
+  assert.equal(await wakes(joined(), { router: 0, manager: 30 }), 1, 'the router');
+  assert.equal(await wakes(joined(), { router: 30, manager: 0 }), 0, 'the router again');
+  assert.equal(await wakes(joined({ joinMinutes: 0 }), { router: 30 }), 1, 'the workload');
+  assert.equal(await wakes(joined({ joinMinutes: 30 }), { router: 0 }), 0, 'the workload again');
+});
+
+test('a level the waker cannot read falls through, is logged once and fails nothing', async () => {
+  const s = setup({ schedule: joined(), now: GAP });
+  await s.store.putManagerSettings({ hibernate: true, joinMinutes: 0, etag: null, readAt: 1, error: null });
+  s.store.getRouterSettings = async () => { throw new Error('ThrottlingException'); };
+  await s.handler(albEvent());
+  assert.equal(s.invocations.length, 1, 'the organization\'s 0, the router\'s unread');
+  assert.deepEqual(s.logs.filter((l) => l.event === 'JoinLevelUnreadable'), [{ event: 'JoinLevelUnreadable', workloadId: 'demo', level: 'router', error: 'ThrottlingException' }]);
+  const both = setup({ schedule: joined(), now: GAP });
+  both.store.getRouterSettings = async () => { throw new Error('ThrottlingException'); };
+  both.store.getManagerSettings = async () => { throw new Error('ThrottlingException'); };
+  assert.equal((await both.handler(albEvent())).statusCode, 503, 'then 15');
+  assert.deepEqual(both.invocations, []);
+});
+
+test('the waker reads the levels only for a workload not awake with a schedule, and one that sets its own reads none', async () => {
+  const counted = (options) => {
+    const s = setup(options);
+    s.reads = 0;
+    for (const name of ['getRouterSettings', 'getManagerSettings']) {
+      const read = s.store[name];
+      s.store[name] = async () => { s.reads++; return read(); };
+    }
+    return s;
+  };
+  const sets = counted({ schedule: joined(), now: GAP });
+  await sets.handler(albEvent());
+  assert.equal(sets.reads, 2);
+  const own = counted({ schedule: joined({ joinMinutes: 15 }), now: GAP });
+  await own.handler(albEvent());
+  assert.equal(own.reads, 0);
+  const none = counted({ schedule: null, now: GAP });
+  await none.handler(albEvent());
+  assert.equal(none.reads, 0);
+  const up = counted({ schedule: joined(), now: GAP, run: { state: STATES.AWAKE } });
+  await up.handler(albEvent());
+  assert.equal(up.reads, 0);
+});

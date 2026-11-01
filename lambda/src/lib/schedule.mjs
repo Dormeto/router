@@ -6,6 +6,9 @@ export const EXCEPTIONS_MAX = 100;
 export const NAP_DAYS_MAX = 60;
 // An idle nap, or a nap window's occurrence, is skipped when an awake window starts within this delay.
 export const CLOSE_START_MS = 30 * 60_000;
+// Two occurrences of one kind separated by this gap or less count as one (design, section 11).
+export const JOIN_DEFAULT_MINUTES = 15;
+export const JOIN_MINUTES_MAX = 120;
 
 const MINUTE = 60_000;
 const DAY = 86_400_000;
@@ -15,6 +18,8 @@ const HORIZON_DAYS = 8;
 const REPEAT_HORIZON_DAYS = 400;
 // What the overlap check compares when a window has a from, an until or a repeat.
 const OVERLAP_DAYS = 400;
+// At least what a clock change moves a wall time by: how far a joined gap's local day can be from its minutes.
+const CLOCK_CHANGE_MINUTES = 120;
 const INTERVAL_MAX = 99;
 const CRON_LENGTH_MAX = 200;
 const CRON_MINUTES_MAX = WEEK;
@@ -23,7 +28,7 @@ const LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 const WAKES = ['never', 'header'];
 // The fields of a schedule and of a window; `by` and `at` (who set it, when) are accepted and ignored, so a schedule
 // read back can be sent again as it is.
-const FIELDS = ['timeZone', 'windows', 'exceptions', 'maxNapDays', 'by', 'at'];
+const FIELDS = ['timeZone', 'windows', 'exceptions', 'maxNapDays', 'joinMinutes', 'by', 'at'];
 const WINDOW_FIELDS = ['kind', 'days', 'start', 'end', 'repeat', 'from', 'until', 'wake'];
 // The fields of a repeat, by pattern.
 const REPEAT_FIELDS = {
@@ -95,7 +100,19 @@ export function normalizeSchedule(s) {
     })),
     exceptions: s.exceptions && [...new Set(s.exceptions)],
     maxNapDays: s.maxNapDays,
+    joinMinutes: s.joinMinutes,
   });
+}
+
+export const isJoinMinutes = (value) => Number.isInteger(value) && value >= 0 && value <= JOIN_MINUTES_MAX && value % 5 === 0;
+
+// The largest gap that joins: the most specific level that sets it, the workload's (its schedule), the router's, the
+// organization's, else the default. Each level is its value; anything that is not one is unset.
+export function resolveJoin({ workload, router, manager } = {}) {
+  if (isJoinMinutes(workload)) return { joinMinutes: workload, from: 'workload' };
+  if (isJoinMinutes(router)) return { joinMinutes: router, from: 'router' };
+  if (isJoinMinutes(manager)) return { joinMinutes: manager, from: 'organization' };
+  return { joinMinutes: JOIN_DEFAULT_MINUTES, from: 'default' };
 }
 
 // Local days are numbered from 1970-01-01, a Thursday; weekdays from 0 (mon).
@@ -127,16 +144,18 @@ function wallClock(t, timeZone) {
 const offsetAt = (t, timeZone) => wallClock(t, timeZone) - Math.floor(t / 1000) * 1000;
 const localDay = (t, timeZone) => Math.floor(wallClock(t, timeZone) / DAY);
 
+// The zone's offset at a UTC midnight, read once per plan.
+function midnightOffset(plan, day) {
+  let offset = plan.midnights.get(day);
+  if (offset === undefined) plan.midnights.set(day, offset = offsetAt(day * DAY, plan.timeZone));
+  return offset;
+}
+
 // The offset of a local day's every wall time when no clock change is near it (the day before to the day after), or
 // null. Most days are like this, so a day costs one read of the zone however many occurrences it has.
 function steadyOffset(plan, day) {
-  const midnight = (d) => {
-    let offset = plan.midnights.get(d);
-    if (offset === undefined) plan.midnights.set(d, offset = offsetAt(d * DAY, plan.timeZone));
-    return offset;
-  };
-  const before = midnight(day - 1);
-  return before === midnight(day + 2) ? before : null;
+  const before = midnightOffset(plan, day - 1);
+  return before === midnightOffset(plan, day + 2) ? before : null;
 }
 
 // The instant of the local wall time `minutes` after midnight of local day `day`, past that day's end when it is over a
@@ -242,18 +261,22 @@ function prepareWindow(w, window) {
 }
 
 // How many days before a day an occurrence of this length can have started and still run on that day.
-const lookbackOf = (w) => Math.max(1, Math.ceil(w.length / 1440));
+const lookbackOf = (w, join = 0) => Math.max(1, Math.ceil((w.length + (join ? join + CLOCK_CHANGE_MINUTES : 0)) / 1440));
 
-// A valid schedule's windows ready for arithmetic, or null when it has none.
-function prepare(s) {
+// A valid schedule's windows ready for arithmetic, or null when it has none. `joinMinutes`: the value its levels resolve
+// to; without one, the schedule's own or the default.
+function prepare(s, { joinMinutes } = {}) {
   if (!s?.timeZone || !Array.isArray(s.windows) || !s.windows.length) return null;
   const windows = s.windows.map((w, window) => prepareWindow(w, window));
+  const join = isJoinMinutes(joinMinutes) ? joinMinutes : resolveJoin({ workload: s.joinMinutes }).joinMinutes;
   return {
     timeZone: s.timeZone,
     exceptions: new Set(s.exceptions ?? []),
     windows,
     midnights: new Map(),
-    lookback: Math.max(...windows.map(lookbackOf)),
+    written: new Map(),
+    joinMs: join * MINUTE,
+    lookback: Math.max(...windows.map((w) => lookbackOf(w, join))),
     horizonDays: s.windows.some((w) => !absent(w.repeat) || !absent(w.from)) ? REPEAT_HORIZON_DAYS : HORIZON_DAYS,
   };
 }
@@ -279,30 +302,72 @@ function startsOn(w, day) {
   return patternHas(w, day) ? w.starts : NO_STARTS;
 }
 
-// The occurrences of the windows (of `kind` when given) that start on local day `day`: an occurrence ends at `end` the
-// same day, the next day when `end` <= `start` (24 hours of wall time when equal), or `minutes` of wall time later. None
-// on an exception date, and none that a clock change leaves empty.
-function occurrencesOn(plan, day, kind) {
-  if (plan.exceptions.has(dateOf(day))) return [];
-  const occurrences = [];
-  for (const w of plan.windows) {
-    if (kind && w.kind !== kind) continue;
-    for (const minutes of startsOn(w, day)) {
-      const start = instantOf(plan, day, minutes);
-      const end = instantOf(plan, day, minutes + w.length);
-      if (end > start) occurrences.push({ kind: w.kind, window: w.window, start, end, ...(w.wake ? { wake: w.wake } : {}) });
-    }
-  }
-  return occurrences;
-}
-
 const byStart = (a, b) => a.start - b.start;
 
-// The window occurrence active at t, or null. Windows of one kind may overlap: the occurrence is the one that started
-// last (its id changes only when a window starts), `end` is where their union ends (within 8 days: when the nap
-// actually ends), and a nap's `wake` is `never` when any active nap window says so.
-export function occurrenceAt(s, t) {
-  const plan = prepare(s);
+// The occurrences of the windows that start on local day `day`, as written, once per plan: an occurrence ends at `end` the
+// same day, the next day when `end` <= `start` (24 hours of wall time when equal), or `minutes` of wall time later. None
+// on an exception date, and none that a clock change leaves empty. `all` in the windows' order, each kind by start.
+function writtenOn(plan, day) {
+  let written = plan.written.get(day);
+  if (written) return written;
+  const all = [];
+  if (!plan.exceptions.has(dateOf(day))) {
+    for (const w of plan.windows) {
+      for (const minutes of startsOn(w, day)) {
+        const start = instantOf(plan, day, minutes);
+        const end = instantOf(plan, day, minutes + w.length);
+        if (end > start) all.push({ kind: w.kind, window: w.window, start, end, ...(w.wake ? { wake: w.wake } : {}) });
+      }
+    }
+  }
+  written = { all, awake: all.filter((o) => o.kind === 'awake').sort(byStart), nap: all.filter((o) => o.kind === 'nap').sort(byStart) };
+  plan.written.set(day, written);
+  return written;
+}
+
+// The first start of a kind from `from` to `to`, both included, or null. Starts are in the order of their days. The
+// offset at the UTC day's midnight gives the local day of `from` within a day either way, and a gap ends within two more.
+function firstStart(plan, kind, from, to) {
+  const near = Math.floor((from + midnightOffset(plan, Math.floor(from / DAY))) / DAY);
+  for (let day = near - 1; day <= near + 2; day++) {
+    const starts = writtenOn(plan, day)[kind];
+    let [lo, hi] = [0, starts.length];
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (starts[mid].start < from) lo = mid + 1;
+      else hi = mid;
+    }
+    if (lo < starts.length) return starts[lo].start <= to ? starts[lo].start : null;
+  }
+  return null;
+}
+
+// Where an occurrence ends once joined: at the next start of its kind when the gap, in elapsed time, is within the value,
+// unless the other kind starts in the gap. A start an exception date or a range removes is no start.
+function joinedEnd(plan, o) {
+  const next = firstStart(plan, o.kind, o.end, o.end + plan.joinMs);
+  if (next === null) return o.end;
+  return firstStart(plan, o.kind === 'nap' ? 'awake' : 'nap', o.end, next - 1) === null ? next : o.end;
+}
+
+// The occurrences (of `kind` when given) that start on local day `day`, joined. What handles overlapping windows of one
+// kind then applies to the gap: the union's end, nextEvents, a nap's wake mode.
+function occurrencesOn(plan, day, kind) {
+  const written = writtenOn(plan, day);
+  const occurrences = kind ? written.all.filter((o) => o.kind === kind) : written.all;
+  if (!plan.joinMs) return occurrences;
+  return occurrences.map((o) => {
+    const end = joinedEnd(plan, o);
+    return end === o.end ? o : { ...o, end };
+  });
+}
+
+// The window occurrence active at t, or null. Windows of one kind may overlap, or join across a short gap: the occurrence
+// is the one that started last (its id changes only when a window starts), `end` is where their union ends (within 8 days:
+// when the nap actually ends), and a nap's `wake` is `never` when any active nap window says so. `joinMinutes`: the value
+// the levels resolve to (resolveJoin).
+export function occurrenceAt(s, t, { joinMinutes } = {}) {
+  const plan = prepare(s, { joinMinutes });
   if (!plan) return null;
   const today = localDay(t, plan.timeZone);
   let near = [];
@@ -353,8 +418,8 @@ function edgesOf(occurrences, t, last) {
 // at one instant, an end comes first. Windows of one kind count as their union, as in occurrenceAt: an end that another
 // occurrence of that kind holds (including one starting then) is not an end, while each start stays (a new occurrence);
 // identical events are the lowest window's. It reads day by day and stops once `count` events can no longer change.
-export function nextEvents(s, t, { count = 5, horizonDays } = {}) {
-  const plan = prepare(s);
+export function nextEvents(s, t, { count = 5, horizonDays, joinMinutes } = {}) {
+  const plan = prepare(s, { joinMinutes });
   if (!plan) return [];
   const shown = (edges) => edges.slice(0, count).map((e) => ({ ...e, at: iso(e.at) }));
   const last = t + (horizonDays ?? plan.horizonDays) * DAY;
@@ -374,12 +439,12 @@ export function nextEvents(s, t, { count = 5, horizonDays } = {}) {
   return shown(edgesOf(occurrences, t, last));
 }
 
-// Whether an awake window's occurrence starts from t to t + ms, both included.
+// Whether an awake window's occurrence starts from t to t + ms, both included. Joining moves no start.
 export function awakeStartWithin(s, t, ms) {
   const plan = prepare(s);
   if (!plan) return false;
   for (let day = localDay(t, plan.timeZone) - 1; day <= localDay(t + ms, plan.timeZone); day++) {
-    if (occurrencesOn(plan, day, 'awake').some((o) => o.start >= t && o.start <= t + ms)) return true;
+    if (writtenOn(plan, day).awake.some((o) => o.start >= t && o.start <= t + ms)) return true;
   }
   return false;
 }
@@ -530,7 +595,7 @@ function overlapProblems(windows, { timeZone, exceptions, now }) {
 // recurring windows starts.
 export function scheduleProblems(s, { now = Date.now() } = {}) {
   if (!isObject(s)) return ['schedule: an object'];
-  const { timeZone, windows, exceptions, maxNapDays } = s;
+  const { timeZone, windows, exceptions, maxNapDays, joinMinutes } = s;
   const listed = Array.isArray(windows) ? windows : [];
   const problems = [];
   if (absent(maxNapDays) && (absent(windows) || (Array.isArray(windows) && !windows.length))) {
@@ -551,5 +616,6 @@ export function scheduleProblems(s, { now = Date.now() } = {}) {
   if (!absent(maxNapDays) && !(Number.isInteger(maxNapDays) && maxNapDays >= 1 && maxNapDays <= NAP_DAYS_MAX)) {
     problems.push(`maxNapDays: a whole number from 1 to ${NAP_DAYS_MAX}`);
   }
+  if (!absent(joinMinutes) && !isJoinMinutes(joinMinutes)) problems.push(`joinMinutes: a whole number from 0 to ${JOIN_MINUTES_MAX}, a multiple of 5`);
   return [...problems, ...unknownFields(s, FIELDS, '')];
 }

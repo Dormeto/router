@@ -1942,7 +1942,7 @@ test('nap: a router that reads the manager\'s settings stops plainly until a rea
   assert.deepEqual(await napAgain(s), [[[id], false]]);
   // A first read that fails: the level stays unknown, stored as such, and the naps stop plainly.
   await s.settings.refresh();
-  assert.deepEqual(s.store.state.managerSettings, { hibernate: null, etag: null, readAt: s.clock.now(), error: 'S3 SlowDown' });
+  assert.deepEqual(s.store.state.managerSettings, { hibernate: null, joinMinutes: null, etag: null, readAt: s.clock.now(), error: 'S3 SlowDown' });
   assert.deepEqual(await napAgain(s), [[[id], false]]);
   assert.deepEqual(warnings.filter((w) => w.event === 'HibernationLevelUnreadable').map((w) => [w.workloadId, w.error]),
     [['demo', 'manager settings not read yet'], ['demo', 'manager settings not read yet: S3 SlowDown']]);
@@ -2036,10 +2036,80 @@ test('release: a failed workload is stopped as a nap would be, hibernating what 
 test('settings of the router: true is recorded with who and when, null removes the record (hibernation)', async () => {
   const s = setup({ run: { state: STATES.AWAKE } });
   const at = s.clock.now();
-  assert.deepEqual(await s.handler({ action: 'settings', settings: { hibernate: true }, by: 'ana' }), { level: 'router', settings: { hibernate: true, by: 'ana', at: new Date(at).toISOString() } });
+  assert.deepEqual(await s.handler({ action: 'settings', settings: { hibernate: true }, by: 'ana' }), { level: 'router', settings: { hibernate: true, joinMinutes: null, by: 'ana', at: new Date(at).toISOString() } });
   assert.deepEqual(s.store.state.routerSettings, { hibernate: true, by: 'ana', at });
-  assert.deepEqual(await s.handler({ action: 'settings', settings: { hibernate: null }, by: 'ana' }), { level: 'router', settings: { hibernate: null, by: null, at: null } });
+  assert.deepEqual(await s.handler({ action: 'settings', settings: { hibernate: null }, by: 'ana' }), { level: 'router', settings: { hibernate: null, joinMinutes: null, by: null, at: null } });
   assert.equal(s.store.state.routerSettings, undefined);
+});
+
+test('settings of the router: joinMinutes and hibernate leave each other alone (joined windows)', async () => {
+  const s = setup({ run: { state: STATES.AWAKE } });
+  const at = new Date(s.clock.now()).toISOString();
+  assert.deepEqual(await s.handler({ action: 'settings', settings: { joinMinutes: 30 }, by: 'ana' }), { level: 'router', settings: { hibernate: null, joinMinutes: 30, by: 'ana', at } });
+  assert.deepEqual(await s.handler({ action: 'settings', settings: { hibernate: false }, by: 'bob' }), { level: 'router', settings: { hibernate: false, joinMinutes: 30, by: 'bob', at } });
+  assert.deepEqual(s.store.state.routerSettings, { hibernate: false, joinMinutes: 30, by: 'bob', at: s.clock.now() });
+  assert.deepEqual(await s.handler({ action: 'settings', settings: { joinMinutes: 0 }, by: 'ana' }), { level: 'router', settings: { hibernate: false, joinMinutes: 0, by: 'ana', at } });
+  assert.deepEqual(await s.handler({ action: 'settings', settings: { joinMinutes: null }, by: 'ana' }), { level: 'router', settings: { hibernate: false, joinMinutes: null, by: 'ana', at } });
+  assert.deepEqual(await s.handler({ action: 'settings', settings: { joinMinutes: 10 }, by: 'ana' }), { level: 'router', settings: { hibernate: false, joinMinutes: 10, by: 'ana', at } });
+  assert.deepEqual(await s.handler({ action: 'settings', settings: { hibernate: null }, by: 'ana' }), { level: 'router', settings: { hibernate: null, joinMinutes: 10, by: 'ana', at } });
+  // Nothing sent changes nothing, and who and when stay.
+  assert.deepEqual(await s.handler({ action: 'settings', settings: {}, by: 'carl' }), { level: 'router', settings: { hibernate: null, joinMinutes: 10, by: 'ana', at } });
+  assert.deepEqual(await s.handler({ action: 'settings', settings: { joinMinutes: null, hibernate: null }, by: 'ana' }), { level: 'router', settings: { hibernate: null, joinMinutes: null, by: null, at: null } });
+  assert.equal(s.store.state.routerSettings, undefined);
+  assert.deepEqual(await s.handler({ action: 'settings', settings: { hibernate: true, joinMinutes: 5 }, by: 'ana' }), { level: 'router', settings: { hibernate: true, joinMinutes: 5, by: 'ana', at } });
+  assert.deepEqual((await s.handler({ action: 'settings', settings: { joinMinutes: 7 }, by: 'ana' })).problems, ['settings: joinMinutes must be a whole number from 0 to 120, a multiple of 5, or null']);
+  assert.equal(s.store.state.routerSettings.joinMinutes, 5);
+});
+
+test('settings of the router: a record that cannot be read is not written over (joined windows)', async () => {
+  const s = setup({ run: { state: STATES.AWAKE } });
+  await s.store.putRouterSettings({ hibernate: false, by: 'ana', at: 1 });
+  const read = s.store.getRouterSettings;
+  s.store.getRouterSettings = async () => { throw new Error('ThrottlingException'); };
+  await assert.rejects(s.handler({ action: 'settings', settings: { joinMinutes: 30 }, by: 'ana' }), /ThrottlingException/);
+  s.store.getRouterSettings = read;
+  assert.deepEqual(await s.store.getRouterSettings(), { hibernate: false, by: 'ana', at: 1 });
+});
+
+test('settings of a workload: joinMinutes is on its schedule, refused here (joined windows)', async () => {
+  const s = setup({ run: { state: STATES.AWAKE }, cfg: testConfig({ source: 'manager' }) });
+  assert.deepEqual(await s.handler({ action: 'settings', workloadId: 'demo', settings: { joinMinutes: 30 }, by: 'ana' }), { problems: ['settings: a workload\'s joinMinutes is on its schedule'] });
+  assert.equal('joinMinutes' in await s.store.getConfig('demo'), false);
+});
+
+test('schedule and status answer the value in force, its level, and what removing the workload\'s would give (joined windows)', async () => {
+  const s = setup({ run: { state: STATES.AWAKE }, managerSettings: { url: 's3://b/settings.json', refresh: async () => {}, current: async () => ({ hibernate: true, joinMinutes: 45, readAt: 1, error: null }) } });
+  const none = await s.handler({ action: 'status', workloadId: 'demo' });
+  assert.equal(none.schedule, null);
+  assert.deepEqual([none.joinMinutes, none.joinFrom, none.joinInherited], [45, 'organization', { joinMinutes: 45, joinFrom: 'organization' }]);
+  await s.store.putRouterSettings({ joinMinutes: 30, by: 'ana', at: 1 });
+  // A gap of 20: joined at 30, not at the default.
+  const windows = [{ kind: 'awake', days: ['mon'], start: '08:00', end: '12:00' }, { kind: 'awake', days: ['mon'], start: '12:20', end: '18:00' }];
+  const inherited = await s.handler({ action: 'schedule', workloadId: 'demo', schedule: { timeZone: 'UTC', windows }, by: 'me' });
+  assert.deepEqual([inherited.joinMinutes, inherited.joinFrom, inherited.joinInherited], [30, 'router', { joinMinutes: 30, joinFrom: 'router' }]);
+  assert.deepEqual(inherited.next.slice(0, 2).map((e) => e.kind), ['awake-start', 'awake-start'], 'its next events use the value');
+  const own = await s.handler({ action: 'schedule', workloadId: 'demo', schedule: { timeZone: 'UTC', windows, joinMinutes: 0 }, by: 'me' });
+  assert.deepEqual([own.joinMinutes, own.joinFrom, own.joinInherited], [0, 'workload', { joinMinutes: 30, joinFrom: 'router' }]);
+  assert.deepEqual(own.next.slice(0, 2).map((e) => e.kind), ['awake-start', 'awake-end']);
+  assert.equal(own.schedule.joinMinutes, 0);
+  assert.equal(s.store.state.schedules.demo.joinMinutes, 0);
+  const shown = await s.handler({ action: 'status', workloadId: 'demo' });
+  assert.deepEqual([shown.joinMinutes, shown.joinFrom, shown.joinInherited], [0, 'workload', { joinMinutes: 30, joinFrom: 'router' }]);
+  // No level: the default.
+  const bare = setup({ run: { state: STATES.AWAKE } });
+  const nothing = await bare.handler({ action: 'schedule', workloadId: 'demo', schedule: { timeZone: 'UTC', windows }, by: 'me' });
+  assert.deepEqual([nothing.joinMinutes, nothing.joinFrom, nothing.joinInherited], [15, 'default', { joinMinutes: 15, joinFrom: 'default' }]);
+});
+
+test('schedule: a level that cannot be read falls through and is logged, never failing the answer (joined windows)', async () => {
+  const s = setup({ run: { state: STATES.AWAKE }, managerSettings: { url: 's3://b/settings.json', refresh: async () => {}, current: async () => ({ hibernate: true, joinMinutes: 30, readAt: 1, error: null }) } });
+  const warnings = [];
+  s.log.warn = (event, fields) => warnings.push({ event, ...fields });
+  s.store.getRouterSettings = async () => { throw new Error('ThrottlingException'); };
+  const windows = [{ kind: 'awake', days: ['mon'], start: '08:00', end: '12:00' }];
+  const answer = await s.handler({ action: 'schedule', workloadId: 'demo', schedule: { timeZone: 'UTC', windows }, by: 'me' });
+  assert.deepEqual([answer.joinMinutes, answer.joinFrom], [30, 'organization']);
+  assert.deepEqual(warnings.filter((w) => w.event === 'JoinLevelUnreadable'), [{ event: 'JoinLevelUnreadable', level: 'router', error: 'ThrottlingException' }]);
 });
 
 test('settings of a workload the manager onboarded: written in its configuration, null removes the key, answers the resolution (hibernation)', async () => {

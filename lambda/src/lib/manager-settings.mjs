@@ -17,13 +17,29 @@ export function settingsUrlOf(catalogUrl) {
   return where ? `s3://${where.bucket}/${where.prefix}settings.json` : null;
 }
 
+// The levels of joinMinutes above a workload's (design, section 11), their readers giving each level's record: { router,
+// manager }, each its value or null. A level that cannot be read is logged and counts as unset: unlike hibernation's,
+// joining has no safety side, and it never fails a check or a wake.
+export async function joinLevels({ router, manager, log, fields = {} }) {
+  const read = async (level, reader) => {
+    try {
+      return (await reader?.())?.joinMinutes ?? null;
+    } catch (err) {
+      log.warn('JoinLevelUnreadable', { ...fields, level, error: err.message });
+      return null;
+    }
+  };
+  const [routerValue, managerValue] = await Promise.all([read('router', router), read('organization', manager)]);
+  return { router: routerValue, manager: managerValue };
+}
+
 // s3.getObjectIf({ bucket, key, etag }) → { notModified: true } | { body: Buffer, etag }: the S3 port of lib/catalog.mjs.
 // catalogUrl: the catalog the router reads, which proves an AccessDenied on settings.json means "missing".
 export function createManagerSettings({ s3, url, catalogUrl = null, store, now = Date.now, log, checkMs = CHECK_MS }) {
   const where = parseUrl(url);
   const catalog = parseUrl(catalogUrl);
   // Nothing read yet: the level is unknown (null), never the built-in true, until a read succeeds (naps stop plainly).
-  const initial = { hibernate: null, etag: null, readAt: null, error: null };
+  const initial = { hibernate: null, joinMinutes: null, etag: null, readAt: null, error: null };
 
   const catalogReads = async () => {
     if (!catalog) return false;
@@ -45,11 +61,12 @@ export function createManagerSettings({ s3, url, catalogUrl = null, store, now =
     const at = now();
     let next;
     try {
-      const out = await s3.getObjectIf({ bucket: where.bucket, key: where.key, etag: last.etag });
+      // A copy from before joinMinutes is read in full: its ETag would answer 304 and hide a value already in the file.
+      const out = await s3.getObjectIf({ bucket: where.bucket, key: where.key, etag: last.joinMinutes === undefined ? null : last.etag });
       if (out.notModified) next = { ...last, readAt: at, error: null };
       else {
         try {
-          next = { hibernate: parseManagerSettings(out.body.toString('utf8')).hibernate, etag: out.etag, readAt: at, error: null };
+          next = { ...parseManagerSettings(out.body.toString('utf8')), etag: out.etag, readAt: at, error: null };
         } catch (err) {
           next = { ...last, readAt: at, error: `settings.json is invalid: ${err.message}` };
         }
@@ -58,7 +75,7 @@ export function createManagerSettings({ s3, url, catalogUrl = null, store, now =
       // Without s3:ListBucket (the routers' roles have none), a missing object answers AccessDenied: never set, but only
       // in a bucket whose catalog the router reads (as lib/catalog.mjs).
       const neverSet = err.name === 'NoSuchKey' || (err.name === 'AccessDenied' && await catalogReads());
-      if (neverSet) next = { hibernate: true, etag: null, readAt: at, error: null };
+      if (neverSet) next = { hibernate: true, joinMinutes: null, etag: null, readAt: at, error: null };
       else {
         next = { ...last, readAt: at, error: `S3 ${err.name}` };
         log.warn('ManagerSettingsUnreadable', { url, error: next.error });
@@ -70,12 +87,12 @@ export function createManagerSettings({ s3, url, catalogUrl = null, store, now =
   return {
     url,
     refresh,
-    // The last known value, from the table: { hibernate, readAt, error }, hibernate null while every read failed; null
+    // The last known values, from the table: { hibernate, joinMinutes, readAt, error }, hibernate null while every read failed; null
     // without a settings URL or before any read.
     async current() {
       if (!where) return null;
       const stored = await store.getManagerSettings();
-      return stored ? { hibernate: stored.hibernate, readAt: stored.readAt, error: stored.error } : null;
+      return stored ? { hibernate: stored.hibernate, joinMinutes: stored.joinMinutes ?? null, readAt: stored.readAt, error: stored.error } : null;
     },
   };
 }

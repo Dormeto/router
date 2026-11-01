@@ -20,7 +20,7 @@ const NIGHT = { kind: 'nap', days: WEEKDAYS, start: '20:00', end: '07:00' };
 const stored = (fields) => ({ timeZone: 'Europe/Paris', ...fields, by: 'ops@example.com', at: at('12T09:00') });
 const occurrence = (window, local) => `${window}@${new Date(at(local)).toISOString()}`;
 
-function setup({ run, schedule, queue = true }) {
+function setup({ run, schedule, queue = true, managerSettings = null }) {
   const clock = fakeClock(at('19T07:00'));
   const cfg = testConfig();
   const store = fakeStore({ config: cfg, run, clock });
@@ -41,7 +41,7 @@ function setup({ run, schedule, queue = true }) {
   const handler = createController({
     store: wrapped, ec2, elbv2, cloudwatch, autoscaling: fakeAutoScaling(), ecs, tagging: fakeTagging(ecs), appscaling: fakeAppScaling(),
     invokeSelf: async (payload) => { invocations.push(payload); }, ...(queue ? { queueWork: async (m) => { queued.push(m); } } : {}),
-    now: clock.now, sleep: clock.sleep, newId: () => `w${++ids}`, log, router: { name: 'dmt-dev' },
+    now: clock.now, sleep: clock.sleep, newId: () => `w${++ids}`, log, router: { name: 'dmt-dev' }, managerSettings,
   });
   // The check the schedule starts at that Paris time (later than the clock).
   async function checkAt(local) {
@@ -515,4 +515,71 @@ test('a monthly nap window naps an awake workload at its start, and not on the e
   const excepted = setup({ run: { state: STATES.AWAKE }, schedule: stored({ windows: [window], exceptions: ['2026-10-19'] }) });
   const [none] = await excepted.checkAt('19T12:00');
   assert.equal(none.schedule, undefined);
+});
+
+// Joined windows (design, section 11): the check resolves the value once, at the levels' most specific.
+const MORNING = { kind: 'awake', days: ['mon'], start: '08:00', end: '12:00' };
+const AFTERNOON = (start) => ({ kind: 'awake', days: ['mon'], start, end: '18:00' });
+
+test('a gap of 15 keeps the idle nap away and asks no wake; the second start is still applied once', async () => {
+  const s = setup({ run: { state: STATES.ASLEEP }, schedule: stored({ windows: [MORNING, AFTERNOON('12:15')] }) });
+  await s.checkAt('19T08:00');
+  assert.equal(s.wakes(), 1);
+  s.putAsleep();
+  // In the gap: the first occurrence, already applied.
+  await s.checkAt('19T12:05');
+  assert.equal(s.wakes(), 1);
+  assert.equal(s.store.state.run.scheduleApplied, occurrence(0, '19T08:00'));
+  await s.checkAt('19T12:15');
+  assert.equal(s.wakes(), 2);
+  assert.equal(s.store.state.run.scheduleApplied, occurrence(1, '19T12:15'));
+});
+
+test('the check uses the most specific level: the schedule\'s, the router\'s, then the organization\'s', async () => {
+  // A gap of 60 minutes, and a first check inside it: joined, the first occurrence is active and not yet applied.
+  const windows = [MORNING, AFTERNOON('13:00')];
+  const wakesInGap = async ({ schedule = {}, router, manager }) => {
+    const managerSettings = manager === undefined ? null : { url: 's3://b/settings.json', refresh: async () => {}, current: async () => ({ hibernate: true, joinMinutes: manager, readAt: 1, error: null }) };
+    const s = setup({ run: { state: STATES.ASLEEP }, schedule: stored({ windows, ...schedule }), managerSettings });
+    if (router !== undefined) await s.store.putRouterSettings({ joinMinutes: router, by: 'ana', at: 1 });
+    await s.checkAt('19T12:05');
+    return s.wakes();
+  };
+  assert.equal(await wakesInGap({}), 0, 'the default');
+  assert.equal(await wakesInGap({ manager: 60 }), 1, 'the organization');
+  assert.equal(await wakesInGap({ router: 60, manager: 0 }), 1, 'the router over the organization');
+  assert.equal(await wakesInGap({ router: 0, manager: 60 }), 0, 'the router\'s 0');
+  assert.equal(await wakesInGap({ schedule: { joinMinutes: 60 }, router: 0 }), 1, 'the workload over the router');
+  assert.equal(await wakesInGap({ schedule: { joinMinutes: 0 }, router: 60, manager: 60 }), 0, 'the workload\'s 0');
+});
+
+test('the check reads the levels once, logs a level it cannot read once, and goes on with the next level, then 15', async () => {
+  const s = setup({ run: { state: STATES.ASLEEP }, schedule: stored({ windows: [MORNING, AFTERNOON('12:15')] }) });
+  let reads = 0;
+  s.wrapped.getRouterSettings = async () => { reads++; throw new Error('ThrottlingException'); };
+  const [result] = await s.checkAt('19T08:00');
+  assert.equal(result.schedule, 'wake');
+  assert.equal(reads, 1);
+  assert.deepEqual(s.logged('JoinLevelUnreadable'), [{ level: 'router', error: 'ThrottlingException' }]);
+});
+
+test('without a schedule the check reads no level for joining', async () => {
+  const s = setup({ run: { state: STATES.AWAKE } });
+  let reads = 0;
+  const read = s.wrapped.getRouterSettings;
+  s.wrapped.getRouterSettings = async () => { reads++; return read(); };
+  await s.checkAt('19T08:00');
+  assert.equal(reads, 0);
+});
+
+test('the value reaches the idle nap: a workload in a gap it joins is kept awake, in a gap it does not, it naps', async () => {
+  const windows = [MORNING, AFTERNOON('13:00')];
+  const idleAt = async (level) => {
+    const s = setup({ run: { state: STATES.AWAKE, awakeSince: 1 }, schedule: stored({ windows }) });
+    if (level !== null) await s.store.putRouterSettings({ joinMinutes: level, by: 'ana', at: 1 });
+    const [result] = await s.checkAt('19T12:05');
+    return result;
+  };
+  assert.equal((await idleAt(60)).kept, 'awake window');
+  assert.notEqual((await idleAt(null)).kept, 'awake window');
 });

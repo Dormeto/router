@@ -414,14 +414,16 @@ test('a schedule item that cannot be read is logged and skipped: the scan goes o
   assert.match(logged[0][1].error, /JSON/);
 });
 
-test('router settings and the manager settings copy are ROUTER items; no hibernate deletes the settings', async () => {
+test('router settings and the manager settings copy are ROUTER items; neither hibernate nor joinMinutes deletes the settings', async () => {
   const items = new Map();
+  const expressions = [];
   const key = (k) => `${k.pk.S}/${k.sk.S}`;
   const dynamo = fakeDynamo({
     getItem: async ({ Key }) => ({ Item: items.get(key(Key)) }),
-    updateItem: async ({ Key, ExpressionAttributeNames: n, ExpressionAttributeValues: v }) => {
+    updateItem: async ({ Key, UpdateExpression, ExpressionAttributeNames: n, ExpressionAttributeValues: v }) => {
+      expressions.push(UpdateExpression);
       const item = {};
-      for (const [name, attr] of Object.entries(n)) item[attr] = v[`:${name.slice(1)}`];
+      for (const [name, attr] of Object.entries(n)) if (v[`:${name.slice(1)}`]) item[attr] = v[`:${name.slice(1)}`];
       items.set(key(Key), item);
     },
     deleteItem: async ({ Key }) => { items.delete(key(Key)); },
@@ -437,6 +439,21 @@ test('router settings and the manager settings copy are ROUTER items; no hiberna
   await store.putRouterSettings({ hibernate: true, by: 'ana', at: 7 });
   await store.putRouterSettings({ hibernate: null, by: 'ana', at: 8 });
   assert.equal(await store.getRouterSettings(), null);
+  // Either one keeps the item, and the one unset is removed from it.
+  await store.putRouterSettings({ joinMinutes: 30, by: 'ana', at: 9 });
+  assert.deepEqual(await store.getRouterSettings(), { joinMinutes: 30, by: 'ana', at: 9 });
+  assert.equal(expressions.at(-1), 'SET #joinMinutes = :joinMinutes, #by = :by, #at = :at REMOVE #hibernate');
+  await store.putRouterSettings({ joinMinutes: 0, hibernate: null, by: 'ana', at: 10 });
+  assert.deepEqual(await store.getRouterSettings(), { joinMinutes: 0, by: 'ana', at: 10 });
+  await store.putRouterSettings({ hibernate: true, joinMinutes: 15, by: 'ana', at: 11 });
+  assert.deepEqual(await store.getRouterSettings(), { hibernate: true, joinMinutes: 15, by: 'ana', at: 11 });
+  assert.equal(expressions.at(-1), 'SET #hibernate = :hibernate, #joinMinutes = :joinMinutes, #by = :by, #at = :at');
+  await store.putRouterSettings({ hibernate: false, joinMinutes: null, by: 'ana', at: 12 });
+  assert.deepEqual(await store.getRouterSettings(), { hibernate: false, by: 'ana', at: 12 });
+  assert.equal(expressions.at(-1), 'SET #hibernate = :hibernate, #by = :by, #at = :at REMOVE #joinMinutes');
+  await store.putRouterSettings({ hibernate: null, joinMinutes: null, by: 'ana', at: 13 });
+  assert.equal(await store.getRouterSettings(), null);
+  assert.equal(items.has('ROUTER/SETTINGS'), false);
   assert.deepEqual(await store.getKubeProxies(), {});
   const pings = { 'c-1': { name: 'dmt-kube-c-1', ok: true, version: '0.33.0', at: 5 } };
   await store.putKubeProxies(pings);

@@ -16,13 +16,14 @@ import { createWakeWatch, unhealthyError } from './wake-watch.mjs';
 import { describeStopped } from './stopped.mjs';
 import { revertInstanceTypes } from './capacity.mjs';
 import { tagsProblem } from './tags.mjs';
-import { awakeStartWithin, CLOSE_START_MS, maintenanceDue, nextEvents, normalizeSchedule, occurrenceAt, scheduleProblems } from './schedule.mjs';
+import { awakeStartWithin, CLOSE_START_MS, maintenanceDue, nextEvents, normalizeSchedule, occurrenceAt, resolveJoin, scheduleProblems } from './schedule.mjs';
 import { STATS_DAYS, totals, workloadSummary } from './summary.mjs';
 import { lastRequestAt } from './metrics.mjs';
 import { checkScope } from './check-scope.mjs';
 import { healthOf, lambdaMetrics, queueDepths } from './health.mjs';
 import { cleanPage, pageWarnings, resolvePage, validatePage, withWake } from './page-settings.mjs';
 import { HIBERNATION_MAX_DAYS, hibernationDue, resolveHibernation, settingsProblems } from './hibernation.mjs';
+import { joinLevels } from './manager-settings.mjs';
 import {
   backendKey, backendStatuses, isCompanion, resolveBackends, resumeBackends, sleepBackends, startCompanions, stopCompanions, toRecord, wakeBackends,
 } from './backends.mjs';
@@ -362,6 +363,10 @@ export function createController({
     const [router, manager] = await Promise.all([store.getRouterSettings?.(), managerSettings?.current?.()]);
     return { router: router ?? null, manager: manager ?? (managerSettings?.url ? { hibernate: null, readAt: null, error: null } : null) };
   }
+  // The levels of joinMinutes above a workload's: read once for a check or an answer, one that cannot be read logged and
+  // unset. A schedule's own value, then these (design, section 11).
+  const readJoinLevels = () => joinLevels({ router: () => store.getRouterSettings?.(), manager: () => managerSettings?.current?.(), log });
+  const joinOf = (schedule, levels) => ({ joinMinutes: resolveJoin({ workload: schedule?.joinMinutes, ...levels }).joinMinutes });
   // An unknown manager level, when it is the one that decides (the workload and the router set nothing), is false, said
   // `unknown`: the built-in true could hibernate against an administrator's "off" the router has not read yet (spec §3).
   const resolvedFor = (cfg, { router, manager }) => {
@@ -603,14 +608,14 @@ export function createController({
   // meets the times: 8 at a time, one run read each, no AWS call but the wakes and naps it asks for. holdOf(workloadId):
   // { paused, keepAsleep }. Answers each workload's outcome (what it did, or what held it) and the schedules the router
   // can read: one it cannot (a time zone Intl refuses) is logged and the workload behaves as if it had none.
-  async function applySchedules(configs, schedules, holdOf, t) {
+  async function applySchedules(configs, schedules, holdOf, t, joins) {
     const due = [];
     const readable = new Map();
     for (const { workloadId } of configs) {
       const schedule = schedules.get(workloadId);
       if (!schedule) continue;
       try {
-        const occurrence = occurrenceAt(schedule, t);
+        const occurrence = occurrenceAt(schedule, t, joinOf(schedule, joins));
         // A nap window's occurrence is skipped when an awake window starts within 30 minutes of its start, or of now (an
         // occurrence first applied late).
         const closeStart = occurrence?.kind === 'nap'
@@ -718,7 +723,7 @@ export function createController({
     if (!schedule) return null;
     if (ctx.applied?.get(workloadId) === 'nap') return {};
     try {
-      if (occurrenceAt(schedule, t)?.kind === 'awake') return { kept: 'awake window' };
+      if (occurrenceAt(schedule, t, joinOf(schedule, ctx.joins))?.kind === 'awake') return { kept: 'awake window' };
       if (awakeStartWithin(schedule, t, CLOSE_START_MS)) return { kept: 'awake window within 30 minutes' };
     } catch (err) {
       log.warn('ScheduleSkipped', { workloadId, error: err.message });
@@ -778,16 +783,7 @@ export function createController({
     const run = await store.getRun(workloadId);
     // An unreadable schedule (the stored JSON does not parse, or a zone this runtime refuses) never breaks the status; a
     // failed read (a store error) does, as any read error would.
-    let view;
-    try {
-      view = scheduleView(await store.getSchedule(workloadId), run);
-    } catch (err) {
-      if (!(err instanceof SyntaxError || err instanceof RangeError)) throw err;
-      log.warn('ScheduleSkipped', { workloadId, error: err.message });
-      // As without a schedule: the hibernation's maintenance wake still shows.
-      view = scheduleView(null, run);
-    }
-    return { ...await status(workloadId, cfg, run ?? {}, {
+    const answer = await status(workloadId, cfg, run ?? {}, {
       pauses: await pausesFor(workloadId),
       drift: store.listDrift ? await store.listDrift(workloadId, 10).catch(() => []) : [],
       noWakeRules: describeRules([{ level: 'router', rules: defaultRules }, { level: 'workload', rules: cfg.noWakeRules }]),
@@ -795,7 +791,16 @@ export function createController({
       loadStats: () => store.getStats(workloadId, STATS_DAYS),
       loadLists: async () => [...await describeStoredLists(store, ipLists), ...(catalog ? (await catalog.describe()).lists : [])],
       loadHibernation: (instanceIds) => hibernationView(cfg, run, instanceIds),
-    }), ...view };
+    });
+    const joins = await readJoinLevels();
+    try {
+      return { ...answer, ...scheduleView(await store.getSchedule(workloadId), run, joins) };
+    } catch (err) {
+      if (!(err instanceof SyntaxError || err instanceof RangeError)) throw err;
+      log.warn('ScheduleSkipped', { workloadId, error: err.message });
+      // As without a schedule: the hibernation's maintenance wake still shows.
+      return { ...answer, ...scheduleView(null, run, joins) };
+    }
   }
 
   // The hibernation a workload gets (hibernation design §4): the resolution, each level (a failed read of one fails it,
@@ -832,14 +837,19 @@ export function createController({
     const cfg = workloadId ? await config(workloadId) : null;
     if (cfg && !cfg.source) throw new Error(`workload ${workloadId} was written by Terraform: set hibernate in its workload module`);
     const problems = settingsProblems(settings);
+    if (!problems.length && cfg && Object.hasOwn(settings, 'joinMinutes')) problems.push('settings: a workload\'s joinMinutes is on its schedule');
     if (problems.length) return { problems };
     const hibernate = typeof settings.hibernate === 'boolean' ? settings.hibernate : null;
     if (!cfg) {
-      // null deletes the record.
-      const record = { hibernate, by, at: now() };
+      // What is not sent stays: setting one never erases the other, and a record that cannot be read is not written over.
+      const stored = await store.getRouterSettings();
+      if (!Object.keys(settings).length) return { level: 'router', settings: routerSettingsView(stored) };
+      const sent = (name) => (Object.hasOwn(settings, name) ? settings[name] : stored?.[name] ?? null);
+      // Neither set deletes the record.
+      const record = { hibernate: sent('hibernate'), joinMinutes: sent('joinMinutes'), by, at: now() };
       await store.putRouterSettings(record);
-      log.info('RouterSettings', { hibernate, by });
-      return { level: 'router', settings: routerSettingsView(hibernate === null ? null : record) };
+      log.info('RouterSettings', { hibernate: record.hibernate, joinMinutes: record.joinMinutes, by });
+      return { level: 'router', settings: routerSettingsView(record.hibernate === null && record.joinMinutes === null ? null : record) };
     }
     const { hibernate: previous, ...rest } = cfg;
     const next = hibernate === null ? rest : { ...rest, hibernate };
@@ -929,15 +939,19 @@ export function createController({
 
   // What people read: the schedule (its `at` as ISO; null when none), the next events and the maintenance wake, the
   // schedule's (maxNapDays) or the hibernation's 60-day limit, whichever comes first.
-  function scheduleView(schedule, run) {
+  function scheduleView(schedule, run, joins) {
     const dues = [
       schedule && run?.state === STATES.ASLEEP && run.stateAt ? maintenanceDue(schedule, run.stateAt) : null,
       run?.state === STATES.ASLEEP || run?.state === STATES.FAILED ? hibernationDue(run) : null,
     ].filter((due) => due !== null);
+    const join = resolveJoin({ workload: schedule?.joinMinutes, ...joins });
+    const inherited = resolveJoin(joins);
     return {
       schedule: schedule && { ...schedule, at: new Date(schedule.at).toISOString() },
-      next: nextEvents(schedule, now()),
+      next: nextEvents(schedule, now(), { joinMinutes: join.joinMinutes }),
       maintenanceDue: dues.length ? new Date(Math.min(...dues)).toISOString() : null,
+      // The value in force and its level; what removing the workload's own would give.
+      joinMinutes: join.joinMinutes, joinFrom: join.from, joinInherited: { joinMinutes: inherited.joinMinutes, joinFrom: inherited.from },
     };
   }
 
@@ -948,7 +962,7 @@ export function createController({
     const stored = { ...normalizeSchedule(schedule), by, at: now() };
     await store.putSchedule(workloadId, stored);
     log.info('Scheduled', { workloadId, by });
-    return scheduleView(stored, await store.getRun(workloadId));
+    return scheduleView(stored, await store.getRun(workloadId), await readJoinLevels());
   }
 
   async function clearSchedule({ workloadId, by }) {
@@ -1042,7 +1056,8 @@ export function createController({
       const configs = listed.configs.sort((a, b) => a.workloadId.localeCompare(b.workloadId));
       // The schedules first, whatever the budget; pauses that cannot be read hold every scheduled nap and wake too.
       const keptAsleep = (workloadId) => pauses === null || pauses.some((p) => p.keepAsleep && (p.workloadId === null || p.workloadId === workloadId));
-      const { applied, readable } = await applySchedules(configs, listed.schedules, (id) => ({ paused: paused(id), keepAsleep: keptAsleep(id) }), now());
+      const joins = listed.schedules.size ? await readJoinLevels() : {};
+      const { applied, readable } = await applySchedules(configs, listed.schedules, (id) => ({ paused: paused(id), keepAsleep: keptAsleep(id) }), now(), joins);
       // Then the hibernation's 60-day limit, for every workload, held alike.
       const limited = await wakeLongHibernated(configs, applied, keptAsleep, now());
       await pingProxies(configs);
@@ -1058,7 +1073,7 @@ export function createController({
       // The rules of the workloads, a chunk at a time in the check's order, each load balancer listed once (the listing
       // cache); backends found by tag once. A chunk is not started when its listing would end past the budget.
       const listing = { balancers: new Map(), listed: new Map(), tags: new Map() };
-      const ctx = { rules: new Map(), scope: checkScope(clients), schedules: readable, applied };
+      const ctx = { rules: new Map(), scope: checkScope(clients), schedules: readable, applied, joins };
       const deadline = Math.min(started + CHECK_BUDGET_MS, budgetEnd);
       const results = [];
       let next = 0;
@@ -1329,7 +1344,7 @@ export function createController({
 
   const TERRAFORM = 'terraform';
   // The router's settings record as people read it (its time ISO): all null when unset.
-  const routerSettingsView = (record) => ({ hibernate: record?.hibernate ?? null, by: record?.by ?? null, at: record ? iso(record.at) : null });
+  const routerSettingsView = (record) => ({ hibernate: record?.hibernate ?? null, joinMinutes: record?.joinMinutes ?? null, by: record?.by ?? null, at: record ? iso(record.at) : null });
   async function measure(t) {
     const [metrics, queues, limit] = await Promise.all([
       lambdaMetrics(cloudwatch, router.functions ?? {}, t).catch((err) => ({ error: err.message })),
@@ -1403,7 +1418,7 @@ export function createController({
     return {
       router: { name: router.name, version: router.version, build: router.build },
       settings: routerSettingsView(routerSettings),
-      managerSettings: { url: managerSettings?.url ?? null, hibernate: manager?.hibernate ?? null, readAt: manager?.readAt ? iso(manager.readAt) : null, error: manager?.error ?? null },
+      managerSettings: { url: managerSettings?.url ?? null, hibernate: manager?.hibernate ?? null, joinMinutes: manager?.joinMinutes ?? null, readAt: manager?.readAt ? iso(manager.readAt) : null, error: manager?.error ?? null },
       configuration: {
         checkSchedule: { value: router.checkSchedule ?? null, source: TERRAFORM },
         ipLists: { value: ipLists.map(({ name, url, action, refreshHours }) => ({ name, url, action, refreshHours })), source: TERRAFORM },

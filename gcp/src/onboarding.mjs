@@ -14,7 +14,7 @@
 //
 // GKE pods (section 8): `gke` in the request, a `k8s` backend. The dry run reads Google only, as it comes before any right in the cluster: it answers the
 // namespace and the Service its NEGs name, which the CLI reads the owner of and applies the Role in. The onboarding then checks each right and reads the owner.
-import { nextEvents, normalizeSchedule, scheduleProblems } from '../../lambda/src/lib/schedule.mjs';
+import { nextEvents, normalizeSchedule, resolveJoin, scheduleProblems } from '../../lambda/src/lib/schedule.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { companionRead, INSTANCE_NAME, isCompanion, statusOf } from './cloudsql.mjs';
 import { groupOf, PauseRefused } from './controller-core.mjs';
@@ -649,11 +649,15 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   // A schedule's answer. One the router cannot read (a time zone Intl refuses) is shown, with no next event.
   function scheduleView(id, schedule) {
     const shown = schedule && { ...schedule, at: isoOf(schedule.at) };
+    // No manager here: the workload's value, then the default (design, section 11).
+    const { joinMinutes, from } = resolveJoin({ workload: schedule?.joinMinutes });
+    const inherited = resolveJoin();
+    const join = { joinMinutes, joinFrom: from, joinInherited: { joinMinutes: inherited.joinMinutes, joinFrom: inherited.from } };
     try {
-      return { schedule: shown, nextEvents: nextEvents(schedule, now()) };
+      return { schedule: shown, nextEvents: nextEvents(schedule, now()), ...join };
     } catch (err) {
       log.warn('ScheduleSkipped', { workloadId: id, error: err.message });
-      return { schedule: shown, nextEvents: [] };
+      return { schedule: shown, nextEvents: [], ...join };
     }
   }
 

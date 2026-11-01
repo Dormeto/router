@@ -263,15 +263,15 @@ test('router action: the router\'s settings record and the manager\'s global set
   const none = setup();
   await none.store.recordScheduledCheck(NOW - 60_000);
   const bare = await none.handler({ action: 'router' });
-  assert.deepEqual(bare.settings, { hibernate: null, by: null, at: null });
-  assert.deepEqual(bare.managerSettings, { url: null, hibernate: null, readAt: null, error: null });
-  const managerSettings = { url: 's3://dmt-dev-manager-ip-lists-1/settings.json', refresh: async () => {}, current: async () => ({ hibernate: false, readAt: NOW - 120_000, error: null }) };
+  assert.deepEqual(bare.settings, { hibernate: null, joinMinutes: null, by: null, at: null });
+  assert.deepEqual(bare.managerSettings, { url: null, hibernate: null, joinMinutes: null, readAt: null, error: null });
+  const managerSettings = { url: 's3://dmt-dev-manager-ip-lists-1/settings.json', refresh: async () => {}, current: async () => ({ hibernate: false, joinMinutes: 30, readAt: NOW - 120_000, error: null }) };
   const s = setup({ managerSettings });
   await s.store.recordScheduledCheck(NOW - 60_000);
-  await s.store.putRouterSettings({ hibernate: true, by: 'ana', at: NOW - HOUR });
+  await s.store.putRouterSettings({ hibernate: true, joinMinutes: 10, by: 'ana', at: NOW - HOUR });
   const info = await s.handler({ action: 'router' });
-  assert.deepEqual(info.settings, { hibernate: true, by: 'ana', at: new Date(NOW - HOUR).toISOString() });
-  assert.deepEqual(info.managerSettings, { url: 's3://dmt-dev-manager-ip-lists-1/settings.json', hibernate: false, readAt: new Date(NOW - 120_000).toISOString(), error: null });
+  assert.deepEqual(info.settings, { hibernate: true, joinMinutes: 10, by: 'ana', at: new Date(NOW - HOUR).toISOString() });
+  assert.deepEqual(info.managerSettings, { url: 's3://dmt-dev-manager-ip-lists-1/settings.json', hibernate: false, joinMinutes: 30, readAt: new Date(NOW - 120_000).toISOString(), error: null });
   assert.equal(info.health.problems.some((p) => p.code === 'manager-settings-unreadable'), false);
 });
 

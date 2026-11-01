@@ -452,26 +452,38 @@ export function createStore({ dynamo, table, now = Date.now, log = null }) {
       });
     },
 
-    // The router's own settings (hibernation design §3): ROUTER / SETTINGS {hibernate, by, at}; no hibernate: unset, no item.
+    // The router's own settings (hibernation design §3): ROUTER / SETTINGS {hibernate?, joinMinutes?, by, at}, the whole
+    // record at each write; neither set: unset, no item.
     async getRouterSettings() {
       const { Item } = await dynamo.getItem({ TableName: table, Key: { pk: { S: 'ROUTER' }, sk: { S: 'SETTINGS' } }, ConsistentRead: true });
-      return Item?.hibernate ? { hibernate: Item.hibernate.BOOL, by: Item.by?.S ?? null, at: Number(Item.at?.N ?? 0) } : null;
+      if (!Item?.hibernate && !Item?.joinMinutes) return null;
+      return {
+        ...(Item.hibernate ? { hibernate: Item.hibernate.BOOL } : {}),
+        ...(Item.joinMinutes ? { joinMinutes: Number(Item.joinMinutes.N) } : {}),
+        by: Item.by?.S ?? null, at: Number(Item.at?.N ?? 0),
+      };
     },
-    async putRouterSettings({ hibernate, by, at }) {
+    async putRouterSettings({ hibernate, joinMinutes, by, at }) {
       const Key = { pk: { S: 'ROUTER' }, sk: { S: 'SETTINGS' } };
-      if (typeof hibernate !== 'boolean') {
+      const set = {
+        ...(typeof hibernate === 'boolean' ? { hibernate: { BOOL: hibernate } } : {}),
+        ...(typeof joinMinutes === 'number' ? { joinMinutes: { N: String(joinMinutes) } } : {}),
+      };
+      if (!Object.keys(set).length) {
         await dynamo.deleteItem({ TableName: table, Key });
         return;
       }
+      const removed = ['hibernate', 'joinMinutes'].filter((name) => !(name in set));
+      const values = { ...set, by: { S: String(by ?? '') }, at: { N: String(at) } };
       await dynamo.updateItem({
         TableName: table, Key,
-        UpdateExpression: 'SET #hibernate = :hibernate, #by = :by, #at = :at',
-        ExpressionAttributeNames: { '#hibernate': 'hibernate', '#by': 'by', '#at': 'at' },
-        ExpressionAttributeValues: { ':hibernate': { BOOL: hibernate }, ':by': { S: String(by ?? '') }, ':at': { N: String(at) } },
+        UpdateExpression: `SET ${Object.keys(values).map((name) => `#${name} = :${name}`).join(', ')}${removed.length ? ` REMOVE ${removed.map((name) => `#${name}`).join(', ')}` : ''}`,
+        ExpressionAttributeNames: Object.fromEntries([...Object.keys(values), ...removed].map((name) => [`#${name}`, name])),
+        ExpressionAttributeValues: Object.fromEntries(Object.entries(values).map(([name, value]) => [`:${name}`, value])),
       });
     },
 
-    // The router's copy of the manager's global settings: { hibernate, etag, readAt, error } (a cold Lambda reads this, never S3).
+    // The router's copy of the manager's global settings: { hibernate, joinMinutes, etag, readAt, error } (a cold Lambda reads this, never S3).
     async getManagerSettings() {
       const { Item } = await dynamo.getItem({ TableName: table, Key: { pk: { S: 'ROUTER' }, sk: { S: 'MANAGER-SETTINGS' } }, ConsistentRead: true });
       return Item?.managerSettings?.S ? JSON.parse(Item.managerSettings.S) : null;

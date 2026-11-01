@@ -297,7 +297,7 @@ test('next events: 20 windows on every day over 8 days stay fast', () => {
   const hour = (i) => String(i).padStart(2, '0');
   const s = paris(Array.from({ length: 20 }, (_, i) => awake(['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'], `${hour(i)}:05`, `${hour(i)}:55`)));
   const begin = performance.now();
-  const events = nextEvents(s, t('2026-11-02T00:00:00+01:00'), { count: 1000 });
+  const events = nextEvents(s, t('2026-11-02T00:00:00+01:00'), { count: 1000, joinMinutes: 0 });
   assert.equal(events.length, 20 * 8 * 2);
   assert.ok(performance.now() - begin < 1000, `${performance.now() - begin} ms`);
 });

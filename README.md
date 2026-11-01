@@ -286,6 +286,19 @@ aws lambda invoke --function-name dmt-dev-controller --cli-binary-format raw-in-
     `from` dates. An exception date has no occurrence to compare. The refusal gives the first date:
     `windows[1]: the nap window overlaps the awake window windows[0] (2027-03-15 08:00–12:00)`. Beyond those 400 days an overlap
     is not refused, and the occurrence that started last applies.
+- **Joined windows (router 0.36.0):** two occurrences of one kind separated by a short gap count as one, so a workload is
+  not woken or napped for the gap. This applies to existing schedules too: set 0 to keep a gap.
+  - `joinMinutes` is the largest gap that joins, both ends included: a whole number from 0 to 120, a multiple of 5. 0 never
+    joins. The gap is elapsed time, so a clock change counts as it passes.
+  - The most specific level that sets it wins: `joinMinutes` on the workload's schedule, the router's (the controller's
+    `settings` action), the organization's (`workloads.joinMinutes` in the manager's `settings.json`, within 5 minutes), else
+    15. A level that cannot be read counts as unset, logged `JoinLevelUnreadable`. On Google Cloud: the workload's, else 15.
+  - Not joined: two kinds, a gap where the other kind starts, a start an exception date or a range removes. The overlap
+    check on save compares windows as written.
+  - `status` and the `schedule` action answer `joinMinutes`, `joinFrom` (`workload`, `router`, `organization` or `default`) and
+    `joinInherited` (`{ joinMinutes, joinFrom }`: what removing the workload's own would give).
+  - The limit, as for touching windows: the second start is still a new occurrence, so a manager's Nap or Wake taken before it
+    lasts until it.
 - **The check applies it** on the clock's 5-minute marks: the `check_schedule` of the `router` module is
   `cron(0/5 * * * ? *)` (not `rate(5 minutes)`), so 08:45 is met at the 08:45 check, within its latency. Each occurrence
   of a window is applied once (the run item records the last one, `scheduleApplied`), so a missed check or a deploy

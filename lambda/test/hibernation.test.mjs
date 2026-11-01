@@ -44,11 +44,21 @@ test('resolveHibernation follows the order workload, fallback types, router, man
   ]) assert.deepEqual(resolveHibernation(input), expected, name);
 });
 
-test('settingsProblems accepts only the key hibernate as true, false or null', () => {
+const JOIN_PROBLEM = 'settings: joinMinutes must be a whole number from 0 to 120, a multiple of 5, or null';
+
+test('settingsProblems accepts only hibernate as true, false or null and joinMinutes as its minutes or null', () => {
   for (const [settings, expected] of [
     [{ hibernate: true }, []],
     [{ hibernate: false }, []],
     [{ hibernate: null }, []],
+    [{ joinMinutes: 0 }, []],
+    [{ joinMinutes: 120 }, []],
+    [{ joinMinutes: null }, []],
+    [{ hibernate: true, joinMinutes: 15 }, []],
+    [{ joinMinutes: 7 }, [JOIN_PROBLEM]],
+    [{ joinMinutes: 125 }, [JOIN_PROBLEM]],
+    [{ joinMinutes: '15' }, [JOIN_PROBLEM]],
+    [{ hibernate: 'yes', joinMinutes: 7 }, ['settings: hibernate must be true, false or null', JOIN_PROBLEM]],
     [{}, []],
     [{ hibernate: 'yes' }, ['settings: hibernate must be true, false or null']],
     [{ hibernate: 1 }, ['settings: hibernate must be true, false or null']],
@@ -60,14 +70,22 @@ test('settingsProblems accepts only the key hibernate as true, false or null', (
   ]) assert.deepEqual(settingsProblems(settings), expected, JSON.stringify(settings));
 });
 
-test('parseManagerSettings reads workloads.hibernate and ignores the rest', () => {
+test('parseManagerSettings reads workloads.hibernate and workloads.joinMinutes and ignores the rest', () => {
   for (const [text, expected] of [
-    ['{}', { hibernate: true }],
-    ['{"workloads":{}}', { hibernate: true }],
-    ['{"workloads":{"hibernate":true}}', { hibernate: true }],
-    ['{"workloads":{"hibernate":false},"x":1}', { hibernate: false }],
-    ['{"workloads":{"hibernate":false,"y":2}}', { hibernate: false }],
+    ['{}', { hibernate: true, joinMinutes: null }],
+    ['{"workloads":{}}', { hibernate: true, joinMinutes: null }],
+    ['{"workloads":{"hibernate":true}}', { hibernate: true, joinMinutes: null }],
+    ['{"workloads":{"hibernate":false},"x":1}', { hibernate: false, joinMinutes: null }],
+    ['{"workloads":{"hibernate":false,"y":2}}', { hibernate: false, joinMinutes: null }],
+    ['{"workloads":{"joinMinutes":30}}', { hibernate: true, joinMinutes: 30 }],
+    ['{"workloads":{"joinMinutes":0,"hibernate":false}}', { hibernate: false, joinMinutes: 0 }],
   ]) assert.deepEqual(parseManagerSettings(text), expected, text);
+});
+
+test('parseManagerSettings: an invalid joinMinutes is unset, and hibernate stays', () => {
+  for (const joinMinutes of ['"15"', '7', '125', '-5', '1.5', 'null', 'true', '[]']) {
+    assert.deepEqual(parseManagerSettings(`{"workloads":{"hibernate":false,"joinMinutes":${joinMinutes}}}`), { hibernate: false, joinMinutes: null }, joinMinutes);
+  }
 });
 
 test('parseManagerSettings throws on bad settings', () => {

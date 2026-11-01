@@ -1,4 +1,6 @@
 // Whether a nap hibernates EC2 instances (hibernation design): the first level that is set decides. Pure.
+import { isJoinMinutes, JOIN_MINUTES_MAX } from './schedule.mjs';
+
 // The longest an instance may stay hibernated: the maintenance wake comes before AWS's 60-day limit.
 export const HIBERNATION_MAX_DAYS = 59;
 const DAY_MS = 86_400_000;
@@ -29,25 +31,30 @@ export function resolveHibernation({ workload, fallbackTypes, router, manager } 
   return { hibernate: true, from: 'default' };
 }
 
-// The settings of a router or a workload: only `hibernate`, true, false or null (inherit).
+// The settings of a router or a workload: `hibernate`, true, false or null (inherit); `joinMinutes`, its minutes or null
+// (inherit), which only a router's take (a workload's is on its schedule).
 export function settingsProblems(settings) {
   if (!isObject(settings)) return ['settings must be an object'];
   const problems = [];
   for (const [key, value] of Object.entries(settings)) {
-    if (key !== 'hibernate') problems.push(`settings: unknown setting ${key}`);
+    if (key === 'joinMinutes') {
+      if (value !== null && !isJoinMinutes(value)) problems.push(`settings: joinMinutes must be a whole number from 0 to ${JOIN_MINUTES_MAX}, a multiple of 5, or null`);
+    } else if (key !== 'hibernate') problems.push(`settings: unknown setting ${key}`);
     else if (value !== null && !isBoolean(value)) problems.push('settings: hibernate must be true, false or null');
   }
   return problems;
 }
 
-// The manager's settings.json: `workloads.hibernate`, true when absent; other keys belong to the manager.
+// The manager's settings.json: `workloads.hibernate`, true when absent; `workloads.joinMinutes`, null when absent or
+// invalid (it has no safety side, so it never loses hibernate); other keys belong to the manager.
 export function parseManagerSettings(text) {
   const doc = JSON.parse(text);
   if (!isObject(doc)) throw new Error('settings.json must be an object');
-  if (!('workloads' in doc)) return { hibernate: true };
+  if (!('workloads' in doc)) return { hibernate: true, joinMinutes: null };
   if (!isObject(doc.workloads)) throw new Error('settings.json: workloads must be an object');
   const { hibernate } = doc.workloads;
-  if (hibernate === undefined) return { hibernate: true };
+  const joinMinutes = isJoinMinutes(doc.workloads.joinMinutes) ? doc.workloads.joinMinutes : null;
+  if (hibernate === undefined) return { hibernate: true, joinMinutes };
   if (!isBoolean(hibernate)) throw new Error('settings.json: workloads.hibernate must be true or false');
-  return { hibernate };
+  return { hibernate, joinMinutes };
 }

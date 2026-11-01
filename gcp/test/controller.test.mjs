@@ -270,6 +270,7 @@ test('POST /v1/tasks: a nap task passes on what the check asked it with', async 
 
 // --- Schedules and pauses --------------------------------------------------------------------------------------------
 
+const NO_SCHEDULE = { schedule: null, nextEvents: [], joinMinutes: 15, joinFrom: 'default', joinInherited: { joinMinutes: 15, joinFrom: 'default' } };
 const SCHEDULE = { timeZone: 'europe/paris', windows: [{ kind: 'nap', days: ['sat', 'sun'], start: '20:00', end: '08:00' }], maxNapDays: 7 };
 
 test('GET /v1/workloads/:id/schedule: none, then the schedule and its next events', async () => {
@@ -277,7 +278,7 @@ test('GET /v1/workloads/:id/schedule: none, then the schedule and its next event
   assert.equal((await call('GET', '/v1/workloads/demo/schedule')).status, 404);
   assert.equal((await call('GET', '/v1/workloads/Bad_ID/schedule')).status, 400);
   await call('POST', '/v1/workloads', INPUT);
-  assert.deepEqual((await call('GET', '/v1/workloads/demo/schedule')).body, { schedule: null, nextEvents: [] });
+  assert.deepEqual((await call('GET', '/v1/workloads/demo/schedule')).body, NO_SCHEDULE);
   await call('PUT', '/v1/workloads/demo/schedule', { ...SCHEDULE, by: 'ops' });
   const res = await call('GET', '/v1/workloads/demo/schedule');
   assert.equal(res.status, 200);
@@ -321,6 +322,23 @@ test('PUT /v1/workloads/:id/schedule: a recurrence is stored as sent, a bad cron
   assert.match(overlapping.body.error, /^windows\[1\]: the nap window overlaps the awake window windows\[0\] \(2023-/);
 });
 
+test('schedule: no manager, so the workload\'s joinMinutes then the default; the answer says which', async () => {
+  const { call, store } = api();
+  await call('POST', '/v1/workloads', INPUT);
+  assert.deepEqual((await call('GET', '/v1/workloads/demo/schedule')).body, NO_SCHEDULE);
+  const windows = [{ kind: 'awake', days: ['mon'], start: '08:00', end: '12:00' }, { kind: 'awake', days: ['mon'], start: '12:10', end: '18:00' }];
+  const inherited = await call('PUT', '/v1/workloads/demo/schedule', { timeZone: 'UTC', windows });
+  assert.deepEqual([inherited.body.joinMinutes, inherited.body.joinFrom], [15, 'default']);
+  assert.deepEqual(inherited.body.nextEvents.slice(0, 2).map((e) => e.kind), ['awake-start', 'awake-start']);
+  const own = await call('PUT', '/v1/workloads/demo/schedule', { timeZone: 'UTC', windows, joinMinutes: 0 });
+  assert.deepEqual([own.body.joinMinutes, own.body.joinFrom, own.body.joinInherited], [0, 'workload', { joinMinutes: 15, joinFrom: 'default' }]);
+  assert.deepEqual(own.body.nextEvents.slice(0, 2).map((e) => e.kind), ['awake-start', 'awake-end']);
+  assert.equal(store.schedules.get('demo').joinMinutes, 0);
+  const bad = await call('PUT', '/v1/workloads/demo/schedule', { timeZone: 'UTC', windows, joinMinutes: 7 });
+  assert.equal(bad.status, 400);
+  assert.equal(bad.body.error, 'joinMinutes: a whole number from 0 to 120, a multiple of 5');
+});
+
 test('PUT /v1/workloads/:id/schedule: a bad schedule → 400 with scheduleProblems\' words, nothing stored', async () => {
   const { call, store } = api();
   await call('POST', '/v1/workloads', INPUT);
@@ -342,7 +360,7 @@ test('DELETE /v1/workloads/:id/schedule: gone, and none left is no failure; unkn
   for (const cleared of [true, false]) {
     const res = await call('DELETE', '/v1/workloads/demo/schedule');
     assert.equal(res.status, 200);
-    assert.deepEqual(res.body, { schedule: null, nextEvents: [] });
+    assert.deepEqual(res.body, NO_SCHEDULE);
     assert.equal(w.logs.findLast((l) => l.event === 'ScheduleCleared').cleared, cleared);
   }
   assert.equal(store.schedules.size, 0);

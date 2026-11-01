@@ -891,7 +891,10 @@ export function createController({
   // { action: 'waiting-page', op: 'get' | 'put' | 'delete', workloadId?, page?, by }: the router's level, or a workload's.
   // A workload Terraform wrote refuses a put; it refuses a delete only of an item Terraform wrote (no by), so an item left
   // from before the workload moved to Terraform can still be cleared. The log holds the size and hash of a page, never it.
-  async function waitingPage({ op, workloadId, page, by }) {
+  async function waitingPage({ op, workloadId = null, page, by }) {
+    // Null or absent is the router's level; anything else must be a workload's id, never a falsy value read as the router's.
+    if (workloadId !== null && (typeof workloadId !== 'string' || !workloadId)) throw new Error('workloadId must be the id of a workload');
+    if (op === 'put' && (typeof by !== 'string' || !by)) throw new Error('a put needs by: who sets the page');
     const cfg = workloadId ? await config(workloadId) : null;
     const level = pageLevel(workloadId);
     const terraformRefuses = () => new Error(`workload ${workloadId} was written by Terraform: set waiting_page in its workload module`);

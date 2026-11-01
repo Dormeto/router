@@ -282,16 +282,22 @@ export function createStore({ dynamo, table, now = Date.now, log = null }) {
 
     // Offboarding: configuration, runtime state and pauses; the daily statistics expire by their TTL.
     async deleteWorkload(workloadId) {
-      const { Items = [] } = await dynamo.query({
-        TableName: table,
-        KeyConditionExpression: '#pk = :pk',
-        ExpressionAttributeNames: { '#pk': 'pk' },
-        ExpressionAttributeValues: { ':pk': { S: `WL#${workloadId}` } },
-        ConsistentRead: true,
-      });
-      for (const item of Items.filter((i) => !i.sk.S.startsWith('STATS#'))) {
-        await dynamo.deleteItem({ TableName: table, Key: { pk: item.pk, sk: item.sk } });
-      }
+      // Every page of the query: the items (a custom page, drift events) can pass the first megabyte.
+      let ExclusiveStartKey;
+      do {
+        const page = await dynamo.query({
+          TableName: table,
+          KeyConditionExpression: '#pk = :pk',
+          ExpressionAttributeNames: { '#pk': 'pk' },
+          ExpressionAttributeValues: { ':pk': { S: `WL#${workloadId}` } },
+          ConsistentRead: true,
+          ExclusiveStartKey,
+        });
+        for (const item of (page.Items ?? []).filter((i) => !i.sk.S.startsWith('STATS#'))) {
+          await dynamo.deleteItem({ TableName: table, Key: { pk: item.pk, sk: item.sk } });
+        }
+        ExclusiveStartKey = page.LastEvaluatedKey;
+      } while (ExclusiveStartKey);
     },
 
     // Drift events (R4c): what the onboarder repaired, kept 90 days (WL#<id> / DRIFT#<at>#<n>).

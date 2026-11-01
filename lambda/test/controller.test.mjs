@@ -2458,3 +2458,16 @@ test('the organization\'s level reaches the get answer from settings.json, and n
   assert.deepEqual([view.effective.title, view.effective.description, view.from.title], ['Org', 'Ours.', 'organization']);
   assert.deepEqual(Object.keys(s.store.state.pages), ['WL#demo']);
 });
+
+test('waiting-page refuses what would widen its target: an empty or odd workloadId (it is not the router\'s level) and a put with no by', async () => {
+  const s = setup({ run: { state: STATES.AWAKE }, cfg: testConfig({ source: 'manager' }) });
+  for (const workloadId of ['', 0, false, {}, ['demo']]) {
+    await assert.rejects(s.handler({ action: 'waiting-page', op: 'put', workloadId, page: TEMPLATE, by: 'ana' }), { message: 'workloadId must be the id of a workload' }, JSON.stringify(workloadId));
+  }
+  for (const by of [undefined, '', null, 7]) {
+    await assert.rejects(waitingPage(s, 'put', { page: TEMPLATE, by }), { message: 'a put needs by: who sets the page' });
+  }
+  assert.deepEqual(s.store.state.pages, {});
+  // Absent or null is the router's level.
+  for (const workloadId of [undefined, null]) assert.equal((await s.handler({ action: 'waiting-page', op: 'get', workloadId })).terraform, false);
+});

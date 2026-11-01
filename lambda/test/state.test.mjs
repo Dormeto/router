@@ -542,3 +542,15 @@ test('the check\'s scan reads configurations and schedules only: PAGE and FAVICO
   await store.deleteWorkload('shop');
   assert.deepEqual(dynamo.calls.filter(([name]) => name === 'deleteItem').map(([, input]) => input.Key.sk.S), ['CFG', 'RUN', 'PAGE', 'FAVICON']);
 });
+
+test('offboarding reads every page of the workload\'s items: a custom page and the run beyond the first page are deleted too', async () => {
+  const pk = { S: 'WL#shop' };
+  const pages = [
+    { Items: ['CFG', 'DRIFT#1', 'FAVICON'].map((sk) => ({ pk, sk: { S: sk } })), LastEvaluatedKey: { pk, sk: { S: 'FAVICON' } } },
+    { Items: ['PAGE', 'PAUSE', 'RUN', 'SCHEDULE', 'STATS#2026-10-05'].map((sk) => ({ pk, sk: { S: sk } })) },
+  ];
+  const dynamo = fakeDynamo({ query: async (input) => (input.ExclusiveStartKey ? pages[1] : pages[0]), deleteItem: async () => ({}) });
+  await createStore({ dynamo, table: 't' }).deleteWorkload('shop');
+  assert.deepEqual(dynamo.calls.filter(([name]) => name === 'deleteItem').map(([, input]) => input.Key.sk.S), ['CFG', 'DRIFT#1', 'FAVICON', 'PAGE', 'PAUSE', 'RUN', 'SCHEDULE']);
+  assert.deepEqual(dynamo.calls.filter(([name]) => name === 'query').map(([, input]) => input.ExclusiveStartKey), [undefined, { pk, sk: { S: 'FAVICON' } }]);
+});

@@ -76,6 +76,8 @@ export function createController({
   publisher = { enabled: false, checked: async () => {}, stateChanged: async () => {} },
   // The favicon read of a nap (lib/favicon.mjs): the network and its time budget, injected for the tests.
   fetch = globalThis.fetch, faviconBudgetMs = FAVICON_BUDGET_MS,
+  // The organization's waiting page, read from the manager's settings.json (lib/organization-page.mjs); null: none.
+  organizationPage = null,
 }) {
   const clients = { ec2, elbv2, autoscaling, ecs, tagging, appscaling, rds, kubernetesOf };
   let budgetEnd = Infinity;
@@ -318,9 +320,9 @@ export function createController({
       const last = await store.getFavicon(workloadId);
       if (spent()) return 'gave up';
       if (last?.fetchedAt > now() - FAVICON_EVERY_MS) return 'done';
-      const [organization, router_, workload] = await Promise.all([store.getWaitingPage('organization'), store.getWaitingPage('router'), store.getWaitingPage({ workloadId })]);
+      const [organization, router_, workload] = await Promise.all([organizationPage ? organizationPage.read({ signal: budget.signal }) : null, store.getWaitingPage('router'), store.getWaitingPage({ workloadId })]);
       if (spent()) return 'gave up';
-      const page = resolvePage(organization?.page, router_?.page, workload?.page);
+      const page = resolvePage(organization, router_?.page, workload?.page);
       if (page.mode !== 'template' || page.icon !== 'auto') return 'done';
       const { icon, error } = await readFavicon(hostOfRules(rules), { fetch, now, budgetMs: faviconBudgetMs, signal: budget.signal });
       await store.putFavicon(workloadId, { icon: icon ?? last?.icon ?? null, fetchedAt: now(), error });
@@ -862,12 +864,17 @@ export function createController({
   // each field comes from, the cached favicon, the warnings and who wrote it. Never throws on a bad stored value.
   async function pageView(workloadId, cfg) {
     const [organization, upper, favicon] = await Promise.all([
-      store.getWaitingPage('organization'), store.getWaitingPage('router'), workloadId ? store.getFavicon(workloadId) : null,
+      // The organization's level is the manager's settings.json; unreadable, it is none here (and logged).
+      organizationPage ? organizationPage.read().catch((err) => {
+        log.warn('WaitingPageUnread', { level: 'organization', error: String(err?.message ?? err).slice(0, 200) });
+        return null;
+      }) : null,
+      store.getWaitingPage('router'), workloadId ? store.getFavicon(workloadId) : null,
     ]);
     // The level read: the workload's, or the router's (its upper levels then are the organization's alone).
     const own = workloadId ? await store.getWaitingPage({ workloadId }) : upper;
-    const inherited = workloadId ? resolvePage(organization?.page, upper?.page, null) : resolvePage(organization?.page, null, null);
-    const effective = workloadId ? resolvePage(organization?.page, upper?.page, own?.page) : resolvePage(organization?.page, own?.page, null);
+    const inherited = workloadId ? resolvePage(organization, upper?.page, null) : resolvePage(organization, null, null);
+    const effective = workloadId ? resolvePage(organization, upper?.page, own?.page) : resolvePage(organization, own?.page, null);
     return {
       own: cleanPage(own?.page),
       inherited,

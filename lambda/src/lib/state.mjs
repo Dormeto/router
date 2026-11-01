@@ -10,14 +10,14 @@ const itemKey = (workloadId, sk) => ({ pk: { S: `WL#${workloadId}` }, sk: { S: s
 const listKey = (name, sk) => ({ pk: { S: `LIST#${name}` }, sk: { S: sk } });
 // Pause of the router (workloadId null) or of a workload: PAUSE for an operator's pause, PAUSE#<id> for an exclusion's.
 const pauseKey = (workloadId, exclusionId) => ({ pk: { S: workloadId ? `WL#${workloadId}` : 'ROUTER' }, sk: { S: exclusionId ? `PAUSE#${exclusionId}` : 'PAUSE' } });
-// The waiting page's levels (branded waiting page design §5): 'organization' and 'router' are the router's own items, a
-// workload is { workloadId } (a workload may be named like a level).
+// The waiting page's levels (branded waiting page design §5) kept in the table: 'router', or a workload { workloadId } (a workload
+// may be named 'router'). The organization's is in the manager's settings.json (lib/organization-page.mjs), never here.
 const pageKey = (level) => {
-  if (level === 'organization') return { pk: { S: 'ROUTER' }, sk: { S: 'ORGANIZATION-PAGE' } };
   if (level === 'router') return { pk: { S: 'ROUTER' }, sk: { S: 'PAGE' } };
   if (typeof level?.workloadId === 'string' && level.workloadId) return itemKey(level.workloadId, 'PAGE');
   throw new TypeError(`unknown waiting page level: ${JSON.stringify(level)}`);
 };
+const PAGE_FIELDS = ['mode', 'icon', 'title', 'description', 'html'];
 const pauseOf = (item) => ({ workloadId: item.pk.S === 'ROUTER' ? null : item.pk.S.slice(3), ...JSON.parse(item.pause.S) });
 
 export const DAY_MS = 86_400_000;
@@ -386,25 +386,29 @@ export function createStore({ dynamo, table, now = Date.now, log = null }) {
     },
 
     // The waiting page of a level (design §5): its own item, never a field of the configuration (that one is scanned at every
-    // check). { page, by, at }: by and at are absent for an item Terraform wrote; a document that cannot be parsed is page null.
-    // eventual: the waker's cache reads cheaper, a minute late at worst.
+    // check). Each field of the document is its own string attribute (mode, icon, title, description, html), so the item holds the
+    // text as it is: a 256 KiB page weighs 256 KiB, not what its JSON would. { page, by, at }: by and at are absent for an item
+    // Terraform wrote; an item with no mode is page null. eventual: the waker's cache reads cheaper, a minute late at worst.
     async getWaitingPage(level, { eventual = false } = {}) {
       const { Item } = await dynamo.getItem({ TableName: table, Key: pageKey(level), ConsistentRead: !eventual });
       if (!Item) return null;
-      let page = null;
-      try {
-        page = JSON.parse(Item.page?.S);
-      } catch {
-        // Read as none: the page then falls to the level above.
-      }
-      return { page, by: Item.by?.S ?? null, at: Item.at ? Number(Item.at.N) : null };
+      const page = typeof Item.mode?.S === 'string' ? { mode: Item.mode.S } : null;
+      if (page) for (const field of PAGE_FIELDS.slice(1)) if (typeof Item[field]?.S === 'string') page[field] = Item[field].S;
+      return { page, by: Item.by?.S || null, at: Item.at ? Number(Item.at.N) : null };
     },
     async putWaitingPage(level, page, { by, at }) {
+      const present = PAGE_FIELDS.filter((field) => typeof page[field] === 'string');
+      const absent = PAGE_FIELDS.filter((field) => !present.includes(field));
+      const names = { '#by': 'by', '#at': 'at', '#page': 'page' };
+      const values = { ':by': { S: String(by ?? '') }, ':at': { N: String(at) } };
+      for (const field of PAGE_FIELDS) names[`#${field}`] = field;
+      for (const field of present) values[`:${field}`] = { S: page[field] };
       await dynamo.updateItem({
         TableName: table, Key: pageKey(level),
-        UpdateExpression: 'SET #page = :page, #by = :by, #at = :at',
-        ExpressionAttributeNames: { '#page': 'page', '#by': 'by', '#at': 'at' },
-        ExpressionAttributeValues: { ':page': { S: JSON.stringify(page) }, ':by': { S: String(by ?? '') }, ':at': { N: String(at) } },
+        // #page: the nested JSON of a first draft, removed with the rest.
+        UpdateExpression: `SET ${[...present.map((f) => `#${f} = :${f}`), '#by = :by', '#at = :at'].join(', ')} REMOVE ${[...absent.map((f) => `#${f}`), '#page'].join(', ')}`,
+        ExpressionAttributeNames: Object.fromEntries(Object.entries(names).filter(([name]) => name === '#by' || name === '#at' || name === '#page' || present.includes(name.slice(1)) || absent.includes(name.slice(1)))),
+        ExpressionAttributeValues: values,
       });
     },
     // True when there was one.

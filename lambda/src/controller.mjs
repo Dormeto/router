@@ -14,6 +14,7 @@ import { createTagging } from './aws/tagging.mjs';
 import { createCatalog } from './lib/catalog.mjs';
 import { createController } from './lib/controller-core.mjs';
 import { createManagerSettings, settingsUrlOf } from './lib/manager-settings.mjs';
+import { createOrganizationPage } from './lib/organization-page.mjs';
 import { kubernetesConnector } from './lib/k8s.mjs';
 import { memoizeAsync } from './lib/memo.mjs';
 import { createPublisher, withTransitionEvents } from './lib/events.mjs';
@@ -43,6 +44,8 @@ const catalog = process.env.DMT_IP_LISTS_CATALOG
 // The manager's global settings: settings.json beside the catalog (hibernation design §3).
 // Without a catalog its url is null: nothing is read.
 const managerSettings = createManagerSettings({ s3, url: settingsUrlOf(process.env.DMT_IP_LISTS_CATALOG), catalogUrl: process.env.DMT_IP_LISTS_CATALOG, store, log: logger });
+// The organization's waiting page: the `waitingPage` key of the same settings.json (read apart from hibernate).
+const organizationPage = createOrganizationPage({ s3, url: settingsUrlOf(process.env.DMT_IP_LISTS_CATALOG), catalogUrl: process.env.DMT_IP_LISTS_CATALOG, log: logger });
 const download = (url) => downloadText(url, { getObject: s3?.getObject });
 // Failure queues of the router (router health): { check, controller } queue URLs.
 const queues = JSON.parse(process.env.DMT_FAILURE_QUEUES || '{}');
@@ -90,4 +93,5 @@ export const handler = createController({
   ipLists: lists,
   catalog,
   managerSettings,
+  organizationPage,
 });

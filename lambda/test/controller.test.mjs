@@ -34,12 +34,15 @@ function setup({ run, instance = 'running', target = 'app', healthy = 1, metric 
   const settings = typeof managerSettings === 'function' ? managerSettings({ store, clock }) : managerSettings;
   // The favicon's network: none unless a test sets network.fetch, so that no test reaches one.
   const network = { fetch: async () => { throw new Error('no network in tests'); }, calls: [] };
+  // The organization's page, from the manager's settings.json in the real router: set organization.page (or make it throw).
+  const organization = { page: null, reads: 0, signals: [], async read({ signal } = {}) { organization.reads += 1; organization.signals.push(signal); if (organization.failure) throw organization.failure; return structuredClone(organization.page); } };
   const handler = createController({
+    organizationPage: organization,
     fetch: (...args) => { network.calls.push(args[0]); return network.fetch(...args); }, faviconBudgetMs: 50,
     store, ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, kubernetesOf: kubernetesOf ?? (k8s ? async () => k8s : undefined), lambda,
     invokeSelf: async (payload) => { invocations.push(payload); }, now: clock.now, sleep: clock.sleep, newId: () => `wake-${++ids}`, log, managerSettings: settings,
   });
-  return { handler, store, ec2, elbv2, cloudwatch, autoscaling, ecs, appscaling, rds, clock, cfg, invocations, log, settings, network };
+  return { handler, store, ec2, elbv2, cloudwatch, autoscaling, ecs, appscaling, rds, clock, cfg, invocations, log, settings, network, organization };
 }
 
 test('wake: starts the instance, waits for health, switches the route and becomes AWAKE', async () => {
@@ -2136,7 +2139,7 @@ const waitingPage = (s, op, extra = {}) => s.handler({ action: 'waiting-page', o
 
 test('waiting-page put at the workload level: validated, stored with who and when, answers the levels\' resolution, warnings and the cached favicon', async () => {
   const s = setup({ run: { state: STATES.AWAKE }, cfg: testConfig({ source: 'manager' }) });
-  await s.store.putWaitingPage('organization', { mode: 'template', icon: 'none', title: 'Org', description: 'From the organization.' }, { by: 'sam', at: 1 });
+  s.organization.page = { mode: 'template', icon: 'none', title: 'Org', description: 'From the organization.' };
   await s.store.putFavicon('demo', { icon: 'data:image/png;base64,AA==', fetchedAt: 1_700_000_000_000 - 1000, error: null });
   const at = s.clock.now();
   const view = await waitingPage(s, 'put', { page: TEMPLATE });
@@ -2188,7 +2191,7 @@ test('waiting-page at the router level: no workload id, the router\'s item; the 
 test('waiting-page get: an unreadable stored page reads as none, inherited by the levels above; Terraform-written is flagged', async () => {
   const s = setup({ run: { state: STATES.AWAKE } });
   s.store.state.pages['WL#demo'] = { page: { mode: 'template', title: 'x'.repeat(200) }, by: null, at: null };
-  s.store.state.pages.organization = { page: CUSTOM, by: 'sam', at: 1 };
+  s.organization.page = CUSTOM;
   const view = await waitingPage(s, 'get');
   assert.deepEqual([view.own, view.terraform, view.by, view.at], [{ mode: 'template' }, true, null, null]);
   assert.equal(view.effective.mode, 'template', 'the field that is bad is dropped, the document still decides the mode');
@@ -2265,13 +2268,13 @@ test('nap: the favicon is due once in 24 hours, successful or not; the FAVICON i
   s.store.getWaitingPage = async (level, ...rest) => { levels.push(level); return getPage(level, ...rest); };
   s.store.state.favicons.demo = { icon: null, fetchedAt: s.clock.now() - DAY + 60_000, error: 'the page answered 401' };
   assert.equal(await napped(s), STATES.ASLEEP);
-  assert.deepEqual([s.network.calls, levels], [[], []], 'read less than a day ago, even when it failed: nothing read');
+  assert.deepEqual([s.network.calls, levels, s.organization.reads], [[], [], 0], 'read less than a day ago, even when it failed: nothing read');
 
   s.store.state.run.state = STATES.AWAKE;
   s.store.state.favicons.demo.fetchedAt = s.clock.now() - DAY - 1;
   assert.equal(await napped(s), STATES.ASLEEP);
   assert.equal(s.network.calls.length, 2);
-  assert.equal(levels.length, 3, 'organization, router, workload');
+  assert.deepEqual([levels.length, s.organization.reads], [2, 1], 'router and workload from the table, the organization\'s from the manager\'s settings');
 });
 
 test('nap: the read happens only for a template with icon auto: not for none, an upload or a custom page, at any level', async () => {
@@ -2284,14 +2287,17 @@ test('nap: the read happens only for a template with icon auto: not for none, an
     const s = setup({ run: { state: STATES.AWAKE } });
     hostRule(s, 'demo.example.com');
     app(s);
-    for (const [level, page] of Object.entries(pages)) s.store.state.pages[level] = { page, by: 'ana', at: 1 };
+    for (const [level, page] of Object.entries(pages)) {
+      if (level === 'organization') s.organization.page = page;
+      else s.store.state.pages[level] = { page, by: 'ana', at: 1 };
+    }
     assert.equal(await napped(s), STATES.ASLEEP, name);
     assert.deepEqual([name, s.network.calls, s.store.state.favicons], [name, [], {}]);
   }
   const auto = setup({ run: { state: STATES.AWAKE } });
   hostRule(auto, 'demo.example.com');
   app(auto);
-  auto.store.state.pages.organization = { page: { mode: 'template', icon: 'auto', title: 'Org' }, by: 'ana', at: 1 };
+  auto.organization.page = { mode: 'template', icon: 'auto', title: 'Org' };
   await napped(auto);
   assert.equal(auto.network.calls.length, 2, 'auto explicitly');
 });
@@ -2419,4 +2425,36 @@ test('nap: the host comes only from rules that are all host (or the path /*): a 
   app(wild);
   await napped(wild);
   assert.equal(wild.network.calls[0], 'https://demo.example.com/');
+});
+
+test('the organization\'s page: read from the manager\'s settings by the favicon step inside its budget and by get; a failed read skips the favicon and leaves get answering', async () => {
+  const s = setup({ run: { state: STATES.AWAKE } });
+  hostRule(s, 'demo.example.com');
+  app(s);
+  s.organization.page = { mode: 'template', icon: 'auto', title: 'Org' };
+  assert.equal(await napped(s), STATES.ASLEEP);
+  assert.equal(s.organization.signals.length, 1);
+  assert.ok(s.organization.signals[0] instanceof AbortSignal, 'inside the step\'s budget');
+  assert.equal(s.network.calls.length, 2);
+
+  const failing = setup({ run: { state: STATES.AWAKE } });
+  hostRule(failing, 'demo.example.com');
+  app(failing);
+  failing.organization.failure = new Error('SlowDown');
+  const warned = [];
+  failing.log.warn = (event, fields) => warned.push([event, fields.error]);
+  assert.equal(await napped(failing), STATES.ASLEEP);
+  assert.deepEqual([failing.network.calls, failing.store.state.favicons], [[], {}], 'the organization may have said none: no read');
+  assert.ok(warned.some(([event]) => event === 'FaviconSkipped'));
+  const view = await waitingPage(failing, 'get');
+  assert.equal(view.effective.mode, 'template');
+  assert.ok(warned.some(([event]) => event === 'WaitingPageUnread'));
+});
+
+test('the organization\'s level reaches the get answer from settings.json, and nothing of it is ever written to the table', async () => {
+  const s = setup({ run: { state: STATES.AWAKE }, cfg: testConfig({ source: 'manager' }) });
+  s.organization.page = { mode: 'template', title: 'Org' };
+  const view = await waitingPage(s, 'put', { page: { mode: 'template', description: 'Ours.' } });
+  assert.deepEqual([view.effective.title, view.effective.description, view.from.title], ['Org', 'Ours.', 'organization']);
+  assert.deepEqual(Object.keys(s.store.state.pages), ['WL#demo']);
 });

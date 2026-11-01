@@ -6,7 +6,7 @@ import { fakeClock } from './fakes.mjs';
 const PNG = `data:image/png;base64,${Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1]).toString('base64')}`;
 const UPLOAD = `data:image/x-icon;base64,${Buffer.from([0, 0, 1, 0, 1]).toString('base64')}`;
 
-// A store holding pages by level ('organization', 'router', workload id) and favicons by workload id; every read is recorded.
+// A store holding pages by level ('router', workload id; 'organization' is the reader's) and favicons by workload id; every read is recorded.
 function setup({ pages = {}, favicons = {}, ...options } = {}) {
   const clock = fakeClock();
   const reads = [];
@@ -25,8 +25,16 @@ function setup({ pages = {}, favicons = {}, ...options } = {}) {
     },
   };
   const log = { info() {}, warn: (event, fields) => warned.push([event, fields]), error() {} };
-  const waiting = createWaitingPages({ store, now: clock.now, log, ...options });
-  return { waiting, store, clock, reads, warned, pages, favicons };
+  // The organization's level is read from S3 (lib/organization-page.mjs): a reader of its own, not the store.
+  const organization = {
+    async read() {
+      reads.push(['page', 'organization', undefined]);
+      if (store.broken || organization.broken) throw new Error('ProvisionedThroughputExceeded');
+      return pages.organization ? structuredClone(pages.organization) : null;
+    },
+  };
+  const waiting = createWaitingPages({ store, organizationPage: organization, now: clock.now, log, ...options });
+  return { waiting, store, organization, clock, reads, warned, pages, favicons };
 }
 
 test('merges the three levels by field and shows the cached favicon for icon auto', async () => {
@@ -61,7 +69,7 @@ test('what is read is cached for 60 seconds, then read again; reads are eventual
   const s = setup({ pages: { router: { mode: 'template', title: 'One' } } });
   await s.waiting.pageOf('shop');
   assert.deepEqual(s.reads.map(([kind, key]) => `${kind}:${key}`).sort(), ['favicon:shop', 'page:organization', 'page:router', 'page:shop']);
-  assert.ok(s.reads.every(([, , eventual]) => eventual === true));
+  assert.ok(s.reads.filter(([, key]) => key !== 'organization').every(([, , eventual]) => eventual === true));
   s.clock.advance(59_000);
   await s.waiting.pageOf('shop');
   assert.equal(s.reads.length, 4);

@@ -40,7 +40,12 @@ export function fakeClock(start = 1_700_000_000_000) {
 
 export function fakeStore({ config, run, clock }) {
   const state = { run: structuredClone(run), stats: {}, lists: {}, pauses: [], schedules: {}, pages: {}, favicons: {} };
-  const pageKey = (level) => (typeof level === 'string' ? level : `WL#${level.workloadId}`);
+  // Levels kept in the table: 'router' and workloads. The organization's page is never written here.
+  const pageKey = (level) => {
+    if (level === 'router') return level;
+    if (level?.workloadId) return `WL#${level.workloadId}`;
+    throw new TypeError(`unknown waiting page level: ${JSON.stringify(level)}`);
+  };
   const samePause = (workloadId, exclusionId) => (p) => p.workloadId === workloadId && (p.exclusionId ?? null) === (exclusionId ?? null);
   const list = (name) => (state.lists[name] ??= { meta: null, parts: {} });
   const copy = () => structuredClone(state.run);

@@ -2,7 +2,6 @@
 // conditional GET at most every 5 minutes by the check, and mirrored in the router table so a cold Lambda and a nap read
 // the last known value from the table, never from S3.
 import { parseManagerSettings } from './hibernation.mjs';
-import { cleanPage } from './page-settings.mjs';
 
 const CHECK_MS = 5 * 60_000;
 
@@ -20,17 +19,6 @@ export function settingsUrlOf(catalogUrl) {
 
 // s3.getObjectIf({ bucket, key, etag }) → { notModified: true } | { body: Buffer, etag }: the S3 port of lib/catalog.mjs.
 // catalogUrl: the catalog the router reads, which proves an AccessDenied on settings.json means "missing".
-// The waiting page of settings.json (`waitingPage`), parsed apart from hibernate so that neither can unread the other: what
-// is valid of it, or null (absent or bad). undefined when the file cannot be read at all: the copy then stays as it is.
-function waitingPageOf(text) {
-  try {
-    const doc = JSON.parse(text);
-    return doc && typeof doc === 'object' && !Array.isArray(doc) ? cleanPage(doc.waitingPage) : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 export function createManagerSettings({ s3, url, catalogUrl = null, store, now = Date.now, log, checkMs = CHECK_MS }) {
   const where = parseUrl(url);
   const catalog = parseUrl(catalogUrl);
@@ -47,17 +35,6 @@ export function createManagerSettings({ s3, url, catalogUrl = null, store, now =
     }
   };
 
-  // The organization's level for the waiting page (design §5): the router's copy at ROUTER / ORGANIZATION-PAGE, written when it
-  // changed and removed when settings.json no longer has one. The waker reads that item, never S3.
-  async function copyPage(page) {
-    const kept = await store.getWaitingPage('organization');
-    if (page === null) {
-      if (kept) await store.deleteWaitingPage('organization');
-    } else if (JSON.stringify(kept?.page) !== JSON.stringify(page)) {
-      await store.putWaitingPage('organization', page, { by: 'settings.json', at: now() });
-    }
-  }
-
   async function refresh() {
     if (!where) return;
     const stored = await store.getManagerSettings();
@@ -67,14 +44,10 @@ export function createManagerSettings({ s3, url, catalogUrl = null, store, now =
     const last = stored ?? initial;
     const at = now();
     let next;
-    // The page to copy (null: none), or undefined: leave the copy as it is.
-    let page;
     try {
-      // A copy stored before this router read the page (pageRead) has an ETag of an object whose page nobody copied: read it afresh once.
-      const out = await s3.getObjectIf({ bucket: where.bucket, key: where.key, etag: last.pageRead ? last.etag : null });
+      const out = await s3.getObjectIf({ bucket: where.bucket, key: where.key, etag: last.etag });
       if (out.notModified) next = { ...last, readAt: at, error: null };
       else {
-        page = waitingPageOf(out.body.toString('utf8'));
         try {
           next = { hibernate: parseManagerSettings(out.body.toString('utf8')).hibernate, etag: out.etag, readAt: at, error: null };
         } catch (err) {
@@ -85,23 +58,10 @@ export function createManagerSettings({ s3, url, catalogUrl = null, store, now =
       // Without s3:ListBucket (the routers' roles have none), a missing object answers AccessDenied: never set, but only
       // in a bucket whose catalog the router reads (as lib/catalog.mjs).
       const neverSet = err.name === 'NoSuchKey' || (err.name === 'AccessDenied' && await catalogReads());
-      if (neverSet) {
-        next = { hibernate: true, etag: null, readAt: at, error: null };
-        page = null;
-      }
+      if (neverSet) next = { hibernate: true, etag: null, readAt: at, error: null };
       else {
         next = { ...last, readAt: at, error: `S3 ${err.name}` };
         log.warn('ManagerSettingsUnreadable', { url, error: next.error });
-      }
-    }
-    if (page !== undefined) {
-      try {
-        await copyPage(page);
-        next = { ...next, pageRead: true };
-      } catch (err) {
-        // Not copied: the ETag is not kept, so the next read brings the object again. Hibernate is stored all the same.
-        log.warn('WaitingPageNotCopied', { error: err.message });
-        next = { ...next, etag: last.etag, pageRead: false };
       }
     }
     await store.putManagerSettings(next);

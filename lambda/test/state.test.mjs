@@ -452,30 +452,52 @@ test('router settings and the manager settings copy are ROUTER items; no hiberna
 
 // --- The waiting page's items (branded waiting page design §5, §6) ----------------------------------------------------
 
-test('the waiting page levels have their own items: WL#<id>/PAGE, ROUTER/PAGE and ROUTER/ORGANIZATION-PAGE, written with who and when', async () => {
+test('the waiting page levels have their own items: WL#<id>/PAGE and ROUTER/PAGE, each field its own string attribute, written with who and when', async () => {
   const dynamo = fakeDynamo({ updateItem: async () => ({}) });
   const store = createStore({ dynamo, table: 't' });
-  const page = { mode: 'template', title: 'Acme' };
+  const page = { mode: 'template', title: 'Acme', description: 'Sleeps.\nWakes.' };
   await store.putWaitingPage({ workloadId: 'shop' }, page, { by: 'ana', at: 5 });
   await store.putWaitingPage('router', page, { by: 'ana', at: 6 });
-  await store.putWaitingPage('organization', page, { by: 'ana', at: 7 });
   assert.deepEqual(dynamo.calls.map(([, input]) => input.Key), [
-    { pk: { S: 'WL#shop' }, sk: { S: 'PAGE' } }, { pk: { S: 'ROUTER' }, sk: { S: 'PAGE' } }, { pk: { S: 'ROUTER' }, sk: { S: 'ORGANIZATION-PAGE' } },
+    { pk: { S: 'WL#shop' }, sk: { S: 'PAGE' } }, { pk: { S: 'ROUTER' }, sk: { S: 'PAGE' } }
   ]);
   const [, put] = dynamo.calls[0];
-  assert.deepEqual(JSON.parse(put.ExpressionAttributeValues[':page'].S), page);
-  assert.deepEqual([put.ExpressionAttributeValues[':by'], put.ExpressionAttributeValues[':at']], [{ S: 'ana' }, { N: '5' }]);
+  assert.equal(put.UpdateExpression, 'SET #mode = :mode, #title = :title, #description = :description, #by = :by, #at = :at REMOVE #icon, #html, #page');
+  const values = put.ExpressionAttributeValues;
+  assert.deepEqual([values[':mode'], values[':title'], values[':description'], values[':by'], values[':at']],
+    [{ S: 'template' }, { S: 'Acme' }, { S: 'Sleeps.\nWakes.' }, { S: 'ana' }, { N: '5' }]);
+  assert.ok(Object.values(values).every((v) => 'S' in v || 'N' in v), 'nothing nested');
   // A workload named like a level is still a workload.
   await store.putWaitingPage({ workloadId: 'router' }, page, { by: 'ana', at: 8 });
-  assert.deepEqual(dynamo.calls[3][1].Key, { pk: { S: 'WL#router' }, sk: { S: 'PAGE' } });
+  assert.deepEqual(dynamo.calls[2][1].Key, { pk: { S: 'WL#router' }, sk: { S: 'PAGE' } });
   await assert.rejects(store.putWaitingPage('demo', page, { by: 'ana', at: 9 }), TypeError);
+  // The organization's page is never a table item.
+  await assert.rejects(store.putWaitingPage('organization', page, { by: 'ana', at: 9 }), TypeError);
+  await assert.rejects(store.getWaitingPage('organization'), TypeError);
 });
 
-test('getWaitingPage reads { page, by, at } (no by: written by Terraform), eventually consistent on request; a bad document reads as none', async () => {
+test('the largest page, with the characters that used to expand, stays under DynamoDB\'s 400 KB item (attribute names and values counted)', async () => {
+  // What DynamoDB counts: the key and every attribute's name and value in bytes.
+  const sizeOf = (input) => {
+    let bytes = Buffer.byteLength(input.Key.pk.S) + Buffer.byteLength(input.Key.sk.S) + 4;
+    for (const [reference, value] of Object.entries(input.ExpressionAttributeValues)) bytes += Buffer.byteLength(input.ExpressionAttributeNames[`#${reference.slice(1)}`]) + Buffer.byteLength(value.S ?? value.N);
+    return bytes;
+  };
+  for (const filler of ['<td>x</td>', '"\\', '\n\t', 'é€😀', '\u0001', '<>&']) {
+    const html = filler.repeat(Math.ceil(256 * 1024 / Buffer.byteLength(filler)));
+    const cut = Buffer.from(html).subarray(0, 256 * 1024).toString('utf8').replaceAll('\uFFFD', '');
+    const dynamo = fakeDynamo({ updateItem: async () => ({}) });
+    await createStore({ dynamo, table: 't' }).putWaitingPage({ workloadId: 'shop' }, { mode: 'custom', html: cut }, { by: 'ana', at: 5 });
+    const size = sizeOf(dynamo.calls[0][1]);
+    assert.ok(size > 255 * 1024 && size < 257 * 1024 + 512, `${JSON.stringify(filler)}: ${size} bytes`);
+  }
+});
+
+test('getWaitingPage reads { page, by, at } from the attributes (no by: written by Terraform), eventually consistent on request; an item with no mode reads as none', async () => {
   const items = {
-    'WL#a/PAGE': { page: { S: '{"mode":"template","title":"A"}' }, by: { S: 'ana' }, at: { N: '5' } },
-    'WL#b/PAGE': { page: { S: '{"mode":"custom","html":"<p>x</p>"}' } },
-    'WL#c/PAGE': { page: { S: '{"mode":' } },
+    'WL#a/PAGE': { mode: { S: 'template' }, title: { S: 'A' }, by: { S: 'ana' }, at: { N: '5' } },
+    'WL#b/PAGE': { mode: { S: 'custom' }, html: { S: '<p>x</p>' } },
+    'WL#c/PAGE': { title: { S: 'no mode' } },
   };
   const dynamo = fakeDynamo({ getItem: async ({ Key }) => ({ Item: items[`${Key.pk.S}/${Key.sk.S}`] }) });
   const store = createStore({ dynamo, table: 't' });

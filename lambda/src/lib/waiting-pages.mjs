@@ -6,7 +6,8 @@ import { resolvePage } from './page-settings.mjs';
 
 const STUCK_MS = 10_000;
 
-export function createWaitingPages({ store, now = Date.now, log, ttlMs = 60_000, maxEntries = 200, readMs = 1000 }) {
+// organization: the organization's level, read from S3 (lib/organization-page.mjs): { read() } -> a page or null; without it none.
+export function createWaitingPages({ store, organizationPage = null, now = Date.now, log, ttlMs = 60_000, maxEntries = 200, readMs = 1000 }) {
   const shared = { organization: { value: null }, router: { value: null } };
   const workloads = new Map();
 
@@ -56,7 +57,7 @@ export function createWaitingPages({ store, now = Date.now, log, ttlMs = 60_000,
     try {
       const expiry = new Promise((resolve) => { timer = setTimeout(() => resolve('late'), readMs); });
       const [organization, router] = await Promise.all([
-        fresh(shared.organization, { level: 'organization' }, () => pageOfLevel('organization'), expiry),
+        fresh(shared.organization, { level: 'organization' }, async () => (organizationPage ? await organizationPage.read() : null), expiry),
         fresh(shared.router, { level: 'router' }, () => pageOfLevel('router'), expiry),
       ]);
       const entry = workloadId ? entryOf(workloadId) : null;

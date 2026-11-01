@@ -9,6 +9,8 @@ import { parseRules } from './lib/no-wake.mjs';
 import { createListCache, parseLists } from './lib/list-cache.mjs';
 import { createStore } from './lib/state.mjs';
 import { sleep } from './lib/time.mjs';
+import { settingsUrlOf } from './lib/manager-settings.mjs';
+import { createOrganizationPage } from './lib/organization-page.mjs';
 import { createAwsWaker } from './lib/waker-aws.mjs';
 
 // Optional CloudWatch metrics (router metrics_enabled), dimension Router = the router name.
@@ -63,7 +65,14 @@ const catalog = process.env.DMT_IP_LISTS_CATALOG
   ? createCatalog({ s3: { getObjectIf: async (input) => (await getS3()).getObjectIf(input) }, url: process.env.DMT_IP_LISTS_CATALOG, own: lists.map((l) => l.name), log: logger })
   : null;
 
+// The organization's waiting page: the `waitingPage` key of the manager's settings.json, beside the catalog.
+const organizationPage = createOrganizationPage({
+  s3: { getObjectIf: async (input) => (await getS3()).getObjectIf(input) },
+  url: settingsUrlOf(process.env.DMT_IP_LISTS_CATALOG), catalogUrl: process.env.DMT_IP_LISTS_CATALOG, log: logger,
+});
+
 export const handler = createAwsWaker({
+  organizationPage,
   store,
   invokeController,
   prefix: process.env.DMT_TG_PREFIX,

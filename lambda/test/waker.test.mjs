@@ -1,10 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createWaker } from '../src/lib/waker-core.mjs';
+import { PAGE_CSP } from '../src/lib/page.mjs';
+import { createWaitingPages } from '../src/lib/waiting-pages.mjs';
 import { STATES } from '../src/lib/state.mjs';
 import { albEvent, fakeClock, fakeStore, silentLog, testConfig } from './fakes.mjs';
 
-function setup({ run, cfg = testConfig(), invoke } = {}) {
+function setup({ run, cfg = testConfig(), invoke, waitingPages } = {}) {
   const clock = fakeClock();
   const store = fakeStore({ config: cfg, run, clock });
   const invocations = [];
@@ -17,6 +19,7 @@ function setup({ run, cfg = testConfig(), invoke } = {}) {
     sleep: clock.sleep,
     newId: () => `wake-${++ids}`,
     log: silentLog,
+    waitingPages,
   });
   return { handler, store, clock, invocations, cfg };
 }
@@ -344,4 +347,141 @@ test('without workloadIdOf, the target group names the workload, under the prefi
   const { handler } = setup({ run: { state: STATES.ASLEEP }, cfg: testConfig({ waitSeconds: 0 }) });
   await assert.rejects(handler(albEvent({ cfg: testConfig({ wakerTargetGroupArn: 'arn:aws:elasticloadbalancing:eu-west-1:111122223333:targetgroup/other-demo/222' }) })), /unexpected target group/);
   assert.equal((await handler(albEvent())).statusCode, 503);
+});
+
+// --- The branded waiting page (design §7 to §9) -----------------------------------------------------------------------
+
+const TEMPLATE = { page: { mode: 'template', title: 'Acme portal', description: 'Sleeps at night.' }, icon: null };
+const CUSTOM = { page: { mode: 'custom', html: '<!doctype html><title>Ours</title><p data-dormeto="status"></p>' }, icon: null };
+// Pages of the waker's tests: records who asked, and answers what it holds.
+const pagesOf = (answer = TEMPLATE) => {
+  const asked = [];
+  return { asked, async pageOf(id) { asked.push(id); return structuredClone(answer); } };
+};
+
+test('the page speaks the visitor\'s language, says it varies by it, and a template answer carries the content security policy', async () => {
+  const waitingPages = pagesOf();
+  const { handler } = setup({ run: { state: STATES.ASLEEP }, cfg: testConfig({ waitSeconds: 0 }), waitingPages });
+  const res = await handler(albEvent({ headers: { 'accept-language': 'fr-CA,en;q=0.5' } }));
+  assert.equal(headerOf(res, 'vary'), 'accept-language');
+  assert.equal(headerOf(res, 'content-security-policy'), PAGE_CSP);
+  assert.match(res.body, /<html lang="fr">/);
+  assert.match(res.body, /<h1>Acme portal<\/h1>/);
+  assert.match(res.body, /Démarrage de l'application/);
+  assert.deepEqual(waitingPages.asked, ['demo']);
+  const english = await handler(albEvent({ headers: { 'accept-language': 'de' } }));
+  assert.match(english.body, /<html lang="en">/);
+});
+
+test('accept-language is read from every header line the load balancer passes, whatever the case of its name', async () => {
+  const { handler } = setup({ run: { state: STATES.ASLEEP }, cfg: testConfig({ waitSeconds: 0 }), waitingPages: pagesOf() });
+  const event = albEvent();
+  event.multiValueHeaders['Accept-Language'] = ['de;q=0.9', 'fr;q=0.8'];
+  assert.match((await handler(event)).body, /<html lang="fr">/);
+  const single = albEvent();
+  delete single.multiValueHeaders;
+  single.headers = { Accept: 'text/html', 'ACCEPT-LANGUAGE': 'fr' };
+  assert.match((await handler(single)).body, /<html lang="fr">/);
+});
+
+test('a custom page is answered with the same status and headers and no content security policy of ours', async () => {
+  const { handler } = setup({ run: { state: STATES.ASLEEP }, cfg: testConfig({ waitSeconds: 0 }), waitingPages: pagesOf(CUSTOM) });
+  const res = await handler(albEvent());
+  assert.equal(res.statusCode, 503);
+  assert.equal(headerOf(res, 'content-security-policy'), undefined);
+  assert.equal(headerOf(res, 'vary'), 'accept-language');
+  assert.equal(headerOf(res, 'retry-after'), '3');
+  assert.match(headerOf(res, 'content-type'), /text\/html/);
+  assert.match(res.body, /<title>Ours<\/title>/);
+  assert.ok(res.body.includes('data-dormeto="status"'));
+});
+
+test('no setting read for HEAD, a JSON client, the wake trigger or the hold; the page is read after the wake was triggered and the hold ended', async () => {
+  const waitingPages = pagesOf();
+  const withPages = setup({ run: { state: STATES.ASLEEP }, waitingPages });
+  const during = [];
+  withPages.clock.onSleep(() => during.push([waitingPages.asked.length, withPages.invocations.length]));
+  const json = await withPages.handler(albEvent({ headers: { accept: 'application/json' } }));
+  assert.deepEqual(waitingPages.asked, []);
+  assert.deepEqual(JSON.parse(json.body), { status: 'waking', retryAfter: 3 });
+  assert.equal(headerOf(json, 'vary'), undefined);
+  assert.equal(headerOf(json, 'content-security-policy'), undefined);
+  assert.ok(during.length > 0 && during.every(([asked, woke]) => asked === 0 && woke === 1), 'the hold ran after the wake was triggered, before any read');
+
+  const head = setup({ run: { state: STATES.ASLEEP }, cfg: testConfig({ waitSeconds: 0 }), waitingPages });
+  const res = await head.handler(albEvent({ method: 'HEAD' }));
+  assert.equal(res.body, '');
+  assert.deepEqual(waitingPages.asked, []);
+
+  const html = await withPages.handler(albEvent());
+  assert.equal(html.statusCode, 503);
+  assert.deepEqual(waitingPages.asked, ['demo']);
+});
+
+test('a store that throws still produces the page, and the wake already happened', async () => {
+  const throwing = createWaitingPages({ store: { getWaitingPage: async () => { throw new Error('AccessDenied'); }, getFavicon: async () => { throw new Error('AccessDenied'); } }, now: Date.now, log: silentLog });
+  const { handler, invocations, store } = setup({ run: { state: STATES.ASLEEP }, cfg: testConfig({ waitSeconds: 0 }), waitingPages: throwing });
+  const res = await handler(albEvent());
+  assert.equal(res.statusCode, 503);
+  assert.match(res.body, /Waking up the application/);
+  assert.deepEqual(invocations, [{ action: 'wake', workloadId: 'demo', wakeId: 'wake-1' }]);
+  assert.equal(store.state.run.state, STATES.WAKING);
+
+  // A pages object that throws or rejects is no different.
+  for (const waitingPages of [{ pageOf: () => { throw new Error('sync'); } }, { pageOf: async () => { throw new Error('async'); } }]) {
+    const s = setup({ run: { state: STATES.ASLEEP }, cfg: testConfig({ waitSeconds: 0 }), waitingPages });
+    assert.match((await s.handler(albEvent())).body, /Waking up the application/);
+    assert.equal(s.invocations.length, 1);
+  }
+});
+
+test('WAKING answers carry the seconds since the wake started; the typical time only when a wake was recorded, on the page and on the probe\'s answer', async () => {
+  for (const [recentWakes, typical] of [[undefined, undefined], ['[10000,30000,20000]', '20000'], ['not json', undefined]]) {
+    const s = setup({ run: { state: STATES.WAKING, wakeId: 'w1', ...(recentWakes === undefined ? {} : { recentWakes }) }, waitingPages: pagesOf() });
+    s.store.state.run.wakeStartedAt = s.clock.now() - 12_000;
+    for (const accept of ['text/html', 'application/json']) {
+      const res = await s.handler(albEvent({ headers: { accept, 'x-dormeto-probe': '1' } }));
+      assert.equal(headerOf(res, 'x-dormeto-state'), STATES.WAKING);
+      assert.equal(headerOf(res, 'x-dormeto-wake-elapsed'), '12000', accept);
+      assert.equal(headerOf(res, 'x-dormeto-wake-typical'), typical, accept);
+    }
+  }
+});
+
+test('the headers are for WAKING only; the page shows the bar from the typical time', async () => {
+  const waiting = setup({ run: { state: STATES.ASLEEP }, cfg: testConfig({ waitSeconds: 0 }), waitingPages: pagesOf() });
+  const asleepButWoken = await waiting.handler(albEvent());
+  assert.equal(headerOf(asleepButWoken, 'x-dormeto-wake-elapsed'), '0', 'the wake just started');
+  for (const state of [STATES.FAILED, STATES.NAPPING, STATES.AWAKE]) {
+    const s = setup({ run: { state, failedAt: 1, awakeSince: 1, recentWakes: '[1000]' }, cfg: testConfig({ waitSeconds: 0 }), waitingPages: pagesOf() });
+    // Backed off after a failure, or just awake: the probe starts no wake.
+    s.store.state.run.awakeSince = s.store.state.run.failedAt = s.clock.now();
+    const res = await s.handler(albEvent({ headers: { 'x-dormeto-probe': '1' } }));
+    assert.equal(headerOf(res, 'x-dormeto-state'), state);
+    assert.equal(headerOf(res, 'x-dormeto-wake-elapsed'), undefined, state);
+    assert.equal(headerOf(res, 'x-dormeto-wake-typical'), undefined, state);
+  }
+  const s = setup({ run: { state: STATES.WAKING, wakeId: 'w1', recentWakes: '[20000]' }, cfg: testConfig({ waitSeconds: 0 }), waitingPages: pagesOf() });
+  s.store.state.run.wakeStartedAt = s.clock.now() - 10_000;
+  const res = await s.handler(albEvent());
+  assert.match(res.body, /role="progressbar"[^>]*aria-valuenow="50"/);
+  assert.match(res.body, /10 s/);
+  const none = setup({ run: { state: STATES.WAKING, wakeId: 'w1' }, cfg: testConfig({ waitSeconds: 0 }), waitingPages: pagesOf() });
+  none.store.state.run.wakeStartedAt = none.clock.now() - 10_000;
+  assert.doesNotMatch((await none.handler(albEvent())).body, /role="progressbar"/);
+});
+
+test('an unconfigured workload answers with the two upper levels only; without waiting pages the built-in page and no new header but vary stays off', async () => {
+  const waitingPages = pagesOf();
+  const { handler } = setup({ run: { state: STATES.ASLEEP }, waitingPages });
+  const event = albEvent();
+  event.requestContext.elb.targetGroupArn = 'arn:aws:elasticloadbalancing:eu-west-1:1:targetgroup/dmt-dev-ghost/1';
+  const res = await handler(event);
+  assert.equal(headerOf(res, 'x-dormeto-state'), STATES.FAILED);
+  assert.deepEqual(waitingPages.asked, [null]);
+
+  const plain = setup({ run: { state: STATES.ASLEEP }, cfg: testConfig({ waitSeconds: 0 }) });
+  const built = await plain.handler(albEvent({ headers: { 'accept-language': 'fr' } }));
+  assert.match(built.body, /Waking up the application/);
+  assert.equal(headerOf(built, 'content-security-policy'), undefined);
 });

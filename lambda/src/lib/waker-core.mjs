@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { failedSpec, failureKind, nextAttemptAt } from './failures.mjs';
 import { STATES } from './state.mjs';
-import { WAKE_HEADER, acceptsHtml, classify, redirectCount, requestOrigin, requestTarget, response, workloadIdFromEvent } from './http.mjs';
-import { renderJson, renderPage } from './page.mjs';
+import { WAKE_HEADER, acceptsHtml, classify, headerValues, redirectCount, requestOrigin, requestTarget, response, workloadIdFromEvent } from './http.mjs';
+import { PAGE_CSP, languageOf, renderJson, renderPage } from './page.mjs';
+import { medianOf } from './page-settings.mjs';
 import { ADMIN_PREFIX, parseAdminPath } from './admin.mjs';
 import { compileRules, describeRules } from './no-wake.mjs';
 import { STATS_DAYS } from './summary.mjs';
@@ -17,7 +18,10 @@ const ROUTE_GRACE_MS = 15_000;
 const ENSURE_INTERVAL_MS = 10_000;
 
 // workloadIdOf(event): how a request names its workload; by default, its target group under the prefix.
-export function createWaker({ store, invokeController, prefix, workloadIdOf = (event) => workloadIdFromEvent(event, prefix), now = Date.now, sleep, newId = randomUUID, log, getAdmin, defaultRules = [], listCache = null }) {
+export function createWaker({ store, invokeController, prefix, workloadIdOf = (event) => workloadIdFromEvent(event, prefix), now = Date.now, sleep, newId = randomUUID, log, getAdmin, defaultRules = [], listCache = null,
+  // The branded waiting page (lib/waiting-pages.mjs): its settings, the visitor's language and the progress. Without it the page is
+  // the built-in one in English (Google Cloud's), as before.
+  waitingPages = null }) {
   const ensured = new Map(); // workload id → last ensure-awake request
   const inRouteGrace = (run) => run.state === STATES.AWAKE && (run.awakeSince ?? 0) > now() - ROUTE_GRACE_MS;
   const servable = (run) => run.state === STATES.AWAKE && !inRouteGrace(run);
@@ -140,19 +144,52 @@ export function createWaker({ store, invokeController, prefix, workloadIdOf = (e
     return current;
   }
 
+  // The typical wake time of the workload, the median of the run's recent wakes; null with none, or a value no use.
+  function typicalWake(run) {
+    try {
+      return medianOf(JSON.parse(run.recentWakes));
+    } catch {
+      return null;
+    }
+  }
+
+  // What the page is made of (branded waiting page design §9): never throws, the built-in page when it cannot be read.
+  async function pageSettings(workloadId) {
+    try {
+      return await waitingPages.pageOf(workloadId);
+    } catch (err) {
+      log.warn('WaitingPageUnread', { workloadId, error: String(err?.message ?? err).slice(0, 200) });
+      return { page: null, icon: null };
+    }
+  }
+
   // failed: { kind, retryAt } of a failed workload (R7a): the page says why and when the next attempt is.
   // napUntil: { at, local, timeZone } of the nap window that keeps the workload asleep.
-  function waiter(event, pollSeconds, state, wakeHeader, failed = null, napUntil = null) {
+  // workloadId: whose settings the page reads (null: the two upper levels only); run: for the wake's elapsed and typical time.
+  // The settings are read only for the HTML page, which is answered after the wake was triggered and the hold ended.
+  async function waiter(event, pollSeconds, state, wakeHeader, failed = null, napUntil = null, { workloadId = null, run = null } = {}) {
+    // Seconds since the wake started and the typical time of the workload, in WAKING (the probe's answer brings them to the page).
+    const wake = waitingPages && state === STATES.WAKING && Number.isFinite(run?.wakeStartedAt)
+      ? { elapsedMs: Math.max(0, now() - run.wakeStartedAt), typicalMs: typicalWake(run) }
+      : null;
     const headers = {
       ...(napUntil ? { 'x-dormeto-nap-until': napUntil.at } : {}),
       'cache-control': 'no-store', 'retry-after': String(pollSeconds), 'x-dormeto-state': state,
       ...(failed?.kind ? { 'x-dormeto-failure': failed.kind } : {}),
       ...(failed?.retryAt ? { 'x-dormeto-retry-at': new Date(failed.retryAt).toISOString() } : {}),
+      ...(wake ? { 'x-dormeto-wake-elapsed': String(Math.round(wake.elapsedMs)) } : {}),
+      ...(wake?.typicalMs ? { 'x-dormeto-wake-typical': String(Math.round(wake.typicalMs)) } : {}),
     };
     if (event.httpMethod === 'HEAD') return response(503, headers);
     if (acceptsHtml(event)) {
       const retryInMs = failed?.retryAt ? Math.max(0, failed.retryAt - now()) : undefined;
-      return response(503, { ...headers, 'content-type': 'text/html; charset=utf-8' }, renderPage({ state, pollSeconds, failure: failed?.kind, retryInMs, napUntil }));
+      const html = { ...headers, 'content-type': 'text/html; charset=utf-8' };
+      if (!waitingPages) return response(503, html, renderPage({ state, pollSeconds, failure: failed?.kind, retryInMs, napUntil }));
+      const { page, icon } = await pageSettings(workloadId);
+      const language = languageOf(headerValues(event, 'accept-language').join(','));
+      const body = renderPage({ state, pollSeconds, failure: failed?.kind, retryInMs, napUntil, language, page, icon, progress: wake });
+      // A custom page is the customer's: our policy would break it. Any other answer is ours, and so is its policy.
+      return response(503, { ...html, vary: 'accept-language', ...(page?.mode === 'custom' ? {} : { 'content-security-policy': PAGE_CSP }) }, body);
     }
     return response(503, { ...headers, 'content-type': 'application/json' }, renderJson({ state, pollSeconds, wakeHeader, napUntil }));
   }
@@ -184,11 +221,11 @@ export function createWaker({ store, invokeController, prefix, workloadIdOf = (e
       const hint = cfg.wakeMode === 'browser' && headerWorks && [STATES.ASLEEP, STATES.FAILED].includes(run.state) ? WAKE_HEADER : undefined;
       const retryAt = nextAttemptAt(cfg, run);
       const failed = retryAt !== null ? { kind: failureKind(run), retryAt } : null;
-      return waiter(event, cfg.pollSeconds, run.state, hint, failed, napUntil);
+      return waiter(event, cfg.pollSeconds, run.state, hint, failed, napUntil, { workloadId: cfg.workloadId, run });
     }
-    if (inRouteGrace(run)) return waiter(event, cfg.pollSeconds, STATES.AWAKE);
+    if (inRouteGrace(run)) return waiter(event, cfg.pollSeconds, STATES.AWAKE, undefined, null, null, { workloadId: cfg.workloadId, run });
     const count = redirectCount(event);
-    if (count >= MAX_REDIRECTS) return waiter(event, cfg.pollSeconds, STATES.AWAKE);
+    if (count >= MAX_REDIRECTS) return waiter(event, cfg.pollSeconds, STATES.AWAKE, undefined, null, null, { workloadId: cfg.workloadId, run });
     return response(307, {
       location: requestTarget(event),
       'cache-control': 'no-store',

@@ -8,6 +8,7 @@ import { memoizeAsync } from './lib/memo.mjs';
 import { parseRules } from './lib/no-wake.mjs';
 import { createListCache, parseLists } from './lib/list-cache.mjs';
 import { createStore } from './lib/state.mjs';
+import { createWaitingPages } from './lib/waiting-pages.mjs';
 import { sleep } from './lib/time.mjs';
 import { createWaker } from './lib/waker-core.mjs';
 
@@ -72,5 +73,7 @@ export const handler = createWaker({
   getAdmin,
   // Router defaults for every workload (Terraform router module no_wake_rules).
   defaultRules: parseRules(process.env.DMT_NO_WAKE_RULES, (error) => logger.error('NoWakeRulesUnreadable', { error })),
+  // The branded waiting page: the three levels' settings and the cached favicon, read only when a page is answered.
+  waitingPages: createWaitingPages({ store, log: logger }),
   listCache: lists.length || catalog ? createListCache({ store, lists, catalog, log: logger }) : null,
 });

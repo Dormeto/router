@@ -2091,3 +2091,136 @@ test('status and the settings answer fail on a failed read of the router\'s or t
   await assert.rejects(manager.handler({ action: 'settings', workloadId: 'demo', settings: { hibernate: true }, by: 'ana' }), /table/);
   assert.equal('hibernate' in (await manager.store.getConfig('demo')), false);
 });
+
+// --- The branded waiting page (design §5, §9, §11) ---------------------------------------------------------------------
+
+const wakeUp = async (s, wakeId = 'w1') => {
+  s.ec2.state.onStart.push(() => { s.clock.onSleep(() => { s.elbv2.state.healthy = 1; }); });
+  return s.handler({ action: 'wake', workloadId: 'demo', wakeId });
+};
+
+test('a completed wake adds its duration to the run\'s recentWakes (a JSON string, the last 10); a wake found awake, failed or superseded does not (waiting page)', async () => {
+  const s = setup({ run: { state: STATES.WAKING, wakeId: 'w1', recentWakes: JSON.stringify([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) }, instance: 'stopped', target: 'waker', healthy: 0 });
+  s.store.state.run.wakeStartedAt = s.clock.now() - 40_000;
+  assert.equal((await wakeUp(s)).state, STATES.AWAKE);
+  const kept = JSON.parse(s.store.state.run.recentWakes);
+  assert.equal(kept.length, 10);
+  assert.deepEqual(kept.slice(0, 9), [2, 3, 4, 5, 6, 7, 8, 9, 10]);
+  assert.ok(kept[9] >= 40_000);
+
+  const fresh = setup({ run: { state: STATES.WAKING, wakeId: 'w1', wakeStartedAt: 1_700_000_000_000 - 5000, recentWakes: 'not json' }, instance: 'stopped', target: 'waker', healthy: 0 });
+  await wakeUp(fresh);
+  const afresh = JSON.parse(fresh.store.state.run.recentWakes);
+  assert.ok(afresh.length === 1 && afresh[0] >= 5000, 'a bad value starts afresh');
+
+  const found = setup({ run: { state: STATES.ASLEEP, recentWakes: '[7]' }, instance: 'running', target: 'waker', healthy: 1, metric: [1] });
+  await found.handler({ action: 'check' });
+  assert.equal(found.store.state.run.state, STATES.AWAKE);
+  assert.equal(found.store.state.run.recentWakes, '[7]', 'found awake: not a wake that ended');
+
+  const failed = setup({ run: { state: STATES.WAKING, wakeId: 'w1', recentWakes: '[7]' }, instance: 'stopped', target: 'waker', healthy: 0 });
+  assert.equal((await failed.handler({ action: 'wake', workloadId: 'demo', wakeId: 'w1' })).state, STATES.FAILED);
+  assert.equal(failed.store.state.run.recentWakes, '[7]');
+
+  const superseded = setup({ run: { state: STATES.WAKING, wakeId: 'newer', recentWakes: '[7]' }, instance: 'stopped', target: 'waker' });
+  assert.equal((await superseded.handler({ action: 'wake', workloadId: 'demo', wakeId: 'older' })).state, 'SUPERSEDED');
+  assert.equal(superseded.store.state.run.recentWakes, '[7]');
+});
+
+const TEMPLATE = { mode: 'template', title: 'Acme portal', description: 'Sleeps at night.' };
+const CUSTOM = { mode: 'custom', html: '<!doctype html><p data-dormeto="status"></p>' };
+const waitingPage = (s, op, extra = {}) => s.handler({ action: 'waiting-page', op, workloadId: 'demo', by: 'ana', ...extra });
+
+test('waiting-page put at the workload level: validated, stored with who and when, answers the levels\' resolution, warnings and the cached favicon', async () => {
+  const s = setup({ run: { state: STATES.AWAKE }, cfg: testConfig({ source: 'manager' }) });
+  await s.store.putWaitingPage('organization', { mode: 'template', icon: 'none', title: 'Org', description: 'From the organization.' }, { by: 'sam', at: 1 });
+  await s.store.putFavicon('demo', { icon: 'data:image/png;base64,AA==', fetchedAt: 1_700_000_000_000 - 1000, error: null });
+  const at = s.clock.now();
+  const view = await waitingPage(s, 'put', { page: TEMPLATE });
+  assert.deepEqual(s.store.state.pages['WL#demo'], { page: TEMPLATE, by: 'ana', at });
+  assert.deepEqual(view.own, TEMPLATE);
+  assert.deepEqual(view.inherited, { mode: 'template', icon: 'none', title: 'Org', description: 'From the organization.', from: { mode: 'organization', icon: 'organization', title: 'organization', description: 'organization' } });
+  assert.deepEqual([view.effective.title, view.effective.icon, view.effective.description], ['Acme portal', 'none', 'Sleeps at night.']);
+  assert.deepEqual(view.from, { mode: 'workload', icon: 'organization', title: 'workload', description: 'workload' });
+  assert.deepEqual(view.favicon, { icon: 'data:image/png;base64,AA==', fetchedAt: new Date(at - 1000).toISOString(), error: null });
+  assert.deepEqual([view.warnings, view.terraform, view.by, view.at], [[], false, 'ana', new Date(at).toISOString()]);
+
+  const custom = await waitingPage(s, 'put', { page: { mode: 'custom', html: '<p>no status</p>' } });
+  assert.equal(custom.warnings.length, 1);
+  assert.match(custom.warnings[0], /data-dormeto="status"/);
+});
+
+test('waiting-page: bad pages answer the problems and write nothing; a 256 KiB page round-trips; the log holds its size and hash, never the html', async () => {
+  const s = setup({ run: { state: STATES.AWAKE }, cfg: testConfig({ source: 'manager' }) });
+  const logged = [];
+  s.log.info = (event, fields) => logged.push({ event, ...fields });
+  const bad = await waitingPage(s, 'put', { page: { mode: 'template', title: 'x'.repeat(81) } });
+  assert.deepEqual(bad.problems.length, 1);
+  assert.deepEqual((await waitingPage(s, 'put', { page: { mode: 'custom' } })).problems, ['html is required in a custom page']);
+  assert.deepEqual((await s.handler({ action: 'waiting-page', op: 'put', page: 'x', by: 'ana' })).problems, ['the page must be an object']);
+  assert.deepEqual(s.store.state.pages, {});
+
+  const html = `<!doctype html><p data-dormeto="status"></p>${'a'.repeat(256 * 1024 - 60)}`;
+  assert.ok(Buffer.byteLength(html) <= 256 * 1024);
+  const view = await waitingPage(s, 'put', { page: { mode: 'custom', html } });
+  assert.equal(view.own.html, html);
+  assert.equal(view.effective.html, html);
+  const line = logged.find((l) => l.event === 'WaitingPageSet');
+  assert.deepEqual([line.level, line.mode, line.bytes], ['workload', 'custom', Buffer.byteLength(html)]);
+  assert.match(line.sha256, /^[0-9a-f]{64}$/);
+  assert.ok(logged.every((l) => !JSON.stringify(l).includes('aaaaaaaa')));
+});
+
+test('waiting-page at the router level: no workload id, the router\'s item; the view has no favicon and is not Terraform\'s', async () => {
+  const s = setup({ run: { state: STATES.AWAKE } });
+  const view = await s.handler({ action: 'waiting-page', op: 'put', page: TEMPLATE, by: 'ana' });
+  assert.deepEqual(s.store.state.pages.router.page, TEMPLATE);
+  assert.deepEqual([view.own, view.favicon, view.terraform, view.from.title], [TEMPLATE, null, false, 'router']);
+  assert.equal((await s.handler({ action: 'waiting-page', op: 'get' })).own.title, 'Acme portal');
+  await s.handler({ action: 'waiting-page', op: 'delete', by: 'ana' });
+  assert.equal((await s.handler({ action: 'waiting-page', op: 'get' })).own, null);
+  assert.equal('router' in s.store.state.pages, false);
+});
+
+test('waiting-page get: an unreadable stored page reads as none, inherited by the levels above; Terraform-written is flagged', async () => {
+  const s = setup({ run: { state: STATES.AWAKE } });
+  s.store.state.pages['WL#demo'] = { page: { mode: 'template', title: 'x'.repeat(200) }, by: null, at: null };
+  s.store.state.pages.organization = { page: CUSTOM, by: 'sam', at: 1 };
+  const view = await waitingPage(s, 'get');
+  assert.deepEqual([view.own, view.terraform, view.by, view.at], [{ mode: 'template' }, true, null, null]);
+  assert.equal(view.effective.mode, 'template', 'the field that is bad is dropped, the document still decides the mode');
+  await assert.rejects(waitingPage(s, 'get', { workloadId: 'nope' }), { message: 'workload not configured: nope' });
+  await assert.rejects(waitingPage(s, 'frob'), { message: 'unknown waiting-page op: frob' });
+});
+
+test('waiting-page: a Terraform workload refuses a put; a delete is refused for an item Terraform wrote (no by) and allowed for one the manager wrote before (waiting page §11)', async () => {
+  const s = setup({ run: { state: STATES.AWAKE } });
+  await assert.rejects(waitingPage(s, 'put', { page: TEMPLATE }), { message: 'workload demo was written by Terraform: set waiting_page in its workload module' });
+  assert.deepEqual(s.store.state.pages, {});
+
+  s.store.state.pages['WL#demo'] = { page: TEMPLATE, by: null, at: null };
+  await assert.rejects(waitingPage(s, 'delete'), { message: 'workload demo was written by Terraform: set waiting_page in its workload module' });
+  assert.ok('WL#demo' in s.store.state.pages);
+
+  s.store.state.pages['WL#demo'] = { page: TEMPLATE, by: 'ana', at: 5 };
+  const view = await waitingPage(s, 'delete');
+  assert.equal(view.own, null);
+  assert.equal('WL#demo' in s.store.state.pages, false);
+
+  const manager = setup({ run: { state: STATES.AWAKE }, cfg: testConfig({ source: 'manager' }) });
+  manager.store.state.pages['WL#demo'] = { page: TEMPLATE, by: null, at: null };
+  await waitingPage(manager, 'delete');
+  assert.equal('WL#demo' in manager.store.state.pages, false);
+});
+
+test('a 256 KiB page and a recentWakes list reach neither the list, the status nor the check\'s summary (waiting page review focus 4)', async () => {
+  const s = setup({ run: { state: STATES.AWAKE, recentWakes: '[1000,2000]' }, cfg: testConfig({ source: 'manager' }) });
+  const html = `<!doctype html><p data-dormeto="status"></p><!--${'z'.repeat(256 * 1024 - 80)}-->`;
+  await waitingPage(s, 'put', { page: { mode: 'custom', html } });
+  await s.store.putFavicon('demo', { icon: `data:image/png;base64,${'A'.repeat(1000)}`, fetchedAt: 1, error: null });
+  for (const event of [{ action: 'list' }, { action: 'status', workloadId: 'demo' }, { action: 'check' }, { action: 'router' }]) {
+    const out = JSON.stringify(await s.handler(event));
+    assert.ok(!out.includes('zzzzzzzz') && !out.includes('AAAAAAAA'), event.action);
+    assert.ok(out.length < 20_000, `${event.action}: ${out.length}`);
+  }
+});

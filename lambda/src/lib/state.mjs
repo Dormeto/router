@@ -10,6 +10,14 @@ const itemKey = (workloadId, sk) => ({ pk: { S: `WL#${workloadId}` }, sk: { S: s
 const listKey = (name, sk) => ({ pk: { S: `LIST#${name}` }, sk: { S: sk } });
 // Pause of the router (workloadId null) or of a workload: PAUSE for an operator's pause, PAUSE#<id> for an exclusion's.
 const pauseKey = (workloadId, exclusionId) => ({ pk: { S: workloadId ? `WL#${workloadId}` : 'ROUTER' }, sk: { S: exclusionId ? `PAUSE#${exclusionId}` : 'PAUSE' } });
+// The waiting page's levels (branded waiting page design §5): 'organization' and 'router' are the router's own items, a
+// workload is { workloadId } (a workload may be named like a level).
+const pageKey = (level) => {
+  if (level === 'organization') return { pk: { S: 'ROUTER' }, sk: { S: 'ORGANIZATION-PAGE' } };
+  if (level === 'router') return { pk: { S: 'ROUTER' }, sk: { S: 'PAGE' } };
+  if (typeof level?.workloadId === 'string' && level.workloadId) return itemKey(level.workloadId, 'PAGE');
+  throw new TypeError(`unknown waiting page level: ${JSON.stringify(level)}`);
+};
 const pauseOf = (item) => ({ workloadId: item.pk.S === 'ROUTER' ? null : item.pk.S.slice(3), ...JSON.parse(item.pause.S) });
 
 export const DAY_MS = 86_400_000;
@@ -374,6 +382,51 @@ export function createStore({ dynamo, table, now = Date.now, log = null }) {
       await dynamo.updateItem({
         TableName: table, Key: { pk: { S: 'ROUTER' }, sk: { S: 'HEALTH' } },
         UpdateExpression: 'SET #health = :health', ExpressionAttributeNames: { '#health': 'health' }, ExpressionAttributeValues: { ':health': { S: JSON.stringify(health) } },
+      });
+    },
+
+    // The waiting page of a level (design §5): its own item, never a field of the configuration (that one is scanned at every
+    // check). { page, by, at }: by and at are absent for an item Terraform wrote; a document that cannot be parsed is page null.
+    // eventual: the waker's cache reads cheaper, a minute late at worst.
+    async getWaitingPage(level, { eventual = false } = {}) {
+      const { Item } = await dynamo.getItem({ TableName: table, Key: pageKey(level), ConsistentRead: !eventual });
+      if (!Item) return null;
+      let page = null;
+      try {
+        page = JSON.parse(Item.page?.S);
+      } catch {
+        // Read as none: the page then falls to the level above.
+      }
+      return { page, by: Item.by?.S ?? null, at: Item.at ? Number(Item.at.N) : null };
+    },
+    async putWaitingPage(level, page, { by, at }) {
+      await dynamo.updateItem({
+        TableName: table, Key: pageKey(level),
+        UpdateExpression: 'SET #page = :page, #by = :by, #at = :at',
+        ExpressionAttributeNames: { '#page': 'page', '#by': 'by', '#at': 'at' },
+        ExpressionAttributeValues: { ':page': { S: JSON.stringify(page) }, ':by': { S: String(by ?? '') }, ':at': { N: String(at) } },
+      });
+    },
+    // True when there was one.
+    async deleteWaitingPage(level) {
+      const { Attributes } = await dynamo.deleteItem({ TableName: table, Key: pageKey(level), ReturnValues: 'ALL_OLD' });
+      return Boolean(Attributes);
+    },
+
+    // The application's favicon, read while it was awake (design §6): { icon, fetchedAt, error }, icon a data URI or null.
+    async getFavicon(workloadId, { eventual = false } = {}) {
+      const { Item } = await dynamo.getItem({ TableName: table, Key: itemKey(workloadId, 'FAVICON'), ConsistentRead: !eventual });
+      try {
+        return Item?.favicon?.S ? JSON.parse(Item.favicon.S) : null;
+      } catch {
+        return null;
+      }
+    },
+    async putFavicon(workloadId, favicon) {
+      await dynamo.updateItem({
+        TableName: table, Key: itemKey(workloadId, 'FAVICON'),
+        UpdateExpression: 'SET #favicon = :favicon', ExpressionAttributeNames: { '#favicon': 'favicon' },
+        ExpressionAttributeValues: { ':favicon': { S: JSON.stringify(favicon) } },
       });
     },
 

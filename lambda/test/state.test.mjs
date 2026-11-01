@@ -449,3 +449,74 @@ test('router settings and the manager settings copy are ROUTER items; no hiberna
   assert.deepEqual(await store.getManagerSettings(), { hibernate: false, etag: null, readAt: 8, error: 'S3 SlowDown' });
   assert.ok(items.has('ROUTER/MANAGER-SETTINGS'));
 });
+
+// --- The waiting page's items (branded waiting page design §5, §6) ----------------------------------------------------
+
+test('the waiting page levels have their own items: WL#<id>/PAGE, ROUTER/PAGE and ROUTER/ORGANIZATION-PAGE, written with who and when', async () => {
+  const dynamo = fakeDynamo({ updateItem: async () => ({}) });
+  const store = createStore({ dynamo, table: 't' });
+  const page = { mode: 'template', title: 'Acme' };
+  await store.putWaitingPage({ workloadId: 'shop' }, page, { by: 'ana', at: 5 });
+  await store.putWaitingPage('router', page, { by: 'ana', at: 6 });
+  await store.putWaitingPage('organization', page, { by: 'ana', at: 7 });
+  assert.deepEqual(dynamo.calls.map(([, input]) => input.Key), [
+    { pk: { S: 'WL#shop' }, sk: { S: 'PAGE' } }, { pk: { S: 'ROUTER' }, sk: { S: 'PAGE' } }, { pk: { S: 'ROUTER' }, sk: { S: 'ORGANIZATION-PAGE' } },
+  ]);
+  const [, put] = dynamo.calls[0];
+  assert.deepEqual(JSON.parse(put.ExpressionAttributeValues[':page'].S), page);
+  assert.deepEqual([put.ExpressionAttributeValues[':by'], put.ExpressionAttributeValues[':at']], [{ S: 'ana' }, { N: '5' }]);
+  // A workload named like a level is still a workload.
+  await store.putWaitingPage({ workloadId: 'router' }, page, { by: 'ana', at: 8 });
+  assert.deepEqual(dynamo.calls[3][1].Key, { pk: { S: 'WL#router' }, sk: { S: 'PAGE' } });
+  await assert.rejects(store.putWaitingPage('demo', page, { by: 'ana', at: 9 }), TypeError);
+});
+
+test('getWaitingPage reads { page, by, at } (no by: written by Terraform), eventually consistent on request; a bad document reads as none', async () => {
+  const items = {
+    'WL#a/PAGE': { page: { S: '{"mode":"template","title":"A"}' }, by: { S: 'ana' }, at: { N: '5' } },
+    'WL#b/PAGE': { page: { S: '{"mode":"custom","html":"<p>x</p>"}' } },
+    'WL#c/PAGE': { page: { S: '{"mode":' } },
+  };
+  const dynamo = fakeDynamo({ getItem: async ({ Key }) => ({ Item: items[`${Key.pk.S}/${Key.sk.S}`] }) });
+  const store = createStore({ dynamo, table: 't' });
+  assert.deepEqual(await store.getWaitingPage({ workloadId: 'a' }), { page: { mode: 'template', title: 'A' }, by: 'ana', at: 5 });
+  assert.deepEqual(await store.getWaitingPage({ workloadId: 'b' }), { page: { mode: 'custom', html: '<p>x</p>' }, by: null, at: null });
+  assert.deepEqual(await store.getWaitingPage({ workloadId: 'c' }), { page: null, by: null, at: null });
+  assert.equal(await store.getWaitingPage({ workloadId: 'none' }), null);
+  assert.equal(dynamo.calls[0][1].ConsistentRead, true);
+  await store.getWaitingPage({ workloadId: 'a' }, { eventual: true });
+  assert.equal(dynamo.calls.at(-1)[1].ConsistentRead, false);
+});
+
+test('deleteWaitingPage tells whether there was one; the favicon item keeps { icon, fetchedAt, error } in WL#<id>/FAVICON', async () => {
+  let stored;
+  const dynamo = fakeDynamo({
+    deleteItem: async () => ({ Attributes: { pk: { S: 'x' } } }),
+    updateItem: async (input) => { stored = input; return {}; },
+    getItem: async () => ({ Item: { favicon: { S: stored.ExpressionAttributeValues[':favicon'].S } } }),
+  });
+  const store = createStore({ dynamo, table: 't' });
+  assert.equal(await store.deleteWaitingPage('router'), true);
+  assert.deepEqual(dynamo.calls[0][1].Key, { pk: { S: 'ROUTER' }, sk: { S: 'PAGE' } });
+  const favicon = { icon: 'data:image/png;base64,AA==', fetchedAt: 9, error: null };
+  await store.putFavicon('shop', favicon);
+  assert.deepEqual(stored.Key, { pk: { S: 'WL#shop' }, sk: { S: 'FAVICON' } });
+  assert.deepEqual(await store.getFavicon('shop'), favicon);
+  assert.equal(dynamo.calls.at(-1)[1].ConsistentRead, true);
+  await store.getFavicon('shop', { eventual: true });
+  assert.equal(dynamo.calls.at(-1)[1].ConsistentRead, false);
+});
+
+test('the check\'s scan reads configurations and schedules only: PAGE and FAVICON items (up to 256 KiB) are never listed, and offboarding removes them', async () => {
+  const dynamo = fakeDynamo({
+    scan: async () => ({ Items: [{ pk: { S: 'WL#a' }, sk: { S: 'CFG' }, config: { S: '{"workloadId":"a"}' } }] }),
+    query: async () => ({ Items: ['CFG', 'RUN', 'PAGE', 'FAVICON', 'STATS#2026-10-05'].map((sk) => ({ pk: { S: 'WL#shop' }, sk: { S: sk } })) }),
+    deleteItem: async () => ({}),
+  });
+  const store = createStore({ dynamo, table: 't' });
+  await store.listWorkloads();
+  assert.deepEqual(dynamo.calls[0][1].ExpressionAttributeValues, { ':cfg': { S: 'CFG' }, ':schedule': { S: 'SCHEDULE' } });
+  assert.equal(dynamo.calls[0][1].FilterExpression, '#sk IN (:cfg, :schedule)');
+  await store.deleteWorkload('shop');
+  assert.deepEqual(dynamo.calls.filter(([name]) => name === 'deleteItem').map(([, input]) => input.Key.sk.S), ['CFG', 'RUN', 'PAGE', 'FAVICON']);
+});

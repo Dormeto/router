@@ -39,7 +39,8 @@ export function fakeClock(start = 1_700_000_000_000) {
 }
 
 export function fakeStore({ config, run, clock }) {
-  const state = { run: structuredClone(run), stats: {}, lists: {}, pauses: [], schedules: {} };
+  const state = { run: structuredClone(run), stats: {}, lists: {}, pauses: [], schedules: {}, pages: {}, favicons: {} };
+  const pageKey = (level) => (typeof level === 'string' ? level : `WL#${level.workloadId}`);
   const samePause = (workloadId, exclusionId) => (p) => p.workloadId === workloadId && (p.exclusionId ?? null) === (exclusionId ?? null);
   const list = (name) => (state.lists[name] ??= { meta: null, parts: {} });
   const copy = () => structuredClone(state.run);
@@ -94,6 +95,11 @@ export function fakeStore({ config, run, clock }) {
     async putKubeProxies(item) { state.kubeProxies = structuredClone(item); },
     async getRouterSettings() { return structuredClone(state.routerSettings ?? null); },
     async putRouterSettings(item) { if (typeof item.hibernate === 'boolean') state.routerSettings = structuredClone(item); else delete state.routerSettings; },
+    async getWaitingPage(level) { return structuredClone(state.pages[pageKey(level)] ?? null); },
+    async putWaitingPage(level, page, { by, at }) { state.pages[pageKey(level)] = { page: structuredClone(page), by: by ?? null, at: at ?? null }; },
+    async deleteWaitingPage(level) { const had = pageKey(level) in state.pages; delete state.pages[pageKey(level)]; return had; },
+    async getFavicon(id) { return structuredClone(state.favicons[id] ?? null); },
+    async putFavicon(id, favicon) { state.favicons[id] = structuredClone(favicon); },
     async getManagerSettings() { return structuredClone(state.managerSettings ?? null); },
     async putManagerSettings(item) { state.managerSettings = structuredClone(item); },
     // Pauses: { workloadId (null for the router), by, at, reason, until?, keepAsleep, exclusionId? }.

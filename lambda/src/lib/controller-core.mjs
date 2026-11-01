@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { STATES } from './state.mjs';
 import { checkName } from './names.mjs';
 import { currentTarget, hostOf, setRoute } from './route.mjs';
@@ -20,6 +20,7 @@ import { STATS_DAYS, totals, workloadSummary } from './summary.mjs';
 import { lastRequestAt } from './metrics.mjs';
 import { checkScope } from './check-scope.mjs';
 import { healthOf, lambdaMetrics, queueDepths } from './health.mjs';
+import { cleanPage, pageWarnings, resolvePage, validatePage, withWake } from './page-settings.mjs';
 import { HIBERNATION_MAX_DAYS, hibernationDue, resolveHibernation, settingsProblems } from './hibernation.mjs';
 import {
   backendKey, backendStatuses, isCompanion, resolveBackends, resumeBackends, sleepBackends, startCompanions, stopCompanions, toRecord, wakeBackends,
@@ -149,12 +150,14 @@ export function createController({
       }
       if (!(await current())) return superseded();
       await routeTo(cfg, 'app');
+      const durationMs = now() - (run.wakeStartedAt ?? now());
       const done = await store.transition(workloadId, {
         cond: { state: STATES.WAKING, wakeId },
-        set: { state: STATES.AWAKE, awakeSince: now(), holders: 0, ...(Object.keys(fallbacks).length ? { instanceTypes: JSON.stringify(fallbacks) } : {}), ...(hibernatedTooLong(run) ? { freshBoot: true } : {}) },
+        // recentWakes (waiting page design §9): only a wake that ended here counts, for the progress bar's typical time.
+        set: { state: STATES.AWAKE, awakeSince: now(), holders: 0, recentWakes: withWake(run.recentWakes, durationMs), ...(Object.keys(fallbacks).length ? { instanceTypes: JSON.stringify(fallbacks) } : {}), ...(hibernatedTooLong(run) ? { freshBoot: true } : {}) },
         remove: ['pendingWake', 'napInstances', 'napBackends', 'failure', 'consecutiveFailures', 'hibernated'],
         // The wake's duration (R7a, the base of R8's wake times), and the instance types it fell back to.
-        event: { wakeId, durationMs: now() - (run.wakeStartedAt ?? now()), ...(Object.keys(fallbacks).length ? { fallbacks } : {}) },
+        event: { wakeId, durationMs, ...(Object.keys(fallbacks).length ? { fallbacks } : {}) },
       });
       if (!done) return superseded();
       log.info('WakeCompleted', { workloadId, wakeId });
@@ -805,6 +808,68 @@ export function createController({
     return { level: 'workload', settings: { hibernate }, hibernation: await hibernationView(next, await store.getRun(workloadId), instanceIds, levels) };
   }
 
+  // --- Waiting page (branded waiting page design §5, §11): one document per level, in its own item ----------------------
+
+  const pageLevel = (workloadId) => (workloadId ? { workloadId } : 'router');
+  const isoOrNull = (ms) => (typeof ms === 'number' && ms > 0 ? new Date(ms).toISOString() : null);
+
+  // What people read: the level's own document (what is valid of it), what it would inherit, the effective page and where
+  // each field comes from, the cached favicon, the warnings and who wrote it. Never throws on a bad stored value.
+  async function pageView(workloadId, cfg) {
+    const [organization, upper, favicon] = await Promise.all([
+      store.getWaitingPage('organization'), store.getWaitingPage('router'), workloadId ? store.getFavicon(workloadId) : null,
+    ]);
+    // The level read: the workload's, or the router's (its upper levels then are the organization's alone).
+    const own = workloadId ? await store.getWaitingPage({ workloadId }) : upper;
+    const inherited = workloadId ? resolvePage(organization?.page, upper?.page, null) : resolvePage(organization?.page, null, null);
+    const effective = workloadId ? resolvePage(organization?.page, upper?.page, own?.page) : resolvePage(organization?.page, own?.page, null);
+    return {
+      own: cleanPage(own?.page),
+      inherited,
+      effective,
+      from: effective.from,
+      favicon: favicon && { icon: favicon.icon ?? null, fetchedAt: isoOrNull(favicon.fetchedAt), error: favicon.error ?? null },
+      warnings: pageWarnings(own?.page),
+      terraform: Boolean(cfg && !cfg.source),
+      by: own?.by ?? null,
+      at: isoOrNull(own?.at),
+    };
+  }
+
+  // { action: 'waiting-page', op: 'get' | 'put' | 'delete', workloadId?, page?, by }: the router's level, or a workload's.
+  // A workload Terraform wrote refuses a put; it refuses a delete only of an item Terraform wrote (no by), so an item left
+  // from before the workload moved to Terraform can still be cleared. The log holds the size and hash of a page, never it.
+  async function waitingPage({ op, workloadId, page, by }) {
+    const cfg = workloadId ? await config(workloadId) : null;
+    const level = pageLevel(workloadId);
+    const terraformRefuses = () => new Error(`workload ${workloadId} was written by Terraform: set waiting_page in its workload module`);
+    switch (op) {
+      case 'get':
+        break;
+      case 'put': {
+        if (cfg && !cfg.source) throw terraformRefuses();
+        const problems = validatePage(page);
+        if (problems.length) return { problems };
+        await store.putWaitingPage(level, page, { by, at: now() });
+        const bytes = page.mode === 'custom' ? Buffer.byteLength(page.html) : undefined;
+        log.info('WaitingPageSet', { level: workloadId ? 'workload' : 'router', workloadId, mode: page.mode, bytes, sha256: createHash('sha256').update(JSON.stringify(page)).digest('hex'), by });
+        break;
+      }
+      case 'delete': {
+        if (cfg && !cfg.source) {
+          const stored = await store.getWaitingPage(level);
+          if (stored && !stored.by) throw terraformRefuses();
+        }
+        const cleared = await store.deleteWaitingPage(level);
+        log.info('WaitingPageCleared', { level: workloadId ? 'workload' : 'router', workloadId, cleared, by });
+        break;
+      }
+      default:
+        throw new Error(`unknown waiting-page op: ${op}`);
+    }
+    return pageView(workloadId, cfg);
+  }
+
   // --- Schedules (R12): stored beside the workload, applied by the check ---------------------------------------------
 
   // What people read: the schedule (its `at` as ISO; null when none), the next events and the maintenance wake, the
@@ -1393,6 +1458,7 @@ export function createController({
       case 'schedule': return setSchedule(event);
       case 'clear-schedule': return clearSchedule(event);
       case 'settings': return setSettings(event);
+      case 'waiting-page': return waitingPage(event);
       case 'router': return routerInfo();
       case 'clusterCheck': return clusterCheck(event);
       default: throw new Error(`unknown action: ${event?.action}`);

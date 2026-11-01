@@ -365,7 +365,9 @@ refuses becomes a stop, so it never fails a nap.
 **Waiting page (router 0.35.0):** the page a visitor sees while a workload wakes takes a template (icon, title, description) or
 the customer's own full HTML, at three levels, each overriding the one above: the workload, the router, the organization.
 Dormeto's own sentences are English or French by the visitor's `Accept-Language` (the answer says `vary: accept-language`),
-and a progress bar follows the workload's real wake times.
+and a progress bar follows the workload's real wake times. From router 0.36.0 the title and the description take Markdown:
+`**bold**`, `*italic*`, `` `code` ``, https links, and in the description also headings, lists, quotes and code blocks. Raw
+HTML shows as text.
 
 - **The document:** `{ "mode": "template", "icon": "auto", "title": "Acme portal", "description": "..." }` or
   `{ "mode": "custom", "html": "<!doctype html>..." }`. `icon` is `auto` (the application's favicon), `none`, or a

@@ -174,8 +174,15 @@ run "a_template_waiting_page_is_written_to_its_own_item_without_a_by" {
     error_message = "WL#<id> / PAGE"
   }
   assert {
-    condition     = jsondecode(jsondecode(aws_dynamodb_table_item.page[0].item).page.S) == { mode = "template", icon = "none", title = "Acme portal", description = "Our test environment sleeps at night.\nIt wakes on the first visit." }
-    error_message = "the document is the module's object"
+    condition = (
+      { for name, attribute in jsondecode(aws_dynamodb_table_item.page[0].item) : name => attribute.S if name != "pk" && name != "sk" } ==
+      { mode = "template", icon = "none", title = "Acme portal", description = "Our test environment sleeps at night.\nIt wakes on the first visit." }
+    )
+    error_message = "each field of the document is its own string attribute, null fields left out"
+  }
+  assert {
+    condition     = !contains(keys(jsondecode(aws_dynamodb_table_item.page[0].item)), "page")
+    error_message = "no nested JSON: the item holds the text at its real size"
   }
   assert {
     condition     = !contains(keys(jsondecode(aws_dynamodb_table_item.page[0].item)), "by") && !contains(keys(jsondecode(aws_dynamodb_table_item.page[0].item)), "at")
@@ -196,7 +203,7 @@ run "null_fields_are_dropped_and_a_custom_page_is_its_html" {
     }
   }
   assert {
-    condition     = jsondecode(jsondecode(aws_dynamodb_table_item.page[0].item).page.S) == { mode = "custom", html = "<!doctype html><p data-dormeto=\"status\"></p>" }
+    condition     = { for name, attribute in jsondecode(aws_dynamodb_table_item.page[0].item) : name => attribute.S if name != "pk" && name != "sk" } == { mode = "custom", html = "<!doctype html><p data-dormeto=\"status\"></p>" }
     error_message = "no null icon, title or description"
   }
 }
@@ -296,4 +303,53 @@ run "waiting_page_html_of_exactly_256_kib_is_accepted" {
   variables {
     waiting_page = { mode = "custom", html = join("", [for i in range(256) : format("%01024d", 0)]) }
   }
+}
+
+run "the_largest_page_is_stored_at_its_real_size_whatever_its_characters" {
+  command = apply
+  variables {
+    waiting_page = { mode = "custom", html = join("", [for i in range(256) : join("", [for j in range(102) : "<td>x</td>"])]) }
+  }
+  assert {
+    condition     = length(jsondecode(aws_dynamodb_table_item.page[0].item).html.S) == 261120
+    error_message = "the html is the attribute, not a JSON text of it"
+  }
+}
+
+run "waiting_page_html_of_exactly_256_kib_of_multi_byte_text_is_accepted" {
+  command = plan
+  variables {
+    waiting_page = { mode = "custom", html = join("", [for i in range(128) : join("", [for j in range(1024) : "é"])]) }
+  }
+}
+
+run "waiting_page_html_a_byte_over_256_kib_of_multi_byte_text_is_refused" {
+  command = plan
+  variables {
+    waiting_page = { mode = "custom", html = "${join("", [for i in range(128) : join("", [for j in range(1024) : "é"])])}x" }
+  }
+  expect_failures = [var.waiting_page]
+}
+
+run "waiting_page_icon_of_exactly_64_kib_is_accepted" {
+  command = plan
+  variables {
+    waiting_page = { mode = "template", icon = "data:image/png;base64,${format("%087380d", 0)}AA==" }
+  }
+}
+
+run "waiting_page_icon_a_byte_over_64_kib_is_refused" {
+  command = plan
+  variables {
+    waiting_page = { mode = "template", icon = "data:image/png;base64,${format("%087380d", 0)}AAA=" }
+  }
+  expect_failures = [var.waiting_page]
+}
+
+run "waiting_page_icon_that_is_not_canonical_base64_is_refused" {
+  command = plan
+  variables {
+    waiting_page = { mode = "template", icon = "data:image/png;base64,AAAAA" }
+  }
+  expect_failures = [var.waiting_page]
 }

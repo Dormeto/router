@@ -348,15 +348,19 @@ and a progress bar follows the workload's real wake times.
   dropped, a custom page with no valid `html` is no document, and the page still answers.
 - **Where each level lives:** the workload's in its own item `WL#<id> / PAGE` (written by the `workload` module's
   `waiting_page`, with no `by`, or by the manager), the router's at `ROUTER / PAGE` (the controller's `waiting-page`
-  action), the organization's in the `waitingPage` key of the manager's `settings.json`, which the check copies to
-  `ROUTER / ORGANIZATION-PAGE` apart from `hibernate` (a bad one never unreads the other). Never fields of the
-  configuration: the check scans it, and a page weighs up to 256 KiB. `deleteWorkload` removes the item and the favicon's.
+  action), the organization's in the `waitingPage` key of the manager's `settings.json`, which the waker and the controller
+  read directly with a conditional GET (cached 60 s; a failed read keeps the last value, none on a cold instance; no copy in
+  the table; their roles already read the catalog's prefix) apart from `hibernate`, which the check copies as before (a bad
+  one never unreads the other). Each field of a stored document (`mode`, `icon`, `title`, `description`, `html`) is its own
+  string attribute, so 256 KiB of HTML fits DynamoDB's item whatever its characters. Never fields of the configuration. A
+  Scan of the check still reads (and bills) these items before its filter drops them. `deleteWorkload` removes the items.
 - **Terraform:** `waiting_page = { mode = "template", icon = "data:image/png;base64,${filebase64("logo.png")}", title = "..." }`
   or `{ mode = "custom", html = file("waiting.html") }`; null writes nothing. The workload then refuses changes from the
-  manager (a delete too, of an item without `by`).
+  manager (a delete too, of an item without `by`). Moving a workload to `waiting_page` over a page the manager wrote may fail
+  at the first apply: clear the page in the manager first. HCL checks sizes in bytes and shapes; the router checks the rest.
 - **The favicon:** a nap reads the application's home page (`https://<first literal host of its rules>/`, certificates
   checked, `dormeto-router`, at most 3 redirects on the same host, 256 KiB), takes its `icon`, `shortcut icon` or
-  `apple-touch-icon` link, else `/favicon.ico`, and keeps it (at most 64 KiB, its type from its bytes) in `WL#<id> / FAVICON`.
+  `apple-touch-icon` link, else `/favicon.ico`, and keeps it (at most 32 KiB, its type from its bytes; only a rule that is all host, or the path `/*`, gives the host) in `WL#<id> / FAVICON`.
   It runs only when the page is a template with `icon: auto`, at most once in 24 hours whatever the outcome, inside a 3 s
   budget, after every check of the nap passed and just before the route switches; it never fails or changes the nap. An
   internal load balancer, a wildcard or host-less rule, an `http:`-only listener or a favicon behind a login gives no
@@ -367,7 +371,8 @@ and a progress bar follows the workload's real wake times.
   hooks (`status`, `elapsed`, `progress`) and the `dormeto:state` event; a template answer carries a content security policy,
   a custom one none.
 - **The waker reads these settings** only when it answers an HTML page, after the wake was triggered, cached 60 seconds per
-  warm instance (200 workloads at most); a read that fails keeps the last value and logs `WaitingPageUnread`.
+  warm instance (200 workloads at most), waiting 1 second for them at most; a read that fails or is late keeps the last value
+  (or none) and logs `WaitingPageUnread`.
 - **Access: nothing to apply again.**
 
 **Health** (`router` action, manager Routers view): the last scheduled idle check (late after three periods: an error,

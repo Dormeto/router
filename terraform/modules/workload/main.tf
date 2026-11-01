@@ -83,18 +83,18 @@ resource "aws_dynamodb_table_item" "config" {
 }
 
 # The workload's waiting page (router 0.35.0), its own item: the configuration is scanned at every check, a page can weigh
-# 256 KiB. No `by`: the router knows Terraform wrote it (it then refuses a change from the manager). Nothing is written, and
-# an item this created is removed, when waiting_page is null.
+# 256 KiB. Each field of the document is its own string attribute (mode, icon, title, description, html), never nested JSON, so
+# the item holds the text at its real size whatever its characters. No `by`: the router knows Terraform wrote it (it then
+# refuses a change from the manager). Nothing is written, and an item this created is removed, when waiting_page is null.
 resource "aws_dynamodb_table_item" "page" {
   count      = var.waiting_page == null ? 0 : 1
   table_name = var.router.table_name
   hash_key   = "pk"
   range_key  = "sk"
-  item = jsonencode({
-    pk   = { S = "WL#${var.workload_id}" }
-    sk   = { S = "PAGE" }
-    page = { S = jsonencode({ for name, value in var.waiting_page : name => value if value != null }) }
-  })
+  item = jsonencode(merge(
+    { pk = { S = "WL#${var.workload_id}" }, sk = { S = "PAGE" } },
+    { for name, value in var.waiting_page : name => { S = value } if value != null }
+  ))
 }
 
 # Initial runtime state only: the Lambdas own it afterwards.

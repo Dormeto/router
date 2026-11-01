@@ -1,5 +1,5 @@
 // Crawlers, monitors and internet scanners: they get the waiter page, never a wake.
-export const BOT_PATTERN = /bot|crawl|spider|slurp|monitor|uptime|pingdom|ELB-HealthChecker|scan|zgrab|censys|expanse|nmap|nuclei|leakix/i;
+export const BOT_PATTERN = /bot|crawl|spider|slurp|monitor|uptime|pingdom|ELB-HealthChecker|scan|zgrab|censys|expanse|nmap|nuclei|leakix|dormeto-router/i;
 // Paths requested by secret and vulnerability scanners (observed on the dev hostnames within minutes of a new
 // certificate): they must not wake a workload.
 export const SCANNER_PATH = new RegExp([

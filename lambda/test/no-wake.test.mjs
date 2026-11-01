@@ -77,6 +77,10 @@ test('classify: rules first (probes included), then the built-ins, with a reason
   assert.deepEqual(classify(albEvent(), rules), { kind: 'normal' });
 });
 
+test('classify: the favicon read\'s own user agent is a no-wake, so that its GET never wakes a workload that answers on the host', () => {
+  assert.deepEqual(classify(albEvent({ headers: { 'user-agent': 'dormeto-router' } })), { kind: 'no-wake', reason: 'bot user agent' });
+});
+
 test('describeRules lists the configured rules with their level and invalid reason', () => {
   const described = describeRules([
     { level: 'router', rules: [{ name: 'e2e', headers: [{ name: 'x-dormeto-e2e', value: 'no-wake', pattern: null }], sourceIps: [], pathPattern: null }] },

@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { hostOfRules, readFavicon } from '../src/lib/favicon.mjs';
+import { BOT_PATTERN } from '../src/lib/http.mjs';
 import { iconTypeOf } from '../src/lib/page-settings.mjs';
 
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
@@ -33,6 +34,12 @@ test('reads the page, takes its icon link, resolves it against the page and answ
   const out = await read({ ...page('<link rel="icon" href="/static/fav.png">'), [`https://${HOST}/static/fav.png`]: [200, { 'content-type': 'image/jpeg' }, PNG] });
   assert.deepEqual([out.icon, out.error, out.calls], [PNG_URI, null, [`https://${HOST}/`, `https://${HOST}/static/fav.png`]]);
   assert.equal(iconTypeOf(Buffer.from(out.icon.split(',')[1], 'base64')), 'png');
+});
+
+test('the user agent the reads send is one the waker takes for a bot (no-wake)', async () => {
+  const out = await read({ ...page('<link rel="icon" href="f.png">'), [`https://${HOST}/f.png`]: [200, {}, PNG] });
+  assert.ok(out.all.length >= 2);
+  for (const { options } of out.all) assert.match(options.headers['user-agent'], BOT_PATTERN);
 });
 
 test('the requests are plain: https, the router\'s user agent, no credentials, redirects handled here', async () => {

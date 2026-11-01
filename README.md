@@ -304,9 +304,9 @@ refuses becomes a stop, so it never fails a nap.
   written to the configuration only when set, so an apply never writes `false` by default) or at onboarding (setting
   `hibernate`), and afterwards from the manager for the workloads it onboarded (a Terraform workload's is refused:
   "set hibernate in its workload module"); the router's from the manager's Router view or
-  `dormeto routers settings <router> --hibernate true|false|inherit` (the controller's `settings` action, stored in the
+  `dormeto aws routers settings <router> --hibernate true|false|inherit` (the controller's `settings` action, stored in the
   state table at `ROUTER / SETTINGS` like a pause); the default for every router from the manager's Routers view or
-  `dormeto settings set --hibernate true|false`, published as `settings.json` beside the IP lists catalog
+  `dormeto aws settings set --hibernate true|false`, published as `settings.json` beside the IP lists catalog
   (`ip_lists_catalog`), which the routers already read. A router without `ip_lists_catalog` reads no manager settings
   and ignores the manager's default: set its router level instead.
 - **The routers' pickup:** each router's check reads `settings.json` with a conditional GET at most every 5 minutes and

@@ -152,8 +152,7 @@ test('template: a title makes the heading and the title, and the status moves to
   const html = renderPage({ ...waking, ...template({ title: 'Acme portal', description: 'Our test environment\nsleeps at night.' }) });
   assert.match(html, /<title>Acme portal<\/title>/);
   assert.match(html, /<h1>Acme portal<\/h1>\s*<p id="message" aria-live="polite" data-dormeto="status">Waking up the application…<\/p>/);
-  assert.match(html, /<p class="note">Our test environment\nsleeps at night\.<\/p>/);
-  assert.match(html, /\.note\{[^}]*white-space:pre-line/);
+  assert.match(html, /<div class="note"><p>Our test environment<br>sleeps at night\.<\/p><\/div>/);
   assert.doesNotMatch(html, /<h1 id="message"/);
   assert.match(html, /<html lang="en">/);
   const french = renderPage({ ...waking, language: 'fr', ...template({ title: 'Acme portal' }) });
@@ -165,7 +164,7 @@ test('template: without a title the status stays the heading and the built-in ti
   const html = renderPage({ ...waking, language: 'fr', ...template({ description: 'Bonjour' }) });
   assert.match(html, /<h1 id="message" aria-live="polite" data-dormeto="status">/);
   assert.match(html, /<title>Démarrage…<\/title>/);
-  assert.match(html, /<p class="note">Bonjour<\/p>/);
+  assert.match(html, /<div class="note"><p>Bonjour<\/p><\/div>/);
 });
 
 test('template: the icon replaces the dot, an empty-alt image bounded in size; the order is the spec\'s', () => {
@@ -185,7 +184,7 @@ test('template: nothing a customer wrote can run, in the page or in the script',
   }) });
   assert.match(html, /<h1>&lt;script&gt;alert\(&quot;t&quot;\)&lt;\/script&gt;<\/h1>/);
   assert.match(html, /<title>&lt;script&gt;/);
-  assert.match(html, /<p class="note">&quot;quoted&quot; &amp; &#39;single&#39; &lt;img src=x onerror=alert\(1\)&gt;<\/p>/);
+  assert.match(html, /<div class="note"><p>&quot;quoted&quot; &amp; &#39;single&#39; &lt;img src=x onerror=alert\(1\)&gt;<\/p><\/div>/);
   assert.doesNotMatch(html, /<script>alert|<img src=x/);
   assert.equal(html.match(/<script>/g).length, 1, 'only the page\'s own script');
   for (const bad of ['javascript:alert(1)', 'data:text/html;base64,PHNjcmlwdD4=', `${PNG}" onload="x`, 'data:image/gif;base64,AAAA', 'auto', 'none', 5, {}]) {
@@ -689,4 +688,67 @@ test('script: its own reference to fetch is taken at its start, so a page that r
   run.context.fetch = async () => { throw new Error('the customer\'s'); };
   await run.next();
   assert.equal(run.context.reloaded, true, 'the later probe used the script\'s own fetch and saw the workload awake');
+});
+
+// --- Markdown in a template's title and description ---------------------------------------------------------------------
+
+const withPage = (page) => renderPage({ state: 'WAKING', pollSeconds: 3, page: { mode: 'template', ...page } });
+const note = (description) => /<div class="note">([\s\S]*?)<\/div>\n/.exec(withPage({ description }))?.[1];
+
+test('a title takes inline Markdown in its heading, and its bare text in the tab', () => {
+  const html = withPage({ title: 'The **Acme** *portal* `v2` [status](https://acme.example/status)' });
+  assert.match(html, /<h1>The <strong>Acme<\/strong> <em>portal<\/em> <code>v2<\/code> <a href="https:\/\/acme\.example\/status" rel="noopener noreferrer" target="_blank">status<\/a><\/h1>/);
+  assert.match(html, /<title>The Acme portal v2 status<\/title>/);
+});
+
+test('a title is one heading: block Markdown stays text in it', () => {
+  const html = withPage({ title: '# Acme' });
+  assert.match(html, /<h1># Acme<\/h1>/);
+  assert.match(html, /<title># Acme<\/title>/);
+});
+
+test('a description takes paragraphs, line breaks, headings, lists, quotes, code and inline Markdown', () => {
+  assert.equal(note('One\nline two\n\nOther **bold**'), '<p>One<br>line two</p><p>Other <strong>bold</strong></p>');
+  assert.equal(note('## About\nText'), '<h2>About</h2><p>Text</p>');
+  assert.equal(note('### Small'), '<h3>Small</h3>');
+  assert.equal(note('- one\n- *two*\n\n1. first\n2. second'), '<ul><li>one</li><li><em>two</em></li></ul><ol><li>first</li><li>second</li></ol>');
+  assert.equal(note('> quoted\n> more'), '<blockquote><p>quoted<br>more</p></blockquote>');
+  assert.equal(note('```\nnpm  start\n```'), '<pre><code>npm  start</code></pre>');
+});
+
+test('a plain text without Markdown reads as it did: marks that close nothing stay', () => {
+  assert.equal(note('5 * 3 = 15, a [note] and `one tick'), '<p>5 * 3 = 15, a [note] and `one tick</p>');
+  assert.equal(note('**not closed'), '<p>**not closed</p>');
+  assert.equal(note('snake_case_name'), '<p>snake_case_name</p>');
+});
+
+test('Markdown makes no HTML from the text: everything is escaped, in every construct', () => {
+  for (const hostile of ['<script>alert(1)</script>', '<img src=x onerror=alert(1)>']) {
+    for (const wrap of [(x) => x, (x) => `**${x}**`, (x) => `*${x}*`, (x) => `\`${x}\``, (x) => `- ${x}`, (x) => `> ${x}`, (x) => `## ${x}`, (x) => `[${x}](https://a.example)`, (x) => `\`\`\`\n${x}\n\`\`\``]) {
+      const out = note(wrap(hostile));
+      assert.doesNotMatch(out, /<script|<img/, wrap(hostile));
+      assert.match(out, /&lt;(script|img)/, wrap(hostile));
+    }
+  }
+});
+
+test('a link goes only to an https address; its address cannot leave its attribute', () => {
+  for (const url of ['javascript:alert(1)', 'data:text/html,x', 'http://acme.example', '//acme.example', 'mailto:a@acme.example']) {
+    const out = note(`[x](${url})`);
+    assert.doesNotMatch(out, /<a /, url);
+    assert.ok(out.includes(`[x](${url})`), url);
+  }
+  const out = note('[x](https://a.example/"onmouseover="alert(1))');
+  assert.match(out, /href="https:\/\/a\.example\/&quot;onmouseover=&quot;alert\(1"/);
+  assert.doesNotMatch(out, /"onmouseover/);
+});
+
+test('quotes nest three deep at most; deeper marks stay text', () => {
+  assert.equal(note('> > > > deep'), '<blockquote><blockquote><blockquote><p>&gt; deep</p></blockquote></blockquote></blockquote>');
+});
+
+test('a long description of marks stays fast', () => {
+  const start = Date.now();
+  note(`${'*'.repeat(100000)} ${'['.repeat(100000)} ${'`'.repeat(100001)}`);
+  assert.ok(Date.now() - start < 1000);
 });

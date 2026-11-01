@@ -58,6 +58,135 @@ const escapeHtml = (value) => String(value).replace(/[&<>"']/g,
 // In a script element: no "<" can end it.
 const json = (value) => JSON.stringify(value).replace(/</g, '\\u003c');
 
+// --- Markdown of a template's title and description. The subset of the dashboard's markdown.ts: headings, paragraphs (a line
+// break inside one), bulleted and numbered lists, quotes, fenced code, `code`, **bold**, *italic* and links to https://
+// addresses. Every piece of the text goes through `text`, so nothing a customer wrote becomes HTML; a mark that closes nothing
+// stays text. A closer is looked for from the last place it was found, and once absent never again: one pass over the text.
+const HTML_MARKS = {
+  text: escapeHtml,
+  tag: (name, inner) => `<${name}>${inner}</${name}>`,
+  link: (url, label) => `<a href="${escapeHtml(url)}" rel="noopener noreferrer" target="_blank">${label}</a>`,
+};
+// For the tab's title: the words alone, escaped once by the caller.
+const BARE_MARKS = { text: (value) => value, tag: (name, inner) => inner, link: (url, label) => label };
+const MAX_URL = 2000;
+
+function finder(find) {
+  let at = -2;
+  let last = -1;
+  return (from) => {
+    if (at === -1) return -1;
+    if (at >= from && last <= from) return at;
+    at = find(from);
+    last = from;
+    return at;
+  };
+}
+
+function inlineOf(text, marks, nested = false) {
+  let out = '';
+  let plain = '';
+  const flush = () => { out += marks.text(plain); plain = ''; };
+  const tick = finder((from) => text.indexOf('`', from));
+  const strong = finder((from) => text.indexOf('**', from));
+  const star = finder((from) => {
+    for (let j = text.indexOf('*', from); j !== -1; j = text.indexOf('*', j + 1)) {
+      if (text[j - 1] !== ' ' && text[j + 1] !== '*' && text[j - 1] !== '*') return j;
+    }
+    return -1;
+  });
+  const bracket = finder((from) => text.indexOf(']', from));
+  const paren = finder((from) => text.indexOf(')', from));
+  const inner = (from, to) => (nested ? marks.text(text.slice(from, to)) : inlineOf(text.slice(from, to), marks, true));
+  for (let i = 0; i < text.length;) {
+    const c = text[i];
+    if (c === '`') {
+      const end = tick(i + 1);
+      if (end > i + 1) { flush(); out += marks.tag('code', marks.text(text.slice(i + 1, end))); i = end + 1; continue; }
+    } else if (c === '*' && text[i + 1] === '*') {
+      const end = strong(i + 3);
+      if (end > i + 2) { flush(); out += marks.tag('strong', inner(i + 2, end)); i = end + 2; continue; }
+    } else if (c === '*' && text[i + 1] !== ' ' && text[i + 1] !== '*' && text[i - 1] !== '*') {
+      const end = star(i + 2);
+      if (end > i + 1) { flush(); out += marks.tag('em', inner(i + 1, end)); i = end + 1; continue; }
+    } else if (c === '[') {
+      const close = bracket(i + 2);
+      if (close > i + 1 && text[close + 1] === '(') {
+        const end = paren(close + 2);
+        const url = end === -1 || end - close > MAX_URL ? '' : text.slice(close + 2, end);
+        if (url.startsWith('https://') && !/\s/.test(url)) {
+          flush();
+          out += marks.link(url, marks.text(text.slice(i + 1, close)));
+          i = end + 1;
+          continue;
+        }
+      }
+    }
+    plain += c;
+    i += 1;
+  }
+  flush();
+  return out;
+}
+
+const MAX_QUOTE_DEPTH = 3;
+const HEADING = /^(#{1,6})[ \t]+(\S.*)$/;
+const BULLET = /^[-*+][ \t]+(\S.*)$/;
+const NUMBER = /^\d{1,9}[.)][ \t]+(\S.*)$/;
+
+function blocksOf(text, depth = 0) {
+  let out = '';
+  let paragraph = [];
+  let items = [];
+  let ordered = false;
+  const inline = (line) => inlineOf(line, HTML_MARKS);
+  const flush = () => {
+    if (paragraph.length) out += `<p>${paragraph.map(inline).join('<br>')}</p>`;
+    if (items.length) out += `<${ordered ? 'ol' : 'ul'}>${items.map((item) => `<li>${inline(item)}</li>`).join('')}</${ordered ? 'ol' : 'ul'}>`;
+    paragraph = [];
+    items = [];
+  };
+  const lines = text.replace(/\r\n?/g, '\n').split('\n');
+  for (let n = 0; n < lines.length; n += 1) {
+    const line = lines[n];
+    const trimmed = line.trim();
+    if (trimmed.startsWith('```')) {
+      flush();
+      const code = [];
+      for (n += 1; n < lines.length && !lines[n].trim().startsWith('```'); n += 1) code.push(lines[n]);
+      out += `<pre><code>${escapeHtml(code.join('\n'))}</code></pre>`;
+      continue;
+    }
+    if (trimmed.startsWith('>') && depth < MAX_QUOTE_DEPTH) {
+      flush();
+      const quoted = [];
+      for (; n < lines.length && lines[n].trim().startsWith('>'); n += 1) quoted.push(lines[n].trim().slice(1).replace(/^ /, ''));
+      n -= 1;
+      out += `<blockquote>${blocksOf(quoted.join('\n'), depth + 1)}</blockquote>`;
+      continue;
+    }
+    const heading = HEADING.exec(trimmed);
+    const bullet = BULLET.exec(trimmed);
+    const number = bullet ? null : NUMBER.exec(trimmed);
+    if (!trimmed) flush();
+    else if (heading) {
+      flush();
+      const name = heading[1].length <= 2 ? 'h2' : 'h3';
+      out += `<${name}>${inline(heading[2])}</${name}>`;
+    } else if (bullet || number) {
+      if (paragraph.length || (items.length && ordered !== !bullet)) flush();
+      ordered = !bullet;
+      items.push((bullet ?? number)[1]);
+    } else if (items.length && /^\s/.test(line)) items[items.length - 1] += ` ${trimmed}`;
+    else {
+      if (items.length) flush();
+      paragraph.push(trimmed);
+    }
+  }
+  flush();
+  return out;
+}
+
 // The first supported primary subtag of an Accept-Language, by q; English when none or the header is no use.
 export function languageOf(acceptLanguage) {
   if (typeof acceptLanguage !== 'string') return 'en';
@@ -286,7 +415,7 @@ export function renderPage({ state, pollSeconds, failure, retryInMs, napUntil, p
     ? `<div class="track"><div class="bar" role="progressbar" data-dormeto="progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}" aria-labelledby="message" style="width:${pct}%"></div></div>\n`
     : '';
   const heading = title
-    ? `<h1>${escapeHtml(title)}</h1>\n<p id="message" aria-live="polite" data-dormeto="status">${escapeHtml(message)}</p>`
+    ? `<h1>${inlineOf(title, HTML_MARKS)}</h1>\n<p id="message" aria-live="polite" data-dormeto="status">${escapeHtml(message)}</p>`
     : `<h1 id="message" aria-live="polite" data-dormeto="status">${escapeHtml(message)}</h1>`;
   return `<!doctype html>
 <html lang="${lang}">
@@ -295,7 +424,7 @@ export function renderPage({ state, pollSeconds, failure, retryInMs, napUntil, p
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
 ${noscript}
-<title>${escapeHtml(title ?? t.title)}</title>
+<title>${escapeHtml(title ? inlineOf(title, BARE_MARKS) : t.title)}</title>
 <style>
 :root{color-scheme:light dark;--bg:#f7f7f8;--fg:#1d1d1f;--muted:#6b6b70;--accent:#5b5bd6;--track:rgba(0,0,0,.1)}
 @media (prefers-color-scheme:dark){:root{--bg:#141416;--fg:#ececf0;--muted:#9a9aa3;--accent:#8f8ff0;--track:rgba(255,255,255,.15)}}
@@ -304,7 +433,13 @@ main{max-width:28rem;padding:2rem 1rem;text-align:center}
 h1{font-size:1.25rem;font-weight:600}
 p{color:var(--muted)}
 [hidden]{display:none!important}
-.note{white-space:pre-line}
+a{color:var(--accent)}
+code{font:.9em ui-monospace,monospace}
+.note h2,.note h3{margin:.75rem 0 .25rem;font-size:1rem;font-weight:600;color:var(--fg)}
+.note p{margin:.5rem 0}
+.note ul,.note ol{display:inline-block;margin:.5rem 0;padding-left:1.25rem;color:var(--muted);text-align:left}
+.note blockquote{margin:.5rem 0;padding-left:.75rem;border-left:2px solid var(--track);text-align:left}
+.note pre{margin:.5rem 0;padding:.5rem .75rem;overflow:auto;border-radius:.25rem;background:var(--track);text-align:left}
 .icon{display:block;margin:0 auto;max-height:4rem;max-width:16rem}
 .dot{width:.75rem;height:.75rem;border-radius:50%;background:var(--accent);display:inline-block;animation:pulse 1.2s infinite ease-in-out}
 .track{height:.375rem;margin:1rem 0;border-radius:.1875rem;background:var(--track);overflow:hidden}
@@ -318,7 +453,7 @@ p{color:var(--muted)}
 <main>
 ${shown ? `<img class="icon" alt="" src="${escapeHtml(shown)}">` : '<span class="dot" aria-hidden="true"></span>'}
 ${heading}
-${description ? `<p class="note">${escapeHtml(description)}</p>\n` : ''}${bar}<p><span id="reload">${escapeHtml(longer ? t.longer : t.reload)}</span> <span id="elapsed" data-dormeto="elapsed">${waiting ? `${Math.round(elapsedMs / 1000)} s` : ''}</span></p>
+${description ? `<div class="note">${blocksOf(description)}</div>\n` : ''}${bar}<p><span id="reload">${escapeHtml(longer ? t.longer : t.reload)}</span> <span id="elapsed" data-dormeto="elapsed">${waiting ? `${Math.round(elapsedMs / 1000)} s` : ''}</span></p>
 </main>
 ${script}
 </body>

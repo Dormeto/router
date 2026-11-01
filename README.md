@@ -553,11 +553,11 @@ services; it takes the image with `--image`.
 
 ```bash
 # Build (podman, linux/amd64) dormeto-router:<version> from gcp/Containerfile
-./scripts/gcp-image.sh 0.35.0
+./scripts/gcp-image.sh 0.36.0
 # Run the controller's health locally: GET /v1/health -> {"version","project","region"}
-podman run --rm -p 8080:8080 -e DMT_ROLE=controller -e DMT_PROJECT=p -e DMT_REGION=europe-west1 -e DMT_DATABASE=d -e DMT_QUEUE=q dormeto-router:0.35.0
+podman run --rm -p 8080:8080 -e DMT_ROLE=controller -e DMT_PROJECT=p -e DMT_REGION=europe-west1 -e DMT_DATABASE=d -e DMT_QUEUE=q dormeto-router:0.36.0
 # Build and push to the dev Artifact Registry repository (the gcloud configuration dormeto-dev's own access)
-./scripts/gcp-image.sh 0.35.0 --push europe-west1-docker.pkg.dev/dormeto-dev/dormeto/router
+./scripts/gcp-image.sh 0.36.0 --push europe-west1-docker.pkg.dev/dormeto-dev/dormeto/router
 ```
 
 The dev repository `dormeto` is created once, by hand, in `dormeto-dev`. Creating it grants nothing of ours, but it can

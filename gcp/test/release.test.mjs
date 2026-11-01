@@ -8,8 +8,8 @@ const ROOT = new URL('../../', import.meta.url).pathname;
 const read = (path) => readFileSync(`${ROOT}${path}`, 'utf8');
 const PACKAGE = JSON.parse(read('package.json'));
 
-test('the router is 0.35.0 and needs the Node that has import.meta.main', () => {
-  assert.equal(PACKAGE.version, '0.35.0');
+test('the router is 0.36.0 and needs the Node that has import.meta.main', () => {
+  assert.equal(PACKAGE.version, '0.36.0');
   assert.equal(PACKAGE.engines.node, '>=24.2');
 });
 
@@ -30,21 +30,21 @@ test('the Containerfile builds the one image from a distroless Node 24 and carri
 const image = (...args) => spawnSync('bash', [`${ROOT}scripts/gcp-image.sh`, ...args], { encoding: 'utf8', env: { ...process.env, DMT_IMAGE_DRY_RUN: '1' } });
 
 test('gcp-image.sh builds linux/amd64 with podman and tags the version', () => {
-  const run = image('0.35.0');
+  const run = image('0.36.0');
   assert.equal(run.status, 0, run.stderr);
-  assert.match(run.stdout, /podman build --platform linux\/amd64 -f gcp\/Containerfile -t dormeto-router:0\.35\.0 \./);
+  assert.match(run.stdout, /podman build --platform linux\/amd64 -f gcp\/Containerfile -t dormeto-router:0\.36\.0 \./);
   assert.doesNotMatch(run.stdout, /push|login/);
 });
 
 test('gcp-image.sh --push logs in with the dormeto-dev token, tags and pushes the repository', () => {
-  const run = image('0.35.0', '--push', 'europe-west1-docker.pkg.dev/dormeto-dev/dormeto/router');
+  const run = image('0.36.0', '--push', 'europe-west1-docker.pkg.dev/dormeto-dev/dormeto/router');
   assert.equal(run.status, 0, run.stderr);
   assert.match(run.stdout, /gcloud --configuration dormeto-dev auth print-access-token \| podman login -u oauth2accesstoken --password-stdin europe-west1-docker\.pkg\.dev/);
-  assert.match(run.stdout, /podman push dormeto-router:0\.35\.0 docker:\/\/europe-west1-docker\.pkg\.dev\/dormeto-dev\/dormeto\/router:0\.35\.0/);
+  assert.match(run.stdout, /podman push dormeto-router:0\.36\.0 docker:\/\/europe-west1-docker\.pkg\.dev\/dormeto-dev\/dormeto\/router:0\.36\.0/);
 });
 
 test('gcp-image.sh refuses a missing or odd argument with exit 2', () => {
-  for (const args of [[], ['0.35.0', '--push'], ['0.35.0', '--other'], ['v1'], ['0.35.0', '--push', 'a', 'b']]) {
+  for (const args of [[], ['0.36.0', '--push'], ['0.36.0', '--other'], ['v1'], ['0.36.0', '--push', 'a', 'b']]) {
     const run = image(...args);
     assert.equal(run.status, 2, args.join(' '));
     assert.match(run.stderr, /usage: /);

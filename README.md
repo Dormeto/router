@@ -250,7 +250,7 @@ aws lambda invoke --function-name dmt-dev-controller --cli-binary-format raw-in-
 ```
 
 - **Fields:** `timeZone` is an IANA name (offsets such as `+01:00` are refused), stored in its canonical form, and required
-  with windows. At most 20 `windows`: `kind` `awake` or `nap`, `days` (a set of `mon` to `sun`, the day the window
+  with windows. At most 100 `windows` (20 before 0.36.0): `kind` `awake` or `nap`, `days` (a set of `mon` to `sun`, the day the window
   starts), `start` and `end` as `HH:MM` with minutes a multiple of 5. An `end` at or before the `start` ends the next day,
   and `start` equal to `end` lasts 24 hours. A nap window's `wake` is `never` (the default) or `header`. An awake and a
   nap window may not overlap anywhere in the week (refused, naming both); two windows of one kind may, and their union
@@ -281,9 +281,12 @@ aws lambda invoke --function-name dmt-dev-controller --cli-binary-format raw-in-
     matches (`0 8 31 2 *`) is refused. `cron(...)`, six fields, `L`, `W` and `#` are refused: EventBridge's weekday 1 is Sunday,
     so its expressions do not read the same here.
   - Exception dates, the wake modes and clock changes apply to these occurrences as to weekly ones.
-  - Overlaps: two plain weekly windows are compared over the week, as above. As soon as either has `from`, `until` or
-    `repeat`, the pair is compared day by day in wall time, over the next 400 local days from the later of today and their
-    `from` dates. An exception date has no occurrence to compare. The refusal gives the first date:
+  - A window's own `exceptions` (router 0.36.0), at most 100 local dates `YYYY-MM-DD`: that window does not start on them,
+    the others do. The schedule's `exceptions` skip every window. The dashboard moves one occurrence of a series this way: its
+    date on the series, and a window of that one date (`from` and `until` the same) at the new times.
+  - Overlaps: two plain weekly windows are compared over the week, as above. As soon as either has `from`, `until`, `repeat`
+    or dates of its own, the pair is compared day by day in wall time, over the next 400 local days from the later of today
+    and their `from` dates. An exception date, the schedule's or the window's, has no occurrence to compare. The refusal gives the first date:
     `windows[1]: the nap window overlaps the awake window windows[0] (2027-03-15 08:00–12:00)`. Beyond those 400 days an overlap
     is not refused, and the occurrence that started last applies.
 - **Joined windows (router 0.36.0):** two occurrences of one kind separated by a short gap count as one, so a workload is

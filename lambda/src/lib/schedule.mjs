@@ -1,7 +1,7 @@
 // Time-based behavior (R12 design, section 3): a workload's awake and nap windows in its time zone, exception dates and a
 // maximum nap. A window repeats on weekly days, or by a pattern or a cron expression within a range of dates (schedule
 // recurrence design). Pure: instants are epoch milliseconds passed in; local wall times come from Intl only.
-export const WINDOWS_MAX = 20;
+export const WINDOWS_MAX = 100;
 export const EXCEPTIONS_MAX = 100;
 export const NAP_DAYS_MAX = 60;
 // An idle nap, or a nap window's occurrence, is skipped when an awake window starts within this delay.
@@ -30,7 +30,7 @@ const WAKES = ['never', 'header'];
 // The fields of a schedule and of a window; `by` and `at` (who set it, when) are accepted and ignored, so a schedule
 // read back can be sent again as it is.
 const FIELDS = ['timeZone', 'windows', 'exceptions', 'maxNapDays', 'joinMinutes', 'by', 'at'];
-const WINDOW_FIELDS = ['kind', 'days', 'start', 'end', 'repeat', 'from', 'until', 'wake'];
+const WINDOW_FIELDS = ['kind', 'days', 'start', 'end', 'repeat', 'from', 'until', 'wake', 'exceptions'];
 // The fields of a repeat, by pattern.
 const REPEAT_FIELDS = {
   daily: ['pattern', 'interval'],
@@ -90,14 +90,15 @@ function canonicalZone(timeZone) {
   }
 }
 
-// The schedule as stored: its own fields only (no by or at, no null one, each exception date once), its time zone in
-// canonical form so the router and the dashboard read the same name. Validate first.
+// The schedule as stored: its own fields only (no by or at, no null one, each exception date once, a window's none when its
+// list is empty), its time zone in canonical form so the router and the dashboard read the same name. Validate first.
 export function normalizeSchedule(s) {
   if (!isObject(s)) return s;
   return defined({
     timeZone: canonicalZone(s.timeZone) ?? s.timeZone,
     windows: (s.windows ?? []).map((w) => defined({
       kind: w.kind, days: w.days, start: w.start, end: w.end, repeat: w.repeat && defined(w.repeat), from: w.from, until: w.until, wake: w.wake,
+      exceptions: w.exceptions?.length ? [...new Set(w.exceptions)] : undefined,
     })),
     exceptions: s.exceptions && [...new Set(s.exceptions)],
     maxNapDays: s.maxNapDays,
@@ -246,14 +247,14 @@ function cronMatches(cron, date) {
 }
 
 // A window ready for arithmetic: plain days are a weekly pattern, and an occurrence is a start minute and a length in wall
-// minutes, from `end` (up to 24 hours) or from a cron's `minutes`.
+// minutes, from `end` (up to 24 hours) or from a cron's `minutes`. `skips`: the window's own dates without it.
 function prepareWindow(w, window) {
   const repeat = w.repeat ?? { pattern: 'weekly', days: w.days };
   const cron = repeat.pattern === 'cron' ? parseCron(repeat.cron) : null;
   const start = minutesOf(w.start);
   const end = minutesOf(w.end);
   return {
-    window, kind: w.kind, from: dayOfDate(w.from), until: dayOfDate(w.until), pattern: repeat.pattern, interval: repeat.interval ?? 1,
+    window, kind: w.kind, from: dayOfDate(w.from), until: dayOfDate(w.until), skips: new Set(w.exceptions ?? []), pattern: repeat.pattern, interval: repeat.interval ?? 1,
     days: new Set(repeat.days), day: repeat.day, nth: repeat.nth, weekday: DAYS.indexOf(repeat.weekday), cron,
     starts: cron ? cron.starts ?? [] : [start],
     length: cron ? Number(repeat.minutes) || 0 : (end > start ? end - start : end - start + 1440),
@@ -297,9 +298,11 @@ function patternHas(w, day) {
 
 const NO_STARTS = [];
 
-// The start minutes of a window's occurrences on local day `day`: none outside its range or its pattern.
+// The start minutes of a window's occurrences on local day `day`: none outside its range or its pattern, or on a date of its own
+// without it.
 function startsOn(w, day) {
   if ((w.from !== null && day < w.from) || (w.until !== null && day > w.until)) return NO_STARTS;
+  if (w.skips.size && w.skips.has(dateOf(day))) return NO_STARTS;
   return patternHas(w, day) ? w.starts : NO_STARTS;
 }
 
@@ -535,6 +538,9 @@ function windowProblems(w, field) {
     if (w.kind === 'awake') problems.push(`${field}.wake: nap windows only`);
     else if (!WAKES.includes(w.wake)) problems.push(`${field}.wake: never or header`);
   }
+  if (!absent(w.exceptions) && !Array.isArray(w.exceptions)) problems.push(`${field}.exceptions: a list`);
+  else if (w.exceptions?.length > EXCEPTIONS_MAX) problems.push(`${field}.exceptions: at most ${EXCEPTIONS_MAX}`);
+  else (w.exceptions ?? []).forEach((d, i) => !isDate(d) && problems.push(`${field}.exceptions[${i}]: a date YYYY-MM-DD`));
   if (!absent(w.from) && !isDate(w.from)) problems.push(`${field}.from: a date YYYY-MM-DD`);
   if (!absent(w.until) && !isDate(w.until)) problems.push(`${field}.until: a date YYYY-MM-DD`);
   else if (!absent(w.until) && isDate(w.from) && w.until < w.from) problems.push(`${field}.until: not before from`);
@@ -572,7 +578,7 @@ function overlap(a, b) {
   return `${weekTime(from)}–${Math.floor(to / 1440) === Math.floor(from / 1440) ? weekTime(to).slice(4) : weekTime(to)}`;
 }
 
-const isWeekly = (w) => absent(w.from) && absent(w.until) && absent(w.repeat);
+const isWeekly = (w) => absent(w.from) && absent(w.until) && absent(w.repeat) && !w.exceptions?.length;
 const wallTime = (m) => `${dateOf(Math.floor(m / 1440))} ${pad(Math.floor(m / 60) % 24)}:${pad(m % 60)}`;
 
 // The first span where two prepared windows' occurrences overlap, in wall time, over the 400 days from the later of today
@@ -596,7 +602,7 @@ function firstOverlap(a, b, today, exceptions) {
 }
 
 // An awake window and a nap window may not overlap: anywhere in the week between two plain weekly windows, in the next 400
-// days as soon as either has a from, an until or a repeat. Two of the same kind may.
+// days as soon as either has a from, an until, a repeat or dates of its own without it. Two of the same kind may.
 function overlapProblems(windows, { timeZone, exceptions, now }) {
   const valid = windows.map((w, i) => ({ w, i })).filter(({ w }) => !windowProblems(w, '').length)
     .map(({ w, i }) => ({ w, i, prepared: prepareWindow(w, i) }));

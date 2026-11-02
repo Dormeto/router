@@ -57,7 +57,7 @@ const PROBLEMS = [
     'windows[0].constructor: unknown field'],
   ['windows without a time zone', { windows: [awake(['mon'], '08:00', '19:00')] }, 'timeZone: required with windows'],
   ['windows not a list', paris({}), 'windows: a list'],
-  ['21 windows', paris(Array.from({ length: 21 }, () => awake(['mon'], '08:00', '09:00'))), 'windows: at most 20'],
+  ['101 windows', paris(Array.from({ length: 101 }, () => awake(['mon'], '08:00', '09:00'))), 'windows: at most 100'],
   ['a window not an object', paris(['mon 08:00']), 'windows[0]: an object with kind, days, start and end'],
   ['an unknown kind', paris([{ ...awake(['mon'], '08:00', '09:00'), kind: 'idle' }]), 'windows[0].kind: awake or nap'],
   ['no days', paris([awake([], '08:00', '09:00')]), DAYS_PROBLEM],

@@ -42,6 +42,14 @@ test('settingsUrlOf: the catalog\'s prefix and settings.json', () => {
   assert.equal(settingsUrlOf('https://x/catalog.json'), null);
 });
 
+test('current() of a copy stored before endedWindowDays answers no such key: unknown, not unset', async () => {
+  const s = setup();
+  s.store.state.managerSettings = { hibernate: true, joinMinutes: 30, etag: '"e0"', readAt: s.clock.now(), error: null };
+  const current = await s.settings.current();
+  assert.equal('endedWindowDays' in current, false);
+  assert.equal(current.joinMinutes, 30);
+});
+
 test('the first refresh stores the value, its ETag and the time', async () => {
   const s = setup();
   s.s3.put('settings.json', { workloads: { hibernate: false } });

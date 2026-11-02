@@ -659,13 +659,15 @@ export function createController({
     }
   }
 
-  // The organization's days before an ended window leaves its schedule, the default without a manager; null when its settings
-  // were never read, or cannot be: then nothing leaves, an organization's 0 (keep) may be there.
+  // The organization's days before an ended window leaves its schedule, the default without a manager (no settings URL); null
+  // when its settings were never read, cannot be, or were read by a router before this field: then nothing leaves, an
+  // organization's 0 (keep) may be there.
   async function endedDaysOf() {
-    if (!managerSettings) return ENDED_DAYS_DEFAULT;
+    if (!managerSettings?.url) return ENDED_DAYS_DEFAULT;
     try {
       const current = await managerSettings.current();
-      return current && current.hibernate !== null ? current.endedWindowDays ?? ENDED_DAYS_DEFAULT : null;
+      if (!current || current.hibernate === null || current.endedWindowDays === undefined) return null;
+      return current.endedWindowDays ?? ENDED_DAYS_DEFAULT;
     } catch (err) {
       log.warn('EndedDaysUnreadable', { error: err.message });
       return null;

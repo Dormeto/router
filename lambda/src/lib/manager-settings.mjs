@@ -118,11 +118,16 @@ export function createManagerSettings({ s3, url, catalogUrl = null, store, now =
     url,
     refresh,
     // The last known values, from the table: { hibernate, joinMinutes, endedWindowDays, readAt, error }, hibernate null while
-    // every read failed; null without a settings URL or before any read.
+    // every read failed; null without a settings URL or before any read. A copy stored before endedWindowDays has no such key:
+    // not known yet, which removes nothing, where null (unset) is the default.
     async current() {
       if (!where) return null;
       const stored = await store.getManagerSettings();
-      return stored ? { hibernate: stored.hibernate, joinMinutes: stored.joinMinutes ?? null, endedWindowDays: stored.endedWindowDays ?? null, readAt: stored.readAt, error: stored.error } : null;
+      if (!stored) return null;
+      return {
+        hibernate: stored.hibernate, joinMinutes: stored.joinMinutes ?? null,
+        ...(stored.endedWindowDays === undefined ? {} : { endedWindowDays: stored.endedWindowDays }), readAt: stored.readAt, error: stored.error,
+      };
     },
   };
 }

@@ -627,6 +627,15 @@ test('the organization\'s days: 0 keeps them, 30 removes what ended 40 days ago;
   assert.deepEqual(unset.store.state.schedules.demo.windows, [OFFICE]);
 });
 
+test('a copy of the settings read before this release (without endedWindowDays) removes nothing; a router without a manager uses the year', async () => {
+  const older = setup({ run: { state: STATES.ASLEEP }, schedule: stored({ windows: [OFFICE, ENDED] }), managerSettings: { url: 's3://b/settings.json', refresh: async () => {}, current: async () => ({ hibernate: true, joinMinutes: null, readAt: 1, error: null }) } });
+  await older.checkAt('19T07:30');
+  assert.equal(older.store.state.schedules.demo.windows.length, 2);
+  const alone = setup({ run: { state: STATES.ASLEEP }, schedule: stored({ windows: [OFFICE, ENDED] }), managerSettings: { url: null, refresh: async () => {}, current: async () => null } });
+  await alone.checkAt('19T07:30');
+  assert.deepEqual(alone.store.state.schedules.demo.windows, [OFFICE]);
+});
+
 test('a schedule left with nothing is removed', async () => {
   const s = setup({ run: { state: STATES.ASLEEP }, schedule: stored({ windows: [ENDED] }) });
   await s.checkAt('19T07:30');

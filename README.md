@@ -303,9 +303,10 @@ aws lambda invoke --function-name dmt-dev-controller --cli-binary-format raw-in-
     `joinInherited` (`{ joinMinutes, joinFrom }`: what removing the workload's own would give).
   - The limit, as for touching windows: the second start is still a new occurrence, so a manager's Nap or Wake taken before it
     lasts until it.
-- **Ended windows leave (router 0.36.0):** the check removes a window whose `until` is more than a year before today in the
-  schedule's zone, and the dates without a window as old (the schedule's and each window's). A schedule left with no window and
-  no `maxNapDays` is removed.
+- **Ended windows leave (router 0.36.0):** the check removes a window that has no valid occurrence ending within the last year
+  and none to come. Valid: its pattern, its range, its own dates and the schedule's decide, so a range ending lately whose last
+  occurrence is older leaves, and a window without `until` never does. The dates without a window older than a year in the
+  schedule's zone leave too (the schedule's and each window's). A schedule left with no window and no `maxNapDays` is removed.
   - The delay is the organization's `workloads.endedWindowDays` in the manager's `settings.json`: 0 keeps them, else 30 to 3650
     days, 365 by default and without a manager. While the settings were never read, or cannot be, nothing is removed.
   - Only between occurrences, since an occurrence's id holds its window's index; and only over the schedule as the check read

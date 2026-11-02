@@ -625,14 +625,33 @@ function overlapProblems(windows, { timeZone, exceptions, now }) {
   return problems;
 }
 
-// The schedule without what ended more than `days` days before today in its zone (the user, 2026-11-02): a window whose `until`
-// is before then, and the dates without a window before then, the schedule's and each window's. 30 days at least: the longest
-// occurrence (a cron's 7 days) has ended. Null when nothing goes, or for 0 days; else { schedule, windows, dates }, what was
-// removed, the schedule null when nothing is left (no window, no maximum nap).
+// Whether a prepared window has a valid occurrence (its pattern, its range, its own dates and the schedule's) that ends after
+// `cutoff`: one to come counts, and so does one that ended since. A window without an end date always has one to come: a
+// pattern that never matches is refused when saved.
+function endsAfter(plan, w, cutoff) {
+  if (w.until === null) return true;
+  const first = localDay(cutoff, plan.timeZone) - lookbackOf(w);
+  for (let day = Math.max(first, w.from ?? first); day <= w.until; day++) {
+    if (plan.exceptions.has(dateOf(day))) continue;
+    for (const minutes of startsOn(w, day)) {
+      const end = instantOf(plan, day, minutes + w.length);
+      if (end > cutoff && end > instantOf(plan, day, minutes)) return true;
+    }
+  }
+  return false;
+}
+
+// The schedule without what has ended (the user, 2026-11-02: "expired windows are the ones having no valid occurrence since 1y
+// and none in the future"): a window none of whose valid occurrences ends within the last `days` days or later, and the dates
+// without a window older than `days` days in the schedule's zone, the schedule's and each window's. Null when nothing goes, or
+// for 0 days; else { schedule, windows, dates }, what was removed, the schedule null when nothing is left (no window, no
+// maximum nap).
 export function withoutEnded(s, t, days = ENDED_DAYS_DEFAULT) {
   const zone = isObject(s) && canonicalZone(s.timeZone);
   if (!days || !zone || !Array.isArray(s.windows)) return null;
   const before = dateOf(localDay(t, zone) - days);
+  const plan = s.windows.length ? prepare({ ...s, timeZone: zone }) : null;
+  const cutoff = t - days * DAY;
   const old = (date) => typeof date === 'string' && date < before;
   let dates = 0;
   const kept = (list) => {
@@ -640,7 +659,7 @@ export function withoutEnded(s, t, days = ENDED_DAYS_DEFAULT) {
     dates += list.length - left.length;
     return left;
   };
-  const windows = s.windows.filter((w) => !old(w?.until)).map((w) => {
+  const windows = s.windows.filter((w, i) => endsAfter(plan, plan.windows[i], cutoff)).map((w) => {
     if (!Array.isArray(w.exceptions)) return w;
     const { exceptions, ...rest } = w;
     const left = kept(exceptions);

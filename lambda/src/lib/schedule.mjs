@@ -9,6 +9,11 @@ export const CLOSE_START_MS = 30 * 60_000;
 // Two occurrences of one kind separated by this gap or less count as one (design, section 11).
 export const JOIN_DEFAULT_MINUTES = 15;
 export const JOIN_MINUTES_MAX = 120;
+// How long after its end a window stays in the schedule (the user, 2026-11-02): the organization's workloads.endedWindowDays,
+// 0 (kept) or 30 days to 10 years, a year by default.
+export const ENDED_DAYS_DEFAULT = 365;
+export const ENDED_DAYS_MIN = 30;
+export const ENDED_DAYS_MAX = 3650;
 
 const MINUTE = 60_000;
 const DAY = 86_400_000;
@@ -105,6 +110,8 @@ export function normalizeSchedule(s) {
     joinMinutes: s.joinMinutes,
   });
 }
+
+export const isEndedDays = (value) => Number.isInteger(value) && (value === 0 || (value >= ENDED_DAYS_MIN && value <= ENDED_DAYS_MAX));
 
 export const isJoinMinutes = (value) => Number.isInteger(value) && value >= 0 && value <= JOIN_MINUTES_MAX && value % 5 === 0;
 
@@ -616,6 +623,35 @@ function overlapProblems(windows, { timeZone, exceptions, now }) {
     }
   }
   return problems;
+}
+
+// The schedule without what ended more than `days` days before today in its zone (the user, 2026-11-02): a window whose `until`
+// is before then, and the dates without a window before then, the schedule's and each window's. 30 days at least: the longest
+// occurrence (a cron's 7 days) has ended. Null when nothing goes, or for 0 days; else { schedule, windows, dates }, what was
+// removed, the schedule null when nothing is left (no window, no maximum nap).
+export function withoutEnded(s, t, days = ENDED_DAYS_DEFAULT) {
+  const zone = isObject(s) && canonicalZone(s.timeZone);
+  if (!days || !zone || !Array.isArray(s.windows)) return null;
+  const before = dateOf(localDay(t, zone) - days);
+  const old = (date) => typeof date === 'string' && date < before;
+  let dates = 0;
+  const kept = (list) => {
+    const left = list.filter((date) => !old(date));
+    dates += list.length - left.length;
+    return left;
+  };
+  const windows = s.windows.filter((w) => !old(w?.until)).map((w) => {
+    if (!Array.isArray(w.exceptions)) return w;
+    const { exceptions, ...rest } = w;
+    const left = kept(exceptions);
+    return left.length ? { ...rest, exceptions: left } : rest;
+  });
+  const exceptions = Array.isArray(s.exceptions) ? kept(s.exceptions) : s.exceptions;
+  const removed = s.windows.length - windows.length;
+  if (!removed && !dates) return null;
+  if (!windows.length && absent(s.maxNapDays)) return { schedule: null, windows: removed, dates };
+  const { exceptions: _, ...rest } = s;
+  return { schedule: { ...rest, windows, ...(exceptions?.length ? { exceptions } : {}) }, windows: removed, dates };
 }
 
 // Why the schedule is refused, each problem naming its field; empty when it is valid. `now` is where the overlap check of

@@ -382,6 +382,28 @@ test('store schedules: written beside the workload, read, deleted (true only whe
   assert.equal(await none.getSchedule('demo'), null);
 });
 
+test('store schedules: replaced or removed only when still as read, a save since kept', async () => {
+  const calls = [];
+  let changed = false;
+  const failing = async (input) => {
+    calls.push(input);
+    if (changed) throw Object.assign(new Error('changed'), { name: 'ConditionalCheckFailedException' });
+    return {};
+  };
+  const store = createStore({ dynamo: fakeDynamo({ updateItem: failing, deleteItem: failing }), table: 't' });
+  const from = { timeZone: 'UTC', windows: [], maxNapDays: 7, by: 'me', at: 5 };
+  assert.equal(await store.replaceSchedule('demo', from, { ...from, maxNapDays: 8 }), true);
+  assert.equal(calls[0].ConditionExpression, '#schedule = :from');
+  assert.deepEqual(calls[0].ExpressionAttributeValues, { ':from': { S: JSON.stringify(from) }, ':next': { S: JSON.stringify({ ...from, maxNapDays: 8 }) } });
+  assert.equal(await store.replaceSchedule('demo', from, null), true);
+  assert.deepEqual(calls[1].Key, { pk: { S: 'WL#demo' }, sk: { S: 'SCHEDULE' } });
+  assert.equal(calls[1].ConditionExpression, '#schedule = :from');
+  changed = true;
+  assert.equal(await store.replaceSchedule('demo', from, null), false);
+  const broken = createStore({ dynamo: fakeDynamo({ updateItem: async () => { throw new Error('throttled'); } }), table: 't' });
+  await assert.rejects(broken.replaceSchedule('demo', from, from), /throttled/);
+});
+
 test('one scan lists the configurations and the schedules; listConfigs keeps answering the configurations only', async () => {
   const items = [
     { pk: { S: 'WL#a' }, sk: { S: 'CFG' }, config: { S: '{"workloadId":"a"}' } },

@@ -68,7 +68,7 @@ export function createManagerSettings({ s3, url, catalogUrl = null, store, now =
   const where = parseUrl(url);
   const catalog = parseUrl(catalogUrl);
   // Nothing read yet: the level is unknown (null), never the built-in true, until a read succeeds (naps stop plainly).
-  const initial = { hibernate: null, joinMinutes: null, etag: null, readAt: null, error: null };
+  const initial = { hibernate: null, joinMinutes: null, endedWindowDays: null, etag: null, readAt: null, error: null };
 
   const catalogReads = async () => {
     if (!catalog) return false;
@@ -90,8 +90,9 @@ export function createManagerSettings({ s3, url, catalogUrl = null, store, now =
     const at = now();
     let next;
     try {
-      // A copy from before joinMinutes is read in full: its ETag would answer 304 and hide a value already in the file.
-      const out = await s3.getObjectIf({ bucket: where.bucket, key: where.key, etag: last.joinMinutes === undefined ? null : last.etag });
+      // A copy from before joinMinutes or endedWindowDays is read in full: its ETag would answer 304 and hide a value already in the file.
+      const older = last.joinMinutes === undefined || last.endedWindowDays === undefined;
+      const out = await s3.getObjectIf({ bucket: where.bucket, key: where.key, etag: older ? null : last.etag });
       if (out.notModified) next = { ...last, readAt: at, error: null };
       else {
         try {
@@ -104,7 +105,7 @@ export function createManagerSettings({ s3, url, catalogUrl = null, store, now =
       // Without s3:ListBucket (the routers' roles have none), a missing object answers AccessDenied: never set, but only
       // in a bucket whose catalog the router reads (as lib/catalog.mjs).
       const neverSet = err.name === 'NoSuchKey' || (err.name === 'AccessDenied' && await catalogReads());
-      if (neverSet) next = { hibernate: true, joinMinutes: null, etag: null, readAt: at, error: null };
+      if (neverSet) next = { hibernate: true, joinMinutes: null, endedWindowDays: null, etag: null, readAt: at, error: null };
       else {
         next = { ...last, readAt: at, error: `S3 ${err.name}` };
         log.warn('ManagerSettingsUnreadable', { url, error: next.error });
@@ -116,12 +117,12 @@ export function createManagerSettings({ s3, url, catalogUrl = null, store, now =
   return {
     url,
     refresh,
-    // The last known values, from the table: { hibernate, joinMinutes, readAt, error }, hibernate null while every read failed; null
-    // without a settings URL or before any read.
+    // The last known values, from the table: { hibernate, joinMinutes, endedWindowDays, readAt, error }, hibernate null while
+    // every read failed; null without a settings URL or before any read.
     async current() {
       if (!where) return null;
       const stored = await store.getManagerSettings();
-      return stored ? { hibernate: stored.hibernate, joinMinutes: stored.joinMinutes ?? null, readAt: stored.readAt, error: stored.error } : null;
+      return stored ? { hibernate: stored.hibernate, joinMinutes: stored.joinMinutes ?? null, endedWindowDays: stored.endedWindowDays ?? null, readAt: stored.readAt, error: stored.error } : null;
     },
   };
 }

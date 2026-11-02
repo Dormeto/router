@@ -189,6 +189,26 @@ export function createStore({ dynamo, table, now = Date.now, log = null }) {
       });
     },
 
+    // The schedule replaced by `next` (null removes it) only when it is still `from`, as read: a save since is kept. True
+    // when written. The stored text is JSON.stringify of what was read, so the two compare as text.
+    async replaceSchedule(workloadId, from, next) {
+      const cond = { ConditionExpression: '#schedule = :from', ExpressionAttributeNames: { '#schedule': 'schedule' }, ExpressionAttributeValues: { ':from': { S: JSON.stringify(from) } } };
+      try {
+        if (next) {
+          await dynamo.updateItem({
+            TableName: table, Key: itemKey(workloadId, 'SCHEDULE'), UpdateExpression: 'SET #schedule = :next', ...cond,
+            ExpressionAttributeValues: { ...cond.ExpressionAttributeValues, ':next': { S: JSON.stringify(next) } },
+          });
+        } else {
+          await dynamo.deleteItem({ TableName: table, Key: itemKey(workloadId, 'SCHEDULE'), ...cond });
+        }
+        return true;
+      } catch (err) {
+        if (err?.name === 'ConditionalCheckFailedException') return false;
+        throw err;
+      }
+    },
+
     // True when there was one.
     async deleteSchedule(workloadId) {
       const { Attributes } = await dynamo.deleteItem({ TableName: table, Key: itemKey(workloadId, 'SCHEDULE'), ReturnValues: 'ALL_OLD' });

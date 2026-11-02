@@ -72,19 +72,19 @@ test('settingsProblems accepts only hibernate as true, false or null and joinMin
 
 test('parseManagerSettings reads workloads.hibernate and workloads.joinMinutes and ignores the rest', () => {
   for (const [text, expected] of [
-    ['{}', { hibernate: true, joinMinutes: null }],
-    ['{"workloads":{}}', { hibernate: true, joinMinutes: null }],
-    ['{"workloads":{"hibernate":true}}', { hibernate: true, joinMinutes: null }],
-    ['{"workloads":{"hibernate":false},"x":1}', { hibernate: false, joinMinutes: null }],
-    ['{"workloads":{"hibernate":false,"y":2}}', { hibernate: false, joinMinutes: null }],
-    ['{"workloads":{"joinMinutes":30}}', { hibernate: true, joinMinutes: 30 }],
-    ['{"workloads":{"joinMinutes":0,"hibernate":false}}', { hibernate: false, joinMinutes: 0 }],
+    ['{}', { hibernate: true, joinMinutes: null, endedWindowDays: null }],
+    ['{"workloads":{}}', { hibernate: true, joinMinutes: null, endedWindowDays: null }],
+    ['{"workloads":{"hibernate":true}}', { hibernate: true, joinMinutes: null, endedWindowDays: null }],
+    ['{"workloads":{"hibernate":false},"x":1}', { hibernate: false, joinMinutes: null, endedWindowDays: null }],
+    ['{"workloads":{"hibernate":false,"y":2}}', { hibernate: false, joinMinutes: null, endedWindowDays: null }],
+    ['{"workloads":{"joinMinutes":30}}', { hibernate: true, joinMinutes: 30, endedWindowDays: null }],
+    ['{"workloads":{"joinMinutes":0,"hibernate":false}}', { hibernate: false, joinMinutes: 0, endedWindowDays: null }],
   ]) assert.deepEqual(parseManagerSettings(text), expected, text);
 });
 
 test('parseManagerSettings: an invalid joinMinutes is unset, and hibernate stays', () => {
   for (const joinMinutes of ['"15"', '7', '125', '-5', '1.5', 'null', 'true', '[]']) {
-    assert.deepEqual(parseManagerSettings(`{"workloads":{"hibernate":false,"joinMinutes":${joinMinutes}}}`), { hibernate: false, joinMinutes: null }, joinMinutes);
+    assert.deepEqual(parseManagerSettings(`{"workloads":{"hibernate":false,"joinMinutes":${joinMinutes}}}`), { hibernate: false, joinMinutes: null, endedWindowDays: null }, joinMinutes);
   }
 });
 

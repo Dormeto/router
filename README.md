@@ -303,6 +303,14 @@ aws lambda invoke --function-name dmt-dev-controller --cli-binary-format raw-in-
     `joinInherited` (`{ joinMinutes, joinFrom }`: what removing the workload's own would give).
   - The limit, as for touching windows: the second start is still a new occurrence, so a manager's Nap or Wake taken before it
     lasts until it.
+- **Ended windows leave (router 0.36.0):** the check removes a window whose `until` is more than a year before today in the
+  schedule's zone, and the dates without a window as old (the schedule's and each window's). A schedule left with no window and
+  no `maxNapDays` is removed.
+  - The delay is the organization's `workloads.endedWindowDays` in the manager's `settings.json`: 0 keeps them, else 30 to 3650
+    days, 365 by default and without a manager. While the settings were never read, or cannot be, nothing is removed.
+  - Only between occurrences, since an occurrence's id holds its window's index; and only over the schedule as the check read
+    it (a conditional write), so a save since is kept. Logged `EndedWindowsRemoved` with the counts. Who set the schedule
+    and when stay as they were. Not on Google Cloud yet.
 - **The check applies it** on the clock's 5-minute marks: the `check_schedule` of the `router` module is
   `cron(0/5 * * * ? *)` (not `rate(5 minutes)`), so 08:45 is met at the 08:45 check, within its latency. Each occurrence
   of a window is applied once (the run item records the last one, `scheduleApplied`), so a missed check or a deploy

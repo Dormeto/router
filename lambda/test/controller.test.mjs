@@ -1942,7 +1942,7 @@ test('nap: a router that reads the manager\'s settings stops plainly until a rea
   assert.deepEqual(await napAgain(s), [[[id], false]]);
   // A first read that fails: the level stays unknown, stored as such, and the naps stop plainly.
   await s.settings.refresh();
-  assert.deepEqual(s.store.state.managerSettings, { hibernate: null, joinMinutes: null, etag: null, readAt: s.clock.now(), error: 'S3 SlowDown' });
+  assert.deepEqual(s.store.state.managerSettings, { hibernate: null, joinMinutes: null, endedWindowDays: null, etag: null, readAt: s.clock.now(), error: 'S3 SlowDown' });
   assert.deepEqual(await napAgain(s), [[[id], false]]);
   assert.deepEqual(warnings.filter((w) => w.event === 'HibernationLevelUnreadable').map((w) => [w.workloadId, w.error]),
     [['demo', 'manager settings not read yet'], ['demo', 'manager settings not read yet: S3 SlowDown']]);
@@ -2078,7 +2078,7 @@ test('settings of a workload: joinMinutes is on its schedule, refused here (join
 });
 
 test('schedule and status answer the value in force, its level, and what removing the workload\'s would give (joined windows)', async () => {
-  const s = setup({ run: { state: STATES.AWAKE }, managerSettings: { url: 's3://b/settings.json', refresh: async () => {}, current: async () => ({ hibernate: true, joinMinutes: 45, readAt: 1, error: null }) } });
+  const s = setup({ run: { state: STATES.AWAKE }, managerSettings: { url: 's3://b/settings.json', refresh: async () => {}, current: async () => ({ hibernate: true, joinMinutes: 45, endedWindowDays: null, readAt: 1, error: null }) } });
   const none = await s.handler({ action: 'status', workloadId: 'demo' });
   assert.equal(none.schedule, null);
   assert.deepEqual([none.joinMinutes, none.joinFrom, none.joinInherited], [45, 'organization', { joinMinutes: 45, joinFrom: 'organization' }]);
@@ -2102,7 +2102,7 @@ test('schedule and status answer the value in force, its level, and what removin
 });
 
 test('schedule: a level that cannot be read falls through and is logged, never failing the answer (joined windows)', async () => {
-  const s = setup({ run: { state: STATES.AWAKE }, managerSettings: { url: 's3://b/settings.json', refresh: async () => {}, current: async () => ({ hibernate: true, joinMinutes: 30, readAt: 1, error: null }) } });
+  const s = setup({ run: { state: STATES.AWAKE }, managerSettings: { url: 's3://b/settings.json', refresh: async () => {}, current: async () => ({ hibernate: true, joinMinutes: 30, endedWindowDays: null, readAt: 1, error: null }) } });
   const warnings = [];
   s.log.warn = (event, fields) => warnings.push({ event, ...fields });
   s.store.getRouterSettings = async () => { throw new Error('ThrottlingException'); };

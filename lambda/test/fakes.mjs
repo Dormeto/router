@@ -65,6 +65,12 @@ export function fakeStore({ config, run, clock }) {
     async getSchedule(id) { return structuredClone(state.schedules[id] ?? null); },
     async putSchedule(id, schedule) { state.schedules[id] = structuredClone(schedule); },
     async deleteSchedule(id) { const had = id in state.schedules; delete state.schedules[id]; return had; },
+    async replaceSchedule(id, from, next) {
+      if (JSON.stringify(state.schedules[id] ?? null) !== JSON.stringify(from)) return false;
+      if (next) state.schedules[id] = structuredClone(next);
+      else delete state.schedules[id];
+      return true;
+    },
     async getRun(id) { return id === config.workloadId ? copy() : null; },
     async transition(id, { cond, set = {}, remove = [], increment = [] }) {
       if (id !== config.workloadId || !matches(state.run, cond)) return null;

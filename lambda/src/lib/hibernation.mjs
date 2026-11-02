@@ -1,5 +1,5 @@
 // Whether a nap hibernates EC2 instances (hibernation design): the first level that is set decides. Pure.
-import { isJoinMinutes, JOIN_MINUTES_MAX } from './schedule.mjs';
+import { isEndedDays, isJoinMinutes, JOIN_MINUTES_MAX } from './schedule.mjs';
 
 // The longest an instance may stay hibernated: the maintenance wake comes before AWS's 60-day limit.
 export const HIBERNATION_MAX_DAYS = 59;
@@ -45,16 +45,18 @@ export function settingsProblems(settings) {
   return problems;
 }
 
-// The manager's settings.json: `workloads.hibernate`, true when absent; `workloads.joinMinutes`, null when absent or
-// invalid (it has no safety side, so it never loses hibernate); other keys belong to the manager.
+// The manager's settings.json: `workloads.hibernate`, true when absent; `workloads.joinMinutes` and
+// `workloads.endedWindowDays`, null when absent or invalid (they have no safety side, so they never lose hibernate); other keys
+// belong to the manager.
 export function parseManagerSettings(text) {
   const doc = JSON.parse(text);
   if (!isObject(doc)) throw new Error('settings.json must be an object');
-  if (!('workloads' in doc)) return { hibernate: true, joinMinutes: null };
+  if (!('workloads' in doc)) return { hibernate: true, joinMinutes: null, endedWindowDays: null };
   if (!isObject(doc.workloads)) throw new Error('settings.json: workloads must be an object');
   const { hibernate } = doc.workloads;
   const joinMinutes = isJoinMinutes(doc.workloads.joinMinutes) ? doc.workloads.joinMinutes : null;
-  if (hibernate === undefined) return { hibernate: true, joinMinutes };
+  const endedWindowDays = isEndedDays(doc.workloads.endedWindowDays) ? doc.workloads.endedWindowDays : null;
+  if (hibernate === undefined) return { hibernate: true, joinMinutes, endedWindowDays };
   if (!isBoolean(hibernate)) throw new Error('settings.json: workloads.hibernate must be true or false');
-  return { hibernate, joinMinutes };
+  return { hibernate, joinMinutes, endedWindowDays };
 }

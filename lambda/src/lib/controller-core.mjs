@@ -16,7 +16,7 @@ import { createWakeWatch, unhealthyError } from './wake-watch.mjs';
 import { describeStopped } from './stopped.mjs';
 import { revertInstanceTypes } from './capacity.mjs';
 import { tagsProblem } from './tags.mjs';
-import { awakeStartWithin, CLOSE_START_MS, maintenanceDue, nextEvents, normalizeSchedule, occurrenceAt, resolveJoin, scheduleProblems } from './schedule.mjs';
+import { awakeStartWithin, CLOSE_START_MS, ENDED_DAYS_DEFAULT, maintenanceDue, nextEvents, normalizeSchedule, occurrenceAt, resolveJoin, scheduleProblems, withoutEnded } from './schedule.mjs';
 import { STATS_DAYS, totals, workloadSummary } from './summary.mjs';
 import { lastRequestAt } from './metrics.mjs';
 import { checkScope } from './check-scope.mjs';
@@ -608,7 +608,7 @@ export function createController({
   // meets the times: 8 at a time, one run read each, no AWS call but the wakes and naps it asks for. holdOf(workloadId):
   // { paused, keepAsleep }. Answers each workload's outcome (what it did, or what held it) and the schedules the router
   // can read: one it cannot (a time zone Intl refuses) is logged and the workload behaves as if it had none.
-  async function applySchedules(configs, schedules, holdOf, t, joins) {
+  async function applySchedules(configs, schedules, holdOf, t, joins, endedDays = null) {
     const due = [];
     const readable = new Map();
     for (const { workloadId } of configs) {
@@ -639,7 +639,37 @@ export function createController({
         }
       }
     }));
+    if (endedDays) await removeEnded(due, t, endedDays);
     return { applied, readable };
+  }
+
+  // Windows that ended more than `endedDays` days ago leave their schedule (the user, 2026-11-02), and so do the dates without
+  // a window as old; a schedule left with nothing is removed. Only between occurrences: an occurrence's id holds its window's
+  // index, which a removal shifts. Written only over the schedule as read, so a save since is kept.
+  async function removeEnded(due, t, days) {
+    for (const { workloadId, schedule, occurrence } of due) {
+      if (occurrence) continue;
+      const ended = withoutEnded(schedule, t, days);
+      if (!ended) continue;
+      try {
+        if (await store.replaceSchedule(workloadId, schedule, ended.schedule)) log.info('EndedWindowsRemoved', { workloadId, windows: ended.windows, dates: ended.dates, days });
+      } catch (err) {
+        log.warn('EndedWindowsKept', { workloadId, error: err.message });
+      }
+    }
+  }
+
+  // The organization's days before an ended window leaves its schedule, the default without a manager; null when its settings
+  // were never read, or cannot be: then nothing leaves, an organization's 0 (keep) may be there.
+  async function endedDaysOf() {
+    if (!managerSettings) return ENDED_DAYS_DEFAULT;
+    try {
+      const current = await managerSettings.current();
+      return current && current.hibernate !== null ? current.endedWindowDays ?? ENDED_DAYS_DEFAULT : null;
+    } catch (err) {
+      log.warn('EndedDaysUnreadable', { error: err.message });
+      return null;
+    }
   }
 
   // The occurrence active now, applied once: the run records the last applied one, so a late check, a deploy inside a
@@ -1057,7 +1087,8 @@ export function createController({
       // The schedules first, whatever the budget; pauses that cannot be read hold every scheduled nap and wake too.
       const keptAsleep = (workloadId) => pauses === null || pauses.some((p) => p.keepAsleep && (p.workloadId === null || p.workloadId === workloadId));
       const joins = listed.schedules.size ? await readJoinLevels() : {};
-      const { applied, readable } = await applySchedules(configs, listed.schedules, (id) => ({ paused: paused(id), keepAsleep: keptAsleep(id) }), now(), joins);
+      const endedDays = listed.schedules.size ? await endedDaysOf() : null;
+      const { applied, readable } = await applySchedules(configs, listed.schedules, (id) => ({ paused: paused(id), keepAsleep: keptAsleep(id) }), now(), joins, endedDays);
       // Then the hibernation's 60-day limit, for every workload, held alike.
       const limited = await wakeLongHibernated(configs, applied, keptAsleep, now());
       await pingProxies(configs);

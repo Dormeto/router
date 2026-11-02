@@ -583,3 +583,67 @@ test('the value reaches the idle nap: a workload in a gap it joins is kept awake
   assert.equal((await idleAt(60)).kept, 'awake window');
   assert.notEqual((await idleAt(null)).kept, 'awake window');
 });
+
+// --- Windows that ended long ago leave the schedule (the user, 2026-11-02) -----------------------------------------------
+
+const ENDED = { kind: 'awake', days: ['sat'], start: '10:00', end: '11:00', until: '2025-09-27' };
+const settingsOf = (endedWindowDays) => ({ url: 's3://b/settings.json', refresh: async () => {}, current: async () => ({ hibernate: true, joinMinutes: null, endedWindowDays, readAt: 1, error: null }) });
+
+test('the check removes a window that ended more than a year ago, and the old dates, keeping who set the schedule, and logs it', async () => {
+  const s = setup({ run: { state: STATES.ASLEEP }, schedule: stored({ windows: [OFFICE, ENDED], exceptions: ['2025-01-01', '2026-12-25'] }) });
+  await s.checkAt('19T07:30');
+  assert.deepEqual(s.store.state.schedules.demo, stored({ windows: [OFFICE], exceptions: ['2026-12-25'] }));
+  assert.deepEqual(s.logged('EndedWindowsRemoved'), [{ workloadId: 'demo', windows: 1, dates: 1, days: 365 }]);
+  // Nothing more to remove: no write, no log.
+  await s.checkAt('19T07:35');
+  assert.equal(s.logged('EndedWindowsRemoved').length, 1);
+});
+
+test('not while a window is active: an occurrence\'s id holds its window\'s index', async () => {
+  const s = setup({ run: { state: STATES.AWAKE }, schedule: stored({ windows: [ENDED, OFFICE] }) });
+  await s.checkAt('19T09:00');
+  assert.equal(s.store.state.schedules.demo.windows.length, 2);
+  await s.checkAt('19T18:30');
+  assert.deepEqual(s.store.state.schedules.demo.windows, [OFFICE]);
+});
+
+test('the organization\'s days: 0 keeps them, 30 removes what ended 40 days ago; settings not read remove nothing', async () => {
+  const recent = { ...ENDED, until: '2026-09-09' };
+  const keep = setup({ run: { state: STATES.ASLEEP }, schedule: stored({ windows: [OFFICE, ENDED] }), managerSettings: settingsOf(0) });
+  await keep.checkAt('19T07:30');
+  assert.equal(keep.store.state.schedules.demo.windows.length, 2);
+  const month = setup({ run: { state: STATES.ASLEEP }, schedule: stored({ windows: [OFFICE, recent] }), managerSettings: settingsOf(30) });
+  await month.checkAt('19T07:30');
+  assert.deepEqual(month.store.state.schedules.demo.windows, [OFFICE]);
+  const unread = setup({ run: { state: STATES.ASLEEP }, schedule: stored({ windows: [OFFICE, ENDED] }), managerSettings: { url: 's3://b/settings.json', refresh: async () => {}, current: async () => { throw new Error('down'); } } });
+  await unread.checkAt('19T07:30');
+  assert.equal(unread.store.state.schedules.demo.windows.length, 2);
+  const never = setup({ run: { state: STATES.ASLEEP }, schedule: stored({ windows: [OFFICE, ENDED] }), managerSettings: { url: 's3://b/settings.json', refresh: async () => {}, current: async () => null } });
+  await never.checkAt('19T07:30');
+  assert.equal(never.store.state.schedules.demo.windows.length, 2);
+  // Unset in a settings.json read: the default year.
+  const unset = setup({ run: { state: STATES.ASLEEP }, schedule: stored({ windows: [OFFICE, ENDED] }), managerSettings: settingsOf(null) });
+  await unset.checkAt('19T07:30');
+  assert.deepEqual(unset.store.state.schedules.demo.windows, [OFFICE]);
+});
+
+test('a schedule left with nothing is removed', async () => {
+  const s = setup({ run: { state: STATES.ASLEEP }, schedule: stored({ windows: [ENDED] }) });
+  await s.checkAt('19T07:30');
+  assert.equal(s.store.state.schedules.demo, undefined);
+});
+
+test('a schedule saved since the check read it is not overwritten', async () => {
+  const s = setup({ run: { state: STATES.ASLEEP }, schedule: stored({ windows: [OFFICE, ENDED] }) });
+  const newer = stored({ windows: [OFFICE, ENDED, NIGHT] });
+  // Saved between the check's listing and its cleanup.
+  const list = s.wrapped.listWorkloads.bind(s.wrapped);
+  s.wrapped.listWorkloads = async () => {
+    const listed = await list();
+    s.store.state.schedules.demo = structuredClone(newer);
+    return listed;
+  };
+  await s.checkAt('19T07:30');
+  assert.deepEqual(s.store.state.schedules.demo, newer);
+  assert.deepEqual(s.logged('EndedWindowsRemoved'), []);
+});

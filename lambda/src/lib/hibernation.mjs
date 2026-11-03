@@ -48,6 +48,20 @@ export function settingsProblems(settings) {
   return problems;
 }
 
+// The settings of a workload the manager onboarded (settings at scale design §8): `hibernate` (true, false or null), the
+// settings of the levels and `type`, each a value or null; its joinMinutes is on its schedule.
+export function workloadSettingsProblems(settings) {
+  if (!isObject(settings)) return ['settings must be an object'];
+  const problems = [];
+  for (const [key, value] of Object.entries(settings)) {
+    if (key === 'joinMinutes') problems.push('settings: a workload\'s joinMinutes is on its schedule');
+    else if (key === 'hibernate') {
+      if (value !== null && !isBoolean(value)) problems.push('settings: hibernate must be true, false or null');
+    } else problems.push(...defaultsProblems({ [key]: value }, { workload: true }).map((p) => `settings: ${p}`));
+  }
+  return problems;
+}
+
 // The manager's settings.json: `workloads.hibernate`, true when absent; `workloads.joinMinutes` and
 // `workloads.endedWindowDays`, null when absent or invalid (they have no safety side, so they never lose hibernate); other keys
 // belong to the manager.

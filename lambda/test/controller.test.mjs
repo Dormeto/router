@@ -2735,3 +2735,67 @@ test('settings at scale: a rename after a router default writes back the stored 
   const stored = await s.store.getConfig('demo');
   assert.deepEqual([stored.name, stored.idleMinutes, stored.inherits, 'settingsFrom' in stored, 'ruleLevels' in stored], ['Shop', 15, ['idleMinutes'], false, false]);
 });
+
+// --- Settings at scale (vision design §8): the router's and a workload's levels, set from the manager ---------------
+
+test('settings at scale: the router\'s defaults from the manager, merged with what it holds; null removes a key, or them all', async () => {
+  const s = setup({ run: { state: STATES.AWAKE } });
+  const first = await s.handler({ action: 'settings', settings: { defaults: { idleMinutes: 30, wakeMode: 'browser' } }, by: 'ana' });
+  assert.deepEqual([first.level, first.settings.defaults], ['router', { idleMinutes: 30, wakeMode: 'browser' }]);
+  const merged = await s.handler({ action: 'settings', settings: { defaults: { idleMinutes: null, waitSeconds: 20 } }, by: 'ana' });
+  assert.deepEqual(merged.settings.defaults, { wakeMode: 'browser', waitSeconds: 20 });
+  // Hibernate and the join leave the defaults as they are, and the other way round.
+  await s.handler({ action: 'settings', settings: { hibernate: false }, by: 'ana' });
+  assert.deepEqual(await s.store.getRouterSettings(), { hibernate: false, defaults: { wakeMode: 'browser', waitSeconds: 20 }, by: 'ana', at: s.clock.now() });
+  assert.deepEqual(await s.handler({ action: 'settings', settings: { defaults: { idleMinutes: 1 } }, by: 'ana' }), { problems: ['settings: defaults: idleMinutes must be a whole number from 5 to 1440'] });
+  const cleared = await s.handler({ action: 'settings', settings: { defaults: null }, by: 'ana' });
+  assert.equal('defaults' in cleared.settings, false);
+  assert.deepEqual(await s.store.getRouterSettings(), { hibernate: false, by: 'ana', at: s.clock.now() });
+  // The router action says them, with the organization's.
+  s.store.state.managerSettings = { hibernate: true, defaults: { idleMinutes: 45 }, types: [{ name: 'api', tags: { kind: 'api' }, settings: {} }], readAt: 1, error: null };
+  await s.handler({ action: 'settings', settings: { defaults: { drainSeconds: 5 } }, by: 'ana' });
+  const info = await s.handler({ action: 'router' });
+  assert.deepEqual(info.settings.defaults, { drainSeconds: 5 });
+});
+
+test('settings at scale: the router action says the organization\'s defaults and types it holds', async () => {
+  const types = [{ name: 'api', tags: { kind: 'api' }, settings: {} }];
+  const s = setup({ run: { state: STATES.AWAKE }, managerSettings: { url: 's3://b/settings.json', refresh: async () => {}, current: async () => ({ hibernate: true, joinMinutes: null, defaults: { idleMinutes: 45 }, types, readAt: 1, error: null }) } });
+  const { managerSettings } = await s.handler({ action: 'router' });
+  assert.deepEqual([managerSettings.defaults, managerSettings.types], [{ idleMinutes: 45 }, types]);
+});
+
+test('settings at scale: a manager workload\'s own settings and type; null gives the key back to the levels', async () => {
+  const s = setup({ run: { state: STATES.AWAKE }, cfg: testConfig({ source: 'manager', inherits: ['idleMinutes', 'wakeMode'] }) });
+  s.store.state.routerSettings = { defaults: { idleMinutes: 30 }, by: 'ana', at: 1 };
+  const set = await s.handler({ action: 'settings', workloadId: 'demo', settings: { idleMinutes: 45, type: 'ecs', noWakeRules: [{ name: 'h', pathPrefixes: ['/health'] }] }, by: 'ops' });
+  assert.deepEqual([set.level, set.settings], ['workload', { idleMinutes: 45, type: 'ecs', noWakeRules: [{ name: 'h', pathPrefixes: ['/health'] }] }]);
+  assert.deepEqual([set.resolved.settings.idleMinutes, set.resolved.settingsFrom.idleMinutes, set.resolved.type], [45, 'workload', { name: 'ecs', from: 'workload' }]);
+  let stored = await s.store.getConfig('demo');
+  assert.deepEqual([stored.idleMinutes, stored.inherits, stored.type, stored.noWakeRules.length], [45, ['wakeMode'], 'ecs', 1]);
+  const back = await s.handler({ action: 'settings', workloadId: 'demo', settings: { idleMinutes: null, type: null, noWakeRules: null }, by: 'ops' });
+  assert.deepEqual([back.resolved.settings.idleMinutes, back.resolved.settingsFrom.idleMinutes], [30, 'router']);
+  stored = await s.store.getConfig('demo');
+  // The built-in value stays written for an older router; the key is the levels' again.
+  assert.deepEqual([stored.idleMinutes, stored.inherits.sort(), 'type' in stored, stored.noWakeRules], [15, ['idleMinutes', 'wakeMode'], false, []]);
+  assert.equal('hibernate' in stored, false, 'hibernate untouched when not sent');
+  assert.deepEqual(await s.handler({ action: 'settings', workloadId: 'demo', settings: { idleMinutes: 4, type: 'Bad' }, by: 'ops' }), { problems: [
+    'settings: idleMinutes must be a whole number from 5 to 1440', 'settings: type must be a type\'s name (lower-case letters, digits and hyphens) or null',
+  ] });
+  assert.deepEqual(await s.handler({ action: 'settings', workloadId: 'demo', settings: { defaults: {} }, by: 'ops' }), { problems: ['settings: unknown setting defaults'] });
+});
+
+test('settings at scale: a manager workload from before `inherits` keeps inheriting what equals the old defaults at its first write', async () => {
+  const s = setup({ run: { state: STATES.AWAKE }, cfg: testConfig({ source: 'manager', idleMinutes: 15, waitSeconds: 60, drainSeconds: 30, wakeTimeoutSeconds: 600, maxHolders: 50, failedRetrySeconds: 60, wakeMode: 'any' }) });
+  await s.handler({ action: 'settings', workloadId: 'demo', settings: { drainSeconds: 10 }, by: 'ops' });
+  const stored = await s.store.getConfig('demo');
+  assert.deepEqual([stored.drainSeconds, [...stored.inherits].sort()], [10, ['failedRetrySeconds', 'idleMinutes', 'maxHolders', 'waitSeconds', 'wakeMode', 'wakeTimeoutSeconds']]);
+});
+
+test('settings at scale: a Terraform workload refuses its settings, naming the variable of its module', async () => {
+  const terraform = setup({ run: { state: STATES.AWAKE } });
+  assert.deepEqual(await terraform.handler({ action: 'settings', workloadId: 'demo', settings: { idleMinutes: 30 }, by: 'ops', refusals: true }),
+    { refused: { code: 'conflict', message: 'workload demo was written by Terraform: set idle_minutes in its workload module' } });
+  assert.deepEqual(await terraform.handler({ action: 'settings', workloadId: 'demo', settings: { noWakeRules: [], hibernate: true }, by: 'ops', refusals: true }),
+    { refused: { code: 'conflict', message: 'workload demo was written by Terraform: set no_wake_rules in its workload module' } });
+});

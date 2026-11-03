@@ -23,9 +23,9 @@ import { lastRequestAt } from './metrics.mjs';
 import { checkScope } from './check-scope.mjs';
 import { healthOf, lambdaMetrics, queueDepths } from './health.mjs';
 import { cleanPage, pageWarnings, resolvePage, validatePage, withWake } from './page-settings.mjs';
-import { HIBERNATION_MAX_DAYS, hibernationDue, resolveHibernation, settingsProblems } from './hibernation.mjs';
+import { HIBERNATION_MAX_DAYS, hibernationDue, resolveHibernation, settingsProblems, workloadSettingsProblems } from './hibernation.mjs';
 import { joinLevels } from './manager-settings.mjs';
-import { describedRules, effectiveConfig } from './settings-levels.mjs';
+import { BUILT_IN, RULE_KEYS, SCALAR_KEYS, TYPE_BUILT_IN, builtInTypeOf, describedRules, effectiveConfig, ownSettings } from './settings-levels.mjs';
 import {
   backendKey, backendStatuses, isCompanion, resolveBackends, resumeBackends, sleepBackends, startCompanions, stopCompanions, toRecord, wakeBackends,
 } from './backends.mjs';
@@ -910,38 +910,83 @@ export function createController({
 
   // --- Settings (hibernation design §4): the router's record, or a workload's configuration ---------------------------
 
-  // Without workloadId the router's record (null removes it); with it the configuration of a workload the manager
-  // onboarded (null removes the key; Terraform writes the others'). Bad settings answer the problems, nothing written.
+  // Terraform's name of each setting a workload module sets (settings at scale design §8): what to set there instead.
+  const MODULE_VARIABLES = {
+    hibernate: 'hibernate', idleMinutes: 'idle_minutes', waitSeconds: 'wait_seconds', drainSeconds: 'drain_seconds', wakeTimeoutSeconds: 'wake_timeout_seconds',
+    maxHolders: 'max_holders', failedRetrySeconds: 'failed_retry_seconds', wakeMode: 'wake_mode', noWakeRules: 'no_wake_rules', wakeRules: 'wake_rules', type: 'type',
+  };
+
+  // Without workloadId the router's record: hibernate, joinMinutes and the defaults of its workloads (merged with what it
+  // holds, a key sent null removed, null for all of them clears them). With it the configuration of a workload the
+  // manager onboarded (Terraform writes the others'): hibernate (null removes the key), the settings of §4 (null gives the
+  // key back to the levels: its built-in value stays written for an older router), its rules (null: none) and its type
+  // (null: inherited). Bad settings answer the problems, nothing written.
   async function setSettings({ workloadId, settings, by }) {
     const cfg = workloadId ? await config(workloadId) : null;
-    if (cfg && !cfg.source) throw new Refusal('conflict', `workload ${workloadId} was written by Terraform: set hibernate in its workload module`);
-    const problems = settingsProblems(settings);
-    if (!problems.length && cfg && Object.hasOwn(settings, 'joinMinutes')) problems.push('settings: a workload\'s joinMinutes is on its schedule');
+    if (cfg && !cfg.source) {
+      const first = Object.keys(settings && typeof settings === 'object' ? settings : {}).find((key) => MODULE_VARIABLES[key]) ?? 'hibernate';
+      throw new Refusal('conflict', `workload ${workloadId} was written by Terraform: set ${MODULE_VARIABLES[first]} in its workload module`);
+    }
+    const problems = cfg ? workloadSettingsProblems(settings) : settingsProblems(settings);
     if (problems.length) return { problems };
-    const hibernate = typeof settings.hibernate === 'boolean' ? settings.hibernate : null;
     if (!cfg) {
       // What is not sent stays: setting one never erases the other, and a record that cannot be read is not written over.
       const stored = await store.getRouterSettings();
       if (!Object.keys(settings).length) return { level: 'router', settings: routerSettingsView(stored) };
       const sent = (name) => (Object.hasOwn(settings, name) ? settings[name] : stored?.[name] ?? null);
-      // Neither set deletes the record.
-      const record = { hibernate: sent('hibernate'), joinMinutes: sent('joinMinutes'), by, at: now() };
+      const merged = !Object.hasOwn(settings, 'defaults') ? stored?.defaults ?? null
+        : settings.defaults === null ? null
+          : Object.fromEntries(Object.entries({ ...stored?.defaults, ...settings.defaults }).filter(([, value]) => value !== null));
+      const defaults = merged && Object.keys(merged).length ? merged : null;
+      // None set deletes the record.
+      const record = { hibernate: sent('hibernate'), joinMinutes: sent('joinMinutes'), defaults, by, at: now() };
       await store.putRouterSettings(record);
-      log.info('RouterSettings', { hibernate: record.hibernate, joinMinutes: record.joinMinutes, by });
-      return { level: 'router', settings: routerSettingsView(record.hibernate === null && record.joinMinutes === null ? null : record) };
+      log.info('RouterSettings', { hibernate: record.hibernate, joinMinutes: record.joinMinutes, defaults: defaults ? Object.keys(defaults) : [], by });
+      return { level: 'router', settings: routerSettingsView(record.hibernate === null && record.joinMinutes === null && !defaults ? null : record) };
     }
-    const { hibernate: previous, ...rest } = cfg;
-    const next = hibernate === null ? rest : { ...rest, hibernate };
+    const next = { ...cfg };
+    if (Object.hasOwn(settings, 'hibernate')) {
+      if (typeof settings.hibernate === 'boolean') next.hibernate = settings.hibernate;
+      else delete next.hibernate;
+    }
+    const scalars = SCALAR_KEYS.filter((key) => Object.hasOwn(settings, key));
+    if (scalars.length) {
+      // A configuration from before `inherits` inherits what equals the onboarder's old defaults (design §7).
+      const own = ownSettings(cfg);
+      const inherits = new Set(Array.isArray(cfg.inherits) ? cfg.inherits : SCALAR_KEYS.filter((key) => !(key in own)));
+      const typeName = builtInTypeOf(cfg, null);
+      for (const key of scalars) {
+        if (settings[key] === null) {
+          next[key] = TYPE_BUILT_IN[typeName]?.[key] ?? BUILT_IN[key];
+          inherits.add(key);
+        } else {
+          next[key] = settings[key];
+          inherits.delete(key);
+        }
+      }
+      next.inherits = SCALAR_KEYS.filter((key) => inherits.has(key));
+    }
+    for (const key of RULE_KEYS) if (Object.hasOwn(settings, key)) next[key] = settings[key] ?? [];
+    if (Object.hasOwn(settings, 'type')) {
+      if (settings.type === null) delete next.type;
+      else next.type = settings.type;
+    }
     // The levels the answer resolves with, read before the write: a failed read changes nothing.
     const levels = await hibernationLevels();
     // Conditional: a change racing an offboarding never writes the workload back.
     if (!(await store.putConfig(workloadId, next, { mustExist: true }))) throw new Refusal('not_found', `workload not configured: ${workloadId}`);
-    log.info('WorkloadSettings', { workloadId, hibernate, previous: previous ?? null, by });
+    log.info('WorkloadSettings', { workloadId, keys: Object.keys(settings), hibernate: next.hibernate ?? null, previous: cfg.hibernate ?? null, by });
     const instanceIds = await resolveBackends(clients, next).then(({ backends }) => backends.filter((b) => b.kind === 'instance').map((b) => b.id)).catch((err) => {
       log.warn('HibernationUnread', { workloadId, error: err.message });
       return null;
     });
-    return { level: 'workload', settings: { hibernate }, hibernation: await hibernationView(next, await store.getRun(workloadId), instanceIds, levels) };
+    const run = await store.getRun(workloadId);
+    const resolved = await effective(next, run);
+    return {
+      level: 'workload', settings: { ...settings },
+      hibernation: await hibernationView(next, run, instanceIds, levels),
+      resolved: { settings: Object.fromEntries(SCALAR_KEYS.map((key) => [key, resolved[key]])), settingsFrom: resolved.settingsFrom, type: resolved.type },
+    };
   }
 
   // --- Waiting page (branded waiting page design §5, §11): one document per level, in its own item ----------------------
@@ -1426,7 +1471,10 @@ export function createController({
 
   const TERRAFORM = 'terraform';
   // The router's settings record as people read it (its time ISO): all null when unset.
-  const routerSettingsView = (record) => ({ hibernate: record?.hibernate ?? null, joinMinutes: record?.joinMinutes ?? null, by: record?.by ?? null, at: record ? iso(record.at) : null });
+  const routerSettingsView = (record) => ({
+    hibernate: record?.hibernate ?? null, joinMinutes: record?.joinMinutes ?? null, ...(record?.defaults ? { defaults: record.defaults } : {}),
+    by: record?.by ?? null, at: record ? iso(record.at) : null,
+  });
   async function measure(t) {
     const [metrics, queues, limit] = await Promise.all([
       lambdaMetrics(cloudwatch, router.functions ?? {}, t).catch((err) => ({ error: err.message })),
@@ -1500,7 +1548,12 @@ export function createController({
     return {
       router: { name: router.name, version: router.version, build: router.build },
       settings: routerSettingsView(routerSettings),
-      managerSettings: { url: managerSettings?.url ?? null, hibernate: manager?.hibernate ?? null, joinMinutes: manager?.joinMinutes ?? null, readAt: manager?.readAt ? iso(manager.readAt) : null, error: manager?.error ?? null },
+      managerSettings: {
+        url: managerSettings?.url ?? null, hibernate: manager?.hibernate ?? null, joinMinutes: manager?.joinMinutes ?? null,
+        // The organization's defaults and types as this router holds them (settings at scale design §6), when there are some.
+        ...(manager?.defaults ? { defaults: manager.defaults } : {}), ...(manager?.types ? { types: manager.types } : {}),
+        readAt: manager?.readAt ? iso(manager.readAt) : null, error: manager?.error ?? null,
+      },
       configuration: {
         checkSchedule: { value: router.checkSchedule ?? null, source: TERRAFORM },
         ipLists: { value: ipLists.map(({ name, url, action, refreshHours }) => ({ name, url, action, refreshHours })), source: TERRAFORM },

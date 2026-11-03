@@ -59,17 +59,24 @@ resource "aws_dynamodb_table_item" "config" {
       loadBalancerDimension   = var.load_balancer_arn_suffix
       appTargetGroupDimension = var.app_target_group_arn_suffix
       instanceIds             = var.instance_ids
-      waitSeconds             = var.wait_seconds
-      idleMinutes             = var.idle_minutes
-      drainSeconds            = var.drain_seconds
-      wakeTimeoutSeconds      = var.wake_timeout_seconds
-      failedRetrySeconds      = var.failed_retry_seconds
-      fallbackInstanceTypes   = var.fallback_instance_types
-      maxHolders              = var.max_holders
-      pollSeconds             = var.poll_seconds
-      noWakeRules             = local.no_wake_rules
-      wakeMode                = var.wake_mode
-      wakeRules               = local.wake_rules
+      # A setting left null writes its built-in value (an older router reads it) and is listed in inherits (router
+      # 0.37.0: the levels decide it, vision settings at scale design §7).
+      waitSeconds           = coalesce(var.wait_seconds, 60)
+      idleMinutes           = coalesce(var.idle_minutes, 15)
+      drainSeconds          = coalesce(var.drain_seconds, 30)
+      wakeTimeoutSeconds    = coalesce(var.wake_timeout_seconds, 600)
+      failedRetrySeconds    = coalesce(var.failed_retry_seconds, 60)
+      fallbackInstanceTypes = var.fallback_instance_types
+      maxHolders            = coalesce(var.max_holders, 50)
+      pollSeconds           = var.poll_seconds
+      noWakeRules           = local.no_wake_rules
+      wakeMode              = coalesce(var.wake_mode, "any")
+      inherits = compact([
+        var.idle_minutes == null ? "idleMinutes" : "", var.wait_seconds == null ? "waitSeconds" : "", var.drain_seconds == null ? "drainSeconds" : "",
+        var.wake_timeout_seconds == null ? "wakeTimeoutSeconds" : "", var.max_holders == null ? "maxHolders" : "",
+        var.failed_retry_seconds == null ? "failedRetrySeconds" : "", var.wake_mode == null ? "wakeMode" : "",
+      ])
+      wakeRules = local.wake_rules
       admin = {
         enabled    = var.admin_enabled && var.admin_secret != null
         secretHash = var.admin_enabled && var.admin_secret != null ? sha256(var.admin_secret) : ""
@@ -78,7 +85,7 @@ resource "aws_dynamodb_table_item" "config" {
       }
       # Written only when set: the key is absent by default, so the router and manager levels apply and a later apply never
       # writes false.
-    }, var.hibernate == null ? {} : { hibernate = var.hibernate })) }
+    }, var.hibernate == null ? {} : { hibernate = var.hibernate }, var.type == null ? {} : { type = var.type })) }
   })
 }
 

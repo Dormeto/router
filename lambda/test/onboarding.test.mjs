@@ -126,6 +126,8 @@ test('onboard tags the backend, creates and registers the waker target group, wr
     instanceIds: [], waitSeconds: 60, idleMinutes: 30, drainSeconds: 30, wakeTimeoutSeconds: 600, failedRetrySeconds: 60, maxHolders: 50, pollSeconds: 3,
     noWakeRules: [], wakeMode: 'browser', wakeRules: [], admin: { enabled: false, secretHash: '', secretParameter: '' },
     source: 'manager', onboardedBy: 'ops@example.com', onboardedAt: 'x', databases: [], tagged: [{ kind: 'instance', id: 'i-0aaa' }],
+    // What the onboarding did not send is the levels' (settings at scale design §7); its value stays for older routers.
+    inherits: ['waitSeconds', 'drainSeconds', 'wakeTimeoutSeconds', 'maxHolders', 'failedRetrySeconds'],
   });
   assert.equal(cfg.onboardedAt, new Date(NOW).toISOString());
   assert.deepEqual(await s.a.store.getRun('shop'), { state: 'AWAKE', version: 0, awakeSince: NOW, holders: 0, wakeCount: 0 });

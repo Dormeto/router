@@ -59,41 +59,43 @@ variable "instance_ids" {
 }
 
 variable "wait_seconds" {
-  description = "Maximum time the waker holds a request before the waiter page. 60 s covers a wake (36-51 s measured from the first request) plus the 15 s route grace window."
+  description = "Maximum time the waker holds a request before the waiter page. 60 s covers a wake (36-51 s measured from the first request) plus the 15 s route grace window. null: the router's levels decide (router 0.37.0: the workload's type, the router's default, the organization's, else the built-in 60)."
   type        = number
-  default     = 60
+  default     = null
 }
 
 variable "idle_minutes" {
-  type    = number
-  default = 15
+  description = "Minutes without a request before a nap. null: the router's levels decide (router 0.37.0: the workload's type, the router's default, the organization's, else the built-in 15)."
+  type        = number
+  default     = null
 }
 
 variable "drain_seconds" {
-  description = "Wait between the route switch and the instance stop. Must exceed ALB rule propagation (about 12 s measured)."
+  description = "Wait between the route switch and the instance stop. Must exceed ALB rule propagation (about 12 s measured). null: the router's levels decide (router 0.37.0: the workload's type, the router's default, the organization's, else the built-in 30)."
   type        = number
-  default     = 30
+  default     = null
 }
 
 variable "wake_timeout_seconds" {
-  type    = number
-  default = 600
+  description = "How long a wake may take before it fails. null: the router's levels decide (router 0.37.0: the workload's type, the router's default, the organization's, else the built-in 600, 1800 with databases)."
+  type        = number
+  default     = null
 }
 
 variable "failed_retry_seconds" {
-  description = "After a failed wake, how long requests wait before they try again (router 0.25.0: doubled after each failure in a row, at most 30 minutes); a wake from the manager does not wait."
+  description = "After a failed wake, how long requests wait before they try again (router 0.25.0: doubled after each failure in a row, at most 30 minutes); a wake from the manager does not wait. null: the router's levels decide (router 0.37.0: the workload's type, the router's default, the organization's, else the built-in 60)."
   type        = number
-  default     = 60
+  default     = null
   validation {
-    condition     = var.failed_retry_seconds >= 10 && var.failed_retry_seconds <= 600 && floor(var.failed_retry_seconds) == var.failed_retry_seconds
+    condition     = var.failed_retry_seconds == null || (var.failed_retry_seconds >= 10 && var.failed_retry_seconds <= 600 && floor(var.failed_retry_seconds) == var.failed_retry_seconds)
     error_message = "failed_retry_seconds must be a whole number from 10 to 600."
   }
 }
 
 variable "max_holders" {
-  description = "Maximum requests held at the same time per workload (each one uses a Lambda execution for up to wait_seconds). Keep it well below the account Lambda concurrency (1000 in this account)."
+  description = "Maximum requests held at the same time per workload (each one uses a Lambda execution for up to wait_seconds). Keep it well below the account Lambda concurrency (1000 in this account). null: the router's levels decide (router 0.37.0: the workload's type, the router's default, the organization's, else the built-in 50)."
   type        = number
-  default     = 50
+  default     = null
 }
 
 variable "poll_seconds" {
@@ -158,11 +160,11 @@ variable "no_wake_rules" {
 }
 
 variable "wake_mode" {
-  description = "any: every request that passes the filters wakes the workload. browser: only the waiter page probe (JavaScript), the x-dormeto-wake: 1 header and wake_rules wake it; other requests get the waiter page at once."
+  description = "any: every request that passes the filters wakes the workload. browser: only the waiter page probe (JavaScript), the x-dormeto-wake: 1 header and wake_rules wake it; other requests get the waiter page at once. null: the router's levels decide (router 0.37.0: the workload's type, the router's default, the organization's, else the built-in any)."
   type        = string
-  default     = "any"
+  default     = null
   validation {
-    condition     = contains(["any", "browser"], var.wake_mode)
+    condition     = var.wake_mode == null || contains(["any", "browser"], var.wake_mode)
     error_message = "wake_mode must be any or browser."
   }
 }
@@ -207,6 +209,16 @@ variable "fallback_instance_types" {
   validation {
     condition     = length(var.fallback_instance_types) <= 5 && alltrue([for t in var.fallback_instance_types : can(regex("^[a-z][a-z0-9-]*[0-9][a-z0-9-]*\\.[a-z0-9]+$", t))])
     error_message = "fallback_instance_types: at most 5 EC2 instance types, for example t3a.medium."
+  }
+}
+
+variable "type" {
+  description = "The workload's type (router 0.37.0): one of the organization's custom types, or a built-in one (instance, asg, ecs, k8s, databases), whose defaults it takes for the settings left null. null: the first custom type its tags select, else the one its backends give."
+  type        = string
+  default     = null
+  validation {
+    condition     = var.type == null || can(regex("^[a-z][a-z0-9-]{0,31}$", var.type))
+    error_message = "type must be lower-case letters, digits and hyphens, starting with a letter (at most 32)."
   }
 }
 

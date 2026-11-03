@@ -12,6 +12,7 @@ import {
 } from './kube-route.mjs';
 import { healthyCount } from './instances.mjs';
 import { checkRights } from './kube-access.mjs';
+import { SCALAR_KEYS } from './settings-levels.mjs';
 
 const WORKLOAD_TAG = 'dormeto:workload';
 // Target groups per Application Load Balancer: not adjustable (the waker target group counts once its rule uses it).
@@ -521,6 +522,8 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
           workloadId, name: checked.name, tags: checked.tags, appTargetGroupArn: targetGroupArn, wakerTargetGroupArn: waker.TargetGroupArn,
           loadBalancerDimension: lb.slice(lb.indexOf('loadbalancer/') + 'loadbalancer/'.length), appTargetGroupDimension: targetGroupArn.split(':').at(-1),
           instanceIds: [], ...DEFAULTS, ...(kubernetes ? { wakeTimeoutSeconds: KUBERNETES_WAKE_TIMEOUT } : {}), ...(databases.length ? { wakeTimeoutSeconds: DATABASE_WAKE_TIMEOUT } : {}), ...settings,
+          // What the onboarding did not send is the levels' (settings at scale design §7): its value above stays for an older router.
+          inherits: SCALAR_KEYS.filter((key) => !Object.hasOwn(settings, key)),
           noWakeRules: [], wakeRules: [], admin: { enabled: false, secretHash: '', secretParameter: '' },
           source: 'manager', onboardedBy: by ?? 'unknown', onboardedAt: new Date(now()).toISOString(), databases, tagged,
           ...(kubernetes ? { kubernetes: kubernetesConfig(kubernetes) } : {}),

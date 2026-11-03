@@ -77,6 +77,16 @@ get the waiter page at once (or JSON naming the wake header), so scanners that d
 workload; a request arriving during a wake is held as usual. The filters (no-wake rules, `HEAD`, bots, scanner paths)
 apply to the probe too.
 
+**Settings and their levels (router 0.37.0):** a workload's idle window, waits, wake timeout, held requests, retry
+after a failed wake and wake mode each come from the first level that sets them: the workload, its type, its router,
+the organization, then the built-in value. The `workload` module's `idle_minutes`, `wait_seconds`, `drain_seconds`,
+`wake_timeout_seconds`, `max_holders`, `failed_retry_seconds` and `wake_mode` are null by default: the module then writes
+the built-in value, which an older router reads, and lists the setting in `inherits`, which a newer one leaves to the
+levels. A value set, even the built-in one, is the workload's own. A **type** is built in (`instance`, `asg`, `ecs`, `k8s`,
+or `databases` for a workload with RDS or Aurora, whose wake timeout is 1800 s) or one of the organization's, picked by
+`type` on the module, else by its tags; the manager sets each type's defaults, the router's and the organization's. The
+no-wake and wake rules of every level add up, the organization's first. The status says where each value comes from.
+
 **IP reputation lists** (`ip_lists` on the `router` module): lists of networks (scanners, cloud ranges) downloaded by
 the controller (daily by default) and used by the waker for every workload. `action = "defer"` (default) handles a
 listed source as in browser mode: it gets the waiter page and only the page's probe wakes, so a real visitor loses about

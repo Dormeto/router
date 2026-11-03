@@ -353,3 +353,46 @@ run "waiting_page_icon_that_is_not_canonical_base64_is_refused" {
   }
   expect_failures = [var.waiting_page]
 }
+
+# Settings at scale (vision design §7): a setting left null is the levels', its built-in value written for older routers.
+run "unset_settings_are_inherited" {
+  command = apply
+  assert {
+    condition     = jsondecode(jsondecode(aws_dynamodb_table_item.config.item).config.S).idleMinutes == 15
+    error_message = "an unset idle window writes the built-in 15"
+  }
+  assert {
+    condition     = jsondecode(jsondecode(aws_dynamodb_table_item.config.item).config.S).inherits == ["idleMinutes", "waitSeconds", "drainSeconds", "wakeTimeoutSeconds", "maxHolders", "failedRetrySeconds", "wakeMode"]
+    error_message = "every unset setting is inherited"
+  }
+  assert {
+    condition     = !contains(keys(jsondecode(jsondecode(aws_dynamodb_table_item.config.item).config.S)), "type")
+    error_message = "no type unless set"
+  }
+}
+
+run "a_set_value_is_the_workloads_own" {
+  command = apply
+  variables {
+    idle_minutes = 15
+    wake_mode    = "browser"
+    type         = "api"
+  }
+  assert {
+    condition     = jsondecode(jsondecode(aws_dynamodb_table_item.config.item).config.S).inherits == ["waitSeconds", "drainSeconds", "wakeTimeoutSeconds", "maxHolders", "failedRetrySeconds"]
+    error_message = "a value set, even the built-in one, is the workload's own"
+  }
+  assert {
+    condition     = jsondecode(jsondecode(aws_dynamodb_table_item.config.item).config.S).type == "api"
+    error_message = "the type is written"
+  }
+}
+
+run "type_must_be_a_type_name" {
+  command = plan
+  variables {
+    type = "Bad_Name"
+  }
+  expect_failures = [var.type]
+}
+

@@ -2618,3 +2618,44 @@ test('nap: the read of the icon runs on the step\'s budget, not on a fresh one: 
   t.mock.timers.tick(10_000);
   assert.equal(await nap, STATES.ASLEEP);
 });
+
+// Refusals are answers, not errors (vision refusals design §1): a caller that sends refusals: true gets each one as
+// { refused: { code, message } }, with the message thrown before, and no Lambda error.
+test('refusals: a caller that understands them gets each one as an answer with its code, logged at info', async () => {
+  const manager = setup({ run: { state: STATES.AWAKE }, cfg: testConfig({ name: 'Demo shop', source: 'manager' }) });
+  const terraform = setup({ run: { state: STATES.AWAKE } });
+  const logged = [];
+  for (const s of [manager, terraform]) s.log.info = (event, data) => logged.push([event, data]);
+  const ask = (s, event) => s.handler({ ...event, refusals: true });
+  const refused = (code, message) => ({ refused: { code, message } });
+  assert.deepEqual(await ask(manager, { action: 'status', workloadId: 'nope' }), refused('not_found', 'workload not configured: nope'));
+  assert.deepEqual(await ask(manager, { action: 'schedule', workloadId: 'nope', schedule: weekly(), by: 'me' }), refused('not_found', 'workload not configured: nope'));
+  assert.deepEqual(await ask(manager, { action: 'rename', workloadId: 'demo', name: ' ', by: 'ops' }), refused('invalid', 'name: required'));
+  assert.deepEqual(await ask(manager, { action: 'tag', workloadId: 'demo', tags: { 'dormeto:x': '1' }, by: 'ops' }), refused('invalid', 'tag "dormeto:x": the dormeto: prefix is reserved'));
+  assert.deepEqual(await ask(manager, { action: 'pause', workloadId: 'demo', by: 'ops', reason: ' ' }), refused('invalid', 'reason required (1 to 256 characters)'));
+  assert.deepEqual(await ask(manager, { action: 'pause', workloadId: 'demo', by: 'ops', reason: 'x', until: 1 }), refused('invalid', 'until must be in the future, within 366 days'));
+  assert.deepEqual(await ask(manager, { action: 'pause', workloadId: 'demo', by: 'ops', reason: 'x', targetGroupArn: 'arn:other' }), refused('not_found', 'workload not configured: demo (its target group is not arn:other)'));
+  assert.deepEqual(await ask(manager, { action: 'waiting-page', op: 'move', workloadId: 'demo', by: 'ops' }), refused('invalid', 'unknown waiting-page op: move'));
+  assert.deepEqual(await ask(manager, { action: 'waiting-page', op: 'put', workloadId: 'demo' }), refused('invalid', 'a put needs by: who sets the page'));
+  assert.deepEqual(await ask(manager, { action: 'dance' }), refused('unsupported', 'unknown action: dance'));
+  assert.deepEqual(await ask(terraform, { action: 'rename', workloadId: 'demo', name: 'x', by: 'ops' }), refused('conflict', 'workload demo was written by Terraform: set name in its workload module'));
+  assert.deepEqual(await ask(terraform, { action: 'tag', workloadId: 'demo', tags: { team: 'x' }, by: 'ops' }), refused('conflict', 'workload demo was written by Terraform: set tags in its workload module'));
+  assert.deepEqual(await ask(terraform, { action: 'settings', workloadId: 'demo', settings: { hibernate: true }, by: 'ana' }), refused('conflict', 'workload demo was written by Terraform: set hibernate in its workload module'));
+  assert.deepEqual(await ask(terraform, { action: 'waiting-page', op: 'put', workloadId: 'demo', page: { mode: 'template' }, by: 'ops' }), refused('conflict', 'workload demo was written by Terraform: set waiting_page in its workload module'));
+  // A change racing an offboarding: the workload is gone.
+  manager.store.putConfig = async () => false;
+  assert.deepEqual(await ask(manager, { action: 'rename', workloadId: 'demo', name: 'Shop', by: 'ops' }), refused('not_found', 'workload not configured: demo'));
+  const said = logged.filter(([event]) => event === 'Refused');
+  assert.equal(said.length, 15);
+  assert.deepEqual(said[0][1], { action: 'status', workloadId: 'nope', code: 'not_found', message: 'workload not configured: nope' });
+  assert.deepEqual(said.at(-6)[1], { action: 'dance', workloadId: null, code: 'unsupported', message: 'unknown action: dance' });
+});
+
+test('refusals: thrown as before without the flag; an error that is no refusal is thrown with it', async () => {
+  const terraform = setup({ run: { state: STATES.AWAKE } });
+  await assert.rejects(terraform.handler({ action: 'rename', workloadId: 'demo', name: 'x', by: 'ops' }), { message: 'workload demo was written by Terraform: set name in its workload module' });
+  await assert.rejects(terraform.handler({ action: 'dance', refusals: false }), { message: 'unknown action: dance' });
+  terraform.store.getConfig = async () => { throw new Error('ProvisionedThroughputExceededException'); };
+  await assert.rejects(terraform.handler({ action: 'status', workloadId: 'demo', refusals: true }), { message: 'ProvisionedThroughputExceededException' });
+});
+

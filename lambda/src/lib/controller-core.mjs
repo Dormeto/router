@@ -1,3 +1,4 @@
+import { Refusal, refused } from './refusal.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import { STATES } from './state.mjs';
 import { checkName } from './names.mjs';
@@ -85,7 +86,7 @@ export function createController({
 
   async function config(workloadId) {
     const cfg = await store.getConfig(workloadId);
-    if (!cfg) throw new Error(`workload not configured: ${workloadId}`);
+    if (!cfg) throw new Refusal('not_found', `workload not configured: ${workloadId}`);
     return cfg;
   }
 
@@ -781,6 +782,16 @@ export function createController({
     return hosts.byWorkload;
   }
 
+  // A workload's row of the list (and of the check's report): pauses are the router's, all of them.
+  async function rowOf(cfg, host, pauses, scheduled) {
+    const [run, stats] = await Promise.all([
+      store.getRun(cfg.workloadId),
+      store.getStats(cfg.workloadId, STATS_DAYS).catch(() => null),
+    ]);
+    const shown = pauses.filter((p) => p.workloadId === cfg.workloadId || p.workloadId === null);
+    return workloadSummary(cfg, run, host, totals(stats), shownPauses(shown), scheduled);
+  }
+
   async function list({ cachedHosts = false } = {}) {
     const { configs, schedules } = await store.listWorkloads();
     const byWorkload = await workloadHosts(configs, { cachedOnly: cachedHosts });
@@ -791,14 +802,7 @@ export function createController({
       return [];
     });
     const routerPauses = pauses.filter((p) => p.workloadId === null);
-    const workloads = await Promise.all(configs.map(async (cfg) => {
-      const [run, stats] = await Promise.all([
-        store.getRun(cfg.workloadId),
-        store.getStats(cfg.workloadId, STATS_DAYS).catch(() => null),
-      ]);
-      const own = pauses.filter((p) => p.workloadId === cfg.workloadId);
-      return workloadSummary(cfg, run, byWorkload.get(cfg.workloadId), totals(stats), shownPauses([...own, ...routerPauses]), schedules.has(cfg.workloadId));
-    }));
+    const workloads = await Promise.all(configs.map((cfg) => rowOf(cfg, byWorkload.get(cfg.workloadId), pauses, schedules.has(cfg.workloadId))));
     const health = await store.getCheck().catch(() => null);
     return {
       router: {
@@ -867,7 +871,7 @@ export function createController({
   // onboarded (null removes the key; Terraform writes the others'). Bad settings answer the problems, nothing written.
   async function setSettings({ workloadId, settings, by }) {
     const cfg = workloadId ? await config(workloadId) : null;
-    if (cfg && !cfg.source) throw new Error(`workload ${workloadId} was written by Terraform: set hibernate in its workload module`);
+    if (cfg && !cfg.source) throw new Refusal('conflict', `workload ${workloadId} was written by Terraform: set hibernate in its workload module`);
     const problems = settingsProblems(settings);
     if (!problems.length && cfg && Object.hasOwn(settings, 'joinMinutes')) problems.push('settings: a workload\'s joinMinutes is on its schedule');
     if (problems.length) return { problems };
@@ -888,7 +892,7 @@ export function createController({
     // The levels the answer resolves with, read before the write: a failed read changes nothing.
     const levels = await hibernationLevels();
     // Conditional: a change racing an offboarding never writes the workload back.
-    if (!(await store.putConfig(workloadId, next, { mustExist: true }))) throw new Error(`workload not configured: ${workloadId}`);
+    if (!(await store.putConfig(workloadId, next, { mustExist: true }))) throw new Refusal('not_found', `workload not configured: ${workloadId}`);
     log.info('WorkloadSettings', { workloadId, hibernate, previous: previous ?? null, by });
     const instanceIds = await resolveBackends(clients, next).then(({ backends }) => backends.filter((b) => b.kind === 'instance').map((b) => b.id)).catch((err) => {
       log.warn('HibernationUnread', { workloadId, error: err.message });
@@ -935,11 +939,11 @@ export function createController({
   // from before the workload moved to Terraform can still be cleared. The log holds the size and hash of a page, never it.
   async function waitingPage({ op, workloadId = null, page, by }) {
     // Null or absent is the router's level; anything else must be a workload's id, never a falsy value read as the router's.
-    if (workloadId !== null && (typeof workloadId !== 'string' || !workloadId)) throw new Error('workloadId must be the id of a workload');
-    if (op === 'put' && (typeof by !== 'string' || !by)) throw new Error('a put needs by: who sets the page');
+    if (workloadId !== null && (typeof workloadId !== 'string' || !workloadId)) throw new Refusal('invalid', 'workloadId must be the id of a workload');
+    if (op === 'put' && (typeof by !== 'string' || !by)) throw new Refusal('invalid', 'a put needs by: who sets the page');
     const cfg = workloadId ? await config(workloadId) : null;
     const level = pageLevel(workloadId);
-    const terraformRefuses = () => new Error(`workload ${workloadId} was written by Terraform: set waiting_page in its workload module`);
+    const terraformRefuses = () => new Refusal('conflict', `workload ${workloadId} was written by Terraform: set waiting_page in its workload module`);
     switch (op) {
       case 'get':
         break;
@@ -962,7 +966,7 @@ export function createController({
         break;
       }
       default:
-        throw new Error(`unknown waiting-page op: ${op}`);
+        throw new Refusal('invalid', `unknown waiting-page op: ${op}`);
     }
     return pageView(workloadId, cfg);
   }
@@ -1167,12 +1171,12 @@ export function createController({
   // The name people see (design section 7), for a workload the manager onboarded (Terraform writes the others').
   async function rename({ workloadId, name, by }) {
     const cfg = await config(workloadId);
-    if (!cfg.source) throw new Error(`workload ${workloadId} was written by Terraform: set name in its workload module`);
+    if (!cfg.source) throw new Refusal('conflict', `workload ${workloadId} was written by Terraform: set name in its workload module`);
     const checked = checkName(name);
-    if (!checked.name) throw new Error('name: required');
-    if (checked.problem) throw new Error(checked.problem);
+    if (!checked.name) throw new Refusal('invalid', 'name: required');
+    if (checked.problem) throw new Refusal('invalid', checked.problem);
     // Conditional: a rename racing an offboarding never writes the workload back.
-    if (!(await store.putConfig(workloadId, { ...cfg, name: checked.name }, { mustExist: true }))) throw new Error(`workload not configured: ${workloadId}`);
+    if (!(await store.putConfig(workloadId, { ...cfg, name: checked.name }, { mustExist: true }))) throw new Refusal('not_found', `workload not configured: ${workloadId}`);
     log.info('Renamed', { workloadId, name: checked.name, by });
     return { workloadId, name: checked.name };
   }
@@ -1180,11 +1184,11 @@ export function createController({
   // The workload's tags (tags design, section 3), replaced whole, for a workload the manager onboarded.
   async function tag({ workloadId, tags, by }) {
     const cfg = await config(workloadId);
-    if (!cfg.source) throw new Error(`workload ${workloadId} was written by Terraform: set tags in its workload module`);
+    if (!cfg.source) throw new Refusal('conflict', `workload ${workloadId} was written by Terraform: set tags in its workload module`);
     const problem = tagsProblem(tags);
-    if (problem) throw new Error(problem);
+    if (problem) throw new Refusal('invalid', problem);
     // Conditional: a tag racing an offboarding never writes the workload back.
-    if (!(await store.putConfig(workloadId, { ...cfg, tags }, { mustExist: true }))) throw new Error(`workload not configured: ${workloadId}`);
+    if (!(await store.putConfig(workloadId, { ...cfg, tags }, { mustExist: true }))) throw new Refusal('not_found', `workload not configured: ${workloadId}`);
     log.info('Tagged', { workloadId, tags, by });
     return { workloadId, tags };
   }
@@ -1249,11 +1253,11 @@ export function createController({
 
   function pauseRecord({ by, reason, until, keepAsleep, exclusionId }) {
     const text = typeof reason === 'string' ? reason.trim() : '';
-    if (!text || text.length > REASON_MAX) throw new Error(`reason required (1 to ${REASON_MAX} characters)`);
+    if (!text || text.length > REASON_MAX) throw new Refusal('invalid', `reason required (1 to ${REASON_MAX} characters)`);
     let untilMs;
     if (until !== undefined && until !== null) {
       untilMs = typeof until === 'number' ? until : Date.parse(until);
-      if (!(untilMs > now() && untilMs <= now() + PAUSE_MAX_MS)) throw new Error('until must be in the future, within 366 days');
+      if (!(untilMs > now() && untilMs <= now() + PAUSE_MAX_MS)) throw new Refusal('invalid', 'until must be in the future, within 366 days');
     }
     return {
       by: by ?? 'unknown', at: now(), reason: text, ...(untilMs === undefined ? {} : { until: untilMs }), keepAsleep: keepAsleep === true,
@@ -1269,7 +1273,7 @@ export function createController({
       // An exclusion names the target group it matched: another workload of the same id (another router) is not it.
       const cfg = await config(workloadId);
       if (event.targetGroupArn && cfg.appTargetGroupArn !== event.targetGroupArn) {
-        throw new Error(`workload not configured: ${workloadId} (its target group is not ${event.targetGroupArn})`);
+        throw new Refusal('not_found', `workload not configured: ${workloadId} (its target group is not ${event.targetGroupArn})`);
       }
     }
     const record = pauseRecord(event);
@@ -1539,10 +1543,22 @@ export function createController({
     }
   }
 
+  // A refusal is an answer for a caller that reads them (refusals: true, the manager's), else thrown as before (vision
+  // refusals design §1); the router's own invocations never send the flag.
   return async function handler(event, context) {
     const remaining = context?.getRemainingTimeInMillis?.();
     budgetEnd = typeof remaining === 'number' ? now() + remaining - TIMEOUT_MARGIN_MS : Infinity;
     if (Array.isArray(event?.Records)) return runQueued(event.Records);
+    try {
+      return await act(event);
+    } catch (err) {
+      if (!(err instanceof Refusal) || event?.refusals !== true) throw err;
+      log.info('Refused', { action: event?.action ?? null, workloadId: event?.workloadId ?? null, code: err.code, message: err.message });
+      return refused(err);
+    }
+  };
+
+  async function act(event) {
     switch (event?.action) {
       case 'wake': return wake(event.workloadId, event.wakeId);
       case 'nap': return nap(event.workloadId, { cause: event.cause === 'schedule' ? 'schedule' : event.by ? 'manager' : 'idle', by: event.by });
@@ -1564,7 +1580,7 @@ export function createController({
       case 'waiting-page': return waitingPage(event);
       case 'router': return routerInfo();
       case 'clusterCheck': return clusterCheck(event);
-      default: throw new Error(`unknown action: ${event?.action}`);
+      default: throw new Refusal('unsupported', `unknown action: ${event?.action}`);
     }
-  };
+  }
 }

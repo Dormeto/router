@@ -464,15 +464,21 @@ test('router settings and the manager settings copy are ROUTER items; neither hi
   // Either one keeps the item, and the one unset is removed from it.
   await store.putRouterSettings({ joinMinutes: 30, by: 'ana', at: 9 });
   assert.deepEqual(await store.getRouterSettings(), { joinMinutes: 30, by: 'ana', at: 9 });
-  assert.equal(expressions.at(-1), 'SET #joinMinutes = :joinMinutes, #by = :by, #at = :at REMOVE #hibernate');
+  assert.equal(expressions.at(-1), 'SET #joinMinutes = :joinMinutes, #by = :by, #at = :at REMOVE #hibernate, #defaults');
   await store.putRouterSettings({ joinMinutes: 0, hibernate: null, by: 'ana', at: 10 });
   assert.deepEqual(await store.getRouterSettings(), { joinMinutes: 0, by: 'ana', at: 10 });
   await store.putRouterSettings({ hibernate: true, joinMinutes: 15, by: 'ana', at: 11 });
+  // Settings at scale: the router's defaults, as JSON, alone enough to keep the item.
+  await store.putRouterSettings({ defaults: { idleMinutes: 30, noWakeRules: [{ name: 'h', pathPrefixes: ['/health'] }] }, by: 'ana', at: 12 });
+  assert.deepEqual(await store.getRouterSettings(), { defaults: { idleMinutes: 30, noWakeRules: [{ name: 'h', pathPrefixes: ['/health'] }] }, by: 'ana', at: 12 });
+  await store.putRouterSettings({ defaults: {}, by: 'ana', at: 13 });
+  assert.equal(await store.getRouterSettings(), null);
+  await store.putRouterSettings({ hibernate: true, joinMinutes: 15, by: 'ana', at: 11 });
   assert.deepEqual(await store.getRouterSettings(), { hibernate: true, joinMinutes: 15, by: 'ana', at: 11 });
-  assert.equal(expressions.at(-1), 'SET #hibernate = :hibernate, #joinMinutes = :joinMinutes, #by = :by, #at = :at');
+  assert.equal(expressions.at(-1), 'SET #hibernate = :hibernate, #joinMinutes = :joinMinutes, #by = :by, #at = :at REMOVE #defaults');
   await store.putRouterSettings({ hibernate: false, joinMinutes: null, by: 'ana', at: 12 });
   assert.deepEqual(await store.getRouterSettings(), { hibernate: false, by: 'ana', at: 12 });
-  assert.equal(expressions.at(-1), 'SET #hibernate = :hibernate, #by = :by, #at = :at REMOVE #joinMinutes');
+  assert.equal(expressions.at(-1), 'SET #hibernate = :hibernate, #by = :by, #at = :at REMOVE #joinMinutes, #defaults');
   await store.putRouterSettings({ hibernate: null, joinMinutes: null, by: 'ana', at: 13 });
   assert.equal(await store.getRouterSettings(), null);
   assert.equal(items.has('ROUTER/SETTINGS'), false);

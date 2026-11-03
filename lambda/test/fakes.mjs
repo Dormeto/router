@@ -106,8 +106,8 @@ export function fakeStore({ config, run, clock }) {
     async putKubeProxies(item) { state.kubeProxies = structuredClone(item); },
     async getRouterSettings() { return structuredClone(state.routerSettings ?? null); },
     async putRouterSettings(item) {
-      const set = Object.fromEntries(Object.entries(item).filter(([, value]) => value !== null && value !== undefined));
-      if ('hibernate' in set || 'joinMinutes' in set) state.routerSettings = structuredClone(set); else delete state.routerSettings;
+      const set = Object.fromEntries(Object.entries(item).filter(([key, value]) => value !== null && value !== undefined && !(key === 'defaults' && !Object.keys(value).length)));
+      if ('hibernate' in set || 'joinMinutes' in set || 'defaults' in set) state.routerSettings = structuredClone(set); else delete state.routerSettings;
     },
     async getWaitingPage(level) { return structuredClone(state.pages[pageKey(level)] ?? null); },
     async putWaitingPage(level, page, { by, at }) { state.pages[pageKey(level)] = { page: structuredClone(page), by: by ?? null, at: at ?? null }; },

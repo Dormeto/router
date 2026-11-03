@@ -44,7 +44,7 @@ export function createJoinLevelsCache({ router, manager, now = Date.now, log, tt
     if (now() < slot.until) return slot.value;
     const asked = now();
     slot.loading ??= Promise.resolve().then(() => slot.reader?.()).then((record) => {
-      slot.value = record?.joinMinutes ?? null;
+      slot.value = record ?? null;
       slot.until = asked + ttlMs;
     }, (err) => {
       log.warn('JoinLevelUnreadable', { ...fields, level, error: err.message });
@@ -56,8 +56,13 @@ export function createJoinLevelsCache({ router, manager, now = Date.now, log, tt
   };
   return {
     async levels(fields = {}) {
-      const [routerValue, managerValue] = await Promise.all([read('router', fields), read('organization', fields)]);
-      return { router: routerValue, manager: managerValue };
+      const { router: routerRecord, manager: managerRecord } = await this.records(fields);
+      return { router: routerRecord?.joinMinutes ?? null, manager: managerRecord?.joinMinutes ?? null };
+    },
+    // The whole records (settings at scale design §6: the defaults and types beside the join), kept the same way.
+    async records(fields = {}) {
+      const [routerRecord, managerRecord] = await Promise.all([read('router', fields), read('organization', fields)]);
+      return { router: routerRecord, manager: managerRecord };
     },
   };
 }
@@ -68,7 +73,7 @@ export function createManagerSettings({ s3, url, catalogUrl = null, store, now =
   const where = parseUrl(url);
   const catalog = parseUrl(catalogUrl);
   // Nothing read yet: the level is unknown (null), never the built-in true, until a read succeeds (naps stop plainly).
-  const initial = { hibernate: null, joinMinutes: null, endedWindowDays: null, etag: null, readAt: null, error: null };
+  const initial = { hibernate: null, joinMinutes: null, endedWindowDays: null, defaults: {}, types: [], etag: null, readAt: null, error: null };
 
   const catalogReads = async () => {
     if (!catalog) return false;
@@ -91,12 +96,15 @@ export function createManagerSettings({ s3, url, catalogUrl = null, store, now =
     let next;
     try {
       // A copy from before joinMinutes or endedWindowDays is read in full: its ETag would answer 304 and hide a value already in the file.
-      const older = last.joinMinutes === undefined || last.endedWindowDays === undefined;
+      // So is a copy from before the defaults and types (settings at scale): every copy since holds both keys.
+      const older = last.joinMinutes === undefined || last.endedWindowDays === undefined || last.defaults === undefined;
       const out = await s3.getObjectIf({ bucket: where.bucket, key: where.key, etag: older ? null : last.etag });
       if (out.notModified) next = { ...last, readAt: at, error: null };
       else {
         try {
-          next = { ...parseManagerSettings(out.body.toString('utf8')), etag: out.etag, readAt: at, error: null };
+          const { problems, defaults = {}, types = [], ...values } = parseManagerSettings(out.body.toString('utf8'));
+          // An invalid part is dropped and its first problem is the error: the rest applies.
+          next = { ...values, defaults, types, etag: out.etag, readAt: at, error: problems ? `settings.json: ${problems[0]}` : null };
         } catch (err) {
           next = { ...last, readAt: at, error: `settings.json is invalid: ${err.message}` };
         }
@@ -105,7 +113,7 @@ export function createManagerSettings({ s3, url, catalogUrl = null, store, now =
       // Without s3:ListBucket (the routers' roles have none), a missing object answers AccessDenied: never set, but only
       // in a bucket whose catalog the router reads (as lib/catalog.mjs).
       const neverSet = err.name === 'NoSuchKey' || (err.name === 'AccessDenied' && await catalogReads());
-      if (neverSet) next = { hibernate: true, joinMinutes: null, endedWindowDays: null, etag: null, readAt: at, error: null };
+      if (neverSet) next = { hibernate: true, joinMinutes: null, endedWindowDays: null, defaults: {}, types: [], etag: null, readAt: at, error: null };
       else {
         next = { ...last, readAt: at, error: `S3 ${err.name}` };
         log.warn('ManagerSettingsUnreadable', { url, error: next.error });
@@ -126,7 +134,11 @@ export function createManagerSettings({ s3, url, catalogUrl = null, store, now =
       if (!stored) return null;
       return {
         hibernate: stored.hibernate, joinMinutes: stored.joinMinutes ?? null,
-        ...(stored.endedWindowDays === undefined ? {} : { endedWindowDays: stored.endedWindowDays }), readAt: stored.readAt, error: stored.error,
+        ...(stored.endedWindowDays === undefined ? {} : { endedWindowDays: stored.endedWindowDays }),
+        // The organization's defaults and types (settings at scale design §6), each only when there is one.
+        ...(stored.defaults && Object.keys(stored.defaults).length ? { defaults: stored.defaults } : {}),
+        ...(stored.types?.length ? { types: stored.types } : {}),
+        readAt: stored.readAt, error: stored.error,
       };
     },
   };

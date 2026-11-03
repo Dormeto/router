@@ -55,7 +55,7 @@ test('the first refresh stores the value, its ETag and the time', async () => {
   s.s3.put('settings.json', { workloads: { hibernate: false } });
   await s.settings.refresh();
   assert.deepEqual(await s.settings.current(), { hibernate: false, joinMinutes: null, endedWindowDays: null, readAt: s.clock.now(), error: null });
-  assert.deepEqual(s.store.state.managerSettings, { hibernate: false, joinMinutes: null, endedWindowDays: null, etag: '"e1"', readAt: s.clock.now(), error: null });
+  assert.deepEqual(s.store.state.managerSettings, { hibernate: false, joinMinutes: null, endedWindowDays: null, defaults: {}, types: [], etag: '"e1"', readAt: s.clock.now(), error: null });
   assert.deepEqual(s.s3.calls, [{ bucket: 'dmt-dev-manager-ip-lists-1', key: 'settings.json', etag: null }]);
 });
 
@@ -106,7 +106,7 @@ test('a failed read with nothing read before stores the level as unknown (null) 
   s.s3.failures.set('settings.json', 'SlowDown');
   await s.settings.refresh();
   assert.deepEqual(await s.settings.current(), { hibernate: null, joinMinutes: null, endedWindowDays: null, readAt: s.clock.now(), error: 'S3 SlowDown' });
-  assert.deepEqual(s.store.state.managerSettings, { hibernate: null, joinMinutes: null, endedWindowDays: null, etag: null, readAt: s.clock.now(), error: 'S3 SlowDown' });
+  assert.deepEqual(s.store.state.managerSettings, { hibernate: null, joinMinutes: null, endedWindowDays: null, defaults: {}, types: [], etag: null, readAt: s.clock.now(), error: 'S3 SlowDown' });
   // Reads that keep failing keep it unknown; an AccessDenied from a bucket whose catalog is unreadable too is a failure.
   s.clock.advance(5 * MIN);
   s.s3.failures.set('settings.json', 'AccessDenied');
@@ -238,6 +238,45 @@ test('a copy from before joinMinutes is read again in full: its ETag would hide 
   s.clock.advance(5 * MIN);
   await s.settings.refresh();
   assert.equal(s.s3.calls[1].etag, '"e1"');
+});
+
+// Settings at scale (vision design §6): the organization's defaults and types, mirrored beside hibernate.
+test('the organization\'s defaults and types: mirrored, answered by current(); an invalid part is the error, the rest kept', async () => {
+  const s = setup();
+  const api = { name: 'api', tags: { kind: 'api' }, settings: { idleMinutes: 30 } };
+  s.s3.put('settings.json', { workloads: { hibernate: false, defaults: { idleMinutes: 20 }, types: [api] } });
+  await s.settings.refresh();
+  assert.deepEqual(await s.settings.current(), { hibernate: false, joinMinutes: null, endedWindowDays: null, defaults: { idleMinutes: 20 }, types: [api], readAt: s.clock.now(), error: null });
+  s.clock.advance(5 * MIN);
+  s.s3.put('settings.json', { workloads: { hibernate: false, defaults: { idleMinutes: 20, waitSeconds: 1 } } });
+  await s.settings.refresh();
+  const current = await s.settings.current();
+  assert.deepEqual([current.defaults, current.types, current.error], [{ idleMinutes: 20 }, undefined, 'settings.json: workloads.defaults: waitSeconds must be a whole number from 5 to 120']);
+});
+
+test('a copy from before the defaults is read again in full: its ETag would hide them', async () => {
+  const s = setup();
+  s.s3.put('settings.json', { workloads: { hibernate: false, defaults: { idleMinutes: 20 } } });
+  s.store.state.managerSettings = { hibernate: false, joinMinutes: null, endedWindowDays: null, etag: '"e1"', readAt: s.clock.now() - 10 * MIN, error: null };
+  await s.settings.refresh();
+  assert.deepEqual(s.s3.calls, [{ bucket: 'dmt-dev-manager-ip-lists-1', key: 'settings.json', etag: null }]);
+  assert.deepEqual((await s.settings.current()).defaults, { idleMinutes: 20 });
+});
+
+test('createJoinLevelsCache.records: the whole records, kept as the levels are', async () => {
+  const clock = fakeClock();
+  const reads = { router: 0, manager: 0 };
+  const cache = createJoinLevelsCache({
+    router: () => { reads.router++; return { joinMinutes: 10, defaults: { idleMinutes: 30 } }; },
+    manager: async () => { reads.manager++; return { hibernate: true, types: [] }; },
+    now: clock.now, log: { warn() {} },
+  });
+  assert.deepEqual(await cache.records(), { router: { joinMinutes: 10, defaults: { idleMinutes: 30 } }, manager: { hibernate: true, types: [] } });
+  assert.deepEqual(await cache.levels(), { router: 10, manager: null });
+  assert.deepEqual(reads, { router: 1, manager: 1 });
+  clock.advance(60_000);
+  await cache.records();
+  assert.deepEqual(reads, { router: 2, manager: 2 });
 });
 
 test('joinLevels: each level\'s value; one that cannot be read is logged once and counts as unset, never failing', async () => {

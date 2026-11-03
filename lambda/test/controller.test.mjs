@@ -1942,7 +1942,7 @@ test('nap: a router that reads the manager\'s settings stops plainly until a rea
   assert.deepEqual(await napAgain(s), [[[id], false]]);
   // A first read that fails: the level stays unknown, stored as such, and the naps stop plainly.
   await s.settings.refresh();
-  assert.deepEqual(s.store.state.managerSettings, { hibernate: null, joinMinutes: null, endedWindowDays: null, etag: null, readAt: s.clock.now(), error: 'S3 SlowDown' });
+  assert.deepEqual(s.store.state.managerSettings, { hibernate: null, joinMinutes: null, endedWindowDays: null, defaults: {}, types: [], etag: null, readAt: s.clock.now(), error: 'S3 SlowDown' });
   assert.deepEqual(await napAgain(s), [[[id], false]]);
   assert.deepEqual(warnings.filter((w) => w.event === 'HibernationLevelUnreadable').map((w) => [w.workloadId, w.error]),
     [['demo', 'manager settings not read yet'], ['demo', 'manager settings not read yet: S3 SlowDown']]);

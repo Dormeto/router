@@ -476,24 +476,27 @@ export function createStore({ dynamo, table, now = Date.now, log = null }) {
     // record at each write; neither set: unset, no item.
     async getRouterSettings() {
       const { Item } = await dynamo.getItem({ TableName: table, Key: { pk: { S: 'ROUTER' }, sk: { S: 'SETTINGS' } }, ConsistentRead: true });
-      if (!Item?.hibernate && !Item?.joinMinutes) return null;
+      if (!Item?.hibernate && !Item?.joinMinutes && !Item?.defaults) return null;
       return {
         ...(Item.hibernate ? { hibernate: Item.hibernate.BOOL } : {}),
         ...(Item.joinMinutes ? { joinMinutes: Number(Item.joinMinutes.N) } : {}),
+        ...(Item.defaults ? { defaults: JSON.parse(Item.defaults.S) } : {}),
         by: Item.by?.S ?? null, at: Number(Item.at?.N ?? 0),
       };
     },
-    async putRouterSettings({ hibernate, joinMinutes, by, at }) {
+    // defaults (settings at scale design §6): the router level of the workload settings, as JSON, absent when empty.
+    async putRouterSettings({ hibernate, joinMinutes, defaults, by, at }) {
       const Key = { pk: { S: 'ROUTER' }, sk: { S: 'SETTINGS' } };
       const set = {
         ...(typeof hibernate === 'boolean' ? { hibernate: { BOOL: hibernate } } : {}),
         ...(typeof joinMinutes === 'number' ? { joinMinutes: { N: String(joinMinutes) } } : {}),
+        ...(defaults && Object.keys(defaults).length ? { defaults: { S: JSON.stringify(defaults) } } : {}),
       };
       if (!Object.keys(set).length) {
         await dynamo.deleteItem({ TableName: table, Key });
         return;
       }
-      const removed = ['hibernate', 'joinMinutes'].filter((name) => !(name in set));
+      const removed = ['hibernate', 'joinMinutes', 'defaults'].filter((name) => !(name in set));
       const values = { ...set, by: { S: String(by ?? '') }, at: { N: String(at) } };
       await dynamo.updateItem({
         TableName: table, Key,

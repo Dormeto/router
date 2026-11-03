@@ -88,6 +88,36 @@ test('parseManagerSettings: an invalid joinMinutes is unset, and hibernate stays
   }
 });
 
+// Settings at scale (vision design §5–§6): the organization's defaults and types; an invalid part is dropped and said, never
+// losing hibernate or the join.
+test('parseManagerSettings reads the organization\'s defaults and types, drops what is invalid and says it', () => {
+  const api = { name: 'api', tags: { kind: 'api' }, settings: { idleMinutes: 30 } };
+  const parsed = parseManagerSettings(JSON.stringify({ workloads: {
+    hibernate: false, joinMinutes: 30, defaults: { idleMinutes: 'x', waitSeconds: 20, wakeMode: 'browser' }, types: [api, { name: 'Bad', tags: {} }, { name: 'databases', settings: { idleMinutes: 45 } }],
+  } }));
+  assert.deepEqual([parsed.hibernate, parsed.joinMinutes, parsed.defaults, parsed.types], [false, 30, { waitSeconds: 20, wakeMode: 'browser' }, [api, { name: 'databases', settings: { idleMinutes: 45 } }]]);
+  assert.deepEqual(parsed.problems, [
+    'workloads.defaults: idleMinutes must be a whole number from 5 to 1440',
+    'workloads.types: type Bad: a name is lower-case letters, digits and hyphens, starting with a letter (at most 32)',
+    'workloads.types: type Bad: tags must select at least one tag (key and value)',
+  ]);
+  // Without hibernate: on, the rest read all the same.
+  assert.deepEqual(parseManagerSettings('{"workloads":{"defaults":{"idleMinutes":20}}}'), { hibernate: true, joinMinutes: null, endedWindowDays: null, defaults: { idleMinutes: 20 } });
+  // Not an object, not a list: none, said.
+  assert.deepEqual(parseManagerSettings('{"workloads":{"defaults":[],"types":{}}}').problems, ['workloads.defaults: settings must be an object', 'workloads.types: types must be a list']);
+  // Twenty-one custom types: none kept, the hibernate still read.
+  const many = Array.from({ length: 21 }, (_, i) => ({ name: `t${i}`, tags: { k: `${i}` }, settings: {} }));
+  const crowded = parseManagerSettings(JSON.stringify({ workloads: { hibernate: false, types: many } }));
+  assert.deepEqual([crowded.hibernate, crowded.types, crowded.problems], [false, undefined, ['workloads.types: at most 20 custom types']]);
+});
+
+test('settingsProblems: a router\'s defaults are checked as a level\'s', () => {
+  assert.deepEqual(settingsProblems({ defaults: { idleMinutes: 30, noWakeRules: [{ name: 'h', pathPrefixes: ['/health'] }], waitSeconds: null } }), []);
+  assert.deepEqual(settingsProblems({ defaults: { idleMinutes: 1 } }), ['settings: defaults: idleMinutes must be a whole number from 5 to 1440']);
+  assert.deepEqual(settingsProblems({ defaults: [] }), ['settings: defaults: settings must be an object']);
+  assert.deepEqual(settingsProblems({ defaults: { type: 'api' } }), ['settings: defaults: unknown setting type']);
+});
+
 test('parseManagerSettings throws on bad settings', () => {
   for (const text of [
     'not json', '', '[]', 'null', '1', '{"workloads":{"hibernate":"no"}}', '{"workloads":{"hibernate":null}}',

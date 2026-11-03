@@ -1,5 +1,6 @@
 // Whether a nap hibernates EC2 instances (hibernation design): the first level that is set decides. Pure.
 import { isEndedDays, isJoinMinutes, JOIN_MINUTES_MAX } from './schedule.mjs';
+import { defaultsProblems, typesProblems } from './settings-levels.mjs';
 
 // The longest an instance may stay hibernated: the maintenance wake comes before AWS's 60-day limit.
 export const HIBERNATION_MAX_DAYS = 59;
@@ -39,6 +40,8 @@ export function settingsProblems(settings) {
   for (const [key, value] of Object.entries(settings)) {
     if (key === 'joinMinutes') {
       if (value !== null && !isJoinMinutes(value)) problems.push(`settings: joinMinutes must be a whole number from 0 to ${JOIN_MINUTES_MAX}, a multiple of 5, or null`);
+    } else if (key === 'defaults') {
+      if (value !== null) problems.push(...defaultsProblems(value).map((p) => `settings: defaults: ${p}`));
     } else if (key !== 'hibernate') problems.push(`settings: unknown setting ${key}`);
     else if (value !== null && !isBoolean(value)) problems.push('settings: hibernate must be true, false or null');
   }
@@ -56,7 +59,41 @@ export function parseManagerSettings(text) {
   const { hibernate } = doc.workloads;
   const joinMinutes = isJoinMinutes(doc.workloads.joinMinutes) ? doc.workloads.joinMinutes : null;
   const endedWindowDays = isEndedDays(doc.workloads.endedWindowDays) ? doc.workloads.endedWindowDays : null;
-  if (hibernate === undefined) return { hibernate: true, joinMinutes, endedWindowDays };
+  const levels = levelsOf(doc.workloads);
+  if (hibernate === undefined) return { hibernate: true, joinMinutes, endedWindowDays, ...levels };
   if (!isBoolean(hibernate)) throw new Error('settings.json: workloads.hibernate must be true or false');
-  return { hibernate, joinMinutes, endedWindowDays };
+  return { hibernate, joinMinutes, endedWindowDays, ...levels };
+}
+
+// The organization's defaults and types (settings at scale design §6): what is valid of them, each key and each type on its
+// own; what is not is dropped and said in `problems` (never failing hibernate). Each key only when there is one.
+function levelsOf(workloads) {
+  const problems = [];
+  const levels = {};
+  if ('defaults' in workloads) {
+    if (!isObject(workloads.defaults)) problems.push('workloads.defaults: settings must be an object');
+    else {
+      const defaults = {};
+      for (const [key, value] of Object.entries(workloads.defaults)) {
+        const found = defaultsProblems({ [key]: value });
+        if (found.length) problems.push(...found.map((p) => `workloads.defaults: ${p}`));
+        else if (value !== null) defaults[key] = value;
+      }
+      if (Object.keys(defaults).length) levels.defaults = defaults;
+    }
+  }
+  if ('types' in workloads) {
+    const whole = typesProblems(workloads.types);
+    if (!Array.isArray(workloads.types) || whole.some((p) => p.startsWith('at most'))) problems.push(...whole.map((p) => `workloads.types: ${p}`));
+    else {
+      const kept = [];
+      for (const type of workloads.types) {
+        const found = typesProblems([...kept, type]).filter((p) => !typesProblems(kept).includes(p));
+        if (found.length) problems.push(...found.map((p) => `workloads.types: ${p}`));
+        else kept.push(type);
+      }
+      if (kept.length) levels.types = kept;
+    }
+  }
+  return problems.length ? { ...levels, problems } : levels;
 }

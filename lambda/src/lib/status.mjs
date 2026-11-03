@@ -102,7 +102,10 @@ export function createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging
         drainSeconds: cfg.drainSeconds,
         wakeTimeoutSeconds: cfg.wakeTimeoutSeconds,
         maxHolders: cfg.maxHolders,
+        failedRetrySeconds: cfg.failedRetrySeconds ?? 60,
       },
+      // Where each setting comes from and the workload's type (settings at scale design §6), for a resolved configuration.
+      ...(cfg.settingsFrom ? { settingsFrom: cfg.settingsFrom, type: cfg.type } : {}),
       // Requests that reached the waker while the workload was not awake: an unreadable table never breaks the status.
       stats: loadStats ? await loadStats().catch((err) => ({ error: err.message })) : null,
       ipLists: loadLists ? await loadLists().catch((err) => [{ error: err.message }]) : [],

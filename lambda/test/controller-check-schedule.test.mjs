@@ -560,16 +560,17 @@ test('the check reads the levels once, logs a level it cannot read once, and goe
   const [result] = await s.checkAt('19T08:00');
   assert.equal(result.schedule, 'wake');
   assert.equal(reads, 1);
-  assert.deepEqual(s.logged('JoinLevelUnreadable'), [{ level: 'router', error: 'ThrottlingException' }]);
+  // One read for the settings and the join alike (settings at scale design §6).
+  assert.deepEqual(s.logged('SettingsLevelUnreadable'), [{ level: 'router', error: 'ThrottlingException' }]);
 });
 
-test('without a schedule the check reads no level for joining', async () => {
+test('without a schedule the check still reads the levels once: the settings come from them', async () => {
   const s = setup({ run: { state: STATES.AWAKE } });
   let reads = 0;
   const read = s.wrapped.getRouterSettings;
   s.wrapped.getRouterSettings = async () => { reads++; return read(); };
   await s.checkAt('19T08:00');
-  assert.equal(reads, 0);
+  assert.equal(reads, 1);
 });
 
 test('the value reaches the idle nap: a workload in a gap it joins is kept awake, in a gap it does not, it naps', async () => {

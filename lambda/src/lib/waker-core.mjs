@@ -5,9 +5,10 @@ import { WAKE_HEADER, acceptsHtml, classify, headerValues, redirectCount, reques
 import { PAGE_CSP, languageOf, renderJson, renderPage } from './page.mjs';
 import { medianOf } from './page-settings.mjs';
 import { ADMIN_PREFIX, parseAdminPath } from './admin.mjs';
-import { compileRules, describeRules } from './no-wake.mjs';
+import { compileRules } from './no-wake.mjs';
 import { STATS_DAYS } from './summary.mjs';
 import { createJoinLevelsCache } from './manager-settings.mjs';
+import { describedRules, effectiveConfig } from './settings-levels.mjs';
 import { isJoinMinutes, napEndHeader, napEndOf, occurrenceAt, resolveJoin } from './schedule.mjs';
 
 const POLL_MS = 1000;
@@ -40,7 +41,8 @@ export function createWaker({ store, invokeController, prefix, workloadIdOf = (e
     }
     return compiled.get(key);
   }
-  const noWakeRules = (cfg) => [...rulesFor('router', defaultRules), ...rulesFor('workload', cfg.noWakeRules)];
+  // Every level's rules, the most general first (settings at scale design §6): the first that matches decides.
+  const noWakeRules = (cfg) => cfg.ruleLevels.noWake.flatMap(({ level, rules }) => rulesFor(level, rules));
 
   // Daily statistics: a failed counter update never changes the answer.
   async function count(workloadId, counter) {
@@ -240,11 +242,14 @@ export function createWaker({ store, invokeController, prefix, workloadIdOf = (e
 
   return async function handler(event) {
     const workloadId = workloadIdOf(event);
-    const [cfg, initial] = await Promise.all([store.getConfig(workloadId), store.getRun(workloadId)]);
-    if (!cfg || !initial) {
+    const [stored, initial] = await Promise.all([store.getConfig(workloadId), store.getRun(workloadId)]);
+    if (!stored || !initial) {
       log.error('WorkloadNotConfigured', { workloadId });
       return waiter(event, 10, STATES.FAILED);
     }
+    // The settings resolved from the levels (settings at scale design §6), read through the cache the join reads.
+    const levels = await joinCache.records({ workloadId });
+    const cfg = effectiveConfig(stored, { run: initial, router: levels.router, organization: levels.manager, terraformRules: defaultRules });
     const admin = getAdmin ? parseAdminPath(event.path, cfg) : null;
     if (!admin && cfg.admin?.enabled && event.path?.startsWith(ADMIN_PREFIX)) {
       // The ALB sends every /_dormeto/* path here: a wrong secret is a 404, never a wake or a redirect.
@@ -255,13 +260,12 @@ export function createWaker({ store, invokeController, prefix, workloadIdOf = (e
       return handle({
         event, workloadId, cfg, run: initial, base: admin.base, route: admin.route,
         forceWake: (run) => forceWake(workloadId, run),
-        noWakeRules: describeRules([{ level: 'router', rules: defaultRules }, { level: 'workload', rules: cfg.noWakeRules }]),
-        wakeRules: describeRules([{ level: 'wake', rules: cfg.wakeRules }]),
+        ...describedRules(cfg),
         loadStats: () => store.getStats(workloadId, STATS_DAYS),
         loadLists: listCache ? () => listCache.describe() : null,
       });
     }
-    const options = { browserMode: cfg.wakeMode === 'browser', wakeRules: rulesFor('wake', cfg.wakeRules) };
+    const options = { browserMode: cfg.wakeMode === 'browser', wakeRules: cfg.ruleLevels.wake.flatMap(({ rules }) => rulesFor('wake', rules)) };
     let classified = classify(event, noWakeRules(cfg), options);
     // IP lists only matter for requests that the filters and explicit wakes did not settle, and not while awake
     // (requests reach the waker then only during the route switch): no list load for the others.

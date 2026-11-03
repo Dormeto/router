@@ -499,3 +499,24 @@ test('the route grace and the redirect limit answer the workload\'s page, and a 
   const unread = setup({ run: { state: STATES.ASLEEP }, cfg: testConfig({ waitSeconds: 0 }), waitingPages: { pageOf: async () => { throw new Error('x'); } } });
   assert.equal(headerOf(await unread.handler(albEvent()), 'content-security-policy'), PAGE_CSP);
 });
+
+// Settings at scale (vision design §6): the waker acts on the resolved settings.
+test('settings at scale: an organization no-wake rule keeps a request from waking, the reason naming it', async () => {
+  const { handler, store, entries, invocations } = rulesSetup();
+  store.state.managerSettings = { hibernate: true, defaults: { noWakeRules: [{ name: 'health', pathPrefixes: ['/health'] }] }, types: [], readAt: 1, error: null };
+  await handler(albEvent({ path: '/health' }));
+  assert.equal(invocations.length, 0);
+  assert.equal(entries.find(([e]) => e === 'WakeIgnored')[1].reason, 'rule health');
+  await handler(albEvent({ path: '/orders' }));
+  assert.equal(invocations.length, 1);
+});
+
+test('settings at scale: a type\'s browser wake mode waits for the page\'s probe', async () => {
+  const cfg = testConfig({ waitSeconds: 0, tags: { kind: 'web' }, inherits: ['wakeMode'] });
+  const { handler, store, invocations } = rulesSetup({ cfg });
+  store.state.managerSettings = { hibernate: true, defaults: {}, types: [{ name: 'web', tags: { kind: 'web' }, settings: { wakeMode: 'browser' } }], readAt: 1, error: null };
+  await handler(albEvent());
+  assert.equal(invocations.length, 0, 'a plain request does not wake in browser mode');
+  await handler(albEvent({ headers: { 'x-dormeto-probe': '1', accept: '*/*' } }));
+  assert.equal(invocations.length, 1);
+});

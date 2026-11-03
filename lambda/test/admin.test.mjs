@@ -298,7 +298,7 @@ test('status.json and the dashboard show the wake mode and the wake rules', asyn
   const { handler } = setup({ run: { state: STATES.AWAKE }, cfg });
   const status = JSON.parse((await handler(albEvent({ path: `${BASE}/status.json`, headers: { accept: 'application/json' } }))).body);
   assert.equal(status.wakeMode, 'browser');
-  assert.deepEqual(status.wakeRules, [{ name: 'api', level: 'wake', conditions: { pathPrefixes: ['/api/'] } }]);
+  assert.deepEqual(status.wakeRules, [{ name: 'api', level: 'wake', conditions: { pathPrefixes: ['/api/'] }, from: 'workload' }]);
   const page = (await handler(albEvent({ path: `${BASE}/` }))).body;
   assert.match(page, /Wake mode<\/th><td>browser: the waiter page probe, the x-dormeto-wake header or a wake rule wakes/);
   assert.match(page, /api \(wake\): path \/api\/\*/);

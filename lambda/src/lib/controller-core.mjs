@@ -25,6 +25,7 @@ import { healthOf, lambdaMetrics, queueDepths } from './health.mjs';
 import { cleanPage, pageWarnings, resolvePage, validatePage, withWake } from './page-settings.mjs';
 import { HIBERNATION_MAX_DAYS, hibernationDue, resolveHibernation, settingsProblems } from './hibernation.mjs';
 import { joinLevels } from './manager-settings.mjs';
+import { describedRules, effectiveConfig } from './settings-levels.mjs';
 import {
   backendKey, backendStatuses, isCompanion, resolveBackends, resumeBackends, sleepBackends, startCompanions, stopCompanions, toRecord, wakeBackends,
 } from './backends.mjs';
@@ -90,6 +91,27 @@ export function createController({
     return cfg;
   }
 
+  // The levels above a workload (vision settings at scale design §6): the router's record and its copy of the manager's
+  // settings, read fresh (a check reads them once for all its workloads). One that cannot be read counts as none.
+  async function readLevels() {
+    const read = (level, reader) => (reader ? reader().catch((err) => {
+      log.warn('SettingsLevelUnreadable', { level, error: err.message });
+      return null;
+    }) : null);
+    // The organization as hibernation and the join read it: the manager's settings reader, else the router's copy.
+    const organizationReader = managerSettings ? () => managerSettings.current() : store.getManagerSettings;
+    const [routerLevel, organization] = await Promise.all([read('router', store.getRouterSettings), read('organization', organizationReader)]);
+    return { routerLevel, organization };
+  }
+
+  // The configuration a wake, a nap, the check, the status and the list act on: each setting resolved, where it comes
+  // from, the type and the rules of every level. The stored one stays what the writes read (config()).
+  async function effective(cfg, run, levels) {
+    if (cfg.settingsFrom) return cfg;
+    const { routerLevel, organization } = levels ?? await readLevels();
+    return effectiveConfig(cfg, { run, router: routerLevel, organization, terraformRules: defaultRules });
+  }
+
   async function managedBackends(cfg, scope = clients) {
     const { backends, ignored } = await resolveBackends(scope, cfg);
     for (const target of ignored) log.info('IgnoredTarget', { workloadId: cfg.workloadId, target: target.id, reason: target.reason });
@@ -130,7 +152,7 @@ export function createController({
     try {
       run = await store.getRun(workloadId);
       if (!isCurrent(run)) return superseded();
-      cfg = knownConfig ?? (await config(workloadId));
+      cfg = await effective(knownConfig ?? (await config(workloadId)), run);
     } catch (err) {
       return fail(err);
     }
@@ -208,7 +230,7 @@ export function createController({
   // cause: what asked for it, the idle check or the manager, and by: who, from the manager (the state change event
   // says both).
   async function nap(workloadId, { cause = 'idle', by } = {}) {
-    const cfg = await config(workloadId);
+    const cfg = await effective(await config(workloadId), await store.getRun(workloadId));
     // A nap requested before a pause (idle check, manager) is refused when it starts.
     if (await isPaused(workloadId)) {
       log.warn('NapSkipped', { workloadId, reason: 'paused' });
@@ -428,9 +450,9 @@ export function createController({
   }
 
   // ctx (an idle check): its rules snapshot (what it compares; anything it changes is read again) and its clients.
-  async function reconcile(cfg, ctx = null) {
+  async function reconcile(cfg, ctx = null, known = undefined) {
     const { workloadId } = cfg;
-    let run = await store.getRun(workloadId);
+    let run = known === undefined ? await store.getRun(workloadId) : known;
     if (!run) return null;
     const stuckBefore = now() - NAPPING_STUCK_MS;
     if (run.state === STATES.NAPPING && (run.updatedAt ?? 0) < stuckBefore) {
@@ -551,8 +573,11 @@ export function createController({
     return run;
   }
 
-  async function checkOne(cfg, paused, ctx = null) {
-    const run = await reconcile(cfg, ctx);
+  async function checkOne(stored, paused, ctx = null) {
+    // Its run read once: it tells the type (the backends' kinds), and the reconcile goes on from it.
+    const known = await store.getRun(stored.workloadId);
+    const cfg = await effective(stored, known, ctx?.levels);
+    const run = await reconcile(cfg, ctx, known);
     // A failed workload still paying (its backends run without a healthy target: the reconcile left it FAILED) is stopped
     // once its idle window has passed since the failure (R7a, FinOps); a paused one is left for its team.
     if (run?.state === STATES.FAILED && !paused && (run.failedAt ?? 0) <= now() - cfg.idleMinutes * 60_000) {
@@ -783,13 +808,13 @@ export function createController({
   }
 
   // A workload's row of the list (and of the check's report): pauses are the router's, all of them.
-  async function rowOf(cfg, host, pauses, scheduled) {
+  async function rowOf(cfg, host, pauses, scheduled, levels) {
     const [run, stats] = await Promise.all([
       store.getRun(cfg.workloadId),
       store.getStats(cfg.workloadId, STATS_DAYS).catch(() => null),
     ]);
     const shown = pauses.filter((p) => p.workloadId === cfg.workloadId || p.workloadId === null);
-    return workloadSummary(cfg, run, host, totals(stats), shownPauses(shown), scheduled);
+    return workloadSummary(await effective(cfg, run, levels), run, host, totals(stats), shownPauses(shown), scheduled);
   }
 
   // One workload's row to the manager at once, after its onboarding (vision refusals design §2): its host read from its
@@ -805,7 +830,7 @@ export function createController({
       return [];
     });
     const scheduled = Boolean(await store.getSchedule(workloadId).catch(() => true));
-    await publisher.listed({ at: iso(now()), workload: await rowOf(cfg, host, pauses, scheduled) });
+    await publisher.listed({ at: iso(now()), workload: await rowOf(cfg, host, pauses, scheduled, await readLevels()) });
     log.info('WorkloadReported', { workloadId });
     return { reported: true };
   }
@@ -820,7 +845,8 @@ export function createController({
       return [];
     });
     const routerPauses = pauses.filter((p) => p.workloadId === null);
-    const workloads = await Promise.all(configs.map((cfg) => rowOf(cfg, byWorkload.get(cfg.workloadId), pauses, schedules.has(cfg.workloadId))));
+    const levels = await readLevels();
+    const workloads = await Promise.all(configs.map((cfg) => rowOf(cfg, byWorkload.get(cfg.workloadId), pauses, schedules.has(cfg.workloadId), levels)));
     const health = await store.getCheck().catch(() => null);
     return {
       router: {
@@ -833,15 +859,14 @@ export function createController({
   }
 
   async function workloadStatus(workloadId) {
-    const cfg = await config(workloadId);
     const run = await store.getRun(workloadId);
+    const cfg = await effective(await config(workloadId), run);
     // An unreadable schedule (the stored JSON does not parse, or a zone this runtime refuses) never breaks the status; a
     // failed read (a store error) does, as any read error would.
     const answer = await status(workloadId, cfg, run ?? {}, {
       pauses: await pausesFor(workloadId),
       drift: store.listDrift ? await store.listDrift(workloadId, 10).catch(() => []) : [],
-      noWakeRules: describeRules([{ level: 'router', rules: defaultRules }, { level: 'workload', rules: cfg.noWakeRules }]),
-      wakeRules: describeRules([{ level: 'wake', rules: cfg.wakeRules }]),
+      ...describedRules(cfg),
       loadStats: () => store.getStats(workloadId, STATS_DAYS),
       loadLists: async () => [...await describeStoredLists(store, ipLists), ...(catalog ? (await catalog.describe()).lists : [])],
       loadHibernation: (instanceIds) => hibernationView(cfg, run, instanceIds),
@@ -1110,7 +1135,9 @@ export function createController({
       const configs = listed.configs.sort((a, b) => a.workloadId.localeCompare(b.workloadId));
       // The schedules first, whatever the budget; pauses that cannot be read hold every scheduled nap and wake too.
       const keptAsleep = (workloadId) => pauses === null || pauses.some((p) => p.keepAsleep && (p.workloadId === null || p.workloadId === workloadId));
-      const joins = listed.schedules.size ? await readJoinLevels() : {};
+      // The levels once for every workload: their settings (settings at scale design §6) and the join of their windows.
+      const levels = await readLevels();
+      const joins = listed.schedules.size ? { router: levels.routerLevel?.joinMinutes ?? null, manager: levels.organization?.joinMinutes ?? null } : {};
       const endedDays = listed.schedules.size ? await endedDaysOf() : null;
       const { applied, readable } = await applySchedules(configs, listed.schedules, (id) => ({ paused: paused(id), keepAsleep: keptAsleep(id) }), now(), joins, endedDays);
       // Then the hibernation's 60-day limit, for every workload, held alike.
@@ -1128,7 +1155,7 @@ export function createController({
       // The rules of the workloads, a chunk at a time in the check's order, each load balancer listed once (the listing
       // cache); backends found by tag once. A chunk is not started when its listing would end past the budget.
       const listing = { balancers: new Map(), listed: new Map(), tags: new Map() };
-      const ctx = { rules: new Map(), scope: checkScope(clients), schedules: readable, applied, joins };
+      const ctx = { rules: new Map(), scope: checkScope(clients), schedules: readable, applied, joins, levels };
       const deadline = Math.min(started + CHECK_BUDGET_MS, budgetEnd);
       const results = [];
       let next = 0;

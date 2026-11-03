@@ -1,7 +1,7 @@
 // A workload's settings at scale (vision settings at scale design §4–§7): each field from the most specific level that
 // sets it, workload → type → router → organization → built-in; the rules of every level add up. Pure: the levels are
 // read elsewhere (the router's record, its mirror of the manager's settings.json).
-import { compileRules } from './no-wake.mjs';
+import { compileRules, describeRules } from './no-wake.mjs';
 
 export const SETTING_RANGES = {
   idleMinutes: [5, 1440], waitSeconds: [5, 120], drainSeconds: [0, 300], wakeTimeoutSeconds: [60, 3600], maxHolders: [1, 500], failedRetrySeconds: [10, 600],
@@ -164,4 +164,13 @@ export function typesProblems(types) {
     if (isSet(type.settings)) problems.push(...defaultsProblems(type.settings).map((p) => `${at}: settings: ${p}`));
   }
   return problems;
+}
+
+// For people (the status, the router's admin page): each no-wake rule with its level, each wake rule with the level it
+// comes from (`level: 'wake'` as before, `from` the level).
+export function describedRules(cfg) {
+  return {
+    noWakeRules: describeRules(cfg.ruleLevels.noWake),
+    wakeRules: cfg.ruleLevels.wake.flatMap(({ level, rules }) => describeRules([{ level: 'wake', rules }]).map((rule) => ({ ...rule, from: level }))),
+  };
 }

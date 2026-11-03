@@ -1850,7 +1850,9 @@ test('nap: the router\'s or the manager\'s false stops the instance; an unreadab
   assert.equal((await release.handler({ action: 'release', workloadId: 'demo' })).state, STATES.ASLEEP);
   assert.deepEqual(stopsOf(release), [[[id], false]]);
   assert.deepEqual(warnings.filter((w) => w.event.endsWith('Unreadable')).map((w) => [w.event, w.error]),
-    [['HibernationLevelUnreadable', 'ProvisionedThroughputExceededException'], ['HibernationLevelUnreadable', 'table'], ['HibernationLevelUnreadable', 'ThrottlingException']]);
+    // The nap's settings read the levels too (settings at scale): each failed read said once for them, once for hibernation.
+    [['SettingsLevelUnreadable', 'ProvisionedThroughputExceededException'], ['HibernationLevelUnreadable', 'ProvisionedThroughputExceededException'],
+      ['SettingsLevelUnreadable', 'table'], ['HibernationLevelUnreadable', 'table'], ['HibernationLevelUnreadable', 'ThrottlingException']]);
 });
 
 test('nap: a run that asks for a fresh boot stops the instance, and the nap removes freshBoot (hibernation, 60 days)', async () => {
@@ -2162,9 +2164,10 @@ test('status gives the hibernation: the resolution, each level, the instances EC
   s.log.warn = (event, fields) => warnings.push({ event, ...fields });
   const describe = s.ec2.describeInstances;
   const routerSettings = s.store.getRouterSettings;
-  let levelsRead = false;
-  s.store.getRouterSettings = async () => { levelsRead = true; return routerSettings(); };
-  s.ec2.describeInstances = async (input) => { if (levelsRead) throw new Error('RequestLimitExceeded'); return describe(input); };
+  // The settings read the levels first (settings at scale), then the hibernation: its read is the second.
+  let levelsRead = 0;
+  s.store.getRouterSettings = async () => { levelsRead += 1; return routerSettings(); };
+  s.ec2.describeInstances = async (input) => { if (levelsRead >= 2) throw new Error('RequestLimitExceeded'); return describe(input); };
   const degraded = await s.handler({ action: 'status', workloadId: 'demo' });
   assert.equal(degraded.hibernation.instances, null);
   assert.deepEqual(warnings.map((w) => [w.event, w.error]), [['HibernationUnread', 'RequestLimitExceeded']]);
@@ -2685,4 +2688,50 @@ test('report: publishes the row of one workload as the check sends it, at once; 
   const first = reporting(fresh);
   await first.handler({ action: 'report', workloadId: 'demo', refusals: true });
   assert.equal(first.sent.listed[0].workload.url, 'https://shop.example.com/');
+});
+
+// --- Settings at scale (vision design §6): the controller acts on the resolved settings and says where each comes from --
+
+const API_TYPE = { name: 'api', tags: { kind: 'api' }, settings: { waitSeconds: 30, wakeRules: [{ name: 'key', headers: [{ name: 'x-api-key', pattern: '.+' }] }] } };
+
+test('settings at scale: a router default idle window applies to a workload that inherits it, and the status says so', async () => {
+  const s = setup({ run: { state: STATES.AWAKE }, cfg: testConfig({ source: 'manager', inherits: ['idleMinutes'] }) });
+  s.store.state.run.awakeSince = s.clock.now() - 20 * 60_000;
+  s.store.state.routerSettings = { defaults: { idleMinutes: 30 }, by: 'ana', at: 1 };
+  await s.handler({ action: 'check' });
+  assert.equal(s.cloudwatch.calls.length, 0, 'not idle long enough for 30 minutes');
+  const status = await s.handler({ action: 'status', workloadId: 'demo' });
+  assert.deepEqual([status.settings.idleMinutes, status.settingsFrom.idleMinutes, status.settingsFrom.waitSeconds], [30, 'router', 'workload']);
+  assert.equal(status.settings.failedRetrySeconds, s.cfg.failedRetrySeconds ?? 60);
+  // Without it, the built-in 15 minutes: the check reads the requests.
+  delete s.store.state.routerSettings;
+  await s.handler({ action: 'check' });
+  assert.ok(s.cloudwatch.calls.length > 0);
+});
+
+test('settings at scale: an organization type picked by tags sets a setting; the status and the list name the type', async () => {
+  const s = setup({ run: { state: STATES.AWAKE }, cfg: testConfig({ source: 'manager', inherits: ['waitSeconds'], tags: { kind: 'api' } }) });
+  s.store.state.managerSettings = { hibernate: true, joinMinutes: null, endedWindowDays: null, defaults: {}, types: [API_TYPE], readAt: 1, error: null };
+  const status = await s.handler({ action: 'status', workloadId: 'demo' });
+  assert.deepEqual([status.settings.waitSeconds, status.settingsFrom.waitSeconds, status.type], [30, 'type', { name: 'api', from: 'tags' }]);
+  assert.deepEqual(status.wakeRules.map((r) => [r.level, r.from, r.name]), [['wake', 'type', 'key']]);
+  const { workloads: [row] } = await s.handler({ action: 'list' });
+  assert.deepEqual([row.type, row.settingsFrom.waitSeconds, row.settings.waitSeconds], ['api', 'type', 30]);
+});
+
+test('settings at scale: the rules of every level in the status, the most general first, the same name twice', async () => {
+  const s = setup({ run: { state: STATES.AWAKE }, cfg: testConfig({ noWakeRules: [{ name: 'same', pathPrefixes: ['/w'] }] }) });
+  s.store.state.managerSettings = { hibernate: true, defaults: { noWakeRules: [{ name: 'same', pathPrefixes: ['/o'] }] }, types: [], readAt: 1, error: null };
+  s.store.state.routerSettings = { defaults: { noWakeRules: [{ name: 'r', pathPrefixes: ['/r'] }] }, by: 'ana', at: 1 };
+  const status = await s.handler({ action: 'status', workloadId: 'demo' });
+  assert.deepEqual(status.noWakeRules.map((r) => [r.level, r.name]), [['organization', 'same'], ['router', 'r'], ['workload', 'same']]);
+});
+
+test('settings at scale: a rename after a router default writes back the stored configuration, never the resolved one', async () => {
+  const s = setup({ run: { state: STATES.AWAKE }, cfg: testConfig({ source: 'manager', name: 'Demo', inherits: ['idleMinutes'] }) });
+  s.store.state.routerSettings = { defaults: { idleMinutes: 30 }, by: 'ana', at: 1 };
+  await s.handler({ action: 'status', workloadId: 'demo' });
+  await s.handler({ action: 'rename', workloadId: 'demo', name: 'Shop', by: 'ops' });
+  const stored = await s.store.getConfig('demo');
+  assert.deepEqual([stored.name, stored.idleMinutes, stored.inherits, 'settingsFrom' in stored, 'ruleLevels' in stored], ['Shop', 15, ['idleMinutes'], false, false]);
 });

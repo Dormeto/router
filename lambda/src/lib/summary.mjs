@@ -65,6 +65,8 @@ export function workloadSummary(cfg, run = {}, host = null, stats7d = null, paus
     // Only while asleep with instances its nap hibernated (hibernation design §4).
     ...(run?.state === STATES.ASLEEP && run.hibernated ? { hibernated: true } : {}),
     stats7d,
+    // Its type and where each setting comes from (settings at scale design §6): the manager counts what a level reaches.
+    ...(cfg.settingsFrom ? { type: cfg.type?.name ?? null, settingsFrom: cfg.settingsFrom } : {}),
     settings: {
       waitSeconds: cfg.waitSeconds,
       idleMinutes: cfg.idleMinutes,

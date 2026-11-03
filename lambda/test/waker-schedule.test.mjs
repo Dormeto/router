@@ -176,7 +176,8 @@ test('a level the waker cannot read falls through, is logged once and fails noth
   assert.deepEqual(both.invocations, []);
 });
 
-test('the waker reads the levels only for a workload not awake with a schedule, and one that sets its own reads none', async () => {
+// Settings at scale (design §6): every request's settings come from the levels, read once a minute through the cache.
+test('the waker reads each level once, whatever the workload: its settings come from them', async () => {
   const counted = (options) => {
     const s = setup(options);
     s.reads = 0;
@@ -191,13 +192,13 @@ test('the waker reads the levels only for a workload not awake with a schedule, 
   assert.equal(sets.reads, 2);
   const own = counted({ schedule: joined({ joinMinutes: 15 }), now: GAP });
   await own.handler(albEvent());
-  assert.equal(own.reads, 0);
+  assert.equal(own.reads, 2);
   const none = counted({ schedule: null, now: GAP });
   await none.handler(albEvent());
-  assert.equal(none.reads, 0);
+  assert.equal(none.reads, 2);
   const up = counted({ schedule: joined(), now: GAP, run: { state: STATES.AWAKE } });
   await up.handler(albEvent());
-  assert.equal(up.reads, 0);
+  assert.equal(up.reads, 2);
 });
 
 // An end that is only the horizon: a daily nap 00:00–23:45, joined at the default, never actually ends.
@@ -320,10 +321,10 @@ test('a value that a failed read replaced is not kept: a level unread is unset',
   assert.equal(s.invocations.length, 1, 'the organization\'s 0');
 });
 
-test('a schedule with its own value reads no level, over a burst too', async () => {
+test('a burst reads each level once a minute, a schedule with its own value too', async () => {
   const s = counting({ schedule: joined({ joinMinutes: 15 }), now: GAP });
   await s.burst();
   s.clock.advance(120 * SECOND);
   await s.burst();
-  assert.deepEqual(s.reads, { getRouterSettings: 0, getManagerSettings: 0 });
+  assert.deepEqual(s.reads, { getRouterSettings: 2, getManagerSettings: 2 });
 });

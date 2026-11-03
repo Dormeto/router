@@ -2659,3 +2659,30 @@ test('refusals: thrown as before without the flag; an error that is no refusal i
   await assert.rejects(terraform.handler({ action: 'status', workloadId: 'demo', refusals: true }), { message: 'ProvisionedThroughputExceededException' });
 });
 
+// A report after an onboarding (vision refusals design §2): the workload's row as the check sends it, at once.
+test('report: publishes the row of one workload as the check sends it, at once; none without a bus', async () => {
+  const reporting = (s) => {
+    const sent = { checked: [], listed: [] };
+    const handler = createController({
+      store: s.store, ec2: fakeEc2(s.cfg.instanceIds), elbv2: s.elbv2, cloudwatch: fakeCloudWatch([5]), autoscaling: fakeAutoScaling(), ecs: fakeEcs(), tagging: fakeTagging(fakeEcs()), appscaling: fakeAppScaling(),
+      invokeSelf: async () => {}, now: s.clock.now, sleep: s.clock.sleep, log: silentLog,
+      router: { name: 'dmt-dev', version: '0.37.0', build: 'abc', checkSchedule: 'rate(5 minutes)' },
+      publisher: { enabled: true, checked: async (payload) => { sent.checked.push(payload); }, stateChanged: async () => {}, listed: async (payload) => { sent.listed.push(payload); } },
+    });
+    return { handler, sent };
+  };
+  const s = setup({ run: { state: STATES.AWAKE }, cfg: testConfig({ name: 'Demo', source: 'manager' }) });
+  const { handler, sent } = reporting(s);
+  await handler({ action: 'check', source: 'schedule' });
+  assert.deepEqual(await handler({ action: 'report', workloadId: 'demo', refusals: true }), { reported: true });
+  assert.deepEqual(sent.listed, [{ at: new Date(s.clock.now()).toISOString(), workload: sent.checked[0].workloads[0] }]);
+  assert.deepEqual(await handler({ action: 'report', workloadId: 'nope', refusals: true }), { refused: { code: 'not_found', message: 'workload not configured: nope' } });
+  assert.equal(sent.listed.length, 1);
+  assert.deepEqual(await s.handler({ action: 'report', workloadId: 'demo' }), { reported: false });
+  // Just onboarded, the check never saw it: its host comes from its rules.
+  const fresh = setup({ run: { state: STATES.AWAKE }, cfg: testConfig({ name: 'Demo', source: 'manager' }) });
+  [...fresh.elbv2.state.rules.values()][0].conditions = [host('shop.example.com')];
+  const first = reporting(fresh);
+  await first.handler({ action: 'report', workloadId: 'demo', refusals: true });
+  assert.equal(first.sent.listed[0].workload.url, 'https://shop.example.com/');
+});

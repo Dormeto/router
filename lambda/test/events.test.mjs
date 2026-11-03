@@ -28,6 +28,7 @@ test('without a bus, nothing is published', async () => {
   const publisher = createPublisher({ events, busArn: '', router: ROUTER, log: logs() });
   await publisher.checked({ checkedAt: 'x', workloads: [{ workloadId: 'a' }] });
   await publisher.stateChanged({ workloadId: 'a', from: 'AWAKE', to: 'NAPPING', at: 'x' });
+  await publisher.listed({ at: 'x', workload: { workloadId: 'a' } });
   assert.equal(events.calls.length, 0);
   assert.equal(publisher.enabled, false);
 });
@@ -122,4 +123,18 @@ test('a state change carries the workload\'s tags ({} without), for the manager\
   const broken = withTransitionEvents({ ...store, getConfig: async () => { throw new Error('boom'); } }, { stateChanged: async (c) => { published.push(c); } }, { now: () => 0 });
   await broken.transition('a', { cond: { state: 'ASLEEP' }, set: { state: 'WAKING' } });
   assert.deepEqual(published.at(-1).tags, {}, 'an unreadable configuration never holds the event back');
+});
+
+// A report after an onboarding (vision refusals design §2): the workload's row alone, never the router's state.
+test('a workload listed is one entry: the router, when and its row; a failed publish is logged, never thrown', async () => {
+  for (const fail of [null, 'throw']) {
+    const events = fakeEvents({ fail });
+    const log = logs();
+    const workload = { workloadId: 'a', name: 'Shop', state: 'AWAKE' };
+    await createPublisher({ events, busArn: BUS, router: ROUTER, log }).listed({ at: '2026-11-03T10:00:00.000Z', workload });
+    const [entry] = events.calls[0].input.Entries;
+    assert.deepEqual([entry.EventBusName, entry.Source, entry.DetailType, events.calls[0].options.region], [BUS, 'dormeto.router', 'Workload listed', 'eu-west-1']);
+    assert.deepEqual(JSON.parse(entry.Detail), { router: ROUTER, at: '2026-11-03T10:00:00.000Z', workload });
+    assert.equal(log.lines.some(([level, event]) => level === 'warn' && event === 'PublishFailed'), fail !== null, String(fail));
+  }
 });

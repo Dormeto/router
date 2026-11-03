@@ -75,7 +75,7 @@ export function createController({
   queueWork = null,
   // The drift queue: the check's repair requests, read with the drift events by the onboarder (2 at a time).
   queueRepair = null,
-  publisher = { enabled: false, checked: async () => {}, stateChanged: async () => {} },
+  publisher = { enabled: false, checked: async () => {}, stateChanged: async () => {}, listed: async () => {} },
   // The favicon read of a nap (lib/favicon.mjs): the network and its time budget, injected for the tests.
   fetch = globalThis.fetch, faviconBudgetMs = FAVICON_BUDGET_MS,
   // The organization's waiting page, read from the manager's settings.json (lib/organization-page.mjs); null: none.
@@ -790,6 +790,24 @@ export function createController({
     ]);
     const shown = pauses.filter((p) => p.workloadId === cfg.workloadId || p.workloadId === null);
     return workloadSummary(cfg, run, host, totals(stats), shownPauses(shown), scheduled);
+  }
+
+  // One workload's row to the manager at once, after its onboarding (vision refusals design §2): its host read from its
+  // rules (a new workload is not in the cache yet), its pauses and schedule as the list reads them.
+  async function reportWorkload({ workloadId }) {
+    const cfg = await config(workloadId);
+    if (!publisher.enabled) return { reported: false };
+    const found = await resolveRules(elbv2, [cfg]).catch(() => new Map());
+    const host = (found.get(workloadId)?.rules ?? []).map(hostOf).find(Boolean) ?? null;
+    hosts.byWorkload.set(workloadId, host);
+    const pauses = await store.listPauses().catch((err) => {
+      log.warn('PausesUnreadable', { error: err.message });
+      return [];
+    });
+    const scheduled = Boolean(await store.getSchedule(workloadId).catch(() => true));
+    await publisher.listed({ at: iso(now()), workload: await rowOf(cfg, host, pauses, scheduled) });
+    log.info('WorkloadReported', { workloadId });
+    return { reported: true };
   }
 
   async function list({ cachedHosts = false } = {}) {
@@ -1567,6 +1585,7 @@ export function createController({
       case 'ensure-awake': return ensureAwake(event.workloadId);
       case 'refresh-lists': return lists ? lists.refresh(event.names ?? []) : [];
       case 'list': return list();
+      case 'report': return reportWorkload(event);
       case 'status': return workloadStatus(event.workloadId);
       case 'force-wake': return forceWake(event.workloadId, event.by);
       case 'pause': return pause(event);

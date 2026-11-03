@@ -124,6 +124,12 @@ instant of its `Workload state changed` event, and an event of a nap or a wake a
 The manager keeps the history from these events and fills a lost one from the next check (the same instant names the
 same transition); the router keeps none.
 
+**Refusals and reports (router 0.37.0):** a request the controller refuses (a workload Terraform wrote, one not
+configured, a bad name, tags or pause) is an answer, `{ refused: { code, message } }`, for a caller that sends
+`refusals: true`, as the manager does: it no longer counts as a Lambda error in the router's health. Without the flag
+it is thrown as before. After an onboarding, the manager asks for the workload's row (`report`): the router publishes it
+as a `Workload listed` event, so the workload shows in the manager at once instead of at the next check.
+
 **What a nap stops (router 0.27.0):** before stopping, a nap describes its backends by what prices them — EC2 instance
 types and OS (an Auto Scaling group at its desired capacity), a Fargate service's task size × desired count, RDS and
 Aurora classes, Aurora Serverless v2 at its minimum capacity — and the event of its end carries them (`stopped`) for the

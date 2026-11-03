@@ -9,7 +9,7 @@ const ENTRIES_MAX = 10;
 const size = (entry) => Buffer.byteLength(entry.Detail) + Buffer.byteLength(entry.DetailType) + Buffer.byteLength(entry.Source);
 
 export function createPublisher({ events, busArn, router, log }) {
-  if (!busArn) return { enabled: false, checked: async () => {}, stateChanged: async () => {} };
+  if (!busArn) return { enabled: false, checked: async () => {}, stateChanged: async () => {}, listed: async () => {} };
   const region = busArn.split(':')[3];
   const entry = (detailType, detail) => ({ EventBusName: busArn, Source: SOURCE, DetailType: detailType, Detail: JSON.stringify(detail) });
 
@@ -54,6 +54,11 @@ export function createPublisher({ events, busArn, router, log }) {
     // with that region (the envelope's account stays the router's).
     async stateChanged(change) {
       await send([entry('Workload state changed', { router: router.name, region: router.region, ...change })], 'state');
+    },
+    // One workload's row, as a check lists it, when it cannot wait for the next check: after its onboarding (vision
+    // refusals design §2). The manager writes it as a row of a check, and never removes a workload for it.
+    async listed({ at, workload }) {
+      await send([entry('Workload listed', { router, at, workload })], 'listed');
     },
   };
 }

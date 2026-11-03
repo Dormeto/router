@@ -124,3 +124,9 @@ test('parseManagerSettings throws on bad settings', () => {
     '{"workloads":[]}', '{"workloads":"x"}', '{"workloads":null}',
   ]) assert.throws(() => parseManagerSettings(text), Error, text);
 });
+
+test('parseManagerSettings drops a rule of the wrong shape and says it (review, 2026-11-04)', () => {
+  const parsed = parseManagerSettings(JSON.stringify({ workloads: { defaults: { idleMinutes: 20, noWakeRules: [{ name: 'health', pathPrefixes: '/health' }] } } }));
+  assert.deepEqual(parsed.defaults, { idleMinutes: 20 });
+  assert.match(parsed.problems[0], /^workloads\.defaults: noWakeRules: rule health: pathPrefixes must be a list of paths/);
+});

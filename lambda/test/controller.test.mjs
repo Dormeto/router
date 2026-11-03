@@ -2799,3 +2799,34 @@ test('settings at scale: a Terraform workload refuses its settings, naming the v
   assert.deepEqual(await terraform.handler({ action: 'settings', workloadId: 'demo', settings: { noWakeRules: [], hibernate: true }, by: 'ops', refusals: true }),
     { refused: { code: 'conflict', message: 'workload demo was written by Terraform: set no_wake_rules in its workload module' } });
 });
+
+// Review (2026-11-04): a level that cannot be read never shortens a workload's idle window or wake timeout.
+test('settings at scale: a level never read and unreadable holds the idle nap, the release and a wake\'s failure', async () => {
+  const throttled = async () => { throw new Error('ThrottlingException'); };
+  const idle = setup({ run: { state: STATES.AWAKE }, cfg: testConfig({ source: 'manager', inherits: ['idleMinutes'] }) });
+  idle.store.state.run.awakeSince = idle.clock.now() - 20 * 60_000;
+  idle.store.getRouterSettings = throttled;
+  const [held] = await idle.handler({ action: 'check' });
+  assert.equal(idle.cloudwatch.calls.length, 0, 'no idle reading, no nap');
+  assert.equal(held.settings, 'unreadable');
+  const waking = setup({ run: { state: STATES.WAKING, wakeId: 'w' }, cfg: testConfig({ source: 'manager', inherits: ['wakeTimeoutSeconds'] }) });
+  waking.store.state.run.wakeStartedAt = waking.clock.now() - 12 * 60_000;
+  waking.store.getRouterSettings = throttled;
+  await waking.handler({ action: 'check' });
+  assert.equal(waking.store.state.run.state, STATES.WAKING, 'its timeout unknown: not failed at 12 minutes');
+  const failed = setup({ run: { state: STATES.FAILED, failedAt: 1 }, instance: 'running', target: 'waker', healthy: 0, cfg: testConfig({ source: 'manager', inherits: ['idleMinutes'] }) });
+  failed.store.getRouterSettings = throttled;
+  const [kept] = await failed.handler({ action: 'check' });
+  assert.notEqual(kept.release, 'requested');
+});
+
+test('settings at scale: a level read before keeps its last value when a read fails', async () => {
+  const s = setup({ run: { state: STATES.AWAKE }, cfg: testConfig({ source: 'manager', inherits: ['idleMinutes'] }) });
+  s.store.state.routerSettings = { defaults: { idleMinutes: 120 }, by: 'ana', at: 1 };
+  await s.handler({ action: 'status', workloadId: 'demo' });
+  s.store.getRouterSettings = async () => { throw new Error('ThrottlingException'); };
+  s.store.state.run.awakeSince = s.clock.now() - 30 * 60_000;
+  const read = s.cloudwatch.calls.length;
+  await s.handler({ action: 'check' });
+  assert.equal(s.cloudwatch.calls.length, read, 'the router\'s 120 minutes, read before: no idle reading at 30');
+});

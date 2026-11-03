@@ -35,8 +35,8 @@ export async function joinLevels({ router, manager, log, fields = {} }) {
 
 // The same levels for the waker, kept in its instance: they sit on the partition of the check and the health, and a request
 // must not read them each time. levels(fields) → { router, manager }. A value (unset is one) is kept ttlMs from the moment
-// it was asked for, so a change shows within ttlMs. A failed read is no value: unset, logged once, and tried again after
-// retryMs, not at each request of a burst. Requests at once share a read.
+// it was asked for, so a change shows within ttlMs. A failed read keeps the last value (unset before any), logged once, and
+// is tried again after retryMs, not at each request of a burst. Requests at once share a read.
 export function createJoinLevelsCache({ router, manager, now = Date.now, log, ttlMs = 60_000, retryMs = 5_000 }) {
   const slots = { router: { reader: router, value: null, until: -Infinity }, organization: { reader: manager, value: null, until: -Infinity } };
   const read = async (level, fields) => {
@@ -47,8 +47,8 @@ export function createJoinLevelsCache({ router, manager, now = Date.now, log, tt
       slot.value = record ?? null;
       slot.until = asked + ttlMs;
     }, (err) => {
+      // The last record read stays until a read succeeds (review, 2026-11-04): none read yet, the level is unset.
       log.warn('JoinLevelUnreadable', { ...fields, level, error: err.message });
-      slot.value = null;
       slot.until = asked + retryMs;
     }).finally(() => { slot.loading = null; });
     await slot.loading;
@@ -99,7 +99,9 @@ export function createManagerSettings({ s3, url, catalogUrl = null, store, now =
       // So is a copy from before the defaults and types (settings at scale): every copy since holds both keys.
       const older = last.joinMinutes === undefined || last.endedWindowDays === undefined || last.defaults === undefined;
       const out = await s3.getObjectIf({ bucket: where.bucket, key: where.key, etag: older ? null : last.etag });
-      if (out.notModified) next = { ...last, readAt: at, error: null };
+      // Unchanged: an invalid part it holds is still its error (one read with the file's own ETag); an unparseable file kept
+      // the last good one's, so a 304 says it is back (review, 2026-11-04).
+      if (out.notModified) next = { ...last, readAt: at, error: last.error?.startsWith('settings.json: ') ? last.error : null };
       else {
         try {
           const { problems, defaults = {}, types = [], ...values } = parseManagerSettings(out.body.toString('utf8'));

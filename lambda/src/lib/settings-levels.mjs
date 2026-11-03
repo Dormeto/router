@@ -95,10 +95,11 @@ export function effectiveConfig(cfg, { run = null, router = null, organization =
   const types = Array.isArray(organization?.types) ? organization.types : [];
   const type = typeOf(cfg, run, types);
   const typeSettings = types.find((t) => isObject(t) && t.name === type.name)?.settings ?? {};
-  const { values, from } = resolveSettings({ own: ownSettings(cfg), type: typeSettings, router: router?.defaults, organization: organization?.defaults, typeName: type.name });
+  // The built-in values follow the backends, whatever type picks the workload: a slow start stays slow (review, 2026-11-04).
+  const { values, from } = resolveSettings({ own: ownSettings(cfg), type: typeSettings, router: router?.defaults, organization: organization?.defaults, typeName: builtInTypeOf(cfg, run) });
   const levels = (key, routerOwn = []) => [
-    ['organization', organization?.defaults?.[key]], ['router', routerOwn], ['router', router?.defaults?.[key]], ['type', typeSettings[key]], ['workload', cfg?.[key]],
-  ].filter(([, rules]) => Array.isArray(rules) && rules.length).map(([level, rules]) => ({ level, rules }));
+    ['organization', organization?.defaults?.[key]], ['router', routerOwn, true], ['router', router?.defaults?.[key]], ['type', typeSettings[key]], ['workload', cfg?.[key]],
+  ].filter(([, rules]) => Array.isArray(rules) && rules.length).map(([level, rules, terraform]) => ({ level, rules, ...(terraform ? { terraform: true } : {}) }));
   return { ...cfg, ...values, settingsFrom: from, type, ruleLevels: { noWake: levels('noWakeRules', terraformRules), wake: levels('wakeRules') } };
 }
 
@@ -170,7 +171,8 @@ export function typesProblems(types) {
 // comes from (`level: 'wake'` as before, `from` the level).
 export function describedRules(cfg) {
   return {
-    noWakeRules: describeRules(cfg.ruleLevels.noWake),
+    // The router's own rules from its Terraform (no_wake_rules) say so (design §6).
+    noWakeRules: cfg.ruleLevels.noWake.flatMap(({ level, rules, terraform }) => describeRules([{ level, rules }]).map((rule) => (terraform ? { ...rule, terraform: true } : rule))),
     wakeRules: cfg.ruleLevels.wake.flatMap(({ level, rules }) => describeRules([{ level: 'wake', rules }]).map((rule) => ({ ...rule, from: level }))),
   };
 }

@@ -38,8 +38,19 @@ function regex(name, source, flags = '') {
   }
 }
 
+// Each condition's shape, before it is compiled: a rule written by hand (settings.json, an environment) must never throw
+// at a request (review, 2026-11-04).
+const SHAPES = {
+  sourceIps: [(v) => Array.isArray(v) && v.every((x) => typeof x === 'string'), 'sourceIps must be a list of addresses and ranges'],
+  pathPrefixes: [(v) => Array.isArray(v) && v.every((x) => typeof x === 'string'), 'pathPrefixes must be a list of paths'],
+  pathPattern: [(v) => typeof v === 'string', 'pathPattern must be a pattern (text)'],
+  userAgentPattern: [(v) => typeof v === 'string', 'userAgentPattern must be a pattern (text)'],
+  headers: [(v) => Array.isArray(v) && v.every((h) => h && typeof h === 'object' && !Array.isArray(h)), 'headers must be a list of headers'],
+};
+
 // One predicate per condition; throws on an invalid rule.
 function compileRule(rule) {
+  for (const [key, [valid, message]] of Object.entries(SHAPES)) if (present(rule?.[key]) && !valid(rule[key])) throw new Error(message);
   const conditions = conditionsOf(rule);
   if (!Object.keys(conditions).length) throw new Error('no condition');
   const tests = [];

@@ -107,3 +107,26 @@ test('types are checked: names, selectors, built-in names, their number', () => 
   assert.match(typesProblems(Array.from({ length: 21 }, (_, i) => custom(`t${i}`)))[0], /at most 20 custom types/);
   assert.match(typesProblems({})[0], /types must be a list/);
 });
+
+// Review fixes (2026-11-04).
+test('a workload with databases keeps its 1800 s wake timeout whatever type picks it', () => {
+  const staging = { name: 'staging', tags: { env: 'staging' }, settings: { idleMinutes: 30 } };
+  const cfg = { workloadId: 'shop', source: 'manager', tags: { env: 'staging' }, databases: [{ id: 'db' }], wakeTimeoutSeconds: 1800, inherits: ['wakeTimeoutSeconds'] };
+  const effective = effectiveConfig(cfg, { run: { backendKinds: 'ecs,rds-instance' }, organization: { types: [staging] } });
+  assert.deepEqual([effective.type.name, effective.wakeTimeoutSeconds, effective.settingsFrom.wakeTimeoutSeconds], ['staging', 1800, 'default']);
+  // An explicit type on it, the same.
+  assert.equal(effectiveConfig({ ...cfg, type: 'ecs' }, { run: { backendKinds: 'ecs,rds-instance' }, organization: null }).wakeTimeoutSeconds, 1800);
+});
+
+test('a rule whose conditions have the wrong shape is refused, never compiled', () => {
+  assert.match(defaultsProblems({ noWakeRules: [{ name: 'health', pathPrefixes: '/health' }] })[0], /noWakeRules: rule health: pathPrefixes must be a list of paths/);
+  assert.match(defaultsProblems({ noWakeRules: [{ name: 'ip', sourceIps: '10.0.0.0/8' }] })[0], /sourceIps must be a list of addresses/);
+  assert.match(defaultsProblems({ wakeRules: [{ name: 'p', pathPattern: ['^/a'] }] })[0], /pathPattern must be a pattern/);
+  assert.match(defaultsProblems({ wakeRules: [{ name: 'h', headers: { name: 'x' } }] })[0], /headers must be a list of headers/);
+});
+
+test('the router\'s Terraform rules are marked in the status (review, 2026-11-04)', async () => {
+  const { describedRules } = await import('../src/lib/settings-levels.mjs');
+  const effective = effectiveConfig({ workloadId: 'w', noWakeRules: [rule('own')] }, { router: { defaults: { noWakeRules: [rule('manager')] } }, terraformRules: [rule('tf')] });
+  assert.deepEqual(describedRules(effective).noWakeRules.map((r) => [r.level, r.name, r.terraform ?? false]), [['router', 'tf', true], ['router', 'manager', false], ['workload', 'own', false]]);
+});

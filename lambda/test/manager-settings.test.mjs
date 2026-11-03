@@ -295,7 +295,7 @@ test('joinLevels: each level\'s value; one that cannot be read is logged once an
   ]);
 });
 
-test('createJoinLevelsCache: a value 60 seconds, unset too, a failure 5 seconds as unset, a reader missing as unset', async () => {
+test('createJoinLevelsCache: a value 60 seconds, unset too, a failure keeps the last value 5 seconds, a reader missing as unset', async () => {
   const clock = fakeClock();
   const warnings = [];
   const log = { warn: (event, fields) => warnings.push({ event, ...fields }) };
@@ -316,8 +316,9 @@ test('createJoinLevelsCache: a value 60 seconds, unset too, a failure 5 seconds 
   answers.router = 'fail';
   answers.manager = 'fail';
   clock.advance(60_000);
-  assert.deepEqual(await cache.levels({ workloadId: 'demo' }), { router: null, manager: null });
-  assert.deepEqual(await cache.levels({ workloadId: 'demo' }), { router: null, manager: null });
+  // The last record read stays (review, 2026-11-04): an unreadable level never drops a router's defaults for a request.
+  assert.deepEqual(await cache.levels({ workloadId: 'demo' }), { router: 20, manager: null });
+  assert.deepEqual(await cache.levels({ workloadId: 'demo' }), { router: 20, manager: null });
   assert.deepEqual(reads, { router: 3, manager: 3 });
   assert.deepEqual(warnings, [
     { event: 'JoinLevelUnreadable', workloadId: 'demo', level: 'router', error: 'sync' },
@@ -329,4 +330,16 @@ test('createJoinLevelsCache: a value 60 seconds, unset too, a failure 5 seconds 
   assert.equal((await cache.levels()).router, 5);
   const none = createJoinLevelsCache({ now: clock.now, log });
   assert.deepEqual(await none.levels(), { router: null, manager: null });
+});
+
+test('an invalid part of settings.json stays the error while the file does not change (review, 2026-11-04)', async () => {
+  const s = setup();
+  s.s3.put('settings.json', { workloads: { hibernate: false, defaults: { idleMinutes: 'x' } } });
+  await s.settings.refresh();
+  const problem = (await s.settings.current()).error;
+  assert.match(problem, /^settings\.json: workloads\.defaults: idleMinutes/);
+  s.clock.advance(5 * MIN);
+  await s.settings.refresh();
+  assert.equal(s.s3.calls.at(-1).etag, '"e1"', 'a conditional read');
+  assert.equal((await s.settings.current()).error, problem);
 });

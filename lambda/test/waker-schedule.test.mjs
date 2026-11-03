@@ -309,7 +309,7 @@ test('a failed read is no value: unset for that request, tried again soon, not a
   assert.equal(s.invocations.length, 1, 'the router\'s 0 joins nothing');
 });
 
-test('a value that a failed read replaced is not kept: a level unread is unset', async () => {
+test('a failed read keeps the last value: the router\'s 30 still joins the gap (review, 2026-11-04)', async () => {
   const s = counting({ schedule: joined(), now: GAP - 60 * SECOND });
   await s.store.putRouterSettings({ joinMinutes: 30, by: 'ana', at: 1 });
   await s.store.putManagerSettings({ hibernate: true, joinMinutes: 0, etag: null, readAt: 1, error: null });
@@ -318,7 +318,7 @@ test('a value that a failed read replaced is not kept: a level unread is unset',
   s.store.getRouterSettings = async () => { throw new Error('ThrottlingException'); };
   s.clock.advance(60 * SECOND);
   await s.handler(albEvent());
-  assert.equal(s.invocations.length, 1, 'the organization\'s 0');
+  assert.equal(s.invocations.length, 0, 'the router\'s 30, read before');
 });
 
 test('a burst reads each level once a minute, a schedule with its own value too', async () => {

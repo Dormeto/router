@@ -93,23 +93,35 @@ export function createController({
 
   // The levels above a workload (vision settings at scale design §6): the router's record and its copy of the manager's
   // settings, read fresh (a check reads them once for all its workloads). One that cannot be read counts as none.
+  // A level that cannot be read keeps the last record this instance read; never read, the levels are unreadable: the
+  // check then takes no idle nap or failure decision and a wake waits the longest timeout (review, 2026-11-04).
+  const lastLevels = {};
   async function readLevels() {
-    const read = (level, reader) => (reader ? reader().catch((err) => {
+    let unreadable = false;
+    const read = (level, reader) => (reader ? Promise.resolve().then(() => reader()).then((record) => {
+      lastLevels[level] = record ?? null;
+      return record ?? null;
+    }, (err) => {
       log.warn('SettingsLevelUnreadable', { level, error: err.message });
-      return null;
+      if (!(level in lastLevels)) unreadable = true;
+      return lastLevels[level] ?? null;
     }) : null);
     // The organization as hibernation and the join read it: the manager's settings reader, else the router's copy.
     const organizationReader = managerSettings ? () => managerSettings.current() : store.getManagerSettings;
     const [routerLevel, organization] = await Promise.all([read('router', store.getRouterSettings), read('organization', organizationReader)]);
-    return { routerLevel, organization };
+    return { routerLevel, organization, ...(unreadable ? { unreadable: true } : {}) };
   }
+  // The longest a wake may wait when its levels cannot be read.
+  const WAKE_TIMEOUT_MAX_S = 3600;
+  const wakeTimeoutS = (cfg) => (cfg.levelsUnreadable ? WAKE_TIMEOUT_MAX_S : cfg.wakeTimeoutSeconds);
 
   // The configuration a wake, a nap, the check, the status and the list act on: each setting resolved, where it comes
   // from, the type and the rules of every level. The stored one stays what the writes read (config()).
   async function effective(cfg, run, levels) {
     if (cfg.settingsFrom) return cfg;
-    const { routerLevel, organization } = levels ?? await readLevels();
-    return effectiveConfig(cfg, { run, router: routerLevel, organization, terraformRules: defaultRules });
+    const { routerLevel, organization, unreadable } = levels ?? await readLevels();
+    const resolved = effectiveConfig(cfg, { run, router: routerLevel, organization, terraformRules: defaultRules });
+    return unreadable ? { ...resolved, levelsUnreadable: true } : resolved;
   }
 
   async function managedBackends(cfg, scope = clients) {
@@ -157,7 +169,7 @@ export function createController({
       return fail(err);
     }
     // The wake deadline counts from the wake start (RUN), not from this invocation: a wake can span invocations.
-    const wakeDeadline = (run.wakeStartedAt ?? now()) + cfg.wakeTimeoutSeconds * 1000;
+    const wakeDeadline = (run.wakeStartedAt ?? now()) + wakeTimeoutS(cfg) * 1000;
     const timing = { sleep, now, deadline: Math.min(wakeDeadline, budgetEnd), wakeDeadline };
     // Instance types a capacity error made this wake fall back to (R7a), given back after the next stop.
     const fallbacks = {};
@@ -467,10 +479,10 @@ export function createController({
         event: failed.event,
       })) ?? store.getRun(workloadId);
     }
-    const wakeStuckBefore = now() - cfg.wakeTimeoutSeconds * 1000 - WAKING_STUCK_GRACE_MS;
+    const wakeStuckBefore = now() - wakeTimeoutS(cfg) * 1000 - WAKING_STUCK_GRACE_MS;
     if (run.state === STATES.WAKING && (run.wakeStartedAt ?? 0) < wakeStuckBefore) {
       log.warn('WakeStuck', { workloadId, wakeId: run.wakeId });
-      const failed = failedSpec(failureError('timeout', `the wake did not finish within ${cfg.wakeTimeoutSeconds} s (its invocation stopped)`), { step: 'wake', wakeId: run.wakeId, at: now() });
+      const failed = failedSpec(failureError('timeout', `the wake did not finish within ${wakeTimeoutS(cfg)} s (its invocation stopped)`), { step: 'wake', wakeId: run.wakeId, at: now() });
       return (await store.transition(workloadId, {
         cond: { state: STATES.WAKING, wakeId: run.wakeId },
         set: { state: STATES.FAILED, failedAt: now(), holders: 0, ...failed.set },
@@ -578,6 +590,8 @@ export function createController({
     const known = await store.getRun(stored.workloadId);
     const cfg = await effective(stored, known, ctx?.levels);
     const run = await reconcile(cfg, ctx, known);
+    // Its levels unreadable (never read here): no decision on an idle window it may not have.
+    if (cfg.levelsUnreadable) return { state: run?.state ?? 'UNKNOWN', settings: 'unreadable' };
     // A failed workload still paying (its backends run without a healthy target: the reconcile left it FAILED) is stopped
     // once its idle window has passed since the failure (R7a, FinOps); a paused one is left for its team.
     if (run?.state === STATES.FAILED && !paused && (run.failedAt ?? 0) <= now() - cfg.idleMinutes * 60_000) {

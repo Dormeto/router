@@ -452,7 +452,8 @@ function replaceService(map, from, to, skip, headers) {
     const weighted = holder[actionKey]?.weightedBackendServices ?? [];
     if (!weighted.some((w) => nameOf(w.backendService) === from)) continue;
     paths.push(at(actionKey));
-    if (weighted.length === 1 && fromPlain(weighted[0])) {
+    // Only back to the application: at a swap, an entry is the customer's, whatever its headers are named.
+    if (!headers && weighted.length === 1 && fromPlain(weighted[0])) {
       const { weightedBackendServices, ...rest } = holder[actionKey];
       rewrite(holder, Object.entries(holder).flatMap(([k, v]) => {
         if (k !== actionKey) return [[k, v]];

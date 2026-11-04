@@ -865,3 +865,11 @@ test('another workload\'s route with headers in a shared matcher is not this one
   assert.deepEqual(withoutWakerRoute(map, OTHER).paths, []);
   assert.throws(() => withWakerRoute(map, APP, OTHER, { headers: HEADERS }), /its own \/_dormeto\/ route/);
 });
+
+test('withSwap with headers: a weighted entry whose own header is named x-dormeto-ref is swapped as weighted, with the headers', () => {
+  const map = swapFixture();
+  map.pathMatchers[2].defaultRouteAction.weightedBackendServices[0].headerAction = { requestHeadersToAdd: [{ headerName: 'x-dormeto-ref', headerValue: 'x' }] };
+  const swapped = withSwap(map, APP, WAKER, { headers: HEADERS }).map;
+  assert.equal(swapped.pathMatchers[2].defaultService, undefined);
+  assert.deepEqual(swapped.pathMatchers[2].defaultRouteAction.weightedBackendServices, [toWaker()]);
+});

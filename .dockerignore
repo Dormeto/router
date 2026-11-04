@@ -2,3 +2,4 @@
 !package.json
 !lambda/src/lib
 !gcp/src
+!gcp/tools/probe.mjs

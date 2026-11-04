@@ -82,3 +82,12 @@ test('the image carries probe.mjs, and only that file of the tools', () => {
   assert.match(file, /^COPY gcp\/tools\/probe\.mjs \.\/gcp\/tools\/probe\.mjs$/m);
   assert.doesNotMatch(file, /measure/);
 });
+
+// The build context is .dockerignore's allow-list (`*`, then `!` entries): a COPY whose source it leaves out fails the build.
+test('every source the Containerfile copies is in the build context', () => {
+  const file = readFileSync(new URL('../Containerfile', import.meta.url), 'utf8');
+  const allowed = readFileSync(new URL('../../.dockerignore', import.meta.url), 'utf8').split('\n').filter((l) => l.startsWith('!')).map((l) => l.slice(1).trim());
+  const sources = [...file.matchAll(/^COPY (\S+) /gm)].map((m) => m[1]);
+  assert.ok(sources.length >= 4, sources.join());
+  for (const source of sources) assert.ok(allowed.some((a) => source === a || source.startsWith(`${a}/`)), `${source} is left out of the build context`);
+});

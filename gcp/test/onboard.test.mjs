@@ -684,15 +684,16 @@ test('a backend service\'s name is unique in its scope: the same name in the oth
   assert.deepEqual((await onboarding.dryRun(INPUT)).reasons, ['backend service app is already workload second']);
 });
 
-test('onboard regional: the waker in the region, EXTERNAL_MANAGED, HTTPS, on the router\'s NEG, with the two headers', async () => {
+// M4: Google refuses custom request headers on a regional EXTERNAL_MANAGED backend service; the map carries them.
+test('onboard regional: the waker in the region, EXTERNAL_MANAGED, HTTPS, on the router\'s NEG, with no header but a description naming it', async () => {
   const { w, onboarding } = setup(regional);
   await onboarding.onboard(INPUT);
   assert.deepEqual(inRegion(w).services[WAKER], {
     name: WAKER,
+    description: 'Dormeto: the waker of workload demo',
     loadBalancingScheme: 'EXTERNAL_MANAGED',
     protocol: 'HTTPS',
     backends: [{ group: `${REGION_URL}/networkEndpointGroups/${NEG}` }],
-    customRequestHeaders: ['x-dormeto-workload: demo', 'x-dormeto-switch: swap'],
   });
   assert.deepEqual(w.services, {}, 'nothing global');
 });
@@ -709,16 +710,21 @@ test('onboard classic: the waker global, EXTERNAL, HTTPS, on the router\'s regio
   });
 });
 
+// The waker's route as each kind writes it: the regional one carries the waker's headers (M4).
+const regionalRoute = { paths: ['/_dormeto/*'], routeAction: { weightedBackendServices: [{ backendService: REGIONAL_WAKER_URL, weight: 100, headerAction: { requestHeadersToAdd: [
+  { headerName: 'x-dormeto-workload', headerValue: 'demo', replace: true }, { headerName: 'x-dormeto-switch', headerValue: 'swap', replace: true }] } }] } };
 const ONBOARDED = [
-  ['regional', regional, (w) => inRegion(w).urlMaps.lb, REGIONAL_WAKER_URL, regionalUrl('app'), REGIONAL_LB, 700],
-  ['classic', classic, (w) => w.urlMaps.lb, WAKER_URL, serviceUrl('app'), { kind: 'classic' }, 850],
+  ['regional', regional, (w) => inRegion(w).urlMaps.lb, REGIONAL_WAKER_URL, regionalUrl('app'), REGIONAL_LB, 700, regionalRoute,
+    { name: WAKER, description: 'Dormeto: the waker of workload demo', backends: [] }],
+  ['classic', classic, (w) => w.urlMaps.lb, WAKER_URL, serviceUrl('app'), { kind: 'classic' }, 850, { paths: ['/_dormeto/*'], service: WAKER_URL },
+    { name: WAKER, customRequestHeaders: ['x-dormeto-switch: swap', 'x-dormeto-workload: demo'], backends: [] }],
 ];
-for (const [kind, world, mapOf, wakerUrl, appUrl, lb, timeout] of ONBOARDED) {
+for (const [kind, world, mapOf, wakerUrl, appUrl, lb, timeout, route, stopped] of ONBOARDED) {
   test(`onboard ${kind}: the route and the hold route in one update, its lb in the configuration and the Workload`, async () => {
     const { w, store, onboarding } = setup(world);
     const workload = await onboarding.onboard(INPUT);
     assert.deepEqual(w.changes, [`create ${WAKER}`, 'map lb']);
-    assert.deepEqual(mapOf(w).pathMatchers[0].pathRules, [{ paths: ['/_dormeto/*'], service: wakerUrl }, { paths: ['/_dormeto/backend/*'], service: appUrl }]);
+    assert.deepEqual(mapOf(w).pathMatchers[0].pathRules, [route, { paths: ['/_dormeto/backend/*'], service: appUrl }]);
     assert.equal(mapOf(w).pathMatchers[0].defaultCustomErrorResponsePolicy, undefined);
     assert.deepEqual(store.configs.get('demo').lb, lb);
     assert.deepEqual(workload.lb, lb);
@@ -770,10 +776,10 @@ for (const [kind, world, mapOf, wakerUrl, appUrl, lb, timeout] of ONBOARDED) {
     assert.ok(w.logs.some((l) => l.event === 'OnboardUndone'));
   });
 
-  test(`onboard ${kind}: the waker of a stopped run of the same workload, with its two headers, is taken over`, async () => {
+  test(`onboard ${kind}: the waker of a stopped run of the same workload, as its kind writes it, is taken over`, async () => {
     const { w, onboarding } = setup((x) => {
       world(x);
-      (kind === 'regional' ? inRegion(x).services : x.services)[WAKER] = { name: WAKER, customRequestHeaders: ['x-dormeto-switch: swap', 'x-dormeto-workload: demo'], backends: [] };
+      (kind === 'regional' ? inRegion(x).services : x.services)[WAKER] = stopped;
     });
     assert.equal((await onboarding.dryRun(INPUT)).eligible, true);
     await onboarding.onboard(INPUT);
@@ -792,7 +798,7 @@ for (const [kind, world, mapOf, wakerUrl, appUrl, lb, timeout] of ONBOARDED) {
     await onboarding.onboard(INPUT);
     const held = mapOf(w).pathMatchers.at(-1);
     assert.equal(held.name, 'dormeto-default');
-    assert.deepEqual(held.pathRules, [{ paths: ['/_dormeto/*'], service: wakerUrl }, { paths: ['/_dormeto/backend/*'], service: appUrl }]);
+    assert.deepEqual(held.pathRules, [route, { paths: ['/_dormeto/backend/*'], service: appUrl }]);
     await onboarding.offboard('demo');
     assertSameMap(mapOf(w), original);
   });
@@ -807,7 +813,7 @@ test('onboard regional: with route rules, the hold route at priority 0, the wake
   await onboarding.onboard(INPUT);
   const rules = inRegion(w).urlMaps.lb.pathMatchers[0].routeRules;
   assert.deepEqual(rules.find((r) => r.priority === 0), { priority: 0, matchRules: [{ prefixMatch: '/_dormeto/backend/' }], service: regionalUrl('app') });
-  assert.deepEqual(rules.find((r) => r.priority === 1), { priority: 1, matchRules: [{ prefixMatch: '/_dormeto/' }], service: REGIONAL_WAKER_URL });
+  assert.deepEqual(rules.find((r) => r.priority === 1), { priority: 1, matchRules: [{ prefixMatch: '/_dormeto/' }], routeAction: regionalRoute.routeAction });
   await onboarding.offboard('demo');
   assertSameMap(inRegion(w).urlMaps.lb, original);
 });
@@ -869,7 +875,8 @@ for (const [kind, world, lowest] of [['regional', regional, 160], ['classic', cl
     w.changes.length = 0;
     assert.equal((await core.nap('demo')).state, STATES.ASLEEP);
     assert.equal(w.vms['vm-a'].status, 'TERMINATED');
-    assert.equal(mapOf().pathMatchers[0].defaultService.endsWith(`/${WAKER}`), true);
+    const { defaultService, defaultRouteAction } = mapOf().pathMatchers[0];
+    assert.equal((defaultService ?? defaultRouteAction.weightedBackendServices[0].backendService).endsWith(`/${WAKER}`), true);
     assert.deepEqual(w.changes, ['map lb', 'stop vm-a']);
     w.changes.length = 0;
     const wakeId = await core.beginWake('demo', STATES.ASLEEP, 'operator');

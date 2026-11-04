@@ -52,6 +52,39 @@ const refsOf = (holder, serviceKey, actionKey) => [
   ...(holder[actionKey]?.weightedBackendServices ?? []).map((w) => w.backendService),
 ];
 
+// The one service a holder sends to: its service, or its weighted services' only one (a regional waker's form, below).
+const soleService = (holder, serviceKey, actionKey) => {
+  const weighted = holder[actionKey]?.weightedBackendServices ?? [];
+  return holder[serviceKey] ?? (weighted.length === 1 ? weighted[0].backendService : undefined);
+};
+
+// ---- The regional waker's headers (M4: a regional backend service takes no custom request header) ----
+// On a regional load balancer the map carries the waker's headers instead, wherever it names the waker: a one-entry weighted
+// service whose header action replaces a client's own value. `headers`: [[name, value]], all named x-dormeto-*. A plain
+// reference swapped gets x-dormeto-ref: service too, so that the unswap writes the plain reference back.
+const OUR_HEADER = /^x-dormeto-/;
+const REF_HEADER = 'x-dormeto-ref';
+const ourHeaders = (headers) => headers.map(([headerName, headerValue]) => ({ headerName, headerValue, replace: true }));
+const wakerEntry = (waker, headers, weight = 100) => ({ backendService: waker, weight, headerAction: { requestHeadersToAdd: ourHeaders(headers) } });
+const fromPlain = (entry) => (entry.headerAction?.requestHeadersToAdd ?? []).some((h) => h.headerName === REF_HEADER);
+function withOurs(headerAction, headers) {
+  if (!headerAction) return { requestHeadersToAdd: ourHeaders(headers) };
+  const theirs = (headerAction.requestHeadersToAdd ?? []).filter((h) => !OUR_HEADER.test(h.headerName));
+  return { ...headerAction, requestHeadersToAdd: [...theirs, ...ourHeaders(headers)] };
+}
+function withoutOurs(headerAction) {
+  if (!headerAction) return undefined;
+  const theirs = (headerAction.requestHeadersToAdd ?? []).filter((h) => !OUR_HEADER.test(h.headerName));
+  const { requestHeadersToAdd, ...rest } = headerAction;
+  const kept = theirs.length ? { ...rest, requestHeadersToAdd: theirs } : rest;
+  return Object.keys(kept).length ? kept : undefined;
+}
+// Rewrites a holder's keys in place, in their order: `entries` of the holder, changed.
+function rewrite(holder, entries) {
+  for (const key of Object.keys(holder)) delete holder[key];
+  Object.assign(holder, Object.fromEntries(entries));
+}
+
 const holds = (holder, serviceKey, actionKey, service) => refsOf(holder, serviceKey, actionKey).map(nameOf).includes(service);
 const matcherHolds = (matcher, service) => holds(matcher, 'defaultService', 'defaultRouteAction', service)
   || (matcher.pathRules ?? []).some((r) => holds(r, 'service', 'routeAction', service))
@@ -128,8 +161,9 @@ export function withoutErrorPolicy(map, waker) {
 }
 
 const inNamespace = (path) => typeof path === 'string' && path.startsWith(ROUTE_NAMESPACE);
-const pathRuleOurs = (rule, waker) => nameOf(rule.service) === nameOf(waker) && rule.paths?.includes(ROUTE_PATH);
-const routeRuleOurs = (rule, waker) => nameOf(rule.service) === nameOf(waker)
+// The waker backend service is the workload's alone: a route to it, plain or with the regional headers, is its route.
+const pathRuleOurs = (rule, waker) => nameOf(soleService(rule, 'service', 'routeAction')) === nameOf(waker) && rule.paths?.includes(ROUTE_PATH);
+const routeRuleOurs = (rule, waker) => nameOf(soleService(rule, 'service', 'routeAction')) === nameOf(waker)
   && (rule.matchRules ?? []).some((m) => m.prefixMatch === ROUTE_PREFIX);
 // The hold route is Dormeto's when it is that alone, to the application: one path, or one match rule with the prefix and
 // nothing else. A rule that merely contains it is the customer's (checkNoOwnRoute refuses it).
@@ -163,8 +197,10 @@ function checkNoOwnRoute(matcher, path, waker, app) {
 
 // The route in one matcher: a route rule where the matcher uses route rules, else a path rule. Returns where it wrote, or
 // null if it was there already. A route rule takes priority 0, as nothing can come before it, or 1 when the hold route
-// has 0: a prefix `/_dormeto/` would win over `/_dormeto/backend/`. The priority must be free.
-function addRoute(matcher, path, waker, app) {
+// has 0: a prefix `/_dormeto/` would win over `/_dormeto/backend/`. The priority must be free. With `headers`, the route
+// names the waker in the regional form.
+function addRoute(matcher, path, waker, app, headers) {
+  const to = headers ? { routeAction: { weightedBackendServices: [wakerEntry(waker, headers)] } } : { service: waker };
   checkNoOwnRoute(matcher, path, waker, app);
   if ((matcher.routeRules ?? []).length > 0) {
     if (matcher.routeRules.some((r) => routeRuleOurs(r, waker))) return null;
@@ -172,11 +208,11 @@ function addRoute(matcher, path, waker, app) {
     if (matcher.routeRules.some((r) => r.priority === priority)) {
       throw new UrlMapRefused(`the URL map uses priority ${priority} for a route rule at ${path}.routeRules: the /_dormeto/ route needs it`);
     }
-    matcher.routeRules.push({ priority, matchRules: [{ prefixMatch: ROUTE_PREFIX }], service: waker });
+    matcher.routeRules.push({ priority, matchRules: [{ prefixMatch: ROUTE_PREFIX }], ...to });
     return `${path}.routeRules`;
   }
   if ((matcher.pathRules ?? []).some((r) => pathRuleOurs(r, waker))) return null;
-  matcher.pathRules = [...(matcher.pathRules ?? []), { paths: [ROUTE_PATH], service: waker }];
+  matcher.pathRules = [...(matcher.pathRules ?? []), { paths: [ROUTE_PATH], ...to }];
   return `${path}.pathRules`;
 }
 
@@ -198,19 +234,20 @@ function addDefaultMatcher(copy, services) {
   return `pathMatchers[${copy.pathMatchers.length - 1}]`;
 }
 
-export function withWakerRoute(map, service, waker) {
+// `headers`: a regional waker's, written in the map (above).
+export function withWakerRoute(map, service, waker, { headers } = {}) {
   need(service, waker);
   const copy = structuredClone(map);
   const paths = [];
   const { matchers } = holders(copy, service);
   for (const { matcher, i } of matchers) {
-    const written = addRoute(matcher, `pathMatchers[${i}]`, waker, service);
+    const written = addRoute(matcher, `pathMatchers[${i}]`, waker, service, headers);
     if (written) paths.push(written);
   }
   const held = addDefaultMatcher(copy, [service]);
   if (held) {
     paths.push(held);
-    addRoute(copy.pathMatchers.at(-1), held, waker, service);
+    addRoute(copy.pathMatchers.at(-1), held, waker, service, headers);
   }
   return { map: copy, paths };
 }
@@ -392,32 +429,55 @@ function checkSwappable(map, name) {
   }
 }
 
-// `from` (a name) becomes `to` (a URL) where `skip(place)` is false.
-function replaceService(map, from, to, skip) {
+// `from` (a name) becomes `to` (a URL) where `skip(place)` is false. With `headers` (a regional swap), the waker is named in
+// the regional form: a plain reference becomes a one-entry weighted service where it was, a weighted one gets the headers.
+// Back to the application, the regional form is undone: an entry from a plain reference is written plainly again.
+function replaceService(map, from, to, skip, headers) {
   const copy = structuredClone(map);
   const paths = [];
   for (const place of placesOf(copy)) {
     if (skip(place)) continue;
     const { holder, serviceKey, actionKey, at } = place;
     if (nameOf(holder[serviceKey]) === from) {
-      holder[serviceKey] = to;
+      if (!headers) holder[serviceKey] = to;
+      else if (holder[actionKey]) {
+        delete holder[serviceKey];
+        holder[actionKey].weightedBackendServices = [wakerEntry(to, [...headers, [REF_HEADER, 'service']])];
+      } else {
+        const action = { weightedBackendServices: [wakerEntry(to, [...headers, [REF_HEADER, 'service']])] };
+        rewrite(holder, Object.entries(holder).map(([k, v]) => (k === serviceKey ? [actionKey, action] : [k, v])));
+      }
       paths.push(at(serviceKey));
     }
     const weighted = holder[actionKey]?.weightedBackendServices ?? [];
-    if (weighted.some((w) => nameOf(w.backendService) === from)) {
-      for (const w of weighted) if (nameOf(w.backendService) === from) w.backendService = to;
-      paths.push(at(actionKey));
+    if (!weighted.some((w) => nameOf(w.backendService) === from)) continue;
+    paths.push(at(actionKey));
+    if (weighted.length === 1 && fromPlain(weighted[0])) {
+      const { weightedBackendServices, ...rest } = holder[actionKey];
+      rewrite(holder, Object.entries(holder).flatMap(([k, v]) => {
+        if (k !== actionKey) return [[k, v]];
+        return Object.keys(rest).length ? [[serviceKey, to], [actionKey, rest]] : [[serviceKey, to]];
+      }));
+      continue;
+    }
+    for (const w of weighted) {
+      if (nameOf(w.backendService) !== from) continue;
+      w.backendService = to;
+      const action = headers ? withOurs(w.headerAction, headers) : withoutOurs(w.headerAction);
+      if (action) w.headerAction = action;
+      else delete w.headerAction;
     }
   }
   return { map: copy, paths };
 }
 
-export function withSwap(map, app, waker) {
+// `headers`: a regional waker's, written in the map (above). The unswap needs none: what it undoes says what it was.
+export function withSwap(map, app, waker, { headers } = {}) {
   need(app, waker);
   const name = nameOf(app);
   checkSwappable(map, name);
   return replaceService(map, name, waker, ({ holder, kind }) => (kind === 'pathRules' && holdPathRule(holder, name))
-    || (kind === 'routeRules' && holdRouteRule(holder, name)));
+    || (kind === 'routeRules' && holdRouteRule(holder, name)), headers);
 }
 
 export function withoutSwap(map, app, waker) {

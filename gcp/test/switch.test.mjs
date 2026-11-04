@@ -1,14 +1,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { inOneUpdate, SWAP_WAIT_MS, switchOf } from '../src/switch.mjs';
-import { withErrorPolicy, withoutErrorPolicy, withoutSwap, withSwap, withWakerRoute } from '../src/urlmaps.mjs';
+import { withErrorPolicy, withHoldRoute, withoutErrorPolicy, withoutSwap, withSwap, withWakerRoute } from '../src/urlmaps.mjs';
 
 const V1 = 'https://compute.googleapis.com/compute/v1/projects/p';
 const WAKER = 'dmtr-europe-west1-demo';
 const urlmaps = { scope: 'global' };
 const regionalUrlmaps = { scope: 'regional' };
 const place = { urlmaps, regionalUrlmaps, project: 'p', region: 'europe-west1' };
-const cfgOf = (lb) => ({ backendService: 'app', wakerBackendService: WAKER, ...(lb ? { lb } : {}) });
+const cfgOf = (lb) => ({ workloadId: 'demo', backendService: 'app', wakerBackendService: WAKER, ...(lb ? { lb } : {}) });
+// Where a rule sends: its service, or the regional waker's one weighted service (M4).
+const servedBy = (rule) => rule.service ?? rule.routeAction?.weightedBackendServices?.[0]?.backendService;
 const mapOf = (base) => ({
   name: 'lb',
   defaultService: `${base}/backendServices/other`,
@@ -32,9 +34,10 @@ for (const [name, lb] of [['no lb', undefined], ['global', { kind: 'global' }]])
   });
 }
 
-for (const [kind, lb, base, adapter, waitMs] of [
-  ['regional', { kind: 'regional', region: 'europe-west1' }, `${V1}/regions/europe-west1`, regionalUrlmaps, 100_000],
-  ['classic', { kind: 'classic' }, `${V1}/global`, urlmaps, 250_000],
+// A regional waker has its headers in the map (M4), a classic one on its backend service.
+for (const [kind, lb, base, adapter, waitMs, headers] of [
+  ['regional', { kind: 'regional', region: 'europe-west1' }, `${V1}/regions/europe-west1`, regionalUrlmaps, 100_000, [['x-dormeto-workload', 'demo'], ['x-dormeto-switch', 'swap']]],
+  ['classic', { kind: 'classic' }, `${V1}/global`, urlmaps, 250_000, undefined],
 ]) {
   const waker = `${base}/backendServices/${WAKER}`;
   const app = `${base}/backendServices/app`;
@@ -50,26 +53,27 @@ for (const [kind, lb, base, adapter, waitMs] of [
 
   test(`${kind}: asleep and awake are the swap and back`, () => {
     const map = sw.route(mapOf(base)).map;
-    assert.deepEqual(sw.asleep(map), withSwap(map, 'app', waker));
-    const swapped = withSwap(map, 'app', waker).map;
+    assert.deepEqual(sw.asleep(map), withSwap(map, 'app', waker, { headers }));
+    const swapped = withSwap(map, 'app', waker, { headers }).map;
     assert.deepEqual(sw.awake(swapped), withoutSwap(swapped, 'app', waker));
     assert.deepEqual(sw.awake(swapped).map, map);
   });
 
   test(`${kind}: the route is the waker's and the hold, in one update; nothing written when they are there`, () => {
     const { map, paths } = sw.route(mapOf(base));
-    assert.deepEqual(map.pathMatchers[0].pathRules.map((rule) => [rule.paths[0], rule.service]).sort(), [['/_dormeto/*', waker], ['/_dormeto/backend/*', app]]);
+    assert.deepEqual(map.pathMatchers[0].pathRules.map((rule) => [rule.paths[0], servedBy(rule)]).sort(), [['/_dormeto/*', waker], ['/_dormeto/backend/*', app]]);
+    assert.deepEqual(map, inOneUpdate(mapOf(base), [(m) => withHoldRoute(m, 'app', waker), (m) => withWakerRoute(m, 'app', waker, { headers })]).map);
     assert.equal(paths.length, 2);
     assert.deepEqual(sw.route(map).paths, []);
   });
 
   test(`${kind}: on a swapped map that lost them, the route writes both, the hold naming the application`, () => {
-    const swapped = withSwap(sw.route(mapOf(base)).map, 'app', waker).map;
+    const swapped = withSwap(sw.route(mapOf(base)).map, 'app', waker, { headers }).map;
     delete swapped.pathMatchers[0].pathRules;
     const { map, paths } = sw.route(swapped);
     assert.equal(paths.length, 2);
-    assert.deepEqual(map.pathMatchers[0].pathRules.map((rule) => [rule.paths[0], rule.service]).sort(), [['/_dormeto/*', waker], ['/_dormeto/backend/*', app]]);
-    assert.equal(map.pathMatchers[0].defaultService, waker);
+    assert.deepEqual(map.pathMatchers[0].pathRules.map((rule) => [rule.paths[0], servedBy(rule)]).sort(), [['/_dormeto/*', waker], ['/_dormeto/backend/*', app]]);
+    assert.equal(map.pathMatchers[0].defaultService ?? map.pathMatchers[0].defaultRouteAction.weightedBackendServices[0].backendService, waker);
   });
 
   test(`${kind}: with route rules, the route on a map that lost it keeps the hold at priority 0, the waker's at 1`, () => {
@@ -85,7 +89,7 @@ for (const [kind, lb, base, adapter, waitMs] of [
     const only = { name: 'lb', defaultService: app };
     const routed = sw.route(only).map;
     assert.deepEqual(routed.pathMatchers[0].pathRules.map((rule) => rule.paths[0]).sort(), ['/_dormeto/*', '/_dormeto/backend/*']);
-    const swapped = { name: 'lb', defaultService: waker };
+    const swapped = withSwap(only, 'app', waker, { headers }).map;
     const again = sw.route(swapped).map;
     assert.deepEqual(again.pathMatchers[0].pathRules.map((rule) => rule.paths[0]).sort(), ['/_dormeto/*', '/_dormeto/backend/*']);
   });
@@ -103,4 +107,11 @@ test('a kind nobody knows is refused, not taken for a global one', () => {
 test('inOneUpdate: each step on the map of the one before, the places in order', () => {
   const step = (name) => (map) => ({ map: { ...map, [name]: Object.keys(map).length }, paths: [name] });
   assert.deepEqual(inOneUpdate({ x: 1 }, [step('a'), step('b')]), { map: { x: 1, a: 1, b: 2 }, paths: ['a', 'b'] });
+});
+
+test('a regional configuration without its workload ID is refused: its waker\'s headers in the map would name no workload', () => {
+  const { workloadId, ...cfg } = cfgOf({ kind: 'regional', region: 'europe-west1' });
+  assert.equal(workloadId, 'demo');
+  assert.throws(() => switchOf(cfg, place), /regional workload needs its ID/);
+  assert.equal(switchOf({ ...cfg, lb: { kind: 'classic' } }, place).kind, 'swap');
 });

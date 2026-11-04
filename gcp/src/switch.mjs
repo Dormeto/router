@@ -5,6 +5,7 @@
 // (the waker's URL of its kind), asleep(map), awake(map), route(map), waitMs }`, the three functions as urlmaps.mjs's, returning
 // `{ map, paths }`. `route` is what stays for good: the waker's route and, under a swap, the hold route. `waitMs`: a change reaching
 // the load balancer, and the application's drain at a nap.
+import { swapHeaders } from './names.mjs';
 import { withErrorPolicy, withHoldRoute, withoutErrorPolicy, withoutSwap, withSwap, withWakerRoute } from './urlmaps.mjs';
 
 const COMPUTE = 'https://compute.googleapis.com/compute/v1';
@@ -20,7 +21,7 @@ export const inOneUpdate = (map, steps) => steps.reduce(({ map: on, paths }, ste
   return { map: done.map, paths: [...paths, ...done.paths] };
 }, { map, paths: [] });
 
-export function switchOf({ backendService: app, wakerBackendService: name, lb }, { urlmaps, regionalUrlmaps, project, region }) {
+export function switchOf({ workloadId, backendService: app, wakerBackendService: name, lb }, { urlmaps, regionalUrlmaps, project, region }) {
   const kind = lb?.kind ?? 'global';
   const url = (scope) => `${COMPUTE}/projects/${project}/${scope}/backendServices/${name}`;
   if (kind === 'global') {
@@ -40,14 +41,17 @@ export function switchOf({ backendService: app, wakerBackendService: name, lb },
   // The regional adapter is the router's region's: anything else would read and write another map, or none.
   if (regional && lb.region !== region) throw new Error(`a regional load balancer of ${lb.region} on the router of ${region}`);
   const waker = url(regional ? `regions/${region}` : 'global');
+  // A regional backend service takes no custom request header (M4): its waker's are written in the map.
+  if (regional && !workloadId) throw new Error('a regional workload needs its ID: its waker\'s headers are in the map');
+  const headers = regional ? swapHeaders(workloadId) : undefined;
   return {
     kind: 'swap',
     urlmaps: regional ? regionalUrlmaps : urlmaps,
     waker,
     waitMs: SWAP_WAIT_MS[kind],
-    asleep: (map) => withSwap(map, app, waker),
+    asleep: (map) => withSwap(map, app, waker, { headers }),
     awake: (map) => withoutSwap(map, app, waker),
     // The hold first: on a swapped map that lost both, it is what names the application where the waker's route must go.
-    route: (map) => inOneUpdate(map, [(m) => withHoldRoute(m, app, waker), (m) => withWakerRoute(m, app, waker)]),
+    route: (map) => inOneUpdate(map, [(m) => withHoldRoute(m, app, waker), (m) => withWakerRoute(m, app, waker, { headers })]),
   };
 }

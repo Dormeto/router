@@ -3,3 +3,6 @@
 export const WORKLOAD_ID = /^[a-z]([a-z0-9-]{0,38}[a-z0-9])?$/;
 export const WORKLOAD_HEADER = 'x-dormeto-workload';
 export const SWITCH_HEADER = 'x-dormeto-switch';
+// A swapped waker's two headers, as [name, value]: on a regional load balancer the map writes them, as its backend services take
+// no custom request header (M4).
+export const swapHeaders = (workloadId) => [[WORKLOAD_HEADER, workloadId], [SWITCH_HEADER, 'swap']];

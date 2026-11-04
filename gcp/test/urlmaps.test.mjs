@@ -774,3 +774,94 @@ test('createUrlMaps: a regional map\'s busy update is waited on for 120 s of pau
     assert.equal(google.calls.filter((c) => c.method === 'PUT').length, tries, scope);
   }
 });
+
+// ---- M4: a regional backend service takes no custom request header (Google: "not allowed for regional EXTERNAL_MANAGED") ----
+// The map carries them instead, wherever it names the regional waker: a one-entry weighted service with a header action that
+// replaces a client's own value (M4: it does). A plain reference swapped says so with x-dormeto-ref, to be written back plainly.
+
+const HEADERS = [['x-dormeto-workload', 'app'], ['x-dormeto-switch', 'swap']];
+const added = (pairs) => pairs.map(([headerName, headerValue]) => ({ headerName, headerValue, replace: true }));
+const toWaker = (extra = []) => ({ backendService: WAKER, weight: 100, headerAction: { requestHeadersToAdd: added([...HEADERS, ...extra]) } });
+const REF = [['x-dormeto-ref', 'service']];
+const R_ROUTE_PATH = { paths: ['/_dormeto/*'], routeAction: { weightedBackendServices: [toWaker()] } };
+const R_ROUTE_RULE = { priority: 0, matchRules: [{ prefixMatch: '/_dormeto/' }], routeAction: { weightedBackendServices: [toWaker()] } };
+
+test('withWakerRoute with headers: the /_dormeto/* route carries them, as a path rule or a route rule; twice writes nothing', () => {
+  const { map, paths } = withWakerRoute(swapFixture(), APP, WAKER, { headers: HEADERS });
+  assert.deepEqual(map.pathMatchers[1].pathRules.at(-1), R_ROUTE_PATH);
+  assert.deepEqual(map.pathMatchers[3].routeRules.at(-1), R_ROUTE_RULE);
+  assert.ok(paths.includes('pathMatchers[1].pathRules') && paths.includes('pathMatchers[3].routeRules'));
+  assert.deepEqual(withWakerRoute(map, APP, WAKER, { headers: HEADERS }).paths, []);
+});
+
+test('withoutWakerRoute: the route with headers goes, the map back to the byte', () => {
+  for (const original of [swapFixture(), swapDefault()]) {
+    const routed = withWakerRoute(original, APP, WAKER, { headers: HEADERS }).map;
+    assert.equal(JSON.stringify(withoutWakerRoute(routed, WAKER).map), JSON.stringify(original));
+  }
+});
+
+test('withSwap with headers: a plain reference becomes one weighted entry with the headers and x-dormeto-ref, a weighted one keeps its weight', () => {
+  const { map, paths } = withSwap(swapFixture(), APP, WAKER, { headers: HEADERS });
+  const expected = swapFixture();
+  delete expected.pathMatchers[0].defaultService;
+  expected.pathMatchers[0].defaultRouteAction = { weightedBackendServices: [toWaker(REF)] };
+  delete expected.pathMatchers[1].pathRules[0].service;
+  expected.pathMatchers[1].pathRules[0].routeAction = { weightedBackendServices: [toWaker(REF)] };
+  expected.pathMatchers[2].defaultRouteAction.weightedBackendServices[0] = toWaker();
+  delete expected.pathMatchers[3].routeRules[0].service;
+  expected.pathMatchers[3].routeRules[0].routeAction = { weightedBackendServices: [toWaker(REF)] };
+  expected.pathMatchers[3].routeRules[1].routeAction.weightedBackendServices[0] = { ...toWaker(), weight: 1 };
+  assert.deepEqual(map, expected);
+  assert.deepEqual(paths, [
+    'pathMatchers[0].defaultService',
+    'pathMatchers[1].pathRules[0].service',
+    'pathMatchers[2].defaultRouteAction',
+    'pathMatchers[3].routeRules[0].service',
+    'pathMatchers[3].routeRules[1].routeAction',
+  ]);
+  // In place: the reference's key becomes the route action's, where it was.
+  assert.deepEqual(Object.keys(map.pathMatchers[1].pathRules[0]), ['paths', 'routeAction']);
+});
+
+test('withSwap then withoutSwap with headers: the map back to the byte, the hold and the waker route with headers kept', () => {
+  for (const original of [swapFixture(), swapDefault()]) {
+    const held = withWakerRoute(withHoldRoute(original, APP, WAKER).map, APP, WAKER, { headers: HEADERS }).map;
+    const swapped = withSwap(held, APP, WAKER, { headers: HEADERS });
+    assert.ok(swapped.paths.length > 0);
+    assert.deepEqual(withSwap(swapped.map, APP, WAKER, { headers: HEADERS }).paths, [], 'swapped already');
+    const back = withoutSwap(swapped.map, APP, WAKER);
+    assert.ok(back.paths.length > 0);
+    assert.equal(JSON.stringify(back.map), JSON.stringify(held));
+    assert.deepEqual(withoutSwap(back.map, APP, WAKER).paths, [], 'unswapped already');
+  }
+});
+
+test('withSwap with headers: a customer\'s own header action and route action stay, and come back as they were', () => {
+  const map = swapFixture();
+  map.pathMatchers[2].defaultRouteAction.weightedBackendServices[0].headerAction = { requestHeadersToAdd: [{ headerName: 'x-team', headerValue: 'shop', replace: false }] };
+  map.pathMatchers[1].pathRules[0].routeAction = { urlRewrite: { pathPrefixRewrite: '/' } };
+  const swapped = withSwap(map, APP, WAKER, { headers: HEADERS }).map;
+  assert.deepEqual(swapped.pathMatchers[2].defaultRouteAction.weightedBackendServices[0].headerAction.requestHeadersToAdd,
+    [{ headerName: 'x-team', headerValue: 'shop', replace: false }, ...added(HEADERS)]);
+  assert.deepEqual(swapped.pathMatchers[1].pathRules[0], { paths: ['/api/*'], routeAction: { urlRewrite: { pathPrefixRewrite: '/' }, weightedBackendServices: [toWaker(REF)] } });
+  assert.deepEqual(withoutSwap(swapped, APP, WAKER).map, map);
+});
+
+test('the route with headers is Dormeto\'s: the swap leaves it, the hold accepts it, the hold\'s removal moves it back to priority 0', () => {
+  const routed = withWakerRoute(swapFixture(), APP, WAKER, { headers: HEADERS }).map;
+  const held = withHoldRoute(routed, APP, WAKER).map;
+  assert.deepEqual(held.pathMatchers[3].routeRules.filter((r) => r.priority < 2), [{ ...R_ROUTE_RULE, priority: 1 }, HOLD_RULE]);
+  const swapped = withSwap(held, APP, WAKER, { headers: HEADERS }).map;
+  assert.deepEqual(swapped.pathMatchers[1].pathRules.slice(-2), [R_ROUTE_PATH, HOLD_PATH]);
+  assert.deepEqual(withoutSwap(routed, APP, WAKER).paths, []);
+  const unheld = withoutHoldRoute(held, APP, WAKER).map;
+  assert.deepEqual(unheld.pathMatchers[3].routeRules.at(-1), R_ROUTE_RULE);
+});
+
+test('another workload\'s route with headers in a shared matcher is not this one\'s', () => {
+  const OTHER = `${V1}/dmtr-europe-west1-other`;
+  const map = withWakerRoute(swapFixture(), APP, WAKER, { headers: HEADERS }).map;
+  assert.deepEqual(withoutWakerRoute(map, OTHER).paths, []);
+  assert.throws(() => withWakerRoute(map, APP, OTHER, { headers: HEADERS }), /its own \/_dormeto\/ route/);
+});

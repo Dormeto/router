@@ -374,12 +374,14 @@ test('a wake timeout beyond the request\'s limit fails the wake before the limit
 
 // --- A regional or classic workload: the swap (the coverage design's section 7) ------------------------------------------
 
+// A regional waker's headers are in the map (M4), a classic one's on its backend service.
+const SWAP_HEADERS = [['x-dormeto-workload', 'demo'], ['x-dormeto-switch', 'swap']];
 const SWAPS = [
-  ['regional', { kind: 'regional', region: 'europe-west1' }, `${V1}/regions/europe-west1`, 100, 'europe-west1'],
-  ['classic', { kind: 'classic' }, `${V1}/global`, 250, 'global'],
+  ['regional', { kind: 'regional', region: 'europe-west1' }, `${V1}/regions/europe-west1`, 100, 'europe-west1', SWAP_HEADERS],
+  ['classic', { kind: 'classic' }, `${V1}/global`, 250, 'global', undefined],
 ];
 
-for (const [kind, lb, base, waitSeconds, healthScope] of SWAPS) {
+for (const [kind, lb, base, waitSeconds, healthScope, headers] of SWAPS) {
   const service = (name) => `${base}/backendServices/${name}`;
   const WAIT = `wait ${waitSeconds} s`;
   const WAIT_MS = waitSeconds * 1000;
@@ -391,11 +393,15 @@ for (const [kind, lb, base, waitSeconds, healthScope] of SWAPS) {
     pathMatchers: [{
       name: 'm',
       defaultService: service('app'),
-      pathRules: [{ paths: ['/_dormeto/*'], service: service(WAKER) }, { paths: ['/_dormeto/backend/*'], service: service('app') }],
+      pathRules: [headers
+        ? { paths: ['/_dormeto/*'], routeAction: { weightedBackendServices: [{ backendService: service(WAKER), weight: 100, headerAction: {
+          requestHeadersToAdd: headers.map(([headerName, headerValue]) => ({ headerName, headerValue, replace: true })) } }] } }
+        : { paths: ['/_dormeto/*'], service: service(WAKER) }, { paths: ['/_dormeto/backend/*'], service: service('app') }],
     }],
   });
-  const swappedMap = () => withSwap(awakeMap(), 'app', service(WAKER)).map;
-  const isSwapped = (map) => map.pathMatchers[0].defaultService === service(WAKER);
+  const swappedMap = () => withSwap(awakeMap(), 'app', service(WAKER), { headers }).map;
+  const defaultOf = (matcher) => matcher.defaultService ?? matcher.defaultRouteAction?.weightedBackendServices?.[0]?.backendService;
+  const isSwapped = (map) => defaultOf(map.pathMatchers[0]) === service(WAKER);
   // `calls` also says the state changes, between what changes the map and the VMs.
   const swapSetup = ({ cfg = {}, vms = { 'vm-a': { status: 'RUNNING' } }, map = awakeMap(), ...rest } = {}) => {
     const t = setup({ cfg: { lb, hibernate: false, ...cfg }, vms, map, ...rest });

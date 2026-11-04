@@ -21,7 +21,7 @@ import { groupOf, PauseRefused } from './controller-core.mjs';
 import {
   clusterProblems, clusterRead, giveBackOwner, gkeMapRefusal, gkeProblems, isGkeNeg, isPods, negsOfService, ownerAsVm, ownerText, pauseLeft,
 } from './gke.mjs';
-import { SWITCH_HEADER, WORKLOAD_HEADER, WORKLOAD_ID } from './names.mjs';
+import { SWITCH_HEADER, WORKLOAD_HEADER, WORKLOAD_ID, swapHeaders } from './names.mjs';
 import { inOneUpdate, SWAP_WAIT_MS } from './switch.mjs';
 import {
   hostsOf, inMatcher, references, UrlMapRefused, withErrorPolicy, withHoldRoute, withoutErrorPolicy, withoutHoldRoute, withoutSwap, withoutWakerRoute, withSwap, withWakerRoute,
@@ -154,7 +154,14 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   const clients = { compute, kubernetesOf: (cluster) => gke.kubernetesOf(cluster) };
   const wakerName = (id) => `dmtr-${config.region}-${id}`;
   const wakerUrl = (name, lb) => `${COMPUTE}/projects/${config.project}/${isRegional(lb) ? `regions/${lb.region}` : 'global'}/backendServices/${name}`;
+  // A regional backend service takes no custom request header (M4: Google refuses them): its waker's are written in the map,
+  // and the service says whose waker it is in its description, which a later onboarding of the same workload reads.
   const wakerHeaders = (id, lb) => [`${WORKLOAD_HEADER}: ${id}`, ...(isSwapped(lb) ? [`${SWITCH_HEADER}: swap`] : [])];
+  const wakerDescription = (id) => `Dormeto: the waker of workload ${id}`;
+  const mapHeaders = (id, lb) => ({ headers: isRegional(lb) ? swapHeaders(id) : undefined });
+  const isWakerOf = (service, id, lb) => (isRegional(lb)
+    ? service.description === wakerDescription(id) && !service.customRequestHeaders?.length
+    : service.customRequestHeaders?.length === wakerHeaders(id, lb).length && wakerHeaders(id, lb).every((h) => service.customRequestHeaders.includes(h)));
   const mapsOf = (lb) => (isRegional(lb) ? regionalUrlmaps : urlmaps);
   const getService = (name, lb) => (isRegional(lb) ? compute.getRegionBackendService(lb.region, name) : compute.getBackendService(name));
   const deleteService = (name, lb) => (isRegional(lb) ? compute.deleteRegionBackendService(lb.region, name) : compute.deleteBackendService(name));
@@ -213,12 +220,12 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   // What the route and the nap would write, tried on the map as it is, the nap's after the route: the route gives the map's
   // default its matcher. A map that does not name the service has its reason already. Under a swap, the nap's is the swap, after
   // the hold route too.
-  function mapProblems(map, backendService, waker, lb) {
+  function mapProblems(map, backendService, waker, lb, id) {
     if (!references(map, backendService).length) return [];
     const problems = [];
     const tried = (write, on, advice) => {
       try {
-        return write(on, backendService, waker).map;
+        return write(on, backendService, waker, mapHeaders(id, lb)).map;
       } catch (err) {
         if (!(err instanceof UrlMapRefused)) throw err;
         problems.push(`${err.message}: ${advice}`);
@@ -406,10 +413,9 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     if (!service.backends?.length) reasons.push(`backend service ${backendService} has no backend: add an instance group, then onboard again`);
 
     const waker = wakerName(id);
-    reasons.push(...mapProblems(map, backendService, wakerUrl(waker, lb), lb));
+    reasons.push(...mapProblems(map, backendService, wakerUrl(waker, lb), lb, id));
     const existing = await getService(waker, lb).catch(absent);
-    const headers = wakerHeaders(id, lb);
-    if (existing && (existing.customRequestHeaders?.length !== headers.length || !headers.every((h) => existing.customRequestHeaders.includes(h)))) {
+    if (existing && !isWakerOf(existing, id, lb)) {
       reasons.push(`backend service ${waker} exists and is not the waker of ${id}: rename it, or onboard under another id`);
     }
 
@@ -516,18 +522,19 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     };
     try {
       if (!wakerExists) {
-        // M4 (the coverage design's section 10) has not been measured: a classic backend service with EXTERNAL and a regional one, on
-        // the router's serverless NEG, with two custom request headers, are as the design has them, unconfirmed by Google.
+        // M4 (the coverage design's section 10): Google takes a classic backend service with EXTERNAL and its two custom request
+        // headers on the router's serverless NEG, and refuses those headers on a regional one, whose map carries them instead.
         await insertService({
           name,
+          ...(isRegional(lb) ? { description: wakerDescription(id) } : {}),
           loadBalancingScheme: SCHEME_OF[lb.kind],
           protocol: 'HTTPS',
           backends: [{ group: `${COMPUTE}/projects/${config.project}/regions/${config.region}/networkEndpointGroups/${config.wakerNeg}` }],
-          customRequestHeaders: wakerHeaders(id, lb),
+          ...(isRegional(lb) ? {} : { customRequestHeaders: wakerHeaders(id, lb) }),
         }, lb).catch(refusedByGoogle(id, `its waker backend service ${name}`));
       }
       await mapsOf(lb).modify(urlMap, (map) => inOneUpdate(map, isSwapped(lb)
-        ? [(m) => withWakerRoute(m, backendService, waker), (m) => withHoldRoute(m, backendService, waker)]
+        ? [(m) => withWakerRoute(m, backendService, waker, mapHeaders(id, lb)), (m) => withHoldRoute(m, backendService, waker)]
         : [(m) => withWakerRoute(m, backendService, waker)])).catch(refusedByGoogle(id, `the update of URL map ${urlMap}`));
       await store.putConfig(id, cfg);
       await store.initRun(id, now());

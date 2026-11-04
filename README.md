@@ -12,7 +12,8 @@ Data plane of [Dormeto](https://dormeto.com) ("nap" in Esperanto): it puts idle 
 sleep and wakes them just-in-time on the next request.
 
 **[Supported scenarios](docs/scenarios/README.md):** EC2 instances, Auto Scaling groups, ECS services, RDS and Aurora
-databases, Kubernetes on EKS, Compute Engine VMs on Google Cloud, each with its diagram, services, measured wake time, behavior and limits.
+databases, Kubernetes on EKS, and on Google Cloud Compute Engine VMs, Cloud SQL databases and Kubernetes on GKE, each with
+its diagram, services, measured wake time, behavior and limits.
 
 This MVP manages one EC2 instance behind an ALB:
 
@@ -591,10 +592,23 @@ aws dynamodb get-item --table-name dmt-dev-router --key '{"pk":{"S":"WL#demo"},"
 
 ## Google Cloud
 
-Since 0.34.0 the router also runs on Google Cloud (Compute Engine VMs behind a global external Application Load
-Balancer, [the scenario](docs/scenarios/google-cloud-compute-engine.md)): `gcp/src` holds the two Cloud Run roles, one
-container image, `DMT_ROLE` (`waker` or `controller`) picks the role. `dormeto gcp install` (the CLI) creates the
-services; it takes the image with `--image`.
+Since 0.34.0 the router also runs on Google Cloud: `gcp/src` holds the two Cloud Run roles, one container image,
+`DMT_ROLE` (`waker` or `controller`) picks the role. `dormeto gcp install` (the CLI) creates the services; it takes the
+image with `--image`. Its scenarios, each with its limits:
+
+- [Compute Engine VMs](docs/scenarios/google-cloud-compute-engine.md): instance groups behind a global external
+  Application Load Balancer since 0.34.0; zonal network endpoint groups, the regional and classic load balancers (the
+  router swaps their URL map's references at each nap and wake), schedules and pauses, and IP lists from 0.37.0.
+- [Cloud SQL databases](docs/scenarios/google-cloud-sql.md): instances named at the onboarding, stopped after the
+  application and started before it, from 0.37.0.
+- [Kubernetes on GKE](docs/scenarios/google-kubernetes-engine.md): a Deployment or StatefulSet behind standalone network
+  endpoint groups, scaled to 0 and back, from 0.37.0.
+
+Router 0.37.0 adds zonal network endpoint groups, the regional and classic load balancers, schedules, pauses, IP lists
+(`dormeto gcp install --ip-list`), Cloud SQL companions and GKE pods, the last two with the access that
+`dormeto gcp install --with cloud-sql,gke` adds (their APIs, the roles `dormetoRouterDatabasesRead`,
+`dormetoRouterDatabases` and `dormetoRouterKubernetes`, and a Kubernetes Role per GKE workload, which the CLI applies).
+They are measured on Google in parts and not accepted yet: each page says what was measured.
 
 ```bash
 # Build (podman, linux/amd64) dormeto-router:<version> from gcp/Containerfile
@@ -615,7 +629,9 @@ gcloud artifacts repositories create dormeto --repository-format=docker --locati
 
 The image carries `package.json`, `lambda/src/lib` and `gcp/src` only, on `gcr.io/distroless/nodejs24-debian12` (Node
 24.2 or later: `server.mjs` uses `import.meta.main`). `gcp/access.json` is the manifest of the access the router needs.
-`terraform/gcp-dev` is the demo VMs and load balancer of the acceptance, with no IAM.
+`terraform/gcp-dev` is the demo VMs and load balancers of the acceptance, with no IAM; its classic load balancer, zonal
+NEG, Cloud SQL instance and GKE cluster are behind variables that default to off (`enable_classic`, `enable_neg`,
+`enable_sql`, `enable_gke`).
 
 ## Version
 

@@ -608,7 +608,8 @@ Router 0.37.0 adds zonal network endpoint groups, the regional and classic load 
 (`dormeto gcp install --ip-list`), Cloud SQL companions and GKE pods, the last two with the access that
 `dormeto gcp install --with cloud-sql,gke` adds (their APIs, the roles `dormetoRouterDatabasesRead`,
 `dormetoRouterDatabases` and `dormetoRouterKubernetes`, and a Kubernetes Role per GKE workload, which the CLI applies).
-They are measured on Google in parts and not accepted yet: each page says what was measured.
+They were accepted on 2026-11-04 in `dormeto-dev` with CLI 0.11.0, both unreleased, but for ten workloads on one URL
+map, which was not run: each page says what was accepted and measured.
 
 ```bash
 # Build (podman, linux/amd64) dormeto-router:<version> from gcp/Containerfile

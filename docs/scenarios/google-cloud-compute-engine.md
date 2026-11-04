@@ -145,8 +145,9 @@ so a workload whose VMs it had begun to stop stays asleep that long. Under a swa
 
 ## Zonal network endpoint groups
 
-**From router 0.37.0, not accepted yet.** The VMs' times below were measured on Google (2026-10-31); the acceptance, which
-naps and wakes such a workload through the router, has not run.
+**From router 0.37.0, accepted on 2026-11-04** with CLI 0.11.0, both unreleased: a NEG's VM, with a Cloud SQL companion,
+napped by its idle window and woken by a browser through the router. The VMs' own times below were measured on Google
+(2026-10-31).
 
 A backend of the application's backend service may be a zonal network endpoint group (NEG) of type `GCE_VM_IP_PORT`,
 each endpoint naming a VM. The onboarding reads the endpoints, and their VMs are napped as an unmanaged group's are:
@@ -166,8 +167,11 @@ recorded.
 | Stopped VM, 5 runs each way | no instance healthy after 9–11 s, stopped after 106–107 s | running after 8–39 s, healthy after 33–64 s, the application answering steadily after 38–75 s |
 | Suspended VM, 3 runs | no instance healthy after 25–27 s, suspended after 26–51 s | healthy after 11–13 s, the application answering steadily after 13–18 s |
 
-These are Compute Engine's times through the load balancer, before the router's code: no wake of a NEG's VM through the
-router has been timed yet. One request of the first run hung for its 6 s right after the stop, as with groups.
+These are Compute Engine's times through the load balancer, before the router's code; one request of the first run hung
+for its 6 s right after the stop, as with groups. Through the router, the acceptance's NEG workload had a Cloud SQL
+companion: its nap took 8.5 minutes (the policy's 300 s, the VM suspended, then the database), and a browser's probe
+woke it in 551 s, the database's start, then the VM's ([Cloud SQL's wake time](google-cloud-sql.md#wake-time)). A NEG's
+VM without a companion was not timed through the router.
 
 ### Limits of zonal NEGs
 
@@ -185,8 +189,9 @@ router has been timed yet. One request of the first run hung for its 6 s right a
 
 ## Regional and classic load balancers: the swap
 
-**From router 0.37.0, not accepted yet.** A nap and a wake were measured through the router once on each kind
-(2026-11-04), the URL maps' changes beforehand (2026-10-31); the acceptance has not run.
+**From router 0.37.0, accepted on 2026-11-04** with CLI 0.11.0, both unreleased, but for ten workloads on one URL map,
+which was not run ([the swap's limits](#limits-of-the-swap)). Each kind was onboarded, napped, woken and offboarded
+through the router, and steady traffic kept each awake; the URL maps' changes were measured beforehand (2026-10-31).
 
 A regional or classic external Application Load Balancer has no custom error response: Google refuses the policy on both.
 So the router changes the URL map itself, one `update` at each nap and one at each wake: every reference to the
@@ -279,14 +284,17 @@ waker: `BackendsNotWoken` is logged, the map is unswapped and the workload is `A
 waits SWAP_WAIT, then the workload is `AWAKE`; with nothing swapped yet, there is no wait. Visitors stay at the waker
 until the unswap has spread.
 
-**The check.** Every 5 minutes the map is put back as the state says: a swap written by hand on an awake workload was
-repaired at the next check, 43 s later (measured, logged `RouteDrift`). VMs started by hand while the workload sleeps
+**The check.** Every 5 minutes the map is put back as the state says: a swap written by hand on an awake classic
+workload was repaired at the next check, 43 s later, and a regional map's `/_dormeto/*` route deleted by hand came back
+at the next check (measured, logged `RouteDrift`). VMs started by hand while the workload sleeps
 make it awake through a wake, which unswaps and waits (`external-start`).
 
 **Idle signal.** Classic: `loadbalancing.googleapis.com/https/request_count`, resource `https_lb_rule`, as on the
 global load balancer. Regional: `loadbalancing.googleapis.com/https/external/regional/request_count`, resource
 `http_external_regional_lb_rule`, with the region in the filter. Both by the backend service's plain name, read back
-with real traffic (measured); the first point came 84 s (classic) and 51 s (regional) after the requests.
+with real traffic (measured); the first point came 84 s (classic) and 51 s (regional) after the requests. Steady
+traffic, 45 requests in 15 minutes, kept each kind awake through the router with a 5-minute idle window (the
+acceptance).
 
 **Offboarding** puts the application back wherever the map is still swapped and removes the hold route and the
 waker's route, in one update, then deletes the waker backend service. Measured: a classic offboarding in 1 min 42 s, the
@@ -294,10 +302,10 @@ map back as before its onboarding.
 
 ### Wake time of the swap
 
-| Measured through the router (2026-11-04, one run each, a suspended VM) | Nap | A visitor's `POST /_dormeto/wake` to the application answering steadily |
+| Measured through the router (2026-11-04, a suspended VM) | Nap | Wake to the application answering steadily |
 |---|---|---|
-| Classic | 5.5 minutes | 2 min 16 s |
-| Regional | 3.5 minutes to `ASLEEP` | 62 s |
+| Classic | 5.5 minutes | 2 min 16 s after a visitor's `POST /_dormeto/wake` |
+| Regional | 3.5 to 6.5 minutes to `ASLEEP` | 62 s after a browser's probe; 62 s and 123 s after a `POST /_dormeto/wake` |
 
 The maps' own changes, measured before the router's code: a classic map's update took about 17 s, then the first new
 answer came after 38–123 s, the last old one after 76–221 s, settled after 78–226 s, with 3 to 11 answers `502` at the
@@ -321,13 +329,14 @@ earlier runs), with one answer `503`.
 - **A nap that dies under a swap holds visitors up to 15 minutes.** If the nap's request ends while the map is swapped
   and no VM is stopping yet (a new revision of the controller, for example), visitors get the waiting page and their
   wakes wait until the check calls the nap stuck, after 15 minutes (35 minutes once a VM is stopping); the workload is
-  then `FAILED`, and the check's wake brings it back.
+  then `FAILED`, and the check's wake brings it back. No nap was killed so in the acceptance: this is what the code does.
 - **A request with a body gets the page under a swap**, a `503`, for any method: API clients should read a `503` as
   asleep, send `POST /_dormeto/wake`, then retry their request.
 - **Ten naps on one regional URL map.** A regional map's update took 85 s (measured), and a nap retries a map busy with
   another update for about 120 s. So of ten workloads on one regional map that nap together, in one nap window, only 2
-  or 3 may nap (by arithmetic, not measured yet): the others' naps fail (`NapFailed`), with that window's occurrence spent,
-  and they nap later by their idle window. Give workloads of one regional map different nap windows, or maps of their own.
+  or 3 may nap (by arithmetic: ten workloads on one URL map were not run in the acceptance, and the retries are
+  unit-tested only): the others' naps fail (`NapFailed`), with that window's occurrence spent, and they nap later by their
+  idle window. Give workloads of one regional map different nap windows, or maps of their own.
 - **A header of your own named `x-dormeto-*` on a regional map's swapped entry is replaced at the swap and not given
   back** at the unswap: the `x-dormeto-` headers are Dormeto's. Name your own headers otherwise.
 - **Your routes under `/_dormeto/`.** `/_dormeto/*` and `/_dormeto/backend/*` are Dormeto's: a route of your own under
@@ -337,14 +346,18 @@ earlier runs), with one answer `503`.
   each nap and wake, and holds Dormeto's routes (and, on regional, the waker's headers): ignore
   `lifecycle { ignore_changes = [default_service, default_route_action, host_rule, path_matcher] }`. Otherwise an apply
   puts the application back in a sleeping workload's map, and the visitors get Google's error until the next check
-  swaps it again. The demo's regional and classic maps have it; that `terraform plan` then shows no change is the
-  acceptance's to check.
+  swaps it again. The demo's regional and classic maps have it, and `terraform plan` showed no change with a regional
+  workload onboarded (the acceptance; the classic one was offboarded by then).
 - **Idle signal.** A metric filter that matched nothing would read 0 and nap a busy workload. The filters were read back
-  with real traffic; that steady traffic keeps each kind awake through the router is the acceptance's to check.
+  with real traffic, and steady traffic kept each kind awake through the router (the acceptance: 45 requests in 15
+  minutes, a 5-minute idle window).
 
 ## Schedules and pauses
 
-**From router 0.37.0, not accepted yet.** The acceptance has not run.
+**From router 0.37.0, accepted on 2026-11-04** with CLI 0.11.0, both unreleased, on a GKE workload, but for ten workloads
+on one URL map in one nap window, which was not run. `schedule show` listed the next events; a nap window napped the
+workload, and a visitor in it was told when it ends and woke nothing; an awake window woke it; a pause refused a nap and
+woke a sleeper; with `--keep-asleep` the workload stayed asleep into an awake window, and a visitor's probe woke it.
 
 As on AWS: a workload's schedule of nap and awake windows, with exceptions and `maxNapDays`, in its time zone, in the
 same JSON (the CLI's README has it), and pauses with a reason. Through the controller, as the operator:
@@ -378,11 +391,15 @@ answered with what is wrong.
 - **A scheduled nap's occurrence is spent once its task is accepted.** A pause, a refused nap or a lost task costs that
   window's nap: it does not come back when the pause ends. The idle check still naps the workload by its idle window.
 - **A pause is a workload's.** Router-wide pauses and exclusions wait for the manager on Google Cloud.
-- **Many workloads of one regional URL map in one nap window:** see [the swap's limits](#limits-of-the-swap).
+- **Many workloads of one regional URL map in one nap window:** see [the swap's limits](#limits-of-the-swap). Ten on one
+  map were not run in the acceptance.
 
 ## IP lists
 
-**From router 0.37.0, not accepted yet.** The acceptance has not run.
+**From router 0.37.0, accepted on 2026-11-04** with CLI 0.11.0, both unreleased: with Google's list of its own addresses
+(`goog.json`, 148 ranges, loaded at the first check), the page's probe from a Google address got a `202` and the
+workload slept on (`WakeIgnored`), the same probe from another address woke it, and the listed address's
+`POST /_dormeto/wake` woke it.
 
 The router ignores the addresses of the IP lists named at its install, for every workload:
 `dormeto gcp install --ip-list name=<n>,url=<u>[,refresh=<hours>]`, repeatable. A run with `--ip-list` replaces the set,
@@ -401,9 +418,9 @@ wakes the workload, from any address.
 - **An IP list stops browsers and scanners on those addresses, not an API client that means to wake** with
   `POST /_dormeto/wake`.
 - **The lists are the router's,** for all its workloads; a catalog of lists waits for the manager on Google Cloud.
-- **The address the waker reads** is the last entry of `X-Forwarded-For` before the load balancer's own. Which address
-  that is behind each kind of load balancer, a forged header included, was not measured yet: the acceptance reads it
-  from real wakes.
+- **The address the waker reads** is the last entry of `X-Forwarded-For` before the load balancer's own. Behind a
+  regional load balancer it was the client's (the acceptance, from real wakes); behind the global and classic ones, and
+  with a forged header, it was not read on Google.
 
 ## Limits
 
@@ -430,7 +447,7 @@ wakes the workload, from any address.
   `google_compute_instance`, `ignore_changes = [desired_status]` if you set it: an apply would start a napped VM. These
   field names pass `terraform validate`; no apply was run against a napped workload. The tag's binding is not a field of
   these resources, so it needs nothing.
-- **From router 0.37.0, not accepted yet: the other fields to ignore in Terraform** are on their pages: a regional or
+- **From router 0.37.0, the other fields to ignore in Terraform** are on their pages: a regional or
   classic load balancer's URL map in [the swap's limits](#limits-of-the-swap), a Cloud SQL companion on [Google Cloud:
   Cloud SQL databases](google-cloud-sql.md#limits), a GKE workload's Deployment or StatefulSet on [Kubernetes on
   GKE](google-kubernetes-engine.md#limits).

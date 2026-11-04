@@ -111,10 +111,17 @@ const PAGE_PARTS = ['```mermaid', '## Services', '## Wake time', '## Behavior', 
 // flat() drops the asterisks of the routes and headers: these read the page with its marks, only its spaces made one.
 const spaced = (text) => text.replace(/\s+/g, ' ');
 
-test('the Compute Engine page: what ships in router 0.37.0 says so, and is not called accepted', () => {
+// The acceptance of 2026-11-04 (vision docs/plans/2026-10-30-google-cloud-coverage.md, "Acceptance results"): passed but for
+// ten workloads on one URL map, which was not run.
+const NOT_ACCEPTED = /not accepted yet|acceptance has not run|the acceptance's to check|the acceptance tries it|No wake through the router has been timed yet|no wake of a NEG's VM through the router has been timed yet/;
+const ACCEPTED = /From router 0\.37\.0, accepted on 2026-11-04 with CLI 0\.11\.0, both unreleased/g;
+
+test('the Compute Engine page: what ships in router 0.37.0 says so, and that it was accepted but for ten workloads on one map', () => {
   const page = flat(read(CE));
   assert.doesNotMatch(page, /router 0\.35\.0/);
-  assert.match(page, /From router 0\.37\.0, not accepted yet/);
+  assert.doesNotMatch(page, NOT_ACCEPTED);
+  assert.equal(page.match(ACCEPTED)?.length, 4, 'the NEGs, the swap, schedules and pauses, IP lists');
+  assert.match(page, /but for ten workloads on one URL map, which was not run/);
   assert.match(page, /\(google-cloud-sql\.md\)/);
   assert.match(page, /\(google-kubernetes-engine\.md\)/);
   assert.doesNotMatch(page, /The global external Application Load Balancer only/);
@@ -132,6 +139,7 @@ test('the Compute Engine page: zonal NEGs, with M1\'s times and their limits', (
   assert.match(page, /\(cause backends-changed/);
   assert.match(page, /A VM added to or removed from a NEG while the workload sleeps is found at its next nap/);
   assert.match(page, /a VM of a managed group/);
+  assert.match(page, /its nap took 8\.5 minutes .*and a browser's probe woke it in 551 s/);
 });
 
 test('the Compute Engine page: the swap of regional and classic load balancers, its times and its limits', () => {
@@ -142,8 +150,12 @@ test('the Compute Engine page: the swap of regional and classic load balancers, 
   }
   assert.match(page, /SWAP_WAIT: 100 s on a regional load balancer, 250 s on a classic one/);
   assert.match(page, /The default wake timeout adds SWAP_WAIT: 700 s for VMs on a regional load balancer, 850 s on a classic one/);
-  assert.match(page, /\| Classic \| 5\.5 minutes .*\| 2 min 16 s \|/);
-  assert.match(page, /\| Regional \| 3\.5 minutes .*\| 62 s \|/);
+  assert.match(page, /\| Classic \| 5\.5 minutes \| 2 min 16 s after a visitor's POST \/_dormeto\/wake \|/);
+  assert.match(page, /\| Regional \| 3\.5 to 6\.5 minutes to ASLEEP \| 62 s after a browser's probe; 62 s and 123 s after a POST \/_dormeto\/wake \|/);
+  assert.match(page, /Steady traffic, 45 requests in 15 minutes, kept each kind awake through the router with a 5-minute idle window/);
+  assert.match(page, /terraform plan showed no change with a regional workload onboarded/);
+  assert.match(page, /ten workloads on one URL map were not run in the acceptance/);
+  assert.match(page, /No nap was killed so in the acceptance/);
   assert.match(page, /ignore_changes = \[default_service, default_route_action, host_rule, path_matcher\]/);
   assert.match(page, /answered that load balancer's plain-HTTP requests with a 302 to https:\/\/ for about 40 s/);
   assert.match(page, /A visitor at a nap's start waits up to 2 × SWAP_WAIT with the VMs running/);
@@ -161,7 +173,11 @@ test('the Compute Engine page: schedules, pauses and IP lists, with what they do
   assert.match(page, /at most 10 scheduled naps each run, oldest occurrence first/);
   assert.match(page, /With --keep-asleep, a visitor still wakes the workload/);
   assert.match(page, /A scheduled nap's occurrence is spent once its task is accepted/);
+  assert.match(page, /on a GKE workload, but for ten workloads on one URL map in one nap window, which was not run/);
+  assert.match(page, /with --keep-asleep the workload stayed asleep into an awake window, and a visitor's probe woke it/);
   assert.match(page, /Only the action ignore exists here/);
+  assert.match(page, /the page's probe from a Google address got a 202 and the workload slept on \(WakeIgnored\)/);
+  assert.match(page, /Behind a regional load balancer it was the client's/);
   assert.match(page, /An IP list stops browsers and scanners on those addresses, not an API client that means to wake/);
   assert.match(page, /called stuck after 35 minutes/);
 });
@@ -174,7 +190,11 @@ test('the Cloud SQL page is linked from the scenarios index and states its limit
   for (const needle of ['dormetoRouterDatabasesRead', 'dormetoRouterDatabases:', 'cloudsql.instances.update', 'dormeto=managed', '--cloud-sql', '--with cloud-sql']) {
     assert.ok(page.includes(needle), needle);
   }
-  assert.match(page, /From router 0\.37\.0, not accepted yet/);
+  assert.doesNotMatch(page, NOT_ACCEPTED);
+  assert.equal(page.match(ACCEPTED)?.length, 1);
+  assert.match(page, /About 9\.2 minutes through the router \(551 s/);
+  assert.match(page, /a wake 5 minutes after the binding's removal was refused/);
+  assert.match(page, /no such refusal was met, in the measures or the acceptance/);
   assert.match(page, /done after 104 s/);
   assert.match(page, /done after 562 s/);
   assert.match(page, /The default wake timeout of a workload with a companion is 1700 s/);
@@ -203,7 +223,11 @@ test('the GKE page is linked from the scenarios index and states its limits', ()
     /\| \(core\) \| pods, events \| list \|/, /\| keda\.sh \| scaledobjects \| list, patch \|/]) {
     assert.match(page, row);
   }
-  assert.match(page, /From router 0\.37\.0, not accepted yet/);
+  assert.doesNotMatch(page, NOT_ACCEPTED);
+  assert.equal(page.match(ACCEPTED)?.length, 1);
+  assert.match(page, /on a Standard cluster with no KEDA/);
+  assert.match(page, /13 s through the router/);
+  assert.match(page, /its nap took about 6 minutes/);
   assert.match(page, /Nothing cluster-wide/);
   assert.match(page, /scaling pods saves money only on Autopilot, or with the node autoscaler freeing a node/);
   assert.match(page, /the application answering steadily 9 s after the scale/);
@@ -221,8 +245,14 @@ test('the scenarios index has a row for each Google Cloud page', () => {
   const row = (page) => flat(rows.find((line) => line.includes(`](${page})`)) ?? '');
   assert.match(row('google-cloud-compute-engine.md'), /global, regional or classic/);
   assert.match(row('google-cloud-compute-engine.md'), /700 s regional, 850 s classic/);
+  assert.match(row('google-cloud-compute-engine.md'), /through a regional load balancer 62 s from a browser, 62–123 s from POST \/_dormeto\/wake/);
+  assert.match(row('google-cloud-sql.md'), /9\.2 min through the router/);
   assert.match(row('google-cloud-sql.md'), /\| 1700 s \|$/);
+  assert.match(row('google-kubernetes-engine.md'), /13 s through the router/);
   assert.match(row('google-kubernetes-engine.md'), /\| 300 s \|$/);
+  const index = flat(read('docs/scenarios/README.md'));
+  assert.doesNotMatch(index, /what the acceptance has not run yet/);
+  assert.match(index, /accepted on 2026-11-04 but for ten workloads on one URL map/);
 });
 
 test('the README\'s Google Cloud section names the three pages and what router 0.37.0 adds', () => {
@@ -233,5 +263,6 @@ test('the README\'s Google Cloud section names the three pages and what router 0
   }
   assert.match(flat(section), /Router 0\.37\.0 adds zonal network endpoint groups/);
   assert.match(flat(section), /--with cloud-sql,gke/);
-  assert.match(flat(section), /not accepted yet/);
+  assert.doesNotMatch(flat(section), /not accepted yet/);
+  assert.match(flat(section), /accepted on 2026-11-04 in dormeto-dev with CLI 0\.11\.0, both unreleased, but for ten workloads on one URL map, which was not run/);
 });

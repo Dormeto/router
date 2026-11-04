@@ -6,9 +6,10 @@ balancer). The nap stops them after the application, the wake starts them and wa
 application, as [RDS and Aurora databases](databases.md) on AWS. An instance stops and starts by its activation policy;
 the router has no connection to it.
 
-**From router 0.37.0, not accepted yet.** A stop and a start were measured on Google (2026-11-04, below), and the tag's
-condition as the router; the acceptance, which naps and wakes a workload with a companion through the router, has not
-run.
+**From router 0.37.0, accepted on 2026-11-04** with CLI 0.11.0, both unreleased, with a VM in a zonal NEG: the database
+went down after the application and came up before it, a wake after the tag's removal was refused, a database started by
+hand while asleep was stopped by the check, and one stopped while awake was started. A stop and a start were measured on
+Google beforehand (below), and the tag's condition as the router.
 
 ```mermaid
 flowchart LR
@@ -51,10 +52,12 @@ What Google adds: turning `sqladmin.googleapis.com` on and creating an instance 
 
 ## Wake time
 
-**About 9.4 minutes for the database alone**, measured once on Google outside the router (2026-11-04, a `db-f1-micro`
-PostgreSQL 16 instance): a start by `activationPolicy: ALWAYS` was done after 562 s, a stop by `NEVER` done after 104 s.
-The application's backends start only once the database runs, so their own start comes on top. Larger instances and
-other engines were not measured. Visitors see the waiting page meanwhile, which reloads by itself.
+**About 9.2 minutes through the router** (551 s, the acceptance, 2026-11-04): from a browser's probe to the application,
+for a VM in a zonal NEG with a `db-f1-micro` companion, the database's start, then the VM's. Its nap took 8.5 minutes:
+the policy's 300 s, the VM suspended, then the database. Measured once on Google outside the router, the same day, on a
+`db-f1-micro` PostgreSQL 16 instance: a start by `activationPolicy: ALWAYS` was done after 562 s, a stop by `NEVER` done
+after 104 s. The application's backends start only once the database runs, so their own start comes on top. Larger
+instances and other engines were not measured. Visitors see the waiting page meanwhile, which reloads by itself.
 
 The default wake timeout of a workload with a companion is 1700 s, whatever its other backends and its load balancer
 (AWS's 1800 s does not fit the controller's request of 1800 s).
@@ -79,20 +82,23 @@ the controller onboards the workload. A companion always goes with an applicatio
    for, then started.
 2. While another operation runs on the instance, Google answers `409` (`operationInProgress`, measured): the change is
    tried again until the wake's deadline. A start refused for lack of capacity is tried again as on AWS, after 30 s,
-   60 s, then every 120 s (Google's words for such a refusal were not measured).
+   60 s, then every 120 s (no such refusal was met, in the measures or the acceptance: Google's words for it are not
+   known).
 3. Then the application's backends start, and the wake ends as their scenario says.
 
 **The check (every 5 minutes).** The application's backends decide the workload's state, and the databases follow it:
 asleep, a running database is stopped again (`DatabaseRestopped`); awake, a stopped one is started (`DatabaseRestarted`).
-One try per check: a refusal, or another operation running, is for the next check.
+One try per check: a refusal, or another operation running, is for the next check. Both were seen in the acceptance;
+the start came one check late, after a `409` at the check before.
 
-**Offboarding.** A workload asleep is woken first, its databases with it; the CLI then removes the tag bindings.
+**Offboarding.** A workload asleep is woken first, its databases with it; the CLI then removes the tag bindings. The
+acceptance's took 14 min 44 s, and left the VM and the database running, untagged.
 
 ## Limits
 
 - **Keep the 1700 s wake timeout.** It is the most a wake can take. Under a regional or classic load balancer, the map's
   change shares those 1700 s: a database start over about 24 minutes fails the wake after the map changed back, and the
-  next check heals it. The measured start took 562 s.
+  next check heals it. The measured start took 562 s, and the acceptance's wake 551 s.
 - **A primary with read replicas** is taken, with a warning at the onboarding: Google stops only the primary, its
   replicas keep running, and billing, while the workload sleeps (measured: the primary stopped in 32 s, its replica left
   running). **A read replica is refused:** Google refuses `NEVER` on one ("Activation policy for replica must be set to
@@ -104,8 +110,10 @@ One try per check: a refusal, or another operation running, is for the next chec
 - **The tag lets the router change it.** If an instance's tag binding is removed, the router's `PATCH` is refused. At a
   nap, the application naps but the database keeps running, and billing: the nap fails at the database (`permission`),
   the next check makes the workload `ASLEEP`, and each check then logs `DatabaseNotFollowed` until the tag is bound again
-  (an offboarding and an onboarding bind it). At a wake, the refusal fails the wake, of kind `permission`. After a new
-  binding, the router's first try, 40 s later, was accepted (measured).
+  (an offboarding and an onboarding bind it). At a wake, the refusal fails the wake, of kind `permission`, the
+  application left down: in the acceptance, a wake 5 minutes after the binding's removal was refused (`403`, in the
+  router's words naming the tag), and the workload was `ASLEEP` again at the next check. After a new binding, the
+  router's first try, 40 s later, was accepted (measured).
 - **An offboarding of an awake workload leaves a stopped database stopped.** An offboarding wakes only a workload asleep:
   a database stopped while the workload was awake (by hand, before a check started it again) stays stopped once the
   workload is offboarded. Set its activation policy back to `ALWAYS` yourself.
@@ -114,7 +122,7 @@ One try per check: a refusal, or another operation running, is for the next chec
   `dormeto gcp workloads show` lists the instance under `companionsGone`, as an application that reports its own
   database error is better than visitors kept out. A plain offboarding goes through: offboard, then onboard again without
   it. Unlike AWS, which finds databases by tag at each nap, the instances are the ones named at the onboarding. How
-  Google answers for a deleted instance (a `404`) was not measured yet: the acceptance tries it.
+  Google answers for a deleted instance (a `404`) was not measured, in the measures or the acceptance.
 - **Stopped is not free.** Google still bills a stopped instance's storage and IP addresses.
 - **The database's readiness is Google's.** The router reads the instance's state, policy and operations, not a
   connection: that an operation's end means the database takes connections was not measured. The application's health

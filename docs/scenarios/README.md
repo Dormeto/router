@@ -12,14 +12,14 @@ time, its behavior and its limits.
 | [ECS services](ecs-services.md) | Desired count 0, Application Auto Scaling suspended | 25–57 s on Fargate | 600 s |
 | [RDS and Aurora databases](databases.md) | Stopped after the application, started before it | 6–15 min with PostgreSQL | 1800 s (manager onboarding) |
 | [Kubernetes on EKS](kubernetes.md) | Deployment or StatefulSet scaled to 0 | 22–26 s on EC2 nodes, 62–74 s on Fargate | 300 s (manager onboarding) |
-| [Google Cloud: Compute Engine VMs](google-cloud-compute-engine.md) | VMs of groups or zonal NEGs suspended or stopped, then resumed or started, behind a global, regional or classic load balancer | 13–25 s after a resume, 37–41 s after a start (Compute Engine's part); through a regional load balancer 62 s, a classic one 2 min 16 s (one run each, a resume) | 600 s; 700 s regional, 850 s classic |
-| [Google Cloud: Cloud SQL databases](google-cloud-sql.md) | Activation policy `NEVER` after the application, `ALWAYS` before it | 9.4 min for a `db-f1-micro` start (one run) | 1700 s |
-| [Google Cloud: Kubernetes on GKE](google-kubernetes-engine.md) | Deployment or StatefulSet behind standalone NEGs scaled to 0 | 9 s from the scale on a Standard cluster (one run, outside the router) | 300 s |
+| [Google Cloud: Compute Engine VMs](google-cloud-compute-engine.md) | VMs of groups or zonal NEGs suspended or stopped, then resumed or started, behind a global, regional or classic load balancer | 13–25 s after a resume, 37–41 s after a start (Compute Engine's part); through a regional load balancer 62 s from a browser, 62–123 s from `POST /_dormeto/wake`, a classic one 2 min 16 s (a resume) | 600 s; 700 s regional, 850 s classic |
+| [Google Cloud: Cloud SQL databases](google-cloud-sql.md) | Activation policy `NEVER` after the application, `ALWAYS` before it | 9.2 min through the router with a `db-f1-micro` companion, 9.4 min for its start alone (one run each) | 1700 s |
+| [Google Cloud: Kubernetes on GKE](google-kubernetes-engine.md) | Deployment or StatefulSet behind standalone NEGs scaled to 0 | 13 s through the router on a Standard cluster, 9 s from the scale (one run each) | 300 s |
 
 A workload may combine backends: Auto Scaling groups and loose instances, an ECS service and its database, pods and
 their database. Databases are always companions of an application's backends. On Google Cloud a workload is a backend
 service of an external Application Load Balancer; its three pages are from router 0.37.0 but for the Compute Engine
-page's global load balancer, and say what the acceptance has not run yet.
+page's global load balancer, accepted on 2026-11-04 but for ten workloads on one URL map, and say what was not run.
 
 ## The cycle
 

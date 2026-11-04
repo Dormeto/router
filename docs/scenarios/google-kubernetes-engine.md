@@ -9,9 +9,11 @@ VMs](google-cloud-compute-engine.md), and only the backend differs. The router r
 endpoint, from Cloud Run, with its own access token, and may do there only what a Role in the workload's namespace lets
 it.
 
-**From router 0.37.0, not accepted yet.** The scale to 0 and back, the DNS endpoint, the Role and GKE's own maps were
-measured on Google (2026-11-04, below); the acceptance, which naps and wakes a GKE workload on the global load balancer
-through the router, has not run.
+**From router 0.37.0, accepted on 2026-11-04** with CLI 0.11.0, both unreleased, on a Standard cluster with no KEDA,
+behind a global load balancer: onboarded with the Role and RoleBinding the CLI wrote, napped and woken through the
+router, the RBAC shown by `access show` and removed at the offboarding, a Gateway's map refused at the dry run, and no
+cluster role or binding of Dormeto's in the cluster. The scale to 0 and back, the DNS endpoint, the Role and GKE's own
+maps were measured on Google beforehand (below).
 
 ```mermaid
 flowchart LR
@@ -84,11 +86,11 @@ node service agent.
 
 ## Wake time
 
-**9 s from the scale to the application**, measured once outside the router (2026-11-04, a Standard cluster whose node
-was running): back to 1 replica, the new pod's endpoint was in the NEG at 3 s, the pod running at 4 s, healthy at 5 s,
-and the application answering steadily 9 s after the scale. Down to 0, the load balancer answered `503` within 0.5 s, the
-endpoint read `UNHEALTHY` at 17 s, no status at 41 s, and left at 45 s; the NEG was kept, empty. No wake through the
-router has been timed yet.
+**13 s through the router**, from a browser's probe to the application (the acceptance, 2026-11-04, one run, a Standard
+cluster whose node was running); its nap took about 6 minutes, the policy's 300 s, then the scale to 0. Measured once
+outside the router the same day: back to 1 replica, the new pod's endpoint was in the NEG at 3 s, the pod running at
+4 s, healthy at 5 s, and the application answering steadily 9 s after the scale. Down to 0, the load balancer answered
+`503` within 0.5 s, the endpoint read `UNHEALTHY` at 17 s, no status at 41 s, and left at 45 s; the NEG was kept, empty.
 
 When no node has room for the pods, the node autoscaler, or Autopilot, must add one first, which adds its time. The
 default wake timeout is 300 s, plus the map's change on a regional or classic load balancer (400 s and 550 s), and

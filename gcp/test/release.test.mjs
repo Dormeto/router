@@ -150,8 +150,8 @@ test('the Compute Engine page: the swap of regional and classic load balancers, 
   }
   assert.match(page, /SWAP_WAIT: 100 s on a regional load balancer, 250 s on a classic one/);
   assert.match(page, /The default wake timeout adds SWAP_WAIT: 700 s for VMs on a regional load balancer, 850 s on a classic one/);
-  assert.match(page, /\| Classic \| 5\.5 minutes \| 2 min 16 s after a visitor's POST \/_dormeto\/wake \|/);
-  assert.match(page, /\| Regional \| 3\.5 to 6\.5 minutes to ASLEEP \| 62 s after a browser's probe; 62 s and 123 s after a POST \/_dormeto\/wake \|/);
+  assert.match(page, /\| Classic \| 5\.5 minutes \| 2 min 16 s after a visitor's POST \/_dormeto\/wake; AWAKE after 287 s, the unswap's 250 s included \|/);
+  assert.match(page, /\| Regional \| 3\.5 to 6\.5 minutes to ASLEEP \| 62 s after a POST \/_dormeto\/wake; AWAKE 123 to 188 s after a wake by a browser's probe, a POST or a pause, the unswap's 100 s included \|/);
   assert.match(page, /Steady traffic, 45 requests in 15 minutes, kept each kind awake through the router with a 5-minute idle window/);
   assert.match(page, /terraform plan showed no change with a regional workload onboarded/);
   assert.match(page, /ten workloads on one URL map were not run in the acceptance/);
@@ -245,7 +245,7 @@ test('the scenarios index has a row for each Google Cloud page', () => {
   const row = (page) => flat(rows.find((line) => line.includes(`](${page})`)) ?? '');
   assert.match(row('google-cloud-compute-engine.md'), /global, regional or classic/);
   assert.match(row('google-cloud-compute-engine.md'), /700 s regional, 850 s classic/);
-  assert.match(row('google-cloud-compute-engine.md'), /through a regional load balancer 62 s from a browser, 62–123 s from POST \/_dormeto\/wake/);
+  assert.match(row('google-cloud-compute-engine.md'), /through a regional load balancer 62 s from POST \/_dormeto\/wake, a classic one 2 min 16 s/);
   assert.match(row('google-cloud-sql.md'), /9\.2 min through the router/);
   assert.match(row('google-cloud-sql.md'), /\| 1700 s \|$/);
   assert.match(row('google-kubernetes-engine.md'), /13 s through the router/);

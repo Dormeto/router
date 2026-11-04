@@ -304,8 +304,8 @@ map back as before its onboarding.
 
 | Measured through the router (2026-11-04, a suspended VM) | Nap | Wake to the application answering steadily |
 |---|---|---|
-| Classic | 5.5 minutes | 2 min 16 s after a visitor's `POST /_dormeto/wake` |
-| Regional | 3.5 to 6.5 minutes to `ASLEEP` | 62 s after a browser's probe; 62 s and 123 s after a `POST /_dormeto/wake` |
+| Classic | 5.5 minutes | 2 min 16 s after a visitor's `POST /_dormeto/wake`; `AWAKE` after 287 s, the unswap's 250 s included |
+| Regional | 3.5 to 6.5 minutes to `ASLEEP` | 62 s after a `POST /_dormeto/wake`; `AWAKE` 123 to 188 s after a wake by a browser's probe, a `POST` or a pause, the unswap's 100 s included |
 
 The maps' own changes, measured before the router's code: a classic map's update took about 17 s, then the first new
 answer came after 38–123 s, the last old one after 76–221 s, settled after 78–226 s, with 3 to 11 answers `502` at the

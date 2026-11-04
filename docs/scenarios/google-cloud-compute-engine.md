@@ -219,7 +219,9 @@ flowchart LR
   rules' scheme tells a global load balancer from a classic one. `dormeto gcp workloads onboard --load-balancer
   global|regional|classic` says it when the same name exists in both, which is refused otherwise. A regional load
   balancer of another region is refused: onboard it on that region's router. A map with forwarding rules of both a
-  global and a classic load balancer (a migration under way) is refused until the migration ends.
+  global and a classic load balancer (a migration under way) is refused until the migration ends. A classic load
+  balancer on the Standard network tier, whose forwarding rule is regional, is refused as having none ("no forwarding
+  rule sends to the target proxy"): a global map's forwarding rules are read globally only (not measured).
 - **The waker backend service follows the kind:** regional in the router's region (`regionBackendServices`), or global
   with the scheme `EXTERNAL` on a classic load balancer, both on the router's serverless NEG.
 - **The hold route.** Google does not health check a backend service that no forwarding rule reaches, and a wake waits

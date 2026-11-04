@@ -1356,6 +1356,17 @@ test('the dry run names the databases asked for; none asked: an empty list', asy
   assert.deepEqual((await onboarding.dryRun(INPUT)).databases, []);
 });
 
+// M8: Google stops a primary with read replicas, which keep running: taken, with a warning.
+test('a primary with read replicas: eligible, its replicas in the dry run, a warning that they keep running; onboarded as any', async () => {
+  const { store, onboarding } = setup(withSql({ db: { replicaNames: ['db-r1'] } }));
+  const answer = await onboarding.dryRun(SQL_INPUT);
+  assert.equal(answer.eligible, true, answer.reasons.join());
+  assert.deepEqual(answer.databases, [{ name: 'db', selfLink: sqlLink('db'), replicas: ['db-r1'] }]);
+  assert.deepEqual(answer.warnings, ['Cloud SQL instance db has read replicas (db-r1): Google stops only the primary, its replicas keep running, and billing, while the workload sleeps']);
+  await onboarding.onboard(SQL_INPUT);
+  assert.deepEqual(store.configs.get('demo').backends.at(-1), { kind: 'cloudsql', name: 'db' });
+});
+
 test('an onboarding with a companion: a cloudsql backend after the application\'s, and shown', async () => {
   const { store, onboarding } = setup(withSql());
   const workload = await onboarding.onboard(SQL_INPUT);
@@ -1374,7 +1385,6 @@ test('with no cloudSql, the configuration names no database and reads no Cloud S
 for (const [title, fields, words] of [
   ['a read replica, by its primary\'s name', { masterInstanceName: 'p:primary' }, /Cloud SQL instance db is a read replica/],
   ['a read replica, by its type', { instanceType: 'READ_REPLICA_INSTANCE' }, /Cloud SQL instance db is a read replica/],
-  ['a primary with replicas', { replicaNames: ['db-r1'] }, /Cloud SQL instance db has read replicas \(db-r1\)/],
 ]) {
   test(`${title} is refused, with its words, at the dry run and the onboarding, nothing changed`, async () => {
     const { w, store, onboarding } = setup(withSql({ db: fields }));

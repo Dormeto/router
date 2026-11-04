@@ -56,10 +56,11 @@ test('isCompanion: a cloudsql backend, and no VM or group', () => {
   assert.equal(isCompanion({ kind: 'mig', location: 'z', name: 'db' }), false);
 });
 
-test('companionProblem: a replica by its primary\'s name or its type, a primary with replicas, else none', () => {
+// M8: Google stops a primary with read replicas (its replicas keep running): no refusal.
+test('companionProblem: a replica by its primary\'s name or its type, else none, a primary with replicas included', () => {
   assert.match(companionProblem({ name: 'r', masterInstanceName: 'p:db' }), /^Cloud SQL instance r is a read replica/);
   assert.match(companionProblem({ name: 'r', instanceType: 'READ_REPLICA_INSTANCE' }), /^Cloud SQL instance r is a read replica/);
-  assert.match(companionProblem({ name: 'db', replicaNames: ['r1', 'r2'] }), /^Cloud SQL instance db has read replicas \(r1, r2\): .*assumed/);
+  assert.equal(companionProblem({ name: 'db', replicaNames: ['r1', 'r2'] }), null);
   assert.equal(companionProblem({ name: 'db', replicaNames: [], instanceType: 'CLOUD_SQL_INSTANCE' }), null);
   assert.equal(companionProblem({ name: 'db' }), null);
 });
@@ -67,6 +68,7 @@ test('companionProblem: a replica by its primary\'s name or its type, a primary 
 test('companionRead: a database, its problem, 404 and 403 in words; anything else thrown', async () => {
   const of = (answer) => companionRead(setup(answer).cloudsql, 'db');
   assert.deepEqual(await of(() => ({ selfLink: 'https://sql/db' })), { database: { name: 'db', selfLink: 'https://sql/db' } });
+  assert.deepEqual(await of(() => ({ selfLink: 'https://sql/db', replicaNames: ['r1'] })), { database: { name: 'db', selfLink: 'https://sql/db', replicas: ['r1'] } });
   const replica = await of(() => ({ selfLink: 'https://sql/db', masterInstanceName: 'p:x' }));
   assert.match(replica.problem, /is a read replica/);
   assert.deepEqual(replica.database, { name: 'db', selfLink: 'https://sql/db' });

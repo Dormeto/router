@@ -63,11 +63,10 @@ function operationFailure(name, operation) {
   return refusedForCapacity(new Error(`Cloud SQL instance ${name}: operation ${operation.name} failed: ${words}`), words);
 }
 
-// Why an instance cannot be a companion, else null. A replica: Google's page says `NEVER` is not supported for one. A primary with
-// replicas: assumed, that page says nothing of it, and M8 tells what Google does.
-export function companionProblem({ name, masterInstanceName, instanceType, replicaNames = [] }) {
+// Why an instance cannot be a companion, else null. A replica: Google refuses `NEVER` for one (M8: "Activation policy for replica must
+// be set to ALWAYS"). A primary with replicas is stopped by Google, its replicas left running (M8): no refusal, a warning (onboarding).
+export function companionProblem({ name, masterInstanceName, instanceType }) {
   if (masterInstanceName || instanceType === REPLICA) return `Cloud SQL instance ${name} is a read replica: Google cannot stop one, name its primary or none`;
-  if (replicaNames.length) return `Cloud SQL instance ${name} has read replicas (${replicaNames.join(', ')}): assumed not to stop with its primary, not measured yet: remove them or leave the instance out`;
   return null;
 }
 
@@ -82,7 +81,8 @@ export async function companionRead(cloudsql, name) {
   try {
     const instance = await cloudsql.get(name);
     const problem = companionProblem({ ...instance, name });
-    return { database: { name, selfLink: instance.selfLink }, ...(problem ? { problem } : {}) };
+    const replicas = instance.replicaNames?.length ? { replicas: instance.replicaNames } : {};
+    return { database: { name, selfLink: instance.selfLink, ...replicas }, ...(problem ? { problem } : {}) };
   } catch (err) {
     if (companionGone(err)) return { gone: true, problem: `Cloud SQL instance ${name} not found: name an instance of this project` };
     if (err?.code === 403) return { problem: `the router cannot read Cloud SQL instance ${name}: it does not exist, or the router was installed without --with cloud-sql: ${err.message}` };

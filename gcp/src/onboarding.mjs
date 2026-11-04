@@ -435,10 +435,14 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     };
   }
 
-  // `warnings`: what does not refuse it, but its operator should know: spec section 8's limit of a Standard cluster.
+  // `warnings`: what does not refuse it, but its operator should know: spec section 8's limit of a Standard cluster, and a database's
+  // replicas, which Google leaves running (M8).
   async function dryRun(input) {
     const { reasons, vms, groups, databases, lb, gke: pods } = await inspect(requested(input));
-    const standard = pods && !pods.autopilot;
+    const warnings = [
+      ...(pods && !pods.autopilot ? [`GKE cluster ${pods.cluster.location}/${pods.cluster.name} is a Standard cluster: scaling pods saves money only on Autopilot, or with the node autoscaler freeing a node; its fixed nodes are paid all the same`] : []),
+      ...databases.filter((d) => d.replicas).map((d) => `Cloud SQL instance ${d.name} has read replicas (${d.replicas.join(', ')}): Google stops only the primary, its replicas keep running, and billing, while the workload sleeps`),
+    ];
     return {
       eligible: reasons.length === 0,
       reasons,
@@ -447,7 +451,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
       databases,
       ...(lb ? { lb } : {}),
       ...(pods ? { gke: pods } : {}),
-      ...(standard ? { warnings: [`GKE cluster ${pods.cluster.location}/${pods.cluster.name} is a Standard cluster: scaling pods saves money only on Autopilot, or with the node autoscaler freeing a node; its fixed nodes are paid all the same`] } : {}),
+      ...(warnings.length ? { warnings } : {}),
     };
   }
 

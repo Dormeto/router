@@ -145,7 +145,7 @@ so a workload whose VMs it had begun to stop stays asleep that long. Under a swa
 
 ## Zonal network endpoint groups
 
-**From router 0.37.0, accepted on 2026-11-04** with CLI 0.11.0, both unreleased: a NEG's VM, with a Cloud SQL companion,
+**From router 0.37.0, accepted on 2026-11-04** with CLI 0.11.0: a NEG's VM, with a Cloud SQL companion,
 napped by its idle window and woken by a browser through the router. The VMs' own times below were measured on Google
 (2026-10-31).
 
@@ -189,7 +189,7 @@ VM without a companion was not timed through the router.
 
 ## Regional and classic load balancers: the swap
 
-**From router 0.37.0, accepted on 2026-11-04** with CLI 0.11.0, both unreleased, but for ten workloads on one URL map,
+**From router 0.37.0, accepted on 2026-11-04** with CLI 0.11.0, but for ten workloads on one URL map,
 which was not run ([the swap's limits](#limits-of-the-swap)). Each kind was onboarded, napped, woken and offboarded
 through the router, and steady traffic kept each awake; the URL maps' changes were measured beforehand (2026-10-31).
 
@@ -354,7 +354,7 @@ earlier runs), with one answer `503`.
 
 ## Schedules and pauses
 
-**From router 0.37.0, accepted on 2026-11-04** with CLI 0.11.0, both unreleased, on a GKE workload, but for ten workloads
+**From router 0.37.0, accepted on 2026-11-04** with CLI 0.11.0, on a GKE workload, but for ten workloads
 on one URL map in one nap window, which was not run. `schedule show` listed the next events; a nap window napped the
 workload, and a visitor in it was told when it ends and woke nothing; an awake window woke it; a pause refused a nap and
 woke a sleeper; with `--keep-asleep` the workload stayed asleep into an awake window, and a visitor's probe woke it.
@@ -396,7 +396,7 @@ answered with what is wrong.
 
 ## IP lists
 
-**From router 0.37.0, accepted on 2026-11-04** with CLI 0.11.0, both unreleased: with Google's list of its own addresses
+**From router 0.37.0, accepted on 2026-11-04** with CLI 0.11.0: with Google's list of its own addresses
 (`goog.json`, 148 ranges, loaded at the first check), the page's probe from a Google address got a `202` and the
 workload slept on (`WakeIgnored`), the same probe from another address woke it, and the listed address's
 `POST /_dormeto/wake` woke it.

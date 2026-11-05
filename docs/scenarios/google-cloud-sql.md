@@ -6,7 +6,7 @@ balancer). The nap stops them after the application, the wake starts them and wa
 application, as [RDS and Aurora databases](databases.md) on AWS. An instance stops and starts by its activation policy;
 the router has no connection to it.
 
-**From router 0.37.0, accepted on 2026-11-04** with CLI 0.11.0, both unreleased, with a VM in a zonal NEG: the database
+**From router 0.37.0, accepted on 2026-11-04** with CLI 0.11.0, with a VM in a zonal NEG: the database
 went down after the application and came up before it, a wake after the tag's removal was refused, a database started by
 hand while asleep was stopped by the check, and one stopped while awake was started. A stop and a start were measured on
 Google beforehand (below), and the tag's condition as the router.

@@ -8,9 +8,25 @@ const ROOT = new URL('../../', import.meta.url).pathname;
 const read = (path) => readFileSync(`${ROOT}${path}`, 'utf8');
 const PACKAGE = JSON.parse(read('package.json'));
 
-test('the router is 0.36.0 and needs the Node that has import.meta.main', () => {
-  assert.equal(PACKAGE.version, '0.36.0');
+test('the router has an x.y.z version and needs the Node that has import.meta.main', () => {
+  assert.match(PACKAGE.version, /^\d+\.\d+\.\d+$/);
   assert.equal(PACKAGE.engines.node, '>=24.2');
+});
+
+// dormeto-release router (vision tools/release) bumps package.json and these lines; they name the package's version.
+test('the README\'s image examples and the scenarios index name the package\'s version', () => {
+  const readme = read('README.md');
+  const named = [...readme.matchAll(/gcp-image\.sh (\d\S*)|dormeto-router:(\d\S*)/g)].map((m) => m[1] ?? m[2]);
+  assert.equal(named.length, 3, 'the build, the local run and the push');
+  for (const version of named) assert.equal(version, PACKAGE.version);
+  assert.match(read('docs/scenarios/README.md'), new RegExp(`as of router ${PACKAGE.version.replace(/\./g, '\\.')}\\.`));
+});
+
+// A release is not a word a released page can keep: dormeto-release router refuses a README.md or docs/ that says it.
+test('the README and the scenario pages call nothing unreleased', () => {
+  for (const file of ['README.md', 'docs/scenarios/README.md', CE, SQL, GKE]) {
+    assert.doesNotMatch(read(file), /unreleased/i, file);
+  }
 });
 
 test('check parses the Google Cloud entry points too', () => {
@@ -30,21 +46,21 @@ test('the Containerfile builds the one image from a distroless Node 24 and carri
 const image = (...args) => spawnSync('bash', [`${ROOT}scripts/gcp-image.sh`, ...args], { encoding: 'utf8', env: { ...process.env, DMT_IMAGE_DRY_RUN: '1' } });
 
 test('gcp-image.sh builds linux/amd64 with podman and tags the version', () => {
-  const run = image('0.36.0');
+  const run = image('1.2.3');
   assert.equal(run.status, 0, run.stderr);
-  assert.match(run.stdout, /podman build --platform linux\/amd64 -f gcp\/Containerfile -t dormeto-router:0\.36\.0 \./);
+  assert.match(run.stdout, /podman build --platform linux\/amd64 -f gcp\/Containerfile -t dormeto-router:1\.2\.3 \./);
   assert.doesNotMatch(run.stdout, /push|login/);
 });
 
 test('gcp-image.sh --push logs in with the dormeto-dev token, tags and pushes the repository', () => {
-  const run = image('0.36.0', '--push', 'europe-west1-docker.pkg.dev/dormeto-dev/dormeto/router');
+  const run = image('1.2.3', '--push', 'europe-west1-docker.pkg.dev/dormeto-dev/dormeto/router');
   assert.equal(run.status, 0, run.stderr);
   assert.match(run.stdout, /gcloud --configuration dormeto-dev auth print-access-token \| podman login -u oauth2accesstoken --password-stdin europe-west1-docker\.pkg\.dev/);
-  assert.match(run.stdout, /podman push dormeto-router:0\.36\.0 docker:\/\/europe-west1-docker\.pkg\.dev\/dormeto-dev\/dormeto\/router:0\.36\.0/);
+  assert.match(run.stdout, /podman push dormeto-router:1\.2\.3 docker:\/\/europe-west1-docker\.pkg\.dev\/dormeto-dev\/dormeto\/router:1\.2\.3/);
 });
 
 test('gcp-image.sh refuses a missing or odd argument with exit 2', () => {
-  for (const args of [[], ['0.36.0', '--push'], ['0.36.0', '--other'], ['v1'], ['0.36.0', '--push', 'a', 'b']]) {
+  for (const args of [[], ['1.2.3', '--push'], ['1.2.3', '--other'], ['v1'], ['1.2.3', '--push', 'a', 'b']]) {
     const run = image(...args);
     assert.equal(run.status, 2, args.join(' '));
     assert.match(run.stderr, /usage: /);
@@ -114,7 +130,7 @@ const spaced = (text) => text.replace(/\s+/g, ' ');
 // The acceptance of 2026-11-04 (vision docs/plans/2026-10-30-google-cloud-coverage.md, "Acceptance results"): passed but for
 // ten workloads on one URL map, which was not run.
 const NOT_ACCEPTED = /not accepted yet|acceptance has not run|the acceptance's to check|the acceptance tries it|No wake through the router has been timed yet|no wake of a NEG's VM through the router has been timed yet/;
-const ACCEPTED = /From router 0\.37\.0, accepted on 2026-11-04 with CLI 0\.11\.0, both unreleased/g;
+const ACCEPTED = /From router 0\.37\.0, accepted on 2026-11-04 with CLI 0\.11\.0[,:]/g;
 
 test('the Compute Engine page: what ships in router 0.37.0 says so, and that it was accepted but for ten workloads on one map', () => {
   const page = flat(read(CE));
@@ -264,5 +280,5 @@ test('the README\'s Google Cloud section names the three pages and what router 0
   assert.match(flat(section), /Router 0\.37\.0 adds zonal network endpoint groups/);
   assert.match(flat(section), /--with cloud-sql,gke/);
   assert.doesNotMatch(flat(section), /not accepted yet/);
-  assert.match(flat(section), /accepted on 2026-11-04 in dormeto-dev with CLI 0\.11\.0, both unreleased, but for ten workloads on one URL map, which was not run/);
+  assert.match(flat(section), /accepted on 2026-11-04 in dormeto-dev with CLI 0\.11\.0, but for ten workloads on one URL map, which was not run/);
 });

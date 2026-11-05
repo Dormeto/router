@@ -9,7 +9,7 @@ VMs](google-cloud-compute-engine.md), and only the backend differs. The router r
 endpoint, from Cloud Run, with its own access token, and may do there only what a Role in the workload's namespace lets
 it.
 
-**From router 0.37.0, accepted on 2026-11-04** with CLI 0.11.0, both unreleased, on a Standard cluster with no KEDA,
+**From router 0.37.0, accepted on 2026-11-04** with CLI 0.11.0, on a Standard cluster with no KEDA,
 behind a global load balancer: onboarded with the Role and RoleBinding the CLI wrote, napped and woken through the
 router, the RBAC shown by `access show` and removed at the offboarding, a Gateway's map refused at the dry run, and no
 cluster role or binding of Dormeto's in the cluster. The scale to 0 and back, the DNS endpoint, the Role and GKE's own

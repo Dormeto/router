@@ -145,5 +145,8 @@ export function fromEnvironment(env = process.env, { fetch, log = logger } = {})
     sleep: (ms) => new Promise((resolve) => { setTimeout(resolve, ms); }),
     log,
   });
-  return createControllerApi({ core, onboarding: createOnboarding({ store, compute, cloudsql, gke, urlmaps, regionalUrlmaps, core, config, log }), config });
+  const handler = createControllerApi({ core, onboarding: createOnboarding({ store, compute, cloudsql, gke, urlmaps, regionalUrlmaps, core, config, log }), config });
+  // SIGTERM commits the buffered stats (server.mjs).
+  handler.flush = () => store.flushStats();
+  return handler;
 }

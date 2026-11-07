@@ -193,11 +193,15 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], n
 // The handler of the `waker` role (server.mjs), on the router's environment.
 export function fromEnvironment(env = process.env, { fetch, log = logger } = {}) {
   const google = createGoogle({ fetch });
-  return createCloudRunWaker({
-    store: createFirestoreStore({ google, project: env.DMT_PROJECT, database: env.DMT_DATABASE, log }),
+  const store = createFirestoreStore({ google, project: env.DMT_PROJECT, database: env.DMT_DATABASE, log });
+  const handler = createCloudRunWaker({
+    store,
     tasks: createTasks({ google, project: env.DMT_PROJECT, region: env.DMT_REGION, queue: env.DMT_QUEUE, serviceAccount: env.DMT_SERVICE_ACCOUNT }),
     controllerUrl: env.DMT_CONTROLLER_URL,
     lists: parseLists(env.DMT_IP_LISTS, (error) => log.error('IpListsUnreadable', { error })),
     log,
   });
+  // SIGTERM commits the buffered stats (server.mjs).
+  handler.flush = () => store.flushStats();
+  return handler;
 }

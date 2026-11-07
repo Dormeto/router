@@ -167,10 +167,10 @@ label is refused at the onboarding and left alone.
 - **A wake with no record brings 1 replica.** An owner scaled to 0 by hand while the workload is awake becomes `ASLEEP`
   at the next check, with no replicas recorded: its wake gives it 1 replica. Scale it back yourself, or let your
   autoscaler.
-- **A KEDA ScaledObject with `minReplicaCount: 0`** already scales the owner to zero by itself, and nothing here refuses
-  it yet. When KEDA takes the owner to 0 while the workload is awake, the next check reads it as stopped by hand
-  (`external-stop`, the waiting page shown), and a wake brings 1 replica with KEDA not paused, free to scale it down
-  again. Keep `minReplicaCount` at 1 or more for a workload Dormeto naps.
+- **A KEDA ScaledObject with `minReplicaCount: 0`** is refused at the onboarding, because KEDA would scale the owner to
+  zero by itself while the workload is awake: "KEDA scales `<owner>` to zero itself (`minReplicaCount: 0`): set it to 1
+  or more for Dormeto to nap it". Set `minReplicaCount` to 1 or more, then onboard again. A cluster with no KEDA, or
+  with no ScaledObject for the owner, is onboarded as usual.
 - **A forced offboarding leaves an asleep owner at 0.** `dormeto gcp workloads offboard <id> --force`, for a workload
   that cannot wake, leaves the owner at 0 replicas (listed as left) and gives KEDA its own pause back. A pause it cannot
   give back is named under `notGivenBack`, with the annotation to remove or set back (the CLI prints it and exits 1). Scale

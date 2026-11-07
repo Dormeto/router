@@ -1755,6 +1755,33 @@ test('the onboarding: a review per right, the owner read, a k8s backend of the d
   assert.ok(kubeCalls(w).every((call) => call.endsWith('/selfsubjectaccessreviews') || call.includes('/namespaces/shop/')), 'nothing outside the namespace');
 });
 
+const scalerAt = (minReplicaCount) => (w) => {
+  const scaler = structuredClone(KEDA);
+  if (minReplicaCount !== undefined) scaler.spec.minReplicaCount = minReplicaCount;
+  w.kube.scaledObjects.push(scaler);
+};
+
+test('the onboarding refuses an owner whose KEDA ScaledObject has minReplicaCount 0, in the constraint\'s words, and writes nothing', async () => {
+  const { w, store, onboarding } = setup((world) => {
+    onGke(world);
+    scalerAt(0)(world);
+  });
+  await assert.rejects(onboarding.onboard(GKE_INPUT), refused(400, 'not-eligible', /KEDA scales Deployment shop\/web to zero itself \(minReplicaCount: 0\): set it to 1 or more for Dormeto to nap it/));
+  assert.deepEqual(w.changes, []);
+  assert.equal(store.configs.size, 0);
+});
+
+for (const [name, change] of [['at 1', scalerAt(1)], ['unset', scalerAt()], ['absent', () => {}], ['for another owner', (w) => { scalerAt(0)(w); w.kube.scaledObjects[0].spec.scaleTargetRef.name = 'admin'; }], ['on a cluster with no KEDA', (w) => { scalerAt(0)(w); w.kube.keda = false; }]]) {
+  test(`the onboarding accepts an owner whose KEDA ScaledObject is ${name}`, async () => {
+    const { store, onboarding } = setup((world) => {
+      onGke(world);
+      change(world);
+    });
+    await onboarding.onboard(GKE_INPUT);
+    assert.equal(store.configs.size, 1);
+  });
+}
+
 test('the onboarding of a StatefulSet at 0 replicas: no endpoint is normal', async () => {
   const { store, onboarding } = setup((w) => {
     onGke(w, { replicas: 0 });

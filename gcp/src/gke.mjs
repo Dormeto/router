@@ -202,6 +202,19 @@ export async function ownerChanged({ compute, kubernetesOf }, backend, readServi
   return problem && `${problem}: if this lasts, offboard and onboard again, naming the owner behind the load balancer`;
 }
 
+// A KEDA ScaledObject of the owner with minReplicaCount 0 scales it to zero while the workload is awake: refused. No KEDA on the cluster, or none for the owner: null.
+async function kedaToZero(k8s, backend) {
+  let objects;
+  try {
+    objects = await k8s.list(`/apis/keda.sh/v1alpha1/namespaces/${backend.namespace}/scaledobjects`);
+  } catch (err) {
+    if (err?.status === 404) return null;
+    throw err;
+  }
+  const zero = objects.some((s) => s.spec?.scaleTargetRef?.name === backend.owner.name && (s.spec.scaleTargetRef.kind ?? 'Deployment') === backend.owner.kind && s.spec.minReplicaCount === 0);
+  return zero ? `KEDA scales ${ownerText(backend)} to zero itself (minReplicaCount: 0): set it to 1 or more for Dormeto to nap it` : null;
+}
+
 // What the onboarding reads in the cluster, once the rights are the CLI's: why not, as reasons. A right per rule of the Role, the owner, the NEGs' endpoints against its
 // pods. A cluster refusing or out of reach is a refusal in its own words: the CLI takes back the RBAC it just added.
 export async function clusterProblems({ compute, kubernetesOf }, backend, negs) {
@@ -212,7 +225,8 @@ export async function clusterProblems({ compute, kubernetesOf }, backend, negs) 
     const object = await ownerOf(k8s, backend);
     if (!object) return [`${ownerText(backend)} not found in GKE cluster ${clusterText(backend.cluster)}`];
     const problem = await endpointsProblem(compute, k8s, backend, object, negs);
-    return problem ? [problem] : [];
+    const keda = await kedaToZero(k8s, backend);
+    return [problem, keda].filter(Boolean);
   } catch (err) {
     if (err?.name !== 'KubernetesError' && !err?.kind) throw err;
     return [`the router cannot read GKE cluster ${clusterText(backend.cluster)}: ${err.message}`];

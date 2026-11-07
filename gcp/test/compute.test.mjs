@@ -60,6 +60,15 @@ test('the forwarding rules and the target proxies of both scopes page through th
   }
 });
 
+test('listAggregatedForwardingRules: the rules of every scope, page after page, scopes with a warning skipped', async () => {
+  const { calls, compute } = setup((m, u) => (u.includes('pageToken=next')
+    ? { items: { 'regions/us-east1': { forwardingRules: [{ name: 'c' }] } } }
+    : { items: { global: { forwardingRules: [{ name: 'a' }] }, 'regions/europe-west1': { forwardingRules: [{ name: 'b' }] }, 'regions/asia-east1': { warning: { code: 'NO_RESULTS_ON_PAGE' } } }, nextPageToken: 'next' }));
+  assert.deepEqual(await compute.listAggregatedForwardingRules(), [{ name: 'a' }, { name: 'b' }, { name: 'c' }]);
+  assert.deepEqual(calls.map((c) => c.url), [`${BASE}/aggregated/forwardingRules`, `${BASE}/aggregated/forwardingRules?pageToken=next`]);
+  assert.deepEqual(await setup(() => ({})).compute.listAggregatedForwardingRules(), []);
+});
+
 test('a list without items is empty', async () => {
   assert.deepEqual(await setup(() => ({})).compute.listForwardingRules(), []);
 });

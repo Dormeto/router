@@ -514,6 +514,25 @@ const REGIONAL_LB = { kind: 'regional', region: REGION };
 // The same name in both scopes.
 const both = (w) => { w.regions[REGION] = regionOf(); };
 
+// A classic load balancer on the Standard network tier: its forwarding rule is regional and targets the global proxy.
+const standardTier = (w, target = w.forwardingRules[0].target) => {
+  classic(w);
+  const [rule] = w.forwardingRules;
+  w.forwardingRules = [];
+  w.regions[REGION] = { ...regionOf(), urlMaps: {}, httpsProxies: [], forwardingRules: [{ ...rule, target, region: `${V1}/regions/${REGION}`, networkTier: 'STANDARD' }], services: {} };
+};
+
+test('a global proxy whose only forwarding rule is regional EXTERNAL on the Standard tier: onboarded as classic', async () => {
+  const { onboarding } = setup(standardTier);
+  assert.deepEqual((await onboarding.dryRun(INPUT)).lb, { kind: 'classic' });
+  assert.equal((await onboarding.onboard(INPUT)).lb.kind, 'classic');
+});
+
+test('a regional rule of another proxy with the same last two segments is not the proxy\'s', async () => {
+  const { onboarding } = setup((w) => standardTier(w, `${V1}/regions/${REGION}/targetHttpsProxies/lb-https`));
+  assert.deepEqual((await onboarding.dryRun(INPUT)).reasons, ['no forwarding rule sends to the target proxy of URL map lb: add one, then onboard again']);
+});
+
 const LB_REFUSALS = [
   ['the same name globally and in the region, without --load-balancer', both, {}, ['URL map lb exists globally and in region europe-west1: say which with --load-balancer global, classic or regional']],
   ['a regional map in another region: it reads as not found, and the router of its region is named', (w) => {

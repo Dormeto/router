@@ -518,6 +518,7 @@ test('fromEnvironment: the database, the project and the NEG of the environment'
     if (url.endsWith('/global/urlMaps')) return { items: [{ name: 'lb', defaultService: serviceUrl('app') }] };
     if (url.endsWith('/global/targetHttpsProxies')) return { items: [{ name: 'lb-https', selfLink: 'x/targetHttpsProxies/lb-https', urlMap: 'x/lb' }] };
     if (url.endsWith('/global/targetHttpProxies')) return { items: [] };
+    if (url.endsWith('/aggregated/forwardingRules')) return { items: {} };
     if (url.endsWith('/global/forwardingRules')) return { items: [{ name: 'fr', target: 'x/targetHttpsProxies/lb-https', loadBalancingScheme: 'EXTERNAL_MANAGED' }] };
     if (url.endsWith('/global/backendServices/app')) return { name: 'app', loadBalancingScheme: 'EXTERNAL_MANAGED', healthChecks: ['hc'], backends: [{ group: unmanagedUrl('ig') }] };
     if (url.endsWith('/global/backendServices') && method === 'POST') {
@@ -557,6 +558,7 @@ test('fromEnvironment: a GKE cluster is read in the environment\'s project', asy
     const app = `${V1}/global/backendServices/app`;
     if (url.endsWith('/global/urlMaps/lb')) return { name: 'lb', defaultService: app, hostRules: [{ hosts: ['demo.example.com'], pathMatcher: 'm' }], pathMatchers: [{ name: 'm', defaultService: app }] };
     if (url.endsWith('/global/targetHttpsProxies')) return { items: [{ name: 'p', selfLink: `${V1}/global/targetHttpsProxies/p`, urlMap: `${V1}/global/urlMaps/lb` }] };
+    if (url.endsWith('/aggregated/forwardingRules')) return { items: {} };
     if (url.endsWith('/global/forwardingRules')) return { items: [{ name: 'r', target: `${V1}/global/targetHttpsProxies/p`, loadBalancingScheme: 'EXTERNAL_MANAGED' }] };
     if (url.endsWith('/global/backendServices/app')) return { name: 'app', loadBalancingScheme: 'EXTERNAL_MANAGED', healthChecks: ['hc'], backends: [{ group: `${V1}/zones/europe-west1-b/networkEndpointGroups/k8s1-a` }] };
     if (url.endsWith('/networkEndpointGroups/k8s1-a')) return { name: 'k8s1-a', networkEndpointType: 'GCE_VM_IP_PORT', description: '{"namespace":"shop","service-name":"web"}' };

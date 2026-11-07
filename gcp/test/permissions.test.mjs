@@ -65,7 +65,7 @@ test('a group\'s list calls name what Google\'s reference asks of them', () => {
 // tests above. The waits are calls too: what changes something reads its operation.
 const ONBOARDING_CALLS = [
   'compute.getBackendService', 'compute.getInstance', 'compute.getMachineType', 'compute.getManagedGroup', 'compute.listGroupInstances', 'compute.listManagedInstances',
-  'compute.listTargetHttpsProxies', 'compute.listTargetHttpProxies', 'compute.listForwardingRules', 'compute.insertBackendService', 'compute.deleteBackendService',
+  'compute.listTargetHttpsProxies', 'compute.listTargetHttpProxies', 'compute.listForwardingRules', 'compute.listAggregatedForwardingRules', 'compute.insertBackendService', 'compute.deleteBackendService',
   'compute.setAutoscalerMode', 'urlmaps.get', 'urlmaps.list', 'urlmaps.modify',
 ];
 const WAITED = {

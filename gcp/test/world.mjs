@@ -379,6 +379,11 @@ export function setup(change = () => {}) {
     ['GET', /^global\/targetHttpsProxies$/, () => ({ items: w.httpsProxies })],
     ['GET', /^global\/targetHttpProxies$/, () => ({ items: w.httpProxies })],
     ['GET', /^global\/forwardingRules$/, () => ({ items: w.forwardingRules })],
+    // As Google: by scope, `global` and `regions/<r>`, a scope without rules carrying a warning instead.
+    ['GET', /^aggregated\/forwardingRules$/, () => ({
+      items: Object.fromEntries([['global', w.forwardingRules], ...Object.entries(w.regions).map(([region, r]) => [`regions/${region}`, r.forwardingRules])]
+        .map(([scope, rules]) => [scope, rules.length ? { forwardingRules: rules } : { warning: { code: 'NO_RESULTS_ON_PAGE' } }])),
+    })],
     ['GET', /^global\/backendServices\/([^/]+)$/, ([name]) => {
       if (!w.services[name]) throw notFound(`backend service ${name}`);
       return w.services[name];

@@ -33,6 +33,8 @@ export const CALLS = {
   getRegionBackendServiceHealth: ['compute.regionBackendServices.get'],
   insertRegionBackendService: ['compute.regionBackendServices.create', 'compute.regionBackendServices.use', 'compute.regionNetworkEndpointGroups.use', 'compute.regionOperations.get'],
   deleteRegionBackendService: ['compute.regionBackendServices.delete', 'compute.regionOperations.get'],
+  // The aggregated list asks the same permission as the regional one (Google's reference).
+  listAggregatedForwardingRules: ['compute.forwardingRules.list'],
   listRegionForwardingRules: ['compute.forwardingRules.list'],
   listRegionTargetHttpProxies: ['compute.regionTargetHttpProxies.list'],
   listRegionTargetHttpsProxies: ['compute.regionTargetHttpsProxies.list'],
@@ -55,6 +57,17 @@ export function createCompute({ google, project, now = Date.now }) {
     do {
       const answer = await google.request('GET', page ? `${url}?pageToken=${e(page)}` : url);
       items.push(...(answer.items ?? []));
+      page = answer.nextPageToken ?? '';
+    } while (page);
+    return items;
+  };
+  // The aggregated lists answer `items` by scope (`global`, `regions/<r>`), a scope without any carrying a `warning` instead.
+  const listAggregated = async (url, key) => {
+    const items = [];
+    let page = '';
+    do {
+      const answer = await google.request('GET', page ? `${url}?pageToken=${e(page)}` : url);
+      for (const scoped of Object.values(answer.items ?? {})) items.push(...(scoped[key] ?? []));
       page = answer.nextPageToken ?? '';
     } while (page);
     return items;
@@ -96,6 +109,7 @@ export function createCompute({ google, project, now = Date.now }) {
     listNetworkEndpoints: (z, name) => listEndpoints(`${zone(z)}/networkEndpointGroups/${e(name)}/listNetworkEndpoints`),
     getMachineType: (z, name) => google.request('GET', `${zone(z)}/machineTypes/${e(name)}`),
     listForwardingRules: () => list(`${base}/global/forwardingRules`),
+    listAggregatedForwardingRules: () => listAggregated(`${base}/aggregated/forwardingRules`, 'forwardingRules'),
     listTargetHttpProxies: () => list(`${base}/global/targetHttpProxies`),
     listTargetHttpsProxies: () => list(`${base}/global/targetHttpsProxies`),
     getRegionBackendService: (r, name) => google.request('GET', `${region(r)}/backendServices/${e(name)}`),

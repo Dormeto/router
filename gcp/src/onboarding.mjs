@@ -65,7 +65,8 @@ const bad = (message) => new Refusal(400, 'bad-request', message);
 const nameOf = (url) => url.slice(url.lastIndexOf('/') + 1);
 const zoneOf = (url) => /\/zones\/([^/]+)\//.exec(url)?.[1];
 // A proxy's URL without what differs between Google's answers, as a forwarding rule's target names it.
-const proxyOf = (url) => url.split('/').slice(-2).join('/');
+// A URL from `projects/` on, whatever the API's host and version: the same proxy has one path, another proxy of the same name elsewhere another.
+const fromProjects = (url) => url.slice(Math.max(url.indexOf('projects/'), 0));
 const isoOf = (ms) => new Date(ms).toISOString();
 const isSwapped = (lb) => Object.hasOwn(SWAP_WAIT_MS, lb.kind);
 const isRegional = (lb) => lb.kind === 'regional';
@@ -195,17 +196,24 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     return { reason: `URL map ${urlMap} not found: name a global URL map of this project, or a regional one of ${config.region}: ${OTHER_ROUTERS}` };
   }
 
+  // A global map's forwarding rules: the global ones, and the regional ones that target a global proxy, which a classic load
+  // balancer on the Standard network tier has (the aggregated list shows them; regional rules have a `region`, global ones none).
+  async function globalRules() {
+    const [global, aggregated] = await Promise.all([compute.listForwardingRules(), compute.listAggregatedForwardingRules()]);
+    return [...global, ...aggregated.filter((r) => r.region)];
+  }
+
   // The URL map's load balancer: one target proxy, and forwarding rules whose scheme tells a global from a classic one.
   // `{ kind, reasons }`, `kind` null when there is nothing supported to tell it from.
   async function loadBalancerOf(urlMap, regional, asked) {
     const [https, http, rules] = await Promise.all(regional
       ? [compute.listRegionTargetHttpsProxies(config.region), compute.listRegionTargetHttpProxies(config.region), compute.listRegionForwardingRules(config.region)]
-      : [compute.listTargetHttpsProxies(), compute.listTargetHttpProxies(), compute.listForwardingRules()]);
+      : [compute.listTargetHttpsProxies(), compute.listTargetHttpProxies(), globalRules()]);
     const refused = (...reasons) => ({ kind: null, reasons });
     const proxies = [...https, ...http].filter((p) => nameOf(p.urlMap ?? '') === urlMap);
     if (!proxies.length) return refused(`URL map ${urlMap} is used by no target proxy: attach it to an external Application Load Balancer, then onboard again`);
     if (proxies.length > 1) return refused(`URL map ${urlMap} is used by ${proxies.length} target proxies (${proxies.map((p) => p.name).join(', ')}): give each load balancer its own URL map`);
-    const fronts = rules.filter((r) => proxyOf(r.target ?? '') === proxyOf(proxies[0].selfLink));
+    const fronts = rules.filter((r) => fromProjects(r.target ?? '') === fromProjects(proxies[0].selfLink));
     if (!fronts.length) return refused(`no forwarding rule sends to the target proxy of URL map ${urlMap}: add one, then onboard again`);
     const kinds = regional ? ['regional'] : ['global', 'classic'];
     const kindsOf = (rule) => kinds.filter((kind) => SCHEME_OF[kind] === rule.loadBalancingScheme);

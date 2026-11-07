@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { response } from '../../lambda/src/lib/http.mjs';
 import { createLogger } from '../../lambda/src/lib/log.mjs';
 import { silentLog } from '../../lambda/test/fakes.mjs';
-import { serve, withSeverity } from '../src/server.mjs';
+import { serve, shutdown, withSeverity } from '../src/server.mjs';
 
 const SERVER = fileURLToPath(new URL('../src/server.mjs', import.meta.url));
 
@@ -92,6 +92,27 @@ test('DMT_ROLE=controller on PORT: its health answers the version built into the
   child.kill('SIGTERM');
   const { code, signal } = await exited;
   assert.deepEqual({ code, signal }, { code: 0, signal: null });
+});
+
+test('shutdown: closes the server and waits for the role\'s stats flush; a role with nothing to flush is fine', async () => {
+  const listening = async () => {
+    const server = serve(async () => response(200, {}, 'ok'), { port: 0, log: silentLog });
+    await new Promise((resolve) => { server.once('listening', resolve); });
+    return server;
+  };
+  const order = [];
+  const server = await listening();
+  await shutdown(server, {
+    flush: async () => {
+      await new Promise((resolve) => { setTimeout(resolve, 20); });
+      order.push('flushed');
+    },
+  });
+  assert.deepEqual(order, ['flushed']);
+  assert.equal(server.listening, false);
+  const other = await listening();
+  await shutdown(other, async () => response(200, {}, ''));
+  assert.equal(other.listening, false);
 });
 
 test('withSeverity: Cloud Logging\'s severity on each line of a logger, its fields kept', () => {

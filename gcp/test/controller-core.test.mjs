@@ -8,7 +8,7 @@ import { fromFields, toFields } from '../src/firestore.mjs';
 import { GoogleError, OPERATION_NOT_DONE } from '../src/google.mjs';
 import { createUrlMaps, withErrorPolicy, withSwap } from '../src/urlmaps.mjs';
 import {
-  CLUSTER, GKE_INPUT, GKE_NEG, NEG_READINGS, OWNER, classic, clockTimers, heartbeatStore, onGke, regional as regionalWorld, setup as worldOf, unmanagedUrl,
+  CLUSTER, GKE_INPUT, GKE_NEG, NEG_READINGS, OWNER, classic, clockTimers, heartbeatStore, onGke, sweepStore, regional as regionalWorld, setup as worldOf, unmanagedUrl,
 } from './world.mjs';
 
 const V1 = 'https://compute.googleapis.com/compute/v1/projects/p';
@@ -78,7 +78,7 @@ function setup({
   };
   const store = fakeStore({ config, run, clock });
   const { every, timers } = clockTimers(clock);
-  Object.assign(store, heartbeatStore(() => store.state.run, clock.now));
+  Object.assign(store, heartbeatStore(() => store.state.run, clock.now), sweepStore(clock.now));
   // The Firestore store's names, and what its fields do to a value: an `undefined` comes back null.
   store.addPause = (id, pause) => store.putPause(id, fromFields(toFields(pause)));
   store.removePauses = async (id, { at } = {}) => {
@@ -474,6 +474,26 @@ test('a beat whose write throws: said each time, and the wake goes on to AWAKE; 
   nap.store.beat = () => { throw new TypeError('no beat here'); };
   assert.equal((await nap.controller.nap('demo')).state, STATES.ASLEEP);
   assert.deepEqual(nap.logged('BeatFailed').map((l) => [l.napId, l.error]), [['wake-2', 'no beat here'], ['wake-2', 'no beat here']]);
+});
+
+test('the check sweeps the counters older than 35 days once a UTC day, logging StatsSwept with the count', async () => {
+  const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
+  await t.controller.check();
+  assert.deepEqual(t.store.swept, [START - 35 * 86_400_000]);
+  assert.deepEqual(t.logged('StatsSwept'), [{ level: 'info', event: 'StatsSwept', swept: 3 }]);
+  t.clock.advance(60_000);
+  await t.controller.check();
+  assert.equal(t.store.swept.length, 1);
+  t.clock.advance(25 * 3_600_000);
+  await t.controller.check();
+  assert.equal(t.store.swept.length, 2);
+});
+
+test('a sweep that fails is logged StatsSweepFailed and the check goes on', async () => {
+  const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
+  t.store.sweepStats = async () => { throw new Error('firestore down'); };
+  assert.equal((await t.controller.check()).length, 1);
+  assert.deepEqual(t.logged('StatsSweepFailed').map((l) => l.error), ['firestore down']);
 });
 
 test('WAKING 3 minutes with no beat: the check sends that wakeId again; 30 s later nothing, a minute later again', async () => {

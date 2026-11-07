@@ -28,6 +28,13 @@ export function serve(handler, { port, log }) {
   return server.listen(port);
 }
 
+// SIGTERM: stops accepting requests, and commits the role's buffered stats (`handler.flush`, if it has one) before the
+// process ends: Cloud Run gives it 10 s.
+export async function shutdown(server, handler) {
+  server.close();
+  await handler.flush?.();
+}
+
 async function main({ DMT_ROLE: role, PORT: port = '8080' } = process.env) {
   const log = withSeverity(logger);
   if (!Object.hasOwn(ROLES, role ?? '')) {
@@ -36,9 +43,10 @@ async function main({ DMT_ROLE: role, PORT: port = '8080' } = process.env) {
     return;
   }
   const { fromEnvironment } = await import(ROLES[role]);
-  const server = serve(fromEnvironment(process.env, { log }), { port: Number(port), log });
+  const handler = fromEnvironment(process.env, { log });
+  const server = serve(handler, { port: Number(port), log });
   server.once('listening', () => log.info('Listening', { role, address: server.address().address, port: server.address().port }));
-  process.once('SIGTERM', () => server.close());
+  process.once('SIGTERM', () => shutdown(server, handler));
 }
 
 if (import.meta.main) await main();

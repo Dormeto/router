@@ -115,7 +115,7 @@ test('a nap window: the probe reads it once, and says it', async () => {
 });
 
 // The controller's Cloud Scheduler call: the pauses, the configurations and the schedules listed, then the workload's run.
-test('Firestore reads: a check, one AWAKE workload, 4', async () => {
+test('Firestore reads: a check, one AWAKE workload, 4; the first of the day 2 more, the router\'s sweep claimed and the counters listed', async () => {
   const clock = fakeClock();
   const { reads, store } = firestoreWith({ state: STATES.AWAKE, version: 0, awakeSince: clock.now(), holders: 0, wakeCount: 0 });
   await store.putConfig('demo', {
@@ -127,5 +127,7 @@ test('Firestore reads: a check, one AWAKE workload, 4', async () => {
   });
   const out = await core.check();
   assert.deepEqual(out.map((r) => [r.workloadId, r.state]), [['demo', STATES.AWAKE]]);
-  assert.equal(reads(), 4);
+  assert.equal(reads(), 6);
+  await core.check();
+  assert.equal(reads(), 10);
 });

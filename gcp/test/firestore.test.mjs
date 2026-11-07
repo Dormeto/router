@@ -4,15 +4,30 @@ import { createFirestoreStore } from '../src/firestore.mjs';
 import { GoogleError } from '../src/google.mjs';
 import { BASE, ROOT, fakeFirestore } from './firestore-fake.mjs';
 
-function setup({ now = () => Date.parse('2026-03-10T12:00:00Z') } = {}) {
+// `timers` holds the stats' flush timers: `fire()` runs those due, as the 10 s passing.
+function setup({ now = () => Date.parse('2026-03-10T12:00:00Z'), log = null } = {}) {
   const firestore = fakeFirestore();
+  const timers = new Set();
   const store = createFirestoreStore({
     google: { request: firestore.request },
     project: 'p',
     database: 'dmtr-europe-west1',
     now,
+    log,
+    after: (ms, fn) => {
+      const timer = { ms, fn };
+      timers.add(timer);
+      return timer;
+    },
+    cancel: (timer) => timers.delete(timer),
   });
-  return { ...firestore, store };
+  const fire = async () => {
+    for (const timer of [...timers]) {
+      timers.delete(timer);
+      await timer.fn();
+    }
+  };
+  return { ...firestore, store, timers, fire };
 }
 
 const commits = (calls) => calls.filter((c) => c.url.endsWith(':commit'));
@@ -174,6 +189,7 @@ test('count: the day\'s counters, created by the first, added by the next; getSt
   await store.count('app', 'deferred:browser mode');
   await store.count('app', 'ignored:bot');
   await store.count('other', 'ignored:bot');
+  await store.flushStats();
   assert.deepEqual([...docs.keys()].sort(), ['stats/app-2026-03-08', 'stats/app-2026-03-10', 'stats/other-2026-03-10']);
   assert.deepEqual(docs.get('stats/app-2026-03-08').fields['ignored:bot'], { integerValue: '2' });
   assert.deepEqual(await store.getStats('app', 3), {
@@ -255,15 +271,139 @@ test('listConfigs and listWorkloads: every configuration across pages; no schedu
   assert.equal(schedules.size, 0);
 });
 
-test('deleteWorkload: the configuration and the run go, the daily counters stay; a missing workload is fine', async () => {
-  const { store, docs } = setup();
+test('deleteWorkload: the configuration, the run and every daily counter go, buffered counts too; a missing workload is fine', async () => {
+  const { store, docs, fire } = setup();
   await store.putConfig('app', { workloadId: 'app' });
+  await store.putConfig('app-2', { workloadId: 'app-2' });
   await store.initRun('app', 1);
   await store.count('app', 'ignored:bot');
+  await store.count('app-2', 'ignored:bot');
+  await store.flushStats();
+  docs.set('stats/app-2026-02-01', { fields: { 'ignored:bot': { integerValue: '4' } }, updateTime: 'x' });
+  await store.count('app', 'wake:browser');
   await store.deleteWorkload('app');
-  assert.deepEqual([...docs.keys()], ['stats/app-2026-03-10']);
+  await fire();
+  await store.flushStats();
+  assert.deepEqual([...docs.keys()].sort(), ['stats/app-2-2026-03-10', 'workloads/app-2']);
   await store.deleteWorkload('app');
   assert.equal(await store.getConfig('app'), null);
+});
+
+test('count: 50 counts in 1 s are one commit with increment 50 per counter, when the 10 s pass', async () => {
+  let t = Date.parse('2026-03-10T12:00:00Z');
+  const { store, docs, calls, timers, fire } = setup({ now: () => t });
+  for (let i = 0; i < 50; i += 1) {
+    await store.count('app', i < 40 ? 'ignored:bot' : 'wake:browser');
+    t += 20;
+  }
+  assert.equal(commits(calls).length, 0);
+  assert.equal(docs.size, 0);
+  assert.deepEqual([...timers].map((timer) => timer.ms), [10_000]);
+  await fire();
+  assert.equal(commits(calls).length, 1);
+  const [write] = commits(calls)[0].body.writes;
+  assert.equal(write.update.name, `${ROOT}/stats/app-2026-03-10`);
+  assert.deepEqual(write.updateTransforms, [
+    { fieldPath: '`ignored:bot`', increment: { integerValue: '40' } },
+    { fieldPath: '`wake:browser`', increment: { integerValue: '10' } },
+  ]);
+  assert.deepEqual(docs.get('stats/app-2026-03-10').fields, { 'ignored:bot': { integerValue: '40' }, 'wake:browser': { integerValue: '10' } });
+  // Nothing buffered is left: another window, another commit.
+  await store.count('app', 'ignored:bot');
+  assert.equal(timers.size, 1);
+  await fire();
+  assert.equal(commits(calls).length, 2);
+  assert.deepEqual(docs.get('stats/app-2026-03-10').fields['ignored:bot'], { integerValue: '41' });
+});
+
+test('count: one commit per document, a day change is another document', async () => {
+  let t = Date.parse('2026-03-10T23:59:59Z');
+  const { store, calls, docs, fire } = setup({ now: () => t });
+  await store.count('app', 'ignored:bot');
+  await store.count('other', 'ignored:bot');
+  t += 2000;
+  await store.count('app', 'ignored:bot');
+  await fire();
+  assert.equal(commits(calls).length, 3);
+  assert.deepEqual([...docs.keys()].sort(), ['stats/app-2026-03-10', 'stats/app-2026-03-11', 'stats/other-2026-03-10']);
+});
+
+test('flushStats: commits what is left now, resolves when done, and the timer has nothing more to do', async () => {
+  const { store, docs, calls, timers, fire } = setup();
+  await store.count('app', 'ignored:bot');
+  await store.count('app', 'ignored:bot');
+  await store.count('other', 'wake:browser');
+  await store.flushStats();
+  assert.deepEqual(docs.get('stats/app-2026-03-10').fields, { 'ignored:bot': { integerValue: '2' } });
+  assert.deepEqual(docs.get('stats/other-2026-03-10').fields, { 'wake:browser': { integerValue: '1' } });
+  assert.equal(timers.size, 0);
+  const done = commits(calls).length;
+  await store.flushStats();
+  await fire();
+  assert.equal(commits(calls).length, done);
+});
+
+test('count: a commit that fails keeps its counts for the next flush, logged StatsWriteFailed', async () => {
+  const warned = [];
+  const firestore = fakeFirestore();
+  let refuse = true;
+  const store = createFirestoreStore({
+    google: {
+      request: async (method, url, body) => {
+        if (refuse && url.endsWith(':commit')) throw new GoogleError('Google: 503 down', { code: 503, status: 'UNAVAILABLE' });
+        return firestore.request(method, url, body);
+      },
+    },
+    project: 'p',
+    database: 'dmtr-europe-west1',
+    now: () => Date.parse('2026-03-10T12:00:00Z'),
+    log: { warn: (event, fields) => warned.push({ event, ...fields }), info() {}, error() {} },
+    after: () => ({}),
+    cancel: () => {},
+  });
+  await store.count('app', 'ignored:bot');
+  await store.count('app', 'ignored:bot');
+  await store.flushStats();
+  assert.equal(firestore.docs.size, 0);
+  assert.deepEqual(warned.map((w) => [w.event, w.workloadId, w.error]), [['StatsWriteFailed', 'app', 'Google: 503 down']]);
+  await store.count('app', 'ignored:bot');
+  refuse = false;
+  await store.flushStats();
+  assert.deepEqual(firestore.docs.get('stats/app-2026-03-10').fields, { 'ignored:bot': { integerValue: '3' } });
+});
+
+test('sweepStats: the documents of days before the day of `before` go, the others stay; the count comes back', async () => {
+  const { store, docs } = setup();
+  for (const day of ['2026-01-29', '2026-02-02', '2026-02-03', '2026-03-07']) {
+    for (const id of ['app', 'other']) docs.set(`stats/${id}-${day}`, { fields: { 'ignored:bot': { integerValue: '1' } }, updateTime: 'x' });
+  }
+  docs.set('workloads/app', { fields: {}, updateTime: 'x' });
+  const swept = await store.sweepStats(Date.parse('2026-03-10T12:00:00Z') - 35 * 86_400_000);
+  assert.equal(swept, 4);
+  assert.deepEqual([...docs.keys()].sort(), [
+    'stats/app-2026-02-03', 'stats/app-2026-03-07', 'stats/other-2026-02-03', 'stats/other-2026-03-07', 'workloads/app',
+  ]);
+  assert.equal(await store.sweepStats(Date.parse('2026-03-10T12:00:00Z') - 35 * 86_400_000), 0);
+});
+
+test('sweepStats: more than a batch of documents, all gone', async () => {
+  const { store, docs } = setup();
+  for (let i = 0; i < 250; i += 1) docs.set(`stats/w${i}-2026-01-01`, { fields: {}, updateTime: 'x' });
+  assert.equal(await store.sweepStats(Date.parse('2026-02-01T00:00:00Z')), 250);
+  assert.equal(docs.size, 0);
+});
+
+test('claimSweep: once a UTC day, true for the one call that wrote the day, in router/sweep', async () => {
+  let t = Date.parse('2026-03-10T01:00:00Z');
+  const { store, docs } = setup({ now: () => t });
+  assert.deepEqual(await Promise.all([store.claimSweep(), store.claimSweep()]).then((all) => all.sort()), [false, true]);
+  assert.deepEqual(docs.get('router/sweep').fields, { day: { stringValue: '2026-03-10' } });
+  t = Date.parse('2026-03-10T23:59:00Z');
+  assert.equal(await store.claimSweep(), false);
+  t = Date.parse('2026-03-11T00:00:01Z');
+  assert.equal(await store.claimSweep(), true);
+  assert.equal(await store.claimSweep(), false);
+  assert.deepEqual(docs.get('router/sweep').fields, { day: { stringValue: '2026-03-11' } });
 });
 
 // A store whose commits are all refused as stale (the run is contended for good), with the sleeps and warnings recorded.

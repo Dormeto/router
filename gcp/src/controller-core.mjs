@@ -33,7 +33,7 @@ import { randomUUID } from 'node:crypto';
 import { failedSpec, failureError } from '../../lambda/src/lib/failures.mjs';
 import { resolveHibernation } from '../../lambda/src/lib/hibernation.mjs';
 import { awakeStartWithin, CLOSE_START_MS, maintenanceDue, occurrenceAt } from '../../lambda/src/lib/schedule.mjs';
-import { STATES } from '../../lambda/src/lib/state.mjs';
+import { DAY_MS, STATES, utcDay } from '../../lambda/src/lib/state.mjs';
 import { createListRefresher } from '../../lambda/src/lib/list-refresh.mjs';
 import { createWakeWatch } from '../../lambda/src/lib/wake-watch.mjs';
 import { COMPANION_GONE, companionGone, companionLost, isCompanion, startDatabase, statusOf, stopDatabase } from './cloudsql.mjs';
@@ -137,6 +137,9 @@ export class PauseRefused extends Error {
 }
 
 // `every(ms, fn)`: the heartbeat's timer, which its answer stops; tests run it on their clock.
+// A day's counters are kept this long, as the DynamoDB store's (lambda/src/lib/state.mjs).
+const STATS_KEPT_DAYS = 35;
+
 export function createController({ store, compute, cloudsql, gke, urlmaps, regionalUrlmaps, monitoring, tasks, config, lists = [], download, now = Date.now, sleep, every = repeat, newId = randomUUID, log }) {
   const clients = { compute, kubernetesOf: (cluster) => gke.kubernetesOf(cluster) };
   const enqueue = (body) => tasks.enqueue({ url: `${config.controllerUrl}/v1/tasks`, body });
@@ -1220,7 +1223,23 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
     // What the schedules did for the workloads the loop did not reach.
     const reached = new Set(results.map((r) => r.workloadId));
     for (const workloadId of applied.keys()) if (!reached.has(workloadId)) results.push({ workloadId, ...passed(workloadId) });
+    await sweepStats();
     return results;
+  }
+
+  // The counters older than 35 days, once a UTC day: the first check of the day sweeps, the others find the day claimed. An
+  // instance that has seen the day claimed reads nothing more of it.
+  let sweepDay = null;
+  async function sweepStats() {
+    const day = utcDay(now());
+    if (sweepDay === day) return;
+    try {
+      const claimed = await store.claimSweep();
+      sweepDay = day;
+      if (claimed) log.info('StatsSwept', { swept: await store.sweepStats(now() - STATS_KEPT_DAYS * DAY_MS) });
+    } catch (err) {
+      log.warn('StatsSweepFailed', { error: err.message });
+    }
   }
 
   return { refreshLists, wake, beginWake, wakeNow, nap, napNow, release, check, pause, resume, pausesFor };

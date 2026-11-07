@@ -48,6 +48,25 @@ export const heartbeatStore = (runOf, now) => ({
   },
 });
 
+// The store's daily sweep of old counters (firestore.mjs) on a fake: the day claimed once, the `before` of each sweep kept.
+export const sweepStore = (now) => {
+  const swept = [];
+  let day = null;
+  return {
+    swept,
+    claimSweep: async () => {
+      const today = new Date(now()).toISOString().slice(0, 10);
+      if (day !== null && day >= today) return false;
+      day = today;
+      return true;
+    },
+    sweepStats: async (before) => {
+      swept.push(before);
+      return 3;
+    },
+  };
+};
+
 export const V1 = 'https://compute.googleapis.com/compute/v1/projects/p';
 export const ZONE = 'europe-west1-b';
 export const REGION = 'europe-west1';
@@ -539,6 +558,7 @@ export function setup(change = () => {}) {
       return true;
     },
     ...heartbeatStore((id) => runs.get(id), clock.now),
+    ...sweepStore(clock.now),
   };
   const { every, timers } = clockTimers(clock);
   const log = Object.fromEntries(['info', 'warn', 'error'].map((level) => [level, (event, fields = {}) => { w.logs.push({ level, event, ...fields }); }]));

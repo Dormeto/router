@@ -1,7 +1,8 @@
 // The router's state on Google Cloud: the DynamoDB store's methods over Firestore's REST API (Native mode, one database
 // per router). One document per workload and kind: `workloads/<id>` (the configuration), `runs/<id>` (the state
-// machine), `schedules/<id>`, `pauses/<id>` (a workload's pause), `stats/<id>-<day>` (the day's counters); and the IP
-// lists: `lists/<name>` (the meta) and `listParts/<name>-<version>-<index>` (the packed parts, 350 kB at most). A transition reads the run, checks its condition, and commits
+// machine), `schedules/<id>`, `pauses/<id>` (a workload's pause), `stats/<id>-<day>` (the day's counters, committed in
+// batches, kept 35 days), `router/sweep` (the day of the last sweep of the old counters); and the IP lists:
+// `lists/<name>` (the meta) and `listParts/<name>-<version>-<index>` (the packed parts, 350 kB at most). A transition reads the run, checks its condition, and commits
 // with the document's `updateTime` as precondition: the conditional write of DynamoDB.
 import { STATES, matches, addStats, emptyStats, utcDay, DAY_MS } from '../../lambda/src/lib/state.mjs';
 import { beats, resendable } from './heartbeat.mjs';
@@ -13,6 +14,9 @@ const LIST_PAGE = 300;
 // Parts weigh up to 350 kB: few per page and per batchGet (a response stays far below a hundred MB).
 const PART_PAGE = 10;
 const DELETE_BATCH = 100;
+// The counters are added up in memory and committed at most this often per document (a flood of probes would contend on it).
+const STATS_FLUSH_MS = 10_000;
+const STATS_DAY = /^stats\/(.+)-(\d{4}-\d{2}-\d{2})$/;
 // Between two attempts: a random delay up to BACKOFF_MS times the attempt, so contending writers drift apart.
 const BACKOFF_MS = 40;
 
@@ -63,7 +67,7 @@ export const CALLS = {
 const lostPrecondition = (err) => err?.status === 'FAILED_PRECONDITION' || err?.status === 'ABORTED';
 const isStatus = (status) => (err) => err?.status === status;
 
-export function createFirestoreStore({ google, project, database, now = Date.now, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), log = null }) {
+export function createFirestoreStore({ google, project, database, now = Date.now, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), log = null, after = (ms, fn) => setTimeout(fn, ms).unref(), cancel = clearTimeout }) {
   const root = `projects/${project}/databases/${database}/documents`;
   const url = (path) => `${BASE}/${root}/${path}`;
   const commit = (writes) => google.request('POST', `${BASE}/${root}:commit`, { writes });
@@ -86,6 +90,31 @@ export function createFirestoreStore({ google, project, database, now = Date.now
 
   async function deleteDocuments(paths) {
     for (let i = 0; i < paths.length; i += DELETE_BATCH) await commit(paths.slice(i, i + DELETE_BATCH).map((path) => ({ delete: named(path) })));
+  }
+
+  // The counts not yet committed, per document (`<id>-<day>`): { workloadId, counters (name → n), timer }.
+  const pendingStats = new Map();
+
+  // Commits one document's counts with `increment: n`. A commit that fails keeps its counts for the next one (added back to
+  // what came meanwhile), logged; it never throws.
+  async function flushStatsDoc(docId) {
+    const entry = pendingStats.get(docId);
+    if (!entry) return;
+    pendingStats.delete(docId);
+    cancel(entry.timer);
+    try {
+      await commit([{
+        update: { name: named(`stats/${docId}`) },
+        updateMask: { fieldPaths: [] },
+        updateTransforms: [...entry.counters].map(([counter, n]) => ({ fieldPath: fieldPath(counter), increment: { integerValue: String(n) } })),
+      }]);
+    } catch (err) {
+      log?.warn('StatsWriteFailed', { workloadId: entry.workloadId, counters: Object.fromEntries(entry.counters), error: err.message });
+      const next = pendingStats.get(docId) ?? { workloadId: entry.workloadId, counters: new Map(), timer: null };
+      for (const [counter, n] of entry.counters) next.counters.set(counter, (next.counters.get(counter) ?? 0) + n);
+      next.timer ??= after(STATS_FLUSH_MS, () => flushStatsDoc(docId));
+      pendingStats.set(docId, next);
+    }
   }
 
   const pauseOf = (workloadId, doc) => ({ workloadId, ...doc.value.pause });
@@ -204,14 +233,57 @@ export function createFirestoreStore({ google, project, database, now = Date.now
       });
     },
 
-    // Daily counter (`ignored:<reason>`, `deferred:<reason>`, `wake:<trigger>`) in `stats/<id>-<day>`: a field transform,
-    // so concurrent requests add up without a precondition.
+    // Daily counter (`ignored:<reason>`, `deferred:<reason>`, `wake:<trigger>`) in `stats/<id>-<day>`. Added up in memory and
+    // committed within 10 s per document, as a field transform (concurrent routers add up without a precondition): it
+    // resolves at once, nothing waits for Firestore on the request path. `flushStats` commits what is left.
     async count(workloadId, counter) {
-      await commit([{
-        update: { name: named(`stats/${workloadId}-${utcDay(now())}`) },
-        updateMask: { fieldPaths: [] },
-        updateTransforms: [{ fieldPath: fieldPath(counter), increment: { integerValue: '1' } }],
-      }]);
+      const docId = `${workloadId}-${utcDay(now())}`;
+      const entry = pendingStats.get(docId) ?? { workloadId, counters: new Map(), timer: null };
+      entry.counters.set(counter, (entry.counters.get(counter) ?? 0) + 1);
+      entry.timer ??= after(STATS_FLUSH_MS, () => flushStatsDoc(docId));
+      pendingStats.set(docId, entry);
+    },
+
+    // Commits every buffered count (the process is stopping: SIGTERM). Resolves when done; a commit that fails is logged.
+    async flushStats() {
+      await Promise.all([...pendingStats.keys()].map(flushStatsDoc));
+    },
+
+    // Deletes the counters of days before `before`'s day (`stats/<id>-<day>`), in batches; the count deleted.
+    async sweepStats(before) {
+      const limit = utcDay(before);
+      const old = (await listAll('stats')).filter((doc) => (STATS_DAY.exec(doc.name)?.[2] ?? limit) < limit);
+      await deleteDocuments(old.map((doc) => doc.name));
+      return old.length;
+    },
+
+    // The daily sweep, once a UTC day whoever asks (the check of any controller instance): true for the call that wrote
+    // today's date in `router/sweep`, which sweeps.
+    async claimSweep() {
+      const day = utcDay(now());
+      const doc = await read('router/sweep');
+      if (doc && doc.value.day >= day) return false;
+      try {
+        await commit([{
+          update: { name: named('router/sweep'), fields: toFields({ day }) },
+          currentDocument: doc ? { updateTime: doc.updateTime } : { exists: false },
+        }]);
+        return true;
+      } catch (err) {
+        if (lostPrecondition(err) || isStatus('ALREADY_EXISTS')(err)) return false;
+        throw err;
+      }
+    },
+
+    // A workload's counters, buffered or committed (an offboarding).
+    async deleteStats(workloadId) {
+      for (const [docId, entry] of pendingStats) {
+        if (entry.workloadId !== workloadId) continue;
+        cancel(entry.timer);
+        pendingStats.delete(docId);
+      }
+      const own = new RegExp(`^stats/${workloadId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}-\\d{4}-\\d{2}-\\d{2}$`);
+      await deleteDocuments((await listAll('stats')).filter((doc) => own.test(doc.name)).map((doc) => doc.name));
     },
 
     // Today and the last `days` days (today included), added up.
@@ -262,9 +334,10 @@ export function createFirestoreStore({ google, project, database, now = Date.now
       }
     },
 
-    // Offboarding: configuration, run, schedule and pause; the daily counters stay.
+    // Offboarding: configuration, run, schedule, pause and the daily counters, as AWS's offboarding.
     async deleteWorkload(workloadId) {
       await commit(['workloads', 'runs', 'schedules', 'pauses'].map((kind) => ({ delete: named(`${kind}/${workloadId}`) })));
+      await this.deleteStats(workloadId);
     },
 
     // The kinds of a workload's backends, written apart from the transitions (no version change).

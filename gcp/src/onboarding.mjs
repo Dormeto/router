@@ -457,15 +457,22 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
 
   // In one update, then the waker backend service: the route and the policy; under a swap, the application back wherever the map
   // is still swapped, the hold route and the route. What is gone already is no failure.
+  // A delete refused as in use means a check wrote the route back between the update and the delete (it read the workload
+  // before the offboarding began): the route goes again, and the delete is tried once more.
   async function removeFromGoogle({ urlMap, backendService, wakerBackendService: name, lb = GLOBAL_LB }) {
     const waker = wakerUrl(name, lb);
-    await mapsOf(lb).modify(urlMap, (map) => {
+    const removeRoute = () => mapsOf(lb).modify(urlMap, (map) => {
       const steps = isSwapped(lb)
         ? [(m) => withoutSwap(m, backendService, waker), (m) => withoutHoldRoute(m, backendService, waker), (m) => withoutWakerRoute(m, waker)]
         : [(m) => withoutErrorPolicy(m, waker), (m) => withoutWakerRoute(m, waker)];
       return inOneUpdate(map, steps);
     }).catch(absent);
-    await deleteService(name, lb).catch(absent);
+    await removeRoute();
+    await deleteService(name, lb).catch(async (err) => {
+      if (err?.code !== 400 || err.reason !== 'resourceInUseByAnotherResource') return absent(err);
+      await removeRoute();
+      await deleteService(name, lb).catch(absent);
+    });
   }
 
   // Nothing of a failed onboarding stays: a waker backend service left would keep the NEG from being uninstalled.

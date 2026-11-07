@@ -1101,6 +1101,12 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
         try {
           results.push({ workloadId: cfg.workloadId, ...(await checkOne(cfg, deadline, paused(cfg.workloadId), ctx)), ...passed(cfg.workloadId) });
         } catch (err) {
+          // An offboarding that ran under this check deleted the workload: its writes failing is no failure.
+          if (!(await store.getConfig(cfg.workloadId).catch(() => cfg))) {
+            log.info('CheckSkipped', { workloadId: cfg.workloadId, reason: 'offboarded' });
+            results.push({ workloadId: cfg.workloadId, skipped: 'offboarded' });
+            continue;
+          }
           log.error('CheckFailed', { workloadId: cfg.workloadId, error: err.message });
           results.push({ workloadId: cfg.workloadId, error: err.message });
         }

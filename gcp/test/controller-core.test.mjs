@@ -1468,6 +1468,26 @@ test('asleep without the error policy: repaired, RouteDrift logged, no 300 s wai
   assert.deepEqual(t.logged('RouteDrift').map((l) => [l.workloadId, l.state, l.paths]), [['demo', STATES.ASLEEP, ['pathMatchers[0].defaultCustomErrorResponsePolicy']]]);
 });
 
+test('a check that races an offboarding: the map write finds the workload deleted, CheckSkipped, no CheckFailed, no error in the results', async () => {
+  const t = setup({ run: { state: STATES.ASLEEP }, vms: { 'vm-a': { status: 'TERMINATED' } } });
+  t.world.on.put = async () => {
+    t.store.getConfig = async () => null;
+    throw new GoogleError('Google: PUT: 404 not found', { code: 404, status: 'NOT_FOUND', reason: 'notFound' });
+  };
+  assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', skipped: 'offboarded' }]);
+  assert.deepEqual(t.logged('CheckSkipped').map((l) => [l.workloadId, l.reason]), [['demo', 'offboarded']]);
+  assert.equal(t.logged('CheckFailed').length, 0);
+});
+
+test('a check that fails while the workload is still there stays a CheckFailed', async () => {
+  const t = setup({ run: { state: STATES.ASLEEP }, vms: { 'vm-a': { status: 'TERMINATED' } } });
+  t.world.on.put = async () => { throw new GoogleError('Google: PUT: 500 oops', { code: 500 }); };
+  const [out] = await t.controller.check();
+  assert.match(out.error, /500 oops/);
+  assert.equal(t.logged('CheckFailed').length, 1);
+  assert.equal(t.logged('CheckSkipped').length, 0);
+});
+
 test('asleep without the route: repaired, RouteDrift logged', async () => {
   const map = asleepMap();
   delete map.pathMatchers[0].pathRules;
@@ -1780,6 +1800,7 @@ test('the check stops at its 240 s, and one workload\'s failure does not stop th
   const store = {
     listWorkloads: async () => ({ configs: [...ids].reverse().map((workloadId) => ({ workloadId, urlMap: 'lb', backendService: 'app', wakerBackendService: WAKER, backends: [VM_A], idleMinutes: 15, wakeTimeoutSeconds: 600 })), schedules: new Map() }),
     listPauses: async () => [],
+    getConfig: async (workloadId) => ({ workloadId }),
     getRun: async (id) => {
       if (id === 'w01') throw new Error('unreadable');
       return { state: STATES.AWAKE, awakeSince: clock.now() };

@@ -933,6 +933,32 @@ test('offboard an awake workload: the route and the policy go in one update, the
   assert.deepEqual(w.tasks, []);
 });
 
+const IN_USE = () => new GoogleError(`Google: DELETE ${WAKER}: 400 The backend_service resource is already being used by the url map`, { code: 400, status: 'INVALID_ARGUMENT', reason: 'resourceInUseByAnotherResource' });
+
+test('offboard: a delete refused as in use (a check wrote the route back) removes the route again and retries once', async () => {
+  const { w, store, onboarding } = setup();
+  const original = structuredClone(w.urlMaps.lb);
+  await onboarding.onboard(INPUT);
+  let refused = 0;
+  w.on[`DELETE global/backendServices/${WAKER}`] = () => {
+    if (refused++) return;
+    throw IN_USE();
+  };
+  await onboarding.offboard('demo');
+  assert.equal(refused, 2);
+  assertSameMap(w.urlMaps.lb, original);
+  assert.equal(w.services[WAKER], undefined);
+  assert.equal(store.configs.size, 0);
+});
+
+test('offboard: a second delete refused as in use fails as before, the documents kept', async () => {
+  const { w, store, onboarding } = setup();
+  await onboarding.onboard(INPUT);
+  w.on[`DELETE global/backendServices/${WAKER}`] = () => { throw IN_USE(); };
+  await assert.rejects(onboarding.offboard('demo'), (err) => err.reason === 'resourceInUseByAnotherResource');
+  assert.equal(store.configs.size, 1);
+});
+
 test('offboarding an asleep workload wakes it first: VMs up and healthy before anything is removed', async () => {
   const { w, store, onboarding } = setup();
   const original = structuredClone(w.urlMaps.lb);

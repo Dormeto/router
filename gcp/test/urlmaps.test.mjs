@@ -365,6 +365,116 @@ test('modify: another error is not retried', async () => {
   assert.deepEqual(sleeps, []);
 });
 
+// ---- One map's changes in one update (F8: ten naps of one regional map, 85 s an update) ----
+
+// A map of three workloads, `a`, `b` and `c`, a matcher each, kept as Google does: each update a new fingerprint, one made on a
+// stale one a 412. The first update's operation runs until `release()`, the others' end at once. `busy`: every update is then a
+// 412; a map naming `waker-gone` is a 400. `puts`: each update asked, as the matchers holding a policy of a waker.
+function heldGoogle() {
+  let version = 0;
+  let stored = { name: 'shared', fingerprint: 'v0', pathMatchers: ['a', 'b', 'c'].map((name) => ({ name, defaultService: `${V1}/${name}` })) };
+  let release;
+  const google = {
+    puts: [],
+    busy: false,
+    get map() { return stored; },
+    release: () => release(),
+    request: async (method, url, body) => {
+      if (method === 'GET') return structuredClone(stored);
+      google.puts.push(body.pathMatchers.filter((m) => m.defaultCustomErrorResponsePolicy?.errorService.includes('/waker-')).map((m) => m.name));
+      if (google.busy || body.fingerprint !== stored.fingerprint) throw gerr(412);
+      if (JSON.stringify(body).includes('waker-gone')) throw Object.assign(new Error('Google: PUT: 400 waker-gone is no backend service'), { code: 400 });
+      version += 1;
+      stored = { ...structuredClone(body), fingerprint: `v${version}` };
+      return { selfLink: `op-${version}` };
+    },
+    waitCompute: (op) => (op.selfLink === 'op-1' ? new Promise((resolve) => { release = resolve; }) : Promise.resolve()),
+  };
+  return google;
+}
+const policyOn = (name, waker = `${V1}/waker-${name}`) => (map) => withErrorPolicy(map, name, waker);
+const turn = () => new Promise((resolve) => { setImmediate(resolve); });
+const policyAt = (i) => [`pathMatchers[${i}].defaultCustomErrorResponsePolicy`];
+
+test('modify: changes asked during an update of the map wait for it, then go together in one update, each answered its own paths', async () => {
+  const google = heldGoogle();
+  const urlmaps = createUrlMaps({ google, project: 'p', sleep: noWait() });
+  const a = urlmaps.modify('shared', policyOn('a'));
+  await turn();
+  const b = urlmaps.modify('shared', policyOn('b'));
+  const c = urlmaps.modify('shared', policyOn('c'));
+  await turn();
+  assert.deepEqual(google.puts, [['a']], 'b and c wait for the update under way');
+  google.release();
+  const answers = await Promise.all([a, b, c]);
+  assert.deepEqual(google.puts, [['a'], ['a', 'b', 'c']]);
+  assert.deepEqual(answers.map((r) => r.paths), [policyAt(0), policyAt(1), policyAt(2)]);
+  assert.deepEqual(google.map.pathMatchers.map((m) => m.defaultCustomErrorResponsePolicy.errorService), ['a', 'b', 'c'].map((name) => `${V1}/waker-${name}`));
+});
+
+test('modify: during an update of the map, a change with nothing to write is answered at once', async () => {
+  const google = heldGoogle();
+  const urlmaps = createUrlMaps({ google, project: 'p', sleep: noWait() });
+  const a = urlmaps.modify('shared', policyOn('a'));
+  await turn();
+  const nothing = await Promise.race([urlmaps.modify('shared', (map) => withoutErrorPolicy(map, `${V1}/waker-b`)), turn().then(turn).then(() => 'waiting')]);
+  assert.deepEqual(nothing.paths, []);
+  google.release();
+  await a;
+  assert.deepEqual(google.puts, [['a']]);
+});
+
+test('modify: a change refused when its shared update applies it is its caller\'s alone: the others are written', async () => {
+  const google = heldGoogle();
+  const urlmaps = createUrlMaps({ google, project: 'p', sleep: noWait() });
+  const a = urlmaps.modify('shared', policyOn('a'));
+  await turn();
+  const b = urlmaps.modify('shared', policyOn('b'));
+  const c = urlmaps.modify('shared', policyOn('c'));
+  await turn();
+  // The customer's own policy on b's matcher, meanwhile.
+  google.map.pathMatchers[1].defaultCustomErrorResponsePolicy = { errorService: `${V1}/theirs`, errorResponseRules: [] };
+  google.release();
+  await assert.rejects(b, (err) => err instanceof UrlMapRefused && /its own error response policy at pathMatchers\[1\]/.test(err.message));
+  assert.deepEqual((await c).paths, policyAt(2));
+  await a;
+  assert.deepEqual(google.puts, [['a'], ['a', 'c']]);
+  assert.equal(google.map.pathMatchers[1].defaultCustomErrorResponsePolicy.errorService, `${V1}/theirs`);
+});
+
+test('modify: a shared update Google refuses (a 400) is tried again change by change: only the change it refuses fails', async () => {
+  const google = heldGoogle();
+  const urlmaps = createUrlMaps({ google, project: 'p', sleep: noWait() });
+  const a = urlmaps.modify('shared', policyOn('a'));
+  await turn();
+  const gone = urlmaps.modify('shared', policyOn('b', `${V1}/waker-gone`));
+  const c = urlmaps.modify('shared', policyOn('c'));
+  await turn();
+  google.release();
+  await assert.rejects(gone, { code: 400 });
+  assert.deepEqual((await c).paths, policyAt(2));
+  await a;
+  assert.deepEqual(google.puts, [['a'], ['a', 'b', 'c'], ['a', 'b'], ['a', 'c']]);
+});
+
+test('modify: a shared update still refused for another one past its pauses fails each of its changes with that refusal, not one by one', async () => {
+  const google = heldGoogle();
+  const sleeps = [];
+  const urlmaps = createUrlMaps({ google, project: 'p', sleep: noWait(sleeps) });
+  const a = urlmaps.modify('shared', policyOn('a'));
+  await turn();
+  const b = urlmaps.modify('shared', policyOn('b'));
+  const c = urlmaps.modify('shared', policyOn('c'));
+  await turn();
+  google.busy = true;
+  google.release();
+  await a;
+  await assert.rejects(b, { code: 412 });
+  await assert.rejects(c, { code: 412 });
+  assert.equal(google.puts.length, 1 + 5, 'the first update, then the shared one\'s five tries');
+  assert.deepEqual(sleeps, [5000, 10_000, 15_000, 30_000]);
+});
+
 test('CALLS names the adapter\'s functions', () => {
   assert.deepEqual(Object.keys(CALLS).sort(), ['get', 'list', 'modify']);
 });

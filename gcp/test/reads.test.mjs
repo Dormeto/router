@@ -131,3 +131,30 @@ test('Firestore reads: a check, one AWAKE workload, 4; the first of the day 2 mo
   await core.check();
   assert.equal(reads(), 10);
 });
+
+// Past 20 workloads, the naps in flight can pass their cap (F8): each run is read once more as the check starts, for the NAPPING ones.
+test('Firestore reads: a check of 21 AWAKE workloads reads each run twice and the lists once, 45; of 20, each run once, 23', async () => {
+  const clock = fakeClock();
+  const awake = { state: STATES.AWAKE, version: 0, awakeSince: clock.now(), holders: 0, wakeCount: 0 };
+  const { firestore, reads, store } = firestoreWith(awake);
+  firestore.docs.delete('workloads/demo');
+  firestore.docs.delete('runs/demo');
+  for (const id of Array.from({ length: 21 }, (_, i) => `w${String(i).padStart(2, '0')}`)) {
+    await store.putConfig(id, {
+      workloadId: id, urlMap: 'lb', backendService: 'app', wakerBackendService: WAKER, backends: [{ kind: 'vm', location: ZONE, name: 'vm-a' }], idleMinutes: 15, wakeTimeoutSeconds: 600, failedRetrySeconds: 60, pollSeconds: 3,
+    });
+    firestore.docs.set(`runs/${id}`, { fields: toFields(awake), updateTime: 't0' });
+  }
+  const { core } = worldOf((w) => {
+    w.store = store;
+    w.services[WAKER] = { name: WAKER, backends: [] };
+  });
+  await core.check();
+  let before = reads();
+  await core.check();
+  assert.equal(reads() - before, 3 + 2 * 21);
+  firestore.docs.delete('workloads/w20');
+  before = reads();
+  await core.check();
+  assert.equal(reads() - before, 3 + 20);
+});

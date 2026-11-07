@@ -35,7 +35,8 @@ const HOLD_PREFIX = '/_dormeto/backend/';
 const DEFAULT_MATCHER = 'dormeto-default';
 // Between two tries of an update refused because of another one, which takes 14 to 25 s on a global map (G0): about 60 s in all.
 const PAUSES_MS = [5000, 10_000, 15_000, 30_000];
-// A regional map's update takes up to 85 s (M3): about 120 s of pauses in all, for two workloads writing one map.
+// A regional map's update takes up to 85 s (M3): about 120 s of pauses in all, for another writer's update (a process's own changes
+// of one map wait for its update under way instead, and share the next: `modify`).
 const PAUSES_REGIONAL_MS = [5000, 10_000, 15_000, 30_000, 30_000, 30_000];
 // Above M3's longest update, a regional map's 85 s (a global one's takes 14 to 25 s).
 const WAIT_MS = 120_000;
@@ -521,21 +522,79 @@ export function createUrlMaps({ google, project, region, scope = 'global', now =
     return items;
   }
 
-  // Reads the map, applies `change(map)` (one of the functions above), and updates it with the map's fingerprint;
-  // changes nothing if `change` wrote nothing. Refused for another update (mapBusy): a pause, then the map read again and
-  // the change applied to it, up to about 60 s.
-  async function modify(name, change) {
+  // The changes in one update, each applied to the map of the one before: `[{ result: { map, paths } } | { error }]` in their
+  // order, `map` as written and `paths` the change's own. A change that throws (UrlMapRefused) is left out, its error its answer;
+  // nothing to write, no update. Refused for another update (mapBusy): a pause, then the map read again and the changes applied
+  // to it, up to about 60 s (120 s regional). The update's own failure is thrown.
+  async function update(name, changes) {
     for (const wait of [...(scope === 'regional' ? PAUSES_REGIONAL_MS : PAUSES_MS), null]) {
-      const result = change(await get(name));
-      if (result.paths.length === 0) return result;
+      let map = await get(name);
+      const answers = changes.map((change) => {
+        try {
+          const result = change(map);
+          map = result.map;
+          return { paths: result.paths };
+        } catch (error) {
+          return { error };
+        }
+      });
+      const answered = () => answers.map(({ error, paths }) => (error ? { error } : { result: { map, paths } }));
+      if (!answers.some(({ paths }) => paths?.length)) return answered();
       try {
-        await google.waitCompute(await google.request('PUT', url(name), result.map), now() + WAIT_MS);
-        return result;
+        await google.waitCompute(await google.request('PUT', url(name), map), now() + WAIT_MS);
+        return answered();
       } catch (e) {
         if (!mapBusy(e) || wait === null) throw e;
       }
       await sleep(wait);
     }
+  }
+
+  // By the map's name, the changes asked while this process updates it: they wait for that update, then go together in the next
+  // one. Ten naps of one regional map make two updates here, not ten in a row at 85 s each, the last ones past their pauses (F8).
+  const waiting = new Map();
+
+  // Each change's caller answered from one update of them all. A refusal that may be one change's, a 400 or a 404 (a backend
+  // service it names, refused or gone), tries each again alone: it is then that one's only.
+  async function together(name, items) {
+    let answers;
+    try {
+      answers = await update(name, items.map((item) => item.change));
+    } catch (err) {
+      if (items.length > 1 && !mapBusy(err) && (err.code === 400 || err.code === 404)) {
+        for (const item of items) await together(name, [item]);
+        return;
+      }
+      answers = items.map(() => ({ error: err }));
+    }
+    items.forEach(({ resolve, reject }, i) => (answers[i].error ? reject(answers[i].error) : resolve(answers[i].result)));
+  }
+
+  // What came during an update goes in the next one; nothing, and the map is free.
+  function next(name) {
+    const items = waiting.get(name);
+    if (!items.length) {
+      waiting.delete(name);
+      return;
+    }
+    waiting.set(name, []);
+    together(name, items).finally(() => next(name));
+  }
+
+  // Reads the map, applies `change(map)` (one of the functions above), and updates it with the map's fingerprint; changes
+  // nothing if `change` wrote nothing. During another update of the map here, a change with something to write waits for it,
+  // then goes with the others in the next one; with nothing to write, it is answered at once.
+  async function modify(name, change) {
+    if (waiting.has(name)) {
+      const result = change(await get(name));
+      if (result.paths.length === 0) return result;
+      const queue = waiting.get(name);
+      if (queue) return new Promise((resolve, reject) => { queue.push({ change, resolve, reject }); });
+    }
+    waiting.set(name, []);
+    return new Promise((resolve, reject) => {
+      together(name, [{ change, resolve, reject }]).finally(() => next(name));
+    });
   }
 
   return { get, list, modify };

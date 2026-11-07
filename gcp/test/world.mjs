@@ -30,6 +30,37 @@ export function clockTimers(clock) {
   return { every, timers };
 }
 
+// A clock for requests that run at once, as the measures' (measure-run.test.mjs): time passes only once every one of them waits,
+// whoever sleeps is woken in time order, and the hooks run first, as fakeClock's (whose sleeps would add up instead). `until(promise)`
+// drives it until the promise settles.
+export function virtualClock(start = 1_700_000_000_000) {
+  let t = start;
+  let order = 0;
+  const hooks = [];
+  const sleepers = [];
+  return {
+    now: () => t,
+    advance: (ms) => { t += ms; },
+    onSleep: (fn) => hooks.push(fn),
+    sleep: (ms) => new Promise((resolve) => { sleepers.push({ at: t + ms, order: order++, resolve }); }),
+    async until(promise) {
+      let settled = false;
+      const end = () => { settled = true; };
+      promise.then(end, end);
+      for (;;) {
+        await new Promise((resolve) => { setImmediate(resolve); });
+        if (settled) return promise;
+        if (!sleepers.length) throw new Error('virtualClock: nothing sleeps, and the promise has not settled');
+        sleepers.sort((a, b) => a.at - b.at || a.order - b.order);
+        const next = sleepers.shift();
+        t = Math.max(t, next.at);
+        for (const hook of hooks) await hook(t);
+        next.resolve();
+      }
+    },
+  };
+}
+
 // The store's heartbeat writes (firestore.mjs) on a fake's run, `runOf(id)` the run itself: `beatAt` while it holds the id,
 // `resentAt` once a minute.
 export const heartbeatStore = (runOf, now) => ({
@@ -307,9 +338,9 @@ function kubeFetch(w) {
 }
 
 // `change(world)`: what differs from the defaults. `fail['<method> <path>']` refuses that call, `on[...]` runs before it.
-// `world.store`: another store than the one here, such as the real one over a fake Firestore.
-export function setup(change = () => {}) {
-  const clock = fakeClock();
+// `world.store`: another store than the one here, such as the real one over a fake Firestore. `clock`: another than fakeClock, such
+// as virtualClock for requests that run at once.
+export function setup(change = () => {}, { clock = fakeClock() } = {}) {
   const w = { ...defaults(), changes: [], tasks: [], healthGroups: [], fail: {}, on: {}, logs: [], used: new Set(), routerToken: 'router-token' };
   change(w);
   const instance = (name) => {

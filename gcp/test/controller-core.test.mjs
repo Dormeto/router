@@ -8,7 +8,8 @@ import { fromFields, toFields } from '../src/firestore.mjs';
 import { GoogleError, OPERATION_NOT_DONE } from '../src/google.mjs';
 import { createUrlMaps, withErrorPolicy, withSwap } from '../src/urlmaps.mjs';
 import {
-  CLUSTER, GKE_INPUT, GKE_NEG, NEG_READINGS, OWNER, classic, clockTimers, heartbeatStore, onGke, sweepStore, regional as regionalWorld, setup as worldOf, unmanagedUrl,
+  CLUSTER, GKE_INPUT, GKE_NEG, NEG_READINGS, OWNER, REGION, classic, clockTimers, heartbeatStore, onGke, sweepStore, regional as regionalWorld, regionalUrl, setup as worldOf,
+  unmanagedUrl, virtualClock,
 } from './world.mjs';
 
 const V1 = 'https://compute.googleapis.com/compute/v1/projects/p';
@@ -720,6 +721,19 @@ for (const [kind, lb, base, waitSeconds, healthScope, headers] of SWAPS) {
     assert.deepEqual(t.world.calls, [`state ${STATES.NAPPING}`, `state ${STATES.AWAKE}`]);
     assert.deepEqual(t.world.sleeps, []);
     assert.equal(t.world.puts, 0);
+  });
+
+  test(`${kind} nap whose map stays busy with other updates past its pauses: nothing swapped, no wait, AWAKE (map-busy), no failure`, async () => {
+    const t = swapSetup();
+    t.world.conflicts = 100;
+    const out = await t.controller.nap('demo');
+    assert.equal(out.aborted, true);
+    assert.deepEqual(t.world.calls, [`state ${STATES.NAPPING}`, `state ${STATES.AWAKE}`]);
+    assert.equal(t.world.sleeps.includes(WAIT_MS), false);
+    assert.equal(t.world.puts, 0);
+    assert.equal(t.run().napAborted.reason, 'map-busy');
+    assert.equal(t.run().failure, undefined);
+    assert.equal(t.world.vms['vm-a'].status, 'RUNNING');
   });
 
   test(`${kind} nap refused at its first write on a map found swapped: unswapped, waited, only then AWAKE`, async () => {
@@ -1502,13 +1516,23 @@ test('a stop refused: FAILED with the kind permission', async () => {
   assert.equal(JSON.parse(t.run().failure).kind, 'permission');
 });
 
-test('a URL map changed five times over: a failure of the switch (throttled), nothing stopped', async () => {
+// F8: a nap does not fail on its map's contention. Nothing it wrote kept visitors from the application: its idle time goes on, and
+// the next check asks again.
+test('a URL map changed five times over: the nap given up (map-busy), nothing stopped, no failure, and the next check asks again', async () => {
   const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
   t.world.conflicts = 5;
   const out = await t.controller.nap('demo');
-  assert.equal(out.state, STATES.FAILED);
-  assert.equal(JSON.parse(t.run().failure).kind, 'throttled');
+  assert.equal(out.state, STATES.AWAKE);
+  assert.equal(out.aborted, true);
+  assert.equal(out.error, 'URL map lb stayed busy with other updates: Google: PUT: 412 fingerprint');
   assert.deepEqual(t.world.calls, []);
+  assert.equal(t.run().state, STATES.AWAKE);
+  assert.equal(t.run().failure, undefined);
+  assert.equal(t.run().napAborted.reason, 'map-busy');
+  assert.equal(t.run().awakeSince, 1, 'its idle time goes on');
+  assert.deepEqual(t.logged('NapAborted').map((l) => [l.level, l.reason]), [['warn', out.error]]);
+  assert.equal(t.logged('StateChanged').find((l) => l.to === STATES.AWAKE).cause, 'map-busy');
+  assert.equal((await check(t)).nap, 'requested');
 });
 
 test('a URL map changed four times over is read again and written, with its pauses', async () => {
@@ -1517,7 +1541,7 @@ test('a URL map changed four times over is read again and written, with its paus
   assert.equal((await t.controller.nap('demo')).state, STATES.ASLEEP);
 });
 
-test('another update of the URL map under way (resourceNotReady): the nap waits for it; for ever, a failure of the switch', async () => {
+test('another update of the URL map under way (resourceNotReady): the nap waits for it; for ever, given up (map-busy), nothing stopped', async () => {
   const notReady = () => new GoogleError('Google: PUT: 400 The resource is not ready', { code: 400, reason: 'resourceNotReady' });
   const waits = setup({ vms: { 'vm-a': { status: 'RUNNING' } }, cfg: { hibernate: false } });
   let refusals = 2;
@@ -1529,8 +1553,9 @@ test('another update of the URL map under way (resourceNotReady): the nap waits 
 
   const never = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
   never.world.on.put = async () => { throw notReady(); };
-  assert.equal((await never.controller.nap('demo')).state, STATES.FAILED);
-  assert.equal(JSON.parse(never.run().failure).kind, 'throttled');
+  assert.equal((await never.controller.nap('demo')).state, STATES.AWAKE);
+  assert.equal(never.run().napAborted.reason, 'map-busy');
+  assert.equal(never.run().failure, undefined);
   assert.deepEqual(never.world.calls, []);
 });
 
@@ -2271,13 +2296,13 @@ test('a schedule the router cannot read: logged, the workload as with none', asy
   assert.deepEqual(t.world.tasks.map((task) => task.body), [{ action: 'nap', workloadId: 'demo', requestedAt: t.clock.now() }]);
 });
 
-// Twelve workloads on the same URL map, their VMs read through the world.
+// Workloads on the same URL map, their VMs read through the world, awake for a day: by ID, each one's schedule (null: none).
 function crowded(schedules) {
   const world = worldOf((w) => { w.services[WAKER] = { name: WAKER, backends: [] }; });
   for (const [workloadId, schedule] of Object.entries(schedules)) {
     world.store.configs.set(workloadId, { workloadId, urlMap: 'lb', backendService: 'app', wakerBackendService: WAKER, backends: [{ kind: 'vm', location: ZONE, name: 'vm-a' }], idleMinutes: 15, wakeTimeoutSeconds: 600 });
     world.store.runs.set(workloadId, { state: STATES.AWAKE, awakeSince: world.clock.now() - DAY });
-    world.store.schedules.set(workloadId, schedule);
+    if (schedule) world.store.schedules.set(workloadId, schedule);
   }
   return world;
 }
@@ -2422,6 +2447,162 @@ test('the budget gone before the loop: no task asked, the nap put off, and said 
   assert.deepEqual(await world.core.check(), [{ workloadId: 'a', schedule: 'nap deferred' }]);
   assert.deepEqual(world.w.tasks, []);
   assert.equal(world.store.runs.get('a').scheduleApplied, undefined);
+});
+
+// --- The naps in flight: at most 20 per router (F8) ---------------------------------------------------------------------
+
+const thirty = Array.from({ length: 30 }, (_, i) => `w${String(i).padStart(2, '0')}`);
+const napTasksOf = (world) => world.w.tasks.filter((task) => task.body.action === 'nap').map((task) => task.body.workloadId);
+const deferredOf = (world) => world.w.logs.filter((l) => l.event === 'NapDeferred').map(({ reason, count }) => ({ reason, count }));
+// Their naps' requests running, each beating.
+const napping = (world, ids) => {
+  const t = world.clock.now();
+  for (const id of ids) Object.assign(world.store.runs.get(id), { state: STATES.NAPPING, napId: `nap-${id}`, stateAt: t, updatedAt: t, beatAt: t });
+};
+const nextCheck = (world) => {
+  world.w.tasks.length = 0;
+  world.w.logs.length = 0;
+  world.clock.advance(FIVE_MINUTES);
+};
+
+// Which workloads the 8 checked at once reach first is theirs to say: the counts and the sets are what holds.
+test('30 idle workloads: 20 nap tasks and NapDeferred once for the 10 others; while the 20 nap, none more but a wake; then the 10 others', async () => {
+  const world = crowded(Object.fromEntries(thirty.map((id) => [id, null])));
+  const { store, core, clock } = world;
+  const out = await core.check();
+  const asked = napTasksOf(world);
+  assert.equal(new Set(asked).size, 20);
+  const others = thirty.filter((id) => !asked.includes(id));
+  for (const id of others) assert.equal(out.find((r) => r.workloadId === id).nap, 'deferred', id);
+  assert.deepEqual(deferredOf(world), [{ reason: 'cap', count: 10 }]);
+
+  // The 20 still napping: no nap more. A wake is never held back: an asleep workload's awake window.
+  nextCheck(world);
+  napping(world, asked);
+  store.configs.set('zz', { ...store.configs.get('w00'), workloadId: 'zz' });
+  store.runs.set('zz', { state: STATES.ASLEEP, stateAt: clock.now() - DAY });
+  store.schedules.set('zz', scheduleOf(AWAKE_WINDOW));
+  await core.check();
+  assert.deepEqual(napTasksOf(world), []);
+  assert.deepEqual(world.w.tasks.map((task) => [task.body.action, task.body.workloadId]), [['wake', 'zz']]);
+  assert.deepEqual(deferredOf(world), [{ reason: 'cap', count: 10 }]);
+
+  // Their naps over (asleep, then woken by visitors): the 10 others.
+  nextCheck(world);
+  store.configs.delete('zz');
+  for (const id of asked) store.runs.set(id, { state: STATES.AWAKE, awakeSince: clock.now() });
+  await core.check();
+  assert.deepEqual(napTasksOf(world).sort(), others);
+  assert.deepEqual(deferredOf(world), []);
+});
+
+test('25 idle workloads and 5 in a nap window: the 5 scheduled naps first, then 15 idle ones, the 10 others deferred', async () => {
+  // The scheduled ones last by name: they go first all the same.
+  const world = crowded(Object.fromEntries(thirty.map((id, i) => [id, i >= 25 ? scheduleOf(NAP) : null])));
+  const out = await world.core.check();
+  const tasks = world.w.tasks.map((task) => task.body);
+  assert.deepEqual(tasks.slice(0, 5).map((body) => [body.workloadId, body.cause]), thirty.slice(25).map((id) => [id, 'schedule']));
+  const idle = tasks.slice(5).map((body) => body.workloadId);
+  assert.equal(new Set(idle).size, 15);
+  assert.equal(tasks.slice(5).every((body) => body.cause === undefined && thirty.slice(0, 25).includes(body.workloadId)), true);
+  for (const id of thirty.slice(0, 25).filter((id) => !idle.includes(id))) assert.equal(out.find((r) => r.workloadId === id).nap, 'deferred', id);
+  assert.deepEqual(deferredOf(world), [{ reason: 'cap', count: 10 }]);
+});
+
+test('the naps in flight count the scheduled ones too: 18 napping, 5 in a nap window → 2 asked, 3 put off to the next check, no idle nap', async () => {
+  const busy = thirty.slice(0, 18);
+  const windowed = thirty.slice(18, 23);
+  const idle = thirty.slice(23, 25);
+  const world = crowded(Object.fromEntries([...busy.map((id) => [id, null]), ...windowed.map((id) => [id, scheduleOf(NAP)]), ...idle.map((id) => [id, null])]));
+  napping(world, busy);
+  const out = await world.core.check();
+  assert.deepEqual(napTasksOf(world), windowed.slice(0, 2));
+  for (const id of windowed.slice(2)) {
+    assert.equal(out.find((r) => r.workloadId === id).schedule, 'nap deferred', id);
+    assert.equal(world.store.runs.get(id).scheduleApplied, undefined, id);
+  }
+  assert.deepEqual(world.w.logs.find((l) => l.event === 'ScheduledNapsDeferred').workloads, windowed.slice(2));
+  assert.deepEqual(deferredOf(world), [{ reason: 'cap', count: 2 }]);
+});
+
+// Ten workloads on the one regional URL map `lb`, onboarded: each its host, matcher, backend service `app-<id>` of the unmanaged group
+// `ig-<id>` of `vm-<id>`, and waker. The store dates its changes as Firestore does: what the check's stuck naps read.
+async function tenOnOneRegionalMap(clock) {
+  const ten = thirty.slice(0, 10);
+  const t = worldOf((w) => {
+    regionalWorld(w);
+    const region = w.regions[REGION];
+    Object.assign(region.urlMaps.lb, {
+      hostRules: ten.map((id) => ({ hosts: [`${id}.example.com`], pathMatcher: id })),
+      pathMatchers: ten.map((id) => ({ name: id, defaultService: regionalUrl(`app-${id}`) })),
+    });
+    for (const [i, id] of ten.entries()) {
+      region.services[`app-${id}`] = { ...region.services.app, name: `app-${id}`, backends: [{ group: unmanagedUrl(`ig-${id}`) }] };
+      w.unmanaged[`ig-${id}`] = [`vm-${id}`];
+      w.vms[`vm-${id}`] = { id: String(3000 + i), status: 'RUNNING' };
+    }
+  }, { clock });
+  for (const id of ten) await t.onboarding.onboard({ urlMap: 'lb', backendService: `app-${id}`, id, settings: { hibernate: false } });
+  const { transition } = t.store;
+  t.store.transition = (id, change) => {
+    const run = t.store.runs.get(id);
+    const dated = change.set?.state !== undefined && change.set.state !== run?.state ? { stateAt: clock.now() } : {};
+    return transition(id, { ...change, set: { ...change.set, ...dated, updatedAt: clock.now() } });
+  };
+  return { ...t, ten };
+}
+
+// The regional map's update as M3 measured it, 85 s. During it another one is refused (resourceNotReady), and one made on the map
+// read before it is a 412, its fingerprint stale. `updates`: when each began.
+function slowRegionalMap(t, clock) {
+  const updates = [];
+  let busyUntil = 0;
+  const { request } = t.google;
+  t.google.request = async (method, url, body) => {
+    if (method !== 'PUT' || !url.endsWith(`/regions/${REGION}/urlMaps/lb`)) return request(method, url, body);
+    const current = body.fingerprint === t.w.regions[REGION].urlMaps.lb.fingerprint;
+    if (current && clock.now() < busyUntil) throw new GoogleError('Google: URL map lb: 400 The resource is not ready', { code: 400, reason: 'resourceNotReady' });
+    const answer = await request(method, url, body);
+    busyUntil = clock.now() + 85_000;
+    updates.push(clock.now());
+    return { ...answer, doneAt: busyUntil };
+  };
+  t.google.waitCompute = async (op) => {
+    if (op?.doneAt) await clock.sleep(op.doneAt - clock.now());
+  };
+  return updates;
+}
+
+// What the controller's API does of a task, as Cloud Tasks dispatches it.
+const dispatch = (core) => ({ body: { action, workloadId, ...rest } }) => {
+  if (action === 'nap') return core.nap(workloadId, rest);
+  if (action === 'wake') return core.wake(workloadId, rest.wakeId);
+  return core.release(workloadId);
+};
+
+test('ten idle workloads on one regional map, an update taking 85 s and a stale fingerprint a 412: all asleep by the third check, none failed', async () => {
+  const clock = virtualClock();
+  const t = await tenOnOneRegionalMap(clock);
+  clock.advance(60 * MINUTE);
+  const updates = slowRegionalMap(t, clock);
+  const started = clock.now();
+  const requests = [];
+  let asleep;
+  await clock.until((async () => {
+    for (const [i, at] of [0, FIVE_MINUTES, 2 * FIVE_MINUTES].entries()) {
+      if (i) await clock.sleep(started + at - clock.now());
+      await t.core.check();
+      requests.push(...t.w.tasks.splice(0).map(dispatch(t.core)));
+    }
+    asleep = t.ten.filter((id) => t.store.runs.get(id).state === STATES.ASLEEP);
+    await Promise.all(requests);
+  })());
+  assert.deepEqual(asleep, t.ten, 'all asleep by the third check');
+  assert.deepEqual(t.w.logs.filter((l) => l.event === 'NapFailed' || l.event === 'NapAborted'), []);
+  assert.equal(t.w.logs.filter((l) => l.event === 'NapCompleted').length, 10);
+  for (const id of t.ten) assert.equal(t.w.vms[`vm-${id}`].status, 'TERMINATED', id);
+  // The first nap's swap alone, then the nine asked during it, together.
+  assert.deepEqual(updates.map((at) => (at - started) / 1000), [0, 85]);
 });
 
 // --- Pauses ------------------------------------------------------------------------------------------------------------

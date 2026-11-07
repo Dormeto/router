@@ -74,6 +74,9 @@ const CHECK_CONCURRENCY = 8;
 const SUSPEND_MAX_MEMORY_MB = 208 * 1024;
 // A nap holds a request of the controller for minutes: a nap window on many workloads is spread over the checks.
 const SCHEDULED_NAPS_MAX = 10;
+// At most this many naps in flight per router (F8), so that the wakes find room among the controller's 10 instances of 10 requests:
+// the NAPPING runs as the check starts, then each nap it asks, the scheduled ones first. The others nap at a later check.
+const NAPS_MAX = 20;
 // Pauses: automatic resume at most this far ahead, reason length.
 const PAUSE_MAX_MS = 366 * 86_400_000;
 const REASON_MAX = 256;
@@ -701,8 +704,11 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
         if (paths.length) await sleep(sw.waitMs);
       }
       const at = now();
+      // A map other updates kept busy holds no switch of this nap's (its first write never went through, or a lost swap's again):
+      // the idle time goes on, and the next check asks again.
+      const since = cause === 'map-busy' ? {} : { awakeSince: at };
       const awake = await transition(workloadId, {
-        cond: { state: STATES.NAPPING }, set: { state: STATES.AWAKE, awakeSince: at, napAborted: { reason: cause, at } }, remove: ['pendingWake', 'stopping'], cause,
+        cond: { state: STATES.NAPPING }, set: { state: STATES.AWAKE, ...since, napAborted: { reason: cause, at } }, remove: ['pendingWake', 'stopping'], cause,
       });
       if (!awake) return superseded();
       log[level]('NapAborted', { workloadId, ...(reason ? { reason } : {}) });
@@ -721,7 +727,12 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
         if (held === 'lost') return await giveUp(`${sw.kind}-lost`, 'warn', { reason: `the ${sw.kind} was lost, no time left to wait for it again` });
       } catch (err) {
         // A customer's own policy, or a service moved or named elsewhere, since the onboarding: nothing is stopped yet, the
-        // application keeps serving.
+        // application keeps serving. So with a map other updates kept busy past the pauses (another router process's naps, a
+        // customer's apply): its switch is not on it, and the nap is no failure (F8).
+        if (mapBusy(err)) {
+          const message = `URL map ${cfg.urlMap} stayed busy with other updates: ${err.message}`;
+          return await giveUp('map-busy', 'warn', { reason: message, error: message });
+        }
         if (!(err instanceof UrlMapRefused)) throw err;
         return await giveUp('switch-failed', 'warn', { reason: err.message, error: err.message });
       }
@@ -841,18 +852,18 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
     }
   };
 
-  // The nap windows' naps a check asks for, oldest occurrence first and at most SCHEDULED_NAPS_MAX accepted: the next check
-  // takes the rest, and those a Cloud Tasks too slow left past the check's budget. Each occurrence is recorded only once its
-  // task is accepted, whatever the state by then: the task may have started. A record lost asks again at the next check, and
-  // the task it adds finds the nap under way. A pause written after that refuses the task, and the occurrence stays consumed:
-  // once the pause is gone only an idle nap comes, not the window's.
-  async function askScheduledNaps(naps, applied, t, deadline) {
+  // The nap windows' naps a check asks for, oldest occurrence first and at most SCHEDULED_NAPS_MAX accepted, within the naps in
+  // flight (`flight`, NAPS_MAX): the next check takes the rest, and those a Cloud Tasks too slow left past the check's budget. Each
+  // occurrence is recorded only once its task is accepted, whatever the state by then: the task may have started. A record lost
+  // asks again at the next check, and the task it adds finds the nap under way. A pause written after that refuses the task, and
+  // the occurrence stays consumed: once the pause is gone only an idle nap comes, not the window's.
+  async function askScheduledNaps(naps, applied, t, deadline, flight) {
     const deferred = [];
     const failed = (workloadId) => (err) => log.error('ScheduleFailed', { workloadId, error: err.message });
     let accepted = 0;
     naps.sort((a, b) => a.occurrence.start - b.occurrence.start || a.workloadId.localeCompare(b.workloadId));
     for (const { workloadId, occurrence } of naps) {
-      if (accepted === SCHEDULED_NAPS_MAX || now() >= deadline) {
+      if (accepted === SCHEDULED_NAPS_MAX || flight.naps >= NAPS_MAX || now() >= deadline) {
         deferred.push(workloadId);
         applied.set(workloadId, 'nap deferred');
         continue;
@@ -865,6 +876,7 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
         continue;
       }
       accepted += 1;
+      flight.naps += 1;
       applied.set(workloadId, 'nap');
       log.info('NapRequested', { workloadId, cause: 'schedule' });
       await recordOccurrence(workloadId, occurrence, 'nap', ANY_STATE).catch(failed(workloadId));
@@ -873,10 +885,10 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
   }
 
   // Before the check's loop, every scheduled workload whatever the loop's budget: 8 at a time, one run read each, nothing
-  // called but the tasks it enqueues. holdOf(workloadId): { paused, keepAsleep }. Answers each workload's outcome (what it did,
-  // or what held it) and the schedules the router can read: one it cannot (a time zone Intl refuses) is logged and the
-  // workload behaves as if it had none.
-  async function applySchedules(configs, schedules, holdOf, t, deadline) {
+  // called but the tasks it enqueues. holdOf(workloadId): { paused, keepAsleep }. `flight`: the naps in flight, which its naps
+  // add to. Answers each workload's outcome (what it did, or what held it) and the schedules the router can read: one it cannot
+  // (a time zone Intl refuses) is logged and the workload behaves as if it had none.
+  async function applySchedules(configs, schedules, holdOf, t, deadline, flight) {
     const due = [];
     const readable = new Map();
     for (const { workloadId } of configs) {
@@ -908,7 +920,7 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
         }
       }
     }));
-    await askScheduledNaps(naps, applied, t, deadline);
+    await askScheduledNaps(naps, applied, t, deadline, flight);
     return { applied, readable };
   }
 
@@ -1181,14 +1193,41 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
     const from = t - idleMs - METRIC_DELAY_MS;
     if ((run.awakeSince ?? 0) > from) return { state: run.state };
     if ((await activityBetween(cfg, from, t)) > 0) return { state: run.state };
-    await enqueue({ action: 'nap', workloadId, requestedAt: t });
+    // Its place among the naps in flight, taken before its task is asked: two workloads checked at once cannot both take the last
+    // one. Given back when the task is refused.
+    if (ctx.flight.naps >= NAPS_MAX) {
+      ctx.flight.deferred += 1;
+      return { state: run.state, nap: 'deferred' };
+    }
+    ctx.flight.naps += 1;
+    try {
+      await enqueue({ action: 'nap', workloadId, requestedAt: t });
+    } catch (err) {
+      ctx.flight.naps -= 1;
+      throw err;
+    }
     log.info('NapRequested', { workloadId });
     return { state: run.state, nap: 'requested' };
   }
 
+  // The naps in flight as the check starts: the NAPPING runs, 8 read at a time. One that cannot be read counts as one.
+  async function napsInFlight(configs) {
+    let napping = 0;
+    let i = 0;
+    await Promise.all(Array.from({ length: Math.min(CHECK_CONCURRENCY, configs.length) }, async () => {
+      while (i < configs.length) {
+        const { workloadId } = configs[i++];
+        const state = await store.getRun(workloadId).then((run) => run?.state, () => STATES.NAPPING);
+        if (state === STATES.NAPPING) napping += 1;
+      }
+    }));
+    return napping;
+  }
+
   // 8 workloads at a time, none started past the budget; one that fails is logged and stops only itself. The schedules
   // first, whatever the budget. Pauses that cannot be read hold every nap and scheduled wake of this check; the reconcile
-  // still runs.
+  // still runs. At most NAPS_MAX naps in flight: the idle naps past it are said once (`NapDeferred`, with their count), and asked
+  // at a later check. Wakes are never held back.
   async function check() {
     const deadline = now() + CHECK_BUDGET_MS;
     const pauses = await activePauses();
@@ -1196,9 +1235,11 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
     const keptAsleep = (workloadId) => pauses === null || pauses.some((p) => p.keepAsleep && p.workloadId === workloadId);
     const { configs, schedules } = await store.listWorkloads();
     const order = [...configs].sort((a, b) => a.workloadId.localeCompare(b.workloadId));
-    const { applied, readable } = await applySchedules(order, schedules, (id) => ({ paused: paused(id), keepAsleep: keptAsleep(id) }), now(), deadline);
+    // A workload holds one nap in flight at most: with no more workloads than NAPS_MAX, their runs are not read for it.
+    const flight = { naps: order.length > NAPS_MAX ? await napsInFlight(order) : 0, deferred: 0 };
+    const { applied, readable } = await applySchedules(order, schedules, (id) => ({ paused: paused(id), keepAsleep: keptAsleep(id) }), now(), deadline, flight);
     await requestListRefresh();
-    const ctx = { schedules: readable, applied };
+    const ctx = { schedules: readable, applied, flight };
     const passed = (workloadId) => (applied.has(workloadId) ? { schedule: applied.get(workloadId) } : {});
     const results = [];
     let next = 0;
@@ -1219,6 +1260,7 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
         }
       }
     }));
+    if (flight.deferred) log.info('NapDeferred', { reason: 'cap', count: flight.deferred });
     if (next < order.length) log.warn('CheckBudgetReached', { checked: next, workloads: order.length, next: order[next].workloadId });
     // What the schedules did for the workloads the loop did not reach.
     const reached = new Set(results.map((r) => r.workloadId));

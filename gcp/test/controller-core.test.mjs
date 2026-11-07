@@ -8,7 +8,7 @@ import { fromFields, toFields } from '../src/firestore.mjs';
 import { GoogleError, OPERATION_NOT_DONE } from '../src/google.mjs';
 import { createUrlMaps, withErrorPolicy, withSwap } from '../src/urlmaps.mjs';
 import {
-  CLUSTER, GKE_INPUT, GKE_NEG, NEG_READINGS, OWNER, classic, onGke, regional as regionalWorld, setup as worldOf,
+  CLUSTER, GKE_INPUT, GKE_NEG, NEG_READINGS, OWNER, classic, onGke, regional as regionalWorld, setup as worldOf, unmanagedUrl,
 } from './world.mjs';
 
 const V1 = 'https://compute.googleapis.com/compute/v1/projects/p';
@@ -2438,6 +2438,90 @@ for (const [name, change, reason] of CHANGED) {
     assert.match(aborted.reason, reason);
   });
 }
+
+// The unmanaged group and the backend service as the onboarding read them: a nap acts on them only while they still are so.
+async function groupWorkload() {
+  const t = worldOf();
+  await t.onboarding.onboard({ urlMap: 'lb', backendService: 'app', id: 'demo', settings: { hibernate: false } });
+  return t;
+}
+
+test('the onboarding records the groups of the unmanaged VMs and the backends of the service', async () => {
+  const t = await groupWorkload();
+  const cfg = await t.store.getConfig('demo');
+  assert.deepEqual(cfg.groups, { 'vm-a': unmanagedUrl('ig') });
+  assert.deepEqual(cfg.serviceBackends, [unmanagedUrl('ig')]);
+});
+
+test('a nap of an unmanaged group that gained a VM since the onboarding stops nothing: awake again (backends-changed)', async () => {
+  const t = await groupWorkload();
+  t.w.unmanaged.ig.push('vm-new');
+  t.w.vms['vm-new'] = { id: '1002', status: 'RUNNING' };
+  const out = await t.core.nap('demo');
+  assert.equal(out.state, STATES.AWAKE);
+  assert.equal(out.aborted, true);
+  assert.match(out.error, /instance group ig changed since the onboarding \(VMs added: vm-new\): offboard and onboard again/);
+  assert.equal(t.w.vms['vm-a'].status, 'RUNNING');
+  assert.equal(t.w.changes.some((c) => c.startsWith('stop') || c.startsWith('suspend')), false);
+  assert.equal(t.w.logs.find((l) => l.event === 'NapAborted').reason, out.error);
+  assert.equal(t.w.logs.find((l) => l.event === 'StateChanged' && l.to === STATES.AWAKE).cause, 'backends-changed');
+});
+
+test('a nap of an unmanaged group that lost a VM since the onboarding stops nothing', async () => {
+  const t = await groupWorkload();
+  t.w.unmanaged.ig = [];
+  const out = await t.core.nap('demo');
+  assert.equal(out.aborted, true);
+  assert.match(out.error, /VMs removed: vm-a/);
+  assert.equal(t.w.vms['vm-a'].status, 'RUNNING');
+});
+
+test('a nap reads each unmanaged group once, whatever its VMs', async () => {
+  const t = worldOf((world) => {
+    world.unmanaged.ig = ['vm-a', 'vm-b'];
+    world.vms['vm-b'] = { id: '1002', status: 'RUNNING' };
+  });
+  await t.onboarding.onboard({ urlMap: 'lb', backendService: 'app', id: 'demo', settings: { hibernate: false } });
+  const reads = [];
+  const listed = t.w.unmanaged;
+  t.w.unmanaged = new Proxy(listed, { get: (target, name) => { if (name === 'ig') reads.push(name); return target[name]; } });
+  assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
+  // The nap checks the backends twice (before the policy and before the stop): one read of the group each time, not one per VM.
+  assert.ok(reads.length > 0 && reads.length <= 2, `${reads.length} reads`);
+});
+
+test('a nap of a backend service that gained a backend since the onboarding stops nothing: awake again (backends-changed)', async () => {
+  const t = await groupWorkload();
+  t.w.services.app.backends.push({ group: unmanagedUrl('late') });
+  const out = await t.core.nap('demo');
+  assert.equal(out.state, STATES.AWAKE);
+  assert.equal(out.aborted, true);
+  assert.match(out.error, /backend service app changed since the onboarding \(backends added: .*late\): offboard and onboard again/);
+  assert.equal(t.w.vms['vm-a'].status, 'RUNNING');
+  assert.equal(t.w.logs.find((l) => l.event === 'StateChanged' && l.to === STATES.AWAKE).cause, 'backends-changed');
+});
+
+test('a nap of a backend service that lost a backend since the onboarding stops nothing', async () => {
+  const t = await groupWorkload();
+  t.w.services.app.backends = [];
+  const out = await t.core.nap('demo');
+  assert.equal(out.aborted, true);
+  assert.match(out.error, /backends removed: .*\/ig\b/);
+  assert.equal(t.w.vms['vm-a'].status, 'RUNNING');
+});
+
+test('a config written before groups and serviceBackends: the nap compares nothing and naps as before', async () => {
+  const t = await groupWorkload();
+  const cfg = await t.store.getConfig('demo');
+  delete cfg.groups;
+  delete cfg.serviceBackends;
+  await t.store.putConfig('demo', cfg);
+  t.w.unmanaged.ig.push('vm-new');
+  t.w.vms['vm-new'] = { id: '1002', status: 'RUNNING' };
+  t.w.services.app.backends.push({ group: unmanagedUrl('late') });
+  assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
+  assert.equal(t.w.vms['vm-a'].status, 'TERMINATED');
+});
 
 test('a nap of a NEG deleted: no stop, AWAKE with a warning, the release stays FAILED, each saying what to do', async () => {
   const t = await negWorkload();

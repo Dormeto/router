@@ -547,6 +547,45 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
     }
   }
 
+  // The unmanaged groups' VMs (`groups`, VM -> group URL), each group read once: what it lists now against the VMs recorded in it.
+  // A config written before the field compares nothing.
+  async function groupsChanged(cfg) {
+    const byGroup = new Map();
+    for (const [vm, url] of Object.entries(cfg.groups ?? {})) byGroup.set(url, [...(byGroup.get(url) ?? []), vm]);
+    return each([...byGroup], async ([url, vms]) => {
+      const [, zone, name] = /\/zones\/([^/]+)\/instanceGroups\/([^/]+)$/.exec(url) ?? [];
+      if (!name) return null;
+      const items = await compute.listGroupInstances(zone, name).catch((err) => {
+        if (err?.code !== 404) throw err;
+        return null;
+      });
+      if (!items) return `instance group ${name} no longer exists: offboard and onboard again`;
+      const current = [...new Set(items.map((item) => nameOf(item.instance)))];
+      const added = current.filter((vm) => !vms.includes(vm));
+      const removed = vms.filter((vm) => !current.includes(vm));
+      if (!added.length && !removed.length) return null;
+      const parts = [...(added.length ? [`VMs added: ${added.join(', ')}`] : []), ...(removed.length ? [`VMs removed: ${removed.join(', ')}`] : [])];
+      return `instance group ${name} changed since the onboarding (${parts.join('; ')}): offboard and onboard again`;
+    });
+  }
+
+  // The backend service's backends (`serviceBackends`) against the service read now, as a set.
+  async function serviceChanged(cfg) {
+    if (!cfg.serviceBackends) return [];
+    const service = await readService(cfg).catch((err) => {
+      if (err?.code !== 404) throw err;
+      return null;
+    });
+    if (!service) return [`backend service ${cfg.backendService} no longer exists: offboard and onboard again`];
+    const current = new Set((service.backends ?? []).map((b) => b.group));
+    const recorded = new Set(cfg.serviceBackends);
+    const added = [...current].filter((group) => !recorded.has(group));
+    const removed = [...recorded].filter((group) => !current.has(group));
+    if (!added.length && !removed.length) return [];
+    const parts = [...(added.length ? [`backends added: ${added.join(', ')}`] : []), ...(removed.length ? [`backends removed: ${removed.join(', ')}`] : [])];
+    return [`backend service ${cfg.backendService} changed since the onboarding (${parts.join('; ')}): offboard and onboard again`];
+  }
+
   // A NEG's VMs are stopped only while they still are the NEG: one is edited more freely than a group. Why not, else null; a NEG
   // deleted is one more change, not a failure. A read that fails throws. The wake needs none of this: starting what was recorded
   // is harmless. An owner's pods legitimately change: what must hold of its NEGs is gke.mjs's, and its being gone throws. A companion
@@ -578,9 +617,11 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
       ];
       return `network endpoint group ${neg.name} changed since the onboarding (${parts.join('; ')}): offboard and onboard again`;
     });
+    const groupChanges = await groupsChanged(cfg);
+    const serviceChanges = await serviceChanged(cfg);
     const ownerChanges = await each(cfg.backends.filter(isPods), (backend) => ownerChanged(clients, backend, () => readService(cfg)));
     const companionChanges = await each(companionsOf(cfg), ({ name }) => companionLost(cloudsql, name));
-    const found = [...changes, ...ownerChanges, ...companionChanges].filter(Boolean);
+    const found = [...changes, ...groupChanges, ...serviceChanges, ...ownerChanges, ...companionChanges].filter(Boolean);
     return found.length ? found.join('; ') : null;
   }
 

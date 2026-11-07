@@ -292,7 +292,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     if (managed && group.kind === 'regional' && (managed.distributionPolicy?.targetShape ?? 'EVEN') === 'EVEN' && (managed.updatePolicy?.instanceRedistributionType ?? 'PROACTIVE') !== 'NONE') {
       reasons.push(`regional managed group ${name} has the target shape EVEN with instance redistribution on: Google cannot stop or suspend its VMs one by one, set its instance redistribution type to NONE or change its target shape, then onboard again`);
     }
-    return { reasons, members, ...(managed ? { group: { ...group, selfLink: managed.selfLink, id: String(managed.id) } } : {}) };
+    return { reasons, members, ...(managed ? {} : { source: url }), ...(managed ? { group: { ...group, selfLink: managed.selfLink, id: String(managed.id) } } : {}) };
   }
 
   async function vmProblems(vm, zone, machineTypes) {
@@ -318,6 +318,9 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
       if (holder) reasons.push(`managed group ${name} belongs to workload ${holder.workloadId}`);
     }
     const unmanaged = new Set(backends.filter((b) => !b.group).flatMap((b) => b.members));
+    // The unmanaged instance group naming each of those VMs (the first, for a VM in two): a nap stops only what is still in it.
+    const groupOf = new Map();
+    for (const b of backends.filter((x) => x.source)) for (const url of b.members) if (!groupOf.has(url)) groupOf.set(url, b.source);
     // A NEG's VMs: URL -> the NEGs naming it, in the order of the service's backends.
     const negsOf = new Map();
     for (const b of backends.filter((x) => x.neg)) for (const url of b.members) negsOf.set(url, [...(negsOf.get(url) ?? []), b.neg]);
@@ -332,6 +335,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     const vms = [];
     // The NEGs of each VM that one names, by the VM's name: the nap checks them again.
     const negs = {};
+    const memberOf = {};
     for (const { url, zone, vm, problems } of read.filter(Boolean)) {
       reasons.push(...problems);
       const owner = negsOf.has(url) && MANAGED_GROUP_OWNER.exec(vm.metadata?.items?.find((item) => item.key === 'created-by')?.value ?? '')?.[1];
@@ -341,8 +345,9 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
       if (holder) reasons.push(`VM ${vm.name} belongs to workload ${holder.workloadId}`);
       vms.push({ zone, name: vm.name, selfLink: vm.selfLink, id: String(vm.id) });
       if (negsOf.has(url)) negs[vm.name] = negsOf.get(url);
+      else if (groupOf.has(url)) memberOf[vm.name] = groupOf.get(url);
     }
-    return { reasons, vms, groups, negs };
+    return { reasons, vms, groups, negs, memberOf };
   }
 
   // The companions asked for: what refuses them, and what the CLI tags.
@@ -388,7 +393,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     const companions = await databasesOf(cloudSql, others);
     reasons.push(...companions.reasons);
     const { databases } = companions;
-    const nothing = { vms: [], groups: [], negs: {}, databases };
+    const nothing = { vms: [], groups: [], negs: {}, memberOf: {}, databases };
     // Refused by its name, with nothing read or tried on it.
     const gkeMap = gkeMapRefusal(urlMap);
     if (gkeMap) return { reasons: [...reasons, gkeMap], ...nothing };
@@ -435,6 +440,8 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
       vms: backends.vms,
       groups: backends.groups,
       negs: backends.negs,
+      memberOf: backends.memberOf ?? {},
+      serviceBackends: (service.backends ?? []).map((b) => b.group).filter(Boolean).sort(),
       podNegs: backends.podNegs,
       ...(backends.gke ? { gke: backends.gke } : {}),
       databases,
@@ -498,7 +505,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   async function onboard(input) {
     const { id, urlMap, backendService, settings, loadBalancer, cloudSql, gkeAsked } = requested(input, { needsAll: true });
     if (await store.getConfig(id)) throw new Refusal(409, 'exists', `workload ${id} is onboarded already`);
-    const { reasons, vms, groups, negs, podNegs, databases, hosts, wakerExists, lb } = await inspect({ id, urlMap, backendService, loadBalancer, settings, cloudSql, gkeAsked });
+    const { reasons, vms, groups, negs, memberOf, serviceBackends, podNegs, databases, hosts, wakerExists, lb } = await inspect({ id, urlMap, backendService, loadBalancer, settings, cloudSql, gkeAsked });
     if (reasons.length) throw new Refusal(400, 'not-eligible', `cannot onboard ${id}: ${reasons.join('; ')}`);
     // Spec section 8's shape, whatever else the request carried. The cluster last, and before anything is written: refused, the CLI takes back its RBAC.
     const pods = gkeAsked && {
@@ -521,6 +528,9 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
       wakerBackendService: name,
       hosts,
       ...(lb.kind === 'global' ? {} : { lb }),
+      // What a nap checks again before it stops anything: the unmanaged groups' VMs and the service's backends as read now.
+      ...(Object.keys(memberOf).length ? { groups: memberOf } : {}),
+      ...(pods ? {} : { serviceBackends }),
       backends: [
         ...vms.map((vm) => ({
           kind: 'vm',

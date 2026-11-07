@@ -697,9 +697,17 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
       const autoscalers = await autoscalersToRecord(cfg, napping);
       const owners = await ownersToRecord(cfg, napping);
       // An idle nap's last read of the requests: from what its check could not see yet (its request less the metric's delay) to now,
-      // the wait included. A scheduled or an operator's nap goes whatever the traffic.
-      if (cause === 'idle' && (await activityBetween(cfg, (requestedAt ?? started) - METRIC_DELAY_MS, now())) > 0) {
-        return await giveUp('traffic', 'info', { reason: 'traffic' });
+      // the wait included. A scheduled or an operator's nap goes whatever the traffic. One that cannot be read is given up, not failed:
+      // the application still serves, and a failure would hold visitors at the waker, then be released by the check.
+      if (cause === 'idle') {
+        let requests;
+        try {
+          requests = await activityBetween(cfg, (requestedAt ?? started) - METRIC_DELAY_MS, now());
+        } catch (err) {
+          const message = `the requests could not be read: ${err.message}`;
+          return await giveUp('traffic-unread', 'warn', { reason: message, error: message });
+        }
+        if (requests > 0) return await giveUp('traffic', 'info', { reason: 'traffic' });
       }
       // Commit point: after this transition the VMs go, even if a request arrives. The modes and the replicas are on the run before any
       // autoscaler is turned off or any owner scaled. A pause written since the nap started aborts it, like a request.

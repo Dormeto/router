@@ -603,6 +603,17 @@ for (const [kind, lb, base, waitSeconds, healthScope, headers] of SWAPS) {
     assert.equal(t.run().napAborted.reason, 'traffic');
   });
 
+  test(`${kind} idle nap whose traffic cannot be read: unswapped, waited, only then AWAKE (traffic-unread), no failure`, async () => {
+    const t = swapSetup({ requests: () => { throw new GoogleError('Google: GET: 503 unavailable', { code: 503 }); } });
+    const out = await t.controller.nap('demo', { requestedAt: START });
+    assertBackAwake(t, out);
+    assert.match(out.error, /503 unavailable/);
+    assert.equal(t.logged('StateChanged').find((l) => l.to === STATES.AWAKE).cause, 'traffic-unread');
+    assert.equal(t.run().napAborted.reason, 'traffic-unread');
+    assert.equal(t.run().failure, undefined);
+    assert.equal(t.logged('NapFailed').length, 0);
+  });
+
   test(`${kind} nap whose abort cannot unswap: FAILED, nothing stopped, the map left as it is`, async () => {
     const t = swapSetup();
     t.clock.onSleep(() => t.store.setPendingWake('demo'));
@@ -1494,6 +1505,40 @@ test('an idle nap reads the traffic again before its commit: 0 at the check, the
   assert.equal((await t.controller.nap('demo', { requestedAt: t.clock.now() })).state, STATES.ASLEEP);
   assert.equal(atTheStop.napAborted, undefined);
   assert.equal(t.run().napAborted, undefined);
+});
+
+test('an idle nap whose traffic cannot be read again: given up, AWAKE (traffic-unread), nothing stopped, no failure, no release at the next check', async () => {
+  let reads = 0;
+  const t = setup({
+    run: AWAKE_LONG,
+    vms: { 'vm-a': { status: 'RUNNING' } },
+    requests: () => {
+      reads += 1;
+      if (reads === 2) throw new GoogleError('Google: GET: 503 unavailable', { code: 503 });
+      return 0;
+    },
+  });
+  await t.controller.check();
+  const out = await t.controller.nap('demo', t.world.tasks[0].body);
+  assert.equal(out.state, STATES.AWAKE);
+  assert.equal(out.aborted, true);
+  assert.match(out.error, /503 unavailable/);
+  assert.deepEqual(t.world.calls, ['map policy', 'wait 300 s', 'map no policy']);
+  assert.equal(t.world.vms['vm-a'].status, 'RUNNING');
+  assert.equal(hasPolicy(t.world.map), false);
+  assert.equal(t.run().state, STATES.AWAKE);
+  assert.equal(t.run().failure, undefined);
+  assert.equal(t.run().consecutiveFailures, undefined);
+  assert.deepEqual(t.run().napAborted, { reason: 'traffic-unread', at: t.clock.now() });
+  assert.equal(t.logged('NapFailed').length, 0);
+  assert.match(t.logged('NapAborted')[0].reason, /503 unavailable/);
+  assert.equal(t.logged('StateChanged').find((l) => l.to === STATES.AWAKE).cause, 'traffic-unread');
+
+  // Past the idle window: an idle nap asked again, no release.
+  t.clock.advance(20 * MINUTE);
+  await t.controller.check();
+  assert.deepEqual(t.world.tasks.map((task) => task.body.action), ['nap', 'nap']);
+  assert.equal(t.run().state, STATES.AWAKE);
 });
 
 test('a scheduled nap and an operator\'s do not read the traffic again: asleep whatever the requests', async () => {

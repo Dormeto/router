@@ -18,7 +18,7 @@ const BEATING = { wakeId: STATES.WAKING, napId: STATES.NAPPING };
 export const beats = (run, field, id) => Object.hasOwn(BEATING, field) && run.state === BEATING[field] && run[field] === id;
 
 // When the run's wake or nap was asked: a wake's start, a nap's NAPPING (the store dates a state change; a store that does not, its
-// last update). Undefined when nothing beats: a nap from before the heartbeat has no napId, and its 35 or 15 minutes alone hold.
+// last update). Undefined when nothing beats: a nap from before the heartbeat has no napId, and its 35 or 22 minutes alone hold.
 function askedAt(run) {
   if (run.state === STATES.WAKING) return run.wakeStartedAt;
   if (run.state === STATES.NAPPING && run.napId !== undefined) return run.stateAt ?? run.updatedAt;

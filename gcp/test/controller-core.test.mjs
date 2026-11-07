@@ -169,11 +169,13 @@ function setup({
     if (ms >= MINUTE) world.calls.push(`wait ${ms / 1000} s`);
     await clock.sleep(ms);
   };
+  const urlmaps = createUrlMaps({ google, project: 'p', now: clock.now, sleep });
+  const regionalUrlmaps = createUrlMaps({ google, project: 'p', region: 'europe-west1', scope: 'regional', now: clock.now, sleep });
   const controller = createController({
     store,
     compute,
-    urlmaps: createUrlMaps({ google, project: 'p', now: clock.now, sleep }),
-    regionalUrlmaps: createUrlMaps({ google, project: 'p', region: 'europe-west1', scope: 'regional', now: clock.now, sleep }),
+    urlmaps,
+    regionalUrlmaps,
     monitoring: {
       requestCount: async (query) => {
         world.metricReads.push(query);
@@ -196,7 +198,7 @@ function setup({
     log,
     newId: () => 'wake-2',
   });
-  return { controller, store, clock, world, timers, run: () => store.state.run, logged: (event) => world.logs.filter((l) => l.event === event) };
+  return { controller, store, clock, world, timers, urlmaps, regionalUrlmaps, run: () => store.state.run, logged: (event) => world.logs.filter((l) => l.event === event) };
 }
 
 // When each beat was asked, written or not.
@@ -841,18 +843,18 @@ for (const [kind, lb, base, waitSeconds, healthScope, headers] of SWAPS) {
 
   const NAPPING_RUN = (age, more = {}) => ({ state: STATES.NAPPING, updatedAt: START - age, ...more });
 
-  test(`${kind} nap dead while swapped: stuck past 15 minutes, not 35, and the recovering wake unswaps`, async () => {
-    const at = swapSetup({ run: NAPPING_RUN(15 * MINUTE), map: swappedMap() });
+  test(`${kind} nap dead while swapped: stuck past 22 minutes, not 35, and the recovering wake unswaps`, async () => {
+    const at = swapSetup({ run: NAPPING_RUN(22 * MINUTE), map: swappedMap() });
     assert.deepEqual(await at.controller.check(), [{ workloadId: 'demo', state: STATES.NAPPING }]);
     assert.equal(at.logged('NapStuck').length, 0);
 
-    const t = swapSetup({ run: NAPPING_RUN(15 * MINUTE + 1), map: swappedMap() });
+    const t = swapSetup({ run: NAPPING_RUN(22 * MINUTE + 1), map: swappedMap() });
     assert.equal((await t.controller.check())[0].state, STATES.FAILED);
     assert.equal(t.logged('NapStuck').length, 1);
     const failure = JSON.parse(t.run().failure);
     assert.equal(failure.kind, 'timeout');
     assert.equal(failure.step, 'nap');
-    assert.match(failure.message, /within 15 minutes/);
+    assert.match(failure.message, /within 22 minutes/);
     assert.equal(t.world.vms['vm-a'].status, 'RUNNING');
 
     // The next check finds it healthy behind the swap: a wake finishes the job, in a request of its own.
@@ -863,7 +865,7 @@ for (const [kind, lb, base, waitSeconds, healthScope, headers] of SWAPS) {
     assert.equal(t.world.vms['vm-a'].status, 'RUNNING');
   });
 
-  test(`${kind} nap whose beat is 4 minutes old: stuck at once, not at 15 minutes, and the recovering wake unswaps`, async () => {
+  test(`${kind} nap whose beat is 4 minutes old: stuck at once, not at 22 minutes, and the recovering wake unswaps`, async () => {
     const t = swapSetup({ run: NAPPING_RUN(5 * MINUTE, { napId: 'n1', stateAt: START - 5 * MINUTE, beatAt: START - 4 * MINUTE }), map: swappedMap() });
     assert.equal((await t.controller.check())[0].state, STATES.FAILED);
     assert.equal(t.logged('NapStuck').length, 1);
@@ -886,30 +888,55 @@ for (const [kind, lb, base, waitSeconds, healthScope, headers] of SWAPS) {
     assert.match(JSON.parse(past.run().failure).message, /within 35 minutes/);
   });
 
-  test(`${kind} slow legal nap: a lost swap and each update at its budget stay under 15 minutes, no check calls it stuck, the VMs stop`, async () => {
+  test(`${kind} slow legal nap: a lost swap, each write behind another update of its map under way here, each update at its worst: under 22 minutes, no check calls it stuck`, async () => {
     // A map's update at its worst: the operation's 120 s and the pauses of a map busy with another (urlmaps.mjs).
     const update = kind === 'classic' ? 180_000 : 240_000;
     const t = swapSetup();
-    t.world.on.put = async () => t.clock.advance(update);
+    t.world.mapLine = (body) => `map ${isSwapped(body) ? 'swapped' : 'unswapped'}${body.description ? ` on ${body.description}` : ''}`;
+    // Another workload's change of the map, its update held until the nap's write waits for it.
+    const maps = kind === 'regional' ? t.regionalUrlmaps : t.urlmaps;
+    let others = 0;
+    let holding = false;
+    const another = () => {
+      holding = true;
+      others += 1;
+      return maps.modify('lb', (map) => ({ map: { ...structuredClone(map), description: `another ${others}` }, paths: ['description'] }));
+    };
+    const turns = async (n) => {
+      for (let i = 0; i < n; i += 1) await new Promise((resolve) => { setImmediate(resolve); });
+    };
+    t.world.on.put = async () => {
+      t.clock.advance(update);
+      if (!holding) return;
+      holding = false;
+      await turns(5);
+    };
     const seen = [];
     let lost = false;
     t.clock.onSleep(async () => {
-      if (!lost) t.world.map = awakeMap();
-      else if (!seen.length) seen.push(...(await t.controller.check()));
+      if (!lost) {
+        t.world.map = awakeMap();
+        another();
+      } else if (!seen.length) seen.push(...(await t.controller.check()));
       lost = true;
     });
+    another();
     assert.equal((await t.controller.nap('demo')).state, STATES.ASLEEP);
+    // Each of the nap's writes on the map as the other update left it: it waited for that one.
+    assert.deepEqual(t.world.calls.filter((c) => c.startsWith('map')), ['map unswapped on another 1', 'map swapped on another 1', 'map unswapped on another 2', 'map swapped on another 2']);
     assert.deepEqual(seen, [{ workloadId: 'demo', state: STATES.NAPPING }]);
     assert.equal(t.logged('NapStuck').length, 0);
     assert.equal(t.world.vms['vm-a'].status, 'TERMINATED');
-    assert.ok(t.clock.now() - START < 15 * MINUTE, `${t.clock.now() - START} ms`);
+    // Regional 2 x 100 s + 2 x (240 s + 240 s) = 1160 s, classic 2 x 250 s + 2 x (180 s + 180 s) = 1220 s: past 15 minutes.
+    const took = t.clock.now() - START;
+    assert.ok(took > 15 * MINUTE && took < 22 * MINUTE, `${took} ms`);
   });
 
   test(`${kind} nap found stuck during its wait: it writes nothing more, whatever the recovering wake did to the map`, async () => {
     const t = swapSetup();
     t.clock.onSleep(async () => {
       if (t.run().state !== STATES.NAPPING) return;
-      t.clock.advance(15 * MINUTE + 1);
+      t.clock.advance(22 * MINUTE + 1);
       assert.equal((await t.controller.check())[0].state, STATES.FAILED);
       t.world.map = awakeMap();
     });
@@ -925,7 +952,7 @@ for (const [kind, lb, base, waitSeconds, healthScope, headers] of SWAPS) {
   test(`${kind} nap found stuck during its first write: no wait, nothing more`, async () => {
     const t = swapSetup();
     t.world.on.put = async () => {
-      t.clock.advance(15 * MINUTE + 1);
+      t.clock.advance(22 * MINUTE + 1);
       await t.controller.check();
     };
     assert.deepEqual(await t.controller.nap('demo'), { state: 'SUPERSEDED' });
@@ -940,7 +967,7 @@ for (const [kind, lb, base, waitSeconds, healthScope, headers] of SWAPS) {
     t.store.getPauses = async (...args) => {
       reads += 1;
       if (reads === 2) {
-        t.clock.advance(15 * MINUTE + 1);
+        t.clock.advance(22 * MINUTE + 1);
         await t.controller.check();
       }
       return getPauses(...args);
@@ -961,7 +988,7 @@ for (const [kind, lb, base, waitSeconds, healthScope, headers] of SWAPS) {
       waits += 1;
       if (waits === 1) await t.store.setPendingWake('demo');
       if (waits === 2) {
-        t.clock.advance(15 * MINUTE + 1);
+        t.clock.advance(22 * MINUTE + 1);
         await t.controller.check();
       }
     });
@@ -1539,6 +1566,26 @@ test('a URL map changed four times over is read again and written, with its paus
   const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } }, cfg: { hibernate: false } });
   t.world.conflicts = 4;
   assert.equal((await t.controller.nap('demo')).state, STATES.ASLEEP);
+});
+
+test('a URL map kept busy while a wake is asked during the nap: given up (map-busy), the idle window starts again, no nap at the next check', async () => {
+  const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
+  t.world.conflicts = 5;
+  let asked = false;
+  t.clock.onSleep(async () => {
+    if (asked) return;
+    asked = true;
+    await t.controller.wakeNow('demo');
+  });
+  const out = await t.controller.nap('demo');
+  assert.equal(out.state, STATES.AWAKE);
+  assert.equal(t.logged('PendingWake').length, 1);
+  assert.equal(t.run().napAborted.reason, 'map-busy');
+  assert.equal(t.run().pendingWake, undefined);
+  assert.equal(t.run().awakeSince, t.run().napAborted.at, 'the wake asked restarts it');
+  assert.equal((await check(t)).nap, undefined);
+  assert.deepEqual(t.world.metricReads, []);
+  assert.deepEqual(t.world.tasks, []);
 });
 
 test('another update of the URL map under way (resourceNotReady): the nap waits for it; for ever, given up (map-busy), nothing stopped', async () => {

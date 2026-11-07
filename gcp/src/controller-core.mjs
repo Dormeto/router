@@ -62,13 +62,17 @@ const METRIC_DELAY_MS = 210_000;
 const WAKING_STUCK_GRACE_MS = 60_000;
 const NAPPING_STUCK_MS = 35 * 60_000;
 // Under a swap, while no VM has been asked to go: visitors are at the waker, so a nap whose request died is a full outage until a
-// check finds it. Its size, a legal nap's way to its commit with one lost swap and each write at its worst (urlmaps.mjs: the
-// operation's 120 s and the pauses of a map busy with another, 60 s on a global map, 120 s on a regional one, so 180 s, not 120 s,
-// on classic): classic 2 x 250 s + 2 x 180 s = 860 s, regional 2 x 100 s + 2 x 240 s = 680 s, and the seconds of its reads. 15
-// minutes holds both, classic by 40 s; the usual nap takes about 5 minutes. Past it, what is called stuck is a nap that lost its swap
-// twice or was given up after one loss (up to 430 s more on classic): nothing is stopped, the commit and the abort are conditional
-// on NAPPING, and the check's wake finishes the job.
-const NAPPING_SWAP_STUCK_MS = 15 * 60_000;
+// check finds it. A request that died stops beating, and is found within minutes (heartbeat.mjs): this is the last resort, for a
+// nap from before the heartbeat, and the one that fails even a nap still beating, so a legal nap must fit it. Its size, a legal
+// nap's way to its commit with one lost swap and each write at its worst: first the update of its map under way in this process,
+// which it waits for (urlmaps.mjs, F8), then its own, each the operation's 120 s and the pauses of a map busy with another (60 s on
+// a global map, 120 s on a regional one), so 180 s on classic and 240 s on regional. Classic 2 x 250 s + 2 x (180 s + 180 s) =
+// 1220 s, regional 2 x 100 s + 2 x (240 s + 240 s) = 1160 s, and the seconds of its reads. 22 minutes holds both, classic by 100 s,
+// and stays under the nap's request (NAP_BUDGET_MS, 29.5 minutes) and the 35 minutes of a nap stopping; the usual nap takes about
+// 5 minutes. Not held: a write behind a shared update that Google refused and that is tried again change by change (a 400 or a
+// 404, rare). Past it, what is called stuck is a nap that lost its swap twice or was given up after one loss (up to 610 s more on
+// classic): nothing is stopped, the commit and the abort are conditional on NAPPING, and the check's wake finishes the job.
+const NAPPING_SWAP_STUCK_MS = 22 * 60_000;
 const CHECK_BUDGET_MS = 240_000;
 const CHECK_CONCURRENCY = 8;
 const SUSPEND_MAX_MEMORY_MB = 208 * 1024;
@@ -704,12 +708,11 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
         if (paths.length) await sleep(sw.waitMs);
       }
       const at = now();
+      const back = { set: { state: STATES.AWAKE, napAborted: { reason: cause, at } }, remove: ['pendingWake', 'stopping'], cause };
       // A map other updates kept busy holds no switch of this nap's (its first write never went through, or a lost swap's again):
-      // the idle time goes on, and the next check asks again.
-      const since = cause === 'map-busy' ? {} : { awakeSince: at };
-      const awake = await transition(workloadId, {
-        cond: { state: STATES.NAPPING }, set: { state: STATES.AWAKE, ...since, napAborted: { reason: cause, at } }, remove: ['pendingWake', 'stopping'], cause,
-      });
+      // unless a wake was asked meanwhile, the idle time goes on, and the next check asks again. A wake asked restarts it, as any abort.
+      const kept = cause === 'map-busy' ? await transition(workloadId, { ...back, cond: { state: STATES.NAPPING, pendingWake: false } }) : null;
+      const awake = kept ?? await transition(workloadId, { ...back, cond: { state: STATES.NAPPING }, set: { ...back.set, awakeSince: at } });
       if (!awake) return superseded();
       log[level]('NapAborted', { workloadId, ...(reason ? { reason } : {}) });
       if (sw.kind === 'policy') await removePolicy(cfg);

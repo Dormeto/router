@@ -368,8 +368,8 @@ test('modify: another error is not retried', async () => {
 // ---- One map's changes in one update (F8: ten naps of one regional map, 85 s an update) ----
 
 // A map of three workloads, `a`, `b` and `c`, a matcher each, kept as Google does: each update a new fingerprint, one made on a
-// stale one a 412. The first update's operation runs until `release()`, the others' end at once. `busy`: every update is then a
-// 412; a map naming `waker-gone` is a 400. `puts`: each update asked, as the matchers holding a policy of a waker.
+// stale one a 412. The first update's operation runs until `release()`, the others' end at once, but for `waits[op]()`'s. `busy`:
+// every update is then a 412; a map naming `waker-gone` is a 400. `puts`: each update asked, as the matchers holding a policy of a waker.
 function heldGoogle() {
   let version = 0;
   let stored = { name: 'shared', fingerprint: 'v0', pathMatchers: ['a', 'b', 'c'].map((name) => ({ name, defaultService: `${V1}/${name}` })) };
@@ -377,6 +377,7 @@ function heldGoogle() {
   const google = {
     puts: [],
     busy: false,
+    waits: {},
     get map() { return stored; },
     release: () => release(),
     request: async (method, url, body) => {
@@ -388,7 +389,7 @@ function heldGoogle() {
       stored = { ...structuredClone(body), fingerprint: `v${version}` };
       return { selfLink: `op-${version}` };
     },
-    waitCompute: (op) => (op.selfLink === 'op-1' ? new Promise((resolve) => { release = resolve; }) : Promise.resolve()),
+    waitCompute: (op) => (op.selfLink === 'op-1' ? new Promise((resolve) => { release = resolve; }) : google.waits[op.selfLink]?.() ?? Promise.resolve()),
   };
   return google;
 }
@@ -473,6 +474,30 @@ test('modify: a shared update still refused for another one past its pauses fail
   await assert.rejects(c, { code: 412 });
   assert.equal(google.puts.length, 1 + 5, 'the first update, then the shared one\'s five tries');
   assert.deepEqual(sleeps, [5000, 10_000, 15_000, 30_000]);
+});
+
+// Its own callers settle whatever ends a shared update, the queue goes on, and nothing is left unhandled for the process to die of.
+test('modify: a shared update ended by what is no error at all (null): each of its callers rejected with it, and the next update still runs', { timeout: 5000 }, async () => {
+  const google = heldGoogle();
+  const urlmaps = createUrlMaps({ google, project: 'p', sleep: noWait() });
+  let end;
+  google.waits['op-2'] = () => new Promise((resolve, reject) => { end = () => reject(null); });
+  const a = urlmaps.modify('shared', policyOn('a'));
+  await turn();
+  const b = urlmaps.modify('shared', policyOn('b'));
+  const c = urlmaps.modify('shared', policyOn('c'));
+  await turn();
+  google.release();
+  await a;
+  await turn();
+  // Asked during b and c's update: the next one.
+  const d = urlmaps.modify('shared', (map) => withoutErrorPolicy(map, `${V1}/waker-a`));
+  await turn();
+  end();
+  await assert.rejects(b, (err) => err === null);
+  await assert.rejects(c, (err) => err === null);
+  assert.deepEqual((await d).paths, policyAt(0));
+  assert.deepEqual(google.puts, [['a'], ['a', 'b', 'c'], ['b', 'c']]);
 });
 
 test('CALLS names the adapter\'s functions', () => {

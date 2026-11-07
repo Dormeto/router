@@ -522,8 +522,8 @@ export function createUrlMaps({ google, project, region, scope = 'global', now =
     return items;
   }
 
-  // The changes in one update, each applied to the map of the one before: `[{ result: { map, paths } } | { error }]` in their
-  // order, `map` as written and `paths` the change's own. A change that throws (UrlMapRefused) is left out, its error its answer;
+  // The changes in one update, each applied to the map of the one before: `[{ result: { map, paths } } | { failed, error }]` in
+  // their order, `map` as written and `paths` the change's own. A change that throws (UrlMapRefused) is left out, its error its answer;
   // nothing to write, no update. Refused for another update (mapBusy): a pause, then the map read again and the changes applied
   // to it, up to about 60 s (120 s regional). The update's own failure is thrown.
   async function update(name, changes) {
@@ -535,10 +535,10 @@ export function createUrlMaps({ google, project, region, scope = 'global', now =
           map = result.map;
           return { paths: result.paths };
         } catch (error) {
-          return { error };
+          return { failed: true, error };
         }
       });
-      const answered = () => answers.map(({ error, paths }) => (error ? { error } : { result: { map, paths } }));
+      const answered = () => answers.map(({ failed, error, paths }) => (failed ? { failed, error } : { result: { map, paths } }));
       if (!answers.some(({ paths }) => paths?.length)) return answered();
       try {
         await google.waitCompute(await google.request('PUT', url(name), map), now() + WAIT_MS);
@@ -555,24 +555,30 @@ export function createUrlMaps({ google, project, region, scope = 'global', now =
   const waiting = new Map();
 
   // Each change's caller answered from one update of them all. A refusal that may be one change's, a 400 or a 404 (a backend
-  // service it names, refused or gone), tries each again alone: it is then that one's only.
+  // service it names, refused or gone), tries each again alone: it is then that one's only. Whatever ends it, thrown or not, each
+  // caller settles (a promise settles once: those answered keep their answer), and this never rejects: nothing is left unhandled.
   async function together(name, items) {
-    let answers;
     try {
-      answers = await update(name, items.map((item) => item.change));
-    } catch (err) {
-      if (items.length > 1 && !mapBusy(err) && (err.code === 400 || err.code === 404)) {
-        for (const item of items) await together(name, [item]);
-        return;
+      let answers;
+      try {
+        answers = await update(name, items.map((item) => item.change));
+      } catch (err) {
+        if (items.length > 1 && !mapBusy(err) && (err?.code === 400 || err?.code === 404)) {
+          for (const item of items) await together(name, [item]);
+          return;
+        }
+        answers = items.map(() => ({ failed: true, error: err }));
       }
-      answers = items.map(() => ({ error: err }));
+      items.forEach(({ resolve, reject }, i) => (answers[i].failed ? reject(answers[i].error) : resolve(answers[i].result)));
+    } catch (err) {
+      for (const { reject } of items) reject(err);
     }
-    items.forEach(({ resolve, reject }, i) => (answers[i].error ? reject(answers[i].error) : resolve(answers[i].result)));
   }
 
-  // What came during an update goes in the next one; nothing, and the map is free.
+  // What came during an update goes in the next one; nothing, and the map is free. Nothing here throws, and `together` never
+  // rejects: the chain leaves no rejection unhandled.
   function next(name) {
-    const items = waiting.get(name);
+    const items = waiting.get(name) ?? [];
     if (!items.length) {
       waiting.delete(name);
       return;

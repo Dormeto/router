@@ -882,7 +882,7 @@ for (const [kind, world, lowest] of [['regional', regional, 160], ['classic', cl
     await onboarding.onboard(INPUT);
     w.changes.length = 0;
     await onboarding.nap('demo');
-    assert.deepEqual(w.tasks, [{ url: `${CONTROLLER}/v1/tasks`, body: { action: 'nap', workloadId: 'demo', requestedAt: clock.now() } }]);
+    assert.deepEqual(w.tasks, [{ url: `${CONTROLLER}/v1/tasks`, body: { action: 'nap', workloadId: 'demo', cause: 'operator', requestedAt: clock.now() } }]);
     assert.deepEqual(w.changes, []);
   });
 
@@ -1226,6 +1226,22 @@ test('show: an ISO awakeSince only while awake, the last wake, the failure as an
   assert.deepEqual(asleep.failure, { kind: 'capacity', step: 'wake', message: 'no capacity', at: '2023-11-14T22:13:20.000Z' });
 });
 
+test('show and list: the last nap given up, its cause and an ISO time, until a nap commits', async () => {
+  const { w, clock, core, onboarding } = setup();
+  await onboarding.onboard({ ...INPUT, settings: { hibernate: false } });
+  assert.equal((await onboarding.show('demo')).napAborted, undefined);
+  w.unmanaged.ig.push('vm-new');
+  w.vms['vm-new'] = { id: '1002', status: 'RUNNING' };
+  assert.equal((await core.nap('demo')).aborted, true);
+  const aborted = { reason: 'backends-changed', at: new Date(clock.now()).toISOString() };
+  assert.deepEqual((await onboarding.show('demo')).napAborted, aborted);
+  assert.deepEqual((await onboarding.list()).find((x) => x.id === 'demo').napAborted, aborted);
+  w.unmanaged.ig = ['vm-a'];
+  clock.advance(60_000);
+  assert.equal((await core.nap('demo')).state, STATES.ASLEEP);
+  assert.equal((await onboarding.show('demo')).napAborted, undefined);
+});
+
 test('show: an unknown workload, a bad ID', async () => {
   const { onboarding } = setup();
   await assert.rejects(onboarding.show('demo'), refused(404, 'not-found', /no workload demo/));
@@ -1250,7 +1266,7 @@ test('nap now: asked of the queue, in a request of its own; asleep already: noth
   await onboarding.onboard(INPUT);
   w.changes.length = 0;
   assert.equal((await onboarding.nap('demo')).id, 'demo');
-  assert.deepEqual(w.tasks, [{ url: `${CONTROLLER}/v1/tasks`, body: { action: 'nap', workloadId: 'demo', requestedAt: clock.now() } }]);
+  assert.deepEqual(w.tasks, [{ url: `${CONTROLLER}/v1/tasks`, body: { action: 'nap', workloadId: 'demo', cause: 'operator', requestedAt: clock.now() } }]);
   assert.deepEqual(w.changes, [], 'the nap takes minutes: not in the operator\'s request');
   w.tasks.length = 0;
   store.runs.get('demo').state = STATES.ASLEEP;

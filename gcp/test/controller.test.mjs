@@ -177,7 +177,7 @@ test('POST /v1/workloads/:id/nap and /wake: the Workload; unknown: 404; busy: 40
   const nap = await call('POST', '/v1/workloads/demo/nap');
   assert.equal(nap.status, 200);
   assert.equal(nap.body.id, 'demo');
-  assert.deepEqual(w.tasks.at(-1).body, { action: 'nap', workloadId: 'demo', requestedAt: clock.now() });
+  assert.deepEqual(w.tasks.at(-1).body, { action: 'nap', workloadId: 'demo', cause: 'operator', requestedAt: clock.now() });
   store.runs.get('demo').state = STATES.ASLEEP;
   const wake = await call('POST', '/v1/workloads/demo/wake');
   assert.equal(wake.status, 200);

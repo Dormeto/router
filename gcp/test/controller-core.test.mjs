@@ -595,6 +595,14 @@ for (const [kind, lb, base, waitSeconds, healthScope, headers] of SWAPS) {
     assertBackAwake(t, out);
   });
 
+  test(`${kind} idle nap with requests since its check: read through its load balancer, unswapped, waited, only then AWAKE (traffic)`, async () => {
+    const t = swapSetup({ requests: 3 });
+    assertBackAwake(t, await t.controller.nap('demo', { requestedAt: START }));
+    assert.deepEqual(t.world.metricReads.map(({ lb: read, from }) => [read, from]), [[lb, START - 210_000]]);
+    assert.equal(t.logged('StateChanged').find((l) => l.to === STATES.AWAKE).cause, 'traffic');
+    assert.equal(t.run().napAborted.reason, 'traffic');
+  });
+
   test(`${kind} nap whose abort cannot unswap: FAILED, nothing stopped, the map left as it is`, async () => {
     const t = swapSetup();
     t.clock.onSleep(() => t.store.setPendingWake('demo'));
@@ -1416,7 +1424,7 @@ test('idle: the check enqueues the nap and never waits for it', async () => {
   assert.deepEqual(t.world.tasks, [{ url: `${CONTROLLER}/v1/tasks`, body: { action: 'nap', workloadId: 'demo', requestedAt: t.clock.now() } }]);
   assert.deepEqual(t.world.sleeps, []);
   assert.deepEqual(t.world.calls, []);
-  assert.deepEqual(t.world.metricReads, [{ backendService: 'app', from: START - 15 * MINUTE - 180_000, to: START }]);
+  assert.deepEqual(t.world.metricReads, [{ backendService: 'app', from: START - 15 * MINUTE - 210_000, to: START }]);
   assert.equal(t.run().state, STATES.AWAKE);
   assert.equal(t.logged('NapRequested').length, 1);
 });
@@ -1436,11 +1444,11 @@ test('awake for less than the idle window: no metric read', async () => {
 });
 
 test('awake for less than the idle window and the metric\'s margin: no metric read; at that distance, read', async () => {
-  const within = setup({ run: { state: STATES.AWAKE, awakeSince: START - 15 * MINUTE - 179_999 }, vms: { 'vm-a': { status: 'RUNNING' } } });
+  const within = setup({ run: { state: STATES.AWAKE, awakeSince: START - 15 * MINUTE - 209_999 }, vms: { 'vm-a': { status: 'RUNNING' } } });
   assert.deepEqual(await within.controller.check(), [{ workloadId: 'demo', state: STATES.AWAKE }]);
   assert.deepEqual(within.world.metricReads, []);
   assert.deepEqual(within.world.tasks, []);
-  const at = setup({ run: { state: STATES.AWAKE, awakeSince: START - 15 * MINUTE - 180_000 }, vms: { 'vm-a': { status: 'RUNNING' } } });
+  const at = setup({ run: { state: STATES.AWAKE, awakeSince: START - 15 * MINUTE - 210_000 }, vms: { 'vm-a': { status: 'RUNNING' } } });
   await at.controller.check();
   assert.equal(at.world.metricReads.length, 1);
 });
@@ -1458,6 +1466,64 @@ test('with a 5-minute window, a request 30 s ago not published yet and the one b
   const t = setup({ run: AWAKE_LONG, cfg: { idleMinutes: 5 }, vms: { 'vm-a': { status: 'RUNNING' } }, requests: publishedPoints([30_000, 320_000]) });
   assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.AWAKE }]);
   assert.deepEqual(t.world.tasks, []);
+});
+
+// F4: what the check could not see yet, and what came during the wait.
+test('an idle nap reads the traffic again before its commit: 0 at the check, then 3: AWAKE (traffic), nothing stopped, napAborted on the run', async () => {
+  let reads = 0;
+  const t = setup({ run: AWAKE_LONG, cfg: { hibernate: false }, vms: { 'vm-a': { status: 'RUNNING' } }, requests: () => (reads++ ? 3 : 0) });
+  await t.controller.check();
+  const [{ body }] = t.world.tasks;
+  const out = await t.controller.nap('demo', body);
+  assert.deepEqual(out, { state: STATES.AWAKE, aborted: true });
+  assert.deepEqual(t.world.calls, ['map policy', 'wait 300 s', 'map no policy']);
+  assert.equal(t.world.vms['vm-a'].status, 'RUNNING');
+  assert.deepEqual(t.world.metricReads[1], { backendService: 'app', from: START - 210_000, to: t.clock.now() });
+  assert.ok(t.clock.now() >= START + 300_000);
+  assert.deepEqual(t.logged('NapAborted').map((l) => l.reason), ['traffic']);
+  assert.equal(t.logged('StateChanged').find((l) => l.to === STATES.AWAKE).cause, 'traffic');
+  assert.equal(t.run().state, STATES.AWAKE);
+  assert.deepEqual(t.run().napAborted, { reason: 'traffic', at: t.clock.now() });
+  assert.equal(hasPolicy(t.world.map), false);
+
+  // A later nap that commits: the record gone from then on.
+  t.world.requests = 0;
+  t.clock.advance(MINUTE);
+  let atTheStop;
+  t.world.on['stop vm-a'] = async () => { atTheStop = structuredClone(t.run()); };
+  assert.equal((await t.controller.nap('demo', { requestedAt: t.clock.now() })).state, STATES.ASLEEP);
+  assert.equal(atTheStop.napAborted, undefined);
+  assert.equal(t.run().napAborted, undefined);
+});
+
+test('a scheduled nap and an operator\'s do not read the traffic again: asleep whatever the requests', async () => {
+  const scheduledNap = setup({ vms: { 'vm-a': { status: 'RUNNING' } }, requests: 5 });
+  assert.equal((await scheduledNap.controller.nap('demo', { cause: 'schedule', requestedAt: START, until: START + 60 * MINUTE })).state, STATES.ASLEEP);
+  assert.deepEqual(scheduledNap.world.metricReads, []);
+  const operator = setup({ vms: { 'vm-a': { status: 'RUNNING' } }, requests: 5 });
+  await operator.controller.napNow('demo');
+  assert.equal((await operator.controller.nap('demo', operator.world.tasks[0].body)).state, STATES.ASLEEP);
+  assert.deepEqual(operator.world.metricReads, []);
+  assert.equal(operator.logged('StateChanged').find((l) => l.to === STATES.NAPPING).cause, 'operator');
+});
+
+// F12: why a workload does not nap, for whoever reads it.
+test('every nap given up is recorded on the run, its cause and time: a wake asked, a changed NEG, a map refused', async () => {
+  const wake = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
+  wake.clock.onSleep(() => wake.store.setPendingWake('demo'));
+  assert.equal((await wake.controller.nap('demo')).aborted, true);
+  assert.deepEqual(wake.run().napAborted, { reason: 'pending-wake', at: wake.clock.now() });
+
+  const neg = setup({ cfg: { backends: [{ ...VM_A, neg: { zone: ZONE, name: 'neg' } }] }, vms: { 'vm-a': { status: 'RUNNING' } } });
+  neg.world.negs.neg = ['vm-a', 'late'];
+  assert.equal((await neg.controller.nap('demo')).aborted, true);
+  assert.deepEqual(neg.run().napAborted, { reason: 'backends-changed', at: neg.clock.now() });
+
+  const map = mapOf();
+  map.pathMatchers[0].defaultCustomErrorResponsePolicy = { errorService: `${V1}/global/backendServices/theirs`, errorResponseRules: [] };
+  const refused = setup({ vms: { 'vm-a': { status: 'RUNNING' } }, map });
+  assert.equal((await refused.controller.nap('demo')).aborted, true);
+  assert.deepEqual(refused.run().napAborted, { reason: 'switch-failed', at: refused.clock.now() });
 });
 
 test('asleep without the error policy: repaired, RouteDrift logged, no 300 s wait', async () => {
@@ -1682,7 +1748,7 @@ test('an idle nap\'s and an operator\'s task say when they were asked for, so a 
   assert.deepEqual(idle.world.tasks.map((task) => task.body), [{ action: 'nap', workloadId: 'demo', requestedAt: START }]);
   const operator = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
   await operator.controller.napNow('demo');
-  assert.deepEqual(operator.world.tasks.map((task) => task.body), [{ action: 'nap', workloadId: 'demo', requestedAt: START }]);
+  assert.deepEqual(operator.world.tasks.map((task) => task.body), [{ action: 'nap', workloadId: 'demo', cause: 'operator', requestedAt: START }]);
   // Delivered in time, it naps.
   assert.equal((await operator.controller.nap('demo', { requestedAt: START })).state, STATES.ASLEEP);
 });
@@ -2117,6 +2183,7 @@ test('a pause written during the nap\'s wait → back to awake at the commit poi
   assert.deepEqual(t.world.calls, ['map policy', 'wait 300 s', 'map no policy']);
   assert.equal(t.logged('StateChanged').find((l) => l.to === STATES.AWAKE).cause, 'paused');
   assert.deepEqual(t.logged('NapAborted').map((l) => l.reason), ['paused']);
+  assert.deepEqual(t.run().napAborted, { reason: 'paused', at: t.clock.now() });
   assert.equal(hasPolicy(t.world.map), false);
 });
 

@@ -130,7 +130,8 @@ function failureOf(run) {
 }
 
 // The API's Workload. `awakeSince` is a time the CLI prints, and left on the run by a nap. `paused`: its active pause. `companionsGone`:
-// the Cloud SQL instances named at its onboarding that no longer exist, as last read.
+// the Cloud SQL instances named at its onboarding that no longer exist, as last read. `napAborted`: why the last nap was given up and
+// when, until a nap commits.
 function workloadOf(cfg, run, paused) {
   const failure = failureOf(run);
   return {
@@ -148,6 +149,7 @@ function workloadOf(cfg, run, paused) {
     ...(failure ? { failure } : {}),
     ...(paused ? { paused } : {}),
     ...(run?.companionsGone?.length ? { companionsGone: run.companionsGone } : {}),
+    ...(run?.napAborted ? { napAborted: { reason: run.napAborted.reason, at: isoOf(run.napAborted.at) } } : {}),
   };
 }
 

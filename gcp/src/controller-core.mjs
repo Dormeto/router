@@ -22,9 +22,9 @@
 //
 // What the run adds to AWS's: `stopped`, `suspended` (the VMs a nap acted on, names), `autoscalers` (`[{ kind, location,
 // name (the autoscaler's), mode }]`, what the wake gives back), `owners` (k8sRecord's: what a nap read of its k8s backends, replicas and KEDA, for
-// the wake), `lastWake` (`{ durationMs }`) and `scheduleApplied` (the last
-// nap or awake window's occurrence applied). The cause and the event of a state change are logged (`StateChanged`): the
-// state history in the manager comes with G2.
+// the wake), `lastWake` (`{ durationMs }`), `scheduleApplied` (the last nap or awake window's occurrence applied) and `napAborted`
+// (`{ reason, at }`: the last nap given up, its cause, until a nap commits). The cause and the event of a state change are logged
+// (`StateChanged`): the state history in the manager comes with G2.
 //
 // Schedules and pauses as on AWS (vision docs/specs/2026-10-30-google-cloud-coverage-design.md, section 5). Here a pause is
 // a workload's: the router's and the exclusions wait for G2.
@@ -53,9 +53,10 @@ const WAKE_BUDGET_MS = 1_740_000;
 const NAP_BUDGET_MS = 1_770_000;
 // A fresh wait for a lost policy needs this left after it: a managed group's stop (G0: 198 s).
 const STOP_ROOM_MS = 200_000;
-// Cloud Monitoring publishes the first point 72 to 125 s after the requests (spec section 12): the newest requests cannot
-// be seen, so the idle read goes this much further back, and the run must have been awake for all of it.
-const METRIC_DELAY_MS = 180_000;
+// Cloud Monitoring publishes the first point 72 to 125 s after the requests (spec section 12), and Google documents the global
+// metric as not visible for up to 210 seconds: the newest requests cannot be seen, so the idle read goes this much further back,
+// and the run must have been awake for all of it. An idle nap reads again from its request less this, up to its commit.
+const METRIC_DELAY_MS = 210_000;
 const WAKING_STUCK_GRACE_MS = 60_000;
 const NAPPING_STUCK_MS = 35 * 60_000;
 // Under a swap, while no VM has been asked to go: visitors are at the waker, so a nap whose request died is a full outage until a
@@ -213,6 +214,10 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
   const setAutoscaler = ({ kind, location, name }, mode) => compute.setAutoscalerMode({ kind, location, name }, mode).catch(stillUnderWay);
 
   const readService = ({ backendService, lb }) => (lb?.kind === 'regional' ? compute.getRegionBackendService(lb.region, backendService) : compute.getBackendService(backendService));
+
+  // The workload's requests over [from, to] (ms), what the idle check and an idle nap's last read go by: its backend service's
+  // request count, through its load balancer's metric.
+  const activityBetween = (cfg, from, to) => monitoring.requestCount({ backendService: cfg.backendService, ...(cfg.lb ? { lb: cfg.lb } : {}), from, to });
 
   // In the service's scope. A service a classic load balancer holds reads no status while its VM is down (M3): none healthy. M9: a NEG at 0 replicas, whichever it answers,
   // none healthy either.
@@ -636,7 +641,8 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
   }
 
   async function nap(workloadId, { cause = 'idle', requestedAt, until } = {}) {
-    const latest = now() + NAP_BUDGET_MS;
+    const started = now();
+    const latest = started + NAP_BUDGET_MS;
     const cfg = await getConfig(workloadId);
     const sw = switchFor(cfg);
     const refusal = await napRefusal(workloadId, requestedAt, until);
@@ -654,15 +660,16 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
     };
     // Nothing is stopped yet, the application keeps serving. Under a swap, visitors are at the waker until the application's back
     // has spread: unswapped and waited for before AWAKE, a wake asked meanwhile being part of it; nothing to unswap, no wait. The
-    // policy's removal follows it.
+    // policy's removal follows it. The run says why (`napAborted`, its cause and time) until a nap commits.
     const giveUp = async (cause, level, { reason, error } = {}) => {
       if (!(await isNapping(workloadId))) return superseded();
       if (sw.kind === 'swap') {
         const { paths } = await writeAwake(cfg);
         if (paths.length) await sleep(sw.waitMs);
       }
+      const at = now();
       const awake = await transition(workloadId, {
-        cond: { state: STATES.NAPPING }, set: { state: STATES.AWAKE, awakeSince: now() }, remove: ['pendingWake', 'stopping'], cause,
+        cond: { state: STATES.NAPPING }, set: { state: STATES.AWAKE, awakeSince: at, napAborted: { reason: cause, at } }, remove: ['pendingWake', 'stopping'], cause,
       });
       if (!awake) return superseded();
       log[level]('NapAborted', { workloadId, ...(reason ? { reason } : {}) });
@@ -689,10 +696,17 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
       if (changed) return await giveUp('backends-changed', 'warn', { reason: changed, error: changed });
       const autoscalers = await autoscalersToRecord(cfg, napping);
       const owners = await ownersToRecord(cfg, napping);
+      // An idle nap's last read of the requests: from what its check could not see yet (its request less the metric's delay) to now,
+      // the wait included. A scheduled or an operator's nap goes whatever the traffic.
+      if (cause === 'idle' && (await activityBetween(cfg, (requestedAt ?? started) - METRIC_DELAY_MS, now())) > 0) {
+        return await giveUp('traffic', 'info', { reason: 'traffic' });
+      }
       // Commit point: after this transition the VMs go, even if a request arrives. The modes and the replicas are on the run before any
       // autoscaler is turned off or any owner scaled. A pause written since the nap started aborts it, like a request.
       const paused = await isPaused(workloadId);
-      if (paused || !(await transition(workloadId, { cond: { state: STATES.NAPPING, pendingWake: false }, set: { stopping: true, autoscalers, ...(owners.length ? { owners } : {}) } }))) {
+      if (paused || !(await transition(workloadId, {
+        cond: { state: STATES.NAPPING, pendingWake: false }, set: { stopping: true, autoscalers, ...(owners.length ? { owners } : {}) }, remove: ['napAborted'],
+      }))) {
         return await giveUp(paused ? 'paused' : 'pending-wake', 'info', paused ? { reason: 'paused' } : {});
       }
       slept = await putToSleep(cfg, { autoscalers, owners }, latest, async () => {
@@ -739,8 +753,8 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
     return { state: STATES.WAKING, wakeId };
   }
 
-  // The operator's nap, in a request of its own: it takes minutes.
-  const napNow = (workloadId) => enqueue({ action: 'nap', workloadId, requestedAt: now() });
+  // The operator's nap, in a request of its own: it takes minutes. Asked for, not idle: it does not read the traffic again.
+  const napNow = (workloadId) => enqueue({ action: 'nap', workloadId, cause: 'operator', requestedAt: now() });
 
   // A failed workload whose backends run for nothing is stopped like a nap and left asleep behind the switch, its failure
   // kept (requests wake it again, backed off). The switch is there since its nap, unless the nap failed before writing it.
@@ -1114,7 +1128,7 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
     if (kept) return { state: run.state, ...kept };
     const from = t - idleMs - METRIC_DELAY_MS;
     if ((run.awakeSince ?? 0) > from) return { state: run.state };
-    if ((await monitoring.requestCount({ backendService: cfg.backendService, ...(cfg.lb ? { lb: cfg.lb } : {}), from, to: t })) > 0) return { state: run.state };
+    if ((await activityBetween(cfg, from, t)) > 0) return { state: run.state };
     await enqueue({ action: 'nap', workloadId, requestedAt: t });
     log.info('NapRequested', { workloadId });
     return { state: run.state, nap: 'requested' };

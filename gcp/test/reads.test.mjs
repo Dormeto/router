@@ -40,6 +40,9 @@ const post = () => request({ method: 'POST', url: '/_dormeto/wake' });
 const ASLEEP = { state: STATES.ASLEEP };
 const NAPPING = { state: STATES.NAPPING };
 const WAKING = (clock) => ({ state: STATES.WAKING, wakeId: 'w1', wakeStartedAt: clock.now() });
+// No beat 90 s after its start: the resend's conditional write reads the run once more; once sent, the next minute's probes do not.
+const STALE = (clock) => ({ state: STATES.WAKING, wakeId: 'w1', wakeStartedAt: clock.now() - 91_000 });
+const RESENT = (clock) => ({ ...STALE(clock), resentAt: clock.now() - 30_000 });
 const AWAKE = { state: STATES.AWAKE, awakeSince: 1 };
 const BACKED_OFF = (clock) => ({ state: STATES.FAILED, failedAt: clock.now(), consecutiveFailures: 1, failure: JSON.stringify({ kind: 'capacity' }) });
 
@@ -53,6 +56,8 @@ for (const [name, run, send, count] of [
   ['a backed-off probe', BACKED_OFF, probe, 3],
   ['a probe, NAPPING', NAPPING, probe, 4],
   ['a probe, WAKING', WAKING, probe, 2],
+  ['a probe, WAKING with no beat', STALE, probe, 3],
+  ['a probe, WAKING with no beat, sent again within the minute', RESENT, probe, 2],
   ['a probe, AWAKE', AWAKE, probe, 2],
   ['a POST, ASLEEP', ASLEEP, post, 4],
   ['a POST, backed off', BACKED_OFF, post, 3],

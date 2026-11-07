@@ -23,7 +23,10 @@ const ENSURE_INTERVAL_MS = 10_000;
 export function createWaker({ store, invokeController, prefix, workloadIdOf = (event) => workloadIdFromEvent(event, prefix), now = Date.now, sleep, newId = randomUUID, log, getAdmin, defaultRules = [], listCache = null,
   // The branded waiting page (lib/waiting-pages.mjs): its settings, the visitor's language and the progress. Without it the page is
   // the built-in one in English (Google Cloud's), as before.
-  waitingPages = null }) {
+  waitingPages = null,
+  // onWaking(workloadId, run): asked when a request that would wake finds the run WAKING within its timeout, before it is answered;
+  // it never throws. Google Cloud's waker sends a lost wake again there (gcp/src/heartbeat.mjs); AWS's passes none.
+  onWaking = null }) {
   const ensured = new Map(); // workload id → last ensure-awake request
   const inRouteGrace = (run) => run.state === STATES.AWAKE && (run.awakeSince ?? 0) > now() - ROUTE_GRACE_MS;
   const servable = (run) => run.state === STATES.AWAKE && !inRouteGrace(run);
@@ -95,7 +98,10 @@ export function createWaker({ store, invokeController, prefix, workloadIdOf = (e
         if (nextAttemptAt(cfg, run) > t) return run;
         return startWake(workloadId, { state: STATES.FAILED }, run, origin);
       case STATES.WAKING:
-        if ((run.wakeStartedAt ?? 0) > t - cfg.wakeTimeoutSeconds * 1000 - STUCK_GRACE_MS) return run;
+        if ((run.wakeStartedAt ?? 0) > t - cfg.wakeTimeoutSeconds * 1000 - STUCK_GRACE_MS) {
+          if (onWaking) await onWaking(workloadId, run);
+          return run;
+        }
         log.warn('WakeStuck', { workloadId, wakeId: run.wakeId });
         return startWake(workloadId, { state: STATES.WAKING, wakeId: run.wakeId }, run, origin);
       case STATES.NAPPING:

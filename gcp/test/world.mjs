@@ -7,8 +7,46 @@ import { createCompute } from '../src/compute.mjs';
 import { createController } from '../src/controller-core.mjs';
 import { createGke } from '../src/gke.mjs';
 import { GoogleError } from '../src/google.mjs';
+import { beats, resendable } from '../src/heartbeat.mjs';
 import { createOnboarding } from '../src/onboarding.mjs';
 import { createUrlMaps } from '../src/urlmaps.mjs';
+
+// The controller's timers (`every`, the heartbeat's) on the fake clock: a timer due runs once when a sleep passes its time, before
+// the hooks a test adds later; the ticks a long sleep passed make one, as they would all write the same time. `timers`: those not stopped.
+export function clockTimers(clock) {
+  const timers = new Set();
+  clock.onSleep(async (t) => {
+    for (const timer of [...timers]) {
+      if (timer.at > t || !timers.has(timer)) continue;
+      while (timer.at <= t) timer.at += timer.ms;
+      await timer.fn();
+    }
+  });
+  const every = (ms, fn) => {
+    const timer = { ms, fn, at: clock.now() + ms };
+    timers.add(timer);
+    return () => { timers.delete(timer); };
+  };
+  return { every, timers };
+}
+
+// The store's heartbeat writes (firestore.mjs) on a fake's run, `runOf(id)` the run itself: `beatAt` while it holds the id,
+// `resentAt` once a minute.
+export const heartbeatStore = (runOf, now) => ({
+  beat: async (id, field, value) => {
+    const run = runOf(id);
+    if (!run || !beats(run, field, value)) return false;
+    run.beatAt = now();
+    return true;
+  },
+  claimResend: async (id, wakeId) => {
+    const run = runOf(id);
+    const t = now();
+    if (!run || !resendable(run, wakeId, t)) return false;
+    run.resentAt = t;
+    return true;
+  },
+});
 
 export const V1 = 'https://compute.googleapis.com/compute/v1/projects/p';
 export const ZONE = 'europe-west1-b';
@@ -500,7 +538,9 @@ export function setup(change = () => {}) {
       run.pendingWake = true;
       return true;
     },
+    ...heartbeatStore((id) => runs.get(id), clock.now),
   };
+  const { every, timers } = clockTimers(clock);
   const log = Object.fromEntries(['info', 'warn', 'error'].map((level) => [level, (event, fields = {}) => { w.logs.push({ level, event, ...fields }); }]));
   const config = { project: 'p', region: w.region ?? REGION, wakerNeg: NEG, controllerUrl: CONTROLLER };
   // `used`: each adapter function called, as `compute.getInstance`.
@@ -520,10 +560,10 @@ export function setup(change = () => {}) {
   const cloudsql = recorded('cloudsql', createCloudSql({ google, project: 'p', now: clock.now, sleep: clock.sleep }));
   const gke = recorded('gke', createGke({ google, project: 'p', fetch: kubeFetch(w), now: clock.now }));
   const core = createController({
-    store, compute, cloudsql, gke, urlmaps, regionalUrlmaps, monitoring: { requestCount: async () => 0 }, tasks, config, now: clock.now, sleep: clock.sleep, newId: () => 'wake-1', log,
+    store, compute, cloudsql, gke, urlmaps, regionalUrlmaps, monitoring: { requestCount: async () => 0 }, tasks, config, now: clock.now, sleep: clock.sleep, every, newId: () => 'wake-1', log,
   });
   const onboarding = createOnboarding({ store, compute, cloudsql, gke, urlmaps, regionalUrlmaps, core, config, now: clock.now, log });
-  return { w, clock, store, core, onboarding, config, log, compute, cloudsql, gke, urlmaps, regionalUrlmaps, google };
+  return { w, clock, store, core, onboarding, config, log, compute, cloudsql, gke, urlmaps, regionalUrlmaps, google, timers };
 }
 
 // The input of an onboarding of `app` as `demo`.

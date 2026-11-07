@@ -21,6 +21,7 @@ import { groupOf, PauseRefused } from './controller-core.mjs';
 import {
   clusterProblems, clusterRead, giveBackOwner, gkeMapRefusal, gkeProblems, isGkeNeg, isPods, negsOfService, ownerAsVm, ownerText, pauseLeft,
 } from './gke.mjs';
+import { beatOf } from './heartbeat.mjs';
 import { SWITCH_HEADER, WORKLOAD_HEADER, WORKLOAD_ID, swapHeaders } from './names.mjs';
 import { inOneUpdate, SWAP_WAIT_MS } from './switch.mjs';
 import {
@@ -131,9 +132,10 @@ function failureOf(run) {
 
 // The API's Workload. `awakeSince` is a time the CLI prints, and left on the run by a nap. `paused`: its active pause. `companionsGone`:
 // the Cloud SQL instances named at its onboarding that no longer exist, as last read. `napAborted`: why the last nap was given up and
-// when, until a nap commits.
+// when, until a nap commits. `beatAt`: the running wake's or nap's last heartbeat (heartbeat.mjs), WAKING or NAPPING only.
 function workloadOf(cfg, run, paused) {
   const failure = failureOf(run);
+  const beatAt = run ? beatOf(run) : undefined;
   return {
     id: cfg.workloadId,
     state: run?.state ?? 'UNKNOWN',
@@ -150,6 +152,7 @@ function workloadOf(cfg, run, paused) {
     ...(paused ? { paused } : {}),
     ...(run?.companionsGone?.length ? { companionsGone: run.companionsGone } : {}),
     ...(run?.napAborted ? { napAborted: { reason: run.napAborted.reason, at: isoOf(run.napAborted.at) } } : {}),
+    ...(beatAt !== undefined ? { beatAt: isoOf(beatAt) } : {}),
   };
 }
 

@@ -22,8 +22,9 @@
 //
 // What the run adds to AWS's: `stopped`, `suspended` (the VMs a nap acted on, names), `autoscalers` (`[{ kind, location,
 // name (the autoscaler's), mode }]`, what the wake gives back), `owners` (k8sRecord's: what a nap read of its k8s backends, replicas and KEDA, for
-// the wake), `lastWake` (`{ durationMs }`), `scheduleApplied` (the last nap or awake window's occurrence applied) and `napAborted`
-// (`{ reason, at }`: the last nap given up, its cause, until a nap commits). The cause and the event of a state change are logged
+// the wake), `lastWake` (`{ durationMs }`), `scheduleApplied` (the last nap or awake window's occurrence applied), `napAborted`
+// (`{ reason, at }`: the last nap given up, its cause, until a nap commits), and the heartbeat's (heartbeat.mjs): `napId` (the
+// running nap's, as `wakeId` is the wake's), `beatAt` and `resentAt`. The cause and the event of a state change are logged
 // (`StateChanged`): the state history in the manager comes with G2.
 //
 // Schedules and pauses as on AWS (vision docs/specs/2026-10-30-google-cloud-coverage-design.md, section 5). Here a pause is
@@ -40,6 +41,7 @@ import {
   giveBackOwner, isPods, ownerAsVm, ownerChanged, ownerRecord, ownerText, podsUnhealthy, recordOf, sleepOwner, wakeOwner, watchRecord,
 } from './gke.mjs';
 import { OPERATION_NOT_DONE } from './google.mjs';
+import { resendStale, startHeartbeat, staleness } from './heartbeat.mjs';
 import { inOneUpdate, switchOf } from './switch.mjs';
 import { mapBusy, references, UrlMapRefused } from './urlmaps.mjs';
 
@@ -92,6 +94,12 @@ const COMPANION_DRIFT = {
 const KIND_OF_CODE = { 403: 'permission', 429: 'throttled' };
 
 const iso = (ms) => new Date(ms).toISOString();
+// The heartbeat's timer: Node's, which holds no process open. The answer stops it.
+const repeat = (ms, fn) => {
+  const timer = setInterval(fn, ms);
+  timer.unref?.();
+  return () => clearInterval(timer);
+};
 const nameOf = (url) => url.slice(url.lastIndexOf('/') + 1);
 const zoneOf = (url) => /\/zones\/([^/]+)\//.exec(url)?.[1];
 const names = (vms) => vms.map((vm) => vm.name);
@@ -128,9 +136,20 @@ export class PauseRefused extends Error {
   }
 }
 
-export function createController({ store, compute, cloudsql, gke, urlmaps, regionalUrlmaps, monitoring, tasks, config, lists = [], download, now = Date.now, sleep, newId = randomUUID, log }) {
+// `every(ms, fn)`: the heartbeat's timer, which its answer stops; tests run it on their clock.
+export function createController({ store, compute, cloudsql, gke, urlmaps, regionalUrlmaps, monitoring, tasks, config, lists = [], download, now = Date.now, sleep, every = repeat, newId = randomUUID, log }) {
   const clients = { compute, kubernetesOf: (cluster) => gke.kubernetesOf(cluster) };
   const enqueue = (body) => tasks.enqueue({ url: `${config.controllerUrl}/v1/tasks`, body });
+
+  // `action()` with the heartbeat of the run's `field` `id` around it, stopped whatever ends it.
+  async function beating(workloadId, field, id, action) {
+    const stop = await startHeartbeat({ store, every, log }, workloadId, field, id);
+    try {
+      return await action();
+    } finally {
+      stop();
+    }
+  }
 
   async function transition(workloadId, change) {
     const next = await store.transition(workloadId, change);
@@ -371,7 +390,11 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
 
   // --- The wake ------------------------------------------------------------------------------------------------------
 
-  async function wake(workloadId, wakeId) {
+  // A wake's request, beating from its start to its end: a duplicate's beats hold the run only while it is still WAKING with that
+  // wakeId, as its transitions do.
+  const wake = (workloadId, wakeId) => beating(workloadId, 'wakeId', wakeId, () => wakeBeating(workloadId, wakeId));
+
+  async function wakeBeating(workloadId, wakeId) {
     const started = now();
     const superseded = () => {
       log.warn('WakeSuperseded', { workloadId, wakeId });
@@ -650,9 +673,16 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
       log.warn('NapSkipped', { workloadId, reason: refusal });
       return { state: 'SKIPPED', reason: refusal };
     }
-    const napping = await transition(workloadId, { cond: { state: STATES.AWAKE }, set: { state: STATES.NAPPING }, remove: ['pendingWake'], cause });
+    // Its id: what its heartbeat holds the run by, from NAPPING to its end.
+    const napId = newId();
+    const napping = await transition(workloadId, { cond: { state: STATES.AWAKE }, set: { state: STATES.NAPPING, napId }, remove: ['pendingWake'], cause });
     if (!napping) return { state: 'SKIPPED' };
     log.info('NapStarted', { workloadId });
+    return beating(workloadId, 'napId', napId, () => napBeating(workloadId, { cfg, sw, napping, cause, requestedAt, started, latest }));
+  }
+
+  // A nap from its NAPPING on.
+  async function napBeating(workloadId, { cfg, sw, napping, cause, requestedAt, started, latest }) {
     // The run moved on while this request held it (a nap called stuck, a forced offboarding): the map and the state are another's.
     const superseded = () => {
       log.warn('NapSuperseded', { workloadId });
@@ -1101,18 +1131,29 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
     let run = await store.getRun(workloadId);
     if (!run) return { state: 'UNKNOWN' };
     if (run.state === STATES.NAPPING) {
+      // A nap whose request no longer beats is stuck now (heartbeat.mjs). Its deadline stays, the last resort: for a nap from before
+      // the heartbeat, or one that still beats past it.
+      const t = now();
+      const stale = staleness(run, t);
       const stuckMs = switchFor(cfg).kind === 'swap' && !run.stopping ? NAPPING_SWAP_STUCK_MS : NAPPING_STUCK_MS;
-      const before = now() - stuckMs;
-      if ((run.updatedAt ?? 0) >= before) return { state: run.state };
-      log.warn('NapStuck', { workloadId });
-      const message = `the nap did not finish within ${stuckMs / 60_000} minutes (its request stopped)`;
-      return { state: (await failStuck(workloadId, { state: STATES.NAPPING, olderThan: { field: 'updatedAt', ms: before } }, 'nap', message, 'nap-stuck'))?.state };
+      const before = t - stuckMs;
+      if (!stale && (run.updatedAt ?? 0) >= before) return { state: run.state };
+      log.warn('NapStuck', { workloadId, ...(stale ? { reason: stale } : {}) });
+      const message = stale ? `the nap's request stopped: ${stale}` : `the nap did not finish within ${stuckMs / 60_000} minutes (its request stopped)`;
+      // A stale nap that moved on since this read (a transition dates it) is not failed.
+      const olderThan = { field: 'updatedAt', ms: stale ? (run.updatedAt ?? 0) + 1 : before };
+      return { state: (await failStuck(workloadId, { state: STATES.NAPPING, olderThan }, 'nap', message, 'nap-stuck'))?.state };
     }
     if (run.state === STATES.WAKING) {
-      // A swap's wait is not cut short at the wake's timeout: a wake in it is no stuck one.
+      // A swap's wait is not cut short at the wake's timeout: a wake in it is no stuck one. Within its deadline, a wake whose task was
+      // lost or whose request died no longer beats: it is sent again with its wakeId (heartbeat.mjs). Past it, the deadline is the last
+      // resort, sent again or not.
       const sw = switchFor(cfg);
       const grace = WAKING_STUCK_GRACE_MS + (sw.kind === 'swap' ? sw.waitMs : 0);
-      if ((run.wakeStartedAt ?? 0) >= now() - cfg.wakeTimeoutSeconds * 1000 - grace) return { state: run.state };
+      if ((run.wakeStartedAt ?? 0) >= now() - cfg.wakeTimeoutSeconds * 1000 - grace) {
+        const resent = await resendStale({ store, enqueue, now, log }, workloadId, run, 'check');
+        return { state: run.state, ...(resent ? { wake: 'resent' } : {}) };
+      }
       log.warn('WakeStuck', { workloadId, wakeId: run.wakeId });
       const message = `the wake did not finish within ${cfg.wakeTimeoutSeconds} s (its request stopped)`;
       return { state: (await failStuck(workloadId, { state: STATES.WAKING, wakeId: run.wakeId }, 'wake', message, 'wake-stuck'))?.state };

@@ -8,7 +8,7 @@ import { fromFields, toFields } from '../src/firestore.mjs';
 import { GoogleError, OPERATION_NOT_DONE } from '../src/google.mjs';
 import { createUrlMaps, withErrorPolicy, withSwap } from '../src/urlmaps.mjs';
 import {
-  CLUSTER, GKE_INPUT, GKE_NEG, NEG_READINGS, OWNER, classic, onGke, regional as regionalWorld, setup as worldOf, unmanagedUrl,
+  CLUSTER, GKE_INPUT, GKE_NEG, NEG_READINGS, OWNER, classic, clockTimers, heartbeatStore, onGke, regional as regionalWorld, setup as worldOf, unmanagedUrl,
 } from './world.mjs';
 
 const V1 = 'https://compute.googleapis.com/compute/v1/projects/p';
@@ -40,8 +40,10 @@ const notDone = () => new GoogleError('Google: operation op not done in time', {
 
 // The world as Compute Engine, the URL map and Monitoring see it. `calls`: what changed, in order, with the nap's wait.
 // `on[line]`: runs when that change is asked; it may throw (refused), or answer 'under way' (done later): not applied.
+// `nodeTimers`: the heartbeat on the controller's own timer, Node's, not on the fake clock.
 function setup({
   run = { state: STATES.AWAKE, awakeSince: 1 }, cfg = {}, vms = {}, groups = {}, autoscalers = {}, machineTypes = {}, map = mapOf(), requests = 0, unhealthyPolls = 0, lists, download,
+  nodeTimers = false,
 } = {}) {
   const clock = fakeClock();
   const world = {
@@ -75,6 +77,8 @@ function setup({
     workloadId: 'demo', urlMap: 'lb', backendService: 'app', wakerBackendService: WAKER, backends: [VM_A], idleMinutes: 15, wakeTimeoutSeconds: 600, failedRetrySeconds: 60, pollSeconds: 3, ...cfg,
   };
   const store = fakeStore({ config, run, clock });
+  const { every, timers } = clockTimers(clock);
+  Object.assign(store, heartbeatStore(() => store.state.run, clock.now));
   // The Firestore store's names, and what its fields do to a value: an `undefined` comes back null.
   store.addPause = (id, pause) => store.putPause(id, fromFields(toFields(pause)));
   store.removePauses = async (id, { at } = {}) => {
@@ -187,10 +191,22 @@ function setup({
     download,
     now: clock.now,
     sleep,
+    ...(nodeTimers ? {} : { every }),
     log,
     newId: () => 'wake-2',
   });
-  return { controller, store, clock, world, run: () => store.state.run, logged: (event) => world.logs.filter((l) => l.event === event) };
+  return { controller, store, clock, world, timers, run: () => store.state.run, logged: (event) => world.logs.filter((l) => l.event === event) };
+}
+
+// When each beat was asked, written or not.
+function beatsOf(t) {
+  const asked = [];
+  const { beat } = t.store;
+  t.store.beat = (...args) => {
+    asked.push(t.clock.now());
+    return beat(...args);
+  };
+  return asked;
 }
 
 const waking = (at, more = {}) => ({ state: STATES.WAKING, wakeId: 'w1', wakeStartedAt: at, ...more });
@@ -370,6 +386,167 @@ test('a wake timeout beyond the request\'s limit fails the wake before the limit
   const out = await t.controller.wake('demo', 'w1');
   assert.equal(out.state, STATES.FAILED);
   assert.ok(t.clock.now() - START < REQUEST_LIMIT - 30_000, `${t.clock.now() - START} ms`);
+});
+
+// --- The heartbeat (F5): a running wake or nap says so on its run, and a lost one is acted on in minutes ---------------------
+
+const NAPPING_BEATING = (more = {}) => ({ state: STATES.NAPPING, napId: 'n1', stateAt: START - 10 * MINUTE, updatedAt: START - 10 * MINUTE, ...more });
+const oops = () => new GoogleError('Google: POST: 500 oops', { code: 500 });
+
+test('a wake beats on its run at its start, then every 60 s, and stops at its end: no timer left', async () => {
+  const t = setup({ run: waking(START), vms: { 'vm-a': { status: 'TERMINATED' } }, unhealthyPolls: 100 });
+  const beats = beatsOf(t);
+  assert.equal((await t.controller.wake('demo', 'w1')).state, STATES.AWAKE);
+  assert.deepEqual(beats.map((at) => at - START), [0, 60_000, 120_000, 180_000]);
+  assert.equal(t.run().beatAt, START + 180_000);
+  assert.equal(t.timers.size, 0);
+});
+
+test('the heartbeat\'s own timer is Node\'s interval: a beat a minute during the wake, none once it ended', async (context) => {
+  context.mock.timers.enable({ apis: ['setInterval'] });
+  const t = setup({ run: waking(START), vms: { 'vm-a': { status: 'TERMINATED' } }, nodeTimers: true });
+  const beats = beatsOf(t);
+  t.world.on['start vm-a'] = async () => {
+    context.mock.timers.tick(60_000);
+  };
+  assert.equal((await t.controller.wake('demo', 'w1')).state, STATES.AWAKE);
+  assert.equal(beats.length, 2);
+  context.mock.timers.tick(10 * 60_000);
+  await new Promise(setImmediate);
+  assert.equal(beats.length, 2);
+});
+
+test('a wake\'s heartbeat stops whatever ends it: failed, superseded, or a failure it cannot even write', async () => {
+  const failed = setup({ run: waking(START), vms: { 'vm-a': { status: 'TERMINATED' } } });
+  failed.world.on['start vm-a'] = async () => { throw oops(); };
+  assert.equal((await failed.controller.wake('demo', 'w1')).state, STATES.FAILED);
+  assert.equal(failed.timers.size, 0);
+
+  const superseded = setup({ run: waking(START, { wakeId: 'w2' }) });
+  assert.equal((await superseded.controller.wake('demo', 'w1')).state, 'SUPERSEDED');
+  assert.equal(superseded.timers.size, 0);
+  assert.equal(superseded.run().beatAt, undefined);
+
+  const unwritten = setup({ run: waking(START), vms: { 'vm-a': { status: 'TERMINATED' } } });
+  unwritten.world.on['start vm-a'] = async () => { throw oops(); };
+  unwritten.store.transition = async () => { throw new GoogleError('Google: POST: 503 firestore', { code: 503 }); };
+  await assert.rejects(unwritten.controller.wake('demo', 'w1'), /503 firestore/);
+  assert.equal(unwritten.timers.size, 0);
+});
+
+test('a nap beats with its napId from NAPPING to its end, and stops whatever ends it: asleep, given up, failed; skipped, none', async () => {
+  const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
+  const beats = beatsOf(t);
+  assert.equal((await t.controller.nap('demo')).state, STATES.ASLEEP);
+  assert.equal(t.run().napId, 'wake-2');
+  // The policy's wait is one sleep of 300 s: its ticks make one beat.
+  assert.deepEqual(beats.map((at) => at - START), [0, 300_000]);
+  assert.equal(t.run().beatAt, START + 300_000);
+  assert.equal(t.timers.size, 0);
+
+  const givenUp = setup({ cfg: { backends: [{ ...VM_A, neg: { zone: ZONE, name: 'neg' } }] }, vms: { 'vm-a': { status: 'RUNNING' } } });
+  assert.equal((await givenUp.controller.nap('demo')).aborted, true);
+  assert.equal(givenUp.timers.size, 0);
+
+  const failed = setup({ cfg: { hibernate: false }, vms: { 'vm-a': { status: 'RUNNING' } } });
+  failed.world.on['stop vm-a'] = async () => { throw oops(); };
+  assert.equal((await failed.controller.nap('demo')).state, STATES.FAILED);
+  assert.equal(failed.timers.size, 0);
+
+  const skipped = setup({ run: { state: STATES.ASLEEP } });
+  const none = beatsOf(skipped);
+  assert.equal((await skipped.controller.nap('demo')).state, 'SKIPPED');
+  assert.deepEqual(none, []);
+  assert.equal(skipped.timers.size, 0);
+});
+
+test('a beat whose write throws: said each time, and the wake goes on to AWAKE; a nap to ASLEEP', async () => {
+  const t = setup({ run: waking(START), vms: { 'vm-a': { status: 'TERMINATED' } }, unhealthyPolls: 40 });
+  t.store.beat = async () => { throw new GoogleError('Google: POST: 503 firestore', { code: 503 }); };
+  assert.equal((await t.controller.wake('demo', 'w1')).state, STATES.AWAKE);
+  assert.deepEqual(t.logged('BeatFailed').map(({ level, workloadId, wakeId, error }) => [level, workloadId, wakeId, error]), [
+    ['warn', 'demo', 'w1', 'Google: POST: 503 firestore'],
+    ['warn', 'demo', 'w1', 'Google: POST: 503 firestore'],
+  ]);
+  assert.equal(t.timers.size, 0);
+
+  const nap = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
+  nap.store.beat = () => { throw new TypeError('no beat here'); };
+  assert.equal((await nap.controller.nap('demo')).state, STATES.ASLEEP);
+  assert.deepEqual(nap.logged('BeatFailed').map((l) => [l.napId, l.error]), [['wake-2', 'no beat here'], ['wake-2', 'no beat here']]);
+});
+
+test('WAKING 3 minutes with no beat: the check sends that wakeId again; 30 s later nothing, a minute later again', async () => {
+  const t = setup({ run: waking(START - 3 * MINUTE), vms: { 'vm-a': { status: 'TERMINATED' } }, map: asleepMap() });
+  assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.WAKING, wake: 'resent' }]);
+  assert.deepEqual(t.world.tasks, [{ url: `${CONTROLLER}/v1/tasks`, body: { action: 'wake', workloadId: 'demo', wakeId: 'w1' } }]);
+  assert.equal(t.run().resentAt, START);
+  assert.equal(t.run().wakeId, 'w1');
+  assert.deepEqual(t.logged('WakeResent'), [{ level: 'warn', event: 'WakeResent', workloadId: 'demo', wakeId: 'w1', by: 'check', reason: 'no heartbeat 90 s after it started' }]);
+  t.clock.advance(30_000);
+  assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.WAKING }]);
+  assert.equal(t.world.tasks.length, 1);
+  t.clock.advance(30_001);
+  assert.equal((await t.controller.check())[0].wake, 'resent');
+  assert.equal(t.world.tasks.length, 2);
+  assert.deepEqual(t.world.calls, []);
+});
+
+test('a wake that beats is left alone, whatever its age within its deadline; one not yet 90 s old too', async () => {
+  for (const run of [waking(START - 9 * MINUTE, { beatAt: START - 30_000 }), waking(START - 90_000), waking(START - 3 * MINUTE, { beatAt: START - 3 * MINUTE })]) {
+    const t = setup({ run });
+    assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.WAKING }]);
+    assert.deepEqual(t.world.tasks, []);
+    assert.equal(t.logged('WakeResent').length, 0);
+  }
+});
+
+test('a resend the queue refuses: said, the run still WAKING, and the check goes on', async () => {
+  const t = setup({ run: waking(START - 3 * MINUTE) });
+  t.world.taskRefused = new GoogleError('Google: POST: 503 tasks', { code: 503 });
+  assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.WAKING }]);
+  assert.equal(t.logged('WakeResendFailed')[0].error, 'Google: POST: 503 tasks');
+  assert.equal(t.logged('CheckFailed').length, 0);
+  assert.equal(t.run().state, STATES.WAKING);
+});
+
+test('two wake tasks, one wakeId (the lost one delivered after all): one start, one AWAKE, the other superseded', async () => {
+  const t = setup({ run: waking(START - 3 * MINUTE), vms: { 'vm-a': { status: 'TERMINATED' } }, map: asleepMap() });
+  await t.controller.check();
+  const [{ body: resent }] = t.world.tasks;
+  assert.equal((await t.controller.wake(resent.workloadId, resent.wakeId)).state, STATES.AWAKE);
+  assert.deepEqual(await t.controller.wake('demo', 'w1'), { state: 'SUPERSEDED' });
+  assert.deepEqual(t.world.calls, ['start vm-a', 'map no policy']);
+  assert.equal(t.logged('WakeCompleted').length, 1);
+  assert.equal(t.logged('WakeSuperseded').length, 1);
+  assert.equal(t.timers.size, 0);
+});
+
+test('a nap whose beat is 4 minutes old: the stuck nap\'s path at once, not at 35 minutes; the next check wakes it, its policy removed', async () => {
+  const t = setup({ run: NAPPING_BEATING({ beatAt: START - 4 * MINUTE }), vms: { 'vm-a': { status: 'RUNNING' } }, map: asleepMap() });
+  assert.equal((await t.controller.check())[0].state, STATES.FAILED);
+  assert.deepEqual(t.logged('NapStuck'), [{ level: 'warn', event: 'NapStuck', workloadId: 'demo', reason: 'no heartbeat for more than 3 minutes' }]);
+  assert.equal(t.logged('StateChanged').at(-1).cause, 'nap-stuck');
+  const failure = JSON.parse(t.run().failure);
+  assert.equal(failure.kind, 'timeout');
+  assert.equal(failure.step, 'nap');
+  assert.equal(failure.message, 'the nap\'s request stopped: no heartbeat for more than 3 minutes');
+  assert.equal(t.world.vms['vm-a'].status, 'RUNNING');
+  // Healthy behind its policy: the next check wakes it, the policy removed.
+  assert.equal((await t.controller.check())[0].state, STATES.AWAKE);
+  assert.equal(t.logged('FailedRecovered').length, 1);
+  assert.equal(hasPolicy(t.world.map), false);
+});
+
+test('a nap\'s heartbeat: a beat 2 minutes old holds; none 90 s after its NAPPING is stale; a nap from before the heartbeat keeps its 35 minutes', async () => {
+  const alive = setup({ run: NAPPING_BEATING({ beatAt: START - 2 * MINUTE }), vms: { 'vm-a': { status: 'RUNNING' } }, map: asleepMap() });
+  assert.deepEqual(await alive.controller.check(), [{ workloadId: 'demo', state: STATES.NAPPING }]);
+  const silent = setup({ run: NAPPING_BEATING({ stateAt: START - 90_001, updatedAt: START - 90_001 }), vms: { 'vm-a': { status: 'RUNNING' } }, map: asleepMap() });
+  assert.equal((await silent.controller.check())[0].state, STATES.FAILED);
+  assert.equal(silent.logged('NapStuck')[0].reason, 'no heartbeat 90 s after it started');
+  const before = setup({ run: { state: STATES.NAPPING, stateAt: START - 30 * MINUTE, updatedAt: START - 30 * MINUTE }, vms: { 'vm-a': { status: 'RUNNING' } }, map: asleepMap() });
+  assert.deepEqual(await before.controller.check(), [{ workloadId: 'demo', state: STATES.NAPPING }]);
+  assert.equal(before.logged('NapStuck').length, 0);
 });
 
 // --- A regional or classic workload: the swap (the coverage design's section 7) ------------------------------------------
@@ -652,6 +829,21 @@ for (const [kind, lb, base, waitSeconds, healthScope, headers] of SWAPS) {
     assert.equal(t.world.vms['vm-a'].status, 'RUNNING');
   });
 
+  test(`${kind} nap whose beat is 4 minutes old: stuck at once, not at 15 minutes, and the recovering wake unswaps`, async () => {
+    const t = swapSetup({ run: NAPPING_RUN(5 * MINUTE, { napId: 'n1', stateAt: START - 5 * MINUTE, beatAt: START - 4 * MINUTE }), map: swappedMap() });
+    assert.equal((await t.controller.check())[0].state, STATES.FAILED);
+    assert.equal(t.logged('NapStuck').length, 1);
+    assert.equal(t.logged('StateChanged').at(-1).cause, 'nap-stuck');
+    assert.equal(t.world.vms['vm-a'].status, 'RUNNING');
+    assert.equal(isSwapped(t.world.map), true);
+    assert.equal((await t.controller.check())[0].state, STATES.WAKING);
+    assert.deepEqual(t.world.tasks.at(-1).body, { action: 'wake', workloadId: 'demo', wakeId: 'wake-2' });
+    assert.equal((await t.controller.wake('demo', 'wake-2')).state, STATES.AWAKE);
+    assert.deepEqual(t.world.map, { ...awakeMap(), fingerprint: 'f1' });
+    assert.equal(t.world.vms['vm-a'].status, 'RUNNING');
+    assert.equal(t.timers.size, 0);
+  });
+
   test(`${kind} nap stopping: its VMs are going, 35 minutes as ever`, async () => {
     const within = swapSetup({ run: NAPPING_RUN(35 * MINUTE, { stopping: true }), map: swappedMap() });
     assert.deepEqual(await within.controller.check(), [{ workloadId: 'demo', state: STATES.NAPPING }]);
@@ -929,9 +1121,10 @@ for (const [kind, lb, base, waitSeconds, healthScope, headers] of SWAPS) {
 
   test(`${kind} wake: in its wait past the timeout, it is not called stuck; past the wait too, it is`, async () => {
     const age = 600_000 + 60_000 + WAIT_MS;
-    const within = swapSetup({ run: waking(START - age), map: swappedMap() });
+    // A wake in its wait still beats.
+    const within = swapSetup({ run: waking(START - age, { beatAt: START - 30_000 }), map: swappedMap() });
     assert.deepEqual(await within.controller.check(), [{ workloadId: 'demo', state: STATES.WAKING }]);
-    const stuck = swapSetup({ run: waking(START - age - 1), map: swappedMap() });
+    const stuck = swapSetup({ run: waking(START - age - 1, { beatAt: START - 30_000 }), map: swappedMap() });
     assert.equal((await stuck.controller.check())[0].state, STATES.FAILED);
     assert.equal(stuck.logged('WakeStuck').length, 1);
   });
@@ -1742,12 +1935,15 @@ test('awake, one VM down and one running, or one on its way up: not an external 
 });
 
 test('stuck waking: FAILED with the kind timeout, past the wake timeout and its grace only', async () => {
+  // The last resort: no beat for 11 minutes, and not sent again past the deadline.
   const stuck = setup({ run: waking(START - 660_001), vms: { 'vm-a': { status: 'TERMINATED' } } });
   assert.equal((await stuck.controller.check())[0].state, STATES.FAILED);
   assert.equal(stuck.run().state, STATES.FAILED);
   assert.equal(JSON.parse(stuck.run().failure).kind, 'timeout');
   assert.equal(stuck.logged('WakeStuck').length, 1);
-  const within = setup({ run: waking(START - 660_000), vms: { 'vm-a': { status: 'TERMINATED' } }, map: asleepMap() });
+  assert.deepEqual(stuck.world.tasks, []);
+  assert.equal(stuck.logged('WakeResent').length, 0);
+  const within = setup({ run: waking(START - 660_000, { beatAt: START - 30_000 }), vms: { 'vm-a': { status: 'TERMINATED' } }, map: asleepMap() });
   assert.deepEqual(await within.controller.check(), [{ workloadId: 'demo', state: STATES.WAKING }]);
   assert.equal(within.run().state, STATES.WAKING);
   assert.equal(within.world.calls.length, 0);
@@ -2002,6 +2198,8 @@ test('an awake window wakes a sleeper in a request of its own, once', async () =
   assert.equal(t.logged('StateChanged').find((l) => l.to === STATES.WAKING).cause, 'schedule');
   assert.equal(t.store.state.stats['wake:schedule'], 1);
   t.clock.advance(FIVE_MINUTES);
+  // Its wake's request runs, and beats.
+  t.run().beatAt = t.clock.now() - 30_000;
   assert.equal((await check(t)).schedule, undefined);
   assert.equal(t.world.tasks.length, 1);
 });
@@ -2804,6 +3002,32 @@ test('a database that does not come up keeps the autoscalers off, on record for 
   await wakeNowIn(t);
   assert.equal(t.w.changes.some((line) => line.startsWith('autoscaler')), false);
   assert.equal(t.store.runs.get('demo').autoscalers.length, 1);
+});
+
+test('a Cloud SQL wake of 28 minutes, near its 1700 s, beating every 60 s: no check sends it again or calls it stuck; AWAKE', async () => {
+  const t = await asleepWithCompanion((w) => { w.sqlTakes.ALWAYS = 28 * MINUTE; });
+  const start = t.clock.now();
+  const beats = [];
+  const { beat } = t.store;
+  t.store.beat = (...args) => {
+    beats.push(t.clock.now() - start);
+    return beat(...args);
+  };
+  const seen = [];
+  let next = start + 5 * MINUTE;
+  t.clock.onSleep(async (now) => {
+    if (now < next) return;
+    next += 5 * MINUTE;
+    seen.push(...(await t.core.check()));
+  });
+  assert.equal((await wakeNowIn(t)).state, STATES.AWAKE);
+  assert.ok(t.clock.now() - start >= 28 * MINUTE, `${t.clock.now() - start} ms`);
+  assert.deepEqual(seen, Array.from({ length: 5 }, () => ({ workloadId: 'demo', state: STATES.WAKING })));
+  assert.deepEqual(t.w.tasks, []);
+  for (const event of ['WakeResent', 'WakeStuck', 'WakeFailed', 'BeatFailed']) assert.equal(t.w.logs.filter((l) => l.event === event).length, 0, event);
+  assert.ok(beats.length >= 28, `${beats.length} beats`);
+  assert.ok(beats.every((at, i) => i === 0 || at - beats[i - 1] <= 60_000), `${beats}`);
+  assert.equal(t.timers.size, 0);
 });
 
 test('a wake moved on during the database\'s wait starts no application', async () => {

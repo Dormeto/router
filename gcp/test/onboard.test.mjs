@@ -1242,6 +1242,24 @@ test('show and list: the last nap given up, its cause and an ISO time, until a n
   assert.equal((await onboarding.show('demo')).napAborted, undefined);
 });
 
+test('show and list: the running wake\'s or nap\'s last beat, an ISO time; none once it ended, or from an earlier one', async () => {
+  const { clock, store, onboarding } = setup();
+  await onboarding.onboard(INPUT);
+  assert.equal((await onboarding.show('demo')).beatAt, undefined);
+  const run = store.runs.get('demo');
+  Object.assign(run, { state: STATES.WAKING, wakeId: 'w1', wakeStartedAt: clock.now() - 60_000, beatAt: clock.now() });
+  const at = new Date(clock.now()).toISOString();
+  assert.equal((await onboarding.show('demo')).beatAt, at);
+  assert.equal((await onboarding.list()).find((x) => x.id === 'demo').beatAt, at);
+  Object.assign(run, { state: STATES.NAPPING, napId: 'n1', stateAt: clock.now() - 1000 });
+  assert.equal((await onboarding.show('demo')).beatAt, at);
+  // The next wake has not beaten yet: the last beat is the nap's.
+  Object.assign(run, { state: STATES.WAKING, wakeId: 'w2', wakeStartedAt: clock.now() + 1000 });
+  assert.equal((await onboarding.show('demo')).beatAt, undefined);
+  Object.assign(run, { state: STATES.AWAKE, awakeSince: clock.now() });
+  assert.equal((await onboarding.show('demo')).beatAt, undefined);
+});
+
 test('show: an unknown workload, a bad ID', async () => {
   const { onboarding } = setup();
   await assert.rejects(onboarding.show('demo'), refused(404, 'not-found', /no workload demo/));

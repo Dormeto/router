@@ -4,6 +4,7 @@
 // lists: `lists/<name>` (the meta) and `listParts/<name>-<version>-<index>` (the packed parts, 350 kB at most). A transition reads the run, checks its condition, and commits
 // with the document's `updateTime` as precondition: the conditional write of DynamoDB.
 import { STATES, matches, addStats, emptyStats, utcDay, DAY_MS } from '../../lambda/src/lib/state.mjs';
+import { beats, resendable } from './heartbeat.mjs';
 
 const BASE = 'https://firestore.googleapis.com/v1';
 // Reads again after a lost precondition (another writer changed the run between the read and the commit).
@@ -279,6 +280,21 @@ export function createFirestoreStore({ google, project, database, now = Date.now
     async setPendingWake(workloadId) {
       // Only the first request of a nap marks it: one log line and one counted wake per pending wake.
       return (await modifyRun(workloadId, (run) => (run.state === STATES.NAPPING && run.pendingWake !== true ? { set: { pendingWake: true } } : null))) !== null;
+    },
+
+    // A running wake's or nap's heartbeat (heartbeat.mjs), `field` its id's (`wakeId`, `napId`): written while the run still holds
+    // that id, with no version and no `updatedAt` change (the deadline of a stuck nap reads it). True when written.
+    async beat(workloadId, field, id) {
+      return (await modifyRun(workloadId, (run) => (beats(run, field, id) ? { set: { beatAt: now() } } : null))) !== null;
+    },
+
+    // One resend a minute of a stale wake, whoever asks (the check, any waker instance): true for the call that wrote `resentAt`,
+    // which sends it.
+    async claimResend(workloadId, wakeId) {
+      return (await modifyRun(workloadId, (run) => {
+        const t = now();
+        return resendable(run, wakeId, t) ? { set: { resentAt: t } } : null;
+      })) !== null;
     },
 
     async tryAcquireHolder(workloadId, max) {

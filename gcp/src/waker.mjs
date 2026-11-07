@@ -15,6 +15,9 @@
 // A nap window: the page and `/_dormeto/wake` say when it ends. Pauses mean nothing here: `keepAsleep` holds the scheduled and
 // maintenance wakes only, and a visitor still wakes the workload (vision docs/specs/2026-10-30-google-cloud-coverage-design.md,
 // section 5).
+//
+// A wake whose task was lost, or whose request died, no longer beats on its run (heartbeat.mjs): a visitor's poll of it sends it
+// again with its wakeId, as the check does, one resend a minute between them and every instance of this waker.
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createListCache, parseLists } from '../../lambda/src/lib/list-cache.mjs';
 import { failureKind, nextAttemptAt } from '../../lambda/src/lib/failures.mjs';
@@ -26,6 +29,7 @@ import { STATES } from '../../lambda/src/lib/state.mjs';
 import { createWaker } from '../../lambda/src/lib/waker-core.mjs';
 import { createFirestoreStore } from './firestore.mjs';
 import { createGoogle } from './google.mjs';
+import { resendStale } from './heartbeat.mjs';
 import { SWITCH_HEADER, WORKLOAD_HEADER, WORKLOAD_ID } from './names.mjs';
 import { createTasks } from './tasks.mjs';
 
@@ -83,6 +87,7 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], n
     return memo.schedule;
   };
 
+  const enqueue = (body) => tasks.enqueue({ url: `${controllerUrl}/v1/tasks`, body });
   const core = createWaker({
     // Whatever the configuration says: no request is held, and only the page's probe and explicit wakes wake.
     store: {
@@ -95,8 +100,10 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], n
     },
     // Only the wake: the route `/_dormeto/*` stays while awake, so reaching the waker then is no drift to repair.
     invokeController: async (payload) => {
-      if (payload.action === 'wake') await tasks.enqueue({ url: `${controllerUrl}/v1/tasks`, body: payload });
+      if (payload.action === 'wake') await enqueue(payload);
     },
+    // A stale wake, sent again with its wakeId; nothing else is read for a run that beats.
+    onWaking: (workloadId, run) => resendStale({ store, enqueue, now, log }, workloadId, run, 'waker'),
     workloadIdOf,
     // The lists' data is read from the store; one that cannot be read counts as none (the cache logs it) and wakes go on.
     listCache: lists.length ? createListCache({ store, lists, now, log }) : null,

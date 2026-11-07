@@ -367,6 +367,53 @@ test('transition: a state change sets stateAt to now, no state change leaves it;
   assert.equal(explicit.stateAt, 42);
 });
 
+test('beat: beatAt alone, while the run holds the id (a wakeId WAKING, a napId NAPPING); no version or updatedAt change', async () => {
+  let t = Date.parse('2026-03-10T12:00:00Z');
+  const { store, calls } = setup({ now: () => t });
+  await store.initRun('app', 1);
+  await store.transition('app', { cond: { state: 'AWAKE' }, set: { state: 'WAKING', wakeId: 'w1', wakeStartedAt: t } });
+  const before = await store.getRun('app');
+  t += 60_000;
+  assert.equal(await store.beat('app', 'wakeId', 'w1'), true);
+  const after = await store.getRun('app');
+  assert.deepEqual(after, { ...before, beatAt: t });
+  const write = commits(calls).at(-1).body.writes[0];
+  assert.deepEqual(write.updateMask, { fieldPaths: ['beatAt'] });
+  assert.ok(write.currentDocument.updateTime);
+  const count = commits(calls).length;
+  assert.equal(await store.beat('app', 'wakeId', 'w2'), false);
+  assert.equal(await store.beat('app', 'napId', 'w1'), false);
+  assert.equal(await store.beat('nope', 'wakeId', 'w1'), false);
+  assert.equal(commits(calls).length, count);
+  await store.transition('app', { cond: { state: 'WAKING' }, set: { state: 'NAPPING', napId: 'n1' } });
+  assert.equal(await store.beat('app', 'wakeId', 'w1'), false);
+  t += 60_000;
+  assert.equal(await store.beat('app', 'napId', 'n1'), true);
+  assert.equal((await store.getRun('app')).beatAt, t);
+});
+
+test('claimResend: resentAt written for the run still WAKING with that wakeId, once a minute; true only for the call that wrote it', async () => {
+  let t = Date.parse('2026-03-10T12:00:00Z');
+  const { store } = setup({ now: () => t });
+  await store.initRun('app', 1);
+  await store.transition('app', { cond: { state: 'AWAKE' }, set: { state: 'WAKING', wakeId: 'w1', wakeStartedAt: t } });
+  const { version, updatedAt } = await store.getRun('app');
+  assert.deepEqual(await Promise.all([store.claimResend('app', 'w1'), store.claimResend('app', 'w1')]).then((all) => all.sort()), [false, true]);
+  assert.equal((await store.getRun('app')).resentAt, t);
+  assert.equal((await store.getRun('app')).version, version);
+  assert.equal((await store.getRun('app')).updatedAt, updatedAt);
+  t += 60_000;
+  assert.equal(await store.claimResend('app', 'w1'), false);
+  t += 1;
+  assert.equal(await store.claimResend('app', 'w2'), false);
+  assert.equal(await store.claimResend('app', 'w1'), true);
+  assert.equal((await store.getRun('app')).resentAt, t);
+  await store.transition('app', { cond: { state: 'WAKING' }, set: { state: 'AWAKE' } });
+  t += 120_000;
+  assert.equal(await store.claimResend('app', 'w1'), false);
+  assert.equal(await store.claimResend('nope', 'w1'), false);
+});
+
 const bytes = (seed, size) => Buffer.from(Array.from({ length: size }, (_, i) => (i * 31 + seed) % 256));
 
 test('lists: the meta is set and removed by field; parts of 350 kB round trip as bytes, in order', async () => {

@@ -9,6 +9,7 @@ import { fakeClock, fakeStore, silentLog, testConfig } from '../../lambda/test/f
 import { toFields } from '../src/firestore.mjs';
 import { createTasks } from '../src/tasks.mjs';
 import { createCloudRunWaker, eventOf, fromEnvironment, workloadIdOf } from '../src/waker.mjs';
+import { heartbeatStore } from './world.mjs';
 
 const CONTROLLER = 'https://dmtr-europe-west1-controller-123.europe-west1.run.app';
 const SERVICE_ACCOUNT = 'dmtr-europe-west1@p.iam.gserviceaccount.com';
@@ -17,6 +18,7 @@ const BROWSER = 'Mozilla/5.0';
 function setup({ run = { state: STATES.ASLEEP }, cfg = testConfig(), enqueue, lists = [], seed } = {}) {
   const clock = fakeClock();
   const store = fakeStore({ config: cfg, run, clock });
+  Object.assign(store, heartbeatStore(() => store.state.run, clock.now));
   const created = [];
   const google = { request: async (method, url, body) => { created.push(body.task); return {}; } };
   const tasks = enqueue ? { enqueue } : createTasks({ google, project: 'p', region: 'europe-west1', queue: 'dmtr-europe-west1', serviceAccount: SERVICE_ACCOUNT });
@@ -372,6 +374,68 @@ test('a task refused by Cloud Tasks → the run fails with a retry, not a crash'
   assert.equal(res.statusCode, 202);
   assert.equal(headerOf(res, 'x-dormeto-state'), STATES.FAILED);
   assert.equal(store.state.run.state, STATES.FAILED);
+});
+
+// F5: a wake whose task was lost, or whose request died, no longer beats on its run. A visitor's poll sends it again with its
+// wakeId, as the check does, one resend a minute between them (`resentAt`).
+const T = 1_700_000_000_000;
+const WAKING_SINCE = (ms, more = {}) => ({ state: STATES.WAKING, wakeId: 'w1', wakeStartedAt: T - ms, wakeCount: 1, ...more });
+
+test('a poll of a WAKING run with no beat for 3 minutes sends its wakeId again; another poll within the minute does not', async () => {
+  const { handler, store, clock, created, warned } = setup({ run: WAKING_SINCE(3 * 60_000) });
+  const res = await handler(probe());
+  assert.equal(res.statusCode, 202);
+  assert.equal(headerOf(res, 'x-dormeto-state'), STATES.WAKING);
+  assert.deepEqual(created.map(decoded), [{ action: 'wake', workloadId: 'demo', wakeId: 'w1' }]);
+  assert.equal(created[0].httpRequest.url, `${CONTROLLER}/v1/tasks`);
+  assert.equal(store.state.run.resentAt, T);
+  assert.deepEqual(warned.filter((w) => w.event === 'WakeResent'), [{ event: 'WakeResent', workloadId: 'demo', wakeId: 'w1', by: 'waker', reason: 'no heartbeat 90 s after it started' }]);
+  clock.advance(30_000);
+  await handler(probe());
+  assert.equal(created.length, 1);
+  clock.advance(30_001);
+  await handler(probe());
+  assert.equal(created.length, 2);
+  // The same wake all along: no new wakeId, nothing counted twice.
+  assert.equal(store.state.run.wakeId, 'w1');
+  assert.equal(store.state.run.wakeCount, 1);
+});
+
+test('a poll of a WAKING run that beats, or not yet 90 s old, or sent again by the check within the minute: no task', async () => {
+  for (const run of [
+    WAKING_SINCE(9 * 60_000, { beatAt: T - 30_000 }),
+    WAKING_SINCE(90_000),
+    WAKING_SINCE(4 * 60_000, { resentAt: T - 30_000 }),
+  ]) {
+    const { handler, created, store } = setup({ run });
+    const res = await handler(probe());
+    assert.equal(headerOf(res, 'x-dormeto-state'), STATES.WAKING);
+    assert.equal(created.length, 0, JSON.stringify(run));
+    assert.equal(store.state.run.resentAt, run.resentAt);
+  }
+});
+
+test('a WAKING run past its timeout: the shared code\'s new wake, as before, not a resend', async () => {
+  const { handler, store, created, warned } = setup({ run: WAKING_SINCE(11 * 60_000) });
+  await handler(probe());
+  assert.equal(created.length, 1);
+  assert.notEqual(decoded(created[0]).wakeId, 'w1');
+  assert.equal(decoded(created[0]).wakeId, store.state.run.wakeId);
+  assert.equal(warned.filter((w) => w.event === 'WakeResent').length, 0);
+  assert.equal(warned.filter((w) => w.event === 'WakeStuck').length, 1);
+});
+
+test('a resend the queue refuses: the poll answered all the same, said, the run still WAKING; a bot\'s poll sends nothing', async () => {
+  const { handler, store, warned } = setup({ run: WAKING_SINCE(3 * 60_000), enqueue: async () => { throw new Error('Google: 503 tasks'); } });
+  const res = await handler(probe());
+  assert.equal(res.statusCode, 202);
+  assert.equal(headerOf(res, 'x-dormeto-state'), STATES.WAKING);
+  assert.equal(store.state.run.state, STATES.WAKING);
+  assert.deepEqual(warned.filter((w) => w.event === 'WakeResendFailed').map((w) => w.error), ['Google: 503 tasks']);
+
+  const bot = setup({ run: WAKING_SINCE(3 * 60_000) });
+  await bot.handler(probe({ 'user-agent': 'Googlebot/2.1' }));
+  assert.equal(bot.created.length, 0);
 });
 
 // The page's real script, in a sandbox with what it uses of a browser; `fetch` is what the waker answers.

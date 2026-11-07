@@ -1757,9 +1757,19 @@ test('the onboarding: a review per right, the owner read, a k8s backend of the d
 
 const scalerAt = (minReplicaCount) => (w) => {
   const scaler = structuredClone(KEDA);
-  if (minReplicaCount !== undefined) scaler.spec.minReplicaCount = minReplicaCount;
+  if (minReplicaCount === undefined) delete scaler.spec.minReplicaCount;
+  else scaler.spec.minReplicaCount = minReplicaCount;
   w.kube.scaledObjects.push(scaler);
 };
+
+test('the onboarding refuses an owner whose KEDA ScaledObject leaves minReplicaCount unset, KEDA\'s default being 0', async () => {
+  const { store, onboarding } = setup((world) => {
+    onGke(world);
+    scalerAt()(world);
+  });
+  await assert.rejects(onboarding.onboard(GKE_INPUT), refused(400, 'not-eligible', /KEDA scales Deployment shop\/web to zero itself \(minReplicaCount: 0\)/));
+  assert.equal(store.configs.size, 0);
+});
 
 test('the onboarding refuses an owner whose KEDA ScaledObject has minReplicaCount 0, in the constraint\'s words, and writes nothing', async () => {
   const { w, store, onboarding } = setup((world) => {
@@ -1771,7 +1781,7 @@ test('the onboarding refuses an owner whose KEDA ScaledObject has minReplicaCoun
   assert.equal(store.configs.size, 0);
 });
 
-for (const [name, change] of [['at 1', scalerAt(1)], ['unset', scalerAt()], ['absent', () => {}], ['for another owner', (w) => { scalerAt(0)(w); w.kube.scaledObjects[0].spec.scaleTargetRef.name = 'admin'; }], ['on a cluster with no KEDA', (w) => { scalerAt(0)(w); w.kube.keda = false; }]]) {
+for (const [name, change] of [['at 1', scalerAt(1)], ['absent', () => {}], ['for another owner', (w) => { scalerAt(0)(w); w.kube.scaledObjects[0].spec.scaleTargetRef.name = 'admin'; }], ['on a cluster with no KEDA', (w) => { scalerAt(0)(w); w.kube.keda = false; }]]) {
   test(`the onboarding accepts an owner whose KEDA ScaledObject is ${name}`, async () => {
     const { store, onboarding } = setup((world) => {
       onGke(world);
@@ -1912,7 +1922,7 @@ const awakePods = async (change = () => {}) => {
   await t.onboarding.onboard(GKE_INPUT);
   return t;
 };
-const KEDA = { metadata: { namespace: 'shop', name: 'web-scaler', annotations: {} }, spec: { scaleTargetRef: { name: 'web' } } };
+const KEDA = { metadata: { namespace: 'shop', name: 'web-scaler', annotations: {} }, spec: { scaleTargetRef: { name: 'web' }, minReplicaCount: 1 } };
 const withKeda = (w) => { w.kube.scaledObjects.push(structuredClone(KEDA)); };
 
 test('an offboarding wakes an asleep owner back to its replicas, KEDA given back, and removes what is Dormeto\'s', async () => {

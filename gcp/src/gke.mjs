@@ -202,7 +202,7 @@ export async function ownerChanged({ compute, kubernetesOf }, backend, readServi
   return problem && `${problem}: if this lasts, offboard and onboard again, naming the owner behind the load balancer`;
 }
 
-// A KEDA ScaledObject of the owner with minReplicaCount 0 scales it to zero while the workload is awake: refused. No KEDA on the cluster, or none for the owner: null.
+// A KEDA ScaledObject of the owner with minReplicaCount 0 (KEDA's default when unset) scales it to zero while the workload is awake: refused. No KEDA on the cluster, or none for the owner: null.
 async function kedaToZero(k8s, backend) {
   let objects;
   try {
@@ -211,7 +211,7 @@ async function kedaToZero(k8s, backend) {
     if (err?.status === 404) return null;
     throw err;
   }
-  const zero = objects.some((s) => s.spec?.scaleTargetRef?.name === backend.owner.name && (s.spec.scaleTargetRef.kind ?? 'Deployment') === backend.owner.kind && s.spec.minReplicaCount === 0);
+  const zero = objects.some((s) => s.spec?.scaleTargetRef?.name === backend.owner.name && (s.spec.scaleTargetRef.kind ?? 'Deployment') === backend.owner.kind && (s.spec.minReplicaCount ?? 0) === 0);
   return zero ? `KEDA scales ${ownerText(backend)} to zero itself (minReplicaCount: 0): set it to 1 or more for Dormeto to nap it` : null;
 }
 

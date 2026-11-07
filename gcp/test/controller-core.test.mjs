@@ -3893,7 +3893,7 @@ test('a wake begun during a release\'s 409s: no other try', async () => {
 // --- GKE pods behind standalone NEGs, over the real adapters and the fake of world.mjs (task R11's assumptions, before M9 to M12) ----------------------------------------
 
 const KEDA_PAUSE = 'autoscaling.keda.sh/paused-replicas';
-const scaler = (annotations = {}) => ({ metadata: { namespace: 'shop', name: 'web-scaler', annotations }, spec: { scaleTargetRef: { name: 'web' } } });
+const scaler = (annotations = {}) => ({ metadata: { namespace: 'shop', name: 'web-scaler', annotations }, spec: { scaleTargetRef: { name: 'web' }, minReplicaCount: 1 } });
 const withScaler = (annotations) => (w) => { w.kube.scaledObjects.push(scaler(annotations)); };
 const scalerAnnotations = (t) => t.w.kube.scaledObjects[0].metadata.annotations;
 const replicasOf = (t) => t.w.kube.owners[OWNER]?.replicas;

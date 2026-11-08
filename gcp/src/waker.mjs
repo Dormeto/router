@@ -8,13 +8,15 @@
 // page (Google: a failed fetch gets a generic error), and its policy's override gives the visitor the 503. On `/_dormeto/wake`,
 // a 503 would be replaced by the page: the nap's policy applies to all the matcher's traffic, and the waker is a backend of it.
 // The fetch carries neither the visitor's path nor its method: it is decided with no path (no path condition or scanner path
-// matches it) in wake mode browser: only a wake rule or an explicit wake's header wakes there, and the page's probe then does.
+// matches a request without one, lambda/src/lib/no-wake.mjs) in wake mode browser: only a wake rule on what the fetch does carry
+// or an explicit wake's header wakes there, and the page's probe then does.
 //
 // Behind a swap (a regional or classic one, which `x-dormeto-switch: swap` says, as Firestore may not be readable), it gets the
 // visitor's real request with no policy to override its code, and a 200 would tell an API client it succeeded: the page is a 503,
 // whatever the method and for any path but `/_dormeto/*`. That request is decided in the workload's wake mode: in `any`, one
 // the filters let through wakes; in `browser`, only the page's probe, an explicit wake or a wake rule does.
-// `/_dormeto/wake` is as behind a policy; `/_dormeto/backend/*` goes to the application and never comes here.
+// `/_dormeto/wake` answers as behind a policy (a 202, or a 200 once awake, never a 503), and is decided in the same wake mode: in
+// `any`, a plain GET of it wakes, as one of `/` does. `/_dormeto/backend/*` goes to the application and never comes here.
 //
 // The page's probe sends the visitor's path in `x-dormeto-path`, and its rules see that path; a POST keeps `/_dormeto/wake`.
 // A forged one bypasses nothing a client couldn't by asking for another path.
@@ -236,7 +238,7 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], n
     const policyFetch = !underSwap(event) && event.path === WAITING_PATH;
     return thisRequest.run({ policyFetch }, async () => {
       if (event.path === WAKE_PATH) return wake(event, workloadId);
-      if (policyFetch) await decide({ ...event, path: '' }, workloadId);
+      if (policyFetch) await decide({ ...event, path: undefined }, workloadId);
       else if (underSwap(event) && !event.path.startsWith(NAMESPACE)) await decide(event, workloadId);
       return waiting(event, workloadId);
     });

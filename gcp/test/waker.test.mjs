@@ -239,27 +239,38 @@ test('under a swap, a workload not configured, and a failed one: the page says s
   assert.match(failed.body, /Google Cloud has no capacity/);
 });
 
-test('under a swap, /_dormeto/wake as with the policy: 202 and one task for a probe or a POST, 200 once awake, never a 503', async () => {
-  const asleep = setup();
+test('under a swap, /_dormeto/wake answers as with the policy: 202 and one task for a probe or a POST, 200 once awake, never a 503', async () => {
+  const asleep = setup({ cfg: swapped() });
   const probed = await asleep.handler(probe(SWAPPED));
   assert.equal(probed.statusCode, 202);
   assert.equal(headerOf(probed, 'x-dormeto-state'), STATES.WAKING);
   assert.equal(asleep.created.length, 1);
   assert.equal((await asleep.handler(probe(SWAPPED))).statusCode, 202, 'waking, its wait included');
 
-  const posted = setup();
+  const posted = setup({ cfg: swapped() });
   const res = await posted.handler(request({ method: 'POST', url: '/_dormeto/wake', headers: SWAPPED }));
   assert.equal(res.statusCode, 202);
   assert.equal(posted.created.length, 1);
 
-  const plain = setup();
-  assert.equal((await plain.handler(request({ url: '/_dormeto/wake', headers: { ...SWAPPED, accept: 'text/html' } }))).statusCode, 202);
-  assert.equal(plain.created.length, 0);
-
-  const awake = setup({ run: { state: STATES.AWAKE, awakeSince: fakeClock().now() } });
+  const awake = setup({ cfg: swapped(), run: { state: STATES.AWAKE, awakeSince: fakeClock().now() } });
   assert.equal((await awake.handler(probe(SWAPPED))).statusCode, 200);
-  const unknown = setup();
+  const unknown = setup({ cfg: swapped() });
   assert.equal((await unknown.handler(probe({ ...SWAPPED, 'x-dormeto-workload': 'other' }))).statusCode, 202);
+});
+
+// A plain GET (a link, a scanner) is decided in the workload's wake mode, as any request under a swap: `/` is no harder to reach.
+test('under a swap, a plain GET /_dormeto/wake → 202, a task in wake mode any, none in browser; behind the policy none, whatever the configuration says', async () => {
+  const plainWake = (headers = {}) => request({ url: '/_dormeto/wake', headers: { accept: 'text/html', ...headers } });
+  for (const [cfg, headers, tasks] of [
+    [swapped({ wakeMode: 'any' }), SWAPPED, 1],
+    [swapped({ wakeMode: 'browser' }), SWAPPED, 0],
+    [testConfig({ wakeMode: 'any' }), {}, 0],
+  ]) {
+    const { handler, created } = setup({ cfg });
+    const res = await handler(plainWake(headers));
+    assert.equal(res.statusCode, 202, JSON.stringify(cfg.lb ?? 'policy'));
+    assert.equal(created.length, tasks, `${JSON.stringify(cfg.lb ?? 'policy')} ${cfg.wakeMode}`);
+  }
 });
 
 test('under a swap, the namespace is not the application: another /_dormeto/ path is the 200 it always was; /_dormeto alone is a visitor\'s', async () => {
@@ -326,13 +337,20 @@ test('the policy\'s fetch goes through the decision in wake mode browser, whatev
   assert.equal(ruled.store.state.stats['wake:rule browsers'], 1);
 });
 
-test('the policy\'s fetch carries no path: no path condition matches it, not even its own /_dormeto/waiting', async () => {
-  const everywhere = setup({ cfg: testConfig({ noWakeRules: [{ name: 'all', pathPrefixes: ['/'] }], wakeRules: [{ name: 'browsers', userAgentPattern: '^Mozilla/' }] }) });
-  await everywhere.handler(request());
-  assert.equal(everywhere.created.length, 1);
-  const waiting = setup({ cfg: testConfig({ wakeRules: [{ name: 'waiting', pathPrefixes: ['/_dormeto/waiting'] }] }) });
-  await waiting.handler(request());
-  assert.equal(waiting.created.length, 0);
+test('the policy\'s fetch carries no path: no path condition matches it, not even one the empty path would, nor its own /_dormeto/waiting', async () => {
+  // A wake rule on a path never wakes on the fetch: a home page's `^/?$` would wake on every scanner's request.
+  for (const rule of [{ pathPattern: '^/?$' }, { pathPattern: '.*' }, { pathPrefixes: ['/'] }, { pathPrefixes: ['/_dormeto/waiting'] }]) {
+    const { handler, created } = setup({ cfg: testConfig({ wakeRules: [{ name: 'path', ...rule }] }) });
+    const res = await handler(request());
+    assert.equal(res.statusCode, 200);
+    assert.equal(created.length, 0, JSON.stringify(rule));
+  }
+  // Nor does a no-wake rule on a path keep a wake rule on the user agent from waking.
+  for (const rule of [{ pathPrefixes: ['/'] }, { pathPattern: '^/?$' }, { pathPattern: '.*' }]) {
+    const { handler, created } = setup({ cfg: testConfig({ noWakeRules: [{ name: 'path', ...rule }], wakeRules: [{ name: 'browsers', userAgentPattern: '^Mozilla/' }] }) });
+    await handler(request());
+    assert.equal(created.length, 1, JSON.stringify(rule));
+  }
 });
 
 test('a probe is classified on the visitor\'s path it sends: from /health, a no-wake rule on /health → no task; from /orders → a task', async () => {

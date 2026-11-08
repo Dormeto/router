@@ -30,6 +30,16 @@ test('paths match by prefix (case-sensitive) or regular expression', () => {
   assert.ok(!match({ name: 'r', pathPattern: '^/api/v[0-9]+/ping$' }, albEvent({ path: '/api/v2/ping/x' })));
 });
 
+test('an event with no path (Google Cloud\'s error fetch) matches no path condition, not even one the empty path would match; nor a scanner path', () => {
+  const pathless = { ...albEvent(), path: undefined };
+  for (const rule of [{ name: 'home', pathPattern: '^/?$' }, { name: 'all', pathPattern: '.*' }, { name: 'root', pathPrefixes: ['/'] }, { name: 'empty', pathPrefixes: [''] }]) {
+    assert.ok(!match(rule, pathless), rule.name);
+  }
+  assert.ok(match({ name: 'home', pathPattern: '^/?$' }, albEvent({ path: '/' })), 'a path still matches');
+  assert.ok(match({ name: 'monitor', userAgentPattern: '^Mozilla/' }, pathless), 'the other conditions still match');
+  assert.deepEqual(classify(pathless), { kind: 'normal' });
+});
+
 test('userAgentPattern is case-insensitive', () => {
   const rule = { name: 'monitor', userAgentPattern: '^dormeto-uptime/' };
   assert.ok(match(rule, albEvent({ headers: { 'user-agent': 'Dormeto-Uptime/1.0' } })));

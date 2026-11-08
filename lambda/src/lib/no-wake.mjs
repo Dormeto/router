@@ -62,10 +62,13 @@ function compileRule(rule) {
       return family > 0 && list.check(ip, family === 6 ? 'ipv6' : 'ipv4');
     });
   }
-  if (conditions.pathPrefixes) tests.push((event) => conditions.pathPrefixes.some((p) => (event.path ?? '').startsWith(p)));
+  // A request with no path (Google Cloud's error fetch carries none of the visitor's) matches no path condition, not even one the
+  // empty path would match: a home page's `^/?$` would otherwise match every fetch. An ALB event always has one.
+  const hasPath = (event) => typeof event.path === 'string';
+  if (conditions.pathPrefixes) tests.push((event) => hasPath(event) && conditions.pathPrefixes.some((p) => event.path.startsWith(p)));
   if (conditions.pathPattern) {
     const pattern = regex('pathPattern', conditions.pathPattern);
-    tests.push((event) => pattern.test(event.path ?? ''));
+    tests.push((event) => hasPath(event) && pattern.test(event.path));
   }
   if (conditions.userAgentPattern) {
     const pattern = regex('userAgentPattern', conditions.userAgentPattern, 'i');

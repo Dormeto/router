@@ -448,14 +448,14 @@ AWS's bodies, answers and checks.
   instance group, `k8s` GKE pods and `databases` a Cloud SQL companion (on AWS an EC2 instance, an Auto Scaling group, Kubernetes on EKS, and RDS or
   Aurora). A workload's type is read from its primary backends, databases first, unless `--type` names another.
 - **The built-in values** are AWS's: an idle window of 15 minutes, a wake timeout of 600 s, a retry after a failed wake of 60 s
-  and the wake mode `any`. The built-in wake timeout is 600 s for every kind, but the `databases` type's 1800 s, brought to 1700 s
+  and the wake mode `any`. The built-in wake timeout is 600 s for every kind, but the `databases` type's built-in is AWS's 1800 s, brought to Google Cloud's cap of 1700 s and shown `fixed`
   below: the computed 300 s for pods and the 1700 s of a Cloud SQL companion of earlier routers are gone, and the swap's wait is
   a floor, not an addition. A longer timeout only delays a failure's report.
 - **A router level never read on this controller instance** takes no idle nap or release decision, waits the longest wake
   timeout (1700 s) and stops plainly, logged `SettingsLevelUnreadable`, as on AWS. A level that cannot be read counts as unset.
 - **The controller resolves before it acts.** The check, the nap, the wake and the release use the resolved values
   (`idleMinutes`, `wakeTimeoutSeconds`, `failedRetrySeconds`, `hibernate`), and the waker resolves the same ones, so the two
-  never disagree. The router level is read once per check, through a 60 s cache.
+  never disagree. The controller reads the router level from the store, once per check and once per wake, nap or release, and keeps the last record it read; the waker keeps it 60 s in a cache.
 - **A configuration written before the levels** has no `inherits`: an `idleMinutes` of 15 and a `failedRetrySeconds` of 60 are
   read as inherited, its wake timeout stays its own, and nothing is rewritten. A new onboarding writes `inherits` for every
   key it is not given.
@@ -593,9 +593,9 @@ Two kinds join the external ones, told from Google by the forwarding rules' sche
   `internal_http_lb_rule`, which `dormeto gcp install` adds to the log view's filter. A regional internal map's service is read with its region, a
   cross-region one's without.
 - **The network.** Nothing is added: your internal load balancer has its proxy-only subnet, and the waker's ingress admits internal
-  load balancers. The page's probe goes through the same load balancer.
+  load balancers (Google's documentation, to be confirmed by the measure). The page's probe goes through the same load balancer.
 - **The limits.** The visitors' addresses are private, so an IP list is for private ranges. A project's regional serverless network
-  endpoint groups share 5,000 queries a second. A cross-region internal load balancer's waker is in one region. The page has no favicon.
+  endpoint groups share 5,000 queries a second (Google's documentation). A cross-region internal load balancer's waker is in one region. The page has no favicon.
   `terraform/gcp-dev` has a demo behind `enable_internal` (off by default): the proxy-only subnets, a regional and a cross-region internal load
   balancer, each in front of a small VM, and a client VM reached through IAP.
 

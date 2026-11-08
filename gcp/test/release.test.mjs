@@ -415,7 +415,7 @@ test('the Compute Engine page: the settings by level, what Google Cloud fixes an
   assert.match(page, /GET and PUT \/v1\/settings/);
   assert.match(page, /The organization level and the custom types are the manager's, so on Google Cloud the organization level reads as unset and only the built-in types exist/);
   assert.match(page, /instance is a VM of an unmanaged instance group or of a zonal network endpoint group, asg a managed instance group, k8s GKE pods and databases a Cloud SQL companion/);
-  assert.match(page, /The built-in wake timeout is 600 s for every kind, but the databases type's 1800 s, brought to 1700 s/);
+  assert.match(page, /The built-in wake timeout is 600 s for every kind, but the databases type's built-in is AWS's 1800 s/);
   for (const row of [
     '| waitSeconds | 0 | The waker holds no request. Behind a swap, the switch back takes longer than any hold (regional 100 s, classic 250 s). Behind the policy, the waker receives only the error fetch. |',
     '| maxHolders | 0 | No request is held. |',
@@ -533,4 +533,14 @@ test('the README and the Cloud SQL page say the G5 features and the 1700 s fixed
   assert.match(readme, /The Google Cloud router has AWS's settings by level, the wake mode and the no-wake and wake rules, the branded waiting page, a capacity retry with fallback machine types, and the internal Application Load Balancers/);
   assert.match(readme, /enable_internal/);
   assert.match(flat(read(SQL)), /The wake timeout 1700 s is fixed: the databases type's 1800 s is brought to the most a wake can take/);
+});
+
+// D1's fix round: what the controller and the waker read, and what Google's documentation (not a measure) says.
+test('the Compute Engine page: the controller reads the router level without a cache, the waker through one; two claims are Google\'s documentation', () => {
+  const page = flat(read(CE));
+  assert.doesNotMatch(page, /The router level is read once per check, through a 60 s cache/);
+  assert.match(page, /The controller reads the router level from the store, once per check and once per wake, nap or release, and keeps the last record it read; the waker keeps it 60 s in a cache/);
+  assert.match(page, /the databases type's built-in is AWS's 1800 s, brought to Google Cloud's cap of 1700 s and shown fixed/);
+  assert.match(page, /5,000 queries a second \(Google's documentation\)/);
+  assert.match(page, /the waker's ingress admits internal load balancers \(Google's documentation, to be confirmed by the measure\)/);
 });

@@ -620,7 +620,8 @@ the Standard tier is found (whether Google accepts it for the swap is unmeasured
 reads the load balancer's request logs and ignores what the waker ignores. GKE refuses a KEDA `minReplicaCount: 0`.
 
 ```bash
-# Build (podman, linux/amd64) dormeto-router:<version> from gcp/Containerfile
+# Build (podman, linux/amd64) dormeto-router:<version> from gcp/Containerfile; <version> is x.y.z, or a pre-release:
+# x.y.z-dev.<n> for a dev image, x.y.z-rc.<n> for a release candidate (a release's own tag is immutable once pushed)
 ./scripts/gcp-image.sh 0.37.0
 # Run the controller's health locally: GET /v1/health -> {"version","project","region"}
 podman run --rm -p 8080:8080 -e DMT_ROLE=controller -e DMT_PROJECT=p -e DMT_REGION=europe-west1 -e DMT_DATABASE=d -e DMT_QUEUE=q dormeto-router:0.37.0

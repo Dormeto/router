@@ -80,6 +80,37 @@ test('gcp-image.sh --push has no default configuration and no default project', 
   }
 });
 
+// The dev image (0.38.0-dev.<n>) and the release candidate (0.38.0-rc.<n>): a SemVer pre-release, never the release's own tag,
+// which immutable repositories would keep for good.
+test('gcp-image.sh takes a SemVer pre-release version: the dev image and the release candidate', () => {
+  for (const version of ['0.38.0-dev.1', '0.38.0-rc.1', '1.2.3-alpha', '1.2.3-x-1.2.b']) {
+    const run = image(version, '--push', '--configuration', 'dormeto-dev', '--repository', 'europe-west1-docker.pkg.dev/dormeto-dev/dormeto');
+    assert.equal(run.status, 0, `${version}: ${run.stderr}`);
+    const tag = version.replace(/\./g, '\\.');
+    assert.match(run.stdout, new RegExp(`-t dormeto-router:${tag} \\.$`, 'm'), version);
+    assert.match(run.stdout, new RegExp(`docker://europe-west1-docker\\.pkg\\.dev/dormeto-dev/dormeto/router:${tag}$`, 'm'), version);
+  }
+  for (const version of ['0.38.0-', '0.38.0-.1', '0.38.0-dev.', '0.38.0-dev..1', '0.38.0+build.1', '0.38.0-rc_1', '0.38.0-rc;id', '0.38', 'v0.38.0-rc.1']) {
+    const run = image(version);
+    assert.equal(run.status, 2, version);
+    assert.match(run.stderr, /usage: /);
+    assert.equal(run.stdout, '', version);
+  }
+});
+
+// --configuration reaches eval (the login's pipe): only a configuration's name gets there.
+test('gcp-image.sh refuses a configuration that is not a plain name, before anything runs', () => {
+  for (const configuration of ['dormeto-dev; echo pwned', '$(id)', '`id`', 'a b', 'dormeto.dev', 'dormeto-dev|cat', 'a/b']) {
+    const run = image('1.2.3', '--push', '--configuration', configuration, '--repository', 'europe-west1-docker.pkg.dev/dormeto-dev/dormeto');
+    assert.equal(run.status, 2, configuration);
+    assert.match(run.stderr, /usage: /);
+    assert.equal(run.stdout, '', configuration);
+  }
+  for (const configuration of ['dormeto-dev', 'dormeto_releases', 'Dev2']) {
+    assert.equal(image('1.2.3', '--push', '--configuration', configuration, '--repository', 'europe-west1-docker.pkg.dev/dormeto-dev/dormeto').status, 0, configuration);
+  }
+});
+
 test('gcp-image.sh refuses a missing or odd argument with exit 2', () => {
   for (const args of [[], ['1.2.3', '--push'], ['1.2.3', '--other'], ['v1'], ['1.2.3', '--configuration', 'c'], ['1.2.3', '--repository', 'a/b/c'], ['1.2.3', '--push', '--configuration'], ['1.2.3', '--push', '--configuration', 'c', '--repository', 'a/b/c', 'd']]) {
     const run = image(...args);

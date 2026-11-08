@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # The router's Google Cloud image:
 #   scripts/gcp-image.sh <version> [--push --configuration <name> --repository <host>/<project>/<repo> [--repository ...]]
+# <version> is x.y.z, or a SemVer pre-release x.y.z-<dot-separated identifiers> for a dev image (0.38.0-dev.<n>) or a release
+# candidate (0.38.0-rc.<n>): never the release's own x.y.z before the release, as the public repositories' tags are immutable.
 # Builds gcp/Containerfile with podman for linux/amd64 (Cloud Run), tagged dormeto-router:<version>. With --push, logs in
 # to each repository's registry with the token of the gcloud configuration named by --configuration (no IAM change: the
 # caller's own access) and pushes <repository>/router:<version>, printing each pushed image's digest. There is no default
@@ -15,7 +17,7 @@ usage() {
   exit 2
 }
 
-[[ $# -ge 1 && "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || usage
+[[ $# -ge 1 && "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]] || usage
 VERSION="$1"
 shift
 PUSH=""
@@ -33,6 +35,8 @@ while [[ $# -gt 0 ]]; do
 done
 if [[ -n "$PUSH" ]]; then
   [[ -n "$CONFIGURATION" && ${#REPOSITORIES[@]} -gt 0 ]] || usage
+  # The configuration and the repositories reach eval (run, below): their names only.
+  [[ "$CONFIGURATION" =~ ^[A-Za-z0-9_-]+$ ]] || usage
   for repository in "${REPOSITORIES[@]}"; do
     [[ "$repository" =~ ^[a-z0-9.-]+/[a-z0-9-]+/[a-z0-9._/-]+$ ]] || usage
   done

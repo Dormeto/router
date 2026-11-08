@@ -1,6 +1,6 @@
 // What a request costs in Firestore reads, through the real store, on a workload with no schedule, no pause and no list. The
 // schedule's read per probe and the two lists per check were accepted rather than a "has a schedule" flag to keep in step:
-// these counts keep them from growing. A commit is no read; a run's transition reads the run first.
+// these counts keep them from growing. A probe or a POST also reads `router/settings` once (the join levels' router level). A commit is no read; a run's transition reads the run first.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { STATES } from '../../lambda/src/lib/state.mjs';
@@ -52,16 +52,16 @@ for (const [name, run, send, count] of [
   ['the page\'s fetch, FAILED', BACKED_OFF, pageFetch, 3],
   ['the page\'s fetch, WAKING', WAKING, pageFetch, 2],
   ['the page\'s fetch, AWAKE', AWAKE, pageFetch, 2],
-  ['a probe that wakes', ASLEEP, probe, 4],
-  ['a backed-off probe', BACKED_OFF, probe, 3],
-  ['a probe, NAPPING', NAPPING, probe, 4],
-  ['a probe, WAKING', WAKING, probe, 2],
-  ['a probe, WAKING with no beat', STALE, probe, 3],
-  ['a probe, WAKING with no beat, sent again within the minute', RESENT, probe, 2],
-  ['a probe, AWAKE', AWAKE, probe, 2],
-  ['a POST, ASLEEP', ASLEEP, post, 4],
-  ['a POST, backed off', BACKED_OFF, post, 3],
-  ['a POST, NAPPING', NAPPING, post, 4],
+  ['a probe that wakes', ASLEEP, probe, 5],
+  ['a backed-off probe', BACKED_OFF, probe, 4],
+  ['a probe, NAPPING', NAPPING, probe, 5],
+  ['a probe, WAKING', WAKING, probe, 3],
+  ['a probe, WAKING with no beat', STALE, probe, 4],
+  ['a probe, WAKING with no beat, sent again within the minute', RESENT, probe, 3],
+  ['a probe, AWAKE', AWAKE, probe, 3],
+  ['a POST, ASLEEP', ASLEEP, post, 5],
+  ['a POST, backed off', BACKED_OFF, post, 4],
+  ['a POST, NAPPING', NAPPING, post, 5],
 ]) {
   test(`Firestore reads: ${name}, ${count}`, async () => {
     const { handler, reads } = wakerOn(run);
@@ -111,7 +111,7 @@ test('a nap window: the probe reads it once, and says it', async () => {
   firestore.docs.set('schedules/demo', { fields: toFields({ schedule }), updateTime: 't0' });
   const res = await handler(probe());
   assert.equal(res.multiValueHeaders['x-dormeto-nap-until']?.[0], '2023-11-14T23:00:00.000Z');
-  assert.equal(reads(), 3);
+  assert.equal(reads(), 4);
 });
 
 // The controller's Cloud Scheduler call: the pauses, the configurations and the schedules listed, then the workload's run.

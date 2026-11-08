@@ -19,7 +19,9 @@ export function fakeFirestore() {
     const current = (name) => staged.get(name) ?? docs.get(name);
     for (const write of writes) {
       if (write.delete) {
-        staged.set(write.delete.slice(ROOT.length + 1), null);
+        const gone = write.delete.slice(ROOT.length + 1);
+        if (write.currentDocument?.exists === true && !current(gone)) throw fail(404, 'NOT_FOUND', `${gone} is missing`);
+        staged.set(gone, null);
         continue;
       }
       const name = write.update.name.slice(ROOT.length + 1);

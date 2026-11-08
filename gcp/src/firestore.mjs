@@ -1,7 +1,9 @@
 // The router's state on Google Cloud: the DynamoDB store's methods over Firestore's REST API (Native mode, one database
 // per router). One document per workload and kind: `workloads/<id>` (the configuration), `runs/<id>` (the state
 // machine), `schedules/<id>`, `pauses/<id>` (a workload's pause), `stats/<id>-<day>` (the day's counters, committed in
-// batches, kept 35 days), `router/sweep` (the day of the last sweep of the old counters); and the IP lists:
+// batches, kept 35 days), `router/sweep` (the day of the last sweep of the old counters), `router/settings` (the router level of the settings:
+// hibernate, joinMinutes, defaults, by, at), `router/page` (the router's waiting page) and, per workload, `pages/<id>` (its
+// waiting page) and `favicons/<id>` (the favicon read while it was awake); and the IP lists:
 // `lists/<name>` (the meta) and `listParts/<name>-<version>-<index>` (the packed parts, 350 kB at most). A transition reads the run, checks its condition, and commits
 // with the document's `updateTime` as precondition: the conditional write of DynamoDB.
 import { STATES, matches, addStats, emptyStats, utcDay, DAY_MS } from '../../lambda/src/lib/state.mjs';
@@ -62,6 +64,15 @@ const WRITE = ['datastore.entities.create', 'datastore.entities.update', 'datast
 export const CALLS = {
   read: READ,
   write: WRITE,
+};
+
+// The waiting page's fields, as AWS's item holds them: each its own string.
+const PAGE_FIELDS = ['mode', 'icon', 'title', 'description', 'html'];
+// A waiting page's document, by level as AWS's pageKey: 'router', or { workloadId } (so no workload ID can be the router's).
+const pagePath = (level) => {
+  if (level === 'router') return 'router/page';
+  if (typeof level?.workloadId === 'string' && level.workloadId) return `pages/${level.workloadId}`;
+  throw new TypeError(`unknown waiting page level: ${JSON.stringify(level)}`);
 };
 
 const lostPrecondition = (err) => err?.status === 'FAILED_PRECONDITION' || err?.status === 'ABORTED';
@@ -336,8 +347,69 @@ export function createFirestoreStore({ google, project, database, now = Date.now
 
     // Offboarding: configuration, run, schedule, pause and the daily counters, as AWS's offboarding.
     async deleteWorkload(workloadId) {
-      await commit(['workloads', 'runs', 'schedules', 'pauses'].map((kind) => ({ delete: named(`${kind}/${workloadId}`) })));
+      await commit(['workloads', 'runs', 'schedules', 'pauses', 'pages', 'favicons'].map((kind) => ({ delete: named(`${kind}/${workloadId}`) })));
       await this.deleteStats(workloadId);
+    },
+
+    // The waiting page of a level: its own document, never a field of the configuration. { page, by, at }: by and at are
+    // null for a document with none; a document with no mode is page null. `eventual` is AWS's cache hint: Firestore reads are
+    // always strong.
+    async getWaitingPage(level, { eventual = false } = {}) {
+      const doc = await read(pagePath(level));
+      if (!doc) return null;
+      const page = typeof doc.value.mode === 'string' ? { mode: doc.value.mode } : null;
+      if (page) for (const field of PAGE_FIELDS.slice(1)) if (typeof doc.value[field] === 'string') page[field] = doc.value[field];
+      return { page, by: doc.value.by || null, at: typeof doc.value.at === 'number' ? doc.value.at : null };
+    },
+    // The whole document at each write: the fields the page lacks are gone.
+    async putWaitingPage(level, page, { by, at }) {
+      const fields = Object.fromEntries(PAGE_FIELDS.filter((field) => typeof page[field] === 'string').map((field) => [field, page[field]]));
+      await commit([{ update: { name: named(pagePath(level)), fields: toFields({ ...fields, by: String(by ?? ''), at }) } }]);
+    },
+    // True when there was one.
+    async deleteWaitingPage(level) {
+      try {
+        await commit([{ delete: named(pagePath(level)), currentDocument: { exists: true } }]);
+        return true;
+      } catch (err) {
+        if (isStatus('NOT_FOUND')(err) || lostPrecondition(err)) return false;
+        throw err;
+      }
+    },
+
+    // The application's favicon, read while it was awake: { icon, fetchedAt, error }, icon a data URI or null.
+    async getFavicon(workloadId, { eventual = false } = {}) {
+      return (await read(`favicons/${workloadId}`))?.value ?? null;
+    },
+    async putFavicon(workloadId, favicon) {
+      await commit([{ update: { name: named(`favicons/${workloadId}`), fields: toFields(favicon) } }]);
+    },
+
+    // The router's own settings: router/settings {hibernate?, joinMinutes?, defaults?, by, at}, the whole record at each
+    // write; none of the three set: unset, no document.
+    async getRouterSettings() {
+      const doc = await read('router/settings');
+      const { hibernate, joinMinutes, defaults, by, at } = doc?.value ?? {};
+      if (hibernate === undefined && joinMinutes === undefined && defaults === undefined) return null;
+      return {
+        ...(hibernate === undefined ? {} : { hibernate }),
+        ...(joinMinutes === undefined ? {} : { joinMinutes }),
+        ...(defaults === undefined ? {} : { defaults }),
+        by: by ?? null, at: at ?? 0,
+      };
+    },
+    async putRouterSettings({ hibernate, joinMinutes, defaults, by, at }) {
+      const name = named('router/settings');
+      const record = {
+        ...(typeof hibernate === 'boolean' ? { hibernate } : {}),
+        ...(typeof joinMinutes === 'number' ? { joinMinutes } : {}),
+        ...(defaults && Object.keys(defaults).length ? { defaults } : {}),
+      };
+      if (!Object.keys(record).length) {
+        await commit([{ delete: name }]);
+        return;
+      }
+      await commit([{ update: { name, fields: toFields({ ...record, by: String(by ?? ''), at }) } }]);
     },
 
     // The kinds of a workload's backends, written apart from the transitions (no version change).

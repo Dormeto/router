@@ -654,3 +654,73 @@ test('deleteWorkload: the schedule and the pause go with the configuration and t
   assert.equal(await store.getSchedule('app'), null);
   assert.deepEqual(await store.getPauses('app'), []);
 });
+
+test('router settings: the record round trips, the defaults as a map; none set deletes the document; null once deleted', async () => {
+  const { store, docs } = setup();
+  assert.equal(await store.getRouterSettings(), null);
+  await store.putRouterSettings({ hibernate: true, joinMinutes: 7, defaults: { idleMinutes: 30, schedule: { tz: 'UTC' } }, by: 'ops', at: 5 });
+  assert.deepEqual(await store.getRouterSettings(), { hibernate: true, joinMinutes: 7, defaults: { idleMinutes: 30, schedule: { tz: 'UTC' } }, by: 'ops', at: 5 });
+  await store.putRouterSettings({ hibernate: false, by: 'ops2', at: 6 });
+  assert.deepEqual(await store.getRouterSettings(), { hibernate: false, by: 'ops2', at: 6 });
+  assert.deepEqual([...docs.keys()], ['router/settings']);
+  await store.putRouterSettings({ defaults: {}, by: 'ops', at: 7 });
+  assert.equal(await store.getRouterSettings(), null);
+  assert.equal(docs.size, 0);
+  await store.putRouterSettings({ by: 'ops', at: 8 });
+});
+
+test('waiting page: a workload\'s and the router\'s are separate documents; the answer is { page, by, at }', async () => {
+  const { store, docs } = setup();
+  assert.equal(await store.getWaitingPage('router'), null);
+  assert.equal(await store.getWaitingPage({ workloadId: 'app' }, { eventual: true }), null);
+  await store.putWaitingPage({ workloadId: 'app' }, { mode: 'custom', title: 'T', html: '<p>x</p>' }, { by: 'ops', at: 3 });
+  await store.putWaitingPage('router', { mode: 'default', description: 'D' }, { by: 'adm', at: 4 });
+  assert.deepEqual([...docs.keys()].sort(), ['pages/app', 'router/page']);
+  assert.deepEqual(await store.getWaitingPage({ workloadId: 'app' }), { page: { mode: 'custom', title: 'T', html: '<p>x</p>' }, by: 'ops', at: 3 });
+  assert.deepEqual(await store.getWaitingPage('router'), { page: { mode: 'default', description: 'D' }, by: 'adm', at: 4 });
+  // A second write replaces the whole page: the fields it lacks are gone.
+  await store.putWaitingPage({ workloadId: 'app' }, { mode: 'custom', icon: 'data:x' }, { by: 'ops', at: 9 });
+  assert.deepEqual(await store.getWaitingPage({ workloadId: 'app' }), { page: { mode: 'custom', icon: 'data:x' }, by: 'ops', at: 9 });
+  await assert.rejects(store.getWaitingPage({}), TypeError);
+  assert.equal(await store.deleteWaitingPage({ workloadId: 'app' }), true);
+  assert.equal(await store.deleteWaitingPage({ workloadId: 'app' }), false);
+  assert.equal(await store.getWaitingPage({ workloadId: 'app' }), null);
+  assert.ok(docs.has('router/page'));
+});
+
+test('waiting page: a document without a mode is page null; a workload called "page" or "router" is not the router\'s page', async () => {
+  const { store, docs } = setup();
+  docs.set('pages/x', { fields: { by: { stringValue: 'tf' } }, updateTime: 'x' });
+  assert.deepEqual(await store.getWaitingPage({ workloadId: 'x' }), { page: null, by: 'tf', at: null });
+  await store.putWaitingPage({ workloadId: 'router' }, { mode: 'custom' }, { by: 'a', at: 1 });
+  assert.equal(await store.getWaitingPage('router'), null);
+  assert.deepEqual([...docs.keys()].sort(), ['pages/router', 'pages/x']);
+});
+
+test('waiting page and favicon: 256 KiB of HTML and a 64 KiB icon are stored and read whole', async () => {
+  const { store } = setup();
+  const html = `<p>${'é'.repeat(131_000)}</p>`;
+  const icon = `data:image/png;base64,${'A'.repeat(64 * 1024 - 22)}`;
+  await store.putWaitingPage({ workloadId: 'app' }, { mode: 'custom', html, icon }, { by: 'ops', at: 1 });
+  const { page } = await store.getWaitingPage({ workloadId: 'app' });
+  assert.equal(page.html, html);
+  assert.equal(page.icon, icon);
+  const favicon = { icon, fetchedAt: 10, error: null };
+  assert.equal(await store.getFavicon('app'), null);
+  await store.putFavicon('app', favicon);
+  assert.deepEqual(await store.getFavicon('app', { eventual: true }), favicon);
+  await store.putFavicon('app', { icon: null, fetchedAt: 11, error: 'HTTP 404' });
+  assert.deepEqual(await store.getFavicon('app'), { icon: null, fetchedAt: 11, error: 'HTTP 404' });
+});
+
+test('deleteWorkload: the waiting page and the favicon go too, the router\'s page and settings stay', async () => {
+  const { store, docs } = setup();
+  await store.putConfig('app', { workloadId: 'app' });
+  await store.putWaitingPage({ workloadId: 'app' }, { mode: 'custom' }, { by: 'ops', at: 1 });
+  await store.putFavicon('app', { icon: null, fetchedAt: 1, error: null });
+  await store.putWaitingPage({ workloadId: 'keep' }, { mode: 'custom' }, { by: 'ops', at: 1 });
+  await store.putWaitingPage('router', { mode: 'default' }, { by: 'ops', at: 1 });
+  await store.putRouterSettings({ hibernate: true, by: 'ops', at: 1 });
+  await store.deleteWorkload('app');
+  assert.deepEqual([...docs.keys()].sort(), ['pages/keep', 'router/page', 'router/settings']);
+});

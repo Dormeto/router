@@ -218,7 +218,9 @@ test('the Compute Engine page: the swap of regional and classic load balancers, 
     assert.ok(spaced(read(CE)).includes(needle), needle);
   }
   assert.match(page, /SWAP_WAIT: 100 s on a regional load balancer, 250 s on a classic one/);
-  assert.match(page, /The default wake timeout adds SWAP_WAIT: 700 s for VMs on a regional load balancer, 850 s on a classic one/);
+  // G5: the built-in wake timeout is 600 s for every kind; the swap's wait is a floor, not an addition.
+  assert.doesNotMatch(page, /The default wake timeout adds SWAP_WAIT|700 s for VMs on a regional/);
+  assert.match(page, /The built-in wake timeout is 600 s, whatever the load balancer; behind a swap it can't be less than SWAP_WAIT plus 60 s/);
   assert.match(page, /\| Classic \| 5\.5 minutes \| 2 min 16 s after a visitor's POST \/_dormeto\/wake; AWAKE after 287 s, the unswap's 250 s included \|/);
   assert.match(page, /\| Regional \| 3\.5 to 6\.5 minutes to ASLEEP \| 62 s after a POST \/_dormeto\/wake; AWAKE 123 to 188 s after a wake by a browser's probe, a POST or a pause, the unswap's 100 s included \|/);
   assert.match(page, /Steady traffic, 45 requests in 15 minutes, kept each kind awake through the router with a 5-minute idle window/);
@@ -233,6 +235,7 @@ test('the Compute Engine page: the swap of regional and classic load balancers, 
   assert.match(page, /Ten naps on one regional URL map/);
   assert.match(spaced(read(CE)), /A header of your own named `x-dormeto-\*` on a regional map's swapped entry is replaced at the swap and not given back/);
   assert.match(page, /about 250 s or more on a regional load balancer and 340 s or more on a classic one/);
+  assert.match(page, /A wake timeout of SWAP_WAIT plus 60 s or less \(160 s regional, 310 s classic\) is refused/);
 });
 
 test('the Compute Engine page: schedules, pauses and IP lists, with what they do not hold', () => {
@@ -369,13 +372,15 @@ test('the GKE page is linked from the scenarios index and states its limits', ()
 test('the scenarios index has a row for each Google Cloud page', () => {
   const rows = read('docs/scenarios/README.md').split('\n').filter((line) => line.startsWith('| ['));
   const row = (page) => flat(rows.find((line) => line.includes(`](${page})`)) ?? '');
-  assert.match(row('google-cloud-compute-engine.md'), /global, regional or classic/);
-  assert.match(row('google-cloud-compute-engine.md'), /700 s regional, 850 s classic/);
+  assert.match(row('google-cloud-compute-engine.md'), /global, regional, classic or internal/);
+  assert.doesNotMatch(row('google-cloud-compute-engine.md'), /700 s regional, 850 s classic/);
+  assert.match(row('google-cloud-compute-engine.md'), /\| 600 s \|$/);
+  assert.match(row('google-cloud-compute-engine.md'), /global, regional, classic or internal/);
   assert.match(row('google-cloud-compute-engine.md'), /through a regional load balancer 62 s from POST \/_dormeto\/wake, a classic one 2 min 16 s/);
   assert.match(row('google-cloud-sql.md'), /9\.2 min through the router/);
   assert.match(row('google-cloud-sql.md'), /\| 1700 s \|$/);
   assert.match(row('google-kubernetes-engine.md'), /13 s through the router/);
-  assert.match(row('google-kubernetes-engine.md'), /\| 300 s \|$/);
+  assert.match(row('google-kubernetes-engine.md'), /\| 600 s \|$/);
   const index = flat(read('docs/scenarios/README.md'));
   assert.doesNotMatch(index, /what the acceptance has not run yet/);
   assert.match(index, /accepted on 2026-11-04, and say what was not run/);
@@ -397,4 +402,135 @@ test('the README\'s Google Cloud section names the three pages and what router 0
   assert.doesNotMatch(flat(section), /unmeasured/);
   assert.match(flat(section), /a classic load balancer on the Standard tier is found, and Google accepts it for the swap \(measured\)/);
   assert.match(flat(section), /the logs decide alone, as Monitoring's count is sampled, but an empty log leaves the count to decide/);
+});
+
+// G5 (vision docs/specs/2026-11-08-google-cloud-router-features-design.md, sections 3 to 8): the Compute Engine page says what the
+// settings levels, the wake mode and the rules, the waiting page, the capacity retry and the fallback machine types, and the internal
+// kinds do, and what Google Cloud fixes, with its reasons, once.
+test('the Compute Engine page: the settings by level, what Google Cloud fixes and why, the wake mode by load balancer', () => {
+  const page = flat(read(CE));
+  assert.match(page, /## Settings and their levels/);
+  assert.match(page, /A workload's settings come from AWS's levels: the workload, its type, the router, then the built-in value/);
+  assert.match(page, /PUT \/v1\/workloads\/\{id\}\/settings/);
+  assert.match(page, /GET and PUT \/v1\/settings/);
+  assert.match(page, /The organization level and the custom types are the manager's, so on Google Cloud the organization level reads as unset and only the built-in types exist/);
+  assert.match(page, /instance is a VM of an unmanaged instance group or of a zonal network endpoint group, asg a managed instance group, k8s GKE pods and databases a Cloud SQL companion/);
+  assert.match(page, /The built-in wake timeout is 600 s for every kind, but the databases type's 1800 s, brought to 1700 s/);
+  for (const row of [
+    '| waitSeconds | 0 | The waker holds no request. Behind a swap, the switch back takes longer than any hold (regional 100 s, classic 250 s). Behind the policy, the waker receives only the error fetch. |',
+    '| maxHolders | 0 | No request is held. |',
+    '| drainSeconds | 0 | The nap\'s switch is a URL map change, and the backend service\'s own connection draining applies. |',
+    '| wakeMode | browser behind the global load balancer\'s policy |',
+    '| wakeTimeoutSeconds | at most 1700 | One controller request lasts at most 1800 s. |',
+    '| wakeTimeoutSeconds | more than the swap\'s wait + 60 s behind a swap |',
+  ]) assert.ok(page.includes(row), row);
+  assert.match(page, /The origin is fixed/);
+  assert.match(page, /An explicit workload value outside these bounds is refused; an inherited one is brought into them and shown with the origin fixed, so a router's value never makes a workload unwakeable/);
+  assert.match(page, /the global load balancer's waiting page can't see the visitor's request, so only the page's probe, an explicit wake or a wake rule wakes it \(wake mode browser\)/);
+  assert.match(page, /At the router's level, any is accepted: it applies to the workloads behind a swap/);
+  assert.match(page, /A configuration written before the levels has no inherits: an idleMinutes of 15 and a failedRetrySeconds of 60 are read as inherited, its wake timeout stays its own, and nothing is rewritten/);
+  assert.match(page, /The check, the nap, the wake and the release use the resolved values/);
+  assert.match(page, /A router level never read on this controller instance takes no idle nap or release decision, waits the longest wake timeout \(1700 s\) and stops plainly, logged SettingsLevelUnreadable/);
+  assert.match(page, /Behind the global load balancer's policy the wake mode is browser, fixed/);
+  assert.match(page, /Behind a swap \(regional, classic and the internal kinds\) the default wake mode is any: a request the filters let through wakes the workload and is answered with the waiting page at once, with no hold/);
+  assert.match(page, /In browser, only the page's probe, an explicit wake or a wake rule wakes it/);
+  assert.match(page, /scanners' requests count as deferred:browser mode/);
+  assert.match(page, /A visitor on a \.php URL or on a path a no-wake rule keeps gets a page whose probe never wakes the workload/);
+  assert.match(page, /The wake header x-dormeto-wake: 1 and the probe header wake on the policy's fetch and under a swap/);
+  assert.match(page, /A decision that fails is logged WakeDecisionFailed and the page is answered all the same/);
+  assert.doesNotMatch(page, /A plain request still does not wake/);
+});
+
+test('the Compute Engine page: what a rule sees on each request', () => {
+  const page = flat(read(CE));
+  assert.match(page, /At most 20 rules per list and level, which add up across the levels, the most general first; the first match decides, and a level's list replaces that level's list as a whole/);
+  assert.match(page, /The order is the shared classify's: the no-wake rules, then HEAD, bots and scanner paths, the wake header, the wake rules, the IP lists, the probe and the wake mode/);
+  for (const row of [
+    '| A visitor\'s request behind a swap | the client\'s address | the request\'s own | the visitor\'s path |',
+    '| The page\'s probe | the client\'s address | the browser\'s request | the visitor\'s path, sent by the page in x-dormeto-path from location.pathname |',
+    '| The policy\'s error fetch | the client\'s address | what the fetch carries: Host, User-Agent, Referer | none: a path condition never matches |',
+    '| An explicit POST /_dormeto/wake | the client\'s address | the request\'s own | /_dormeto/wake |',
+  ]) assert.ok(page.includes(row), row);
+  assert.match(page, /A forged x-dormeto-path bypasses nothing a client couldn't bypass by requesting another path/);
+  assert.match(page, /The router level holds the router-wide rules: there is no Terraform level on Google Cloud/);
+});
+
+test('the Compute Engine page: the waiting page, its storage and its custom-pages switch', () => {
+  const page = flat(read(CE));
+  assert.match(page, /## The waiting page/);
+  for (const needle of ['router/settings', 'router/page', 'pages/<id>', 'favicons/<id>', 'recentWakes',
+    'GET, PUT and DELETE /v1/workloads/{id}/waiting-page', 'GET, PUT and DELETE /v1/waiting-page']) {
+    assert.ok(page.includes(needle), needle);
+  }
+  assert.match(page, /The answers have AWS's shape: own, inherited, effective, from, favicon, warnings, terraform, by and at/);
+  assert.match(page, /icon of 64 KiB at most, a title of 80 characters, a description of 500, HTML of 256 KiB/);
+  assert.match(page, /custom pages are off on this router: an administrator turns them on with dormeto gcp install --custom-pages/);
+  assert.match(page, /DMT_CUSTOM_PAGES=1 on the controller and the waker/);
+  assert.match(page, /a custom page already stored is read as absent: the template levels or the default page show/);
+  assert.match(page, /WaitingPageSet records the size and the SHA-256 of a page, never its content/);
+  assert.match(page, /The waker renders through a cache of 60 s, 1 s per read, which keeps the last value when a read fails/);
+  assert.match(page, /the language from Accept-Language, English or French, with vary: accept-language/);
+  assert.match(page, /the headers x-dormeto-wake-elapsed and x-dormeto-wake-typical/);
+  assert.match(page, /filled from the median of the last 10 wakes/);
+  assert.match(page, /The favicon is read at a nap, at most once a day, in 3 s, when the icon is auto and the workload awake/);
+  assert.match(page, /from the first host rule whose path matcher sends the whole of \/ to the workload's backend service by the path alone/);
+  assert.match(page, /A host whose \/ goes elsewhere or depends on more than the path \(a regex or a path template match, a header\), or a wildcard host, gives no favicon: no rule for the whole of a host name/);
+  assert.match(page, /The internal kinds get none/);
+  assert.match(page, /An offboarding deletes pages\/<id> and favicons\/<id>/);
+  assert.match(page, /Whether the policy's error fetch carries Accept-Language and Cookie, whether its page's Content-Security-Policy and Vary reach the visitor, and the largest answer that passes whole, are not measured yet/);
+});
+
+test('the Compute Engine page: the capacity retry and the fallback machine types', () => {
+  const page = flat(read(CE));
+  assert.match(page, /## Capacity and fallback machine types/);
+  assert.doesNotMatch(page, /There is no fallback machine type/);
+  assert.match(page, /every start and resume of a VM or a managed group refused for lack of capacity \(ZONE_RESOURCE_POOL_EXHAUSTED, POOL_CAPACITY_INSUFFICIENT\) is tried again within the wake: after 30 s, 60 s, then every 120 s until the wake's deadline/);
+  assert.match(page, /A quota error is never retried this way/);
+  assert.match(page, /fallbackInstanceTypes, set at the onboarding with --fallback-type, at most 5, for the VMs of unmanaged instance groups and zonal network endpoint groups/);
+  assert.match(page, /fallback machine types are for VMs of unmanaged instance groups: a managed group's machine type is its template's/);
+  assert.match(page, /Each VM starts on its own type first\. On a capacity error the router sets the next type of its own and the list on the stopped VM \(instances\.setMachineType\) and starts it again/);
+  assert.match(page, /Past the list the VM stays on its last type, and the retry's waits apply to it/);
+  assert.match(page, /A suspended VM resumes on its own type, with the retry only: Google changes no machine type while a VM is suspended/);
+  assert.match(page, /A list turns hibernation off unless the workload says true/);
+  assert.match(page, /the type is of the VM's series, or both series are first or second generation ones \(N1, N2, N2D, E2, C2, C2D, M1, M2, T2D\)/);
+  assert.match(page, /instanceTypes \(\{<vm>: \{from, to\}\}\)/);
+  assert.match(page, /InstanceTypeFallback/);
+  assert.match(page, /InstanceTypeNotReverted/);
+  assert.match(page, /The nap, after the VMs stop, and the release give each VM its own type back/);
+  assert.match(page, /compute\.instances\.setMachineType, in dormetoRouterBackends under its dormeto=managed condition/);
+  assert.match(page, /the router's role lacks compute\.instances\.setMachineType: run dormeto gcp install again/);
+});
+
+test('the Compute Engine page: the internal Application Load Balancers', () => {
+  const page = flat(read(CE));
+  assert.match(page, /## Internal load balancers/);
+  assert.match(page, /internal: a regional map whose forwarding rules are INTERNAL_MANAGED, in the router's region/);
+  assert.match(page, /cross-region-internal: a global map whose rules are INTERNAL_MANAGED, onboardable on any router/);
+  assert.match(page, /INTERNAL_SELF_MANAGED \(Cloud Service Mesh\) stays refused/);
+  assert.match(page, /Google documents no custom error response on either, so the switch is the swap/);
+  assert.match(page, /loadbalancing\.googleapis\.com\/https\/internal\/request_count/);
+  assert.match(page, /internal_http_lb_rule/);
+  assert.match(page, /That Google accepts an INTERNAL_MANAGED waker backend service on the router's serverless network endpoint group, and each kind's SWAP_WAIT, are not measured yet: both use a regional load balancer's 100 s/);
+  assert.match(page, /The visitors' addresses are private/);
+  assert.match(page, /5,000 queries a second/);
+  assert.match(page, /A cross-region internal load balancer's waker is in one region/);
+  assert.match(page, /enable_internal/);
+  assert.doesNotMatch(page, /Internal load balancers and Cloud Run backends are not supported/);
+  assert.match(page, /Application Load Balancers only: external \(global, regional and classic\) and internal \(regional and cross-region\)/);
+});
+
+test('the GKE page: the exact refusal of GKE\'s own load balancers, and the way', () => {
+  const page = flat(read(GKE));
+  assert.match(page, /a URL map named k8s2-, k8s-um-, gkegw1-, gkemcg1- or mci-/);
+  assert.match(page, /a map whose description names k8sResource \(a Gateway's\), or whose target proxy or forwarding rule carries kubernetes\.io\/ingress-name \(an Ingress's\), whatever its name/);
+  assert.match(page, /Give the Service a standalone network endpoint group \(cloud\.google\.com\/neg\)/);
+  assert.match(page, /The default wake timeout is 600 s, whatever the load balancer; 1700 s with a Cloud SQL companion/);
+  assert.doesNotMatch(page, /400 s and 550 s/);
+});
+
+test('the README and the Cloud SQL page say the G5 features and the 1700 s fixed value', () => {
+  const readme = flat(read('README.md'));
+  assert.match(readme, /The Google Cloud router has AWS's settings by level, the wake mode and the no-wake and wake rules, the branded waiting page, a capacity retry with fallback machine types, and the internal Application Load Balancers/);
+  assert.match(readme, /enable_internal/);
+  assert.match(flat(read(SQL)), /The wake timeout 1700 s is fixed: the databases type's 1800 s is brought to the most a wake can take/);
 });

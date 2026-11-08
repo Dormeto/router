@@ -93,8 +93,8 @@ outside the router the same day: back to 1 replica, the new pod's endpoint was i
 `503` within 0.5 s, the endpoint read `UNHEALTHY` at 17 s, no status at 41 s, and left at 45 s; the NEG was kept, empty.
 
 When no node has room for the pods, the node autoscaler, or Autopilot, must add one first, which adds its time. The
-default wake timeout is 300 s, plus the map's change on a regional or classic load balancer (400 s and 550 s), and
-1700 s with a Cloud SQL companion.
+default wake timeout is 600 s, whatever the load balancer (behind a swap it can't be less than the map's change plus 60 s),
+and 1700 s with a Cloud SQL companion.
 
 ## Behavior
 
@@ -149,12 +149,15 @@ label is refused at the onboarding and left alone.
 
 - **Standard clusters save less.** Scaling pods saves money only on Autopilot, or with the node autoscaler freeing a
   node: a Standard cluster's fixed nodes are paid all the same. The onboarding warns of it.
-- **Standalone NEGs on a load balancer of your own.** A load balancer GKE owns, from a Gateway or an Ingress (its URL map
-  named `k8s2-`, `gkegw1-` or `gkemcg1-`), is refused: GKE writes its map back. Measured: a custom error response policy
+- **Standalone NEGs on a load balancer of your own.** A load balancer GKE owns, from a Gateway, an Ingress or a Multi Cluster
+  Ingress, is refused: GKE writes its map back. It is told by a URL map named `k8s2-`, `k8s-um-`, `gkegw1-`, `gkemcg1-` or `mci-`
+  (`k8s-um-` is an older Ingress's, `mci-` a Multi Cluster Ingress's), and by the descriptions GKE writes: a map whose description
+  names `k8sResource` (a Gateway's), or whose target proxy or forwarding rule carries `kubernetes.io/ingress-name` (an Ingress's),
+  whatever its name. Measured: a custom error response policy
   written on a Gateway's map stayed 20 minutes, through an annotation of the HTTPRoute, and GKE took it away, without a
   word, 48 s after the HTTPRoute's rules changed. It lasts until the next change of the Gateway or its routes, which a
-  sleeping workload cannot trust. Give the Service a standalone NEG (`cloud.google.com/neg`), name it in a backend
-  service of your own load balancer, and onboard that.
+  sleeping workload cannot trust. Give the Service a standalone network endpoint group (`cloud.google.com/neg`), name it in a backend
+  service of your own load balancer, and onboard that: the refusal says so.
 - **The DNS endpoint only.** The router reaches a cluster through its DNS endpoint and no other way: no IP endpoint, no
   VPC connector. A private cluster too: turn its DNS endpoint on.
 - **Deployments and StatefulSets only, one owner, one Service.** Each backend of the backend service is a zonal NEG of the
@@ -186,8 +189,9 @@ label is refused at the onboarding and left alone.
   that `--gke-cluster` names: name the right one.
 - **Only requests through the load balancer wake the workload.** Calls from inside the cluster to the Service do not,
   and do not keep it awake.
-- **Wake timeout.** 300 s by default, plus SWAP_WAIT on a regional or classic load balancer; 1700 s with a Cloud SQL
-  companion ([Google Cloud: Cloud SQL databases](google-cloud-sql.md)).
+- **Wake timeout.** The default wake timeout is 600 s, whatever the load balancer; 1700 s with a Cloud SQL companion
+  ([Google Cloud: Cloud SQL databases](google-cloud-sql.md)). The settings are the [Compute Engine page's](google-cloud-compute-engine.md#settings-and-their-levels):
+  the type here is `k8s`, and fallback machine types are refused for pods.
 - **Terraform.** On `kubernetes_deployment_v1` or `kubernetes_stateful_set_v1`,
   `lifecycle { ignore_changes = [spec[0].replicas] }`: a nap sets it to 0, and an apply would start the pods while the
   workload sleeps (the next check then makes it awake). The Role and RoleBinding `dormeto-<workload>` are the CLI's: keep

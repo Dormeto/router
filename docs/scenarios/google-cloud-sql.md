@@ -60,7 +60,8 @@ after 104 s. The application's backends start only once the database runs, so th
 instances and other engines were not measured. Visitors see the waiting page meanwhile, which reloads by itself.
 
 The default wake timeout of a workload with a companion is 1700 s, whatever its other backends and its load balancer
-(AWS's 1800 s does not fit the controller's request of 1800 s).
+(AWS's 1800 s does not fit the controller's request of 1800 s). The wake timeout 1700 s is fixed: the `databases` type's 1800 s is
+brought to the most a wake can take, and `show` says `fixed` ([Settings](google-cloud-compute-engine.md#settings-and-their-levels)).
 
 ## Behavior
 

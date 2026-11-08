@@ -610,6 +610,11 @@ Router 0.37.0 adds zonal network endpoint groups, the regional and classic load 
 `dormetoRouterDatabases` and `dormetoRouterKubernetes`, and a Kubernetes Role per GKE workload, which the CLI applies).
 They were accepted on 2026-11-04 in `dormeto-dev` with CLI 0.11.0: each page says what was accepted and measured.
 
+The Google Cloud router has AWS's settings by level, the wake mode and the no-wake and wake rules, the branded waiting page, a
+capacity retry with fallback machine types, and the internal Application Load Balancers: the [Compute Engine
+page](docs/scenarios/google-cloud-compute-engine.md) says what each does, what Google Cloud fixes and why, and
+[Kubernetes on GKE](docs/scenarios/google-kubernetes-engine.md) says which load balancers GKE owns and are refused.
+
 Router 0.38.0 fixes the limits of 0.37.0 on Google Cloud, and each is on the
 [Compute Engine page](docs/scenarios/google-cloud-compute-engine.md): a running wake or nap beats every minute, and one
 that stops is sent again or called stuck within minutes; the naps of one URL map share its updates, and a busy map gives
@@ -650,7 +655,8 @@ The image carries `package.json`, `lambda/src/lib` and `gcp/src` only, on `gcr.i
 24.2 or later: `server.mjs` uses `import.meta.main`). `gcp/access.json` is the manifest of the access the router needs.
 `terraform/gcp-dev` is the demo VMs and load balancers of the acceptance, with no IAM; its classic load balancer, zonal
 NEG, Cloud SQL instance and GKE cluster are behind variables that default to off (`enable_classic`, `enable_neg`,
-`enable_sql`, `enable_gke`, plus `enable_classic_standard` and `enable_ten` with `ten_map` for the measures).
+`enable_sql`, `enable_gke`, plus `enable_classic_standard` and `enable_ten` with `ten_map` for the measures, and `enable_internal` for the
+internal load balancers).
 
 ## Version
 

@@ -41,8 +41,8 @@ const MAP_HEADERS = [['x-dormeto-workload', 'demo'], ['x-dormeto-switch', 'swap'
 for (const [kind, lb, base, adapter, waitMs, headers] of [
   ['regional', { kind: 'regional', region: 'europe-west1' }, `${V1}/regions/europe-west1`, regionalUrlmaps, 100_000, MAP_HEADERS],
   ['classic', { kind: 'classic' }, `${V1}/global`, urlmaps, 250_000, undefined],
-  ['internal', { kind: 'internal', region: 'europe-west1' }, `${V1}/regions/europe-west1`, regionalUrlmaps, 100_000, MAP_HEADERS],
-  ['cross-region-internal', { kind: 'cross-region-internal' }, `${V1}/global`, urlmaps, 100_000, MAP_HEADERS],
+  ['internal', { kind: 'internal', region: 'europe-west1' }, `${V1}/regions/europe-west1`, regionalUrlmaps, 30_000, MAP_HEADERS],
+  ['cross-region-internal', { kind: 'cross-region-internal' }, `${V1}/global`, urlmaps, 150_000, MAP_HEADERS],
 ]) {
   const waker = `${base}/backendServices/${WAKER}`;
   const app = `${base}/backendServices/app`;

@@ -179,7 +179,8 @@ function setup({
   const log = Object.fromEntries(['info', 'warn', 'error'].map((level) => [level, (event, fields = {}) => world.logs.push({ level, event, ...fields })]));
   const sleep = async (ms) => {
     world.sleeps.push(ms);
-    if (ms >= MINUTE) world.calls.push(`wait ${ms / 1000} s`);
+    // A wait is a sleep of a minute or more, or the swap's own where it is shorter (regional internal's 30 s, which a swap test sets).
+    if (ms >= MINUTE || ms === world.swapWaitMs) world.calls.push(`wait ${ms / 1000} s`);
     await clock.sleep(ms);
   };
   const urlmaps = createUrlMaps({ google, project: 'p', now: clock.now, sleep });
@@ -808,13 +809,13 @@ test('a nap\'s heartbeat: a beat 2 minutes old holds; none 90 s after its NAPPIN
 // --- A regional, classic or internal workload: the swap (the coverage design's section 7; G5's design, section 7) --------------
 
 // A regional waker's headers are in the map (M4), as an internal one's, regional or cross-region (Google's page), the cross-region
-// one's map global; a classic one's on its backend service. The internal kinds wait as regional does until M3 measures them.
+// one's map global; a classic one's on its backend service. The internal kinds wait as M3 measured them (30 s, 150 s).
 const SWAP_HEADERS = [['x-dormeto-workload', 'demo'], ['x-dormeto-switch', 'swap']];
 const SWAPS = [
   ['regional', { kind: 'regional', region: 'europe-west1' }, `${V1}/regions/europe-west1`, 100, 'europe-west1', SWAP_HEADERS],
   ['classic', { kind: 'classic' }, `${V1}/global`, 250, 'global', undefined],
-  ['internal', { kind: 'internal', region: 'europe-west1' }, `${V1}/regions/europe-west1`, 100, 'europe-west1', SWAP_HEADERS],
-  ['cross-region-internal', { kind: 'cross-region-internal' }, `${V1}/global`, 100, 'global', SWAP_HEADERS],
+  ['internal', { kind: 'internal', region: 'europe-west1' }, `${V1}/regions/europe-west1`, 30, 'europe-west1', SWAP_HEADERS],
+  ['cross-region-internal', { kind: 'cross-region-internal' }, `${V1}/global`, 150, 'global', SWAP_HEADERS],
 ];
 
 for (const [kind, lb, base, waitSeconds, healthScope, headers] of SWAPS) {
@@ -843,6 +844,7 @@ for (const [kind, lb, base, waitSeconds, healthScope, headers] of SWAPS) {
   // `calls` also says the state changes, between what changes the map and the VMs.
   const swapSetup = ({ cfg = {}, vms = { 'vm-a': { status: 'RUNNING' } }, map = awakeMap(), ...rest } = {}) => {
     const t = setup({ cfg: { lb, hibernate: false, ...cfg }, vms, map, ...rest });
+    t.world.swapWaitMs = WAIT_MS;
     t.world.mapLine = (body) => `map ${isSwapped(body) ? 'swapped' : 'unswapped'}`;
     const { transition } = t.store;
     t.store.transition = async (id, change) => {
@@ -860,7 +862,7 @@ for (const [kind, lb, base, waitSeconds, healthScope, headers] of SWAPS) {
     const out = await t.controller.nap('demo');
     assert.equal(out.state, STATES.ASLEEP);
     assert.deepEqual(t.world.calls, [`state ${STATES.NAPPING}`, 'map swapped', WAIT, 'stop vm-a', `state ${STATES.ASLEEP}`]);
-    assert.deepEqual(t.world.sleeps.filter((ms) => ms >= MINUTE), [WAIT_MS]);
+    assert.deepEqual(t.world.sleeps.filter((ms) => ms >= MINUTE || ms === WAIT_MS), [WAIT_MS]);
     assert.deepEqual(t.world.map, { ...swappedMap(), fingerprint: 'f1' });
     assert.deepEqual([...t.world.mapWrites], [`${base}/urlMaps/lb`]);
     assert.deepEqual(t.run().stopped, ['vm-a']);
@@ -968,8 +970,9 @@ for (const [kind, lb, base, waitSeconds, healthScope, headers] of SWAPS) {
     t.world.conflicts = 100;
     const out = await t.controller.nap('demo');
     assert.equal(out.aborted, true);
-    assert.deepEqual(t.world.calls, [`state ${STATES.NAPPING}`, `state ${STATES.AWAKE}`]);
-    assert.equal(t.world.sleeps.includes(WAIT_MS), false);
+    // The busy map's pauses are 30 s each, as regional internal's wait is: only the map's writes, and no wait where it differs, tell.
+    assert.deepEqual(t.world.calls.filter((call) => WAIT_MS === 30_000 ? !call.startsWith('wait') : true), [`state ${STATES.NAPPING}`, `state ${STATES.AWAKE}`]);
+    if (WAIT_MS !== 30_000) assert.equal(t.world.sleeps.includes(WAIT_MS), false);
     assert.equal(t.world.puts, 0);
     assert.equal(t.run().napAborted.reason, 'map-busy');
     assert.equal(t.run().failure, undefined);
@@ -1130,6 +1133,7 @@ for (const [kind, lb, base, waitSeconds, healthScope, headers] of SWAPS) {
     // A map's update at its worst: the operation's 120 s and the pauses of a map busy with another (urlmaps.mjs), by its scope.
     const update = regionalScope ? 240_000 : 180_000;
     const t = swapSetup();
+    t.world.swapWaitMs = WAIT_MS;
     t.world.mapLine = (body) => `map ${isSwapped(body) ? 'swapped' : 'unswapped'}${body.description ? ` on ${body.description}` : ''}`;
     // Another workload's change of the map, its update held until the nap's write waits for it.
     const maps = regionalScope ? t.regionalUrlmaps : t.urlmaps;
@@ -1469,10 +1473,14 @@ for (const [kind, lb, base, waitSeconds, healthScope, headers] of SWAPS) {
     const slow = swapSetup({ run: waking(START), cfg: { wakeTimeoutSeconds: 1700 }, vms: { 'vm-a': { status: 'TERMINATED' } }, map: swappedMap(), unhealthyPolls: polls(1_400_000) });
     assert.equal((await slow.controller.wake('demo', 'w1')).state, STATES.AWAKE);
     assert.ok(slow.clock.now() - START < REQUEST_LIMIT - 30_000, `${slow.clock.now() - START} ms`);
-    const late = swapSetup({ run: waking(START), cfg: { wakeTimeoutSeconds: 1700 }, vms: { 'vm-a': { status: 'TERMINATED' } }, map: swappedMap(), unhealthyPolls: polls(1_690_000) });
-    assert.equal((await late.controller.wake('demo', 'w1')).state, STATES.FAILED);
-    assert.equal(late.world.puts, 0);
-    assert.equal(JSON.parse(late.run().failure).kind, 'timeout');
+    // The request's budget (1,740 s) less the wait binds before the timeout (1,700 s) only where the wait is over 40 s: the 30 s one
+    // never leaves a healthy VM past it.
+    if (WAIT_MS > 40_000) {
+      const late = swapSetup({ run: waking(START), cfg: { wakeTimeoutSeconds: 1700 }, vms: { 'vm-a': { status: 'TERMINATED' } }, map: swappedMap(), unhealthyPolls: polls(1_690_000) });
+      assert.equal((await late.controller.wake('demo', 'w1')).state, STATES.FAILED);
+      assert.equal(late.world.puts, 0);
+      assert.equal(JSON.parse(late.run().failure).kind, 'timeout');
+    }
   });
 
   test(`${kind} wake: in its wait past the timeout, it is not called stuck; past the wait too, it is`, async () => {

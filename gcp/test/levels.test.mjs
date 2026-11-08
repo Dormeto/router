@@ -88,22 +88,23 @@ test('isPolicy and swapFloorOf', () => {
   assert.deepEqual([swapFloorOf(undefined), swapFloorOf({ kind: 'global' }), swapFloorOf({ kind: 'regional' }), swapFloorOf({ kind: 'classic' })], [null, null, 161, 311]);
 });
 
-// The internal kinds swap, with regional's wait until M3 measures theirs. A kind not known, as the onboarding's load balancer before it
+// The internal kinds swap, with the waits M3 measured (30 s and 150 s). A kind not known, as the onboarding's load balancer before it
 // is read, is neither the policy nor a swap: what the settings ask of it waits until it is known.
-test('isPolicy and swapFloorOf: the internal kinds swap, at regional\'s floor; a kind not known is neither', () => {
+test('isPolicy and swapFloorOf: the internal kinds swap, at their measured floors; a kind not known is neither', () => {
   const kinds = [{ kind: 'internal', region: 'r' }, { kind: 'cross-region-internal' }, { kind: 'unread' }];
   assert.deepEqual(kinds.map(isPolicy), [false, false, false]);
-  assert.deepEqual(kinds.map(swapFloorOf), [161, 161, null]);
+  assert.deepEqual(kinds.map(swapFloorOf), [91, 211, null]);
 });
 
 test('levelProblems: the internal kinds\' floor, worded as regional\'s', () => {
-  for (const [lb, words] of [[{ kind: 'internal', region: 'europe-west1' }, 'an internal'], [{ kind: 'cross-region-internal' }, 'a cross-region-internal']]) {
+  for (const [lb, words, floor] of [[{ kind: 'internal', region: 'europe-west1' }, 'an internal', 91], [{ kind: 'cross-region-internal' }, 'a cross-region-internal', 211]]) {
+    const change = floor - 61;
     const cfg = { backends: [vm], lb };
-    assert.deepEqual(levelProblems({ wakeTimeoutSeconds: 161 }, { level: 'workload', cfg }), []);
-    assert.deepEqual(levelProblems({ wakeTimeoutSeconds: 120 }, { level: 'workload', cfg }),
-      [`wakeTimeoutSeconds 120 is too short for ${words} load balancer: its wake includes the URL map's change, 100 s: use more than 160`]);
+    assert.deepEqual(levelProblems({ wakeTimeoutSeconds: floor }, { level: 'workload', cfg }), []);
+    assert.deepEqual(levelProblems({ wakeTimeoutSeconds: floor - 1 }, { level: 'workload', cfg }),
+      [`wakeTimeoutSeconds ${floor - 1} is too short for ${words} load balancer: its wake includes the URL map's change, ${change} s: use more than ${floor - 1}`]);
     assert.deepEqual(levelProblems({ wakeMode: 'any' }, { level: 'workload', cfg }), []);
-    assert.deepEqual([effectiveOf({ ...cfg, inherits: [] }, { router: { defaults: { wakeTimeoutSeconds: 60 } } }).wakeTimeoutSeconds, effectiveOf({ ...cfg, inherits: [] }, {}).settingsFrom.wakeMode], [161, 'default']);
+    assert.deepEqual([effectiveOf({ ...cfg, inherits: [] }, { router: { defaults: { wakeTimeoutSeconds: 60 } } }).wakeTimeoutSeconds, effectiveOf({ ...cfg, inherits: [] }, {}).settingsFrom.wakeMode], [floor, 'default']);
   }
 });
 

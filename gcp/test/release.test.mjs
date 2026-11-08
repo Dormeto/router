@@ -235,7 +235,7 @@ test('the Compute Engine page: the swap of regional and classic load balancers, 
   assert.match(page, /Ten naps on one regional URL map/);
   assert.match(spaced(read(CE)), /A header of your own named `x-dormeto-\*` on a regional map's swapped entry is replaced at the swap and not given back/);
   assert.match(page, /about 250 s or more on a regional load balancer and 340 s or more on a classic one/);
-  assert.match(page, /A wake timeout of SWAP_WAIT plus 60 s or less \(160 s regional, 310 s classic\) is refused/);
+  assert.match(page, /A wake timeout of SWAP_WAIT plus 60 s or less \(160 s regional, 310 s classic, 90 s internal, 210 s cross-region internal\) is refused/);
 });
 
 test('the Compute Engine page: schedules, pauses and IP lists, with what they do not hold', () => {
@@ -514,7 +514,16 @@ test('the Compute Engine page: the internal Application Load Balancers', () => {
   assert.match(page, /Google documents no custom error response on either, so the switch is the swap/);
   assert.match(page, /loadbalancing\.googleapis\.com\/https\/internal\/request_count/);
   assert.match(page, /internal_http_lb_rule/);
-  assert.match(page, /That Google accepts an INTERNAL_MANAGED waker backend service on the router's serverless network endpoint group, and each kind's SWAP_WAIT, are not measured yet: both use a regional load balancer's 100 s/);
+  assert.doesNotMatch(page, /are not measured yet: both use a regional load balancer's 100 s|regional's 100 s until measured|to be confirmed by the measure/);
+  assert.match(page, /Google accepts an INTERNAL_MANAGED waker backend service, regional and global, on the router's serverless network endpoint group \(measured 2026-11-08\)/);
+  assert.match(page, /SWAP_WAIT is 30 s on an internal load balancer and 150 s on a cross-region one/);
+  assert.match(page, /regional internal, the other side's first answer came 0 to 3 s after the map write's operation ended \(six writes, each 5 to 7 s\); cross-region internal, 28 to 120 s \(nine writes, each about 40 s\)/);
+  assert.match(page, /A wake timeout of 90 s or less on an internal load balancer, or 210 s or less on a cross-region one, is refused/);
+  assert.match(page, /the waker's ingress admits both internal kinds/);
+  assert.match(page, /forged X-Forwarded-For of 1\.2\.3\.4 was ignored and the client's private address named, behind both kinds/);
+  assert.match(page, /Measured 2026-11-08: the resource internal_http_lb_rule, log requests, backend_target_name the plain name, remoteIp with a port, about 7\.5 s late/);
+  assert.match(page, /The cross-region kind's entries carry the forwarding rule's region, its metric points region: global/);
+  assert.match(page, /wake mode any woke on a plain request behind the cross-region kind/);
   assert.match(page, /The visitors' addresses are private/);
   assert.match(page, /5,000 queries a second/);
   assert.match(page, /A cross-region internal load balancer's waker is in one region/);
@@ -546,5 +555,5 @@ test('the Compute Engine page: the controller reads the router level without a c
   assert.match(page, /The controller reads the router level from the store, once per check and once per wake, nap or release, and keeps the last record it read; the waker keeps it 60 s in a cache/);
   assert.match(page, /the databases type's built-in is AWS's 1800 s, brought to Google Cloud's cap of 1700 s and shown fixed/);
   assert.match(page, /5,000 queries a second \(Google's documentation\)/);
-  assert.match(page, /the waker's ingress admits internal load balancers \(Google's documentation, to be confirmed by the measure\)/);
+  assert.match(page, /the waker's ingress admits both internal kinds \(measured 2026-11-08\)/);
 });

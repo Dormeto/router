@@ -986,13 +986,13 @@ test('wakeTimeoutSeconds: 600 by default on a global load balancer; 60 and 1700 
   }
 });
 
-// The map's change is included in the wake: an explicit timeout must leave room for it (the ruling of R9). The internal kinds wait as
-// regional does until M3 measures them. `mapOf`: where the kind's map is.
+// The map's change is included in the wake: an explicit timeout must leave room for it (the ruling of R9). The internal kinds wait as M3 measured them (30 s, 150 s).
+// `mapOf`: where the kind's map is.
 const SWAPPED_KINDS = [
   ['regional', regional, 160, (w) => w.regions[REGION].urlMaps.lb],
   ['classic', classic, 310, (w) => w.urlMaps.lb],
-  ['internal', internal, 160, (w) => w.regions[REGION].urlMaps.lb],
-  ['cross-region-internal', crossRegionInternal, 160, (w) => w.urlMaps.lb],
+  ['internal', internal, 90, (w) => w.regions[REGION].urlMaps.lb],
+  ['cross-region-internal', crossRegionInternal, 210, (w) => w.urlMaps.lb],
 ];
 for (const [kind, world, lowest, mapIn] of SWAPPED_KINDS) {
   test(`${kind}: a wakeTimeoutSeconds not above SWAP_WAIT plus 60 s is refused, with the words, at the dry run and the onboarding`, async () => {
@@ -2352,10 +2352,10 @@ test('a global onboarding with wakeMode any is refused with the reason, at the d
 });
 
 test('the regional onboarding with wakeTimeoutSeconds 120 is refused as before G5: the map\'s change leaves it no room; the internal ones in the same words', async () => {
-  for (const [world, words] of [[regional, 'a regional'], [internal, 'an internal'], [crossRegionInternal, 'a cross-region-internal']]) {
+  for (const [world, words, asked, change] of [[regional, 'a regional', 120, 100], [internal, 'an internal', 90, 30], [crossRegionInternal, 'a cross-region-internal', 210, 150]]) {
     const { w, store, onboarding } = setup(world);
-    await assert.rejects(onboarding.onboard({ ...INPUT, settings: { wakeTimeoutSeconds: 120 } }), refused(400, 'not-eligible',
-      new RegExp(`^cannot onboard demo: settings: wakeTimeoutSeconds 120 is too short for ${words} load balancer: its wake includes the URL map's change, 100 s: use more than 160$`)));
+    await assert.rejects(onboarding.onboard({ ...INPUT, settings: { wakeTimeoutSeconds: asked } }), refused(400, 'not-eligible',
+      new RegExp(`^cannot onboard demo: settings: wakeTimeoutSeconds ${asked} is too short for ${words} load balancer: its wake includes the URL map's change, ${change} s: use more than ${change + 60}$`)));
     assert.deepEqual(w.changes, []);
     assert.equal(store.configs.size, 0);
   }
@@ -2405,7 +2405,7 @@ test('PUT settings: what a level refuses is a 400 with the problems, nothing wri
     [setup, { waitSeconds: 0, maxHolders: 0 }, [`settings: ${WAIT_FIXED}`, 'settings: maxHolders is 0 on Google Cloud: no request is held']],
     [setup, { wakeMode: 'any' }, [`settings: ${BROWSER_ONLY}`]],
     [() => setup(regional), { wakeTimeoutSeconds: 120 }, ['settings: wakeTimeoutSeconds 120 is too short for a regional load balancer: its wake includes the URL map\'s change, 100 s: use more than 160']],
-    [() => setup(internal), { wakeTimeoutSeconds: 120 }, ['settings: wakeTimeoutSeconds 120 is too short for an internal load balancer: its wake includes the URL map\'s change, 100 s: use more than 160']],
+    [() => setup(internal), { wakeTimeoutSeconds: 90 }, ['settings: wakeTimeoutSeconds 90 is too short for an internal load balancer: its wake includes the URL map\'s change, 30 s: use more than 90']],
     [setup, { wakeTimeoutSeconds: 1800 }, ['settings: wakeTimeoutSeconds must be at most 1700: one controller request lasts at most 1800 s']],
     [setup, { joinMinutes: 10 }, ['settings: a workload\'s joinMinutes is on its schedule']],
     [setup, { hibernate: 'yes' }, ['settings: hibernate must be true, false or null']],

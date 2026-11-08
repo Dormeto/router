@@ -14,8 +14,10 @@ const COMPUTE = 'https://compute.googleapis.com/compute/v1';
 // The nap's policy reaching the load balancer (G0: 163 to 215 s), which is also the application's drain.
 const POLICY_WAIT_MS = 300_000;
 // SWAP_WAIT, by the load balancer's kind: a map's change reaching the load balancer. Regional: G0's worst 89 s, M3 35 s;
-// classic: M2's worst 226 s and 10 %. The internal kinds: regional's until G5's M3 measures them (Envoy-based, as regional).
-export const SWAP_WAIT_MS = { regional: 100_000, classic: 250_000, internal: 100_000, 'cross-region-internal': 100_000 };
+// classic: M2's worst 226 s and 10 %. The internal kinds, G5's M3 (2026-11-08, dormeto-dev): regional internal, the other side's first
+// answer 0 to 3 s after the map write's operation ended (six writes, each 5 to 7 s); cross-region internal, 28 to 120 s (nine writes,
+// each about 40 s). The waits are ten times and one and a quarter times the worst.
+export const SWAP_WAIT_MS = { regional: 100_000, classic: 250_000, internal: 30_000, 'cross-region-internal': 150_000 };
 
 // The kinds whose map, backend services and waker are in the router's region; the others' are global.
 const REGIONAL_KINDS = new Set(['regional', 'internal']);

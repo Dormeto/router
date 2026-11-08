@@ -265,7 +265,7 @@ A regional or classic external Application Load Balancer has no custom error res
 So the router changes the URL map itself, one `update` at each nap and one at each wake: every reference to the
 application's backend service (the map's default, a path matcher's default, path rules, route rules, weighted services)
 becomes the workload's waker backend service, and back. A map's change reaches the load balancer slowly, so each one is
-followed by a wait, SWAP_WAIT: 100 s on a regional load balancer, 250 s on a classic one (measured: the last old answer
+followed by a wait, SWAP_WAIT: 100 s on a regional load balancer, 250 s on a classic one, 30 s on an internal one and 150 s on a cross-region internal one (measured: the last old answer
 up to 89 s after a regional change; a classic change settled up to 226 s after its update). Google retires the classic
 load balancer and offers a migration to the global one, whose wake does not wait for a map's change: prefer it.
 
@@ -389,7 +389,7 @@ earlier runs), with one answer `503`.
 ### Limits of the swap
 
 - **Set a wake timeout that leaves room for the map's change.** A wake timeout of SWAP_WAIT plus 60 s or less (160 s
-  regional, 310 s classic) is refused, at the onboarding and at the settings, as a wake would always fail, and an inherited
+  regional, 310 s classic, 90 s internal, 210 s cross-region internal) is refused, at the onboarding and at the settings, as a wake would always fail, and an inherited
   one is brought above it; about 250 s or more on a regional load balancer and 340 s or more on a classic one is advised.
 - **Classic's redirect on an HTTP-only front end.** Right after a classic map's change first sends a path to the waker
   (the onboarding's route, a nap's swap), Cloud Run answered that load balancer's plain-HTTP requests with a 302 to
@@ -473,7 +473,7 @@ Some values can't be chosen on Google Cloud. The router resolves them to the val
 | `drainSeconds` | 0 | The nap's switch is a URL map change, and the backend service's own connection draining applies. |
 | `wakeMode` | `browser` behind the global load balancer's policy | The error fetch carries neither the visitor's path nor its method: waking on it would let every scanner wake the workload. |
 | `wakeTimeoutSeconds` | at most 1700 | One controller request lasts at most 1800 s. |
-| `wakeTimeoutSeconds` | more than the swap's wait + 60 s behind a swap | The wake waits for the map's change to spread: more than 160 s on a regional or internal load balancer, more than 310 s on a classic one. |
+| `wakeTimeoutSeconds` | more than the swap's wait + 60 s behind a swap | The wake waits for the map's change to spread: more than 160 s on a regional load balancer, more than 310 s on a classic one, more than 90 s on an internal one, more than 210 s on a cross-region internal one. |
 
 An explicit workload value outside these bounds is refused; an inherited one is brought into them and shown with the origin
 `fixed`, so a router's value never makes a workload unwakeable. The refusals say the reason, and `inherit` is accepted for the three zeros.
@@ -588,13 +588,22 @@ Two kinds join the external ones, told from Google by the forwarding rules' sche
   references at each nap and wake, as for a regional load balancer, with the hold route and the `/_dormeto/*` route. The waker's headers are in the map, as
   on regional: an internal backend service takes no custom request header.
 - **The waker's backend service** is `INTERNAL_MANAGED`, regional for `internal` and global for `cross-region-internal`, on the router's
-  serverless network endpoint group. That Google accepts an `INTERNAL_MANAGED` waker backend service on the router's serverless network endpoint group, and
-  each kind's SWAP_WAIT, are not measured yet: both use a regional load balancer's 100 s.
+  serverless network endpoint group. Google accepts an `INTERNAL_MANAGED` waker backend service, regional and global, on the router's
+  serverless network endpoint group (measured 2026-11-08).
+- **The swap's wait.** SWAP_WAIT is 30 s on an internal load balancer and 150 s on a cross-region one. Measured on
+  2026-11-08: regional internal, the other side's first answer came 0 to 3 s after the map write's operation ended (six writes, each
+  5 to 7 s); cross-region internal, 28 to 120 s (nine writes, each about 40 s). The waits are ten times and one and a quarter times the
+  worst. A wake timeout of 90 s or less on an internal load balancer, or 210 s or less on a cross-region one, is refused.
 - **The idle check** reads `loadbalancing.googleapis.com/https/internal/request_count`, and the request logs of the resource
   `internal_http_lb_rule`, which `dormeto gcp install` adds to the log view's filter. A regional internal map's service is read with its region, a
   cross-region one's without.
-- **The network.** Nothing is added: your internal load balancer has its proxy-only subnet, and the waker's ingress admits internal
-  load balancers (Google's documentation, to be confirmed by the measure). The page's probe goes through the same load balancer.
+- **The network.** Nothing is added: your internal load balancer has its proxy-only subnet, and the waker's ingress admits both
+  internal kinds (measured 2026-11-08). The page's probe goes through the same load balancer.
+- **What the waker reads.** Measured 2026-11-08: a forged `X-Forwarded-For` of `1.2.3.4` was ignored and the client's private address named,
+  behind both kinds. The wake mode `any` woke on a plain request behind the cross-region kind.
+- **The request logs.** Measured 2026-11-08: the resource `internal_http_lb_rule`, log `requests`, `backend_target_name` the plain name,
+  `remoteIp` with a port, about 7.5 s late. The cross-region kind's entries carry the forwarding rule's region, its metric points
+  `region: global`.
 - **The limits.** The visitors' addresses are private, so an IP list is for private ranges. A project's regional serverless network
   endpoint groups share 5,000 queries a second (Google's documentation). A cross-region internal load balancer's waker is in one region. The page has no favicon.
   `terraform/gcp-dev` has a demo behind `enable_internal` (off by default): the proxy-only subnets, a regional and a cross-region internal load

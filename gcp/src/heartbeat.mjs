@@ -50,11 +50,13 @@ export function staleness(run, t) {
 const resendsOf = (run, wakeId) => (run.resends?.wakeId === wakeId ? run.resends.count : 0);
 
 // Whether the wake may be sent again at `t`: still WAKING with that wakeId, sent again less than twice, and not in the last minute.
-export const resendable = (run, wakeId, t) => run.state === STATES.WAKING && run.wakeId === wakeId && resendsOf(run, wakeId) < RESENDS_MAX
-  && (run.resentAt === undefined || run.resentAt < t - RESEND_MS);
+export const resendable = (run, wakeId, t) => run.state === STATES.WAKING && run.wakeId === wakeId
+  && resendsOf(run, wakeId) < RESENDS_MAX && (run.resentAt === undefined || run.resentAt < t - RESEND_MS);
 
 // What claiming the wake's resend at `t` writes on the run: when, and the wake's count. Null when it may not be sent again.
-export const resendClaim = (run, wakeId, t) => (resendable(run, wakeId, t) ? { resentAt: t, resends: { wakeId, count: resendsOf(run, wakeId) + 1 } } : null);
+export const resendClaim = (run, wakeId, t) => (resendable(run, wakeId, t)
+  ? { resentAt: t, resends: { wakeId, count: resendsOf(run, wakeId) + 1 } }
+  : null);
 
 // The heartbeat of `field` `id` on the run, from now: its first beat tried before this returns, then one every 60 s through
 // `every(ms, fn)` (a timer; its answer stops it). Answers the stop, for every way out of the wake or the nap, which stops a retry
@@ -93,8 +95,9 @@ export async function startHeartbeat({ store, every, log }, workloadId, field, i
 }
 
 // A stale wake sent again with its wakeId, `enqueue(body)` its task, by the check or the waker (`by`): one resend a minute between
-// them, through the run's `resentAt`, read first then written on condition. True when this call sent it. It never throws: a resend
-// that fails is said, and the next try is a minute later.
+// them and twice at most, through the run's `resentAt` and `resends`, read first then written on condition. True when this call
+// sent it. It never throws: a resend that fails is said, and the next try is a minute later (a claimed one that the queue refused
+// counts as sent).
 export async function resendStale({ store, enqueue, now, log }, workloadId, run, by) {
   const t = now();
   const reason = run.state === STATES.WAKING ? staleness(run, t) : null;

@@ -24,8 +24,8 @@
 // name (the autoscaler's), mode }]`, what the wake gives back), `owners` (k8sRecord's: what a nap read of its k8s backends, replicas and KEDA, for
 // the wake), `lastWake` (`{ durationMs }`), `scheduleApplied` (the last nap or awake window's occurrence applied), `napAborted`
 // (`{ reason, at }`: the last nap given up, its cause, until a nap commits), and the heartbeat's (heartbeat.mjs): `napId` (the
-// running nap's, as `wakeId` is the wake's), `beatAt`, `resentAt` and `resends`. The cause and the event of a state change are logged
-// (`StateChanged`): the state history in the manager comes with G2.
+// running nap's, as `wakeId` is the wake's), `beatAt`, `resentAt` and `resends`. The cause and the event of a state change are
+// logged (`StateChanged`): the state history in the manager comes with G2.
 //
 // Schedules and pauses as on AWS (vision docs/specs/2026-10-30-google-cloud-coverage-design.md, section 5). Here a pause is
 // a workload's: the router's and the exclusions wait for G2.
@@ -269,9 +269,9 @@ export function createController({
 
   // The workload's activity over [from, to] (ms), what the idle check and an idle nap's last read go by: `{ activity, reads }`. Its
   // backend service's request count, through its load balancer's metric. Of 1 to 1,000 requests, on a service that logs every one,
-  // the requests of its logs, read from a metric point before `from`, the waker would not ignore (activity.mjs). Logs that cannot be trusted (past the limit, unreadable,
-  // fewer than counted) and a logConfig that cannot be read leave the count to decide. `reads`: null when none was counted, idle
-  // whichever is read.
+  // the requests of its logs the waker would not ignore (activity.mjs), read from a metric point before `from`. Logs that cannot be
+  // trusted (past the limit, unreadable, fewer than counted) and a logConfig that cannot be read leave the count to decide.
+  // `reads`: null when none was counted, idle whichever is read.
   async function activityBetween(cfg, from, to) {
     const { workloadId, backendService } = cfg;
     const lb = cfg.lb ? { lb: cfg.lb } : {};

@@ -127,18 +127,54 @@ refused for lack of capacity (`ZONE_RESOURCE_POOL_EXHAUSTED`) is a capacity fail
 fallback machine type.
 
 **Idle check (every 5 minutes).** For each awake workload, the router reads the application's backend service's
-`request_count` over the idle window, through any URL map (Cloud Monitoring publishes it 72–125 s late, and a single request can be missed:
-the effective idle window is that much longer). None: nap. For each workload asleep, it checks the URL map still holds
+`request_count` over the idle window, through any URL map. The metric's delay is 210 s: Google documents the newest
+requests as not visible for up to that long. So the check reads that much further back, and the effective idle window
+is that much longer. None: nap. A nap that the check asked reads the traffic again before it stops anything, from the
+check's request less 210 s to that moment. A request in it gives the nap up (`traffic`), and the workload stays awake.
+The last 210 s stay unseen even then, as the metric lags. A read that fails gives the nap up too (`traffic-unread`). For each workload asleep, it checks the URL map still holds
 the error response policy and the `/_dormeto/*` route (else it repairs them), and that the VMs are still down: a VM
 started by hand makes the workload awake, and VMs all stopped by hand while it is awake make it `ASLEEP` with the cause
 `external-stop`, as on AWS. A wake asked during a nap is kept: during the wait the nap gives up, no VM is stopped and the policy is removed; once the
 VMs are going down, the workload wakes as soon as the nap ends.
 
-**A nap that dies.** A nap runs in one request of the controller. If that request ends before the nap does (a new
-revision of the controller during it, for example), the check finds the nap still `NAPPING` and has it called stuck
-after 35 minutes: the workload is then `FAILED`, and the next wake works. Until then a visitor's wake waits for the nap,
-so a workload whose VMs it had begun to stop stays asleep that long. Under a swap with no VM stopping yet, 15 minutes
-([the swap's limits](#limits-of-the-swap)).
+**A wake or a nap that dies.** A wake or a nap runs in one request of the controller. A running wake or nap beats on its
+run every minute (`beatAt`, in `dormeto gcp workloads show --json`). One whose beat is older than 3 minutes, or absent 90 s after it
+was asked, is stale: its task was lost or its request died. The check, and the waker when a visitor polls, act on it at
+most once a minute. A stale wake is sent again with its `wakeId`, which a duplicate cannot disturb. A stale nap is called
+stuck: the workload is then `FAILED`, and the next wake works. So both are sent again or called stuck within minutes. The
+deadlines stay as the last resort, for a run from before the beat or one that beats on: the wake's timeout, and for a nap
+called stuck after 35 minutes, or 22 under a swap with no VM stopping yet ([the swap's limits](#limits-of-the-swap)).
+Until then a visitor's wake waits for the nap.
+
+**A nap that gives up.** Before it stops anything, a nap checks that nothing changed since the onboarding, and gives up
+otherwise: nothing is stopped and the workload stays awake. The run says why in `napAborted` (`reason` and `at`),
+in `dormeto gcp workloads show --json`, until a nap commits. The reasons: `backends-changed`, `traffic`, `map-busy`,
+`switch-failed`, `paused`, `pending-wake`, `traffic-unread` and `swap-lost` or `policy-lost`. `backends-changed` checks, against the onboarding, an
+unmanaged group's VMs (added or removed), a network endpoint group's endpoints, and the backend service's backends
+(added or removed); a group or service that is gone counts as changed. After such a change, offboard and onboard the
+workload again. A config written before the checks compares nothing for the groups and the service.
+
+**Stats.** The router counts, per workload and day, the wakes by trigger and the requests it ignored or deferred. It
+commits a count at most every 10 s per document and flushes what is left when Cloud Run stops the instance (`SIGTERM`).
+The counts are kept 35 days and swept once a day, and an offboarding deletes its workload's.
+
+**Request logs.** The idle check can read the load balancer's request logs instead of counting every request.
+- **What it reads.** When Monitoring counts 1 to 1,000 requests in the window and the backend service logs every request
+  (`logConfig` enabled, sample rate 1.0), the check reads the window's log entries and counts only the requests the
+  waker would not ignore: not scanners, not `HEAD` requests, not an IP list's addresses. If none is left, the workload
+  is idle. Past 1,000 requests, with logs that cannot be read or hold fewer entries than Monitoring counted, or with
+  logging off, the count decides. `workloads show` says which it read: `idle check: request logs` or `idle check:
+  request count`.
+- **How it gets there.** `dormeto gcp install` creates the log view `dmtr-<region>-lb` on the project's `_Default`
+  bucket, filtered to the load balancers' request logs, and gives the router `roles/logging.viewAccessor` on that view
+  alone, by an IAM condition: never the project's other logs. `dormeto gcp workloads onboard --request-logs` turns the
+  backend service's logging on at sample rate 1.0, as the operator; the offboarding sets it back. Without the flag, the
+  onboarding warns that every request counts, scanners included.
+- **Terraform.** If you write the backend service in Terraform, keep `log_config { enable = true, sample_rate = 1.0 }`
+  in it. Then an apply does not turn the logs off.
+- **Cost.** Cloud Logging charges past 50 GiB a month and project, about 1 KB per request: 50 million requests are free.
+- **Limit.** The view lives in the `global` location. A project that stores its `_Default` bucket elsewhere gets no
+  view, and the count decides.
 
 **Offboarding.** `DELETE /v1/workloads/<id>` (the CLI) removes the policy, the route and the waker backend service. With
 `force=true` it does so for a workload that cannot wake, and leaves its VMs down, saying so.
@@ -225,8 +261,9 @@ flowchart LR
   global|regional|classic` says it when the same name exists in both, which is refused otherwise. A regional load
   balancer of another region is refused: onboard it on that region's router. A map with forwarding rules of both a
   global and a classic load balancer (a migration under way) is refused until the migration ends. A classic load
-  balancer on the Standard network tier, whose forwarding rule is regional, is refused as having none ("no forwarding
-  rule sends to the target proxy"): a global map's forwarding rules are read globally only (not measured).
+  balancer on the Standard network tier has a regional forwarding rule that targets a global proxy. The onboarding finds
+  it through the aggregated forwarding rules, and the kind is read as classic. Whether Google accepts such a load balancer
+  for the swap is unmeasured.
 - **The waker backend service follows the kind:** regional in the router's region (`regionBackendServices`), or global
   with the scheme `EXTERNAL` on a classic load balancer, both on the router's serverless NEG.
 - **The hold route.** Google does not health check a backend service that no forwarding rule reaches, and a wake waits
@@ -326,17 +363,21 @@ earlier runs), with one answer `503`.
   while a nap waits for its swap wakes the workload, but the nap gives up only at the end of its wait, then unswaps and
   waits again: up to 200 s on regional and 500 s on classic on the waiting page, though no VM stopped. A longer idle
   window makes it rarer.
-- **A nap that dies under a swap holds visitors up to 15 minutes.** If the nap's request ends while the map is swapped
-  and no VM is stopping yet (a new revision of the controller, for example), visitors get the waiting page and their
-  wakes wait until the check calls the nap stuck, after 15 minutes (35 minutes once a VM is stopping); the workload is
-  then `FAILED`, and the check's wake brings it back. No nap was killed so in the acceptance: this is what the code does.
+- **A nap that dies under a swap holds visitors for minutes.** If the nap's request ends while the map is swapped and no
+  VM is stopping yet (a new revision of the controller, for example), visitors get the waiting page. The nap stops
+  beating, and the check calls it stuck within minutes; the workload is then `FAILED`, and the check's wake brings it
+  back. A nap from before the beat, or one that beats on, is called stuck after 22 minutes under a swap. Once a VM is
+  stopping, it is 35 minutes. No nap was killed so in the acceptance: this is what the code does.
 - **A request with a body gets the page under a swap**, a `503`, for any method: API clients should read a `503` as
   asleep, send `POST /_dormeto/wake`, then retry their request.
-- **Ten naps on one regional URL map.** A regional map's update took 85 s (measured), and a nap retries a map busy with
-  another update for about 120 s. So of ten workloads on one regional map that nap together, in one nap window, only 2
-  or 3 may nap (by arithmetic: ten workloads on one URL map were not run in the acceptance, and the retries are
-  unit-tested only): the others' naps fail (`NapFailed`), with that window's occurrence spent, and they nap later by their
-  idle window. Give workloads of one regional map different nap windows, or maps of their own.
+- **Ten naps on one regional URL map.** A regional map's update took 85 s (measured). The naps of one map no longer fail
+  on it: those in the same controller instance wait for the update under way and share the next. A nap retries a map that other updates keep busy (your Terraform's, say) for about 120 s.
+  Then it gives up as `map-busy`, the workload left awake with its idle time kept. It is no failure, and the next check asks
+  again. How many naps share an update in one nap window is unmeasured: ten workloads on one URL map were not run in the
+  acceptance. Give workloads of one regional map different nap windows if their naps give up.
+- **At most 20 naps in flight per router (`NapDeferred`).** A nap holds a controller request for minutes. So a check asks
+  for at most 20 naps at once, counting the naps already running. It asks the scheduled ones first. The others are said once
+  in the log (`NapDeferred`, with their count) and nap at a later check.
 - **A header of your own named `x-dormeto-*` on a regional map's swapped entry is replaced at the swap and not given
   back** at the unswap: the `x-dormeto-` headers are Dormeto's. Name your own headers otherwise.
 - **Your routes under `/_dormeto/`.** `/_dormeto/*` and `/_dormeto/backend/*` are Dormeto's: a route of your own under
@@ -462,8 +503,10 @@ wakes the workload, from any address.
   8 s). A managed group drains its VMs first.
 - **VMs stopped by hand.** Until the next check, and until the policy it writes has spread (up to 8 minutes in all),
   visitors get Google's plain `503` and not the page, since no nap wrote the policy.
-- **Internet noise counts.** The idle check counts every request the backend service answers, scanners' too: 8 such requests
-  in 2 minutes kept a demo VM awake past its window. The browser filters refuse declared bots, but a scanner that runs
+- **Internet noise counts, unless the check reads request logs.** Without [request logs](#behavior), the idle check
+  counts every request the backend service answers, scanners' too: 8 such requests
+  in 2 minutes kept a demo VM awake past its window. With them, the requests the waker would ignore do not keep the
+  workload awake. The browser filters refuse declared bots, but a scanner that runs
   JavaScript with a browser's user agent wakes the workload as a visitor would (seen on the demo). A map's default service
   gets the requests for any host name, so it is the most exposed.
 - **The waiting page's browser wake.** The wake comes from the page's script, or from `POST /_dormeto/wake`. A client

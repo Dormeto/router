@@ -125,6 +125,9 @@ write.
    given back at the wake.
 5. The owner's `scale` subresource is set to 0, and the router waits until its pods are gone.
 
+A ScaledObject whose `minReplicaCount` is 0, set or left to KEDA's default, is refused at the onboarding: `KEDA scales
+<owner> to zero itself (minReplicaCount: 0): set it to 1 or more for Dormeto to nap it`.
+
 **Wake.**
 1. The owner's `scale` gets back its recorded replicas, at least 1. Replicas set since the nap, by hand or by a GitOps
    tool, are left as they are.

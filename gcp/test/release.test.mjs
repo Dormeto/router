@@ -196,7 +196,7 @@ test('the Compute Engine page: the swap of regional and classic load balancers, 
   assert.match(page, /ignore_changes = \[default_service, default_route_action, host_rule, path_matcher\]/);
   assert.match(page, /answered that load balancer's plain-HTTP requests with a 302 to https:\/\/ for about 40 s/);
   assert.match(page, /A visitor at a nap's start waits up to 2 × SWAP_WAIT with the VMs running/);
-  assert.match(page, /A nap that dies under a swap holds visitors up to 15 minutes/);
+  assert.match(page, /A nap that dies under a swap holds visitors for minutes/);
   assert.match(page, /A request with a body gets the page under a swap/);
   assert.match(page, /Ten naps on one regional URL map/);
   assert.match(spaced(read(CE)), /A header of your own named `x-dormeto-\*` on a regional map's swapped entry is replaced at the swap and not given back/);
@@ -217,6 +217,28 @@ test('the Compute Engine page: schedules, pauses and IP lists, with what they do
   assert.match(page, /Behind a regional load balancer it was the client's/);
   assert.match(page, /An IP list stops browsers and scanners on those addresses, not an API client that means to wake/);
   assert.match(page, /called stuck after 35 minutes/);
+});
+
+test('the Compute Engine page: the fixes of router 0.38.0 and the idle check that reads request logs', () => {
+  const page = flat(read(CE));
+  assert.match(page, /A running wake or nap beats on its run every minute/);
+  assert.match(page, /sent again or called stuck within minutes/);
+  assert.match(page, /22 minutes under a swap/);
+  assert.doesNotMatch(page, /up to 15 minutes/);
+  assert.match(page, /At most 20 naps in flight per router \(NapDeferred\)/);
+  assert.match(page, /gives up as map-busy, the workload left awake/);
+  assert.match(page, /The metric's delay is 210 s/);
+  assert.match(page, /reads the traffic again before it stops anything/);
+  assert.match(page, /napAborted/);
+  assert.match(page, /backends-changed/);
+  assert.match(page, /kept 35 days/);
+  assert.match(page, /Standard network tier/);
+  assert.match(page, /Whether Google accepts such a load balancer for the swap is unmeasured/);
+  assert.match(page, /dormeto gcp workloads onboard --request-logs/);
+  assert.match(page, /log_config \{ enable = true, sample_rate = 1\.0 \}/);
+  assert.match(page, /dmtr-<region>-lb/);
+  assert.match(page, /Cloud Logging charges past 50 GiB a month/);
+  assert.match(flat(read(GKE)), /KEDA scales <owner> to zero itself \(minReplicaCount: 0\): set it to 1 or more for Dormeto to nap it/);
 });
 
 test('the Cloud SQL page is linked from the scenarios index and states its limits', () => {

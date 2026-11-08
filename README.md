@@ -593,8 +593,8 @@ aws dynamodb get-item --table-name dmt-dev-router --key '{"pk":{"S":"WL#demo"},"
 ## Google Cloud
 
 Since 0.34.0 the router also runs on Google Cloud: `gcp/src` holds the two Cloud Run roles, one container image,
-`DMT_ROLE` (`waker` or `controller`) picks the role. `dormeto gcp install` (the CLI) creates the services; it takes the
-image with `--image`. Its scenarios, each with its limits:
+`DMT_ROLE` (`waker` or `controller`) picks the role. `dormeto gcp install` (the CLI) creates the services, from Dormeto's public image by
+default (from 0.38.0) or from your own with `--image`. Its scenarios, each with its limits:
 
 - [Compute Engine VMs](docs/scenarios/google-cloud-compute-engine.md): instance groups behind a global external
   Application Load Balancer since 0.34.0; zonal network endpoint groups, the regional and classic load balancers (the
@@ -610,6 +610,14 @@ Router 0.37.0 adds zonal network endpoint groups, the regional and classic load 
 `dormetoRouterDatabases` and `dormetoRouterKubernetes`, and a Kubernetes Role per GKE workload, which the CLI applies).
 They were accepted on 2026-11-04 in `dormeto-dev` with CLI 0.11.0, but for ten workloads on one URL
 map, which was not run: each page says what was accepted and measured.
+
+Router 0.38.0 fixes the limits of 0.37.0 on Google Cloud, and each is on the
+[Compute Engine page](docs/scenarios/google-cloud-compute-engine.md): a running wake or nap beats every minute, and one
+that stops is sent again or called stuck within minutes; the naps of one URL map share its updates, and a busy map gives
+a nap up instead of failing it; at most 20 naps are in flight per router; an idle nap reads the traffic again before it
+stops anything; a nap checks an unmanaged group's VMs and the backend service's backends; and a classic load balancer on
+the Standard tier is found (whether Google accepts it for the swap is unmeasured). With `--request-logs` the idle check
+reads the load balancer's request logs and ignores what the waker ignores. GKE refuses a KEDA `minReplicaCount: 0`.
 
 ```bash
 # Build (podman, linux/amd64) dormeto-router:<version> from gcp/Containerfile

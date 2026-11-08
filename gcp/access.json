@@ -53,7 +53,7 @@
     },
     "dormetoRouterBackends": {
       "title": "Dormeto router backends",
-      "description": "Lets a Dormeto router start, stop, suspend and resume its workloads' VMs and managed instance groups. Granted on the condition that the resource has the tag dormeto=managed.",
+      "description": "Lets a Dormeto router start, stop, suspend and resume its workloads' VMs and managed instance groups, and change the machine type of a stopped VM. Granted on the condition that the resource has the tag dormeto=managed.",
       "permissions": [
         "compute.instances.start",
         "compute.instances.stop",

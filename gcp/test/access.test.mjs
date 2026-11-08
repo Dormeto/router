@@ -115,6 +115,8 @@ test('dormetoRouterBackends holds what starts, stops, suspends and resumes the b
     'compute.instances.start', 'compute.instances.stop', 'compute.instances.suspend', 'compute.instances.resume', 'compute.instances.setMachineType',
     'compute.instanceGroupManagers.update', 'compute.instanceGroupManagers.use',
   ]));
+  assert.match(roles.dormetoRouterBackends.description, /change the machine type of a stopped VM/);
+  assert.match(roles.dormetoRouterBackends.description, /dormeto=managed/);
   // An autoscaler cannot carry a tag: under the tag condition its change would always be refused (ruling 7).
   assert.ok(roles.dormetoRouter.permissions.includes('compute.autoscalers.update'));
   assert.ok(!roles.dormetoRouterBackends.permissions.includes('compute.autoscalers.update'));

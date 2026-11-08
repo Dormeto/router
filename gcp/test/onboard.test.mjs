@@ -2543,3 +2543,76 @@ test('waiting page: an offboarding takes the workload\'s page and favicon with i
   assert.deepEqual([...store.pages.keys()], ['router/page']);
   assert.equal(store.favicons.size, 0);
 });
+
+// --- C: the workload's fallback machine types, checked at the onboarding ------------------------------------------------------
+
+const withTypes = (...names) => (w) => { for (const name of names) w.machineTypes[name] = { name, memoryMb: 4096 }; };
+
+test('onboard: fallback machine types of the VM\'s series are kept at the config\'s top level and shown, as AWS\'s', async () => {
+  const { store, onboarding } = setup(withTypes('e2-medium', 'e2-standard-2'));
+  const workload = await onboarding.onboard({ ...INPUT, fallbackInstanceTypes: ['e2-medium', 'e2-standard-2'] });
+  assert.deepEqual(store.configs.get('demo').fallbackInstanceTypes, ['e2-medium', 'e2-standard-2']);
+  assert.deepEqual(workload.fallbackInstanceTypes, ['e2-medium', 'e2-standard-2']);
+});
+
+test('onboard: without fallback machine types, no field', async () => {
+  const { store, onboarding } = setup();
+  await onboarding.onboard({ ...INPUT, fallbackInstanceTypes: [] });
+  assert.equal('fallbackInstanceTypes' in store.configs.get('demo'), false);
+});
+
+test('dry run: a type of another series is allowed when both series are in Google\'s first and second generation list, and refused otherwise', async () => {
+  const { onboarding } = setup(withTypes('n2-standard-2', 'c3-standard-4', 'a2-highgpu-1g'));
+  assert.deepEqual((await onboarding.dryRun({ ...INPUT, fallbackInstanceTypes: ['n2-standard-2'] })).reasons, []);
+  const refusedC3 = (await onboarding.dryRun({ ...INPUT, fallbackInstanceTypes: ['c3-standard-4'] })).reasons;
+  assert.equal(refusedC3.length, 1);
+  assert.match(refusedC3[0], /^fallback machine type c3-standard-4 of VM vm-a: a machine type of another series can be set only between first and second generation series, and c3 is not one/);
+  assert.match((await onboarding.dryRun({ ...INPUT, fallbackInstanceTypes: ['a2-highgpu-1g'] })).reasons[0], /a2 is not one/);
+});
+
+test('dry run: a VM of a series outside the list refuses a type of another series', async () => {
+  const { onboarding } = setup((w) => {
+    withTypes('c3-standard-4', 'e2-medium')(w);
+    w.machineTypes['c3-standard-8'] = { name: 'c3-standard-8', memoryMb: 4096 };
+    w.vms['vm-a'].machineType = `${V1}/zones/${ZONE}/machineTypes/c3-standard-8`;
+  });
+  assert.deepEqual((await onboarding.dryRun({ ...INPUT, fallbackInstanceTypes: ['c3-standard-4'] })).reasons, []);
+  assert.match((await onboarding.dryRun({ ...INPUT, fallbackInstanceTypes: ['e2-medium'] })).reasons[0], /VM vm-a is of the series c3/);
+});
+
+const FALLBACK_REFUSALS = [
+  ['more than 5 types', ['e2-medium', 'e2-standard-2', 'e2-standard-4', 'e2-standard-8', 'e2-standard-16', 'e2-highmem-2'], /fallbackInstanceTypes: must be at most 5 machine types/],
+  ['a type named twice', ['e2-medium', 'e2-medium'], /fallbackInstanceTypes: e2-medium is named twice/],
+  ['the VM\'s own type', ['e2-small'], /fallbackInstanceTypes: e2-small is the type of VM vm-a/],
+  ['a type that is not in the zone', ['e2-nothere'], /fallback machine type e2-nothere does not exist in zone/],
+  ['a name that is no machine type', ['E2 Medium'], /fallbackInstanceTypes: "E2 Medium" is not a machine type name/],
+  ['not a list', 'e2-medium', /fallbackInstanceTypes: must be a list of machine type names/],
+];
+for (const [name, list, message] of FALLBACK_REFUSALS) {
+  const reason = /does not exist|is the type of/.test(message.source) ? 'not-eligible' : 'bad-request';
+  test(`fallback machine types: ${name} is refused`, async () => {
+    const { w, onboarding } = setup(withTypes('e2-medium', 'e2-standard-2', 'e2-standard-4', 'e2-standard-8', 'e2-standard-16', 'e2-highmem-2'));
+    await assert.rejects(onboarding.onboard({ ...INPUT, fallbackInstanceTypes: list }), refused(400, reason, message));
+    assert.deepEqual(w.changes, []);
+  });
+}
+
+test('fallback machine types: a type with an accelerator is refused', async () => {
+  const { onboarding } = setup((w) => { w.machineTypes['n1-gpu'] = { name: 'n1-gpu', memoryMb: 4096, accelerators: [{ guestAcceleratorCount: 1 }] }; });
+  assert.match((await onboarding.dryRun({ ...INPUT, fallbackInstanceTypes: ['n1-gpu'] })).reasons[0], /fallback machine type n1-gpu has a GPU/);
+});
+
+test('fallback machine types: a VM with a local SSD or a GPU is refused', async () => {
+  const ssd = setup((w) => { withTypes('e2-medium')(w); w.vms['vm-a'].disks = [{ type: 'PERSISTENT' }, { type: 'SCRATCH' }]; });
+  assert.deepEqual((await ssd.onboarding.dryRun({ ...INPUT, fallbackInstanceTypes: ['e2-medium'] })).reasons, ['VM vm-a has a local SSD: a stop would lose its data, take it out of the backend service']);
+  const gpu = setup((w) => { withTypes('e2-medium')(w); w.vms['vm-a'].guestAccelerators = [{ acceleratorCount: 1 }]; });
+  assert.deepEqual((await gpu.onboarding.dryRun({ ...INPUT, fallbackInstanceTypes: ['e2-medium'] })).reasons, ['VM vm-a has a GPU: GPU VMs are not supported, take it out of the backend service']);
+});
+
+test('fallback machine types: a managed group is refused, in the verbatim words, once', async () => {
+  const { w, onboarding } = setup((world) => { withMig(world); withTypes('e2-medium')(world); });
+  const answer = await onboarding.dryRun({ ...INPUT, fallbackInstanceTypes: ['e2-medium'] });
+  assert.deepEqual(answer.reasons, ['fallback machine types are for VMs of unmanaged instance groups: a managed group\'s machine type is its template\'s']);
+  assert.deepEqual(w.changes, []);
+  assert.deepEqual((await onboarding.dryRun(INPUT)).reasons, []);
+});

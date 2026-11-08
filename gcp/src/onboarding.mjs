@@ -54,6 +54,17 @@ const LOCAL_SSD = 'SCRATCH';
 const INSTANCE_GROUP = /\/(zones|regions)\/([^/]+)\/instanceGroups\/([^/]+)$/;
 const NEG_URL = /\/(zones|regions|global)\/(?:([^/]+)\/)?networkEndpointGroups\/([^/]+)$/;
 const NEG_OF_VMS = 'GCE_VM_IP_PORT';
+// A workload's fallback machine types, as AWS's: at most 5.
+const FALLBACK_TYPES_MAX = 5;
+// Google's rule for a machine type of another series on a stopped VM: "supported for only first and second generation machine series,
+// excluding the T2A and A2 machine series". The page does not name the series; these are the first and second generation ones of
+// Google's machine families, N1 including its shared-core f1 and g1 types. Read on 2026-11-08 at
+// https://docs.cloud.google.com/compute/docs/instances/changing-machine-type-of-stopped-instance
+const CHANGEABLE_SERIES = new Set(['n1', 'f1', 'g1', 'n2', 'n2d', 'e2', 'c2', 'c2d', 'm1', 'm2', 't2d']);
+const MACHINE_TYPE = /^[a-z][a-z0-9]*(-[a-z0-9]+)+$/;
+const FALLBACK_REFUSAL_FOR_GROUPS = 'fallback machine types are for VMs of unmanaged instance groups: a managed group\'s machine type is its template\'s';
+// A type's series: its name's first word, `custom-...` being N1's.
+const seriesOf = (type) => (type.startsWith('custom-') ? 'n1' : type.split('-')[0]);
 const MANAGED_GROUP_OWNER = /\/instanceGroupManagers\/([^/]+)$/;
 // Not a setting of the levels.
 const POLL_SECONDS = 3;
@@ -149,6 +160,15 @@ function routerProblems(settings) {
   ];
 }
 
+function fallbackTypesProblems(types) {
+  if (!Array.isArray(types)) return ['fallbackInstanceTypes: must be a list of machine type names'];
+  return [
+    ...(types.length > FALLBACK_TYPES_MAX ? [`fallbackInstanceTypes: must be at most ${FALLBACK_TYPES_MAX} machine types`] : []),
+    ...types.filter((t) => typeof t !== 'string' || !MACHINE_TYPE.test(t)).map((t) => `fallbackInstanceTypes: ${JSON.stringify(t)} is not a machine type name`),
+    ...[...new Set(types.filter((t, i) => types.indexOf(t) !== i))].map((t) => `fallbackInstanceTypes: ${t} is named twice`),
+  ];
+}
+
 function cloudSqlProblems(cloudSql) {
   if (!Array.isArray(cloudSql)) return ['cloudSql: must be a list of Cloud SQL instance names'];
   return [
@@ -241,7 +261,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   const insertService = (body, lb) => (isRegional(lb) ? compute.insertRegionBackendService(lb.region, body) : compute.insertBackendService(body));
 
   // The request's fields, or a 400. Without an ID, the backend service's name, when it is one. `needsAll`: an onboarding's `gke` names all, a dry run's the cluster alone.
-  function requested({ urlMap, backendService, id, settings = {}, loadBalancer, cloudSql = [], gke: gkeAsked, requestLogs }, { needsAll = false } = {}) {
+  function requested({ urlMap, backendService, id, settings = {}, loadBalancer, cloudSql = [], gke: gkeAsked, requestLogs, fallbackInstanceTypes }, { needsAll = false } = {}) {
     if (!urlMap || !backendService) throw bad('urlMap and backendService are needed');
     for (const [key, value] of Object.entries({ urlMap, backendService })) {
       if (typeof value !== 'string' || !NAME.test(value)) throw bad(`${key}: ${JSON.stringify(value)} is not a Compute Engine name`);
@@ -250,9 +270,9 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     const workloadId = checkedId(id || backendService);
     const waker = wakerName(workloadId);
     if (waker.length > NAME_MAX) throw bad(`workload ID ${workloadId} would name the waker backend service ${waker}, longer than the ${NAME_MAX} characters of a Compute Engine name: use a shorter one`);
-    const problems = [...onboardSettingsProblems(settings), ...cloudSqlProblems(cloudSql), ...(requestLogs === undefined ? [] : requestLogsProblems(requestLogs)), ...(gkeAsked === undefined ? [] : gkeProblems(gkeAsked, { needsAll }))];
+    const problems = [...onboardSettingsProblems(settings), ...cloudSqlProblems(cloudSql), ...(requestLogs === undefined ? [] : requestLogsProblems(requestLogs)), ...(fallbackInstanceTypes === undefined ? [] : fallbackTypesProblems(fallbackInstanceTypes)), ...(gkeAsked === undefined ? [] : gkeProblems(gkeAsked, { needsAll }))];
     if (problems.length) throw bad(problems.join('; '));
-    return { id: workloadId, urlMap, backendService, settings, loadBalancer, cloudSql, gkeAsked, requestLogs };
+    return { id: workloadId, urlMap, backendService, settings, loadBalancer, cloudSql, gkeAsked, requestLogs, fallbackTypes: fallbackInstanceTypes ?? [] };
   }
 
   // The URL map, `{ map, regional }`, or why it is not one: `{ reason }`. A regional one elsewhere than the router's region reads as none.
@@ -367,7 +387,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     return { reasons, members, ...(managed ? {} : { source: url }), ...(managed ? { group: { ...group, selfLink: managed.selfLink, id: String(managed.id) } } : {}) };
   }
 
-  async function vmProblems(vm, zone, machineTypes) {
+  async function vmProblems(vm, zone, machineTypes, fallbackTypes = []) {
     const reasons = [];
     const type = nameOf(vm.machineType ?? '');
     const key = `${zone}/${type}`;
@@ -375,12 +395,42 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     const machine = await machineTypes.get(key);
     if (vm.guestAccelerators?.length || machine?.accelerators?.length) reasons.push(`VM ${vm.name} has a GPU: GPU VMs are not supported, take it out of the backend service`);
     if (vm.disks?.some((d) => d.type === LOCAL_SSD)) reasons.push(`VM ${vm.name} has a local SSD: a stop would lose its data, take it out of the backend service`);
+    reasons.push(...await fallbackProblems(vm, zone, type, machineTypes, fallbackTypes));
+    return reasons;
+  }
+
+  // The workload's fallback machine types against one VM: not its own, each in its zone, with no GPU, and of its series unless both
+  // series may be changed between. A VM with a Local SSD or a GPU is refused above, whatever it is asked.
+  async function fallbackProblems(vm, zone, own, machineTypes, fallbackTypes) {
+    const reasons = [];
+    for (const type of fallbackTypes) {
+      if (type === own) {
+        reasons.push(`fallbackInstanceTypes: ${type} is the type of VM ${vm.name}`);
+        continue;
+      }
+      const key = `${zone}/${type}`;
+      if (!machineTypes.has(key)) machineTypes.set(key, compute.getMachineType(zone, type).catch(absent));
+      const machine = await machineTypes.get(key);
+      if (!machine) {
+        reasons.push(`fallback machine type ${type} does not exist in zone ${zone}, where VM ${vm.name} is: name a type of that zone`);
+        continue;
+      }
+      if (machine.accelerators?.length) {
+        reasons.push(`fallback machine type ${type} has a GPU: GPU VMs are not supported`);
+        continue;
+      }
+      const [from, to] = [seriesOf(own), seriesOf(type)];
+      if (from === to) continue;
+      const rule = `fallback machine type ${type} of VM ${vm.name}: a machine type of another series can be set only between first and second generation series`;
+      if (!CHANGEABLE_SERIES.has(to)) reasons.push(`${rule}, and ${to} is not one`);
+      else if (!CHANGEABLE_SERIES.has(from)) reasons.push(`${rule}, and VM ${vm.name} is of the series ${from}, which is not one`);
+    }
     return reasons;
   }
 
   // The service's backends: what refuses them, and what the CLI tags: the VMs of unmanaged groups and the managed groups.
   // A managed group's own VMs are the group's to tag and to act on, but they must qualify all the same.
-  async function backendsOf(service, others) {
+  async function backendsOf(service, others, fallbackTypes = []) {
     const holderOf = (kind, location, name) => others.find((c) => c.backends?.some((b) => b.kind === kind && b.location === location && b.name === name));
     const backends = await Promise.all((service.backends ?? []).map((b) => backendOf(b, service.name)));
     const reasons = backends.flatMap((b) => b.reasons);
@@ -389,6 +439,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
       const holder = holderOf('mig', location, name);
       if (holder) reasons.push(`managed group ${name} belongs to workload ${holder.workloadId}`);
     }
+    if (groups.length && fallbackTypes.length) reasons.push(FALLBACK_REFUSAL_FOR_GROUPS);
     const unmanaged = new Set(backends.filter((b) => !b.group).flatMap((b) => b.members));
     // The unmanaged instance group naming each of those VMs (the first, for a VM in two): a nap stops only what is still in it.
     const groupOf = new Map();
@@ -397,12 +448,14 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     const negsOf = new Map();
     for (const b of backends.filter((x) => x.neg)) for (const url of b.members) negsOf.set(url, [...(negsOf.get(url) ?? []), b.neg]);
     const machineTypes = new Map();
+    // A managed group's members: its template's types, the group refused above when types are asked.
+    const groupMembers = new Set(backends.filter((b) => b.group).flatMap((b) => b.members));
     // One read per VM, a VM in two groups of the service being one VM. A group lists a VM it is still creating.
     const read = await Promise.all([...new Set(backends.flatMap((b) => b.members))].map(async (url) => {
       const zone = zoneOf(url);
       const vm = await compute.getInstance(zone, nameOf(url)).catch(absent);
       if (!vm && negsOf.has(url)) reasons.push(`network endpoint group ${negsOf.get(url)[0].name} names the VM ${nameOf(url)}, which does not exist: remove the endpoint, then onboard again`);
-      return vm && { url, zone, vm, problems: await vmProblems(vm, zone, machineTypes) };
+      return vm && { url, zone, vm, problems: await vmProblems(vm, zone, machineTypes, groupMembers.has(url) ? [] : fallbackTypes) };
     }));
     const vms = [];
     // The NEGs of each VM that one names, by the VM's name: the nap checks them again.
@@ -457,7 +510,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   }
 
   // Section 7: why the workload cannot be onboarded, its load balancer (`lb`, none when it cannot be told), its VMs, groups and databases, and with `gkeAsked` the NEGs. Reads only.
-  async function inspect({ id, urlMap, backendService, loadBalancer, settings, cloudSql, gkeAsked }) {
+  async function inspect({ id, urlMap, backendService, loadBalancer, settings, cloudSql, gkeAsked, fallbackTypes = [] }) {
     const reasons = [];
     const configs = await store.listConfigs();
     const others = configs.filter((c) => c.workloadId !== id);
@@ -504,7 +557,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
       reasons.push(`backend service ${waker} exists and is not the waker of ${id}: rename it, or onboard under another id`);
     }
 
-    const backends = await (gkeAsked ? podsOf(service, gkeAsked, others) : backendsOf(service, others));
+    const backends = await (gkeAsked ? podsOf(service, gkeAsked, others) : backendsOf(service, others, fallbackTypes));
     reasons.push(...backends.reasons);
     return {
       reasons,
@@ -575,9 +628,9 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   }
 
   async function onboard(input) {
-    const { id, urlMap, backendService, settings, loadBalancer, cloudSql, gkeAsked, requestLogs } = requested(input, { needsAll: true });
+    const { id, urlMap, backendService, settings, loadBalancer, cloudSql, gkeAsked, requestLogs, fallbackTypes } = requested(input, { needsAll: true });
     if (await store.getConfig(id)) throw new Refusal(409, 'exists', `workload ${id} is onboarded already`);
-    const { reasons, vms, groups, negs, memberOf, serviceBackends, podNegs, databases, hosts, wakerExists, lb } = await inspect({ id, urlMap, backendService, loadBalancer, settings, cloudSql, gkeAsked });
+    const { reasons, vms, groups, negs, memberOf, serviceBackends, podNegs, databases, hosts, wakerExists, lb } = await inspect({ id, urlMap, backendService, loadBalancer, settings, cloudSql, gkeAsked, fallbackTypes });
     if (reasons.length) throw new Refusal(400, 'not-eligible', `cannot onboard ${id}: ${reasons.join('; ')}`);
     // Spec section 8's shape, whatever else the request carried. The cluster last, and before anything is written: refused, the CLI takes back its RBAC.
     const pods = gkeAsked && {
@@ -608,6 +661,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
       // What a nap checks again before it stops anything: the unmanaged groups' VMs and the service's backends as read now.
       ...(Object.keys(memberOf).length ? { groups: memberOf } : {}),
       ...(pods ? {} : { serviceBackends }),
+      ...(fallbackTypes.length ? { fallbackInstanceTypes: fallbackTypes } : {}),
       ...(requestLogs ? { requestLogs: { before: { enable: requestLogs.before.enable, sampleRate: requestLogs.before.sampleRate } } } : {}),
       backends: [
         ...vms.map((vm) => ({

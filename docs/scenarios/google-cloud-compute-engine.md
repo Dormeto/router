@@ -160,11 +160,12 @@ The counts are kept 35 days and swept once a day, and an offboarding deletes its
 
 **Request logs.** The idle check can read the load balancer's request logs instead of counting every request.
 - **What it reads.** When Monitoring counts 1 to 1,000 requests in the window and the backend service logs every request
-  (`logConfig` enabled, sample rate 1.0), the check reads the window's log entries and counts only the requests the
-  waker would not ignore: not scanners, not `HEAD` requests, not an IP list's addresses. If none is left, the workload
-  is idle. Past 1,000 requests, with logs that cannot be read or hold fewer entries than Monitoring counted, or with
-  logging off, the count decides. `workloads show` says which it read: `idle check: request logs` or `idle check:
-  request count`.
+  (`logConfig` enabled, sample rate 1.0), the check reads the log entries from a minute before the window to its end,
+  as Monitoring's one-minute points can count requests up to a minute before it: the extra minute can only add
+  requests. It counts only the requests the waker would not ignore: not scanners, not `HEAD` requests, not an IP list's
+  addresses. If none is left, the workload is idle. Past 1,000 requests, with logs that cannot be read or hold fewer
+  entries than Monitoring counted, or with logging off, the count decides. `workloads show` says which it read: `idle
+  check: request logs` or `idle check: request count`.
 - **How it gets there.** `dormeto gcp install` creates the log view `dmtr-<region>-lb` on the project's `_Default`
   bucket, filtered to the load balancers' request logs, and gives the router `roles/logging.viewAccessor` on that view
   alone, by an IAM condition: never the project's other logs. `dormeto gcp workloads onboard --request-logs` turns the

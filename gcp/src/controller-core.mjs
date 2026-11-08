@@ -68,6 +68,10 @@ const STOP_ROOM_MS = 200_000;
 const METRIC_DELAY_MS = 210_000;
 // The most requests the idle check reads in the logs: past it, the count decides (a busy workload is no idle one anyway).
 const LOGS_READ_MAX = 1000;
+// Monitoring's request_count is a DELTA metric of 60 s points, and a point whose end is in the window counts the requests of the
+// minute before it: the count can hold requests up to a minute before the window's start. The logs are read from that much earlier,
+// to the window's end, so they hold all it counted; the extra minute can only add requests, which errs toward staying awake.
+const METRIC_POINT_MS = 60_000;
 // What the idle check reads (`idleReads`, on the run and in the API's Workload).
 const READS = { logs: 'request logs', count: 'request count' };
 const WAKING_STUCK_GRACE_MS = 60_000;
@@ -265,7 +269,7 @@ export function createController({
 
   // The workload's activity over [from, to] (ms), what the idle check and an idle nap's last read go by: `{ activity, reads }`. Its
   // backend service's request count, through its load balancer's metric. Of 1 to 1,000 requests, on a service that logs every one,
-  // the requests of its logs the waker would not ignore (activity.mjs). Logs that cannot be trusted (past the limit, unreadable,
+  // the requests of its logs, read from a metric point before `from`, the waker would not ignore (activity.mjs). Logs that cannot be trusted (past the limit, unreadable,
   // fewer than counted) and a logConfig that cannot be read leave the count to decide. `reads`: null when none was counted, idle
   // whichever is read.
   async function activityBetween(cfg, from, to) {
@@ -283,7 +287,7 @@ export function createController({
       return counted;
     }
     if (!logsEveryRequest(service.logConfig)) return counted;
-    const requests = await logs.requests({ backendService, ...lb, from, to, limit: LOGS_READ_MAX, expected: count });
+    const requests = await logs.requests({ backendService, ...lb, from: from - METRIC_POINT_MS, to, limit: LOGS_READ_MAX, expected: count });
     if (!requests) return counted;
     return { activity: activityOf(requests, { lists: listCache ? await listCache.get() : [], rules: [] }), reads: READS.logs };
   }

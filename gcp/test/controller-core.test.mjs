@@ -2979,7 +2979,8 @@ test('request logs: scanners and bots only, on a backend service logging every r
   assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.AWAKE, nap: 'requested' }]);
   assert.deepEqual(t.world.metricReads, [{ backendService: 'app', ...IDLE_WINDOW }]);
   assert.deepEqual(t.world.serviceReads, ['global app']);
-  assert.deepEqual(t.world.logReads, [{ backendService: 'app', ...IDLE_WINDOW, limit: 1000, expected: 4 }]);
+  // The logs from a metric point before Monitoring's window (below).
+  assert.deepEqual(t.world.logReads, [{ backendService: 'app', from: IDLE_WINDOW.from - MINUTE, to: IDLE_WINDOW.to, limit: 1000, expected: 4 }]);
   assert.equal(t.world.tasks[0].body.action, 'nap');
   assert.equal(t.run().idleReads, 'request logs');
 });
@@ -3094,9 +3095,41 @@ test('an idle nap\'s last read goes by the request logs too: scanners during the
     await t.controller.check();
     const out = await t.controller.nap('demo', t.world.tasks[0].body);
     assert.equal(out.state, state);
-    assert.deepEqual(t.world.logReads, [{ backendService: 'app', from: START - 210_000, to: t.world.metricReads[1].to, limit: 1000, expected: during.length }]);
+    assert.deepEqual(t.world.logReads, [{ backendService: 'app', from: START - 210_000 - MINUTE, to: t.world.metricReads[1].to, limit: 1000, expected: during.length }]);
     if (state === STATES.AWAKE) assert.deepEqual(t.run().napAborted, { reason: 'traffic', at: t.clock.now() });
   }
+});
+
+// Monitoring's request_count is a DELTA of 60 s points, and a point whose end is in the window counts the minute before it starts:
+// the logs are read from that minute on, to the window's end, which can only add requests. `timed`: `[at (ms), request]`, what
+// the log view holds; read as logs.mjs reads it, over [from, to), null when it holds fewer than Monitoring counted.
+const logView = (timed) => ({ from, to, expected }) => {
+  const held = timed.filter(([at]) => at >= from && at < to).map(([, request]) => request);
+  return held.length < expected ? null : held;
+};
+
+test('request logs: a scanner\'s request in the minute before the window, counted by Monitoring, is read too: no activity, the nap asked', async () => {
+  const t = setup({
+    run: AWAKE_LONG, vms: RUNNING, requests: 2, logConfig: EVERY_REQUEST,
+    logs: logView([[IDLE_WINDOW.from - 30_000, entry('/.env')], [IDLE_WINDOW.from + MINUTE, entry('/wp-login.php')]]),
+  });
+  assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.AWAKE, nap: 'requested' }]);
+  assert.deepEqual(t.world.metricReads, [{ backendService: 'app', ...IDLE_WINDOW }]);
+  assert.deepEqual(t.world.logReads, [{ backendService: 'app', from: IDLE_WINDOW.from - MINUTE, to: IDLE_WINDOW.to, limit: 1000, expected: 2 }]);
+  assert.equal(t.run().idleReads, 'request logs');
+});
+
+test('an idle nap\'s last read: a scanners\' burst in the minute before it starts, which the check read as noise, is no traffic: it naps', async () => {
+  // The burst 240 s before the check: in the check's window, and in Monitoring's point that ends at the nap's read's start.
+  const burst = [entry('/.env'), entry('/wp-login.php'), entry('/', { method: 'HEAD' })].map((request) => [START - 240_000, request]);
+  const t = setup({ run: AWAKE_LONG, cfg: { hibernate: false }, vms: RUNNING, requests: burst.length, logConfig: EVERY_REQUEST, logs: logView(burst) });
+  assert.equal((await t.controller.check())[0].nap, 'requested');
+  const out = await t.controller.nap('demo', t.world.tasks[0].body);
+  assert.equal(out.state, STATES.ASLEEP);
+  assert.equal(t.world.metricReads[1].from, START - 210_000);
+  assert.equal(t.world.logReads[1].from, START - 210_000 - MINUTE);
+  assert.equal(t.run().napAborted, undefined);
+  assert.deepEqual(t.logged('LogsUnread'), []);
 });
 
 // --- A zonal NEG's VM -----------------------------------------------------------------------------------------------------

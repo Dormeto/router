@@ -32,8 +32,8 @@
 //
 // The idle check's activity (vision docs/specs/2026-11-07-google-cloud-fixes-design.md, section 5, amended by M2): on a backend
 // service that logs every request, the requests the waker would not ignore decide alone, read in the router's log view (`logs`,
-// absent without DMT_LOG_VIEW); otherwise, and when they cannot be read, Monitoring's request count. The run says what the last check
-// that read the logs, or counted any request, read (`idleReads`).
+// absent without DMT_LOG_VIEW); otherwise, and when they cannot be read or are empty, Monitoring's request count. The run says what
+// the last check that read the logs, or counted any request, read (`idleReads`).
 import { randomUUID } from 'node:crypto';
 import { failedSpec, failureError } from '../../lambda/src/lib/failures.mjs';
 import { resolveHibernation } from '../../lambda/src/lib/hibernation.mjs';
@@ -74,6 +74,9 @@ const LOGS_READ_MAX = 1000;
 const METRIC_POINT_MS = 60_000;
 // What the idle check reads (`idleReads`, on the run and in the API's Workload).
 const READS = { logs: 'request logs', count: 'request count' };
+// Logs empty while Monitoring counts requests are said (`LogsEmpty`) at most this often per workload, by this process: a log lost
+// upstream stays so for every check.
+const LOGS_EMPTY_EVERY_MS = 60 * 60_000;
 const WAKING_STUCK_GRACE_MS = 60_000;
 const NAPPING_STUCK_MS = 35 * 60_000;
 // Under a swap, while no VM has been asked to go: visitors are at the waker, so a nap whose request died is a full outage until a
@@ -266,6 +269,8 @@ export function createController({
 
   // The router's lists as the waker holds them (waker.mjs), for the requests the idle check reads in the logs.
   const listCache = lists.length ? createListCache({ store, lists, now, log }) : null;
+  // When each workload's empty logs were last said (LOGS_EMPTY_EVERY_MS).
+  const logsEmptySaid = new Map();
 
   // The requests of the backend service's logs over [from, to] (ms), read from a metric point before `from`, when it logs every
   // one: null without a log view, with logging off or sampled, and with a logConfig or logs that cannot be read (logs.mjs: past the
@@ -285,14 +290,21 @@ export function createController({
   }
 
   // The workload's activity over [from, to] (ms), what the idle check and an idle nap's last read go by: `{ activity, reads }`. On
-  // a backend service that logs every request, its logs decide alone, whatever Monitoring counts, none included (M2: the count is
-  // sampled and batched): the requests the waker would not ignore (activity.mjs). Otherwise, and when they cannot be read, the
-  // service's request count decides, through its load balancer's metric, as before the logs. `reads`: null when that count is none,
-  // idle whichever is read.
+  // a backend service that logs every request, any entry of its logs makes them decide alone, whatever Monitoring counts (M2: the
+  // count is sampled and batched): the requests the waker would not ignore (activity.mjs). Otherwise the service's request count
+  // decides, through its load balancer's metric, as before the logs: without logs, when they cannot be read, and when they are empty,
+  // so that a log lost upstream (a _Default sink's exclusion, the first minutes of regional logging) naps no busy workload, said in
+  // `LogsEmpty`. `reads`: null when that count is none, idle whichever is read.
   async function activityBetween(cfg, from, to) {
+    const { workloadId, backendService } = cfg;
     const requests = await loggedRequests(cfg, from, to);
-    if (requests) return { activity: activityOf(requests, { lists: listCache ? await listCache.get() : [], rules: [] }), reads: READS.logs };
-    const count = await monitoring.requestCount({ backendService: cfg.backendService, ...(cfg.lb ? { lb: cfg.lb } : {}), from, to });
+    if (requests?.length) return { activity: activityOf(requests, { lists: listCache ? await listCache.get() : [], rules: [] }), reads: READS.logs };
+    const count = await monitoring.requestCount({ backendService, ...(cfg.lb ? { lb: cfg.lb } : {}), from, to });
+    const said = logsEmptySaid.get(workloadId);
+    if (requests && count > 0 && (said === undefined || now() - said >= LOGS_EMPTY_EVERY_MS)) {
+      logsEmptySaid.set(workloadId, now());
+      log.warn('LogsEmpty', { workloadId, backendService, count });
+    }
     return { activity: count, reads: count < 1 ? null : READS.count };
   }
 

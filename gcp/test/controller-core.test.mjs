@@ -3103,6 +3103,41 @@ test('request logs decide alone: Monitoring counts 48, the logs hold 30 scanners
   assert.equal(t.run().idleReads, 'request logs');
 });
 
+test('request logs: three scanners\' entries while Monitoring counts 48: idle, Monitoring not read', async () => {
+  const t = setup({ run: AWAKE_LONG, vms: RUNNING, requests: 48, logConfig: EVERY_REQUEST, logs: SCANNERS.slice(0, 3) });
+  assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.AWAKE, nap: 'requested' }]);
+  assert.deepEqual(t.world.metricReads, []);
+  assert.deepEqual(t.logged('LogsEmpty'), []);
+  assert.equal(t.run().idleReads, 'request logs');
+});
+
+// Logs that are empty while requests came are lost upstream (a _Default sink's exclusion of the load balancers' logs, the first
+// minutes of regional logging): Monitoring's count over the same window says so.
+test('request logs empty, Monitoring counts 0: idle, the count read over the same window, the run left as it says', async () => {
+  const t = setup({ run: AWAKE_LONG, vms: RUNNING, requests: 0, logConfig: EVERY_REQUEST, logs: [] });
+  assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.AWAKE, nap: 'requested' }]);
+  assert.deepEqual(t.world.logReads, [LOGS_WINDOW]);
+  assert.deepEqual(t.world.metricReads, [{ backendService: 'app', ...IDLE_WINDOW }]);
+  assert.deepEqual(t.logged('LogsEmpty'), []);
+  assert.equal(t.run().idleReads, undefined);
+});
+
+test('request logs empty, Monitoring counts 5: the count decides, awake, request count, LogsEmpty said once an hour per workload', async () => {
+  const t = setup({ run: AWAKE_LONG, vms: RUNNING, requests: 5, logConfig: EVERY_REQUEST, logs: [] });
+  assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.AWAKE }]);
+  assert.deepEqual(t.world.tasks, []);
+  assert.equal(t.run().idleReads, 'request count');
+  assert.deepEqual(t.logged('LogsEmpty').map(({ level, workloadId, backendService, count }) => ({ level, workloadId, backendService, count })), [
+    { level: 'warn', workloadId: 'demo', backendService: 'app', count: 5 },
+  ]);
+  t.clock.advance(59 * MINUTE);
+  assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.AWAKE }]);
+  assert.equal(t.logged('LogsEmpty').length, 1);
+  t.clock.advance(MINUTE);
+  await t.controller.check();
+  assert.equal(t.logged('LogsEmpty').length, 2);
+});
+
 test('a failed read of the logs (null): the count decides, 0 idle and the run left as it says, more awake and request count', async () => {
   const idle = setup({ run: { ...AWAKE_LONG, idleReads: 'request logs' }, vms: RUNNING, requests: 0, logConfig: EVERY_REQUEST, logs: null });
   assert.equal((await idle.controller.check())[0].nap, 'requested');

@@ -8,8 +8,9 @@
 // and the region, as a regional service's name is unique only there. M2 (2026-11-08) read both kinds so.
 //
 // The entries are the requests, as many as the view holds: no count is compared with them, as Monitoring's is sampled and batched
-// (M2: its points late and in lumps, 13 for minutes that logged 4, gaps of six minutes). `null` past the limit, when they cannot be
-// read, or when their pages do not end within 10 (or 3 of them empty): then the count decides.
+// (M2: its points late and in lumps, 13 for minutes that logged 4, gaps of six minutes); the controller reads it for empty logs only.
+// `null` past the limit, when they cannot be read, or when their pages do not end within 10 (or 3 of them empty): then the count
+// decides.
 const LOGGING = 'https://logging.googleapis.com/v2';
 // The resource type of the entries and the label naming the backend service, by kind; the view's filter names the same types.
 const LOG_RESOURCES = {

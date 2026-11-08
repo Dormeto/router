@@ -33,7 +33,7 @@
 // The idle check's activity (vision docs/specs/2026-11-07-google-cloud-fixes-design.md, section 5, amended by M2): on a backend
 // service that logs every request, the requests the waker would not ignore decide alone, read in the router's log view (`logs`,
 // absent without DMT_LOG_VIEW); otherwise, and when they cannot be read or are empty, Monitoring's request count. The run says what
-// the last check that read the logs, or counted any request, read (`idleReads`).
+// the last check that read log entries, or counted any request, read (`idleReads`).
 import { randomUUID } from 'node:crypto';
 import { failedSpec, failureError } from '../../lambda/src/lib/failures.mjs';
 import { resolveHibernation } from '../../lambda/src/lib/hibernation.mjs';
@@ -294,7 +294,8 @@ export function createController({
   // count is sampled and batched): the requests the waker would not ignore (activity.mjs). Otherwise the service's request count
   // decides, through its load balancer's metric, as before the logs: without logs, when they cannot be read, and when they are empty,
   // so that a log lost upstream (a _Default sink's exclusion, the first minutes of regional logging) naps no busy workload, said in
-  // `LogsEmpty`. `reads`: null when that count is none, idle whichever is read.
+  // `LogsEmpty`. A log lost only in part is not caught: an exclusion that keeps a sample, one added during the window, or a long
+  // ingestion delay leaves entries, and they decide. `reads`: null when that count is none, idle whichever is read.
   async function activityBetween(cfg, from, to) {
     const { workloadId, backendService } = cfg;
     const requests = await loggedRequests(cfg, from, to);

@@ -82,16 +82,18 @@ test('requests: each entry as the method, the URL, its path as received, the use
 
 // M2: the regional load balancer logs the client's address with its port, the global and classic ones without. The address alone
 // is the client's, which the IP lists match.
-test('requests: the client\'s address without its port, IPv4 or bracketed IPv6; a bare IPv6 address as it is', async () => {
+test('requests: the client\'s address without its port, IPv4 or bracketed IPv6, brackets with no port too; a bare IPv6 address and an empty one as they are', async () => {
   const { reader } = setup([{
     entries: [
       entry('https://demo.example.com/', { remoteIp: '82.127.11.49:56212' }),
       entry('https://demo.example.com/', { remoteIp: '[2001:db8::1]:443' }),
       entry('https://demo.example.com/', { remoteIp: '2001:db8::1' }),
       entry('https://demo.example.com/', { remoteIp: '82.127.11.49' }),
+      entry('https://demo.example.com/', { remoteIp: '[2001:db8::1]' }),
+      entry('https://demo.example.com/', { remoteIp: '' }),
     ],
   }]);
-  assert.deepEqual((await read(reader)).map((r) => r.remoteIp), ['82.127.11.49', '2001:db8::1', '2001:db8::1', '82.127.11.49']);
+  assert.deepEqual((await read(reader)).map((r) => r.remoteIp), ['82.127.11.49', '2001:db8::1', '2001:db8::1', '82.127.11.49', '2001:db8::1', '']);
 });
 
 test('requests: the pages are read in turn, each asking what the limit leaves', async () => {

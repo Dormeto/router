@@ -3149,6 +3149,8 @@ test('a failed read of the logs (null): the count decides, 0 idle and the run le
   assert.equal(busy.world.logReads.length, 1);
   assert.deepEqual(busy.world.tasks, []);
   assert.equal(busy.run().idleReads, 'request count');
+  // A read that failed is no empty log.
+  assert.deepEqual(busy.logged('LogsEmpty'), []);
 });
 
 test('a failed read of the logs through logs.mjs (a 403): said in LogsUnread, and the count decides', async () => {
@@ -3206,7 +3208,8 @@ test('a logConfig that cannot be read: the count decides, said in LogsUnread, an
   assert.equal(t.logged('CheckFailed').length, 0);
 });
 
-test('the logs are read whatever Monitoring counts, past 1,000 too: 1,000 entries are read, more leave the count to decide (logs.mjs)', async () => {
+// Past 1,000 entries, the read is null and the count decides: logs.test.mjs, "more entries than the limit is null".
+test('the logs are read whatever Monitoring counts, past 1,000 too, and 1,000 entries decide', async () => {
   const busy = setup({ run: AWAKE_LONG, vms: RUNNING, requests: 1001, logConfig: EVERY_REQUEST, logs: SCANNERS });
   assert.equal((await busy.controller.check())[0].nap, 'requested');
   assert.deepEqual(busy.world.logReads, [LOGS_WINDOW]);
@@ -3281,6 +3284,18 @@ test('an idle nap\'s last read: a browser\'s request the logs showed only after 
   const out = await t.controller.nap('demo', t.world.tasks[0].body);
   assert.equal(out.state, STATES.AWAKE);
   assert.deepEqual(t.run().napAborted, { reason: 'traffic', at: t.clock.now() });
+  assert.ok(!t.world.calls.some((call) => /^(stop|suspend)/.test(call)), t.world.calls.join(', '));
+});
+
+// The log lost upstream, at the nap's last read: the count over its window decides.
+test('an idle nap\'s last read on an empty log while Monitoring counts 3: traffic, AWAKE, said in LogsEmpty, nothing stopped', async () => {
+  let reads = 0;
+  const t = setup({ run: AWAKE_LONG, cfg: { hibernate: false }, vms: RUNNING, requests: () => (reads++ ? 3 : 0), logConfig: EVERY_REQUEST, logs: [] });
+  assert.equal((await t.controller.check())[0].nap, 'requested');
+  const out = await t.controller.nap('demo', t.world.tasks[0].body);
+  assert.equal(out.state, STATES.AWAKE);
+  assert.deepEqual(t.run().napAborted, { reason: 'traffic', at: t.clock.now() });
+  assert.deepEqual(t.logged('LogsEmpty').map(({ count }) => count), [3]);
   assert.ok(!t.world.calls.some((call) => /^(stop|suspend)/.test(call)), t.world.calls.join(', '));
 });
 

@@ -26,7 +26,10 @@ export function createWaker({ store, invokeController, prefix, workloadIdOf = (e
   waitingPages = null,
   // onWaking(workloadId, run): asked when a request that would wake finds the run WAKING within its timeout, before it is answered;
   // it never throws. Google Cloud's waker sends a lost wake again there (gcp/src/heartbeat.mjs); AWS's passes none.
-  onWaking = null }) {
+  onWaking = null,
+  // The levels above the workload's, kept per instance (createJoinLevelsCache): a caller that reads them too passes its own, so
+  // that both read one record (Google Cloud's waker, gcp/src/waker.mjs). AWS's passes none: the core makes its own.
+  levelsCache = null }) {
   const ensured = new Map(); // workload id → last ensure-awake request
   const inRouteGrace = (run) => run.state === STATES.AWAKE && (run.awakeSince ?? 0) > now() - ROUTE_GRACE_MS;
   const servable = (run) => run.state === STATES.AWAKE && !inRouteGrace(run);
@@ -203,7 +206,7 @@ export function createWaker({ store, invokeController, prefix, workloadIdOf = (e
     return response(503, { ...headers, 'content-type': 'application/json' }, renderJson({ state, pollSeconds, wakeHeader, napUntil }));
   }
 
-  const joinCache = createJoinLevelsCache({ router: () => store.getRouterSettings?.(), manager: () => store.getManagerSettings?.(), now, log });
+  const joinCache = levelsCache ?? createJoinLevelsCache({ router: () => store.getRouterSettings?.(), manager: () => store.getManagerSettings?.(), now, log });
 
   // The nap window active now for a workload that is not awake, or null. A bad stored schedule counts as none. The levels
   // of joinMinutes are read only here, kept 60 seconds, and not when the schedule sets its own.

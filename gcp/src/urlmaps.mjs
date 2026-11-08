@@ -26,7 +26,8 @@ export class UrlMapRefused extends Error {
 
 const COMPUTE = 'https://compute.googleapis.com/compute/v1';
 const POLICY = 'defaultCustomErrorResponsePolicy';
-const WAITING_PATH = '/_dormeto/waiting';
+// Where the nap's policy fetches the waiting page from the waker.
+export const WAITING_PATH = '/_dormeto/waiting';
 const ROUTE_PATH = '/_dormeto/*';
 const ROUTE_PREFIX = '/_dormeto/';
 const ROUTE_NAMESPACE = '/_dormeto';

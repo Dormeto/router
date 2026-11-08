@@ -104,8 +104,8 @@ test('HEAD → no body and no task: 200 at the error response\'s fetch, 202 at t
 // visitor the 503 (G0 measured an error service answering 200).
 test('the error response\'s fetch → the waiting page, 200, Retry-After, and no task', async () => {
   const { handler, store, created } = setup();
-  // Whatever the fetch carries: no Accept here, an explicit wake's headers next.
-  for (const headers of [{}, { accept: 'text/html', 'x-dormeto-probe': '1', 'x-dormeto-wake': '1' }]) {
+  // No Accept here, a browser's next.
+  for (const headers of [{}, { accept: 'text/html' }]) {
     const res = await handler(request({ headers }));
     assert.equal(res.statusCode, 200);
     assert.equal(headerOf(res, 'retry-after'), '3');
@@ -117,6 +117,16 @@ test('the error response\'s fetch → the waiting page, 200, Retry-After, and no
   }
   assert.equal(created.length, 0);
   assert.equal(store.state.run.state, STATES.ASLEEP);
+});
+
+// The fetch goes through the shared decision (G5's design, section 4.3): an explicit wake wakes in wake mode browser, as on AWS.
+test('the error response\'s fetch with an explicit wake\'s header → one task, and the page, 200', async () => {
+  const { handler, created } = setup();
+  const res = await handler(request({ headers: { accept: 'text/html', 'x-dormeto-wake': '1' } }));
+  assert.equal(res.statusCode, 200);
+  assert.equal(headerOf(res, 'x-dormeto-state'), STATES.WAKING);
+  assert.match(res.body, /Waking up the application/);
+  assert.equal(created.length, 1);
 });
 
 test('any other path gets the waiting page too, never a wake', async () => {
@@ -155,9 +165,12 @@ test('the waiting page when Firestore cannot be read: the page all the same, 200
 
 const SWAPPED = { 'x-dormeto-switch': 'swap' };
 const visitor = ({ headers = {}, ...rest } = {}) => request({ url: '/orders?id=1', ...rest, headers: { ...SWAPPED, ...headers } });
+// A workload behind a regional load balancer, as the onboarding writes it.
+const REGIONAL = { kind: 'regional', region: 'europe-west1' };
+const swapped = (more = {}) => testConfig({ lb: REGIONAL, ...more });
 
-test('under a swap, a POST with a body to an application path → the page, 503, Retry-After, and no wake', async () => {
-  const { handler, store, created } = setup();
+test('under a swap, a POST with a body to an application path → the page, 503, Retry-After, and in wake mode browser no wake', async () => {
+  const { handler, store, created } = setup({ cfg: swapped({ wakeMode: 'browser' }) });
   const res = await handler({ ...visitor({ method: 'POST', headers: { 'content-type': 'application/json', 'content-length': '11' } }), body: '{"order":1}' });
   assert.equal(res.statusCode, 503);
   assert.equal(res.statusDescription, '503 Service Unavailable');
@@ -171,8 +184,8 @@ test('under a swap, a POST with a body to an application path → the page, 503,
   assert.equal(store.state.run.state, STATES.ASLEEP);
 });
 
-test('under a swap, a plain GET → the page, 503, and no wake', async () => {
-  const { handler, store, created } = setup();
+test('under a swap, a plain GET → the page, 503, and in wake mode browser no wake', async () => {
+  const { handler, store, created } = setup({ cfg: swapped({ wakeMode: 'browser' }) });
   const res = await handler(visitor({ headers: { accept: 'text/html' } }));
   assert.equal(res.statusCode, 503);
   assert.match(res.body, /Waking up the application/);
@@ -180,7 +193,7 @@ test('under a swap, a plain GET → the page, 503, and no wake', async () => {
   assert.equal(store.state.run.state, STATES.ASLEEP);
 });
 
-test('under a swap, the page is a 503 whatever the method, and an explicit wake\'s headers wake nothing there', async () => {
+test('under a swap, the page is a 503 whatever the method, and an explicit wake\'s header wakes there, as on AWS', async () => {
   const { handler, created } = setup();
   for (const method of ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']) {
     const res = await handler(visitor({ method, headers: { 'x-dormeto-wake': '1', 'x-dormeto-probe': '1' } }));
@@ -191,7 +204,7 @@ test('under a swap, the page is a 503 whatever the method, and an explicit wake\
   assert.equal(head.statusCode, 503);
   assert.equal(head.body, '');
   assert.equal(headerOf(head, 'retry-after'), '3');
-  assert.equal(created.length, 0);
+  assert.equal(created.length, 1, 'the first woke it; the next found it waking');
 });
 
 test('x-dormeto-switch: its last value says, as x-dormeto-workload\'s; none, or another, is the policy\'s 200', async () => {
@@ -255,6 +268,136 @@ test('under a swap, the namespace is not the application: another /_dormeto/ pat
   assert.equal((await handler(request({ url: '/_dormeto', headers: SWAPPED }))).statusCode, 503);
   assert.equal((await handler(request({ url: '/_dormetofoo', headers: SWAPPED }))).statusCode, 503);
   assert.equal(created.length, 0);
+});
+
+// --- The wake decision (G5's design, sections 4.3 and 4.4): the wake mode resolved through the levels, and the rules --------
+
+test('under a swap in wake mode any, a GET / from a browser → one wake task, and the page as a 503 that says it wakes', async () => {
+  const { handler, store, created } = setup({ cfg: swapped({ wakeMode: 'any' }) });
+  const res = await handler(visitor({ url: '/', headers: { accept: 'text/html' } }));
+  assert.equal(res.statusCode, 503);
+  assert.equal(res.statusDescription, '503 Service Unavailable');
+  assert.equal(headerOf(res, 'retry-after'), '3');
+  assert.equal(headerOf(res, 'cache-control'), 'no-store');
+  assert.match(headerOf(res, 'content-type'), /text\/html/);
+  assert.match(res.body, /fetch\("\/_dormeto\/wake", /);
+  assert.equal(headerOf(res, 'x-dormeto-state'), STATES.WAKING);
+  assert.deepEqual(created.map(decoded), [{ action: 'wake', workloadId: 'demo', wakeId: store.state.run.wakeId }]);
+  assert.equal(store.state.stats['wake:normal'], 1);
+  await handler(visitor({ url: '/' }));
+  assert.equal(created.length, 1, 'the next request finds it waking');
+});
+
+test('under a swap in wake mode any, a GET /.env → no task: the filters come first', async () => {
+  const { handler, store, created } = setup({ cfg: swapped({ wakeMode: 'any' }) });
+  const res = await handler(visitor({ url: '/.env' }));
+  assert.equal(res.statusCode, 503);
+  assert.equal(headerOf(res, 'x-dormeto-state'), STATES.ASLEEP);
+  assert.equal(created.length, 0);
+  assert.equal(store.state.stats['ignored:scanner path'], 1);
+});
+
+test('under a swap in wake mode browser, a GET / from a browser → no task, and the page whose probe wakes it', async () => {
+  const { handler, store, created } = setup({ cfg: swapped({ wakeMode: 'browser' }) });
+  const res = await handler(visitor({ url: '/', headers: { accept: 'text/html' } }));
+  assert.equal(res.statusCode, 503);
+  assert.equal(headerOf(res, 'x-dormeto-state'), STATES.ASLEEP);
+  assert.equal(created.length, 0);
+  assert.equal(store.state.stats['deferred:browser mode'], 1);
+  await handler(probe({ ...SWAPPED, 'x-dormeto-path': '/' }));
+  assert.equal(created.length, 1);
+});
+
+test('the policy\'s fetch goes through the decision in wake mode browser, whatever the levels say: no task; a wake rule on the user agent → a task, the page a 200', async () => {
+  const plain = setup();
+  plain.store.state.routerSettings = { defaults: { wakeMode: 'any' }, by: 'ops', at: 1 };
+  const res = await plain.handler(request());
+  assert.equal(res.statusCode, 200);
+  assert.equal(plain.created.length, 0);
+  assert.equal(plain.store.state.stats['deferred:browser mode'], 1);
+
+  const ruled = setup({ cfg: testConfig({ wakeRules: [{ name: 'browsers', userAgentPattern: '^Mozilla/' }] }) });
+  const woken = await ruled.handler(request());
+  assert.equal(woken.statusCode, 200);
+  assert.equal(headerOf(woken, 'retry-after'), '3');
+  assert.match(woken.body, /Waking up the application/);
+  assert.equal(headerOf(woken, 'x-dormeto-state'), STATES.WAKING);
+  assert.equal(ruled.created.length, 1);
+  assert.equal(ruled.store.state.stats['wake:rule browsers'], 1);
+});
+
+test('the policy\'s fetch carries no path: no path condition matches it, not even its own /_dormeto/waiting', async () => {
+  const everywhere = setup({ cfg: testConfig({ noWakeRules: [{ name: 'all', pathPrefixes: ['/'] }], wakeRules: [{ name: 'browsers', userAgentPattern: '^Mozilla/' }] }) });
+  await everywhere.handler(request());
+  assert.equal(everywhere.created.length, 1);
+  const waiting = setup({ cfg: testConfig({ wakeRules: [{ name: 'waiting', pathPrefixes: ['/_dormeto/waiting'] }] }) });
+  await waiting.handler(request());
+  assert.equal(waiting.created.length, 0);
+});
+
+test('a probe is classified on the visitor\'s path it sends: from /health, a no-wake rule on /health → no task; from /orders → a task', async () => {
+  const cfg = testConfig({ noWakeRules: [{ name: 'health', pathPrefixes: ['/health'] }] });
+  const health = setup({ cfg });
+  const res = await health.handler(probe({ 'x-dormeto-path': '/health' }));
+  assert.equal(res.statusCode, 202);
+  assert.equal(health.created.length, 0);
+  assert.equal(health.store.state.stats['ignored:rule health'], 1);
+  const orders = setup({ cfg });
+  await orders.handler(probe({ 'x-dormeto-path': '/orders' }));
+  assert.equal(orders.created.length, 1);
+});
+
+test('POST /_dormeto/wake keeps its own path: a no-wake rule on the path it sends does not stop it', async () => {
+  const { handler, created } = setup({ cfg: testConfig({ noWakeRules: [{ name: 'health', pathPrefixes: ['/health'] }] }) });
+  const res = await handler(request({ method: 'POST', url: '/_dormeto/wake', headers: { 'x-dormeto-probe': '1', 'x-dormeto-path': '/health' } }));
+  assert.equal(res.statusCode, 202);
+  assert.equal(created.length, 1);
+});
+
+test('a configuration that leaves waitSeconds, maxHolders and wakeMode to the levels still gets Google Cloud\'s: no hold, and behind the policy no wake on a plain request', async () => {
+  const cfg = testConfig({ inherits: ['waitSeconds', 'maxHolders', 'wakeMode', 'drainSeconds'] });
+  const posted = setup({ cfg });
+  const start = posted.clock.now();
+  const res = await posted.handler(request({ method: 'POST', url: '/_dormeto/wake' }));
+  assert.equal(res.statusCode, 202);
+  assert.equal(posted.created.length, 1);
+  assert.equal(posted.clock.now(), start, 'no hold');
+  const linked = setup({ cfg });
+  await linked.handler(request({ url: '/_dormeto/wake', headers: { accept: 'text/html' } }));
+  assert.equal(linked.created.length, 0);
+});
+
+test('the router level: its wake mode applies under a swap; unreadable, its last value stays, and before any read the built-ins; never a 500', async () => {
+  const cfg = swapped({ inherits: ['wakeMode'] });
+  const { handler, store, clock, created, warned } = setup({ cfg });
+  store.state.routerSettings = { defaults: { wakeMode: 'browser' }, by: 'ops', at: 1 };
+  assert.equal((await handler(visitor())).statusCode, 503);
+  assert.equal(created.length, 0, 'the router\'s browser mode');
+  clock.advance(61_000);
+  store.getRouterSettings = async () => { throw new Error('Google: 503 firestore'); };
+  assert.equal((await handler(visitor())).statusCode, 503);
+  assert.equal(created.length, 0, 'its last value');
+  assert.deepEqual(warned.filter((w) => w.event === 'JoinLevelUnreadable').map((w) => [w.workloadId, w.level, w.error]), [['demo', 'router', 'Google: 503 firestore']]);
+
+  const fresh = setup({ cfg });
+  fresh.store.getRouterSettings = store.getRouterSettings;
+  assert.equal((await fresh.handler(request())).statusCode, 200);
+  assert.equal(fresh.created.length, 0, 'the policy\'s fetch: browser');
+  const res = await fresh.handler(visitor());
+  assert.equal(res.statusCode, 503);
+  assert.equal(fresh.created.length, 1, 'the built-in any');
+  assert.equal((await fresh.handler(probe(SWAPPED))).statusCode, 202);
+});
+
+test('a decision that fails past its reads (a transition refused): the page all the same, logged', async () => {
+  const { handler, store, created, warned } = setup({ cfg: swapped({ wakeMode: 'any' }) });
+  store.transition = async () => { throw new Error('Google: 503 firestore'); };
+  const res = await handler(visitor());
+  assert.equal(res.statusCode, 503);
+  assert.equal(headerOf(res, 'x-dormeto-state'), STATES.ASLEEP);
+  assert.match(res.body, /Waking up the application/);
+  assert.equal(created.length, 0);
+  assert.deepEqual(warned.filter((w) => w.event === 'WakeDecisionFailed'), [{ event: 'WakeDecisionFailed', workloadId: 'demo', error: 'Google: 503 firestore' }]);
 });
 
 test('the waiting page of a failed workload says why and when, in Google Cloud\'s words', async () => {
@@ -327,7 +470,7 @@ test('POST /_dormeto/wake goes through the filters: a bot and a no-wake rule get
   assert.equal(ruled.store.state.stats['ignored:rule office'], 1);
 });
 
-test('GET /_dormeto/wake that is no probe (a scanner, a link) → no task, whatever the workload\'s wake mode', async () => {
+test('GET /_dormeto/wake that is no probe (a scanner, a link) behind the policy → no task, whatever the configuration\'s wake mode', async () => {
   const { handler, created, store } = setup({ cfg: testConfig({ wakeMode: 'traffic' }) });
   const res = await handler(request({ url: '/_dormeto/wake', headers: { accept: 'text/html' } }));
   assert.equal(res.statusCode, 202);
@@ -452,7 +595,7 @@ test('a resend the queue refuses: the poll answered all the same, said, the run 
 function browse(html, respond, clock) {
   const script = html.match(/<script>([\s\S]*)<\/script>/)[1];
   const browser = { timers: [], reloads: 0, asked: [], answers: [], pending: Promise.resolve(), message: {} };
-  const location = { href: 'https://app.example/orders?page=2', reload: () => { browser.reloads += 1; } };
+  const location = { href: 'https://app.example/orders?page=2', pathname: '/orders', reload: () => { browser.reloads += 1; } };
   vm.runInNewContext(script, {
     location,
     document: { getElementById: (id) => (id === 'message' ? browser.message : {}) },
@@ -487,7 +630,7 @@ test('the page\'s script: its probe wakes, and it reloads the visitor\'s address
   const page = await handler(request());
   const browser = browse(page.body, wakerAnswers(handler), clock);
   await browser.settled();
-  assert.deepEqual(browser.asked, [{ url: '/_dormeto/wake', headers: { 'x-dormeto-probe': '1' } }]);
+  assert.deepEqual(browser.asked, [{ url: '/_dormeto/wake', headers: { 'x-dormeto-probe': '1', 'x-dormeto-path': '/orders' } }]);
   assert.deepEqual(browser.answers, [202], 'not a 503, which the nap\'s policy would replace');
   assert.equal(created.length, 1);
   assert.equal(browser.reloads, 0);
@@ -653,7 +796,9 @@ test('a schedule that cannot be read: the page all the same, as with none, logge
   store.getSchedule = unread.store.getSchedule;
   const handler = createCloudRunWaker({ store, tasks: {}, controllerUrl: CONTROLLER, now: clock.now, log: { ...silentLog, warn: (event, fields) => logged.push({ event, ...fields }) } });
   await handler(request());
-  assert.deepEqual(logged, [{ event: 'ScheduleSkipped', workloadId: 'demo', error: 'Google: 503 firestore' }]);
+  // The shared decision's and the page's, of one read, as a probe's (reads.test.mjs).
+  const skipped = { event: 'ScheduleSkipped', workloadId: 'demo', error: 'Google: 503 firestore' };
+  assert.deepEqual(logged, [skipped, skipped]);
 });
 
 test('a visitor\'s probe in a nap window wakes nothing, and says the same as the page', async () => {

@@ -1,6 +1,8 @@
 // What a request costs in Firestore reads, through the real store, on a workload with no schedule, no pause and no list. The
-// schedule's read per probe and the two lists per check were accepted rather than a "has a schedule" flag to keep in step:
-// these counts keep them from growing. A probe or a POST also reads `router/settings` once (the join levels' router level). A commit is no read; a run's transition reads the run first.
+// schedule's read per request and the two lists per check were accepted rather than a "has a schedule" flag to keep in step:
+// these counts keep them from growing. The router level (`router/settings`) is read at most once a minute per waker instance (the
+// shared core's 60-second cache, which the configuration's fixed values read too): each count below is a new instance's first
+// request, so it holds that read; the next requests of the minute don't. A commit is no read; a run's transition reads the run first.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { STATES } from '../../lambda/src/lib/state.mjs';
@@ -47,11 +49,11 @@ const AWAKE = { state: STATES.AWAKE, awakeSince: 1 };
 const BACKED_OFF = (clock) => ({ state: STATES.FAILED, failedAt: clock.now(), consecutiveFailures: 1, failure: JSON.stringify({ kind: 'capacity' }) });
 
 for (const [name, run, send, count] of [
-  ['the page\'s fetch, ASLEEP', ASLEEP, pageFetch, 3],
-  ['the page\'s fetch, NAPPING', NAPPING, pageFetch, 3],
-  ['the page\'s fetch, FAILED', BACKED_OFF, pageFetch, 3],
-  ['the page\'s fetch, WAKING', WAKING, pageFetch, 2],
-  ['the page\'s fetch, AWAKE', AWAKE, pageFetch, 2],
+  ['the page\'s fetch, ASLEEP', ASLEEP, pageFetch, 4],
+  ['the page\'s fetch, NAPPING', NAPPING, pageFetch, 4],
+  ['the page\'s fetch, FAILED', BACKED_OFF, pageFetch, 4],
+  ['the page\'s fetch, WAKING', WAKING, pageFetch, 3],
+  ['the page\'s fetch, AWAKE', AWAKE, pageFetch, 3],
   ['a probe that wakes', ASLEEP, probe, 5],
   ['a backed-off probe', BACKED_OFF, probe, 4],
   ['a probe, NAPPING', NAPPING, probe, 5],
@@ -69,6 +71,24 @@ for (const [name, run, send, count] of [
     assert.equal(reads(), count);
   });
 }
+
+const routerReads = (firestore) => firestore.calls.filter((c) => c.method === 'GET' && c.url.endsWith('/router/settings')).length;
+
+test('the router level is read once a minute per instance, whatever the requests: the page\'s fetches, the probes and the POSTs', async () => {
+  const clock = fakeClock();
+  const { firestore, store } = firestoreWith(ASLEEP);
+  firestore.docs.set('router/settings', { fields: toFields({ defaults: { idleMinutes: 30 }, by: 'ops', at: 1 }), updateTime: 't0' });
+  const handler = createCloudRunWaker({ store, tasks: { enqueue: async () => {} }, controllerUrl: CONTROLLER, now: clock.now, log: silentLog });
+  await Promise.all([handler(pageFetch()), handler(probe()), handler(pageFetch())]);
+  assert.equal(routerReads(firestore), 1);
+  clock.advance(59_000);
+  await handler(post());
+  await handler(pageFetch());
+  assert.equal(routerReads(firestore), 1);
+  clock.advance(2_000);
+  await handler(probe());
+  assert.equal(routerReads(firestore), 2);
+});
 
 const scheduleReads = (firestore) => firestore.calls.filter((c) => c.method === 'GET' && c.url.includes('/schedules/')).length;
 

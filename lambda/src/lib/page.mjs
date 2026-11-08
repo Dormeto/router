@@ -304,7 +304,7 @@ function scriptFor({ t, cloud, initial, pollMs, probeUrl, wake, last, custom }) 
   setInterval(paint, 1000);
   const probe = async () => {
     try {
-      const r = await fetch(${probeUrl ? json(probeUrl) : 'location.href'}, { cache: 'no-store', credentials: 'same-origin', redirect: 'manual', headers: { 'x-dormeto-probe': '1' } });
+      const r = await fetch(${probeUrl ? json(probeUrl) : 'location.href'}, { cache: 'no-store', credentials: 'same-origin', redirect: 'manual', headers: { 'x-dormeto-probe': '1'${probeUrl ? ", 'x-dormeto-path': location.pathname" : ''} } });
       const state = r.type === 'opaqueredirect' ? null : r.headers.get('x-dormeto-state');
       ${probeUrl ? '' : "if (!state) { location.reload(); return; }\n      "}const nap = r.headers.get('x-dormeto-nap-until');
       const failure = r.headers.get('x-dormeto-failure');

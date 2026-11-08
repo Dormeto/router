@@ -1,16 +1,23 @@
 // The waker on Cloud Run: one service behind the load balancer for every workload, which the backend service names in
-// `x-dormeto-workload`. It answers the error response's fetch with the waiting page, and wakes through the `/_dormeto/wake`
-// that the page probes, after the shared request filters. It holds nothing and redirects nothing: once the VMs are
-// healthy, the load balancer sends the next request to them.
+// `x-dormeto-workload`. It answers the error response's fetch with the waiting page, and wakes as the shared core decides
+// (vision docs/specs/2026-11-08-google-cloud-router-features-design.md, sections 4.3 and 4.4): the request filters, the no-wake
+// and wake rules of every level and the wake mode, resolved through the levels with what Google Cloud fixes (levels.mjs). It
+// holds nothing and redirects nothing: once the VMs are healthy, the load balancer sends the next request to them.
 //
 // Behind a policy (a global load balancer) it never answers a 503. The fetch must succeed for the load balancer to serve the
 // page (Google: a failed fetch gets a generic error), and its policy's override gives the visitor the 503. On `/_dormeto/wake`,
 // a 503 would be replaced by the page: the nap's policy applies to all the matcher's traffic, and the waker is a backend of it.
+// The fetch carries neither the visitor's path nor its method: it is decided with no path (no path condition or scanner path
+// matches it) in wake mode browser: only a wake rule or an explicit wake's header wakes there, and the page's probe then does.
 //
 // Behind a swap (a regional or classic one, which `x-dormeto-switch: swap` says, as Firestore may not be readable), it gets the
 // visitor's real request with no policy to override its code, and a 200 would tell an API client it succeeded: the page is a 503,
-// whatever the method and for any path but `/_dormeto/*`. It does not wake there either, as a scanner's request would.
+// whatever the method and for any path but `/_dormeto/*`. That request is decided in the workload's wake mode: in `any`, one
+// the filters let through wakes; in `browser`, only the page's probe, an explicit wake or a wake rule does.
 // `/_dormeto/wake` is as behind a policy; `/_dormeto/backend/*` goes to the application and never comes here.
+//
+// The page's probe sends the visitor's path in `x-dormeto-path`, and its rules see that path; a POST keeps `/_dormeto/wake`.
+// A forged one bypasses nothing a client couldn't by asking for another path.
 //
 // A nap window: the page and `/_dormeto/wake` say when it ends. Pauses mean nothing here: `keepAsleep` holds the scheduled and
 // maintenance wakes only, and a visitor still wakes the workload (vision docs/specs/2026-10-30-google-cloud-coverage-design.md,
@@ -23,6 +30,7 @@ import { createListCache, parseLists } from '../../lambda/src/lib/list-cache.mjs
 import { failureKind, nextAttemptAt } from '../../lambda/src/lib/failures.mjs';
 import { WAKE_HEADER, header, response } from '../../lambda/src/lib/http.mjs';
 import { logger } from '../../lambda/src/lib/log.mjs';
+import { createJoinLevelsCache } from '../../lambda/src/lib/manager-settings.mjs';
 import { renderPage } from '../../lambda/src/lib/page.mjs';
 import { napEndHeader, napEndOf, occurrenceAt } from '../../lambda/src/lib/schedule.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
@@ -30,11 +38,16 @@ import { createWaker } from '../../lambda/src/lib/waker-core.mjs';
 import { createFirestoreStore } from './firestore.mjs';
 import { createGoogle } from './google.mjs';
 import { resendStale } from './heartbeat.mjs';
+import { wakerConfigOf } from './levels.mjs';
 import { SWITCH_HEADER, WORKLOAD_HEADER, WORKLOAD_ID } from './names.mjs';
 import { createTasks } from './tasks.mjs';
+import { WAITING_PATH } from './urlmaps.mjs';
 
 const WAKE_PATH = '/_dormeto/wake';
 const NAMESPACE = '/_dormeto/';
+const PROBE_HEADER = 'x-dormeto-probe';
+// The visitor's path, which the page's probe sends (lambda/src/lib/page.mjs).
+const PATH_HEADER = 'x-dormeto-path';
 const CLOUD = 'Google Cloud';
 const UNKNOWN_POLL_SECONDS = 10;
 // The run could not be read: nothing is claimed, the page says it wakes.
@@ -86,15 +99,31 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], n
     memo.schedule ??= store.getSchedule(workloadId);
     return memo.schedule;
   };
+  // So are its configuration and its run, which the shared decision and the page both read. The run is then the last one the
+  // decision wrote, so that the page says the state it left; after a transition another instance won, it is read again.
+  const readConfig = (workloadId) => (thisRequest.getStore().config ??= store.getConfig(workloadId));
+  const readRun = (workloadId) => (thisRequest.getStore().run ??= store.getRun(workloadId));
+
+  // The levels above the workload's, kept 60 s by the instance in the cache the shared core reads too: a request reads one record
+  // of them, so that the values Google Cloud fixes below and the core's resolution agree. Never throws.
+  const levels = createJoinLevelsCache({ router: () => store.getRouterSettings?.(), manager: () => store.getManagerSettings?.(), now, log });
+  const levelsCache = { ...levels, records: (fields) => (thisRequest.getStore().levels ??= levels.records(fields)) };
 
   const enqueue = (body) => tasks.enqueue({ url: `${controllerUrl}/v1/tasks`, body });
   const core = createWaker({
-    // Whatever the configuration says: no request is held, and only the page's probe and explicit wakes wake.
+    // Whatever the levels say, what Google Cloud fixes: no request is held, and the wake mode is browser behind the policy and on
+    // its fetch. The rest the core resolves.
     store: {
       ...store,
       getConfig: async (workloadId) => {
-        const cfg = await store.getConfig(workloadId);
-        return cfg && { ...cfg, waitSeconds: 0, wakeMode: 'browser' };
+        const [cfg, { router }] = await Promise.all([readConfig(workloadId), levelsCache.records({ workloadId })]);
+        return cfg && wakerConfigOf(cfg, { router, policyFetch: thisRequest.getStore().policyFetch });
+      },
+      getRun: readRun,
+      transition: async (workloadId, change) => {
+        const next = await store.transition(workloadId, change);
+        thisRequest.getStore().run = next ? Promise.resolve(next) : undefined;
+        return next;
       },
       getSchedule,
     },
@@ -107,6 +136,7 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], n
     workloadIdOf,
     // The lists' data is read from the store; one that cannot be read counts as none (the cache logs it) and wakes go on.
     listCache: lists.length ? createListCache({ store, lists, now, log }) : null,
+    levelsCache,
     now,
     log,
   });
@@ -141,13 +171,16 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], n
     };
   }
 
-  // Asked by the page's script or an API client, answered in headers and JSON. A POST is an explicit wake. Not awake, the
-  // shared code's 503 is a 202, the rest as it is. Awake, it answers a redirect, or a 503 in AWS's route grace: here,
-  // plainly `AWAKE`.
+  // Asked by the page's script or an API client, answered in headers and JSON. A POST is an explicit wake, decided on its own
+  // path; the page's probe is decided on the visitor's, which it sends. Not awake, the shared code's 503 is a 202, the rest as it
+  // is. Awake, it answers a redirect, or a 503 in AWS's route grace: here, plainly `AWAKE`.
   async function wake(event, workloadId) {
+    const post = event.httpMethod === 'POST';
+    const path = !post && header(event, PROBE_HEADER) === '1' ? header(event, PATH_HEADER) : undefined;
     const res = await core({
       ...event,
-      headers: { ...event.headers, accept: 'application/json', ...(event.httpMethod === 'POST' ? { [WAKE_HEADER]: '1' } : {}) },
+      ...(path ? { path } : {}),
+      headers: { ...event.headers, accept: 'application/json', ...(post ? { [WAKE_HEADER]: '1' } : {}) },
     });
     const state = res.multiValueHeaders['x-dormeto-state']?.[0];
     if (res.statusCode !== 307 && state !== STATES.AWAKE) {
@@ -157,11 +190,24 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], n
     return event.httpMethod === 'HEAD' ? response(200, headers) : response(200, headers, JSON.stringify({ status: 'awake' }));
   }
 
+  // A visitor's request under a swap, or the policy's fetch: the shared core decides first, on this request's reads (the filters,
+  // the rules, the wake mode, a wake, the stats and the logs), and the page answers whatever it decided. A workload that can't be
+  // read, or isn't configured, is the page's to say.
+  async function decide(event, workloadId) {
+    const read = await Promise.all([readConfig(workloadId), readRun(workloadId), levelsCache.records({ workloadId })]).catch(() => null);
+    if (!read?.[0] || !read[1]) return;
+    try {
+      await core(event);
+    } catch (err) {
+      log.warn('WakeDecisionFailed', { workloadId, error: err.message });
+    }
+  }
+
   // The error response's fetch, which may carry nothing of the visitor's request, or under a swap that request itself: the page
-  // whatever the path, method and headers, never a wake (every scanner's request would wake the workload).
+  // whatever the path, method and headers, once the wake is decided, with the state the decision left.
   async function waiting(event, workloadId) {
     const statusCode = underSwap(event) && !event.path.startsWith(NAMESPACE) ? 503 : 200;
-    const read = await Promise.all([store.getConfig(workloadId), store.getRun(workloadId)]).catch((err) => {
+    const read = await Promise.all([readConfig(workloadId), readRun(workloadId)]).catch((err) => {
       log.error('WaitingPageUnread', { workloadId, error: err.message });
       return null;
     });
@@ -186,7 +232,14 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], n
     if (!workloadId) {
       return response(400, { 'cache-control': 'no-store', 'content-type': 'application/json' }, JSON.stringify({ error: 'bad request', reason: `${WORKLOAD_HEADER} names no workload` }));
     }
-    return thisRequest.run({}, () => (event.path === WAKE_PATH ? wake(event, workloadId) : waiting(event, workloadId)));
+    // The policy's fetch carries none of the visitor's path: it is decided with none, in wake mode browser.
+    const policyFetch = !underSwap(event) && event.path === WAITING_PATH;
+    return thisRequest.run({ policyFetch }, async () => {
+      if (event.path === WAKE_PATH) return wake(event, workloadId);
+      if (policyFetch) await decide({ ...event, path: '' }, workloadId);
+      else if (underSwap(event) && !event.path.startsWith(NAMESPACE)) await decide(event, workloadId);
+      return waiting(event, workloadId);
+    });
   };
 }
 

@@ -58,6 +58,26 @@ test('renderPage probes probeUrl, and only then reloads once AWAKE; without it t
   assert.equal(probing.context.reloaded, true);
 });
 
+test('the probe sends the visitor\'s path as x-dormeto-path only with probeUrl; a page probing its own address sends none', () => {
+  // What the script's first probe asks, copied out of the sandbox.
+  const asked = (html) => {
+    const sent = [];
+    vm.runInNewContext(scriptOf(html), {
+      document: { getElementById: () => null },
+      location: { href: 'https://app.example/orders?page=2', pathname: '/orders', reload() {} },
+      Date, Math, Number, Promise, JSON, isFinite, setInterval: () => {}, setTimeout: () => {},
+      fetch: (url, init) => {
+        sent.push({ url, headers: { ...init.headers } });
+        return new Promise(() => {});
+      },
+    });
+    return sent;
+  };
+  assert.deepEqual(asked(renderPage({ state: 'WAKING', pollSeconds: 3 })), [{ url: 'https://app.example/orders?page=2', headers: { 'x-dormeto-probe': '1' } }]);
+  assert.deepEqual(asked(renderPage({ state: 'WAKING', pollSeconds: 3, probeUrl: '/_dormeto/wake' })), [{ url: '/_dormeto/wake', headers: { 'x-dormeto-probe': '1', 'x-dormeto-path': '/orders' } }]);
+  assert.deepEqual(asked(renderPage({ state: 'WAKING', pollSeconds: 3, probeUrl: '/_dormeto/wake', page: { mode: 'custom', html: '<p>x</p>' } }))[0].headers, { 'x-dormeto-probe': '1', 'x-dormeto-path': '/orders' });
+});
+
 test('renderPage names the cloud that has no capacity, in the page and in its script; AWS by default', () => {
   const capacity = { state: 'FAILED', pollSeconds: 3, failure: 'capacity', retryInMs: 30_000 };
   assert.match(renderPage(capacity), /<h1[^>]*>AWS has no capacity for this application right now: the start is retried, next attempt in less than a minute\.<\/h1>/);

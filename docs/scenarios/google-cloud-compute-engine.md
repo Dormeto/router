@@ -160,13 +160,16 @@ commits a count at most every 10 s per document and flushes what is left when Cl
 The counts are kept 35 days and swept once a day, and an offboarding deletes its workload's.
 
 **Request logs.** The idle check can read the load balancer's request logs instead of counting every request.
-- **What it reads.** On a backend service that logs every request (`logConfig` enabled, sample rate 1.0), the request
-  logs decide alone, whatever Monitoring counts, none included. The check reads the log entries from a minute before
-  the window to its end: the extra minute can only add requests. It counts only the requests the waker would not
-  ignore: not scanners, not `HEAD` requests, not an IP list's addresses. If none is left, the workload is idle. With
-  logs that cannot be read or hold more than 1,000 entries, or with logging off or sampled, Monitoring's count decides.
+- **What it reads.** On a backend service that logs every request (`logConfig` enabled, sample rate 1.0), any entry in
+  the window's request logs makes them decide alone, whatever Monitoring counts. The check reads the log entries from a
+  minute before the window to its end: the extra minute can only add requests. It counts only the requests the waker
+  would not ignore: not scanners, not `HEAD` requests, not an IP list's addresses. If none is left, the workload is
+  idle. With logs that cannot be read or hold more than 1,000 entries, or with logging off or sampled, Monitoring's
+  count decides.
   An empty log while Monitoring counts requests leaves the count deciding: a log lost upstream (a `_Default` sink's
-  exclusion of the load balancers' logs, say) is caught that way, said in `LogsEmpty` at most once an hour per workload.
+  exclusion of the load balancers' logs, say) is caught that way, said in `LogsEmpty` at most once an hour per workload
+  and controller instance. A log lost only in part is not caught: an exclusion that keeps part of the load balancers'
+  logs, one added during the window, or a long ingestion delay leaves entries, and the logs decide on what is left.
   `workloads show` says which it read: `idle check: request logs` or `idle check: request count`.
 - **Why the logs alone.** Monitoring's `request_count` is sampled and batched: its one-minute points came late and in
   lumps (13 for minutes that logged 4), with gaps of six minutes (measured on 2026-11-08). It cannot tell whether the
@@ -368,8 +371,8 @@ map back as before its onboarding.
 | Regional | 3.5 to 6.5 minutes to `ASLEEP` | 62 s after a `POST /_dormeto/wake`; `AWAKE` 123 to 188 s after a wake by a browser's probe, a `POST` or a pause, the unswap's 100 s included |
 
 On the Standard network tier (2026-11-08), the nap's task took 316 s, an operator's nap 325 s to `ASLEEP`, and a
-`POST /_dormeto/wake` woke the workload to `AWAKE` in 289 s and 297 s, the unswap's 250 s included: classic's times on the
-Premium tier (287 s above).
+`POST /_dormeto/wake` woke the workload to `AWAKE` in 289 s and 297 s, the unswap's 250 s included: classic's times on
+the Premium tier (287 s above).
 
 The maps' own changes, measured before the router's code: a classic map's update took about 17 s, then the first new
 answer came after 38–123 s, the last old one after 76–221 s, settled after 78–226 s, with 3 to 11 answers `502` at the
@@ -487,10 +490,10 @@ wakes the workload, from any address.
   `POST /_dormeto/wake`.
 - **The lists are the router's,** for all its workloads; a catalog of lists waits for the manager on Google Cloud.
 - **The address the waker reads** is the last entry of `X-Forwarded-For` before the load balancer's own: the client's
-  behind the global, regional and classic load balancers, a forged `X-Forwarded-For` included (measured: the regional
-  one in the acceptance, from real wakes; the global one and the classic one on the Standard tier on 2026-11-08, with a
-  forged header). The idle check reads the same address in the request logs, without the port that the regional load
-  balancer logs with it.
+  behind the global, regional and classic load balancers, a forged `X-Forwarded-For` included behind the global and
+  classic ones (measured: the regional one in the acceptance of 2026-11-04, from real wakes, with no forged header; the
+  global one and the classic one on the Standard tier on 2026-11-08, with a forged header). The idle check reads the
+  same address in the request logs, without the port that the regional load balancer logs with it.
 
 ## Limits
 

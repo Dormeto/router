@@ -246,7 +246,8 @@ test('the Compute Engine page: schedules, pauses and IP lists, with what they do
   assert.match(page, /Only the action ignore exists here/);
   assert.match(page, /the page's probe from a Google address got a 202 and the workload slept on \(WakeIgnored\)/);
   // M5 (2026-11-08): the client's behind the global and classic load balancers too, a forged header included.
-  assert.match(page, /The address the waker reads is the last entry of X-Forwarded-For before the load balancer's own: the client's behind the global, regional and classic load balancers, a forged X-Forwarded-For included \(measured: the regional one in the acceptance, from real wakes; the global one and the classic one on the Standard tier on 2026-11-08, with a forged header\)/);
+  // A forged header was measured behind the global and classic ones only; the regional one, from real wakes (G3's acceptance).
+  assert.match(page, /The address the waker reads is the last entry of X-Forwarded-For before the load balancer's own: the client's behind the global, regional and classic load balancers, a forged X-Forwarded-For included behind the global and classic ones \(measured: the regional one in the acceptance of 2026-11-04, from real wakes, with no forged header; the global one and the classic one on the Standard tier on 2026-11-08, with a forged header\)/);
   assert.match(page, /The idle check reads the same address in the request logs, without the port that the regional load balancer logs with it/);
   assert.doesNotMatch(page, /with a forged header, it was not read on Google/);
   assert.match(page, /An IP list stops browsers and scanners on those addresses, not an API client that means to wake/);
@@ -280,11 +281,14 @@ test('the Compute Engine page: the fixes of router 0.38.0 and the idle check tha
   assert.match(page, /dmtr-<region>-lb/);
   assert.match(page, /Cloud Logging charges past 50 GiB a month/);
   // M2 (2026-11-08): the logs decide alone, Monitoring's count being sampled.
-  assert.match(page, /On a backend service that logs every request \(logConfig enabled, sample rate 1\.0\), the request logs decide alone, whatever Monitoring counts, none included/);
+  assert.match(page, /On a backend service that logs every request \(logConfig enabled, sample rate 1\.0\), any entry in the window's request logs makes them decide alone, whatever Monitoring counts/);
+  assert.doesNotMatch(page, /the request logs decide alone, whatever Monitoring counts, none included/);
   assert.match(page, /The check reads the log entries from a minute before the window to its end: the extra minute can only add requests/);
   assert.match(page, /With logs that cannot be read or hold more than 1,000 entries, or with logging off or sampled, Monitoring's count decides/);
   // The controller's ruling (2026-11-08): an empty log naps no busy workload.
-  assert.match(page, /An empty log while Monitoring counts requests leaves the count deciding: a log lost upstream \(a _Default sink's exclusion of the load balancers' logs, say\) is caught that way, said in LogsEmpty at most once an hour per workload/);
+  assert.match(page, /An empty log while Monitoring counts requests leaves the count deciding: a log lost upstream \(a _Default sink's exclusion of the load balancers' logs, say\) is caught that way, said in LogsEmpty at most once an hour per workload and controller instance/);
+  // Caught only when nothing of the window was logged.
+  assert.match(page, /A log lost only in part is not caught: an exclusion that keeps part of the load balancers' logs, one added during the window, or a long ingestion delay leaves entries, and the logs decide on what is left/);
   assert.match(page, /the count decides while the window's logs are empty/);
   assert.doesNotMatch(page, /When Monitoring counts 1 to 1,000 requests|fewer entries than Monitoring counted/);
   assert.match(page, /Monitoring's request_count is sampled and batched: its one-minute points came late and in lumps \(13 for minutes that logged 4\), with gaps of six minutes/);

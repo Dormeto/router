@@ -4158,9 +4158,9 @@ for (const [title, reading] of READINGS) {
 
   test(`the wake after one that timed out, the start still under way, ${title}: waited for`, async () => {
     const t = await asleepWithCompanion(inReading(reading));
-    t.store.configs.get('demo').wakeTimeoutSeconds = 60;
+    await t.onboarding.setSettings('demo', { wakeTimeoutSeconds: 60 });
     assert.equal((await wakeNowIn(t)).state, STATES.FAILED);
-    t.store.configs.get('demo').wakeTimeoutSeconds = 1700;
+    await t.onboarding.setSettings('demo', { wakeTimeoutSeconds: 1700 });
     t.clock.advance(reading.listLagMs ?? 0);
     const seen = watchApplication(t);
     const start = t.clock.now();
@@ -4720,7 +4720,7 @@ test('a wake waits for a healthy endpoint: scaled, not ready for a while, then A
   assert.equal(t.w.urlMaps.lb.pathMatchers[0].defaultCustomErrorResponsePolicy, undefined);
 });
 
-test('a pod that stays unschedulable: unhealthy at the deadline, with the Kubernetes events, at 300 s', async () => {
+test('a pod that stays unschedulable: unhealthy at the deadline, with the Kubernetes events, at the built-in 600 s', async () => {
   const t = await asleepPods();
   t.w.kube.unschedulable = true;
   t.w.kube.events.push(event(t.clock.now() + 1000, 'FailedScheduling', '0/3 nodes are available: 3 Insufficient cpu.'));
@@ -4729,8 +4729,8 @@ test('a pod that stays unschedulable: unhealthy at the deadline, with the Kubern
   assert.equal(out.state, STATES.FAILED);
   assert.equal(failureOfRun(t).kind, 'unhealthy');
   assert.match(failureOfRun(t).message, /^no pod of Deployment shop\/web healthy when the wake timed out: pod web-0: FailedScheduling: 0\/3 nodes are available/);
-  assert.ok(t.clock.now() - started >= 300_000);
-  assert.ok(t.clock.now() - started < 310_000);
+  assert.ok(t.clock.now() - started >= 600_000);
+  assert.ok(t.clock.now() - started < 610_000);
   assert.equal(replicasOf(t), 2);
 });
 

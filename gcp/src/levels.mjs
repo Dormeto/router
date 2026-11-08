@@ -1,6 +1,6 @@
 // A Google Cloud workload's settings through AWS's levels (design §3): the shared resolution, with what Google imposes
 // applied on top and named `fixed`. Pure: no store, no Google.
-import { defaultsProblems, effectiveConfig } from '../../lambda/src/lib/settings-levels.mjs';
+import { defaultsProblems, effectiveConfig, ownSettings, SCALAR_KEYS } from '../../lambda/src/lib/settings-levels.mjs';
 import { SWAP_WAIT_MS } from './switch.mjs';
 
 // What Google Cloud fixes whatever the level says; the swap's wait + 60 s is the wake's floor behind a swap.
@@ -35,6 +35,14 @@ function sharedView(cfg, run) {
     cfg: { ...cfg, inherits, ...(databases.length ? { databases } : {}) },
     run: { ...run, backendKinds: names.join(',') },
   };
+}
+
+// The keys a configuration leaves to the levels: its `inherits`; one stored before them, every key it doesn't set and those that
+// equal the manager-less defaults (the reading effectiveOf makes of it).
+export function inheritsOf(cfg) {
+  if (Array.isArray(cfg?.inherits)) return cfg.inherits;
+  const own = ownSettings(sharedView(cfg, null).cfg);
+  return SCALAR_KEYS.filter((key) => !Object.hasOwn(own, key));
 }
 
 export function effectiveOf(cfg, { run = null, router = null } = {}) {
@@ -74,8 +82,10 @@ export function levelProblems(settings, { level, cfg } = {}) {
   const workload = level === 'workload';
   const isObject = !!settings && typeof settings === 'object' && !Array.isArray(settings);
   const fixed = isObject ? FIXED_ZERO.filter((key) => settings[key] !== undefined && settings[key] !== null) : [];
-  const rest = isObject ? Object.fromEntries(Object.entries(settings).filter(([key]) => !fixed.includes(key))) : settings;
-  const problems = [...fixed.map((key) => REASONS[key]), ...defaultsProblems(rest, { workload })];
+  // A key of Object's prototype (constructor, __proto__) is an unknown setting: the shared check would look it up as a range.
+  const prototyped = isObject ? Object.keys(settings).filter((key) => key in Object.prototype) : [];
+  const rest = isObject ? Object.fromEntries(Object.entries(settings).filter(([key]) => !fixed.includes(key) && !prototyped.includes(key))) : settings;
+  const problems = [...fixed.map((key) => REASONS[key]), ...prototyped.map((key) => `unknown setting ${key}`), ...defaultsProblems(rest, { workload })];
   if (!isObject) return problems;
   const asked = settings.wakeTimeoutSeconds;
   if (Number.isInteger(asked)) {

@@ -4,7 +4,8 @@ import { STATES } from '../../lambda/src/lib/state.mjs';
 import { GoogleError } from '../src/google.mjs';
 import { Refusal } from '../src/onboarding.mjs';
 import {
-  CLUSTER, CONTROLLER, GKE_DRY, GKE_INPUT, GKE_NEG, INPUT, K8S_BACKEND, NEG, NEG_READINGS, OWNER, REGION, V1, WAKER, WAKER_URL, ZONE, classic, onGke, regionOf, regional, regionalUrl, serviceUrl, setup, unmanagedUrl,
+  CLUSTER, CONTROLLER, DEFAULT_FROM, DEFAULT_SETTINGS, GKE_DRY, GKE_INPUT, GKE_NEG, INPUT, K8S_BACKEND, NEG, NEG_READINGS, OWNER, REGION, V1, WAKER, WAKER_URL, ZONE, classic, onGke, regionOf, regional, regionalUrl,
+  serviceUrl, setup, unmanagedUrl,
 } from './world.mjs';
 
 const refused = (status, reason, message) => (err) => {
@@ -273,14 +274,25 @@ test('bad input is a 400 before any read', async () => {
     [{ urlMap: 'lb', backendService: 'app-' }, /backendService: "app-" is not a Compute Engine name/],
     [{ ...INPUT, id: 'Bad_ID' }, /\^\[a-z\]\(\[a-z0-9-\]\{0,38\}\[a-z0-9\]\)\?\$/],
     [{ ...INPUT, id: `a${'b'.repeat(39)}c` }, /\^\[a-z\]/],
-    [{ ...INPUT, settings: { idleMinutes: 4 } }, /settings: idleMinutes must be an integer from 5 to 1440/],
-    [{ ...INPUT, settings: { idleMinutes: 1441 } }, /settings: idleMinutes must be an integer from 5 to 1440/],
-    [{ ...INPUT, settings: { waitSeconds: 121 } }, /settings: waitSeconds must be an integer from 5 to 120/],
-    [{ ...INPUT, settings: { wakeTimeoutSeconds: 59 } }, /settings: wakeTimeoutSeconds must be an integer from 60 to 1700/],
-    [{ ...INPUT, settings: { wakeTimeoutSeconds: 1701 } }, /settings: wakeTimeoutSeconds must be an integer from 60 to 1700/],
+    [{ ...INPUT, settings: { idleMinutes: 4 } }, /settings: idleMinutes must be a whole number from 5 to 1440/],
+    [{ ...INPUT, settings: { idleMinutes: 1441 } }, /settings: idleMinutes must be a whole number from 5 to 1440/],
+    [{ ...INPUT, settings: { waitSeconds: 30 } }, /settings: waitSeconds is 0 on Google Cloud: the waker holds no request/],
+    [{ ...INPUT, settings: { waitSeconds: 0 } }, /settings: waitSeconds is 0 on Google Cloud/],
+    [{ ...INPUT, settings: { maxHolders: 0 } }, /settings: maxHolders is 0 on Google Cloud: no request is held/],
+    [{ ...INPUT, settings: { drainSeconds: 30 } }, /settings: drainSeconds is 0 on Google Cloud/],
+    [{ ...INPUT, settings: { wakeTimeoutSeconds: 59 } }, /settings: wakeTimeoutSeconds must be a whole number from 60 to 3600/],
+    [{ ...INPUT, settings: { wakeTimeoutSeconds: 1701 } }, /settings: wakeTimeoutSeconds must be at most 1700: one controller request lasts at most 1800 s/],
+    [{ ...INPUT, settings: { failedRetrySeconds: 5 } }, /settings: failedRetrySeconds must be a whole number from 10 to 600/],
+    [{ ...INPUT, settings: { wakeMode: 'sometimes' } }, /settings: wakeMode must be any or browser/],
+    [{ ...INPUT, settings: { noWakeRules: Array.from({ length: 21 }, (_, i) => ({ name: `r${i}`, pathPrefixes: ['/x'] })) } }, /settings: noWakeRules: at most 20 rules/],
+    [{ ...INPUT, settings: { wakeRules: [{ name: 'bad', pathPattern: '(' }] } }, /settings: wakeRules: rule bad: /],
+    [{ ...INPUT, settings: { type: 'Not A Type' } }, /settings: type must be a type's name/],
+    // A top-level field of the body (ruling 1 of the plan's ledger), not a setting of the levels.
+    [{ ...INPUT, settings: { fallbackInstanceTypes: ['e2-medium'] } }, /settings: unknown setting fallbackInstanceTypes/],
+    [{ ...INPUT, settings: { joinMinutes: 15 } }, /settings: unknown setting joinMinutes/],
     [{ ...INPUT, loadBalancer: 'internal' }, /loadBalancer: "internal" is not global, regional or classic/],
     [{ ...INPUT, settings: { hibernate: 'yes' } }, /settings: hibernate must be true or false/],
-    [{ ...INPUT, settings: { wakeMode: 'any' } }, /settings: unknown setting wakeMode/],
+    [{ ...INPUT, settings: { hibernate: null } }, /settings: hibernate must be true or false/],
     [{ ...INPUT, settings: { constructor: 1 } }, /settings: unknown setting constructor/],
     [{ ...INPUT, settings: JSON.parse('{"__proto__": 1}') }, /settings: unknown setting __proto__/],
     [{ ...INPUT, settings: [] }, /settings: must be an object/],
@@ -330,7 +342,7 @@ test('onboard: the waker backend service dmtr-europe-west1-demo with x-dormeto-w
 
 test('onboard: the service, then the route, then the configuration and AWAKE; no policy and no change to the VMs', async () => {
   const { w, store, clock, onboarding } = setup();
-  const workload = await onboarding.onboard({ ...INPUT, settings: { idleMinutes: 30, hibernate: false, waitSeconds: 10 } });
+  const workload = await onboarding.onboard({ ...INPUT, settings: { idleMinutes: 30, hibernate: false } });
   assert.deepEqual(w.changes, [`create ${WAKER}`, 'map lb']);
   assert.deepEqual(w.urlMaps.lb.pathMatchers[0].pathRules, [{ paths: ['/_dormeto/*'], service: WAKER_URL }]);
   assert.equal(w.urlMaps.lb.pathMatchers[0].defaultCustomErrorResponsePolicy, undefined);
@@ -339,11 +351,11 @@ test('onboard: the service, then the route, then the configuration and AWAKE; no
   const config = store.configs.get('demo');
   assert.equal(config.workloadId, 'demo');
   assert.equal(config.wakerBackendService, WAKER);
-  assert.equal(config.wakeTimeoutSeconds, 600);
-  assert.equal(config.failedRetrySeconds, 60);
   assert.equal(config.pollSeconds, 3);
   assert.equal(config.idleMinutes, 30);
   assert.equal(config.hibernate, false);
+  assert.equal(config.source, 'cli');
+  assert.deepEqual(config.inherits, ['waitSeconds', 'drainSeconds', 'wakeTimeoutSeconds', 'maxHolders', 'failedRetrySeconds', 'wakeMode']);
   assert.ok(!('admin' in config), 'cfg.admin.enabled would turn /_dormeto/wake into a 404');
   assert.deepEqual(workload, {
     id: 'demo',
@@ -353,7 +365,12 @@ test('onboard: the service, then the route, then the configuration and AWAKE; no
     wakerBackendService: WAKER,
     hosts: ['demo.example.com'],
     lb: { kind: 'global' },
-    settings: { idleMinutes: 30, waitSeconds: 10, wakeTimeoutSeconds: 600, hibernate: false },
+    settings: { ...DEFAULT_SETTINGS, idleMinutes: 30 },
+    settingsFrom: { ...DEFAULT_FROM, idleMinutes: 'workload' },
+    type: { name: 'instance', from: 'backends' },
+    noWakeRules: [],
+    wakeRules: [],
+    hibernation: { hibernate: false, from: 'workload', workload: false, router: null, manager: null },
     backends: [{ kind: 'vm', location: ZONE, name: 'vm-a', id: '1001' }],
     awakeSince: new Date(clock.now()).toISOString(),
   });
@@ -388,7 +405,8 @@ test('onboard: default settings, a managed group as a backend, the map\'s defaul
   const workload = await onboarding.onboard(INPUT);
   assert.deepEqual(workload.backends, [{ kind: 'mig', location: ZONE, name: 'mig', id: '2001' }]);
   assert.deepEqual(workload.hosts, ['demo.example.com', '*']);
-  assert.deepEqual(workload.settings, { idleMinutes: 15, wakeTimeoutSeconds: 600 });
+  assert.deepEqual(workload.settings, DEFAULT_SETTINGS);
+  assert.deepEqual(workload.type, { name: 'asg', from: 'backends' });
   assert.equal('hibernate' in store.configs.get('demo'), false);
 });
 
@@ -758,12 +776,12 @@ test('onboard classic: the waker global, EXTERNAL, HTTPS, on the router\'s regio
 const regionalRoute = { paths: ['/_dormeto/*'], routeAction: { weightedBackendServices: [{ backendService: REGIONAL_WAKER_URL, weight: 100, headerAction: { requestHeadersToAdd: [
   { headerName: 'x-dormeto-workload', headerValue: 'demo', replace: true }, { headerName: 'x-dormeto-switch', headerValue: 'swap', replace: true }] } }] } };
 const ONBOARDED = [
-  ['regional', regional, (w) => inRegion(w).urlMaps.lb, REGIONAL_WAKER_URL, regionalUrl('app'), REGIONAL_LB, 700, regionalRoute,
+  ['regional', regional, (w) => inRegion(w).urlMaps.lb, REGIONAL_WAKER_URL, regionalUrl('app'), REGIONAL_LB, regionalRoute,
     { name: WAKER, description: 'Dormeto: the waker of workload demo', backends: [] }],
-  ['classic', classic, (w) => w.urlMaps.lb, WAKER_URL, serviceUrl('app'), { kind: 'classic' }, 850, { paths: ['/_dormeto/*'], service: WAKER_URL },
+  ['classic', classic, (w) => w.urlMaps.lb, WAKER_URL, serviceUrl('app'), { kind: 'classic' }, { paths: ['/_dormeto/*'], service: WAKER_URL },
     { name: WAKER, customRequestHeaders: ['x-dormeto-switch: swap', 'x-dormeto-workload: demo'], backends: [] }],
 ];
-for (const [kind, world, mapOf, wakerUrl, appUrl, lb, timeout, route, stopped] of ONBOARDED) {
+for (const [kind, world, mapOf, wakerUrl, appUrl, lb, route, stopped] of ONBOARDED) {
   test(`onboard ${kind}: the route and the hold route in one update, its lb in the configuration and the Workload`, async () => {
     const { w, store, onboarding } = setup(world);
     const workload = await onboarding.onboard(INPUT);
@@ -776,13 +794,17 @@ for (const [kind, world, mapOf, wakerUrl, appUrl, lb, timeout, route, stopped] o
     assert.equal(store.runs.get('demo').state, STATES.AWAKE);
   });
 
-  test(`${kind}: wakeTimeoutSeconds is by default the VMs' 600 plus SWAP_WAIT; one set stays as it is`, async () => {
+  test(`${kind}: wakeTimeoutSeconds follows the levels, the built-in 600 (no longer G1's 600 plus SWAP_WAIT); one set stays as it is`, async () => {
     const byDefault = setup(world);
-    assert.equal((await byDefault.onboarding.onboard(INPUT)).settings.wakeTimeoutSeconds, timeout);
-    assert.equal(byDefault.store.configs.get('demo').wakeTimeoutSeconds, timeout);
+    const workload = await byDefault.onboarding.onboard(INPUT);
+    assert.equal(workload.settings.wakeTimeoutSeconds, 600);
+    assert.equal(workload.settingsFrom.wakeTimeoutSeconds, 'default');
+    assert.ok(byDefault.store.configs.get('demo').inherits.includes('wakeTimeoutSeconds'));
     const given = setup(world);
     await given.onboarding.onboard({ ...INPUT, settings: { wakeTimeoutSeconds: 400 } });
     assert.equal(given.store.configs.get('demo').wakeTimeoutSeconds, 400);
+    assert.equal(given.store.configs.get('demo').inherits.includes('wakeTimeoutSeconds'), false);
+    assert.equal((await given.onboarding.show('demo')).settingsFrom.wakeTimeoutSeconds, 'workload');
   });
 
   test(`offboard ${kind}: the route and the hold route in one update, then the waker`, async () => {
@@ -1568,16 +1590,19 @@ test('a companion behind a backend service with no backend is refused, as any', 
   assert.match((await onboarding.dryRun(SQL_INPUT)).reasons.join('; '), /has no backend/);
 });
 
-test('wakeTimeoutSeconds: 1700 by default with a companion; one set stays as it is', async () => {
+test('wakeTimeoutSeconds: 1700 by default with a companion, the databases\' 1800 brought to what Google Cloud fixes; one set stays as it is', async () => {
   const byDefault = setup(withSql());
-  assert.equal((await byDefault.onboarding.onboard(SQL_INPUT)).settings.wakeTimeoutSeconds, 1700);
+  const workload = await byDefault.onboarding.onboard(SQL_INPUT);
+  assert.equal(workload.settings.wakeTimeoutSeconds, 1700);
+  assert.equal(workload.settingsFrom.wakeTimeoutSeconds, 'fixed');
+  assert.deepEqual(workload.type, { name: 'databases', from: 'backends' });
   const given = setup(withSql());
   await given.onboarding.onboard({ ...SQL_INPUT, settings: { wakeTimeoutSeconds: 900 } });
   assert.equal(given.store.configs.get('demo').wakeTimeoutSeconds, 900);
 });
 
 for (const [kind, world] of [['classic', classic], ['regional', regional]]) {
-  test(`wakeTimeoutSeconds: 1700 with a companion on a ${kind} load balancer too: SWAP_WAIT added, up to the 1700`, async () => {
+  test(`wakeTimeoutSeconds: 1700 with a companion on a ${kind} load balancer too`, async () => {
     const { onboarding } = setup((w) => {
       world(w);
       withSql()(w);
@@ -1777,13 +1802,15 @@ for (const [name, map] of [['k8s2-', 'k8s2-um-abc-shop-web'], ['gkegw1-', 'gkegw
   });
 }
 
-test('the onboarding: a review per right, the owner read, a k8s backend of the design\'s shape, and pods\' wake timeout', async () => {
+test('the onboarding: a review per right, the owner read, a k8s backend of the design\'s shape, and pods\' wake timeout, the built-in one', async () => {
   const { w, store, onboarding } = setup(onGke);
   const workload = await onboarding.onboard(GKE_INPUT);
   const backend = { kind: 'k8s', cluster: CLUSTER, namespace: 'shop', service: 'web', owner: { kind: 'Deployment', name: 'web' } };
   assert.deepEqual(store.configs.get('demo').backends, [backend]);
   assert.deepEqual(workload.backends, [backend]);
-  assert.equal(store.configs.get('demo').wakeTimeoutSeconds, 300);
+  assert.equal(workload.settings.wakeTimeoutSeconds, 600);
+  assert.equal(workload.settingsFrom.wakeTimeoutSeconds, 'default');
+  assert.deepEqual(workload.type, { name: 'k8s', from: 'backends' });
   const reviews = kubeCalls(w).filter((call) => call.endsWith('/selfsubjectaccessreviews'));
   assert.equal(reviews.length, 9);
   assert.ok(kubeCalls(w).includes('GET /apis/apps/v1/namespaces/shop/deployments/web'), 'the owner read');
@@ -1837,14 +1864,15 @@ test('the onboarding of a StatefulSet at 0 replicas: no endpoint is normal', asy
   assert.deepEqual(store.configs.get('demo').backends[0].owner, { kind: 'StatefulSet', name: 'db' });
 });
 
+// G1's computed timeouts (300 s for pods, plus SWAP_WAIT under a swap) are gone: the levels', then the built-in 600.
 const WAKE_TIMEOUTS = [
-  ['a global load balancer', {}, () => {}, 300],
-  ['a regional one, with SWAP_WAIT', {}, (w) => {
+  ['a global load balancer', {}, () => {}, 600],
+  ['a regional one', {}, (w) => {
     const backends = w.services.app.backends;
     regional(w);
     w.regions[REGION].services.app.backends = backends;
-  }, 400],
-  ['a classic one, with SWAP_WAIT', {}, classic, 550],
+  }, 600],
+  ['a classic one', {}, classic, 600],
   ['a companion', { cloudSql: ['db'] }, (w) => { w.sql.db = {}; }, 1700],
   ['a companion on a classic one: 1700 still wins', { cloudSql: ['db'] }, (w) => {
     classic(w);
@@ -1859,6 +1887,8 @@ for (const [name, extra, change, seconds] of WAKE_TIMEOUTS) {
       change(w);
     });
     await onboarding.onboard({ ...GKE_INPUT, ...extra });
+    assert.equal((await onboarding.show('demo')).settings.wakeTimeoutSeconds, seconds);
+    // What a router before G5 reads of it.
     assert.equal(store.configs.get('demo').wakeTimeoutSeconds, seconds);
   });
 }
@@ -2084,4 +2114,276 @@ test('a forced offboarding of an asleep owner logs the replicas it had: its reco
   assert.equal((await t.core.nap('demo')).state, STATES.ASLEEP);
   await t.onboarding.offboard('demo', { force: true });
   assert.deepEqual(t.w.logs.find((l) => l.event === 'Offboarded').replicasBefore, [{ owner: 'Deployment shop/web', replicas: 2 }]);
+});
+
+// --- Settings by level (vision docs/specs/2026-11-08-google-cloud-router-features-design.md, section 4) ----------------------------
+
+const NO_WAKE = { name: 'health', pathPrefixes: ['/health'] };
+const WAKE = { name: 'office', sourceIps: ['10.0.0.0/8'] };
+const BROWSER_ONLY = 'the global load balancer\'s waiting page can\'t see the visitor\'s request, so only the page\'s probe, an explicit wake or a wake rule wakes it (wake mode browser)';
+const WAIT_FIXED = 'waitSeconds is 0 on Google Cloud: the waker holds no request (behind a swap the switch back takes longer than any hold; behind the policy it receives only the error fetch)';
+const NO_ROUTER = { hibernate: null, joinMinutes: null, by: null, at: null };
+const ALL_KEYS = ['idleMinutes', 'waitSeconds', 'drainSeconds', 'wakeTimeoutSeconds', 'maxHolders', 'failedRetrySeconds', 'wakeMode'];
+
+// A 400 whose problems are these, as AWS's settings action answers them.
+const refusedWith = (problems) => (err) => {
+  assert.ok(err instanceof Refusal, err.stack);
+  assert.equal(err.status, 400);
+  assert.equal(err.reason, 'bad-request');
+  assert.deepEqual(err.problems, problems);
+  assert.equal(err.message, problems.join('; '));
+  return true;
+};
+
+test('an onboarding without idleMinutes: inherits lists it, the configuration is the CLI\'s, and show says default; the router level then applies', async () => {
+  const { store, onboarding } = setup();
+  await onboarding.onboard(INPUT);
+  const config = store.configs.get('demo');
+  assert.deepEqual(config.inherits, ALL_KEYS);
+  assert.equal(config.source, 'cli');
+  assert.deepEqual([config.noWakeRules, config.wakeRules], [[], []]);
+  const shown = await onboarding.show('demo');
+  assert.deepEqual(shown.settings, DEFAULT_SETTINGS);
+  assert.deepEqual(shown.settingsFrom, DEFAULT_FROM);
+  assert.deepEqual(shown.type, { name: 'instance', from: 'backends' });
+  assert.deepEqual([shown.noWakeRules, shown.wakeRules], [[], []]);
+  store.router.settings = { defaults: { idleMinutes: 5 }, by: 'ops', at: 1 };
+  const after = await onboarding.show('demo');
+  assert.equal(after.settings.idleMinutes, 5);
+  assert.equal(after.settingsFrom.idleMinutes, 'router');
+  assert.equal((await onboarding.list())[0].settingsFrom.idleMinutes, 'router');
+});
+
+test('an onboarding\'s own settings leave inherits; its wake mode, rules and type are kept and shown', async () => {
+  const { store, onboarding } = setup(regional);
+  await onboarding.onboard({ ...INPUT, settings: { idleMinutes: 30, wakeMode: 'any', failedRetrySeconds: 120, noWakeRules: [NO_WAKE], wakeRules: [WAKE], type: 'asg', hibernate: false } });
+  const config = store.configs.get('demo');
+  assert.deepEqual(config.inherits, ['waitSeconds', 'drainSeconds', 'wakeTimeoutSeconds', 'maxHolders']);
+  assert.deepEqual([config.idleMinutes, config.wakeMode, config.failedRetrySeconds, config.type, config.hibernate], [30, 'any', 120, 'asg', false]);
+  assert.deepEqual([config.noWakeRules, config.wakeRules], [[NO_WAKE], [WAKE]]);
+  const shown = await onboarding.show('demo');
+  assert.deepEqual(shown.settings, { idleMinutes: 30, waitSeconds: 0, drainSeconds: 0, wakeTimeoutSeconds: 600, maxHolders: 0, failedRetrySeconds: 120, wakeMode: 'any' });
+  assert.deepEqual(shown.settingsFrom, {
+    idleMinutes: 'workload', waitSeconds: 'fixed', drainSeconds: 'fixed', wakeTimeoutSeconds: 'default', maxHolders: 'fixed', failedRetrySeconds: 'workload', wakeMode: 'workload',
+  });
+  assert.deepEqual(shown.type, { name: 'asg', from: 'workload' });
+  assert.deepEqual(shown.noWakeRules, [{ name: 'health', level: 'workload', conditions: { pathPrefixes: ['/health'] } }]);
+  assert.deepEqual(shown.wakeRules, [{ name: 'office', level: 'wake', conditions: { sourceIps: ['10.0.0.0/8'] }, from: 'workload' }]);
+  assert.deepEqual(shown.hibernation, { hibernate: false, from: 'workload', workload: false, router: null, manager: null });
+});
+
+test('an onboarding\'s setting sent null is left to the levels, as one not sent', async () => {
+  const { store, onboarding } = setup();
+  await onboarding.onboard({ ...INPUT, settings: { idleMinutes: null, type: null, noWakeRules: null } });
+  const config = store.configs.get('demo');
+  assert.deepEqual([config.inherits, config.idleMinutes, 'type' in config, config.noWakeRules], [ALL_KEYS, 15, false, []]);
+});
+
+test('a key left to the levels holds the value it resolves to without any level, for a router before G5', async () => {
+  const swapped = setup(regional);
+  await swapped.onboarding.onboard(INPUT);
+  const config = swapped.store.configs.get('demo');
+  assert.deepEqual(ALL_KEYS.map((key) => config[key]), [15, 0, 0, 600, 0, 60, 'any']);
+  const companion = setup(withSql());
+  await companion.onboarding.onboard(SQL_INPUT);
+  assert.equal(companion.store.configs.get('demo').wakeTimeoutSeconds, 1700);
+  assert.equal(companion.store.configs.get('demo').wakeMode, 'browser');
+});
+
+test('a global onboarding with wakeMode any is refused with the reason, at the dry run and the onboarding; under a swap it is taken', async () => {
+  const { w, store, onboarding } = setup();
+  const input = { ...INPUT, settings: { wakeMode: 'any' } };
+  const { eligible, reasons } = await onboarding.dryRun(input);
+  assert.equal(eligible, false);
+  assert.deepEqual(reasons, [`settings: ${BROWSER_ONLY}`]);
+  await assert.rejects(onboarding.onboard(input), refused(400, 'not-eligible', /\(wake mode browser\)$/));
+  assert.deepEqual(w.changes, []);
+  assert.equal(store.configs.size, 0);
+  assert.equal((await setup(classic).onboarding.dryRun(input)).eligible, true);
+});
+
+test('the regional onboarding with wakeTimeoutSeconds 120 is refused as before G5: the map\'s change leaves it no room', async () => {
+  const { w, store, onboarding } = setup(regional);
+  await assert.rejects(onboarding.onboard({ ...INPUT, settings: { wakeTimeoutSeconds: 120 } }), refused(400, 'not-eligible',
+    /^cannot onboard demo: settings: wakeTimeoutSeconds 120 is too short for a regional load balancer: its wake includes the URL map's change, 100 s: use more than 160$/));
+  assert.deepEqual(w.changes, []);
+  assert.equal(store.configs.size, 0);
+});
+
+test('PUT settings with idleMinutes null: back to the levels, its built-in value written for a router before G5; the answer is AWS\'s', async () => {
+  const { w, store, onboarding } = setup();
+  await onboarding.onboard({ ...INPUT, settings: { idleMinutes: 30 } });
+  store.router.settings = { defaults: { idleMinutes: 5 }, by: 'ops', at: 1 };
+  const answer = await onboarding.setSettings('demo', { idleMinutes: null, by: 'ann' });
+  assert.deepEqual(answer, {
+    level: 'workload',
+    settings: { idleMinutes: null },
+    hibernation: { hibernate: true, from: 'default', workload: null, router: null, manager: null },
+    resolved: { settings: { ...DEFAULT_SETTINGS, idleMinutes: 5 }, settingsFrom: { ...DEFAULT_FROM, idleMinutes: 'router' }, type: { name: 'instance', from: 'backends' } },
+  });
+  const config = store.configs.get('demo');
+  assert.deepEqual(config.inherits, ALL_KEYS);
+  assert.equal(config.idleMinutes, 15);
+  assert.equal((await onboarding.show('demo')).settingsFrom.idleMinutes, 'router');
+  assert.deepEqual(w.logs.filter((l) => l.event === 'WorkloadSettings'), [{ level: 'info', event: 'WorkloadSettings', workloadId: 'demo', keys: ['idleMinutes'], hibernate: null, previous: null, by: 'ann' }]);
+});
+
+test('PUT settings: a value is the workload\'s own; the rules and the type set, then null for none and inherited; hibernate null removed', async () => {
+  const { w, store, onboarding } = setup(regional);
+  await onboarding.onboard(INPUT);
+  const set = await onboarding.setSettings('demo', { idleMinutes: 45, wakeTimeoutSeconds: 900, wakeMode: 'browser', noWakeRules: [NO_WAKE], wakeRules: [WAKE], type: 'asg', hibernate: false });
+  const config = store.configs.get('demo');
+  assert.deepEqual(config.inherits, ['waitSeconds', 'drainSeconds', 'maxHolders', 'failedRetrySeconds']);
+  assert.deepEqual([config.idleMinutes, config.wakeTimeoutSeconds, config.wakeMode, config.type, config.hibernate], [45, 900, 'browser', 'asg', false]);
+  assert.deepEqual([config.noWakeRules, config.wakeRules], [[NO_WAKE], [WAKE]]);
+  assert.equal(config.source, 'cli');
+  assert.deepEqual(set.resolved.settings, { idleMinutes: 45, waitSeconds: 0, drainSeconds: 0, wakeTimeoutSeconds: 900, maxHolders: 0, failedRetrySeconds: 60, wakeMode: 'browser' });
+  assert.deepEqual(set.resolved.type, { name: 'asg', from: 'workload' });
+  assert.deepEqual(set.hibernation, { hibernate: false, from: 'workload', workload: false, router: null, manager: null });
+  await onboarding.setSettings('demo', { noWakeRules: null, wakeRules: null, type: null, hibernate: null });
+  const after = store.configs.get('demo');
+  assert.deepEqual([after.noWakeRules, after.wakeRules, 'type' in after, 'hibernate' in after], [[], [], false, false]);
+  assert.deepEqual(after.inherits, config.inherits);
+  assert.equal(w.logs.filter((l) => l.event === 'WorkloadSettings').at(-1).by, 'unknown');
+});
+
+test('PUT settings: what a level refuses is a 400 with the problems, nothing written', async () => {
+  const cases = [
+    [setup, { waitSeconds: 30 }, [`settings: ${WAIT_FIXED}`]],
+    // A value equal to the fixed one is still a value set at a level.
+    [setup, { waitSeconds: 0, maxHolders: 0 }, [`settings: ${WAIT_FIXED}`, 'settings: maxHolders is 0 on Google Cloud: no request is held']],
+    [setup, { wakeMode: 'any' }, [`settings: ${BROWSER_ONLY}`]],
+    [() => setup(regional), { wakeTimeoutSeconds: 120 }, ['settings: wakeTimeoutSeconds 120 is too short for a regional load balancer: its wake includes the URL map\'s change, 100 s: use more than 160']],
+    [setup, { wakeTimeoutSeconds: 1800 }, ['settings: wakeTimeoutSeconds must be at most 1700: one controller request lasts at most 1800 s']],
+    [setup, { joinMinutes: 10 }, ['settings: a workload\'s joinMinutes is on its schedule']],
+    [setup, { hibernate: 'yes' }, ['settings: hibernate must be true, false or null']],
+    [setup, { fallbackInstanceTypes: ['e2-medium'] }, ['settings: unknown setting fallbackInstanceTypes']],
+  ];
+  for (const [world, body, problems] of cases) {
+    const { store, onboarding } = world();
+    await onboarding.onboard(INPUT);
+    const before = structuredClone(store.configs.get('demo'));
+    await assert.rejects(onboarding.setSettings('demo', body), refusedWith(problems), JSON.stringify(body));
+    assert.deepEqual(store.configs.get('demo'), before);
+  }
+});
+
+test('PUT settings on a workload offboarded: a 404, nothing written, also when it goes between the read and the write', async () => {
+  const { store, onboarding } = setup();
+  await assert.rejects(onboarding.setSettings('demo', { idleMinutes: 30 }), refused(404, 'not-found', /^no workload demo$/));
+  await assert.rejects(onboarding.setSettings('Bad_ID', { idleMinutes: 30 }), refused(400, 'bad-request'));
+  assert.equal(store.configs.size, 0);
+  await onboarding.onboard(INPUT);
+  const { getRouterSettings } = store;
+  store.getRouterSettings = async () => {
+    store.configs.delete('demo');
+    return getRouterSettings();
+  };
+  await assert.rejects(onboarding.setSettings('demo', { idleMinutes: 30 }), refused(404, 'not-found', /^no workload demo$/));
+  assert.equal(store.configs.has('demo'), false);
+});
+
+test('a configuration from before G5 (no inherits, no source): shown without error, its wake timeout its own; a PUT keeps that reading for the keys not sent', async () => {
+  const { store, onboarding } = setup(regional);
+  const legacy = {
+    workloadId: 'demo', urlMap: 'lb', backendService: 'app', wakerBackendService: WAKER, hosts: ['demo.example.com'], lb: REGIONAL_LB,
+    backends: [{ kind: 'vm', location: ZONE, name: 'vm-a', id: '1001' }], idleMinutes: 15, failedRetrySeconds: 60, pollSeconds: 3, wakeTimeoutSeconds: 700, onboardedAt: '2026-11-01T00:00:00.000Z',
+  };
+  store.configs.set('demo', legacy);
+  store.router.settings = { defaults: { idleMinutes: 5, wakeTimeoutSeconds: 900 }, by: 'ops', at: 1 };
+  const shown = await onboarding.show('demo');
+  assert.deepEqual([shown.settings.idleMinutes, shown.settingsFrom.idleMinutes], [5, 'router']);
+  assert.deepEqual([shown.settings.wakeTimeoutSeconds, shown.settingsFrom.wakeTimeoutSeconds], [700, 'workload']);
+  assert.deepEqual([shown.settings.wakeMode, shown.settingsFrom.wakeMode], ['any', 'default']);
+  await onboarding.setSettings('demo', { wakeMode: 'browser' });
+  const config = store.configs.get('demo');
+  assert.deepEqual(config.inherits, ['idleMinutes', 'waitSeconds', 'drainSeconds', 'maxHolders', 'failedRetrySeconds']);
+  assert.equal(config.wakeTimeoutSeconds, 700);
+  assert.equal(config.wakeMode, 'browser');
+});
+
+test('show: the rules of every level, described, the most general first', async () => {
+  const { store, onboarding } = setup();
+  store.router.settings = { defaults: { noWakeRules: [{ name: 'scanners', userAgentPattern: 'scan' }], wakeRules: [{ name: 'vpn', sourceIps: ['192.168.0.0/16'] }] }, by: 'ops', at: 1 };
+  await onboarding.onboard({ ...INPUT, settings: { noWakeRules: [NO_WAKE], wakeRules: [WAKE] } });
+  const shown = await onboarding.show('demo');
+  assert.deepEqual(shown.noWakeRules, [
+    { name: 'scanners', level: 'router', conditions: { userAgentPattern: 'scan' } },
+    { name: 'health', level: 'workload', conditions: { pathPrefixes: ['/health'] } },
+  ]);
+  assert.deepEqual(shown.wakeRules, [
+    { name: 'vpn', level: 'wake', conditions: { sourceIps: ['192.168.0.0/16'] }, from: 'router' },
+    { name: 'office', level: 'wake', conditions: { sourceIps: ['10.0.0.0/8'] }, from: 'workload' },
+  ]);
+});
+
+test('show: the hibernation as AWS\'s, from the workload, its fallback machine types, then the router level', async () => {
+  const { store, onboarding } = setup();
+  await onboarding.onboard(INPUT);
+  assert.deepEqual((await onboarding.show('demo')).hibernation, { hibernate: true, from: 'default', workload: null, router: null, manager: null });
+  store.router.settings = { hibernate: false, by: 'ops', at: 1 };
+  assert.deepEqual((await onboarding.show('demo')).hibernation, { hibernate: false, from: 'router', workload: null, router: false, manager: null });
+  store.configs.get('demo').hibernate = true;
+  assert.deepEqual((await onboarding.show('demo')).hibernation, { hibernate: true, from: 'workload', workload: true, router: false, manager: null });
+  delete store.configs.get('demo').hibernate;
+  store.router.settings = { hibernate: true, by: 'ops', at: 1 };
+  store.configs.get('demo').fallbackInstanceTypes = ['e2-medium'];
+  assert.deepEqual((await onboarding.show('demo')).hibernation, { hibernate: false, from: 'fallback-types', workload: null, router: true, manager: null });
+});
+
+test('show and list: the fallback machine types, and the types the VMs run on while one runs on a fallback', async () => {
+  const { store, onboarding } = setup();
+  await onboarding.onboard(INPUT);
+  const before = await onboarding.show('demo');
+  assert.equal(before.fallbackInstanceTypes, undefined);
+  assert.equal(before.instanceTypes, undefined);
+  store.configs.get('demo').fallbackInstanceTypes = ['e2-medium'];
+  store.runs.get('demo').instanceTypes = { 'vm-a': { from: 'e2-small', to: 'e2-medium' } };
+  for (const shown of [await onboarding.show('demo'), (await onboarding.list())[0]]) {
+    assert.deepEqual(shown.fallbackInstanceTypes, ['e2-medium']);
+    assert.deepEqual(shown.instanceTypes, { 'vm-a': { from: 'e2-small', to: 'e2-medium' } });
+  }
+  store.runs.get('demo').instanceTypes = {};
+  assert.equal((await onboarding.show('demo')).instanceTypes, undefined);
+});
+
+test('GET the router level with none: AWS\'s empty answer', async () => {
+  const { onboarding } = setup();
+  assert.deepEqual(await onboarding.routerSettings(), { level: 'router', settings: NO_ROUTER });
+});
+
+test('PUT the router level: merged with what it holds, a key sent null removed, by and at; an empty body reads; none left, no record', async () => {
+  const { w, store, clock, onboarding } = setup();
+  const at = new Date(clock.now()).toISOString();
+  const first = await onboarding.setRouterSettings({ hibernate: false, defaults: { idleMinutes: 30, wakeMode: 'any' }, by: 'ops' });
+  assert.deepEqual(first, { level: 'router', settings: { hibernate: false, joinMinutes: null, defaults: { idleMinutes: 30, wakeMode: 'any' }, by: 'ops', at } });
+  assert.deepEqual(store.router.settings, { hibernate: false, defaults: { idleMinutes: 30, wakeMode: 'any' }, by: 'ops', at: clock.now() });
+  const second = await onboarding.setRouterSettings({ joinMinutes: 15, defaults: { idleMinutes: null, noWakeRules: [NO_WAKE] } });
+  assert.deepEqual(second, { level: 'router', settings: { hibernate: false, joinMinutes: 15, defaults: { wakeMode: 'any', noWakeRules: [NO_WAKE] }, by: 'unknown', at } });
+  assert.deepEqual(await onboarding.routerSettings(), second);
+  assert.deepEqual(await onboarding.setRouterSettings({ by: 'ops' }), second);
+  assert.deepEqual(await onboarding.setRouterSettings({ hibernate: null, joinMinutes: null, defaults: null, by: 'ops' }), { level: 'router', settings: NO_ROUTER });
+  assert.equal(store.router.settings, null);
+  assert.deepEqual(w.logs.filter((l) => l.event === 'RouterSettings').map(({ hibernate, joinMinutes, defaults, by }) => ({ hibernate, joinMinutes, defaults, by })), [
+    { hibernate: false, joinMinutes: null, defaults: ['idleMinutes', 'wakeMode'], by: 'ops' },
+    { hibernate: false, joinMinutes: 15, defaults: ['wakeMode', 'noWakeRules'], by: 'unknown' },
+    { hibernate: null, joinMinutes: null, defaults: [], by: 'ops' },
+  ]);
+});
+
+test('PUT the router level: what it refuses is a 400 with the problems, nothing written; wakeMode any is the router\'s to set', async () => {
+  const { store, onboarding } = setup();
+  const cases = [
+    [{ defaults: { waitSeconds: 30 } }, [`settings: defaults: ${WAIT_FIXED}`]],
+    [{ defaults: { wakeTimeoutSeconds: 1800 } }, ['settings: defaults: wakeTimeoutSeconds must be at most 1700: one controller request lasts at most 1800 s']],
+    [{ defaults: { type: 'asg' } }, ['settings: defaults: unknown setting type']],
+    [{ hibernate: 'yes' }, ['settings: hibernate must be true, false or null']],
+    [{ joinMinutes: 7 }, ['settings: joinMinutes must be a whole number from 0 to 120, a multiple of 5, or null']],
+    [{ idleMinutes: 30 }, ['settings: unknown setting idleMinutes']],
+  ];
+  for (const [body, problems] of cases) {
+    await assert.rejects(onboarding.setRouterSettings(body), refusedWith(problems), JSON.stringify(body));
+    assert.equal(store.router.settings, null);
+  }
+  assert.equal((await onboarding.setRouterSettings({ defaults: { wakeMode: 'any' } })).settings.defaults.wakeMode, 'any');
 });

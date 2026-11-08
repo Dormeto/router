@@ -7,7 +7,9 @@ import { createControllerApi, fromEnvironment } from '../src/controller.mjs';
 import { toFields } from '../src/firestore.mjs';
 import { GoogleError } from '../src/google.mjs';
 import { fakeFirestore } from './firestore-fake.mjs';
-import { INPUT, REGION, V1, WAKER, ZONE, serviceUrl, setup, unmanagedUrl } from './world.mjs';
+import {
+  DEFAULT_FROM, DEFAULT_SETTINGS, INPUT, REGION, V1, WAKER, ZONE, regional, serviceUrl, setup, unmanagedUrl,
+} from './world.mjs';
 
 const PACKAGE = JSON.parse(await readFile(new URL('../../package.json', import.meta.url), 'utf8'));
 const PATTERN = '^[a-z]([a-z0-9-]{0,38}[a-z0-9])?$';
@@ -52,7 +54,12 @@ test('GET /v1/workloads: none, then each as a Workload the CLI can read', async 
     wakerBackendService: WAKER,
     hosts: ['demo.example.com'],
     lb: { kind: 'global' },
-    settings: { idleMinutes: 15, wakeTimeoutSeconds: 600 },
+    settings: DEFAULT_SETTINGS,
+    settingsFrom: DEFAULT_FROM,
+    type: { name: 'instance', from: 'backends' },
+    noWakeRules: [],
+    wakeRules: [],
+    hibernation: { hibernate: true, from: 'default', workload: null, router: null, manager: null },
     backends: [{ kind: 'vm', location: ZONE, name: 'vm-a', id: '1001' }],
     // The CLI reads it as a string: a number would fail its decoding.
     awakeSince: new Date(clock.now()).toISOString(),
@@ -455,12 +462,81 @@ test('an offboarding takes the schedule and the pause with it', async () => {
   assert.equal(store.schedules.size + store.pauses.size, 0);
 });
 
+// --- Settings by level (vision docs/specs/2026-11-08-google-cloud-router-features-design.md, section 4.5) --------------------------
+
+const WAIT_FIXED = 'settings: waitSeconds is 0 on Google Cloud: the waker holds no request (behind a swap the switch back takes longer than any hold; behind the policy it receives only the error fetch)';
+const BROWSER_ONLY = 'settings: the global load balancer\'s waiting page can\'t see the visitor\'s request, so only the page\'s probe, an explicit wake or a wake rule wakes it (wake mode browser)';
+
+test('PUT /v1/workloads/:id/settings: AWS\'s answer; a level\'s refusal: 400 with the problems, nothing written; unknown: 404; a bad ID or body: 400', async () => {
+  const { call, store, w } = api();
+  assert.equal((await call('PUT', '/v1/workloads/demo/settings', { idleMinutes: 30 })).status, 404);
+  assert.equal((await call('PUT', '/v1/workloads/Bad_ID/settings', { idleMinutes: 30 })).status, 400);
+  await call('POST', '/v1/workloads', INPUT);
+  const res = await call('PUT', '/v1/workloads/demo/settings', { idleMinutes: 30, hibernate: false, by: 'ops' });
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body, {
+    level: 'workload',
+    settings: { idleMinutes: 30, hibernate: false },
+    hibernation: { hibernate: false, from: 'workload', workload: false, router: null, manager: null },
+    resolved: { settings: { ...DEFAULT_SETTINGS, idleMinutes: 30 }, settingsFrom: { ...DEFAULT_FROM, idleMinutes: 'workload' }, type: { name: 'instance', from: 'backends' } },
+  });
+  assert.equal(w.logs.find((l) => l.event === 'WorkloadSettings').by, 'ops');
+  const before = structuredClone(store.configs.get('demo'));
+  const refused = await call('PUT', '/v1/workloads/demo/settings', { waitSeconds: 30, wakeMode: 'any' });
+  assert.equal(refused.status, 400);
+  assert.deepEqual(refused.body, { error: `${WAIT_FIXED}; ${BROWSER_ONLY}`, reason: 'bad-request', problems: [WAIT_FIXED, BROWSER_ONLY] });
+  assert.deepEqual(store.configs.get('demo'), before);
+  for (const body of ['{', '[]']) assert.equal((await call('PUT', '/v1/workloads/demo/settings', body)).status, 400);
+});
+
+test('GET /v1/workloads/:id: each setting resolved, where it comes from, the type and the rules', async () => {
+  const { call, store } = api();
+  await call('POST', '/v1/workloads', { ...INPUT, settings: { noWakeRules: [{ name: 'health', pathPrefixes: ['/health'] }] } });
+  store.router.settings = { defaults: { idleMinutes: 5 }, by: 'ops', at: 1 };
+  const { body } = await call('GET', '/v1/workloads/demo');
+  assert.deepEqual(body.settings, { ...DEFAULT_SETTINGS, idleMinutes: 5 });
+  assert.deepEqual(body.settingsFrom, { ...DEFAULT_FROM, idleMinutes: 'router' });
+  assert.deepEqual(body.type, { name: 'instance', from: 'backends' });
+  assert.deepEqual(body.noWakeRules, [{ name: 'health', level: 'workload', conditions: { pathPrefixes: ['/health'] } }]);
+  assert.deepEqual(body.wakeRules, []);
+});
+
+test('GET /v1/settings: the router level, none as AWS\'s empty answer; PUT: stored and answered; a refusal: 400 with the problems', async () => {
+  const { call, store, clock } = api();
+  const none = await call('GET', '/v1/settings');
+  assert.equal(none.status, 200);
+  assert.deepEqual(none.body, { level: 'router', settings: { hibernate: null, joinMinutes: null, by: null, at: null } });
+  const set = await call('PUT', '/v1/settings', { hibernate: false, defaults: { idleMinutes: 30 }, by: 'ops' });
+  assert.equal(set.status, 200);
+  const settings = { hibernate: false, joinMinutes: null, defaults: { idleMinutes: 30 }, by: 'ops', at: new Date(clock.now()).toISOString() };
+  assert.deepEqual(set.body, { level: 'router', settings });
+  assert.deepEqual((await call('GET', '/v1/settings')).body, { level: 'router', settings });
+  const refused = await call('PUT', '/v1/settings', { defaults: { waitSeconds: 30 } });
+  assert.equal(refused.status, 400);
+  const problem = WAIT_FIXED.replace('settings: ', 'settings: defaults: ');
+  assert.deepEqual(refused.body, { error: problem, reason: 'bad-request', problems: [problem] });
+  assert.deepEqual(store.router.settings, { hibernate: false, defaults: { idleMinutes: 30 }, by: 'ops', at: clock.now() });
+  for (const body of ['{', '[]']) assert.equal((await call('PUT', '/v1/settings', body)).status, 400);
+});
+
+test('POST /v1/workloads: the regional onboarding with wakeTimeoutSeconds 120 is refused as before G5', async () => {
+  const { call, store } = api(regional);
+  const res = await call('POST', '/v1/workloads', { ...INPUT, settings: { wakeTimeoutSeconds: 120 } });
+  assert.equal(res.status, 400);
+  assert.deepEqual(res.body, {
+    error: 'cannot onboard demo: settings: wakeTimeoutSeconds 120 is too short for a regional load balancer: its wake includes the URL map\'s change, 100 s: use more than 160',
+    reason: 'not-eligible',
+  });
+  assert.equal(store.configs.size, 0);
+});
+
 test('any other route or method: a 404 in the same shape', async () => {
   const { call } = api();
   for (const [method, path] of [
     ['GET', '/'], ['GET', '/v1'], ['POST', '/v1/health'], ['PUT', '/v1/workloads'], ['DELETE', '/v1/workloads'],
     ['POST', '/v1/workloads/demo'], ['PUT', '/v1/workloads/demo'], ['GET', '/v1/workloads/demo/nap'], ['POST', '/v1/workloads/demo/other'], ['POST', '/v1/workloads/demo/nap/x'],
     ['GET', '/v1/tasks'], ['GET', '/v1/check'], ['POST', '/v1/workloads/demo/schedule'], ['GET', '/v1/workloads/demo/pause'], ['PUT', '/v1/workloads/demo/pause'], ['GET', '/v1/workloads/demo/resume'],
+    ['GET', '/v1/workloads/demo/settings'], ['POST', '/v1/workloads/demo/settings'], ['DELETE', '/v1/workloads/demo/settings'], ['POST', '/v1/settings'], ['DELETE', '/v1/settings'], ['GET', '/v1/settings/x'],
   ]) {
     const res = await call(method, path);
     assert.equal(res.status, 404, `${method} ${path}`);

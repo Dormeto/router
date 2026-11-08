@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { effectiveConfig } from '../../lambda/src/lib/settings-levels.mjs';
-import { effectiveOf, isPolicy, levelProblems, swapFloorOf, wakerConfigOf } from '../src/levels.mjs';
+import { effectiveOf, inheritsOf, isPolicy, levelProblems, swapFloorOf, wakerConfigOf } from '../src/levels.mjs';
 
 const vm = { kind: 'vm', name: 'web', zone: 'europe-west1-b' };
 const global = { backends: [vm], lb: { kind: 'global' } };
@@ -29,6 +29,12 @@ test('a legacy configuration reads 15 and 60 as inherited, another value as its 
   assert.deepEqual([legacy.idleMinutes, legacy.settingsFrom.idleMinutes, legacy.failedRetrySeconds, legacy.settingsFrom.failedRetrySeconds], [5, 'router', 90, 'router']);
   const own = effectiveOf({ ...regional, idleMinutes: 20 }, { router });
   assert.deepEqual([own.idleMinutes, own.settingsFrom.idleMinutes], [20, 'workload']);
+});
+
+test('inheritsOf: the configuration\'s inherits; a legacy one\'s, every key it doesn\'t set and 15 and 60', () => {
+  assert.deepEqual(inheritsOf({ ...regional, inherits: ['idleMinutes'], idleMinutes: 15 }), ['idleMinutes']);
+  assert.deepEqual(inheritsOf({ ...regional, idleMinutes: 15, failedRetrySeconds: 60, wakeTimeoutSeconds: 700 }), ['idleMinutes', 'waitSeconds', 'drainSeconds', 'maxHolders', 'failedRetrySeconds', 'wakeMode']);
+  assert.deepEqual(inheritsOf({ ...regional, idleMinutes: 20, waitSeconds: 10 }), ['drainSeconds', 'wakeTimeoutSeconds', 'maxHolders', 'failedRetrySeconds', 'wakeMode']);
 });
 
 test('behind a swap the wake timeout is at least the swap\'s wait + 60 s, fixed', () => {
@@ -139,4 +145,12 @@ test('levelProblems keeps AWS\'s messages: 21 rules, a type at the router', () =
   assert.deepEqual(levelProblems({ noWakeRules: rules }, { level: 'router' }), ['noWakeRules: at most 20 rules']);
   assert.deepEqual(levelProblems({ type: 'databases' }, { level: 'router' }), ['unknown setting type']);
   assert.deepEqual(levelProblems({ type: 'databases' }, { level: 'workload', cfg: global }), []);
+});
+
+test('levelProblems names a key of Object\'s prototype an unknown setting, as any other, where the shared check would throw', () => {
+  for (const settings of [{ constructor: 1 }, JSON.parse('{"__proto__": 1}'), { toString: 'x' }]) {
+    assert.deepEqual(levelProblems(settings, { level: 'router' }), [`unknown setting ${Object.keys(settings)[0]}`]);
+    assert.deepEqual(levelProblems(settings, { level: 'workload', cfg: regional }), [`unknown setting ${Object.keys(settings)[0]}`]);
+  }
+  assert.deepEqual(levelProblems({ constructor: 1, idleMinutes: 4 }, { level: 'router' }), ['unknown setting constructor', 'idleMinutes must be a whole number from 5 to 1440']);
 });

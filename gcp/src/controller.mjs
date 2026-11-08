@@ -1,6 +1,7 @@
 // The controller on Cloud Run (vision docs/plans/2026-10-29-google-cloud.md, the controller API): the operator's calls, the
 // tasks of Cloud Tasks and the check job. Cloud Run's IAM checks the caller. Errors are `{ error, reason }`: what is wrong,
-// and a short reason for a program; a failure is left to `serve`, which logs it and answers a 500.
+// and a short reason for a program, with `problems` for refused settings (AWS's list); a failure is left to `serve`, which logs it
+// and answers a 500.
 import { response } from '../../lambda/src/lib/http.mjs';
 import { logger } from '../../lambda/src/lib/log.mjs';
 import { parseLists } from '../../lambda/src/lib/list-cache.mjs';
@@ -19,6 +20,8 @@ import { createTasks } from './tasks.mjs';
 import { createUrlMaps } from './urlmaps.mjs';
 
 const WORKLOADS = '/v1/workloads';
+// The router level of the settings (vision docs/specs/2026-11-08-google-cloud-router-features-design.md, section 4.5).
+const SETTINGS = '/v1/settings';
 const WORKLOAD = /^\/v1\/workloads\/([^/]+)(?:\/([^/]+))?$/;
 const MAX_BODY_BYTES = 1024 * 1024;
 
@@ -88,6 +91,8 @@ export function createControllerApi({ core, onboarding, config }) {
     if (path === '/v1/health' && method === 'GET') return { version: PACKAGE.version, project: config.project, region: config.region };
     if (path === '/v1/check' && method === 'POST') return { results: await core.check() };
     if (path === '/v1/tasks' && method === 'POST') return task(await bodyOf(request));
+    if (path === SETTINGS && method === 'GET') return onboarding.routerSettings();
+    if (path === SETTINGS && method === 'PUT') return onboarding.setRouterSettings(await bodyOf(request));
     if (path === WORKLOADS && method === 'GET') return onboarding.list();
     if (path === WORKLOADS && method === 'POST') {
       const body = await bodyOf(request);
@@ -102,6 +107,7 @@ export function createControllerApi({ core, onboarding, config }) {
     if (verb === 'schedule' && method === 'GET') return onboarding.showSchedule(idOf(encoded));
     if (verb === 'schedule' && method === 'PUT') return onboarding.setSchedule(idOf(encoded), await bodyOf(request));
     if (verb === 'schedule' && method === 'DELETE') return onboarding.clearSchedule(idOf(encoded));
+    if (verb === 'settings' && method === 'PUT') return onboarding.setSettings(idOf(encoded), await bodyOf(request));
     if (verb === 'pause' && method === 'POST') return onboarding.pause(idOf(encoded), await bodyOf(request));
     if (verb === 'resume' && method === 'POST') return onboarding.resume(idOf(encoded), await bodyOf(request));
     return null;
@@ -114,7 +120,7 @@ export function createControllerApi({ core, onboarding, config }) {
       if (answer === null) return json(404, { error: `no route for ${request.method} ${pathname}`, reason: 'not-found' });
       return json(200, answer);
     } catch (err) {
-      if (err instanceof Refusal) return json(err.status, { error: err.message, reason: err.reason });
+      if (err instanceof Refusal) return json(err.status, { error: err.message, reason: err.reason, ...(err.problems ? { problems: err.problems } : {}) });
       throw err;
     }
   };

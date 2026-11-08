@@ -14,7 +14,13 @@
 //
 // GKE pods (section 8): `gke` in the request, a `k8s` backend. The dry run reads Google only, as it comes before any right in the cluster: it answers the
 // namespace and the Service its NEGs name, which the CLI reads the owner of and applies the Role in. The onboarding then checks each right and reads the owner.
+//
+// Settings by level (vision docs/specs/2026-11-08-google-cloud-router-features-design.md, section 4): AWS's keys in the configuration, with
+// `inherits` (the keys that follow the levels) and `source: 'cli'`; the router level in `router/settings`. The routes that set them are
+// AWS's `settings` action, with what Google Cloud fixes (levels.mjs); a Workload shows each setting resolved and where it comes from.
+import { resolveHibernation, settingsProblems, workloadSettingsProblems } from '../../lambda/src/lib/hibernation.mjs';
 import { nextEvents, normalizeSchedule, resolveJoin, scheduleProblems } from '../../lambda/src/lib/schedule.mjs';
+import { describedRules, RULE_KEYS, SCALAR_KEYS } from '../../lambda/src/lib/settings-levels.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { companionRead, INSTANCE_NAME, isCompanion, statusOf } from './cloudsql.mjs';
 import { groupOf, PauseRefused } from './controller-core.mjs';
@@ -22,6 +28,7 @@ import {
   clusterProblems, clusterRead, giveBackOwner, gkeMapRefusal, gkeProblems, isGkeNeg, isPods, negsOfService, ownerAsVm, ownerText, pauseLeft,
 } from './gke.mjs';
 import { beatOf } from './heartbeat.mjs';
+import { effectiveOf, inheritsOf, levelProblems } from './levels.mjs';
 import { SWITCH_HEADER, WORKLOAD_HEADER, WORKLOAD_ID, swapHeaders } from './names.mjs';
 import { inOneUpdate, SWAP_WAIT_MS } from './switch.mjs';
 import {
@@ -41,28 +48,26 @@ const INSTANCE_GROUP = /\/(zones|regions)\/([^/]+)\/instanceGroups\/([^/]+)$/;
 const NEG_URL = /\/(zones|regions|global)\/(?:([^/]+)\/)?networkEndpointGroups\/([^/]+)$/;
 const NEG_OF_VMS = 'GCE_VM_IP_PORT';
 const MANAGED_GROUP_OWNER = /\/instanceGroupManagers\/([^/]+)$/;
-const DEFAULTS = { idleMinutes: 15, failedRetrySeconds: 60, pollSeconds: 3 };
-const VMS_WAKE_SECONDS = 600;
-const PODS_WAKE_SECONDS = 300;
-// AWS's 1800 s does not fit the request.
-const COMPANION_WAKE_SECONDS = 1700;
-// What an explicit wake's timeout must leave, beyond its URL map's change, under a swap: for the VMs to start at all.
-const SWAP_WAKE_ROOM_SECONDS = 60;
-// What the CLI's flags set, with AWS's ranges (lambda/src/lib/onboarding.mjs); the wake's fits the controller's request.
-const RANGES = { idleMinutes: [5, 1440], waitSeconds: [5, 120], wakeTimeoutSeconds: [60, 1700] };
-// What a Workload shows of its configuration.
-const SETTINGS = ['idleMinutes', 'waitSeconds', 'wakeTimeoutSeconds', 'hibernate'];
+// Not a setting of the levels.
+const POLL_SECONDS = 3;
+// The load balancer before it is read: neither the policy nor a swap, so what the settings ask of it waits until it is known.
+const UNREAD_LB = { kind: 'unread' };
 
+// `problems`: each problem of a refused body, as AWS's settings action answers them.
 export class Refusal extends Error {
-  constructor(status, reason, message) {
+  constructor(status, reason, message, { problems } = {}) {
     super(message);
     this.name = 'Refusal';
     this.status = status;
     this.reason = reason;
+    if (problems) this.problems = problems;
   }
 }
 
 const bad = (message) => new Refusal(400, 'bad-request', message);
+const refusedSettings = (problems) => new Refusal(400, 'bad-request', problems.join('; '), { problems });
+const notFound = (id) => new Refusal(404, 'not-found', `no workload ${id}`);
+const isObject = (value) => !!value && typeof value === 'object' && !Array.isArray(value);
 const nameOf = (url) => url.slice(url.lastIndexOf('/') + 1);
 const zoneOf = (url) => /\/zones\/([^/]+)\//.exec(url)?.[1];
 // A proxy's URL without what differs between Google's answers, as a forwarding rule's target names it.
@@ -82,8 +87,6 @@ function requestLogsProblems(asked) {
   ];
 }
 
-// The map's change is included in the wake's time.
-const defaultWakeSeconds = (lb, companions, pods) => Math.min((companions ? COMPANION_WAKE_SECONDS : pods ? PODS_WAKE_SECONDS : VMS_WAKE_SECONDS) + (isSwapped(lb) ? SWAP_WAIT_MS[lb.kind] / 1000 : 0), RANGES.wakeTimeoutSeconds[1]);
 const backendText = (backend) => (isPods(backend) ? ownerText(backend) : backend.name);
 const sameCluster = (a, b) => a.location === b.location && a.name === b.name;
 
@@ -105,14 +108,38 @@ function checkedId(id) {
   return id;
 }
 
-function settingsProblems(settings) {
-  if (typeof settings !== 'object' || settings === null || Array.isArray(settings)) return ['settings: must be an object'];
-  return Object.entries(settings).flatMap(([key, value]) => {
-    if (key === 'hibernate') return typeof value === 'boolean' ? [] : ['settings: hibernate must be true or false'];
-    if (!Object.hasOwn(RANGES, key)) return [`settings: unknown setting ${key}`];
-    const [min, max] = RANGES[key];
-    return Number.isInteger(value) && value >= min && value <= max ? [] : [`settings: ${key} must be an integer from ${min} to ${max}`];
-  });
+// An onboarding's settings (ruling 1 of the plan's ledger): `hibernate`, true or false, and the settings of the levels, each a value or
+// null (left to the levels), through levelProblems. What they ask of the load balancer is checked once it is read: an explicit wake
+// timeout must leave room for a swap's map change, and the policy keeps the wake mode browser.
+function onboardSettingsProblems(settings, lb = UNREAD_LB) {
+  if (!isObject(settings)) return ['settings: must be an object'];
+  const { hibernate, ...levels } = settings;
+  return [
+    ...(Object.hasOwn(settings, 'hibernate') && typeof hibernate !== 'boolean' ? ['settings: hibernate must be true or false'] : []),
+    ...levelProblems(levels, { level: 'workload', cfg: { lb } }).map((problem) => `settings: ${problem}`),
+  ];
+}
+
+// A workload's settings, as AWS's workloadSettingsProblems: `hibernate` and `joinMinutes` in its words, the settings of the levels with
+// what Google Cloud refuses for the workload's load balancer.
+function workloadProblems(settings, cfg) {
+  if (!isObject(settings)) return ['settings must be an object'];
+  const aws = (key) => key === 'hibernate' || key === 'joinMinutes';
+  const entries = Object.entries(settings);
+  return [
+    ...workloadSettingsProblems(Object.fromEntries(entries.filter(([key]) => aws(key)))),
+    ...levelProblems(Object.fromEntries(entries.filter(([key]) => !aws(key))), { level: 'workload', cfg }).map((problem) => `settings: ${problem}`),
+  ];
+}
+
+// The router level's, as AWS's settingsProblems: its defaults with what Google Cloud refuses at the router.
+function routerProblems(settings) {
+  if (!isObject(settings)) return ['settings must be an object'];
+  const { defaults, ...rest } = settings;
+  return [
+    ...settingsProblems(rest),
+    ...(defaults === undefined || defaults === null ? [] : levelProblems(defaults, { level: 'router' }).map((problem) => `settings: defaults: ${problem}`)),
+  ];
 }
 
 function cloudSqlProblems(cloudSql) {
@@ -123,13 +150,29 @@ function cloudSqlProblems(cloudSql) {
   ];
 }
 
-// The map's change is included in the wake: a timeout that leaves it no room is a wake that always fails.
-function swapTimeoutProblems({ wakeTimeoutSeconds: asked }, lb) {
-  if (asked === undefined || !isSwapped(lb)) return [];
-  const change = SWAP_WAIT_MS[lb.kind] / 1000;
-  const lowest = change + SWAP_WAKE_ROOM_SECONDS;
-  return asked > lowest ? [] : [`settings: wakeTimeoutSeconds ${asked} is too short for a ${lb.kind} load balancer: its wake includes the URL map's change, ${change} s: use more than ${lowest}`];
+// What each key left to the levels resolves to without any level (the built-in value, with what Google Cloud fixes): the value a
+// router before G5 reads, as AWS writes its built-in values for an older router.
+const builtInsOf = (cfg) => effectiveOf({ ...cfg, inherits: SCALAR_KEYS });
+
+// AWS's hibernation of a workload, as its status and its settings answer give it: the resolution (its own, none with fallback machine
+// types, the router's, the built-in), each level's value, and the manager's, none until G2.
+function hibernationOf(cfg, router) {
+  return {
+    ...resolveHibernation({ workload: cfg.hibernate, fallbackTypes: cfg.fallbackInstanceTypes, router: router?.hibernate }),
+    workload: typeof cfg.hibernate === 'boolean' ? cfg.hibernate : null,
+    router: typeof router?.hibernate === 'boolean' ? router.hibernate : null,
+    manager: null,
+  };
 }
+
+// Each setting resolved, where it comes from, and the type, as AWS's settings answer gives them.
+const resolvedOf = (effective) => ({ settings: Object.fromEntries(SCALAR_KEYS.map((key) => [key, effective[key]])), settingsFrom: effective.settingsFrom, type: effective.type });
+
+// The router's record as people read it (AWS's routerSettingsView): all null when unset, its time ISO.
+const routerSettingsView = (record) => ({
+  hibernate: record?.hibernate ?? null, joinMinutes: record?.joinMinutes ?? null, ...(record?.defaults ? { defaults: record.defaults } : {}),
+  by: record?.by ?? null, at: record ? isoOf(record.at) : null,
+});
 
 function failureOf(run) {
   if (!run?.failure) return null;
@@ -145,10 +188,14 @@ function failureOf(run) {
 // the Cloud SQL instances named at its onboarding that no longer exist, as last read. `napAborted`: why the last nap was given up and
 // when, until a nap commits. `beatAt`: the running wake's or nap's last heartbeat (heartbeat.mjs), WAKING or NAPPING only. `idleReads`:
 // what the idle check read at the last check that read log entries or counted a request, `request logs` or `request count`
-// (controller-core.mjs).
-function workloadOf(cfg, run, paused) {
+// (controller-core.mjs). With the router level (`router`): each setting resolved (`settings`), where it comes from, the type and the
+// rules of every level, as AWS's status gives them, and its hibernation; its fallback machine types, and `instanceTypes` while a VM
+// runs on one.
+function workloadOf(cfg, run, paused, router) {
   const failure = failureOf(run);
   const beatAt = run ? beatOf(run) : undefined;
+  const effective = effectiveOf(cfg, { run, router });
+  const { settings, settingsFrom, type } = resolvedOf(effective);
   return {
     id: cfg.workloadId,
     state: run?.state ?? 'UNKNOWN',
@@ -157,8 +204,14 @@ function workloadOf(cfg, run, paused) {
     wakerBackendService: cfg.wakerBackendService,
     hosts: cfg.hosts,
     lb: cfg.lb ?? GLOBAL_LB,
-    settings: Object.fromEntries(SETTINGS.filter((name) => cfg[name] !== undefined).map((name) => [name, cfg[name]])),
+    settings,
+    settingsFrom,
+    type,
+    ...describedRules(effective),
+    hibernation: hibernationOf(cfg, router),
     backends: cfg.backends,
+    ...(Array.isArray(cfg.fallbackInstanceTypes) && cfg.fallbackInstanceTypes.length ? { fallbackInstanceTypes: cfg.fallbackInstanceTypes } : {}),
+    ...(run?.instanceTypes && Object.keys(run.instanceTypes).length ? { instanceTypes: run.instanceTypes } : {}),
     ...(cfg.requestLogs ? { requestLogs: cfg.requestLogs } : {}),
     ...(run?.state === STATES.AWAKE && run.awakeSince !== undefined ? { awakeSince: isoOf(run.awakeSince) } : {}),
     ...(run?.lastWake ? { lastWake: run.lastWake } : {}),
@@ -198,7 +251,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     const workloadId = checkedId(id || backendService);
     const waker = wakerName(workloadId);
     if (waker.length > NAME_MAX) throw bad(`workload ID ${workloadId} would name the waker backend service ${waker}, longer than the ${NAME_MAX} characters of a Compute Engine name: use a shorter one`);
-    const problems = [...settingsProblems(settings), ...cloudSqlProblems(cloudSql), ...(requestLogs === undefined ? [] : requestLogsProblems(requestLogs)), ...(gkeAsked === undefined ? [] : gkeProblems(gkeAsked, { needsAll }))];
+    const problems = [...onboardSettingsProblems(settings), ...cloudSqlProblems(cloudSql), ...(requestLogs === undefined ? [] : requestLogsProblems(requestLogs)), ...(gkeAsked === undefined ? [] : gkeProblems(gkeAsked, { needsAll }))];
     if (problems.length) throw bad(problems.join('; '));
     return { id: workloadId, urlMap, backendService, settings, loadBalancer, cloudSql, gkeAsked, requestLogs };
   }
@@ -424,7 +477,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     const kind = front.kind ?? (regional ? 'regional' : loadBalancer ?? 'global');
     const lb = regional ? { kind, region: config.region } : { kind };
     const told = front.kind ? { lb } : {};
-    if (front.kind) reasons.push(...swapTimeoutProblems(settings, lb));
+    if (front.kind) reasons.push(...onboardSettingsProblems(settings, lb));
 
     // A backend service's name is unique in its scope.
     const owner = others.find((c) => c.backendService === backendService && isRegional(c.lb ?? GLOBAL_LB) === regional);
@@ -539,9 +592,14 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
       const problems = await clusterProblems(clients, pods, podNegs);
       if (problems.length) throw new Refusal(400, 'not-eligible', `cannot onboard ${id}: ${problems.join('; ')}`);
     }
+    // The level the answer resolves with, read before anything is written.
+    const router = await routerLevel();
     const name = wakerName(id);
     const waker = wakerUrl(name, lb);
-    const cfg = {
+    // A setting sent null is left to the levels, as one not sent.
+    const { hibernate, ...asked } = settings;
+    const levels = Object.fromEntries(Object.entries(asked).filter(([, value]) => value !== null));
+    const written = {
       workloadId: id,
       urlMap,
       backendService,
@@ -565,11 +623,18 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
         ...(pods ? [pods] : []),
         ...databases.map(({ name: database }) => ({ kind: 'cloudsql', name: database })),
       ],
-      ...DEFAULTS,
-      wakeTimeoutSeconds: defaultWakeSeconds(lb, databases.length > 0, Boolean(pods)),
-      ...settings,
+      pollSeconds: POLL_SECONDS,
+      noWakeRules: [],
+      wakeRules: [],
+      ...levels,
+      ...(typeof hibernate === 'boolean' ? { hibernate } : {}),
+      // What the onboarding is not given follows the levels (design section 4.1), G1's computed wake timeout included.
+      inherits: SCALAR_KEYS.filter((key) => !Object.hasOwn(levels, key)),
+      source: 'cli',
       onboardedAt: isoOf(now()),
     };
+    const builtIn = builtInsOf(written);
+    const cfg = { ...written, ...Object.fromEntries(written.inherits.map((key) => [key, builtIn[key]])) };
     try {
       if (!wakerExists) {
         // M4 (the coverage design's section 10): Google takes a classic backend service with EXTERNAL and its two custom request
@@ -594,15 +659,18 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
       throw err;
     }
     log.info('Onboarded', { workloadId: id, urlMap, backendService });
-    return workloadOf(cfg, await store.getRun(id));
+    return workloadOf(cfg, await store.getRun(id), undefined, router);
   }
 
   // The configuration, or a 400 or a 404.
   async function find(id) {
     const cfg = await store.getConfig(checkedId(id));
-    if (!cfg) throw new Refusal(404, 'not-found', `no workload ${id}`);
+    if (!cfg) throw notFound(id);
     return cfg;
   }
+
+  // The router level (`router/settings`), null when unset. A read that fails fails the request, as any other read of it.
+  const routerLevel = async () => (await store.getRouterSettings()) ?? null;
 
   // Back awake in this request, up to the wake's timeout: the VMs must be up once the policy goes and the CLI unbinds the tag.
   async function awaken(id, run) {
@@ -671,16 +739,17 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     return {};
   }
 
-  // The Workload as it is now.
-  async function current(cfg) {
-    const [run, [paused]] = await Promise.all([store.getRun(cfg.workloadId), core.pausesFor(cfg.workloadId)]);
-    return workloadOf(cfg, run, paused);
+  // The Workload as it is now. `router`: the router level, already read.
+  async function current(cfg, { router } = {}) {
+    const [run, [paused], level] = await Promise.all([store.getRun(cfg.workloadId), core.pausesFor(cfg.workloadId), router === undefined ? routerLevel() : router]);
+    return workloadOf(cfg, run, paused, level);
   }
 
   const show = async (id) => current(await find(id));
 
   async function list() {
-    const workloads = await Promise.all((await store.listConfigs()).map(current));
+    const [configs, router] = await Promise.all([store.listConfigs(), routerLevel()]);
+    const workloads = await Promise.all(configs.map((cfg) => current(cfg, { router })));
     return workloads.sort((a, b) => a.id.localeCompare(b.id));
   }
 
@@ -755,5 +824,70 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     return current(cfg);
   }
 
-  return { dryRun, onboard, offboard, find, show, list, nap, wake, showSchedule, setSchedule, clearSchedule, pause, resume };
+  // AWS's settings action for a workload (lambda/src/lib/controller-core.mjs, `setSettings`): `hibernate` (null removes it), the
+  // settings of the levels (null gives the key back to the levels, its value without any level written for a router before G5), the
+  // rules (null: none) and the type (null: inherited). `by` says who sets them, as a schedule's. A refusal names every problem, with
+  // nothing written; a workload offboarded meanwhile is a 404, never written back.
+  async function setSettings(id, { by, ...settings }) {
+    const cfg = await find(id);
+    const problems = workloadProblems(settings, cfg);
+    if (problems.length) throw refusedSettings(problems);
+    const next = { ...cfg };
+    if (Object.hasOwn(settings, 'hibernate')) {
+      if (typeof settings.hibernate === 'boolean') next.hibernate = settings.hibernate;
+      else delete next.hibernate;
+    }
+    const scalars = SCALAR_KEYS.filter((key) => Object.hasOwn(settings, key));
+    if (scalars.length) {
+      // A configuration from before `inherits` is read as effectiveOf reads it (design section 4.1).
+      const inherits = new Set(inheritsOf(cfg));
+      const builtIn = builtInsOf(cfg);
+      for (const key of scalars) {
+        if (settings[key] === null) {
+          next[key] = builtIn[key];
+          inherits.add(key);
+        } else {
+          next[key] = settings[key];
+          inherits.delete(key);
+        }
+      }
+      next.inherits = SCALAR_KEYS.filter((key) => inherits.has(key));
+    }
+    for (const key of RULE_KEYS) if (Object.hasOwn(settings, key)) next[key] = settings[key] ?? [];
+    if (Object.hasOwn(settings, 'type')) {
+      if (settings.type === null) delete next.type;
+      else next.type = settings.type;
+    }
+    // The level the answer resolves with, read before the write: a failed read changes nothing.
+    const router = await routerLevel();
+    if (!(await store.putConfig(id, next, { mustExist: true }))) throw notFound(id);
+    log.info('WorkloadSettings', { workloadId: id, keys: Object.keys(settings), hibernate: next.hibernate ?? null, previous: cfg.hibernate ?? null, by: by ?? 'unknown' });
+    return { level: 'workload', settings: { ...settings }, hibernation: hibernationOf(next, router), resolved: resolvedOf(effectiveOf(next, { router })) };
+  }
+
+  const routerSettings = async () => ({ level: 'router', settings: routerSettingsView(await routerLevel()) });
+
+  // AWS's settings action without a workload: `hibernate`, `joinMinutes` and the `defaults` of the router's workloads, merged with
+  // what it holds (what is not sent stays, a key of the defaults sent null goes, `defaults: null` clears them); none left, no record.
+  // An empty body reads. `by` says who sets them, as a schedule's. A refusal names every problem, with nothing written.
+  async function setRouterSettings({ by, ...settings }) {
+    const problems = routerProblems(settings);
+    if (problems.length) throw refusedSettings(problems);
+    // A record that cannot be read is not written over.
+    const stored = await routerLevel();
+    if (!Object.keys(settings).length) return { level: 'router', settings: routerSettingsView(stored) };
+    const sent = (name) => (Object.hasOwn(settings, name) ? settings[name] : stored?.[name] ?? null);
+    const merged = !Object.hasOwn(settings, 'defaults') ? stored?.defaults ?? null
+      : settings.defaults === null ? null
+        : Object.fromEntries(Object.entries({ ...stored?.defaults, ...settings.defaults }).filter(([, value]) => value !== null));
+    const defaults = merged && Object.keys(merged).length ? merged : null;
+    const record = { hibernate: sent('hibernate'), joinMinutes: sent('joinMinutes'), defaults, by: by ?? 'unknown', at: now() };
+    await store.putRouterSettings(record);
+    log.info('RouterSettings', { hibernate: record.hibernate, joinMinutes: record.joinMinutes, defaults: defaults ? Object.keys(defaults) : [], by: record.by });
+    return { level: 'router', settings: routerSettingsView(record.hibernate === null && record.joinMinutes === null && !defaults ? null : record) };
+  }
+
+  return {
+    dryRun, onboard, offboard, find, show, list, nap, wake, showSchedule, setSchedule, clearSchedule, pause, resume, setSettings, routerSettings, setRouterSettings,
+  };
 }

@@ -551,11 +551,14 @@ export function setup(change = () => {}, { clock = fakeClock() } = {}) {
   const runs = new Map();
   const schedules = new Map();
   const pauses = new Map();
+  // The router level (`router/settings`): `router.settings`, null when unset.
+  const router = { settings: null };
   const store = w.store ?? {
     configs,
     runs,
     schedules,
     pauses,
+    router,
     getConfig: async (id) => structuredClone(configs.get(id) ?? null),
     listConfigs: async () => [...configs.values()].map((c) => structuredClone(c)),
     listWorkloads: async () => ({ configs: [...configs.values()].map((c) => structuredClone(c)), schedules: structuredClone(schedules) }),
@@ -572,9 +575,21 @@ export function setup(change = () => {}, { clock = fakeClock() } = {}) {
     removePauses: async (id) => pauses.delete(id),
     count: async () => {},
     getRun: async (id) => structuredClone(runs.get(id) ?? null),
-    putConfig: async (id, config) => {
+    // As Firestore's: with mustExist, false when the workload is gone, nothing written.
+    putConfig: async (id, config, { mustExist = false } = {}) => {
+      if (mustExist && !configs.has(id)) return false;
       configs.set(id, structuredClone(config));
       return true;
+    },
+    getRouterSettings: async () => structuredClone(router.settings),
+    // As Firestore's: the whole record at each write, none of the three set: no record.
+    putRouterSettings: async ({ hibernate, joinMinutes, defaults, by, at }) => {
+      const record = {
+        ...(typeof hibernate === 'boolean' ? { hibernate } : {}),
+        ...(typeof joinMinutes === 'number' ? { joinMinutes } : {}),
+        ...(defaults && Object.keys(defaults).length ? { defaults } : {}),
+      };
+      router.settings = Object.keys(record).length ? structuredClone({ ...record, by: String(by ?? ''), at }) : null;
     },
     initRun: async (id, at) => {
       if (runs.has(id)) return false;
@@ -630,6 +645,10 @@ export function setup(change = () => {}, { clock = fakeClock() } = {}) {
 
 // The input of an onboarding of `app` as `demo`.
 export const INPUT = { urlMap: 'lb', backendService: 'app', id: 'demo' };
+// A global workload of VMs with no setting of its own and no router level: its settings resolved, and where each comes from
+// (vision docs/specs/2026-11-08-google-cloud-router-features-design.md, section 3).
+export const DEFAULT_SETTINGS = { idleMinutes: 15, waitSeconds: 0, drainSeconds: 0, wakeTimeoutSeconds: 600, maxHolders: 0, failedRetrySeconds: 60, wakeMode: 'browser' };
+export const DEFAULT_FROM = { idleMinutes: 'default', waitSeconds: 'fixed', drainSeconds: 'fixed', wakeTimeoutSeconds: 'default', maxHolders: 'fixed', failedRetrySeconds: 'default', wakeMode: 'fixed' };
 
 // --- A GKE workload ----------------------------------------------------------------------------------------------------------
 

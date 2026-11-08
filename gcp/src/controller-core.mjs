@@ -11,6 +11,12 @@
 // | 'mig', location, name } | { kind: 'cloudsql', name } | { kind: 'k8s', cluster, namespace, service, owner }], idleMinutes, wakeTimeoutSeconds, hibernate?, lb? }`. `lb`: `{ kind: 'regional',
 // region }` or `{ kind: 'classic' }`, absent for a global load balancer. `config`: `{ project, region, controllerUrl }`.
 //
+// The check, the wake, the nap and the release act on the settings resolved through the levels (levels.mjs; vision
+// docs/specs/2026-11-08-google-cloud-router-features-design.md, section 4.5), as AWS's `effective()`: the idle window and the wake's
+// timeout from the workload, its type, the router level (`router/settings`) and the built-in values, with what Google Cloud fixes;
+// whether a nap suspends from the workload, its `fallbackInstanceTypes`, then the router level. The stored configuration stays what
+// the writes read. `failedRetrySeconds` is the waker's backoff (failures.mjs), not read here.
+//
 // A `cloudsql` backend is a companion (cloudsql.mjs): the VMs and groups, the primaries, alone decide the state and serve; it goes
 // after them and comes back before them, as on AWS. One deleted without an offboarding is the customer's own state: a nap does not go
 // for it, as a NEG gone, and a wake or a check goes on without it, said in `CompanionGone` and on the run's `companionsGone`, until an
@@ -49,6 +55,7 @@ import {
 } from './gke.mjs';
 import { OPERATION_NOT_DONE } from './google.mjs';
 import { resendStale, startHeartbeat, staleness } from './heartbeat.mjs';
+import { effectiveOf } from './levels.mjs';
 import { inOneUpdate, switchOf } from './switch.mjs';
 import { mapBusy, references, UrlMapRefused } from './urlmaps.mjs';
 
@@ -197,6 +204,18 @@ export function createController({
     const cfg = await store.getConfig(workloadId);
     if (!cfg) throw new Error(`workload not configured: ${workloadId}`);
     return cfg;
+  }
+
+  // The router level (`router/settings`): read once by a check for all its workloads, once by a wake, a nap or a release. A read
+  // that fails is said, and keeps the last record this instance read, else none: the built-in values. Never a failed check or wake.
+  let lastRouterLevel = null;
+  async function routerLevel() {
+    try {
+      lastRouterLevel = (await store.getRouterSettings?.()) ?? null;
+    } catch (err) {
+      log.warn('RouterSettingsUnread', { error: err.message });
+    }
+    return lastRouterLevel;
   }
 
   // --- The URL map ---------------------------------------------------------------------------------------------------
@@ -442,10 +461,11 @@ export function createController({
   // Down when this returns, the companions asked to go: an operation's end says little (a managed group's VMs go after it, and its
   // wait may run out before), so the VMs are read until they are. `stillGoing()`: whether the run is still the nap's or the release's:
   // a wake taken over, or asked and kept, needs its database, which is then left alone.
-  async function putToSleep(cfg, { autoscalers, owners }, latest, stillGoing) {
+  async function putToSleep(cfg, { autoscalers, owners, router }, latest, stillGoing) {
     const deadline = Math.min(now() + STOP_TIMEOUT_MS, latest);
     await each(autoscalers, (recorded) => setAutoscaler(recorded, 'OFF'));
-    const { hibernate } = resolveHibernation({ workload: cfg.hibernate });
+    // The workload's own, else none with fallback machine types (the type a VM wakes on may not suspend), else the router's.
+    const { hibernate } = resolveHibernation({ workload: cfg.hibernate, fallbackTypes: cfg.fallbackInstanceTypes, router: router?.hibernate });
     const done = await each(primariesOf(cfg), (backend) => sleepBackend(backend, hibernate, deadline, owners));
     for (;;) {
       const up = (await allVms(cfg)).filter((vm) => !GONE.has(vm.status));
@@ -501,7 +521,8 @@ export function createController({
       run = await store.getRun(workloadId);
       // A delayed or duplicated task must not touch anything once its wake is no longer the current one.
       if (run?.state !== STATES.WAKING || run.wakeId !== wakeId) return superseded();
-      cfg = await getConfig(workloadId);
+      const [stored, router] = await Promise.all([getConfig(workloadId), routerLevel()]);
+      cfg = effectiveOf(stored, { run, router });
       sw = switchFor(cfg);
     } catch (err) {
       return fail(err);
@@ -747,7 +768,8 @@ export function createController({
   async function nap(workloadId, { cause = 'idle', requestedAt, until } = {}) {
     const started = now();
     const latest = started + NAP_BUDGET_MS;
-    const cfg = await getConfig(workloadId);
+    const [stored, router] = await Promise.all([getConfig(workloadId), routerLevel()]);
+    const cfg = effectiveOf(stored, { router });
     const sw = switchFor(cfg);
     const refusal = await napRefusal(workloadId, requestedAt, until);
     if (refusal) {
@@ -759,11 +781,11 @@ export function createController({
     const napping = await transition(workloadId, { cond: { state: STATES.AWAKE }, set: { state: STATES.NAPPING, napId }, remove: ['pendingWake'], cause });
     if (!napping) return { state: 'SKIPPED' };
     log.info('NapStarted', { workloadId });
-    return beating(workloadId, 'napId', napId, () => napBeating(workloadId, { cfg, sw, napping, cause, requestedAt, started, latest }));
+    return beating(workloadId, 'napId', napId, () => napBeating(workloadId, { cfg, router, sw, napping, cause, requestedAt, started, latest }));
   }
 
   // A nap from its NAPPING on.
-  async function napBeating(workloadId, { cfg, sw, napping, cause, requestedAt, started, latest }) {
+  async function napBeating(workloadId, { cfg, router, sw, napping, cause, requestedAt, started, latest }) {
     // The run moved on while this request held it (a nap called stuck, a forced offboarding): the map and the state are another's.
     const superseded = () => {
       log.warn('NapSuperseded', { workloadId });
@@ -835,7 +857,7 @@ export function createController({
       }))) {
         return await giveUp(paused ? 'paused' : 'pending-wake', 'info', paused ? { reason: 'paused' } : {});
       }
-      slept = await putToSleep(cfg, { autoscalers, owners }, latest, async () => {
+      slept = await putToSleep(cfg, { autoscalers, owners, router }, latest, async () => {
         const current = await store.getRun(workloadId);
         return current?.state === STATES.NAPPING && !current.pendingWake;
       });
@@ -889,7 +911,8 @@ export function createController({
     let run = await store.getRun(workloadId);
     if (run?.state !== STATES.FAILED) return { state: 'SKIPPED', reason: run?.state ?? 'unknown' };
     if (await isPaused(workloadId)) return { state: 'SKIPPED', reason: 'paused' };
-    const cfg = await getConfig(workloadId);
+    const [stored, router] = await Promise.all([getConfig(workloadId), routerLevel()]);
+    const cfg = effectiveOf(stored, { run, router });
     try {
       const { paths } = await writeOnlyAsleep(cfg);
       if (paths.length) {
@@ -907,7 +930,7 @@ export function createController({
       const owners = await ownersToRecord(cfg, run);
       // A wake asked meanwhile takes over.
       if (!(await transition(workloadId, { cond: { state: STATES.FAILED }, set: { autoscalers, ...(owners.length ? { owners } : {}) } }))) return { state: 'SUPERSEDED' };
-      const slept = await putToSleep(cfg, { autoscalers, owners }, latest, async () => (await store.getRun(workloadId))?.state === STATES.FAILED);
+      const slept = await putToSleep(cfg, { autoscalers, owners, router }, latest, async () => (await store.getRun(workloadId))?.state === STATES.FAILED);
       const asleep = await transition(workloadId, { cond: { state: STATES.FAILED }, set: { state: STATES.ASLEEP, ...slept }, cause: 'failed-released', event: slept });
       if (!asleep) return { state: 'SUPERSEDED' };
       log.warn('FailedReleased', { workloadId, ...slept });
@@ -1215,10 +1238,11 @@ export function createController({
     }
   }
 
-  async function checkOne(cfg, deadline, paused, ctx) {
-    const { workloadId } = cfg;
+  async function checkOne(stored, deadline, paused, ctx) {
+    const { workloadId } = stored;
     let run = await store.getRun(workloadId);
     if (!run) return { state: 'UNKNOWN' };
+    const cfg = effectiveOf(stored, { run, router: ctx.router });
     if (run.state === STATES.NAPPING) {
       // A nap whose request no longer beats is stuck now (heartbeat.mjs). Its deadline stays, the last resort: for a nap from before
       // the heartbeat, or one that still beats past it.
@@ -1309,13 +1333,13 @@ export function createController({
     const pauses = await activePauses();
     const paused = (workloadId) => pauses === null || pauses.some((p) => p.workloadId === workloadId);
     const keptAsleep = (workloadId) => pauses === null || pauses.some((p) => p.keepAsleep && p.workloadId === workloadId);
-    const { configs, schedules } = await store.listWorkloads();
+    const [{ configs, schedules }, router] = await Promise.all([store.listWorkloads(), routerLevel()]);
     const order = [...configs].sort((a, b) => a.workloadId.localeCompare(b.workloadId));
     // A workload holds one nap in flight at most: with no more workloads than NAPS_MAX, their runs are not read for it.
     const flight = { naps: order.length > NAPS_MAX ? await napsInFlight(order) : 0, deferred: 0 };
     const { applied, readable } = await applySchedules(order, schedules, (id) => ({ paused: paused(id), keepAsleep: keptAsleep(id) }), now(), deadline, flight);
     await requestListRefresh();
-    const ctx = { schedules: readable, applied, flight };
+    const ctx = { schedules: readable, applied, flight, router };
     const passed = (workloadId) => (applied.has(workloadId) ? { schedule: applied.get(workloadId) } : {});
     const results = [];
     let next = 0;

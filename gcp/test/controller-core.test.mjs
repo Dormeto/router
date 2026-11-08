@@ -2338,6 +2338,135 @@ test('the check stops at its 240 s, and one workload\'s failure does not stop th
   assert.equal(logs.find((l) => l.event === 'CheckBudgetReached').workloads, 12);
 });
 
+// --- The levels (G5, design §4.5): what the check, the wake, the nap and the release act on is resolved ---------------------
+
+const RUNNING_VM = { 'vm-a': { status: 'RUNNING' } };
+const unreadable = () => new GoogleError('Google: GET: 503 unavailable', { code: 503 });
+// The setup with the router's record (router/settings).
+const leveled = (router, options) => {
+  const t = setup(options);
+  t.store.state.routerSettings = router;
+  return t;
+};
+// How many times the router level was read.
+function routerReads(t) {
+  const reads = { count: 0 };
+  const { getRouterSettings } = t.store;
+  t.store.getRouterSettings = (...args) => {
+    reads.count += 1;
+    return getRouterSettings(...args);
+  };
+  return reads;
+}
+
+test('the router\'s idleMinutes 5 on a workload that inherits it: the check reads [t − 5 min − 210 s, t], and asks the nap', async () => {
+  const t = leveled({ defaults: { idleMinutes: 5 } }, { run: { state: STATES.AWAKE, awakeSince: START - 5 * MINUTE - 210_000 }, cfg: { inherits: ['idleMinutes'] }, vms: RUNNING_VM });
+  assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.AWAKE, nap: 'requested' }]);
+  assert.deepEqual(t.world.metricReads, [{ backendService: 'app', from: START - 5 * MINUTE - 210_000, to: START }]);
+  // A configuration from before G5 (no `inherits`) holding G1's 15 inherits it too; its own 20 wins.
+  const legacy = leveled({ defaults: { idleMinutes: 5 } }, { run: AWAKE_LONG, vms: RUNNING_VM });
+  await legacy.controller.check();
+  assert.deepEqual(legacy.world.metricReads.map((q) => q.from), [START - 5 * MINUTE - 210_000]);
+  const own = leveled({ defaults: { idleMinutes: 5 } }, { run: AWAKE_LONG, cfg: { idleMinutes: 20 }, vms: RUNNING_VM });
+  await own.controller.check();
+  assert.deepEqual(own.world.metricReads.map((q) => q.from), [START - 20 * MINUTE - 210_000]);
+});
+
+test('a failed workload is released once the resolved idle window has passed: the router\'s 5 minutes', async () => {
+  const t = leveled({ defaults: { idleMinutes: 5 } }, { run: FAILED_RUN(START - 5 * MINUTE), cfg: { inherits: ['idleMinutes'] }, vms: RUNNING_VM, map: asleepMap(), unhealthyPolls: Infinity });
+  assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.FAILED, release: 'requested' }]);
+  assert.deepEqual(t.world.tasks.map((task) => task.body), [{ action: 'release', workloadId: 'demo' }]);
+});
+
+test('the router\'s hibernate false, the workload setting none: the nap and the release stop, never suspend; the workload\'s own true wins', async () => {
+  const nap = leveled({ hibernate: false }, { vms: RUNNING_VM });
+  assert.equal((await nap.controller.nap('demo')).state, STATES.ASLEEP);
+  assert.deepEqual(nap.world.calls, ['map policy', 'wait 300 s', 'stop vm-a']);
+  assert.deepEqual(nap.run().stopped, ['vm-a']);
+  const release = leveled({ hibernate: false }, { run: FAILED_RUN(START - 15 * MINUTE), vms: RUNNING_VM, map: asleepMap() });
+  assert.deepEqual(await release.controller.release('demo'), { state: STATES.ASLEEP });
+  assert.deepEqual(release.world.calls, ['stop vm-a']);
+  const own = leveled({ hibernate: false }, { cfg: { hibernate: true }, vms: RUNNING_VM });
+  await own.controller.nap('demo');
+  assert.deepEqual(own.world.calls, ['map policy', 'wait 300 s', 'suspend vm-a']);
+});
+
+test('a workload with fallback machine types: the nap stops, whatever the router says, unless its own hibernate is true', async () => {
+  const fallback = leveled({ hibernate: true }, { cfg: { fallbackInstanceTypes: ['e2-medium'] }, vms: RUNNING_VM });
+  await fallback.controller.nap('demo');
+  assert.deepEqual(fallback.world.calls, ['map policy', 'wait 300 s', 'stop vm-a']);
+  const own = setup({ cfg: { fallbackInstanceTypes: ['e2-medium'], hibernate: true }, vms: RUNNING_VM });
+  await own.controller.nap('demo');
+  assert.deepEqual(own.world.calls, ['map policy', 'wait 300 s', 'suspend vm-a']);
+});
+
+test('a router level that cannot be read: the check goes on with the built-in values, said, and no CheckFailed', async () => {
+  const t = setup({ run: AWAKE_LONG, cfg: { inherits: ['idleMinutes'] }, vms: RUNNING_VM });
+  t.store.getRouterSettings = async () => { throw unreadable(); };
+  assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.AWAKE, nap: 'requested' }]);
+  assert.deepEqual(t.world.metricReads, [{ backendService: 'app', from: START - 15 * MINUTE - 210_000, to: START }]);
+  assert.deepEqual(t.logged('CheckFailed'), []);
+  assert.deepEqual(t.logged('RouterSettingsUnread').map((l) => l.error), ['Google: GET: 503 unavailable']);
+});
+
+test('a router level that cannot be read keeps the last one this instance read: for the next check, a wake and a nap', async () => {
+  const t = leveled({ hibernate: false, defaults: { idleMinutes: 5, wakeTimeoutSeconds: 120 } }, { run: AWAKE_LONG, cfg: { inherits: ['idleMinutes', 'wakeTimeoutSeconds'] }, vms: RUNNING_VM, requests: 1 });
+  await t.controller.check();
+  t.store.getRouterSettings = async () => { throw unreadable(); };
+  await t.controller.check();
+  assert.deepEqual(t.world.metricReads.map((q) => q.from), [START - 5 * MINUTE - 210_000, START - 5 * MINUTE - 210_000]);
+  assert.deepEqual(t.logged('CheckFailed'), []);
+  t.world.requests = 0;
+  await t.controller.nap('demo');
+  assert.deepEqual(t.world.calls, ['map policy', 'wait 300 s', 'stop vm-a']);
+  t.store.state.run = waking(t.clock.now());
+  t.world.unhealthyPolls = Infinity;
+  const started = t.clock.now();
+  assert.equal((await t.controller.wake('demo', 'w1')).state, STATES.FAILED);
+  assert.equal(t.clock.now() - started, 120_000);
+  assert.equal(t.logged('RouterSettingsUnread').length, 3);
+});
+
+test('the wake\'s deadline is the resolved wake timeout: the router\'s 120 s on a workload that inherits it', async () => {
+  const t = leveled({ defaults: { wakeTimeoutSeconds: 120 } }, { run: waking(START), cfg: { inherits: ['wakeTimeoutSeconds'] }, vms: { 'vm-a': { status: 'TERMINATED' } }, unhealthyPolls: Infinity });
+  assert.equal((await t.controller.wake('demo', 'w1')).state, STATES.FAILED);
+  assert.equal(t.clock.now() - START, 120_000);
+  assert.equal(t.logged('WakeFailed').length, 1);
+});
+
+test('the stuck wake\'s deadline is the resolved wake timeout: the router\'s 300 s and the grace, not the stored 600 s', async () => {
+  const router = { defaults: { wakeTimeoutSeconds: 300 } };
+  const within = leveled(router, { run: waking(START - 360_000, { beatAt: START - 30_000 }), cfg: { inherits: ['wakeTimeoutSeconds'] }, vms: { 'vm-a': { status: 'TERMINATED' } }, map: asleepMap() });
+  assert.deepEqual(await within.controller.check(), [{ workloadId: 'demo', state: STATES.WAKING }]);
+  const stuck = leveled(router, { run: waking(START - 360_001, { beatAt: START - 30_000 }), cfg: { inherits: ['wakeTimeoutSeconds'] }, vms: { 'vm-a': { status: 'TERMINATED' } }, map: asleepMap() });
+  assert.equal((await stuck.controller.check())[0].state, STATES.FAILED);
+  assert.equal(stuck.logged('WakeStuck').length, 1);
+  assert.equal(JSON.parse(stuck.run().failure).message, 'the wake did not finish within 300 s (its request stopped)');
+});
+
+test('the stuck wake\'s deadline is bounded as Google Cloud fixes it: the router\'s 3600 s is 1700 s', async () => {
+  const stuck = leveled({ defaults: { wakeTimeoutSeconds: 3600 } }, { run: waking(START - 1_760_001, { beatAt: START - 30_000 }), cfg: { inherits: ['wakeTimeoutSeconds'] }, vms: { 'vm-a': { status: 'TERMINATED' } }, map: asleepMap() });
+  assert.equal((await stuck.controller.check())[0].state, STATES.FAILED);
+  assert.equal(JSON.parse(stuck.run().failure).message, 'the wake did not finish within 1700 s (its request stopped)');
+});
+
+test('the router level is read once by a check, once by a wake, once by a nap, once by a release', async () => {
+  const t = setup({ run: AWAKE_LONG, vms: RUNNING_VM });
+  const reads = routerReads(t);
+  await t.controller.check();
+  assert.equal(reads.count, 1);
+  await t.controller.nap('demo', t.world.tasks[0].body);
+  assert.equal(reads.count, 2);
+  await t.controller.wakeNow('demo');
+  await t.controller.wake('demo', 'wake-2');
+  assert.equal(t.run().state, STATES.AWAKE);
+  assert.equal(reads.count, 3);
+  const failed = setup({ run: FAILED_RUN(START - 15 * MINUTE), vms: RUNNING_VM, map: asleepMap() });
+  const released = routerReads(failed);
+  await failed.controller.release('demo');
+  assert.equal(released.count, 1);
+});
+
 // --- Schedules ---------------------------------------------------------------------------------------------------------
 
 // The fake clock starts on Tuesday 2023-11-14 at 22:13 UTC.

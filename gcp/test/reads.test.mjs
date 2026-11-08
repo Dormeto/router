@@ -114,8 +114,9 @@ test('a nap window: the probe reads it once, and says it', async () => {
   assert.equal(reads(), 4);
 });
 
-// The controller's Cloud Scheduler call: the pauses, the configurations and the schedules listed, then the workload's run.
-test('Firestore reads: a check, one AWAKE workload, 4; the first of the day 2 more, the router\'s sweep claimed and the counters listed', async () => {
+// The controller's Cloud Scheduler call: the pauses, the configurations and the schedules listed, the router level (router/settings),
+// once for every workload, then the workload's run.
+test('Firestore reads: a check, one AWAKE workload, 5; the first of the day 2 more, the router\'s sweep claimed and the counters listed', async () => {
   const clock = fakeClock();
   const { reads, store } = firestoreWith({ state: STATES.AWAKE, version: 0, awakeSince: clock.now(), holders: 0, wakeCount: 0 });
   await store.putConfig('demo', {
@@ -127,13 +128,13 @@ test('Firestore reads: a check, one AWAKE workload, 4; the first of the day 2 mo
   });
   const out = await core.check();
   assert.deepEqual(out.map((r) => [r.workloadId, r.state]), [['demo', STATES.AWAKE]]);
-  assert.equal(reads(), 6);
+  assert.equal(reads(), 7);
   await core.check();
-  assert.equal(reads(), 10);
+  assert.equal(reads(), 12);
 });
 
 // Past 20 workloads, the naps in flight can pass their cap (F8): each run is read once more as the check starts, for the NAPPING ones.
-test('Firestore reads: a check of 21 AWAKE workloads reads each run twice and the lists once, 45; of 20, each run once, 23', async () => {
+test('Firestore reads: a check of 21 AWAKE workloads reads each run twice, the lists and the router level once, 46; of 20, each run once, 24', async () => {
   const clock = fakeClock();
   const awake = { state: STATES.AWAKE, version: 0, awakeSince: clock.now(), holders: 0, wakeCount: 0 };
   const { firestore, reads, store } = firestoreWith(awake);
@@ -152,9 +153,9 @@ test('Firestore reads: a check of 21 AWAKE workloads reads each run twice and th
   await core.check();
   let before = reads();
   await core.check();
-  assert.equal(reads() - before, 3 + 2 * 21);
+  assert.equal(reads() - before, 4 + 2 * 21);
   firestore.docs.delete('workloads/w20');
   before = reads();
   await core.check();
-  assert.equal(reads() - before, 3 + 20);
+  assert.equal(reads() - before, 4 + 20);
 });

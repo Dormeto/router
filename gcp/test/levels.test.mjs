@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { effectiveConfig } from '../../lambda/src/lib/settings-levels.mjs';
 import { effectiveOf, isPolicy, levelProblems, swapFloorOf, wakerConfigOf } from '../src/levels.mjs';
 
 const vm = { kind: 'vm', name: 'web', zone: 'europe-west1-b' };
@@ -81,16 +82,31 @@ test('isPolicy and swapFloorOf', () => {
   assert.deepEqual([swapFloorOf(undefined), swapFloorOf({ kind: 'global' }), swapFloorOf({ kind: 'regional' }), swapFloorOf({ kind: 'classic' })], [null, null, 161, 311]);
 });
 
-test('the waker\'s configuration holds the fixed keys as its own values', () => {
-  const cfg = effectiveOf({ ...regional, inherits: ['idleMinutes', 'waitSeconds', 'maxHolders', 'drainSeconds', 'wakeTimeoutSeconds'] }, { router: { defaults: { wakeTimeoutSeconds: 60, idleMinutes: 5 } } });
-  const waker = wakerConfigOf(cfg, { policyFetch: false });
-  assert.deepEqual(waker.inherits, ['idleMinutes']);
-  assert.deepEqual([waker.waitSeconds, waker.maxHolders, waker.drainSeconds, waker.wakeTimeoutSeconds, waker.wakeMode], [0, 0, 0, 161, 'any']);
+test('the waker\'s configuration holds the fixed keys as its own values, whatever the router says', () => {
+  const router = { defaults: { wakeTimeoutSeconds: 3600 } };
+  const waker = wakerConfigOf({ ...global, inherits: ['wakeTimeoutSeconds', 'idleMinutes'] }, { router, policyFetch: false });
+  assert.deepEqual([waker.wakeTimeoutSeconds, waker.inherits], [1700, ['idleMinutes']]);
+  const shared = effectiveConfig(waker, { router });
+  assert.deepEqual([shared.wakeTimeoutSeconds, shared.waitSeconds, shared.maxHolders, shared.drainSeconds, shared.wakeMode], [1700, 0, 0, 0, 'browser']);
 });
 
-test('the waker\'s configuration is browser on the policy\'s fetch', () => {
-  const waker = wakerConfigOf({ ...regional, inherits: ['wakeMode'], wakeMode: 'any' }, { policyFetch: true });
-  assert.deepEqual([waker.wakeMode, waker.inherits], ['browser', []]);
+test('the waker\'s configuration of a regional workload: the floor, and the zeros', () => {
+  const stored = { ...regional, inherits: ['idleMinutes', 'waitSeconds', 'maxHolders', 'drainSeconds', 'wakeTimeoutSeconds'] };
+  const router = { defaults: { wakeTimeoutSeconds: 60, idleMinutes: 5, waitSeconds: 30 } };
+  const waker = wakerConfigOf(stored, { router, policyFetch: false });
+  assert.deepEqual(waker.inherits, ['idleMinutes']);
+  const shared = effectiveConfig(waker, { router });
+  assert.deepEqual([shared.wakeTimeoutSeconds, shared.idleMinutes, shared.waitSeconds, shared.maxHolders, shared.drainSeconds], [161, 5, 0, 0, 0]);
+  assert.equal(stored.inherits.length, 5);
+});
+
+test('the waker\'s configuration is browser on the policy\'s fetch, and not forced otherwise', () => {
+  const forced = wakerConfigOf({ ...regional, inherits: ['wakeMode'] }, { policyFetch: true });
+  assert.deepEqual([forced.wakeMode, forced.inherits], ['browser', []]);
+  const router = { defaults: { wakeMode: 'any' } };
+  const free = wakerConfigOf({ ...regional, inherits: ['wakeMode'] }, { router, policyFetch: false });
+  assert.deepEqual([free.wakeMode, free.inherits], [undefined, ['wakeMode']]);
+  assert.equal(effectiveConfig(free, { router }).wakeMode, 'any');
 });
 
 test('levelProblems refuses what Google Cloud fixes, with the reason', () => {

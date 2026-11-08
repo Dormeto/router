@@ -72,6 +72,9 @@
       "datastore.entities.update",
       "datastore.entities.delete"
     ],
+    "roles/logging.viewAccessor": [
+      "logging.views.access"
+    ],
     "roles/cloudtasks.enqueuer": [
       "cloudtasks.tasks.create"
     ],
@@ -101,6 +104,14 @@
       "condition": {
         "title": "The router's database",
         "expression": "resource.name == \"projects/{project}/databases/{database}\""
+      }
+    },
+    {
+      "role": "roles/logging.viewAccessor",
+      "on": "project",
+      "condition": {
+        "title": "The router's log view",
+        "expression": "resource.name == \"projects/{project}/locations/global/buckets/_Default/views/dmtr-{region}-lb\""
       }
     },
     {
@@ -173,6 +184,10 @@
         "cloudtasks.queues.update",
         "cloudtasks.queues.getIamPolicy",
         "cloudtasks.queues.setIamPolicy"
+      ],
+      "logView": [
+        "logging.views.create",
+        "logging.views.get"
       ]
     },
     "install-router": {
@@ -229,6 +244,10 @@
         "run.services.delete",
         "run.operations.get"
       ],
+      "logView": [
+        "logging.views.get",
+        "logging.views.delete"
+      ],
       "queue": [
         "cloudtasks.queues.get",
         "cloudtasks.queues.delete"
@@ -276,6 +295,12 @@
         "compute.instanceGroupManagers.listTagBindings",
         "compute.instanceGroupManagers.createTagBinding",
         "compute.instanceGroupManagers.deleteTagBinding"
+      ],
+      "requestLogs": [
+        "compute.backendServices.get",
+        "compute.backendServices.update",
+        "compute.regionBackendServices.get",
+        "compute.regionBackendServices.update"
       ]
     },
     "offboard": {
@@ -289,6 +314,12 @@
         "compute.instances.deleteTagBinding",
         "compute.instanceGroupManagers.listTagBindings",
         "compute.instanceGroupManagers.deleteTagBinding"
+      ],
+      "requestLogs": [
+        "compute.backendServices.get",
+        "compute.backendServices.update",
+        "compute.regionBackendServices.get",
+        "compute.regionBackendServices.update"
       ]
     }
   },

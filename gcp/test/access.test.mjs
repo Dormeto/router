@@ -23,12 +23,12 @@ const PLACEHOLDERS = ['{project}', '{projectNumber}', '{region}', '{database}'];
 // Ruling 1 of the plan's ledger: the commands and their steps, in order.
 const STEPS = {
   check: ['read'],
-  install: ['read', 'apis', 'roles', 'serviceAccount', 'projectBindings', 'tag', 'database', 'queue'],
+  install: ['read', 'apis', 'roles', 'serviceAccount', 'projectBindings', 'tag', 'database', 'queue', 'logView'],
   'install-router': ['image', 'cloudRun', 'neg', 'job'],
-  uninstall: ['read', 'job', 'neg', 'cloudRun', 'queue', 'database', 'projectBindings', 'tag', 'serviceAccount', 'roles'],
+  uninstall: ['read', 'job', 'neg', 'cloudRun', 'logView', 'queue', 'database', 'projectBindings', 'tag', 'serviceAccount', 'roles'],
   workloads: ['invoke'],
-  onboard: ['invoke', 'tag'],
-  offboard: ['invoke', 'tag'],
+  onboard: ['invoke', 'tag', 'requestLogs'],
+  offboard: ['invoke', 'tag', 'requestLogs'],
 };
 
 // Every list of permissions in the manifest, named for the failure messages.
@@ -124,7 +124,15 @@ test('dormetoRouterBackends holds what starts, stops, suspends and resumes the b
   }
 });
 
-test('the router\'s six grants, where and on which condition', async () => {
+// The log view's grant (G4, the design's section 5): its role reads a view's entries, and its condition names the router's view alone,
+// so that the router reads the load balancers' requests and never the applications' logs.
+const LOG_VIEW_GRANT = {
+  role: 'roles/logging.viewAccessor',
+  on: 'project',
+  condition: { title: 'The router\'s log view', expression: 'resource.name == "projects/{project}/locations/global/buckets/_Default/views/dmtr-{region}-lb"' },
+};
+
+test('the router\'s seven grants, where and on which condition', async () => {
   const m = await load();
   assert.deepEqual(m.router, [
     { role: 'projects/{project}/roles/dormetoRouter', on: 'project' },
@@ -138,6 +146,7 @@ test('the router\'s six grants, where and on which condition', async () => {
       on: 'project',
       condition: { title: 'The router\'s database', expression: 'resource.name == "projects/{project}/databases/{database}"' },
     },
+    LOG_VIEW_GRANT,
     { role: 'roles/cloudtasks.enqueuer', on: 'queue' },
     { role: 'roles/run.invoker', on: 'controller' },
     { role: 'roles/iam.serviceAccountUser', on: 'serviceAccount' },
@@ -153,11 +162,12 @@ test('the router\'s six grants, where and on which condition', async () => {
   assert.deepEqual(Object.keys(m.predefined).filter((r) => !m.router.some((g) => g.role === r)), []);
 });
 
-test('the conditions name the tag and the database through placeholders', async () => {
+test('the conditions name the tag, the database and the log view through placeholders', async () => {
   const { router } = await load();
   const conditions = router.filter((g) => g.condition).map((g) => g.condition.expression);
   assert.ok(conditions.some((e) => e.includes("'{project}/dormeto'")));
   assert.ok(conditions.some((e) => e.includes('{database}')));
+  assert.ok(conditions.some((e) => e.includes('/buckets/_Default/views/dmtr-{region}-lb"')));
 });
 
 test('placeholders appear only in the conditions and in the custom roles\' names, and only the four known', async () => {
@@ -182,7 +192,8 @@ test('placeholders appear only in the conditions and in the custom roles\' names
 
 test('the predefined roles list the permissions the router relies on', async () => {
   const { predefined } = await load();
-  assert.deepEqual(Object.keys(predefined), ['roles/datastore.user', 'roles/cloudtasks.enqueuer', 'roles/run.invoker', 'roles/iam.serviceAccountUser']);
+  assert.deepEqual(Object.keys(predefined), ['roles/datastore.user', 'roles/logging.viewAccessor', 'roles/cloudtasks.enqueuer', 'roles/run.invoker', 'roles/iam.serviceAccountUser']);
+  assert.deepEqual(predefined['roles/logging.viewAccessor'], ['logging.views.access']);
   includesAll(predefined['roles/datastore.user'], ['datastore.entities.get', 'datastore.entities.list', 'datastore.entities.create', 'datastore.entities.update', 'datastore.entities.delete'], 'roles/datastore.user');
   assert.deepEqual(predefined['roles/cloudtasks.enqueuer'], ['cloudtasks.tasks.create']);
   assert.deepEqual(predefined['roles/run.invoker'], ['run.routes.invoke']);
@@ -218,6 +229,19 @@ test('the operator\'s permissions of spec section 4, step by step', async () => 
   for (const command of ['workloads', 'onboard', 'offboard']) includesAll(o[command].invoke, ['run.routes.invoke'], `${command}.invoke`);
   includesAll(o.onboard.tag, ['compute.instances.createTagBinding', 'resourcemanager.tagValueBindings.create'], 'onboard.tag');
   includesAll(o.offboard.tag, ['compute.instances.deleteTagBinding', 'resourcemanager.tagValueBindings.delete'], 'offboard.tag');
+});
+
+// The log view, made by the install and removed by the uninstall; the backend service's logConfig, set by an onboarding's
+// --request-logs and set back by its offboarding, with the operator's rights, not the router's (the design's section 5).
+test('the log view\'s steps and the request logs\' steps, exactly', async () => {
+  const { operator: o, roles } = await load();
+  assert.deepEqual(o.install.logView, ['logging.views.create', 'logging.views.get']);
+  assert.deepEqual(o.uninstall.logView, ['logging.views.get', 'logging.views.delete']);
+  const requestLogs = ['compute.backendServices.get', 'compute.backendServices.update', 'compute.regionBackendServices.get', 'compute.regionBackendServices.update'];
+  assert.deepEqual(o.onboard.requestLogs, requestLogs);
+  assert.deepEqual(o.offboard.requestLogs, requestLogs);
+  // The router never changes a customer's backend service.
+  for (const p of ['compute.backendServices.update', 'compute.regionBackendServices.update']) assert.ok(!roles.dormetoRouter.permissions.includes(p), p);
 });
 
 // A refused or interrupted onboarding takes back what it added (the CLI's undoBindings and undoGrant), for the operator `check` approved.

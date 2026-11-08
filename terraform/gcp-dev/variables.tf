@@ -126,7 +126,13 @@ locals {
 }
 
 variable "enable_internal" {
-  description = "Internal Application Load Balancers: a regional one and a cross-region one, each in front of a VM of its own, a global proxy-only subnet, and a client VM in the subnet (no external address, reached through IAP)."
+  description = "Internal Application Load Balancers: a regional one and a cross-region one, each in front of a VM of its own, and a global proxy-only subnet. The measures reach them from a Cloud Run job with Direct VPC egress."
   type        = bool
   default     = false
+}
+
+variable "internal_region" {
+  description = "The region of the regional internal load balancer, its VM and its subnets (a zone -b VM, 10.10.4.0/24 and the proxy-only 10.10.5.0/24); null: var.region. The cross-region one stays in var.region."
+  type        = string
+  default     = null
 }

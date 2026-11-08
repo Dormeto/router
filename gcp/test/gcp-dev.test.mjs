@@ -139,7 +139,7 @@ test('every resource of an optional file has a count or a for_each on its own va
     assert.ok(resources.length > 0, file);
     for (const [, type, name] of resources) {
       const [[, body]] = bodies(code, type).filter(([n]) => n === name);
-      assert.match(body, new RegExp(`^\\s*(?:count\\s*=\\s*var\\.${variable}\\s*\\?\\s*1\\s*:\\s*0|for_each\\s*=\\s*var\\.${variable}\\s*\\?[^\\n]*:\\s*\\{\\}|for_each\\s*=\\s*var\\.${variable}\\s*\\?[^\\n]*:\\s*toset\\(\\[\\]\\))\\s*$`, 'm'), `${type}.${name}`);
+      assert.match(body, new RegExp(`^\\s*(?:count\\s*=\\s*var\\.${variable}\\s*\\?\\s*1\\s*:\\s*0|count\\s*=\\s*local\\.internal_other\\s*\\?\\s*1\\s*:\\s*0|for_each\\s*=\\s*var\\.${variable}\\s*\\?[^\\n]*:\\s*\\{\\}|for_each\\s*=\\s*var\\.${variable}\\s*\\?[^\\n]*:\\s*toset\\(\\[\\]\\))\\s*$`, 'm'), `${type}.${name}`);
     }
   }
 });
@@ -220,7 +220,7 @@ test('outputs.tf gains nothing conditional: an output a plan with the defaults w
   assert.deepEqual([...outputs.matchAll(/^output\s+"([^"]+)"/gm)].map((m) => m[1]), ['urls', 'addresses', 'url_maps', 'backend_services']);
 });
 
-test('internal.tf: both internal load balancers are INTERNAL_MANAGED over HTTP, each on its own VM, with a client VM that has no address and is reached through IAP', async () => {
+test('internal.tf: both internal load balancers are INTERNAL_MANAGED over HTTP, each on its own VM, and no client VM is left', async () => {
   const code = uncommented(await readFile(join(ROOT, 'internal.tf'), 'utf8'));
   const purposes = bodies(code, 'google_compute_subnetwork').map(([, body]) => /purpose\s*=\s*"([^"]+)"/.exec(body)?.[1]);
   assert.deepEqual(purposes, ['GLOBAL_MANAGED_PROXY']);
@@ -229,7 +229,7 @@ test('internal.tf: both internal load balancers are INTERNAL_MANAGED over HTTP, 
   for (const [name, body] of rules) {
     assert.match(body, /load_balancing_scheme\s*=\s*"INTERNAL_MANAGED"/, name);
     assert.match(body, /port_range\s*=\s*"80"/, name);
-    assert.match(body, /subnetwork\s*=\s*google_compute_subnetwork\.dev\.id/, name);
+    assert.match(body, /subnetwork\s*=\s*(?:google_compute_subnetwork\.dev\.id|local\.internal_subnet)/, name);
   }
   const backends = [...bodies(code, 'google_compute_backend_service'), ...bodies(code, 'google_compute_region_backend_service')];
   assert.equal(backends.length, 2);
@@ -237,11 +237,9 @@ test('internal.tf: both internal load balancers are INTERNAL_MANAGED over HTTP, 
     assert.match(body, /load_balancing_scheme\s*=\s*"INTERNAL_MANAGED"/, name);
     assert.match(body, /^\s*connection_draining_timeout_sec\s*=\s*30\s*$/m, name);
   }
-  assert.deepEqual(bodies(code, 'google_compute_instance').map(([name]) => name), ['internal', 'internal_client']);
-  const client = bodies(code, 'google_compute_instance').find(([name]) => name === 'internal_client')[1];
-  assert.doesNotMatch(client, /access_config/);
-  assert.match(code, /35\.235\.240\.0\/20/);
-  assert.match(code, /ports\s*=\s*\["22"\]/);
+  // The measures reach the load balancers from a Cloud Run job with Direct VPC egress: no client VM, no IAP rule.
+  assert.deepEqual(bodies(code, 'google_compute_instance').map(([name]) => name), ['internal']);
+  assert.doesNotMatch(code, /internal_client|client_tag|35\.235\.240\.0\/20|ports\s*=\s*\["22"\]/);
   assert.doesNotMatch(code, /google_compute_global_forwarding_rule"\s+"[^"]+"\s*\{[\s\S]*EXTERNAL/);
 });
 
@@ -250,8 +248,10 @@ test('the internal outputs live in their own file, are null unless enable_intern
   const names = [...outputs.matchAll(/^output\s+"([^"]+)"/gm)].map((m) => m[1]);
   assert.deepEqual(names, ['internal']);
   assert.match(outputs, /var\.enable_internal \?[\s\S]*: null/);
-  for (const key of ['url_map', 'address', 'client']) assert.match(outputs, new RegExp(`\\b${key}\\b`));
-  assert.match(outputs, /zone/);
+  for (const key of ['url_map', 'address']) assert.match(outputs, new RegExp(`\\b${key}\\b`));
+  assert.doesNotMatch(outputs, /client/);
+  // The regional load balancer's region is the one the resources take, not always var.region.
+  assert.match(outputs, /region\s*=\s*local\.internal_region/);
 });
 
 test('no two address ranges of the root overlap: subnets and secondary ranges share one network', async () => {
@@ -268,17 +268,47 @@ test('no two address ranges of the root overlap: subnets and secondary ranges sh
   }
 });
 
-test('the internal demo\'s firewall rules admit only Google\'s checkers, the proxies and IAP, to their own tags', async () => {
+test('the internal demo\'s firewall rule admits only Google\'s checkers and the proxies, to their own tags', async () => {
   const code = uncommented(await readFile(join(ROOT, 'internal.tf'), 'utf8'));
   const rules = Object.fromEntries(bodies(code, 'google_compute_firewall'));
   const internal = rules.internal;
-  assert.match(internal, /source_ranges\s*=\s*\["35\.191\.0\.0\/16", "130\.211\.0\.0\/22", google_compute_subnetwork\.proxy\.ip_cidr_range, google_compute_subnetwork\.proxy_global\[0\]\.ip_cidr_range\]/);
+  assert.match(internal, /source_ranges\s*=\s*concat\(\["35\.191\.0\.0\/16", "130\.211\.0\.0\/22", google_compute_subnetwork\.proxy\.ip_cidr_range, google_compute_subnetwork\.proxy_global\[0\]\.ip_cidr_range\], local\.internal_other \? \[google_compute_subnetwork\.proxy_internal\[0\]\.ip_cidr_range\] : \[\]\)/);
   assert.match(internal, /target_tags\s*=\s*\[local\.internal_tag\]/);
   assert.match(internal, /ports\s*=\s*\["80"\]/);
-  assert.match(rules.internal_client, /source_ranges\s*=\s*\["35\.235\.240\.0\/20"\]/);
-  assert.match(rules.internal_client, /target_tags\s*=\s*\[local\.client_tag\]/);
-  assert.match(rules.internal_client, /ports\s*=\s*\["22"\]/);
+  assert.deepEqual(Object.keys(rules), ['internal']);
   assert.doesNotMatch(code, /0\.0\.0\.0\/0/);
   assert.match(code, /internal_tag\s*=\s*"\$\{local\.demo\}-internal"/);
-  assert.match(code, /client_tag\s*=\s*"\$\{local\.demo\}-client"/);
+});
+
+test('internal_region defaults to null (var.region), and only the regional internal load balancer takes its region from it', async () => {
+  const variables = uncommented(await readFile(join(ROOT, 'variables.tf'), 'utf8'));
+  const block = variableBlock(variables, 'internal_region');
+  assert.ok(block, 'internal_region is declared');
+  assert.match(block, /^\s*type\s*=\s*string\s*$/m);
+  assert.match(block, /^\s*default\s*=\s*null\s*$/m);
+  const code = uncommented((await terraformFiles()).map(([, text]) => text).join('\n'));
+  assert.match(code, /internal_region\s*=\s*var\.internal_region != null \? var\.internal_region : var\.region/);
+  assert.match(code, /internal_other\s*=\s*var\.enable_internal && local\.internal_region != var\.region/);
+  const internal = uncommented(await readFile(join(ROOT, 'internal.tf'), 'utf8'));
+  for (const [type, name] of [['google_compute_region_backend_service', 'internal_regional'], ['google_compute_region_url_map', 'internal'], ['google_compute_region_target_http_proxy', 'internal'], ['google_compute_forwarding_rule', 'internal']]) {
+    const body = bodies(internal, type).find(([n]) => n === name)[1];
+    assert.match(body, /^\s*region\s*=\s*local\.internal_region\s*$/m, `${type}.${name}`);
+  }
+  // The regional VM and its group sit in a zone of that region; the cross-region one stays in var.zone.
+  assert.match(internal, /internal_zone\s*=\s*local\.internal_other \? "\$\{local\.internal_region\}-b" : var\.zone/);
+  assert.match(bodies(internal, 'google_compute_instance')[0][1], /zone\s*=\s*each\.key == "regional" \? local\.internal_zone : var\.zone/);
+  assert.match(bodies(internal, 'google_compute_instance_group')[0][1], /zone\s*=\s*each\.key == "regional" \? local\.internal_zone : var\.zone/);
+  // The cross-region load balancer and its proxy-only subnet stay in var.region.
+  assert.match(bodies(internal, 'google_compute_subnetwork').find(([n]) => n === 'proxy_global')[1], /region\s*=\s*var\.region/);
+  // The other region's subnets exist only when it differs, with the ranges the design names.
+  const network = uncommented(await readFile(join(ROOT, 'network.tf'), 'utf8'));
+  const subnet = bodies(network, 'google_compute_subnetwork').find(([n]) => n === 'dev_internal')[1];
+  assert.match(subnet, /count\s*=\s*local\.internal_other \? 1 : 0/);
+  assert.match(subnet, /name\s*=\s*"\$\{local\.name\}-\$\{local\.internal_region\}"/);
+  assert.match(subnet, /ip_cidr_range\s*=\s*"10\.10\.4\.0\/24"/);
+  const proxy = bodies(network, 'google_compute_subnetwork').find(([n]) => n === 'proxy_internal')[1];
+  assert.match(proxy, /count\s*=\s*local\.internal_other \? 1 : 0/);
+  assert.match(proxy, /ip_cidr_range\s*=\s*"10\.10\.5\.0\/24"/);
+  assert.match(proxy, /purpose\s*=\s*"REGIONAL_MANAGED_PROXY"/);
+  assert.match(proxy, /region\s*=\s*local\.internal_region/);
 });

@@ -21,6 +21,27 @@ resource "google_compute_subnetwork" "proxy" {
   role          = "ACTIVE"
 }
 
+# The internal demo's regional load balancer in another region (internal_region): its subnet and its proxies' subnet.
+resource "google_compute_subnetwork" "dev_internal" {
+  count = local.internal_other ? 1 : 0
+
+  name          = "${local.name}-${local.internal_region}"
+  network       = google_compute_network.dev.id
+  region        = local.internal_region
+  ip_cidr_range = "10.10.4.0/24"
+}
+
+resource "google_compute_subnetwork" "proxy_internal" {
+  count = local.internal_other ? 1 : 0
+
+  name          = "${local.name}-proxy-${local.internal_region}"
+  network       = google_compute_network.dev.id
+  region        = local.internal_region
+  ip_cidr_range = "10.10.5.0/24"
+  purpose       = "REGIONAL_MANAGED_PROXY"
+  role          = "ACTIVE"
+}
+
 # Google's front ends and health checkers, and the regional load balancer's proxies, to the demo's two ports.
 resource "google_compute_firewall" "demo" {
   name          = "${local.name}-demo"

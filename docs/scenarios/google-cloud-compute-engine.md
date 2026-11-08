@@ -452,7 +452,8 @@ AWS's bodies, answers and checks.
   below: the computed 300 s for pods and the 1700 s of a Cloud SQL companion of earlier routers are gone, and the swap's wait is
   a floor, not an addition. A longer timeout only delays a failure's report.
 - **A router level never read on this controller instance** takes no idle nap or release decision, waits the longest wake
-  timeout (1700 s) and stops plainly, logged `SettingsLevelUnreadable`, as on AWS. A level that cannot be read counts as unset.
+  timeout (1700 s) and stops plainly, logged `SettingsLevelUnreadable`, as on AWS. A failed read of the router level keeps the last
+  record this controller instance read, and the failure is logged the same way.
 - **The controller resolves before it acts.** The check, the nap, the wake and the release use the resolved values
   (`idleMinutes`, `wakeTimeoutSeconds`, `failedRetrySeconds`, `hibernate`), and the waker resolves the same ones, so the two
   never disagree. The controller reads the router level from the store, once per check and once per wake, nap or release, and keeps the last record it read; the waker keeps it 60 s in a cache.

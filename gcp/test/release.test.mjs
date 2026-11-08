@@ -409,6 +409,10 @@ test('the README\'s Google Cloud section names the three pages and what router 0
 // kinds do, and what Google Cloud fixes, with its reasons, once.
 test('the Compute Engine page: the settings by level, what Google Cloud fixes and why, the wake mode by load balancer', () => {
   const page = flat(read(CE));
+  // A failed read keeps the last record the instance read; only a level never read takes AWS's never-read rule (controller-core.mjs routerLevel).
+  assert.match(page, /A failed read of the router level keeps the last record this controller instance read/);
+  assert.match(page, /A router level never read on this controller instance takes no idle nap or release decision, waits the longest wake timeout \(1700 s\) and stops plainly, logged SettingsLevelUnreadable, as on AWS/);
+  assert.doesNotMatch(page, /A level that cannot be read counts as unset/);
   assert.match(page, /## Settings and their levels/);
   assert.match(page, /A workload's settings come from AWS's levels: the workload, its type, the router, then the built-in value/);
   assert.match(page, /PUT \/v1\/workloads\/\{id\}\/settings/);

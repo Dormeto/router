@@ -2616,3 +2616,12 @@ test('fallback machine types: a managed group is refused, in the verbatim words,
   assert.deepEqual(w.changes, []);
   assert.deepEqual((await onboarding.dryRun(INPUT)).reasons, []);
 });
+
+test('fallback machine types: a GKE workload\'s pods are refused, as a managed group', async () => {
+  const { w, onboarding } = setup((world) => { onGke(world); withTypes('e2-medium')(world); });
+  await assert.rejects(
+    onboarding.onboard({ ...GKE_INPUT, fallbackInstanceTypes: ['e2-medium'] }),
+    refused(400, 'not-eligible', /fallback machine types are for VMs of unmanaged instance groups: the pods of a GKE cluster have no machine type of their own/),
+  );
+  assert.deepEqual(w.changes, []);
+});

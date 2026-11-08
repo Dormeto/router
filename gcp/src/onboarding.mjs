@@ -486,7 +486,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   }
 
   // Section 8: what --gke-cluster says of the service's NEGs and of the cluster, from Google alone: what refuses them, `gke` the dry run's answer (with the cluster read) and `podNegs`.
-  async function podsOf(service, asked, others) {
+  async function podsOf(service, asked, others, fallbackTypes = []) {
     const { cluster, owner } = asked;
     const [{ view, problem }, { reasons, negs, named }] = await Promise.all([clusterRead(gke, cluster), negsOfService(compute, service, asked)]);
     const place = { namespace: named?.namespace ?? asked.namespace ?? null, service: named?.service ?? asked.service ?? null };
@@ -498,6 +498,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
       reasons: [
         ...(problem ? [problem] : []),
         ...reasons,
+        ...(fallbackTypes.length ? [`fallback machine types are for VMs of unmanaged instance groups: the pods of a GKE cluster have no machine type of their own`] : []),
         ...(holdsService ? [`Service ${place.namespace}/${place.service} of ${where} belongs to workload ${holdsService.holder}`] : []),
         ...(holdsOwner ? [`${owner.kind} ${place.namespace}/${owner.name} of ${where} belongs to workload ${holdsOwner.holder}`] : []),
       ],
@@ -557,7 +558,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
       reasons.push(`backend service ${waker} exists and is not the waker of ${id}: rename it, or onboard under another id`);
     }
 
-    const backends = await (gkeAsked ? podsOf(service, gkeAsked, others) : backendsOf(service, others, fallbackTypes));
+    const backends = await (gkeAsked ? podsOf(service, gkeAsked, others, fallbackTypes) : backendsOf(service, others, fallbackTypes));
     reasons.push(...backends.reasons);
     return {
       reasons,

@@ -148,8 +148,9 @@ and for a nap called stuck after 35 minutes, or 22 under a swap with no VM stopp
 ([the swap's limits](#limits-of-the-swap)). Until then a visitor's wake waits for the nap.
 
 **A nap that gives up.** Before it stops anything, a nap checks that nothing changed since the onboarding, and gives up
-otherwise: nothing is stopped and the workload stays awake. The run says why in `napAborted` (`reason` and `at`),
-in `dormeto gcp workloads show --json`, until a nap commits. The reasons: `backends-changed`, `traffic`, `map-busy`,
+otherwise: nothing is stopped and the workload stays awake. The run says why, until a nap commits: `dormeto gcp
+workloads show` prints it in a `nap given up:` line (its reason and time), and `--json` carries it as `napAborted`
+(`reason` and `at`). The reasons: `backends-changed`, `traffic`, `map-busy`,
 `switch-failed`, `paused`, `pending-wake`, `traffic-unread` and `swap-lost` or `policy-lost`. `backends-changed` checks, against the onboarding, an
 unmanaged group's VMs (added or removed), a network endpoint group's endpoints, and the backend service's backends
 (added or removed); a group or service that is gone counts as changed. After such a change, offboard and onboard the

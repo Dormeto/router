@@ -267,6 +267,9 @@ test('the Compute Engine page: the fixes of router 0.38.0 and the idle check tha
   assert.match(page, /The metric's delay is 210 s/);
   assert.match(page, /reads the traffic again before it stops anything/);
   assert.match(page, /napAborted/);
+  // cli 7040b64: workloads show prints it, --json carries napAborted.
+  assert.match(page, /The run says why, until a nap commits: dormeto gcp workloads show prints it in a nap given up: line \(its reason and time\), and --json carries it as napAborted \(reason and at\)/);
+  assert.doesNotMatch(page, /napAborted \(reason and at\), in dormeto gcp workloads show --json/);
   assert.match(page, /backends-changed/);
   assert.match(page, /kept 35 days/);
   assert.match(page, /Standard network tier/);

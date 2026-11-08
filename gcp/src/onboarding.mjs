@@ -34,7 +34,7 @@ import { STATES } from '../../lambda/src/lib/state.mjs';
 import { companionRead, INSTANCE_NAME, isCompanion, statusOf } from './cloudsql.mjs';
 import { groupOf, PauseRefused } from './controller-core.mjs';
 import {
-  clusterProblems, clusterRead, giveBackOwner, gkeMapRefusal, gkeProblems, isGkeNeg, isPods, negsOfService, ownerAsVm, ownerText, pauseLeft,
+  clusterProblems, clusterRead, giveBackOwner, gkeDescriptionRefusal, gkeMapRefusal, gkeProblems, isGkeNeg, isPods, negsOfService, ownerAsVm, ownerText, pauseLeft,
 } from './gke.mjs';
 import { beatOf } from './heartbeat.mjs';
 import { effectiveOf, inheritsOf, levelProblems } from './levels.mjs';
@@ -310,15 +310,22 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
 
   // The URL map's load balancer: one target proxy, and forwarding rules whose scheme tells a global from a classic or a cross-region
   // internal one, and a regional from an internal one. `{ kind, reasons }`, `kind` null when there is nothing supported to tell it from.
-  async function loadBalancerOf(urlMap, regional, asked) {
+  async function loadBalancerOf(urlMap, regional, asked, map) {
     const [https, http, rules] = await Promise.all(regional
       ? [compute.listRegionTargetHttpsProxies(config.region), compute.listRegionTargetHttpProxies(config.region), compute.listRegionForwardingRules(config.region)]
       : [compute.listTargetHttpsProxies(), compute.listTargetHttpProxies(), globalRules()]);
     const refused = (...reasons) => ({ kind: null, reasons });
     const proxies = [...https, ...http].filter((p) => nameOf(p.urlMap ?? '') === urlMap);
+    // K14: GKE's, told by the descriptions it writes in the proxies and the rules.
+    const owned = (found) => {
+      const gke = gkeDescriptionRefusal(urlMap, { map, proxies, rules: found });
+      return gke ? { kind: null, reasons: [gke], gke } : null;
+    };
+    if (proxies.length && owned([])) return owned([]);
     if (!proxies.length) return refused(`URL map ${urlMap} is used by no target proxy: attach it to an Application Load Balancer, then onboard again`);
     if (proxies.length > 1) return refused(`URL map ${urlMap} is used by ${proxies.length} target proxies (${proxies.map((p) => p.name).join(', ')}): give each load balancer its own URL map`);
     const fronts = rules.filter((r) => fromProjects(r.target ?? '') === fromProjects(proxies[0].selfLink));
+    if (owned(fronts)) return owned(fronts);
     if (!fronts.length) return refused(`no forwarding rule sends to the target proxy of URL map ${urlMap}: add one, then onboard again`);
     const kinds = regional ? REGIONAL_KINDS : GLOBAL_KINDS;
     const kindsOf = (rule) => kinds.filter((kind) => SCHEME_OF[kind] === rule.loadBalancingScheme);
@@ -539,7 +546,8 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     if (gkeMap) return { reasons: [...reasons, gkeMap], ...nothing };
     const { map, regional, reason } = await findMap(urlMap, loadBalancer);
     if (!map) return { reasons: [...reasons, reason], ...nothing };
-    const front = await loadBalancerOf(urlMap, regional, loadBalancer);
+    const front = await loadBalancerOf(urlMap, regional, loadBalancer, map);
+    if (front.gke) return { reasons: [...reasons, front.gke], ...nothing };
     reasons.push(...front.reasons);
     // Not told: the kind asked for, whose scope is the map's, else its scope's first.
     const kind = front.kind ?? loadBalancer ?? (regional ? 'regional' : 'global');

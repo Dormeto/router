@@ -29,7 +29,11 @@ const OWNER_KINDS = ['Deployment', 'StatefulSet'];
 // M11: the token goes there, so nothing else may.
 const DNS_ENDPOINT = /^[a-z0-9-]+(\.[a-z0-9-]+)*\.gke\.goog$/;
 // M10 only confirms why: GKE's controllers write these maps back at their next sync.
-const GKE_MAP = /^(k8s2-|gkegw1-|gkemcg1-)/;
+// K14: k8s2- (v1 Ingress, internal), k8s-um- (v1 Ingress's map), gkegw1- and gkemcg1- (Gateways), mci- plus six characters (Multi Cluster Ingress).
+const GKE_MAP = /^(k8s2-|k8s-um-|gkegw1-|gkemcg1-|mci-)/;
+// What GKE writes in the descriptions: a Gateway's map names its `k8sResource`; an Ingress's proxies and rules, `kubernetes.io/ingress-name`.
+const GKE_MAP_FIELD = 'k8sResource';
+const GKE_INGRESS_FIELD = 'kubernetes.io/ingress-name';
 // M12: what GKE writes in the NEGs it makes (the annotations, or the description), and the prefix of their names.
 const GKE_NEG_FIELD = /cluster-(uid|name)/i;
 const GKE_NEG_PREFIX = 'k8s1-';
@@ -85,10 +89,20 @@ export async function clusterRead(gke, cluster) {
   }
 }
 
-// M10: a load balancer GKE owns (Gateway, Ingress), told by its URL map's name. Why, else null.
+// M10: why a load balancer GKE owns (Gateway, Ingress) cannot be onboarded.
+const gkeMapWords = (name) => `URL map ${name} belongs to a load balancer GKE owns (a Gateway or an Ingress): GKE writes it back at its next sync, so a nap's switch could not be trusted. Give the Service a standalone network endpoint group with the annotation cloud.google.com/neg, name it in a backend service of a load balancer of your own, and onboard that`;
+
+// M10: a load balancer GKE owns, told by its URL map's name. Why, else null.
 export function gkeMapRefusal(name) {
-  if (!GKE_MAP.test(name)) return null;
-  return `URL map ${name} belongs to a load balancer GKE owns (a Gateway or an Ingress): GKE writes it back at its next sync, so a nap's switch could not be trusted. Give the Service a standalone network endpoint group with the annotation cloud.google.com/neg, name it in a backend service of a load balancer of your own, and onboard that`;
+  return GKE_MAP.test(name) ? gkeMapWords(name) : null;
+}
+
+// K14: the same, told by the descriptions GKE writes, whatever the names: the map's (`k8sResource`), its target proxies' and its forwarding rules'
+// (`kubernetes.io/ingress-name`). Why, else null.
+export function gkeDescriptionRefusal(name, { map, proxies = [], rules = [] } = {}) {
+  const has = (item, field) => typeof item?.description === 'string' && item.description.includes(field);
+  const gke = has(map, GKE_MAP_FIELD) || [...proxies, ...rules].some((item) => has(item, GKE_INGRESS_FIELD));
+  return gke ? gkeMapWords(name) : null;
 }
 
 // M12: a NEG that GKE made, its endpoints being pods.

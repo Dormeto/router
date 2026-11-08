@@ -1902,7 +1902,7 @@ test('--gke-cluster on a mix, the VM NEG first and with no --gke-cluster: refuse
   assert.match((await setup(mix).onboarding.dryRun(GKE_DRY)).reasons.join(), /was not made by GKE/);
 });
 
-for (const [name, map] of [['k8s2-', 'k8s2-um-abc-shop-web'], ['gkegw1-', 'gkegw1-abc-shop-gw'], ['gkemcg1-', 'gkemcg1-abc-shop-gw']]) {
+for (const [name, map] of [['k8s2-', 'k8s2-um-abc-shop-web'], ['gkegw1-', 'gkegw1-abc-shop-gw'], ['gkemcg1-', 'gkemcg1-abc-shop-gw'], ['k8s-um-', 'k8s-um-abc-shop-web'], ['mci-', 'mci-a1b2c3']]) {
   test(`GKE's own map ${name}: refused, saying how to use a standalone NEG, with nothing written or tried`, async () => {
     const input = { ...INPUT, urlMap: map };
     const { w, onboarding, store } = setup((world) => {
@@ -1919,6 +1919,35 @@ for (const [name, map] of [['k8s2-', 'k8s2-um-abc-shop-web'], ['gkegw1-', 'gkegw
     assert.equal(store.configs.size, 0);
   });
 }
+
+const INGRESS_NAME = JSON.stringify({ 'kubernetes.io/ingress-name': 'shop/web' });
+for (const [what, mark] of [
+  ['a map described with k8sResource', (w) => { w.urlMaps.lb.description = '{"k8sResource":"/apis/gateway.networking.k8s.io/v1/namespaces/shop/gateways/gw"}'; }],
+  ['a proxy described with kubernetes.io/ingress-name', (w) => { w.httpsProxies[0].description = INGRESS_NAME; }],
+  ['a rule described with kubernetes.io/ingress-name', (w) => { w.forwardingRules[0].description = INGRESS_NAME; }],
+]) {
+  test(`GKE's load balancer told by ${what}, whatever the map's name: refused with nothing written`, async () => {
+    const { w, onboarding, store } = setup(mark);
+    const words = /belongs to a load balancer GKE owns \(a Gateway or an Ingress\).*cloud\.google\.com\/neg/;
+    const answer = await onboarding.dryRun(INPUT);
+    assert.equal(answer.eligible, false);
+    assert.match(answer.reasons.join(), words);
+    await assert.rejects(onboarding.onboard(INPUT), refused(400, 'not-eligible', words));
+    assert.deepEqual(w.changes, []);
+    assert.equal(store.configs.size, 0);
+  });
+}
+
+test('a customer\'s map whose name holds a GKE prefix later, and descriptions of its own: onboarded as today', async () => {
+  const { w, onboarding } = setup((world) => {
+    world.urlMaps.lb.description = 'our shop';
+    world.httpsProxies[0].description = 'our proxy';
+    world.forwardingRules[0].description = 'our rule';
+  });
+  assert.equal((await onboarding.dryRun(INPUT)).eligible, true);
+  await onboarding.onboard(INPUT);
+  assert.ok(w.changes.length > 0);
+});
 
 test('the onboarding: a review per right, the owner read, a k8s backend of the design\'s shape, and pods\' wake timeout, the built-in one', async () => {
   const { w, store, onboarding } = setup(onGke);

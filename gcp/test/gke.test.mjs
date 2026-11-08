@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { classify } from '../../lambda/src/lib/failures.mjs';
 import { CLUSTER_TTL_MS } from '../../lambda/src/lib/k8s.mjs';
 import { fakeClock } from '../../lambda/test/fakes.mjs';
-import { clusterProblem, clusterView, createGke, gkeMapRefusal, gkeProblems, isGkeNeg, negServiceOf } from '../src/gke.mjs';
+import { gkeDescriptionRefusal, clusterProblem, clusterView, createGke, gkeMapRefusal, gkeProblems, isGkeNeg, negServiceOf } from '../src/gke.mjs';
 import { GoogleError } from '../src/google.mjs';
 import { NEG_READINGS } from './world.mjs';
 
@@ -175,8 +175,17 @@ test('M12: a NEG is GKE\'s by its name, its description or its annotations; a VM
 });
 
 test('M10: the maps GKE owns are told by their names', () => {
-  for (const name of ['k8s2-um-a', 'gkegw1-a', 'gkemcg1-a']) assert.match(gkeMapRefusal(name), /cloud\.google\.com\/neg/);
-  for (const name of ['lb', 'k8s1-a', 'my-k8s2-map']) assert.equal(gkeMapRefusal(name), null);
+  for (const name of ['k8s2-um-a', 'k8s-um-a', 'gkegw1-a', 'gkemcg1-a', 'mci-a1b2c3']) assert.match(gkeMapRefusal(name), /cloud\.google\.com\/neg/);
+  for (const name of ['lb', 'k8s1-a', 'my-k8s2-map', 'my-k8s-um-map', 'my-mci-map']) assert.equal(gkeMapRefusal(name), null);
+});
+
+test('K14: a map, a proxy or a rule is GKE\'s by its description, whatever its name', () => {
+  const ingress = JSON.stringify({ 'kubernetes.io/ingress-name': 'shop/web' });
+  assert.match(gkeDescriptionRefusal('lb', { map: { description: '{"k8sResource":"/apis/gateway.networking.k8s.io/v1/namespaces/a/gateways/g"}' } }), /cloud\.google\.com\/neg/);
+  assert.match(gkeDescriptionRefusal('lb', { proxies: [{ description: ingress }] }), /cloud\.google\.com\/neg/);
+  assert.match(gkeDescriptionRefusal('lb', { rules: [{ description: 'ours' }, { description: ingress }] }), /belongs to a load balancer GKE owns/);
+  assert.equal(gkeDescriptionRefusal('lb', { map: { description: 'ours' }, proxies: [{}], rules: [{ description: 'ours' }] }), null);
+  assert.equal(gkeDescriptionRefusal('lb', {}), null);
 });
 
 const FULL = { cluster: CLUSTER, namespace: 'shop', service: 'web', owner: { kind: 'Deployment', name: 'web' } };

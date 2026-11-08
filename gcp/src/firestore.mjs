@@ -366,13 +366,14 @@ export function createFirestoreStore({ google, project, database, now = Date.now
       const fields = Object.fromEntries(PAGE_FIELDS.filter((field) => typeof page[field] === 'string').map((field) => [field, page[field]]));
       await commit([{ update: { name: named(pagePath(level)), fields: toFields({ ...fields, by: String(by ?? ''), at }) } }]);
     },
-    // True when there was one.
+    // True when there was one. Only Firestore's NOT_FOUND says there was none: a refusal for contention is thrown, never read as
+    // "no page".
     async deleteWaitingPage(level) {
       try {
         await commit([{ delete: named(pagePath(level)), currentDocument: { exists: true } }]);
         return true;
       } catch (err) {
-        if (isStatus('NOT_FOUND')(err) || lostPrecondition(err)) return false;
+        if (isStatus('NOT_FOUND')(err)) return false;
         throw err;
       }
     },

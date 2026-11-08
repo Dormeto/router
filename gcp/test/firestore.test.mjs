@@ -697,6 +697,26 @@ test('waiting page: a document without a mode is page null; a workload called "p
   assert.deepEqual([...docs.keys()].sort(), ['pages/router', 'pages/x']);
 });
 
+test('deleteWaitingPage: a refusal for contention is thrown, never read as no page; only NOT_FOUND is', async () => {
+  const { store, request, docs } = setup();
+  await store.putWaitingPage('router', { mode: 'template', title: 'T' }, { by: 'ops', at: 1 });
+  for (const status of ['ABORTED', 'FAILED_PRECONDITION']) {
+    const contended = createFirestoreStore({
+      google: {
+        request: async (method, url, body) => {
+          if (url.endsWith(':commit')) throw new GoogleError(`Google: 409 ${status}`, { code: 409, status });
+          return request(method, url, body);
+        },
+      },
+      project: 'p', database: 'dmtr-europe-west1',
+    });
+    await assert.rejects(contended.deleteWaitingPage('router'), (err) => err.status === status, status);
+  }
+  assert.ok(docs.has('router/page'));
+  assert.equal(await store.deleteWaitingPage('router'), true);
+  assert.equal(await store.deleteWaitingPage('router'), false);
+});
+
 test('waiting page and favicon: 256 KiB of HTML and a 64 KiB icon are stored and read whole', async () => {
   const { store } = setup();
   const html = `<p>${'é'.repeat(131_000)}</p>`;

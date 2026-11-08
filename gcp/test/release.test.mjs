@@ -245,7 +245,10 @@ test('the Compute Engine page: schedules, pauses and IP lists, with what they do
   assert.match(page, /with --keep-asleep the workload stayed asleep into an awake window, and a visitor's probe woke it/);
   assert.match(page, /Only the action ignore exists here/);
   assert.match(page, /the page's probe from a Google address got a 202 and the workload slept on \(WakeIgnored\)/);
-  assert.match(page, /Behind a regional load balancer it was the client's/);
+  // M5 (2026-11-08): the client's behind the global and classic load balancers too, a forged header included.
+  assert.match(page, /The address the waker reads is the last entry of X-Forwarded-For before the load balancer's own: the client's behind the global, regional and classic load balancers, a forged X-Forwarded-For included \(measured: the regional one in the acceptance, from real wakes; the global one and the classic one on the Standard tier on 2026-11-08, with a forged header\)/);
+  assert.match(page, /The idle check reads the same address in the request logs, without the port that the regional load balancer logs with it/);
+  assert.doesNotMatch(page, /with a forged header, it was not read on Google/);
   assert.match(page, /An IP list stops browsers and scanners on those addresses, not an API client that means to wake/);
   assert.match(page, /called stuck after 35 minutes/);
 });
@@ -266,14 +269,28 @@ test('the Compute Engine page: the fixes of router 0.38.0 and the idle check tha
   assert.match(page, /backends-changed/);
   assert.match(page, /kept 35 days/);
   assert.match(page, /Standard network tier/);
-  assert.match(page, /Whether Google accepts such a load balancer for the swap is unmeasured/);
+  // M1 (2026-11-08): Google accepts it, at classic's times.
+  assert.doesNotMatch(page, /for the swap is unmeasured/);
+  assert.match(page, /Google accepts such a load balancer for the swap \(measured on 2026-11-08/);
+  assert.match(page, /On the Standard network tier \(2026-11-08\), the nap's task took 316 s, an operator's nap 325 s to ASLEEP, and a POST \/_dormeto\/wake woke the workload to AWAKE in 289 s and 297 s, the unswap's 250 s included: classic's times on the Premium tier/);
   assert.match(page, /dormeto gcp workloads onboard --request-logs/);
   // A one-line block takes one argument: the two are on lines of their own, as HCL wants.
   assert.ok(read(CE).includes('  log_config {\n    enable      = true\n    sample_rate = 1.0\n  }\n'), 'log_config, multi-line');
   assert.doesNotMatch(read(CE), /log_config \{[^\n}]*=/);
   assert.match(page, /dmtr-<region>-lb/);
   assert.match(page, /Cloud Logging charges past 50 GiB a month/);
-  assert.match(page, /the check reads the log entries from a minute before the window to its end, as Monitoring's one-minute points can count requests up to a minute before it: the extra minute can only add requests/);
+  // M2 (2026-11-08): the logs decide alone, Monitoring's count being sampled.
+  assert.match(page, /On a backend service that logs every request \(logConfig enabled, sample rate 1\.0\), the request logs decide alone, whatever Monitoring counts, none included/);
+  assert.match(page, /The check reads the log entries from a minute before the window to its end: the extra minute can only add requests/);
+  assert.match(page, /With logs that cannot be read or hold more than 1,000 entries, or with logging off or sampled, Monitoring's count decides/);
+  assert.doesNotMatch(page, /When Monitoring counts 1 to 1,000 requests|fewer entries than Monitoring counted/);
+  assert.match(page, /Monitoring's request_count is sampled and batched: its one-minute points came late and in lumps \(13 for minutes that logged 4\), with gaps of six minutes/);
+  assert.match(page, /0\.6 to 1\.5 s later on a classic load balancer, about 10 s on a regional one/);
+  assert.match(page, /an idle nap's last read, before anything stops/);
+  assert.match(page, /On a regional load balancer, logging begins a few minutes after the change \(2 to 5 minutes, measured\)/);
+  assert.match(page, /Scanners that send a browser's user agent to the application's own paths count as activity/);
+  assert.match(page, /\/, \/favicon\.ico, \/geoserver\/web\/, seen within minutes on a bare address/);
+  assert.match(page, /IP lists catch known scanner networks/);
   // The CLI's install on a 404 of the global _Default bucket: a notice, and no view.
   assert.match(page, /A project whose _Default log bucket isn't in global gets no log view: the install says so and goes on, and the idle check counts every request/);
   assert.doesNotMatch(page, /stores its _Default bucket elsewhere gets no view, and the count decides/);
@@ -363,4 +380,8 @@ test('the README\'s Google Cloud section names the three pages and what router 0
   assert.match(flat(section), /--with cloud-sql,gke/);
   assert.doesNotMatch(flat(section), /not accepted yet/);
   assert.match(flat(section), /accepted on 2026-11-04 in dormeto-dev with CLI 0\.11\.0, but for ten workloads on one URL map, which was not run/);
+  // M1 and M2 (2026-11-08).
+  assert.doesNotMatch(flat(section), /unmeasured/);
+  assert.match(flat(section), /a classic load balancer on the Standard tier is found, and Google accepts it for the swap \(measured\)/);
+  assert.match(flat(section), /the logs decide alone, as Monitoring's count is sampled/);
 });

@@ -616,8 +616,9 @@ Router 0.38.0 fixes the limits of 0.37.0 on Google Cloud, and each is on the
 that stops is sent again or called stuck within minutes; the naps of one URL map share its updates, and a busy map gives
 a nap up instead of failing it; at most 20 naps are in flight per router; an idle nap reads the traffic again before it
 stops anything; a nap checks an unmanaged group's VMs and the backend service's backends; and a classic load balancer on
-the Standard tier is found (whether Google accepts it for the swap is unmeasured). With `--request-logs` the idle check
-reads the load balancer's request logs and ignores what the waker ignores. GKE refuses a KEDA `minReplicaCount: 0`.
+the Standard tier is found, and Google accepts it for the swap (measured). With `--request-logs` the idle check reads the
+load balancer's request logs and ignores what the waker ignores: the logs decide alone, as Monitoring's count is sampled.
+GKE refuses a KEDA `minReplicaCount: 0`.
 
 ```bash
 # Build (podman, linux/amd64) dormeto-router:<version> from gcp/Containerfile; <version> is x.y.z, or a pre-release:

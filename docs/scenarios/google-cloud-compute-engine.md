@@ -160,18 +160,28 @@ commits a count at most every 10 s per document and flushes what is left when Cl
 The counts are kept 35 days and swept once a day, and an offboarding deletes its workload's.
 
 **Request logs.** The idle check can read the load balancer's request logs instead of counting every request.
-- **What it reads.** When Monitoring counts 1 to 1,000 requests in the window and the backend service logs every request
-  (`logConfig` enabled, sample rate 1.0), the check reads the log entries from a minute before the window to its end,
-  as Monitoring's one-minute points can count requests up to a minute before it: the extra minute can only add
-  requests. It counts only the requests the waker would not ignore: not scanners, not `HEAD` requests, not an IP list's
-  addresses. If none is left, the workload is idle. Past 1,000 requests, with logs that cannot be read or hold fewer
-  entries than Monitoring counted, or with logging off, the count decides. `workloads show` says which it read: `idle
-  check: request logs` or `idle check: request count`.
+- **What it reads.** On a backend service that logs every request (`logConfig` enabled, sample rate 1.0), the request
+  logs decide alone, whatever Monitoring counts, none included. The check reads the log entries from a minute before
+  the window to its end: the extra minute can only add requests. It counts only the requests the waker would not
+  ignore: not scanners, not `HEAD` requests, not an IP list's addresses. If none is left, the workload is idle. With
+  logs that cannot be read or hold more than 1,000 entries, or with logging off or sampled, Monitoring's count decides.
+  `workloads show` says which it read: `idle check: request logs` or `idle check: request count`.
+- **Why the logs alone.** Monitoring's `request_count` is sampled and batched: its one-minute points came late and in
+  lumps (13 for minutes that logged 4), with gaps of six minutes (measured on 2026-11-08). It cannot tell whether the
+  logs are complete, so they are not compared with it.
+- **The newest requests.** An entry reaches the logs after its request: 0.6 to 1.5 s later on a classic load balancer,
+  about 10 s on a regional one (measured). A request the check could not see yet is read by an idle nap's last read,
+  before anything stops.
+- **Scanners that send a browser's user agent to the application's own paths count as activity** (`/`,
+  `/favicon.ico`, `/geoserver/web/`, seen within minutes on a bare address): the waker's filters cannot tell them from
+  visitors, and they keep the workload awake. IP lists catch known scanner networks ([IP lists](#ip-lists)).
 - **How it gets there.** `dormeto gcp install` creates the log view `dmtr-<region>-lb` on the project's `_Default`
   bucket, filtered to the load balancers' request logs, and gives the router `roles/logging.viewAccessor` on that view
   alone, by an IAM condition: never the project's other logs. `dormeto gcp workloads onboard --request-logs` turns the
   backend service's logging on at sample rate 1.0, as the operator; the offboarding sets it back. Without the flag, the
-  onboarding warns that every request counts, scanners included.
+  onboarding warns that every request counts, scanners included. On a regional load balancer, logging begins a few
+  minutes after the change (2 to 5 minutes, measured): a request in those minutes is not in the logs, and the first idle
+  window after the onboarding does not see it.
 - **Terraform.** If you write the backend service in Terraform, keep this block in it. Then an apply does not turn the
   logs off.
 
@@ -272,8 +282,8 @@ flowchart LR
   balancer of another region is refused: onboard it on that region's router. A map with forwarding rules of both a
   global and a classic load balancer (a migration under way) is refused until the migration ends. A classic load
   balancer on the Standard network tier has a regional forwarding rule that targets a global proxy. The onboarding finds
-  it through the aggregated forwarding rules, and the kind is read as classic. Whether Google accepts such a load balancer
-  for the swap is unmeasured.
+  it through the aggregated forwarding rules, and the kind is read as classic. Google accepts such a load balancer for
+  the swap (measured on 2026-11-08, at classic's times: [the swap's wake time](#wake-time-of-the-swap)).
 - **The waker backend service follows the kind:** regional in the router's region (`regionBackendServices`), or global
   with the scheme `EXTERNAL` on a classic load balancer, both on the router's serverless NEG.
 - **The hold route.** Google does not health check a backend service that no forwarding rule reaches, and a wake waits
@@ -353,6 +363,10 @@ map back as before its onboarding.
 |---|---|---|
 | Classic | 5.5 minutes | 2 min 16 s after a visitor's `POST /_dormeto/wake`; `AWAKE` after 287 s, the unswap's 250 s included |
 | Regional | 3.5 to 6.5 minutes to `ASLEEP` | 62 s after a `POST /_dormeto/wake`; `AWAKE` 123 to 188 s after a wake by a browser's probe, a `POST` or a pause, the unswap's 100 s included |
+
+On the Standard network tier (2026-11-08), the nap's task took 316 s, an operator's nap 325 s to `ASLEEP`, and a
+`POST /_dormeto/wake` woke the workload to `AWAKE` in 289 s and 297 s, the unswap's 250 s included: classic's times on the
+Premium tier (287 s above).
 
 The maps' own changes, measured before the router's code: a classic map's update took about 17 s, then the first new
 answer came after 38–123 s, the last old one after 76–221 s, settled after 78–226 s, with 3 to 11 answers `502` at the
@@ -469,9 +483,11 @@ wakes the workload, from any address.
 - **An IP list stops browsers and scanners on those addresses, not an API client that means to wake** with
   `POST /_dormeto/wake`.
 - **The lists are the router's,** for all its workloads; a catalog of lists waits for the manager on Google Cloud.
-- **The address the waker reads** is the last entry of `X-Forwarded-For` before the load balancer's own. Behind a
-  regional load balancer it was the client's (the acceptance, from real wakes); behind the global and classic ones, and
-  with a forged header, it was not read on Google.
+- **The address the waker reads** is the last entry of `X-Forwarded-For` before the load balancer's own: the client's
+  behind the global, regional and classic load balancers, a forged `X-Forwarded-For` included (measured: the regional
+  one in the acceptance, from real wakes; the global one and the classic one on the Standard tier on 2026-11-08, with a
+  forged header). The idle check reads the same address in the request logs, without the port that the regional load
+  balancer logs with it.
 
 ## Limits
 
@@ -516,7 +532,8 @@ wakes the workload, from any address.
 - **Internet noise counts, unless the check reads request logs.** Without [request logs](#behavior), the idle check
   counts every request the backend service answers, scanners' too: 8 such requests
   in 2 minutes kept a demo VM awake past its window. With them, the requests the waker would ignore do not keep the
-  workload awake. The browser filters refuse declared bots, but a scanner that runs
+  workload awake, but a scanner that sends a browser's user agent to the application's own paths does: IP lists catch
+  known scanner networks. The browser filters refuse declared bots, but a scanner that runs
   JavaScript with a browser's user agent wakes the workload as a visitor would (seen on the demo). A map's default service
   gets the requests for any host name, so it is the most exposed.
 - **The waiting page's browser wake.** The wake comes from the page's script, or from `POST /_dormeto/wake`. A client

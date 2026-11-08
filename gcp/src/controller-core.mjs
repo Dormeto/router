@@ -216,7 +216,7 @@ export function createController({
     try {
       lastRouterLevel = (await store.getRouterSettings?.()) ?? null;
     } catch (err) {
-      log.warn('RouterSettingsUnread', { level: 'router', error: err.message });
+      log.warn('SettingsLevelUnreadable', { level: 'router', error: err.message });
       if (lastRouterLevel === undefined) return { router: null, unreadable: true };
     }
     return { router: lastRouterLevel };

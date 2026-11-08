@@ -2414,7 +2414,7 @@ test('a router level never read on this instance: the check asks no idle nap and
   assert.deepEqual(idle.world.tasks, []);
   assert.deepEqual(idle.world.metricReads, []);
   assert.deepEqual(idle.logged('CheckFailed'), []);
-  assert.deepEqual(idle.logged('RouterSettingsUnread').map(({ level, error }) => ({ level, error })), [{ level: 'router', error: 'Google: GET: 503 unavailable' }]);
+  assert.deepEqual(idle.logged('SettingsLevelUnreadable').map(({ level, error }) => ({ level, error })), [{ level: 'router', error: 'Google: GET: 503 unavailable' }]);
   const failed = neverRead({ run: FAILED_RUN(START - 60 * MINUTE), vms: RUNNING_VM, map: asleepMap(), unhealthyPolls: Infinity });
   assert.deepEqual(await failed.controller.check(), [{ workloadId: 'demo', state: STATES.FAILED, settings: 'unreadable' }]);
   assert.deepEqual(failed.world.tasks, []);
@@ -2460,7 +2460,7 @@ test('a router level that cannot be read keeps the last one this instance read: 
   const started = t.clock.now();
   assert.equal((await t.controller.wake('demo', 'w1')).state, STATES.FAILED);
   assert.equal(t.clock.now() - started, 120_000);
-  assert.equal(t.logged('RouterSettingsUnread').length, 3);
+  assert.equal(t.logged('SettingsLevelUnreadable').length, 3);
 });
 
 test('the wake\'s deadline is the resolved wake timeout: the router\'s 120 s on a workload that inherits it', async () => {

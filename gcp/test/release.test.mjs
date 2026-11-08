@@ -269,6 +269,9 @@ test('the Compute Engine page: the fixes of router 0.38.0 and the idle check tha
   assert.match(page, /log_config \{ enable = true, sample_rate = 1\.0 \}/);
   assert.match(page, /dmtr-<region>-lb/);
   assert.match(page, /Cloud Logging charges past 50 GiB a month/);
+  // The CLI's install on a 404 of the global _Default bucket: a notice, and no view.
+  assert.match(page, /A project whose _Default log bucket isn't in global gets no log view: the install says so and goes on, and the idle check counts every request/);
+  assert.doesNotMatch(page, /stores its _Default bucket elsewhere gets no view, and the count decides/);
   assert.match(flat(read(GKE)), /KEDA scales <owner> to zero itself \(minReplicaCount: 0\): set it to 1 or more for Dormeto to nap it/);
 });
 

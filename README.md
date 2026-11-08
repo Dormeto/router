@@ -608,8 +608,7 @@ Router 0.37.0 adds zonal network endpoint groups, the regional and classic load 
 (`dormeto gcp install --ip-list`), Cloud SQL companions and GKE pods, the last two with the access that
 `dormeto gcp install --with cloud-sql,gke` adds (their APIs, the roles `dormetoRouterDatabasesRead`,
 `dormetoRouterDatabases` and `dormetoRouterKubernetes`, and a Kubernetes Role per GKE workload, which the CLI applies).
-They were accepted on 2026-11-04 in `dormeto-dev` with CLI 0.11.0, but for ten workloads on one URL
-map, which was not run: each page says what was accepted and measured.
+They were accepted on 2026-11-04 in `dormeto-dev` with CLI 0.11.0: each page says what was accepted and measured.
 
 Router 0.38.0 fixes the limits of 0.37.0 on Google Cloud, and each is on the
 [Compute Engine page](docs/scenarios/google-cloud-compute-engine.md): a running wake or nap beats every minute, and one
@@ -618,7 +617,8 @@ a nap up instead of failing it; at most 20 naps are in flight per router; an idl
 stops anything; a nap checks an unmanaged group's VMs and the backend service's backends; and a classic load balancer on
 the Standard tier is found, and Google accepts it for the swap (measured). With `--request-logs` the idle check reads
 the load balancer's request logs and ignores what the waker ignores: the logs decide alone, as Monitoring's count is
-sampled, but an empty log leaves the count to decide. GKE refuses a KEDA `minReplicaCount: 0`.
+sampled, but an empty log leaves the count to decide. GKE refuses a KEDA `minReplicaCount: 0`. Router 0.38.0 is not released yet. Its acceptance passed on 2026-11-08 in
+`dormeto-dev`, with the image 0.38.0-dev.2 and the CLI built from `main`.
 
 ```bash
 # Build (podman, linux/amd64) dormeto-router:<version> from gcp/Containerfile; <version> is x.y.z, or a pre-release:

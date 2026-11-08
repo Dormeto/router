@@ -252,8 +252,8 @@ VM without a companion was not timed through the router.
 
 ## Regional and classic load balancers: the swap
 
-**From router 0.37.0, accepted on 2026-11-04** with CLI 0.11.0, but for ten workloads on one URL map,
-which was not run ([the swap's limits](#limits-of-the-swap)). Each kind was onboarded, napped, woken and offboarded
+**From router 0.37.0, accepted on 2026-11-04** with CLI 0.11.0, and for ten workloads on one URL map
+on 2026-11-08 ([the swap's limits](#limits-of-the-swap)). Each kind was onboarded, napped, woken and offboarded
 through the router, and steady traffic kept each awake; the URL maps' changes were measured beforehand (2026-10-31).
 
 A regional or classic external Application Load Balancer has no custom error response: Google refuses the policy on both.
@@ -404,8 +404,8 @@ earlier runs), with one answer `503`.
 - **Ten naps on one regional URL map.** A regional map's update took 85 s (measured). The naps of one map no longer fail
   on it: those in the same controller instance wait for the update under way and share the next. A nap retries a map that other updates keep busy (your Terraform's, say) for about 120 s.
   Then it gives up as `map-busy`, the workload left awake with its idle time kept. It is no failure, and the next check asks
-  again. How many naps share an update in one nap window is unmeasured: ten workloads on one URL map were not run in the
-  acceptance. Give workloads of one regional map different nap windows if their naps give up.
+  again. Ten naps asked at once on one map were all asleep, none failed, within 509 s global and 283 s regional (the
+  acceptance of 2026-11-08). Give workloads of one regional map different nap windows if their naps give up.
 - **At most 20 naps in flight per router (`NapDeferred`).** A nap holds a controller request for minutes. So a check asks
   for at most 20 naps at once, counting the naps already running. It asks the scheduled ones first. The others are said once
   in the log (`NapDeferred`, with their count) and nap at a later check.
@@ -426,8 +426,8 @@ earlier runs), with one answer `503`.
 
 ## Schedules and pauses
 
-**From router 0.37.0, accepted on 2026-11-04** with CLI 0.11.0, on a GKE workload, but for ten workloads
-on one URL map in one nap window, which was not run. `schedule show` listed the next events; a nap window napped the
+**From router 0.37.0, accepted on 2026-11-04** with CLI 0.11.0, on a GKE workload, and on 2026-11-08 for ten workloads
+on one URL map in one nap window. `schedule show` listed the next events; a nap window napped the
 workload, and a visitor in it was told when it ends and woke nothing; an awake window woke it; a pause refused a nap and
 woke a sleeper; with `--keep-asleep` the workload stayed asleep into an awake window, and a visitor's probe woke it.
 
@@ -464,7 +464,7 @@ answered with what is wrong.
   window's nap: it does not come back when the pause ends. The idle check still naps the workload by its idle window.
 - **A pause is a workload's.** Router-wide pauses and exclusions wait for the manager on Google Cloud.
 - **Many workloads of one regional URL map in one nap window:** see [the swap's limits](#limits-of-the-swap). Ten on one
-  map were not run in the acceptance.
+  map all napped in the acceptance of 2026-11-08.
 
 ## IP lists
 

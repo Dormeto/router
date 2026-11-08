@@ -179,17 +179,18 @@ const PAGE_PARTS = ['```mermaid', '## Services', '## Wake time', '## Behavior', 
 // flat() drops the asterisks of the routes and headers: these read the page with its marks, only its spaces made one.
 const spaced = (text) => text.replace(/\s+/g, ' ');
 
-// The acceptance of 2026-11-04 (vision docs/plans/2026-10-30-google-cloud-coverage.md, "Acceptance results"): passed but for
-// ten workloads on one URL map, which was not run.
+// The acceptance of 2026-11-04 (vision docs/plans/2026-10-30-google-cloud-coverage.md, "Acceptance results") passed; the ten
+// workloads on one URL map were accepted on 2026-11-08, with router 0.38.0-dev.2.
 const NOT_ACCEPTED = /not accepted yet|acceptance has not run|the acceptance's to check|the acceptance tries it|No wake through the router has been timed yet|no wake of a NEG's VM through the router has been timed yet/;
 const ACCEPTED = /From router 0\.37\.0, accepted on 2026-11-04 with CLI 0\.11\.0[,:]/g;
 
-test('the Compute Engine page: what ships in router 0.37.0 says so, and that it was accepted but for ten workloads on one map', () => {
+test('the Compute Engine page: what ships in router 0.37.0 says so, and that ten workloads on one map were accepted on 2026-11-08', () => {
   const page = flat(read(CE));
   assert.doesNotMatch(page, /router 0\.35\.0/);
   assert.doesNotMatch(page, NOT_ACCEPTED);
   assert.equal(page.match(ACCEPTED)?.length, 4, 'the NEGs, the swap, schedules and pauses, IP lists');
-  assert.match(page, /but for ten workloads on one URL map, which was not run/);
+  assert.match(page, /and for ten workloads on one URL map on 2026-11-08/);
+  assert.doesNotMatch(page, /which was not run|were not run in the acceptance/);
   assert.match(page, /\(google-cloud-sql\.md\)/);
   assert.match(page, /\(google-kubernetes-engine\.md\)/);
   assert.doesNotMatch(page, /The global external Application Load Balancer only/);
@@ -222,7 +223,7 @@ test('the Compute Engine page: the swap of regional and classic load balancers, 
   assert.match(page, /\| Regional \| 3\.5 to 6\.5 minutes to ASLEEP \| 62 s after a POST \/_dormeto\/wake; AWAKE 123 to 188 s after a wake by a browser's probe, a POST or a pause, the unswap's 100 s included \|/);
   assert.match(page, /Steady traffic, 45 requests in 15 minutes, kept each kind awake through the router with a 5-minute idle window/);
   assert.match(page, /terraform plan showed no change with a regional workload onboarded/);
-  assert.match(page, /ten workloads on one URL map were not run in the acceptance/);
+  assert.match(page, /Ten naps asked at once on one map were all asleep, none failed, within 509 s global and 283 s regional \(the acceptance of 2026-11-08\)/);
   assert.match(page, /No nap was killed so in the acceptance/);
   assert.match(page, /ignore_changes = \[default_service, default_route_action, host_rule, path_matcher\]/);
   assert.match(page, /answered that load balancer's plain-HTTP requests with a 302 to https:\/\/ for about 40 s/);
@@ -241,7 +242,7 @@ test('the Compute Engine page: schedules, pauses and IP lists, with what they do
   assert.match(page, /at most 10 scheduled naps each run, oldest occurrence first/);
   assert.match(page, /With --keep-asleep, a visitor still wakes the workload/);
   assert.match(page, /A scheduled nap's occurrence is spent once its task is accepted/);
-  assert.match(page, /on a GKE workload, but for ten workloads on one URL map in one nap window, which was not run/);
+  assert.match(page, /on a GKE workload, and on 2026-11-08 for ten workloads on one URL map in one nap window/);
   assert.match(page, /with --keep-asleep the workload stayed asleep into an awake window, and a visitor's probe woke it/);
   assert.match(page, /Only the action ignore exists here/);
   assert.match(page, /the page's probe from a Google address got a 202 and the workload slept on \(WakeIgnored\)/);
@@ -377,7 +378,7 @@ test('the scenarios index has a row for each Google Cloud page', () => {
   assert.match(row('google-kubernetes-engine.md'), /\| 300 s \|$/);
   const index = flat(read('docs/scenarios/README.md'));
   assert.doesNotMatch(index, /what the acceptance has not run yet/);
-  assert.match(index, /accepted on 2026-11-04 but for ten workloads on one URL map/);
+  assert.match(index, /accepted on 2026-11-04, and say what was not run/);
 });
 
 test('the README\'s Google Cloud section names the three pages and what router 0.37.0 adds', () => {
@@ -389,7 +390,9 @@ test('the README\'s Google Cloud section names the three pages and what router 0
   assert.match(flat(section), /Router 0\.37\.0 adds zonal network endpoint groups/);
   assert.match(flat(section), /--with cloud-sql,gke/);
   assert.doesNotMatch(flat(section), /not accepted yet/);
-  assert.match(flat(section), /accepted on 2026-11-04 in dormeto-dev with CLI 0\.11\.0, but for ten workloads on one URL map, which was not run/);
+  assert.match(flat(section), /accepted on 2026-11-04 in dormeto-dev with CLI 0\.11\.0: each page says what was accepted and measured/);
+  assert.match(flat(section), /Router 0\.38\.0 is not released yet\. Its acceptance passed on 2026-11-08 in dormeto-dev, with the image 0\.38\.0-dev\.2 and the CLI built from main/);
+  assert.doesNotMatch(flat(section), /which was not run/);
   // M1 and M2 (2026-11-08).
   assert.doesNotMatch(flat(section), /unmeasured/);
   assert.match(flat(section), /a classic load balancer on the Standard tier is found, and Google accepts it for the swap \(measured\)/);

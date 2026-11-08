@@ -19,7 +19,7 @@ time, its behavior and its limits.
 A workload may combine backends: Auto Scaling groups and loose instances, an ECS service and its database, pods and
 their database. Databases are always companions of an application's backends. On Google Cloud a workload is a backend
 service of an external Application Load Balancer; its three pages are from router 0.37.0 but for the Compute Engine
-page's global load balancer, accepted on 2026-11-04 but for ten workloads on one URL map, and say what was not run.
+page's global load balancer, accepted on 2026-11-04, and say what was not run.
 
 ## The cycle
 

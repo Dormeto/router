@@ -172,8 +172,16 @@ The counts are kept 35 days and swept once a day, and an offboarding deletes its
   alone, by an IAM condition: never the project's other logs. `dormeto gcp workloads onboard --request-logs` turns the
   backend service's logging on at sample rate 1.0, as the operator; the offboarding sets it back. Without the flag, the
   onboarding warns that every request counts, scanners included.
-- **Terraform.** If you write the backend service in Terraform, keep `log_config { enable = true, sample_rate = 1.0 }`
-  in it. Then an apply does not turn the logs off.
+- **Terraform.** If you write the backend service in Terraform, keep this block in it. Then an apply does not turn the
+  logs off.
+
+  ```hcl
+  log_config {
+    enable      = true
+    sample_rate = 1.0
+  }
+  ```
+
 - **Cost.** Cloud Logging charges past 50 GiB a month and project, about 1 KB per request: 50 million requests are free.
 - **Limit.** The view lives in the `global` location. A project whose `_Default` log bucket isn't in `global` gets no
   log view: the install says so and goes on, and the idle check counts every request.

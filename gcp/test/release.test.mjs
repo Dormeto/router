@@ -268,7 +268,9 @@ test('the Compute Engine page: the fixes of router 0.38.0 and the idle check tha
   assert.match(page, /Standard network tier/);
   assert.match(page, /Whether Google accepts such a load balancer for the swap is unmeasured/);
   assert.match(page, /dormeto gcp workloads onboard --request-logs/);
-  assert.match(page, /log_config \{ enable = true, sample_rate = 1\.0 \}/);
+  // A one-line block takes one argument: the two are on lines of their own, as HCL wants.
+  assert.ok(read(CE).includes('  log_config {\n    enable      = true\n    sample_rate = 1.0\n  }\n'), 'log_config, multi-line');
+  assert.doesNotMatch(read(CE), /log_config \{[^\n}]*=/);
   assert.match(page, /dmtr-<region>-lb/);
   assert.match(page, /Cloud Logging charges past 50 GiB a month/);
   assert.match(page, /the check reads the log entries from a minute before the window to its end, as Monitoring's one-minute points can count requests up to a minute before it: the extra minute can only add requests/);

@@ -7,7 +7,7 @@ import { createCompute } from '../src/compute.mjs';
 import { createController } from '../src/controller-core.mjs';
 import { createGke } from '../src/gke.mjs';
 import { GoogleError } from '../src/google.mjs';
-import { beats, resendable } from '../src/heartbeat.mjs';
+import { beats, resendClaim } from '../src/heartbeat.mjs';
 import { createOnboarding } from '../src/onboarding.mjs';
 import { createUrlMaps } from '../src/urlmaps.mjs';
 
@@ -62,7 +62,7 @@ export function virtualClock(start = 1_700_000_000_000) {
 }
 
 // The store's heartbeat writes (firestore.mjs) on a fake's run, `runOf(id)` the run itself: `beatAt` while it holds the id,
-// `resentAt` once a minute.
+// `resentAt` once a minute and `resends`, twice at most.
 export const heartbeatStore = (runOf, now) => ({
   beat: async (id, field, value) => {
     const run = runOf(id);
@@ -72,9 +72,9 @@ export const heartbeatStore = (runOf, now) => ({
   },
   claimResend: async (id, wakeId) => {
     const run = runOf(id);
-    const t = now();
-    if (!run || !resendable(run, wakeId, t)) return false;
-    run.resentAt = t;
+    const set = run && resendClaim(run, wakeId, now());
+    if (!set) return false;
+    Object.assign(run, set);
     return true;
   },
 });

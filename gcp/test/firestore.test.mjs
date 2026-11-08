@@ -570,6 +570,25 @@ test('claimResend: resentAt written for the run still WAKING with that wakeId, o
   assert.equal(await store.claimResend('nope', 'w1'), false);
 });
 
+test('claimResend: twice at most per wakeId, the count on the run; a new wake counts afresh', async () => {
+  let t = Date.parse('2026-03-10T12:00:00Z');
+  const { store } = setup({ now: () => t });
+  await store.initRun('app', 1);
+  await store.transition('app', { cond: { state: 'AWAKE' }, set: { state: 'WAKING', wakeId: 'w1', wakeStartedAt: t } });
+  assert.equal(await store.claimResend('app', 'w1'), true);
+  t += 60_001;
+  assert.equal(await store.claimResend('app', 'w1'), true);
+  assert.deepEqual((await store.getRun('app')).resends, { wakeId: 'w1', count: 2 });
+  t += 60_001;
+  assert.equal(await store.claimResend('app', 'w1'), false);
+  assert.equal((await store.getRun('app')).resentAt, t - 60_001);
+  await store.transition('app', { cond: { state: 'WAKING' }, set: { state: 'AWAKE' } });
+  await store.transition('app', { cond: { state: 'AWAKE' }, set: { state: 'WAKING', wakeId: 'w2', wakeStartedAt: t } });
+  t += 60_001;
+  assert.equal(await store.claimResend('app', 'w2'), true);
+  assert.deepEqual((await store.getRun('app')).resends, { wakeId: 'w2', count: 1 });
+});
+
 const bytes = (seed, size) => Buffer.from(Array.from({ length: size }, (_, i) => (i * 31 + seed) % 256));
 
 test('lists: the meta is set and removed by field; parts of 350 kB round trip as bytes, in order', async () => {

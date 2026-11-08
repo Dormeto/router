@@ -24,7 +24,7 @@
 // name (the autoscaler's), mode }]`, what the wake gives back), `owners` (k8sRecord's: what a nap read of its k8s backends, replicas and KEDA, for
 // the wake), `lastWake` (`{ durationMs }`), `scheduleApplied` (the last nap or awake window's occurrence applied), `napAborted`
 // (`{ reason, at }`: the last nap given up, its cause, until a nap commits), and the heartbeat's (heartbeat.mjs): `napId` (the
-// running nap's, as `wakeId` is the wake's), `beatAt` and `resentAt`. The cause and the event of a state change are logged
+// running nap's, as `wakeId` is the wake's), `beatAt`, `resentAt` and `resends`. The cause and the event of a state change are logged
 // (`StateChanged`): the state history in the manager comes with G2.
 //
 // Schedules and pauses as on AWS (vision docs/specs/2026-10-30-google-cloud-coverage-design.md, section 5). Here a pause is

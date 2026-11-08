@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { STATES } from '../../lambda/src/lib/state.mjs';
-import { beatOf, beats, resendable, staleness } from '../src/heartbeat.mjs';
+import { beatOf, beats, resendClaim, resendable, staleness } from '../src/heartbeat.mjs';
 
 const T = 1_700_000_000_000;
 const MINUTE = 60_000;
@@ -67,4 +67,20 @@ test('resendable: WAKING with that wakeId, and no resend in the last minute', ()
   assert.equal(resendable(waking({ resentAt: T - 30_000 }), 'w1', T), false);
   assert.equal(resendable(waking({ resentAt: T - MINUTE }), 'w1', T), false);
   assert.equal(resendable(waking({ resentAt: T - MINUTE - 1 }), 'w1', T), true);
+});
+
+test('resendable: twice at most per wakeId, then only the stuck wake\'s deadline acts; another wake\'s resends are not this one\'s', () => {
+  const before = T - 2 * MINUTE;
+  assert.equal(resendable(waking({ resentAt: before, resends: { wakeId: 'w1', count: 1 } }), 'w1', T), true);
+  assert.equal(resendable(waking({ resentAt: before, resends: { wakeId: 'w1', count: 2 } }), 'w1', T), false);
+  assert.equal(resendable(waking({ resentAt: before, resends: { wakeId: 'w0', count: 2 } }), 'w1', T), true);
+});
+
+test('resendClaim: what a resend writes, when and the wake\'s count; null when it may not be sent', () => {
+  assert.deepEqual(resendClaim(waking(), 'w1', T), { resentAt: T, resends: { wakeId: 'w1', count: 1 } });
+  assert.deepEqual(resendClaim(waking({ resentAt: T - 2 * MINUTE, resends: { wakeId: 'w1', count: 1 } }), 'w1', T), { resentAt: T, resends: { wakeId: 'w1', count: 2 } });
+  assert.deepEqual(resendClaim(waking({ resentAt: T - 2 * MINUTE, resends: { wakeId: 'w0', count: 2 } }), 'w1', T), { resentAt: T, resends: { wakeId: 'w1', count: 1 } });
+  assert.equal(resendClaim(waking({ resentAt: T - 2 * MINUTE, resends: { wakeId: 'w1', count: 2 } }), 'w1', T), null);
+  assert.equal(resendClaim(waking({ resentAt: T - 30_000 }), 'w1', T), null);
+  assert.equal(resendClaim(waking(), 'w2', T), null);
 });

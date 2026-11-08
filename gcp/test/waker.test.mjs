@@ -415,6 +415,16 @@ test('a poll of a WAKING run that beats, or not yet 90 s old, or sent again by t
   }
 });
 
+test('a poll of a stale WAKING run sent again twice already: no task, the deadline alone acts', async () => {
+  const run = WAKING_SINCE(5 * 60_000, { resentAt: T - 2 * 60_000, resends: { wakeId: 'w1', count: 2 } });
+  const { handler, created, store, warned } = setup({ run });
+  const res = await handler(probe());
+  assert.equal(headerOf(res, 'x-dormeto-state'), STATES.WAKING);
+  assert.equal(created.length, 0);
+  assert.equal(store.state.run.resentAt, run.resentAt);
+  assert.deepEqual(warned.filter((w) => w.event === 'WakeResent'), []);
+});
+
 test('a WAKING run past its timeout: the shared code\'s new wake, as before, not a resend', async () => {
   const { handler, store, created, warned } = setup({ run: WAKING_SINCE(11 * 60_000) });
   await handler(probe());

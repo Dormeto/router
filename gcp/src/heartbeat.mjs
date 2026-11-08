@@ -3,13 +3,16 @@
 // `napId` NAPPING. A run whose beat is older than 3 minutes, or absent 90 s after its request, is stale: its task was lost, or its
 // request died. The check, and the waker when a visitor polls, act on it at most once a minute (`resentAt`, written by one of them
 // only): a wake is sent again with its wakeId, which its transitions guard, so a duplicate is harmless; a nap takes the stuck
-// nap's path (controller-core.mjs). The deadlines of a stuck wake and a stuck nap stay, as the last resort.
+// nap's path (controller-core.mjs). A wake is sent again twice at most (`resends`, its count by wakeId): a duplicate still holds a
+// controller request for the whole wake, and the queue's saturation that makes a wake stale would only deepen. The deadlines of a
+// stuck wake and a stuck nap stay, as the last resort.
 import { STATES } from '../../lambda/src/lib/state.mjs';
 
 const BEAT_MS = 60_000;
 const STALE_MS = 3 * 60_000;
 const FIRST_BEAT_MS = 90_000;
 const RESEND_MS = 60_000;
+const RESENDS_MAX = 2;
 
 // The state each id beats in.
 const BEATING = { wakeId: STATES.WAKING, napId: STATES.NAPPING };
@@ -40,8 +43,15 @@ export function staleness(run, t) {
   return t - asked > FIRST_BEAT_MS ? 'no heartbeat 90 s after it started' : null;
 }
 
-// Whether the wake may be sent again at `t`: still WAKING with that wakeId, and not sent again in the last minute.
-export const resendable = (run, wakeId, t) => run.state === STATES.WAKING && run.wakeId === wakeId && (run.resentAt === undefined || run.resentAt < t - RESEND_MS);
+// How many times that wake was sent again: `resends` counts the run's last wakeId sent again only.
+const resendsOf = (run, wakeId) => (run.resends?.wakeId === wakeId ? run.resends.count : 0);
+
+// Whether the wake may be sent again at `t`: still WAKING with that wakeId, sent again less than twice, and not in the last minute.
+export const resendable = (run, wakeId, t) => run.state === STATES.WAKING && run.wakeId === wakeId && resendsOf(run, wakeId) < RESENDS_MAX
+  && (run.resentAt === undefined || run.resentAt < t - RESEND_MS);
+
+// What claiming the wake's resend at `t` writes on the run: when, and the wake's count. Null when it may not be sent again.
+export const resendClaim = (run, wakeId, t) => (resendable(run, wakeId, t) ? { resentAt: t, resends: { wakeId, count: resendsOf(run, wakeId) + 1 } } : null);
 
 // The heartbeat of `field` `id` on the run, from now: its first beat written before this returns, then one every 60 s through
 // `every(ms, fn)` (a timer; its answer stops it). Answers the stop, for every way out of the wake or the nap. A beat that fails is

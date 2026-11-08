@@ -542,6 +542,26 @@ test('WAKING 3 minutes with no beat: the check sends that wakeId again; 30 s lat
   assert.deepEqual(t.world.calls, []);
 });
 
+// A duplicate wake holds a controller request for the whole wake: under a saturated queue, the cause of a stale wake, resends
+// without end would deepen it. Twice per wakeId, then the deadline alone.
+test('a stale wake is sent again twice at most: then nothing more, and its deadline calls it stuck', async () => {
+  const t = setup({ run: waking(START - 3 * MINUTE), vms: { 'vm-a': { status: 'TERMINATED' } }, map: asleepMap() });
+  assert.equal((await t.controller.check())[0].wake, 'resent');
+  t.clock.advance(MINUTE + 1);
+  assert.equal((await t.controller.check())[0].wake, 'resent');
+  t.clock.advance(MINUTE + 1);
+  assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.WAKING }]);
+  t.clock.advance(4 * MINUTE);
+  assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.WAKING }]);
+  assert.deepEqual(t.world.tasks.map((task) => task.body), Array(2).fill({ action: 'wake', workloadId: 'demo', wakeId: 'w1' }));
+  assert.equal(t.logged('WakeResent').length, 2);
+  // Past the wake's 600 s and the grace: stuck.
+  t.clock.advance(2 * MINUTE);
+  assert.equal((await t.controller.check())[0].state, STATES.FAILED);
+  assert.equal(t.logged('WakeStuck').length, 1);
+  assert.equal(t.world.tasks.length, 2);
+});
+
 test('a wake that beats is left alone, whatever its age within its deadline; one not yet 90 s old too', async () => {
   for (const run of [waking(START - 9 * MINUTE, { beatAt: START - 30_000 }), waking(START - 90_000), waking(START - 3 * MINUTE, { beatAt: START - 3 * MINUTE })]) {
     const t = setup({ run });

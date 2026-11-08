@@ -254,6 +254,7 @@ test('the Compute Engine page: the fixes of router 0.38.0 and the idle check tha
   const page = flat(read(CE));
   assert.match(page, /A running wake or nap beats on its run every minute/);
   assert.match(page, /sent again or called stuck within minutes/);
+  assert.match(page, /A stale wake is sent again with its wakeId, twice at most, which a duplicate cannot disturb: after that, its deadline alone acts/);
   assert.match(page, /22 minutes under a swap/);
   assert.doesNotMatch(page, /up to 15 minutes/);
   assert.match(page, /At most 20 naps in flight per router \(NapDeferred\)/);

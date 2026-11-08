@@ -69,7 +69,7 @@ import {
 } from './gke.mjs';
 import { OPERATION_NOT_DONE } from './google.mjs';
 import { resendStale, startHeartbeat, staleness } from './heartbeat.mjs';
-import { effectiveOf, WAKE_TIMEOUT_MAX } from './levels.mjs';
+import { effectiveOf, SWAP_WAKE_ROOM_SECONDS, WAKE_TIMEOUT_MAX } from './levels.mjs';
 import { faviconReachable, servedPage } from './pages.mjs';
 import { inOneUpdate, switchOf } from './switch.mjs';
 import { listenerRulesOf, mapBusy, references, UrlMapRefused } from './urlmaps.mjs';
@@ -691,8 +691,9 @@ export function createController({
         if (!(await isCurrent())) return superseded();
       }
       let givenBack = true;
-      // Under a swap the retries end in time for the map's change: a start later than that could not unswap before the deadline.
-      types = wakeTypes(cfg, run, wakeId, deadline - (sw.kind === 'swap' ? sw.waitMs : 0));
+      // Under a swap the retries end in time for the map's change: the swap's wait, and the room the wake's floor gives it (levels.mjs) for
+      // the last start's own time and the map's write. A wait past that is not taken: the VM is given up, as once its retries are done.
+      types = wakeTypes(cfg, run, wakeId, deadline - (sw.kind === 'swap' ? sw.waitMs + SWAP_WAKE_ROOM_SECONDS * 1000 : 0));
       try {
         await wakeBackends(cfg, run, deadline, types);
       } catch (err) {

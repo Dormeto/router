@@ -1332,12 +1332,53 @@ for (const [kind, lb, base, waitSeconds, healthScope, headers] of SWAPS) {
     assert.equal((await t.controller.wake('demo', 'w1')).state, STATES.AWAKE);
     const retries = t.world.sleeps.slice(0, -1);
     assert.deepEqual(retries.slice(0, 3), [30_000, 60_000, 120_000]);
-    assert.ok(START + retries.reduce((sum, ms) => sum + ms, 0) + 120_000 >= START + 600_000 - WAIT_MS, 'no wait left out that the map\'s change would fit');
+    // Up to the deadline less the swap's wait and the room of the wake's floor (60 s), and no wait left out that would fit.
+    assert.ok(START + retries.reduce((sum, ms) => sum + ms, 0) + 120_000 >= START + 600_000 - WAIT_MS - 60_000, 'no wait left out that the map\'s change would fit');
     assert.equal(t.world.sleeps.at(-1), WAIT_MS);
     assert.ok(t.clock.now() <= START + 600_000);
     assert.equal(t.logged('BackendsNotWoken').length, 1);
     assert.match(t.logged('BackendsNotWoken')[0].error, /ZONE_RESOURCE_POOL_EXHAUSTED/);
     assert.equal(isSwapped(t.world.map), false);
+  });
+
+  // A start takes time, and so does the map's write (5 s here): the retries end early enough for the last start, the write and the swap's
+  // wait, the room of section 3's floor (60 s beyond the wait). A bound at the wait alone timed out, regional for d of 8, 9 and 33 to 42 s,
+  // classic for 3, 4 and 34 to 46 s.
+  const SLOW_STARTS = [0, 3, 4, 8, 9, ...Array.from({ length: 14 }, (_, i) => 33 + i)];
+  const slowly = (t, line, d, refusals = Infinity) => {
+    let starts = 0;
+    t.world.on.put = async () => { t.clock.advance(5000); };
+    t.world.on[line] = async () => {
+      starts += 1;
+      t.clock.advance(d * 1000);
+      if (starts <= refusals) throw stockout();
+    };
+    return () => starts;
+  };
+
+  test(`${kind} wake: a VM refused for capacity, each start taking d seconds, while another serves: its retries end in time, AWAKE, never a timeout`, async () => {
+    for (const d of SLOW_STARTS) {
+      const t = swapSetup({ run: waking(START), cfg: { backends: [VM_A, VM_B] }, vms: { 'vm-a': { status: 'RUNNING' }, 'vm-b': { status: 'TERMINATED' } }, map: swappedMap() });
+      slowly(t, 'start vm-b', d);
+      const out = await t.controller.wake('demo', 'w1');
+      assert.equal(out.state, STATES.AWAKE, `d = ${d} s: ${out.error}`);
+      assert.equal(t.logged('BackendsNotWoken').length, 1, `d = ${d} s`);
+      assert.ok(t.clock.now() < START + 600_000, `d = ${d} s`);
+    }
+  });
+
+  test(`${kind} wake: a VM refused for capacity, each start taking d seconds: FAILED for capacity, never a timeout; started at the last try the retries allow, AWAKE`, async () => {
+    for (const d of SLOW_STARTS) {
+      const refused = swapSetup({ run: waking(START), map: swappedMap(), vms: { 'vm-a': { status: 'TERMINATED' } } });
+      const tries = slowly(refused, 'start vm-a', d);
+      assert.equal((await refused.controller.wake('demo', 'w1')).state, STATES.FAILED, `d = ${d} s`);
+      assert.equal(JSON.parse(refused.run().failure).kind, 'capacity', `d = ${d} s`);
+
+      const last = swapSetup({ run: waking(START), map: swappedMap(), vms: { 'vm-a': { status: 'TERMINATED' } } });
+      slowly(last, 'start vm-a', d, tries() - 1);
+      const out = await last.controller.wake('demo', 'w1');
+      assert.equal(out.state, STATES.AWAKE, `d = ${d} s, started at try ${tries()}: ${out.error}`);
+    }
   });
 
   test(`${kind} wake: a VM that cannot start and a health that cannot be read: FAILED with the VM's error`, async () => {

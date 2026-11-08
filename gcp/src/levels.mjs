@@ -6,7 +6,8 @@ import { SWAP_WAIT_MS } from './switch.mjs';
 // What Google Cloud fixes whatever the level says; the swap's wait + 60 s is the wake's floor behind a swap.
 const FIXED_ZERO = ['waitSeconds', 'maxHolders', 'drainSeconds'];
 export const WAKE_TIMEOUT_MAX = 1700;
-const SWAP_WAKE_ROOM_SECONDS = 60;
+// A swap's wake's room beyond the map's wait: in its floor, and before it the end of its capacity retries (controller-core.mjs).
+export const SWAP_WAKE_ROOM_SECONDS = 60;
 // The workload's backends' kinds, by the names AWS gives its types.
 const TYPE_NAMES = { vm: 'instance', mig: 'asg', k8s: 'k8s', cloudsql: 'databases' };
 // What a manager-less configuration stored before `inherits`: it inherits what equals these.

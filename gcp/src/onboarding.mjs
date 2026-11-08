@@ -20,7 +20,8 @@
 // AWS's `settings` action, with what Google Cloud fixes (levels.mjs); a Workload shows each setting resolved and where it comes from.
 import { resolveHibernation, settingsProblems, workloadSettingsProblems } from '../../lambda/src/lib/hibernation.mjs';
 import { nextEvents, normalizeSchedule, resolveJoin, scheduleProblems } from '../../lambda/src/lib/schedule.mjs';
-import { describedRules, RULE_KEYS, SCALAR_KEYS } from '../../lambda/src/lib/settings-levels.mjs';
+import { describedRules, SCALAR_KEYS } from '../../lambda/src/lib/settings-levels.mjs';
+import { mergedRouterSettings, resolvedSettings, routerSettingsView, withSettings, writtenRouterView } from '../../lambda/src/lib/settings-writes.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { companionRead, INSTANCE_NAME, isCompanion, statusOf } from './cloudsql.mjs';
 import { groupOf, PauseRefused } from './controller-core.mjs';
@@ -165,15 +166,6 @@ function hibernationOf(cfg, router) {
   };
 }
 
-// Each setting resolved, where it comes from, and the type, as AWS's settings answer gives them.
-const resolvedOf = (effective) => ({ settings: Object.fromEntries(SCALAR_KEYS.map((key) => [key, effective[key]])), settingsFrom: effective.settingsFrom, type: effective.type });
-
-// The router's record as people read it (AWS's routerSettingsView): all null when unset, its time ISO.
-const routerSettingsView = (record) => ({
-  hibernate: record?.hibernate ?? null, joinMinutes: record?.joinMinutes ?? null, ...(record?.defaults ? { defaults: record.defaults } : {}),
-  by: record?.by ?? null, at: record ? isoOf(record.at) : null,
-});
-
 function failureOf(run) {
   if (!run?.failure) return null;
   try {
@@ -195,7 +187,7 @@ function workloadOf(cfg, run, paused, router) {
   const failure = failureOf(run);
   const beatAt = run ? beatOf(run) : undefined;
   const effective = effectiveOf(cfg, { run, router });
-  const { settings, settingsFrom, type } = resolvedOf(effective);
+  const { settings, settingsFrom, type } = resolvedSettings(effective);
   return {
     id: cfg.workloadId,
     state: run?.state ?? 'UNKNOWN',
@@ -824,67 +816,41 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     return current(cfg);
   }
 
-  // AWS's settings action for a workload (lambda/src/lib/controller-core.mjs, `setSettings`): `hibernate` (null removes it), the
-  // settings of the levels (null gives the key back to the levels, its value without any level written for a router before G5), the
-  // rules (null: none) and the type (null: inherited). `by` says who sets them, as a schedule's. A refusal names every problem, with
-  // nothing written; a workload offboarded meanwhile is a 404, never written back.
+  // AWS's settings action for a workload, its write shared (settings-writes.mjs): `hibernate` (null removes it), the settings of the
+  // levels (null gives the key back to the levels, its value without any level written for a router before G5), the rules (null: none)
+  // and the type (null: inherited). Every workload here is the CLI's: no Terraform writes one, so none is refused as on AWS. `by` says
+  // who sets them, as a schedule's. A refusal names every problem, with nothing written; a workload offboarded meanwhile is a 404,
+  // never written back.
   async function setSettings(id, { by, ...settings }) {
     const cfg = await find(id);
     const problems = workloadProblems(settings, cfg);
     if (problems.length) throw refusedSettings(problems);
-    const next = { ...cfg };
-    if (Object.hasOwn(settings, 'hibernate')) {
-      if (typeof settings.hibernate === 'boolean') next.hibernate = settings.hibernate;
-      else delete next.hibernate;
-    }
-    const scalars = SCALAR_KEYS.filter((key) => Object.hasOwn(settings, key));
-    if (scalars.length) {
-      // A configuration from before `inherits` is read as effectiveOf reads it (design section 4.1).
-      const inherits = new Set(inheritsOf(cfg));
-      const builtIn = builtInsOf(cfg);
-      for (const key of scalars) {
-        if (settings[key] === null) {
-          next[key] = builtIn[key];
-          inherits.add(key);
-        } else {
-          next[key] = settings[key];
-          inherits.delete(key);
-        }
-      }
-      next.inherits = SCALAR_KEYS.filter((key) => inherits.has(key));
-    }
-    for (const key of RULE_KEYS) if (Object.hasOwn(settings, key)) next[key] = settings[key] ?? [];
-    if (Object.hasOwn(settings, 'type')) {
-      if (settings.type === null) delete next.type;
-      else next.type = settings.type;
-    }
+    // A configuration from before `inherits` is read as effectiveOf reads it (design section 4.1). Once it has `inherits`, it is the
+    // CLI's, as an onboarding writes it.
+    const next = withSettings(cfg, settings, { inheritsOf, builtIns: builtInsOf });
+    if (Object.hasOwn(next, 'inherits')) next.source ??= 'cli';
     // The level the answer resolves with, read before the write: a failed read changes nothing.
     const router = await routerLevel();
     if (!(await store.putConfig(id, next, { mustExist: true }))) throw notFound(id);
     log.info('WorkloadSettings', { workloadId: id, keys: Object.keys(settings), hibernate: next.hibernate ?? null, previous: cfg.hibernate ?? null, by: by ?? 'unknown' });
-    return { level: 'workload', settings: { ...settings }, hibernation: hibernationOf(next, router), resolved: resolvedOf(effectiveOf(next, { router })) };
+    return { level: 'workload', settings: { ...settings }, hibernation: hibernationOf(next, router), resolved: resolvedSettings(effectiveOf(next, { router })) };
   }
 
   const routerSettings = async () => ({ level: 'router', settings: routerSettingsView(await routerLevel()) });
 
-  // AWS's settings action without a workload: `hibernate`, `joinMinutes` and the `defaults` of the router's workloads, merged with
-  // what it holds (what is not sent stays, a key of the defaults sent null goes, `defaults: null` clears them); none left, no record.
-  // An empty body reads. `by` says who sets them, as a schedule's. A refusal names every problem, with nothing written.
+  // AWS's settings action without a workload, its merge shared (settings-writes.mjs): `hibernate`, `joinMinutes` and the `defaults` of
+  // the router's workloads, merged with what it holds; none left, no record. An empty body reads. `by` says who sets them, as a
+  // schedule's. A refusal names every problem, with nothing written.
   async function setRouterSettings({ by, ...settings }) {
     const problems = routerProblems(settings);
     if (problems.length) throw refusedSettings(problems);
     // A record that cannot be read is not written over.
     const stored = await routerLevel();
     if (!Object.keys(settings).length) return { level: 'router', settings: routerSettingsView(stored) };
-    const sent = (name) => (Object.hasOwn(settings, name) ? settings[name] : stored?.[name] ?? null);
-    const merged = !Object.hasOwn(settings, 'defaults') ? stored?.defaults ?? null
-      : settings.defaults === null ? null
-        : Object.fromEntries(Object.entries({ ...stored?.defaults, ...settings.defaults }).filter(([, value]) => value !== null));
-    const defaults = merged && Object.keys(merged).length ? merged : null;
-    const record = { hibernate: sent('hibernate'), joinMinutes: sent('joinMinutes'), defaults, by: by ?? 'unknown', at: now() };
+    const record = mergedRouterSettings(stored, settings, { by: by ?? 'unknown', at: now() });
     await store.putRouterSettings(record);
-    log.info('RouterSettings', { hibernate: record.hibernate, joinMinutes: record.joinMinutes, defaults: defaults ? Object.keys(defaults) : [], by: record.by });
-    return { level: 'router', settings: routerSettingsView(record.hibernate === null && record.joinMinutes === null && !defaults ? null : record) };
+    log.info('RouterSettings', { hibernate: record.hibernate, joinMinutes: record.joinMinutes, defaults: record.defaults ? Object.keys(record.defaults) : [], by: record.by });
+    return { level: 'router', settings: writtenRouterView(record) };
   }
 
   return {

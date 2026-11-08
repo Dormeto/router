@@ -2283,23 +2283,27 @@ test('PUT settings on a workload offboarded: a 404, nothing written, also when i
   assert.equal(store.configs.has('demo'), false);
 });
 
-test('a configuration from before G5 (no inherits, no source): shown without error, its wake timeout its own; a PUT keeps that reading for the keys not sent', async () => {
+test('a configuration from before G5 (no inherits, no source): shown without error, its wake timeout its own; a PUT, never refused as Terraform\'s on AWS, keeps that reading for the keys not sent and makes it the CLI\'s', async () => {
   const { store, onboarding } = setup(regional);
   const legacy = {
     workloadId: 'demo', urlMap: 'lb', backendService: 'app', wakerBackendService: WAKER, hosts: ['demo.example.com'], lb: REGIONAL_LB,
     backends: [{ kind: 'vm', location: ZONE, name: 'vm-a', id: '1001' }], idleMinutes: 15, failedRetrySeconds: 60, pollSeconds: 3, wakeTimeoutSeconds: 700, onboardedAt: '2026-11-01T00:00:00.000Z',
   };
-  store.configs.set('demo', legacy);
+  store.configs.set('demo', structuredClone(legacy));
   store.router.settings = { defaults: { idleMinutes: 5, wakeTimeoutSeconds: 900 }, by: 'ops', at: 1 };
   const shown = await onboarding.show('demo');
   assert.deepEqual([shown.settings.idleMinutes, shown.settingsFrom.idleMinutes], [5, 'router']);
   assert.deepEqual([shown.settings.wakeTimeoutSeconds, shown.settingsFrom.wakeTimeoutSeconds], [700, 'workload']);
   assert.deepEqual([shown.settings.wakeMode, shown.settingsFrom.wakeMode], ['any', 'default']);
+  // Rules only: no inherits written, the configuration stays as it was read.
+  await onboarding.setSettings('demo', { noWakeRules: [NO_WAKE] });
+  assert.deepEqual(store.configs.get('demo'), { ...legacy, noWakeRules: [NO_WAKE] });
   await onboarding.setSettings('demo', { wakeMode: 'browser' });
   const config = store.configs.get('demo');
   assert.deepEqual(config.inherits, ['idleMinutes', 'waitSeconds', 'drainSeconds', 'maxHolders', 'failedRetrySeconds']);
   assert.equal(config.wakeTimeoutSeconds, 700);
   assert.equal(config.wakeMode, 'browser');
+  assert.equal(config.source, 'cli');
 });
 
 test('show: the rules of every level, described, the most general first', async () => {

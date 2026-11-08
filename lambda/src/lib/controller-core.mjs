@@ -25,7 +25,8 @@ import { healthOf, lambdaMetrics, queueDepths } from './health.mjs';
 import { cleanPage, pageWarnings, resolvePage, validatePage, withWake } from './page-settings.mjs';
 import { HIBERNATION_MAX_DAYS, hibernationDue, resolveHibernation, settingsProblems, workloadSettingsProblems } from './hibernation.mjs';
 import { joinLevels } from './manager-settings.mjs';
-import { BUILT_IN, RULE_KEYS, SCALAR_KEYS, TYPE_BUILT_IN, builtInTypeOf, describedRules, effectiveConfig, ownSettings } from './settings-levels.mjs';
+import { describedRules, effectiveConfig } from './settings-levels.mjs';
+import { mergedRouterSettings, resolvedSettings, routerSettingsView, withSettings, writtenRouterView } from './settings-writes.mjs';
 import {
   backendKey, backendStatuses, isCompanion, resolveBackends, resumeBackends, sleepBackends, startCompanions, stopCompanions, toRecord, wakeBackends,
 } from './backends.mjs';
@@ -944,47 +945,17 @@ export function createController({
     const problems = cfg ? workloadSettingsProblems(settings) : settingsProblems(settings);
     if (problems.length) return { problems };
     if (!cfg) {
-      // What is not sent stays: setting one never erases the other, and a record that cannot be read is not written over.
+      // What is not sent stays (settings-writes.mjs), and a record that cannot be read is not written over.
       const stored = await store.getRouterSettings();
       if (!Object.keys(settings).length) return { level: 'router', settings: routerSettingsView(stored) };
-      const sent = (name) => (Object.hasOwn(settings, name) ? settings[name] : stored?.[name] ?? null);
-      const merged = !Object.hasOwn(settings, 'defaults') ? stored?.defaults ?? null
-        : settings.defaults === null ? null
-          : Object.fromEntries(Object.entries({ ...stored?.defaults, ...settings.defaults }).filter(([, value]) => value !== null));
-      const defaults = merged && Object.keys(merged).length ? merged : null;
       // None set deletes the record.
-      const record = { hibernate: sent('hibernate'), joinMinutes: sent('joinMinutes'), defaults, by, at: now() };
+      const record = mergedRouterSettings(stored, settings, { by, at: now() });
       await store.putRouterSettings(record);
-      log.info('RouterSettings', { hibernate: record.hibernate, joinMinutes: record.joinMinutes, defaults: defaults ? Object.keys(defaults) : [], by });
-      return { level: 'router', settings: routerSettingsView(record.hibernate === null && record.joinMinutes === null && !defaults ? null : record) };
+      log.info('RouterSettings', { hibernate: record.hibernate, joinMinutes: record.joinMinutes, defaults: record.defaults ? Object.keys(record.defaults) : [], by });
+      return { level: 'router', settings: writtenRouterView(record) };
     }
-    const next = { ...cfg };
-    if (Object.hasOwn(settings, 'hibernate')) {
-      if (typeof settings.hibernate === 'boolean') next.hibernate = settings.hibernate;
-      else delete next.hibernate;
-    }
-    const scalars = SCALAR_KEYS.filter((key) => Object.hasOwn(settings, key));
-    if (scalars.length) {
-      // A configuration from before `inherits` inherits what equals the onboarder's old defaults (design §7).
-      const own = ownSettings(cfg);
-      const inherits = new Set(Array.isArray(cfg.inherits) ? cfg.inherits : SCALAR_KEYS.filter((key) => !(key in own)));
-      const typeName = builtInTypeOf(cfg, null);
-      for (const key of scalars) {
-        if (settings[key] === null) {
-          next[key] = TYPE_BUILT_IN[typeName]?.[key] ?? BUILT_IN[key];
-          inherits.add(key);
-        } else {
-          next[key] = settings[key];
-          inherits.delete(key);
-        }
-      }
-      next.inherits = SCALAR_KEYS.filter((key) => inherits.has(key));
-    }
-    for (const key of RULE_KEYS) if (Object.hasOwn(settings, key)) next[key] = settings[key] ?? [];
-    if (Object.hasOwn(settings, 'type')) {
-      if (settings.type === null) delete next.type;
-      else next.type = settings.type;
-    }
+    // A configuration from before `inherits` inherits what equals the onboarder's old defaults (design §7).
+    const next = withSettings(cfg, settings);
     // The levels the answer resolves with, read before the write: a failed read changes nothing.
     const levels = await hibernationLevels();
     // Conditional: a change racing an offboarding never writes the workload back.
@@ -999,7 +970,7 @@ export function createController({
     return {
       level: 'workload', settings: { ...settings },
       hibernation: await hibernationView(next, run, instanceIds, levels),
-      resolved: { settings: Object.fromEntries(SCALAR_KEYS.map((key) => [key, resolved[key]])), settingsFrom: resolved.settingsFrom, type: resolved.type },
+      resolved: resolvedSettings(resolved),
     };
   }
 
@@ -1484,11 +1455,6 @@ export function createController({
   // --- Router: identity, configuration with its source, workloads, pauses, health ------------------------------------
 
   const TERRAFORM = 'terraform';
-  // The router's settings record as people read it (its time ISO): all null when unset.
-  const routerSettingsView = (record) => ({
-    hibernate: record?.hibernate ?? null, joinMinutes: record?.joinMinutes ?? null, ...(record?.defaults ? { defaults: record.defaults } : {}),
-    by: record?.by ?? null, at: record ? iso(record.at) : null,
-  });
   async function measure(t) {
     const [metrics, queues, limit] = await Promise.all([
       lambdaMetrics(cloudwatch, router.functions ?? {}, t).catch((err) => ({ error: err.message })),

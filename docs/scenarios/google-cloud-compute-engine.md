@@ -398,7 +398,9 @@ earlier runs), with one answer `503`.
   VM is stopping yet (a new revision of the controller, for example), visitors get the waiting page. The nap stops
   beating, and the check calls it stuck within minutes; the workload is then `FAILED`, and the check's wake brings it
   back. A nap from before the beat, or one that beats on, is called stuck after 22 minutes under a swap. Once a VM is
-  stopping, it is 35 minutes. No nap was killed so in the acceptance: this is what the code does.
+  stopping, it is 35 minutes. The acceptance of 2026-11-08 ran a regional nap through an upgrade to a new revision. Cloud Run let the in-flight request
+  finish on the old revision, and the workload slept 165 s after the nap was asked. A nap that does die is caught by its
+  heartbeat.
 - **A request with a body gets the page under a swap**, a `503`, for any method: API clients should read a `503` as
   asleep, send `POST /_dormeto/wake`, then retry their request.
 - **Ten naps on one regional URL map.** A regional map's update took 85 s (measured). The naps of one map no longer fail

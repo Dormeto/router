@@ -224,7 +224,7 @@ test('the Compute Engine page: the swap of regional and classic load balancers, 
   assert.match(page, /Steady traffic, 45 requests in 15 minutes, kept each kind awake through the router with a 5-minute idle window/);
   assert.match(page, /terraform plan showed no change with a regional workload onboarded/);
   assert.match(page, /Ten naps asked at once on one map were all asleep, none failed, within 509 s global and 283 s regional \(the acceptance of 2026-11-08\)/);
-  assert.match(page, /No nap was killed so in the acceptance/);
+  assert.match(page, /a regional nap through an upgrade to a new revision\. Cloud Run let the in-flight request finish on the old revision, and the workload slept 165 s after the nap was asked\. A nap that does die is caught by its heartbeat/);
   assert.match(page, /ignore_changes = \[default_service, default_route_action, host_rule, path_matcher\]/);
   assert.match(page, /answered that load balancer's plain-HTTP requests with a 302 to https:\/\/ for about 40 s/);
   assert.match(page, /A visitor at a nap's start waits up to 2 × SWAP_WAIT with the VMs running/);

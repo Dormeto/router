@@ -187,7 +187,8 @@
       ],
       "logView": [
         "logging.views.create",
-        "logging.views.get"
+        "logging.views.get",
+        "logging.views.update"
       ]
     },
     "install-router": {
@@ -300,7 +301,9 @@
         "compute.backendServices.get",
         "compute.backendServices.update",
         "compute.regionBackendServices.get",
-        "compute.regionBackendServices.update"
+        "compute.regionBackendServices.update",
+        "compute.globalOperations.get",
+        "compute.regionOperations.get"
       ]
     },
     "offboard": {
@@ -319,7 +322,9 @@
         "compute.backendServices.get",
         "compute.backendServices.update",
         "compute.regionBackendServices.get",
-        "compute.regionBackendServices.update"
+        "compute.regionBackendServices.update",
+        "compute.globalOperations.get",
+        "compute.regionOperations.get"
       ]
     }
   },

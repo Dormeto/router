@@ -235,9 +235,14 @@ test('the operator\'s permissions of spec section 4, step by step', async () => 
 // --request-logs and set back by its offboarding, with the operator's rights, not the router's (the design's section 5).
 test('the log view\'s steps and the request logs\' steps, exactly', async () => {
   const { operator: o, roles } = await load();
-  assert.deepEqual(o.install.logView, ['logging.views.create', 'logging.views.get']);
+  // update: a later fix of the view's filter, applied to an existing install.
+  assert.deepEqual(o.install.logView, ['logging.views.create', 'logging.views.get', 'logging.views.update']);
   assert.deepEqual(o.uninstall.logView, ['logging.views.get', 'logging.views.delete']);
-  const requestLogs = ['compute.backendServices.get', 'compute.backendServices.update', 'compute.regionBackendServices.get', 'compute.regionBackendServices.update'];
+  // The CLI waits for each operation it starts (WaitCompute): a global service's and a regional one's.
+  const requestLogs = [
+    'compute.backendServices.get', 'compute.backendServices.update', 'compute.regionBackendServices.get', 'compute.regionBackendServices.update',
+    'compute.globalOperations.get', 'compute.regionOperations.get',
+  ];
   assert.deepEqual(o.onboard.requestLogs, requestLogs);
   assert.deepEqual(o.offboard.requestLogs, requestLogs);
   // The router never changes a customer's backend service.

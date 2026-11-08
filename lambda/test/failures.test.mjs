@@ -57,3 +57,19 @@ test('classifies the errors of a cluster: refused rights are permission, an unre
   for (const [error, kind] of cases) assert.equal(classify(error).kind, kind, `${error.status} ${error.reason}`);
   assert.deepEqual(classify(kube(503, 'ServiceUnavailable', 'the server is currently unable to handle the request')), { kind: 'cluster', message: 'the server is currently unable to handle the request' });
 });
+
+// Compute Engine's errors (vision docs/specs/2026-11-08-google-cloud-router-features-design.md, section 6), as a failed operation reads
+// on Google Cloud (gcp/src/google.mjs: each error's code, then its message): a stockout and a pool short of capacity are capacity, the
+// wake's retries; a quota is not.
+test('classifies Compute Engine\'s capacity errors as capacity, POOL_CAPACITY_INSUFFICIENT among them, and its quota as quota', () => {
+  const google = (text) => Object.assign(new Error(`Google: operation start https://compute.googleapis.com/compute/v1/projects/p/zones/europe-west1-b/instances/vm-a: ${text}`), { name: 'GoogleError' });
+  const cases = [
+    ['ZONE_RESOURCE_POOL_EXHAUSTED: The zone \'projects/p/zones/europe-west1-b\' does not have enough resources available to fulfill the request.', 'capacity'],
+    ['ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS: The zone does not have enough resources available to fulfill the request.', 'capacity'],
+    ['REGION_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS: The region does not have enough resources available to fulfill the request.', 'capacity'],
+    ['POOL_CAPACITY_INSUFFICIENT: The request cannot be fulfilled at this time.', 'capacity'],
+    ['QUOTA_EXCEEDED: Quota \'CPUS\' exceeded. Limit: 8.0 in region europe-west1.', 'quota'],
+  ];
+  for (const [text, kind] of cases) assert.equal(classify(google(text)).kind, kind, text);
+  assert.equal(classifyText('POOL_CAPACITY_INSUFFICIENT'), 'capacity');
+});

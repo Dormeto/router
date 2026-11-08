@@ -59,6 +59,7 @@
         "compute.instances.stop",
         "compute.instances.suspend",
         "compute.instances.resume",
+        "compute.instances.setMachineType",
         "compute.instanceGroupManagers.update",
         "compute.instanceGroupManagers.use"
       ]

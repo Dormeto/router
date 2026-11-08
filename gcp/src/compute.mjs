@@ -26,6 +26,8 @@ export const CALLS = {
   getZonalNetworkEndpointGroup: ['compute.networkEndpointGroups.get'],
   listNetworkEndpoints: ['compute.networkEndpointGroups.get'],
   getMachineType: ['compute.machineTypes.get'],
+  // A stopped VM's machine type: a fallback type at a wake, its own back after the next stop.
+  setMachineType: ['compute.instances.setMachineType', 'compute.zoneOperations.get'],
   listForwardingRules: ['compute.globalForwardingRules.list'],
   listTargetHttpProxies: ['compute.targetHttpProxies.list'],
   listTargetHttpsProxies: ['compute.targetHttpsProxies.list'],
@@ -108,6 +110,11 @@ export function createCompute({ google, project, now = Date.now }) {
     getZonalNetworkEndpointGroup: (z, name) => google.request('GET', `${zone(z)}/networkEndpointGroups/${e(name)}`),
     listNetworkEndpoints: (z, name) => listEndpoints(`${zone(z)}/networkEndpointGroups/${e(name)}/listNetworkEndpoints`),
     getMachineType: (z, name) => google.request('GET', `${zone(z)}/machineTypes/${e(name)}`),
+    setMachineType: async (z, name, machineType) => waited(await google.request(
+      'POST',
+      `${zone(z)}/instances/${e(name)}/setMachineType`,
+      { machineType: `zones/${z}/machineTypes/${machineType}` },
+    )),
     listForwardingRules: () => list(`${base}/global/forwardingRules`),
     listAggregatedForwardingRules: () => listAggregated(`${base}/aggregated/forwardingRules`, 'forwardingRules'),
     listTargetHttpProxies: () => list(`${base}/global/targetHttpProxies`),

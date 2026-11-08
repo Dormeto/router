@@ -15,8 +15,8 @@ const BY_NAME = [
 // Texts of Auto Scaling activities, ECS service events and AWS messages without a telling name.
 const BY_TEXT = [
   [/\b(vcpu limit|limit of \d+|quota|limitexceeded)\b/i, 'quota'],
-  // Compute Engine's stockout: ZONE_RESOURCE_POOL_EXHAUSTED (_WITH_DETAILS).
-  [/sufficient .*capacity|no capacity|capacity is unavailable|insufficient.*capacity|unable to place a task|no container instance met|resource_pool_exhausted/i, 'capacity'],
+  // Compute Engine's stockout: ZONE_RESOURCE_POOL_EXHAUSTED (_WITH_DETAILS, and the region's), and a pool short of capacity.
+  [/sufficient .*capacity|no capacity|capacity is unavailable|insufficient.*capacity|unable to place a task|no container instance met|resource_pool_exhausted|pool_capacity_insufficient/i, 'capacity'],
   [/not authorized|unauthorized|access denied|accessdenied/i, 'permission'],
   [/launch template|does not exist|not found|invalid|not supported|unsupported|image id/i, 'configuration'],
   [/timeout|timed out|not available yet/i, 'timeout'],

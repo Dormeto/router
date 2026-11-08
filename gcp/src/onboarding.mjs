@@ -671,6 +671,11 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   // The router level (`router/settings`), null when unset. A read that fails fails the request, as any other read of it.
   const routerLevel = async () => (await store.getRouterSettings()) ?? null;
 
+  // The VMs a wake left on a fallback machine type (`instanceTypes`, the run's: `{ <vm>: { from, to } }`, `from` its own type, `to` the one
+  // it runs on), named in the offboarding's answer: no stop of the router's gives them their own back once it is offboarded (vision
+  // docs/specs/2026-11-08-google-cloud-router-features-design.md, section 6).
+  const onFallback = (run) => (run?.instanceTypes && Object.keys(run.instanceTypes).length ? { instanceTypes: run.instanceTypes } : {});
+
   // Back awake in this request, up to the wake's timeout: the VMs must be up once the policy goes and the CLI unbinds the tag.
   async function awaken(id, run) {
     const wakeId = await core.beginWake(id, run.state, 'offboarding');
@@ -697,7 +702,8 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   // A workload that cannot wake, or whose state is stuck: no wake, and all of Dormeto's goes. The backends stay as they are,
   // and those not up are named. A nap in flight finds its waker backend service gone before it would stop anything, unless
   // it is already stopping them. What it cannot give back is named too, `notGivenBack`, in the operator's words: none, no field, and
-  // the router will not try again. `left` stays what it was for a CLI below this version.
+  // the router will not try again; and the VMs on a fallback machine type, `instanceTypes`. `left` stays what it was for a CLI below
+  // this version.
   async function forceOff(cfg, run) {
     const { workloadId } = cfg;
     const up = await Promise.all(cfg.backends.map((backend) => isUp(backend, workloadId)));
@@ -717,10 +723,11 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     // An owner left at 0: what it ran goes with the run, its record.
     const replicasBefore = (run?.owners ?? []).map((record) => ({ owner: ownerText(record), replicas: record.replicas }));
     log.warn('Offboarded', { workloadId, force: true, left: left.map(backendText), ...(replicasBefore.length ? { replicasBefore } : {}) });
-    return { id: workloadId, left, ...(notGivenBack.length ? { notGivenBack } : {}) };
+    return { id: workloadId, left, ...(notGivenBack.length ? { notGivenBack } : {}), ...onFallback(run) };
   }
 
-  // An offboarding that stops keeps the documents: they name what is left to remove when it runs again.
+  // An offboarding that stops keeps the documents: they name what is left to remove when it runs again. Its answer names the VMs left on
+  // a fallback machine type.
   async function offboard(id, { force = false } = {}) {
     const cfg = await find(id);
     let run = await store.getRun(id);
@@ -735,7 +742,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     await removeFromGoogle(cfg);
     await store.deleteWorkload(id);
     log.info('Offboarded', { workloadId: id });
-    return {};
+    return onFallback(run);
   }
 
   // The Workload as it is now. `router`: the router level, already read.

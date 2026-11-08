@@ -27,6 +27,12 @@
 // where the state is decided, its replicas stand for the VM's status. Scaled to 0, its NEG holds no endpoint and none is healthy: the switch, the idle check and the wake's
 // health are the VMs'. `hibernate` means nothing to it.
 //
+// Capacity (vision docs/specs/2026-11-08-google-cloud-router-features-design.md, section 6), as AWS's (lambda/src/lib/capacity.mjs): every start
+// and resume of a wake refused for capacity is tried again within its deadline, and a VM's start may fall back to the next machine type
+// of the workload's `fallbackInstanceTypes`, given back after the next stop. The run's `instanceTypes` (`{ <vm>: { from, to } }`, AWS's
+// field) is the VMs on a type not their own, `from` their own: written before each change, it is the only record, as a label would need
+// one more permission.
+//
 // What the run adds to AWS's: `stopped`, `suspended` (the VMs a nap acted on, names), `autoscalers` (`[{ kind, location,
 // name (the autoscaler's), mode }]`, what the wake gives back), `owners` (k8sRecord's: what a nap read of its k8s backends, replicas and KEDA, for
 // the wake), `lastWake` (`{ durationMs }`), `recentWakes` (AWS's: the last 10 wakes' durations, for the waiting page's progress bar), `scheduleApplied` (the last nap or awake window's occurrence applied), `napAborted`
@@ -46,7 +52,8 @@
 // absent without DMT_LOG_VIEW); otherwise, and when they cannot be read or are empty, Monitoring's request count. The run says what
 // the last check that read log entries, or counted any request, read (`idleReads`).
 import { randomUUID } from 'node:crypto';
-import { failedSpec, failureError } from '../../lambda/src/lib/failures.mjs';
+import { retryCapacity } from '../../lambda/src/lib/capacity.mjs';
+import { classify, failedSpec, failureError } from '../../lambda/src/lib/failures.mjs';
 import { cacheFavicon, FAVICON_BUDGET_MS, hostOfRules } from '../../lambda/src/lib/favicon.mjs';
 import { resolveHibernation } from '../../lambda/src/lib/hibernation.mjs';
 import { createListCache } from '../../lambda/src/lib/list-cache.mjs';
@@ -132,6 +139,12 @@ const COMPANION_DRIFT = {
 };
 // What the shared classification cannot read in a Google error.
 const KIND_OF_CODE = { 403: 'permission', 429: 'throttled' };
+// A machine type's change refused for the permission: a router installed before it was in its role.
+const SET_TYPE_REFUSED = 'the router\'s role lacks compute.instances.setMachineType: run dormeto gcp install again';
+// Google refused the change itself, its operation's error included: nothing changed.
+const nothingChanged = (err) => err?.code >= 400 && err.code < 500;
+// A machine type's change refused, in the words that say what to do.
+const typeRefusal = (err) => (err?.code === 403 ? failureError('permission', SET_TYPE_REFUSED) : err);
 
 const iso = (ms) => new Date(ms).toISOString();
 // The heartbeat's timer: Node's, which holds no process open. The answer stops it.
@@ -280,11 +293,13 @@ export function createController({
 
   // --- The backends --------------------------------------------------------------------------------------------------
 
-  // A backend's VMs: `{ name, zone, status, url?, error? }`, a managed group's with its URL and its last failure.
+  // A backend's VMs: `{ name, zone, status, type?, url?, error? }`, a VM's with its machine type's name, a managed group's with its URL and
+  // its last failure.
   async function vmsOf(backend) {
     if (isPods(backend)) return [await ownerAsVm(clients, backend)];
     if (backend.kind !== 'mig') {
-      return [{ name: backend.name, zone: backend.location, status: (await compute.getInstance(backend.location, backend.name)).status }];
+      const { status, machineType } = await compute.getInstance(backend.location, backend.name);
+      return [{ name: backend.name, zone: backend.location, status, ...(machineType ? { type: nameOf(machineType) } : {}) }];
     }
     return (await compute.listManagedInstances(groupOf(backend))).map((m) => ({
       name: nameOf(m.instance),
@@ -371,18 +386,121 @@ export function createController({
     return answers.flatMap((a) => a.healthStatus ?? []).filter((h) => h.healthState === 'HEALTHY').length;
   }
 
+  // --- Machine types (vision docs/specs/2026-11-08-google-cloud-router-features-design.md, section 6) ----------------------------------
+
+  // What a wake does of its VMs' machine types: `recorded`, the run's `instanceTypes` as this wake changes it, written on the run before each
+  // change (`record`), so that a request that dies leaves the next stop what to give back; `fallbacks`, this wake's (`fellBack`), for its
+  // AWAKE event. `retryUntil`: when its retries end.
+  function wakeTypes(cfg, run, wakeId, retryUntil) {
+    const { workloadId } = cfg;
+    const recorded = { ...(run.instanceTypes ?? {}) };
+    const fallbacks = {};
+    // One write at a time, each of the record as it is then: VMs fall back at once, and the last write holds them all.
+    let writes = Promise.resolve();
+    const record = (name, change) => {
+      if (change) recorded[name] = change;
+      else delete recorded[name];
+      writes = writes.catch(() => {}).then(async () => {
+        const map = { ...recorded };
+        const written = await transition(workloadId, { cond: { state: STATES.WAKING, wakeId }, ...(Object.keys(map).length ? { set: { instanceTypes: map } } : { remove: ['instanceTypes'] }) });
+        if (!written) throw new Error(`${name}: its machine type was not recorded: the wake is no longer the current one`);
+      });
+      return writes;
+    };
+    const fellBack = (name, change) => {
+      fallbacks[name] = change;
+      log.warn('InstanceTypeFallback', { workloadId, wakeId, instance: name, ...change });
+    };
+    const list = Array.isArray(cfg.fallbackInstanceTypes) ? cfg.fallbackInstanceTypes : [];
+    return { workloadId, list, recorded, fallbacks, record, fellBack, timing: { now, sleep, deadline: retryUntil } };
+  }
+
+  // A stopped VM's start, in AWS's order (capacity.mjs's startWithCapacity): its own type first, given back first when a stop could not;
+  // on a capacity error the next type of [its own, ...the list], set on it and started again at once; past the list, its last type
+  // under the retries' waits, its own tried again only at the next wake. Its own type: the run's record, else the type it has.
+  async function startVm(backend, vm, types) {
+    const { location: zone, name } = backend;
+    const start = () => act(backend, 'start', [vm]);
+    let { type } = vm;
+    const own = types.recorded[name]?.from ?? type;
+    if (type !== own) {
+      try {
+        await compute.setMachineType(zone, name, own).catch((err) => { throw typeRefusal(err); });
+        type = own;
+      } catch (err) {
+        log.warn('InstanceTypeNotReverted', { workloadId: types.workloadId, instance: name, error: err.message });
+      }
+    }
+    if (type === own && types.recorded[name]) await types.record(name, null);
+    if (!types.list.length || !own) return retryCapacity(start, types.timing);
+    const order = [...new Set([own, ...types.list])];
+    return retryCapacity(async () => {
+      for (;;) {
+        try {
+          return await start();
+        } catch (err) {
+          const next = classify(err).kind === 'capacity' && order[order.indexOf(type) + 1];
+          if (!next) throw err;
+          const before = types.recorded[name];
+          const change = { from: own, to: next };
+          await types.record(name, change);
+          try {
+            await compute.setMachineType(zone, name, next);
+          } catch (refusal) {
+            // Google refused it: the record goes back to what is. That write lost, the record names a type the VM is not on, and the
+            // next stop, which reads the VM's own, changes nothing.
+            if (nothingChanged(refusal)) await types.record(name, before).catch(() => {});
+            throw typeRefusal(refusal);
+          }
+          type = next;
+          types.fellBack(name, change);
+        }
+      }
+    }, types.timing);
+  }
+
+  // After a stop (AWS's revertInstanceTypes): each VM the run says is on a fallback type gets its own back, once stopped. One that cannot
+  // (`InstanceTypeNotReverted`), or not stopped, stays on the run, for the next try. The run's change: none when it records none.
+  async function revertTypes(cfg, recorded) {
+    if (!recorded || !Object.keys(recorded).length) return { set: {}, remove: [] };
+    const kept = {};
+    await each(Object.entries(recorded), async ([name, change]) => {
+      try {
+        const backend = cfg.backends.find((b) => b.kind === 'vm' && b.name === name);
+        if (!backend) throw new Error(`${name} is no VM of the workload`);
+        const vm = await compute.getInstance(backend.location, name);
+        if (!STOPPED.has(vm.status)) {
+          kept[name] = change;
+          return;
+        }
+        if (nameOf(vm.machineType) !== change.from) await compute.setMachineType(backend.location, name, change.from).catch((err) => { throw typeRefusal(err); });
+      } catch (err) {
+        log.warn('InstanceTypeNotReverted', { workloadId: cfg.workloadId, instance: name, error: err.message });
+        kept[name] = change;
+      }
+    });
+    return Object.keys(kept).length ? { set: { instanceTypes: kept }, remove: [] } : { set: {}, remove: ['instanceTypes'] };
+  }
+
+  // --- The wake's backends -------------------------------------------------------------------------------------------
+
   // A VM still going down is waited for (a wake right after a stop); the others are read live, not from the nap's record:
-  // after 60 days Compute Engine turns a suspended VM into a stopped one. An owner is read live too.
-  async function wakeBackend(backend, deadline, run) {
+  // after 60 days Compute Engine turns a suspended VM into a stopped one. An owner is read live too. A wake's machine types (`types`,
+  // wakeTypes): its starts and resumes refused for capacity tried again, a VM's start on a fallback type; without, a check's: one try.
+  // A suspended VM resumes on its type: Google changes none while suspended.
+  async function wakeBackend(backend, deadline, run, types) {
     if (isPods(backend)) {
       await wakeOwner(clients, backend, recordOf(run.owners, backend));
       return;
     }
+    const retried = (action) => (types ? retryCapacity(action, types.timing) : action());
     for (;;) {
       const vms = await vmsOf(backend);
       if (!vms.some((vm) => GOING.has(vm.status))) {
-        await act(backend, 'start', vms.filter((vm) => STOPPED.has(vm.status)));
-        await act(backend, 'resume', vms.filter((vm) => vm.status === 'SUSPENDED'));
+        const stopped = vms.filter((vm) => STOPPED.has(vm.status));
+        if (types && backend.kind === 'vm' && stopped.length) await startVm(backend, stopped[0], types);
+        else await retried(() => act(backend, 'start', stopped));
+        await retried(() => act(backend, 'resume', vms.filter((vm) => vm.status === 'SUSPENDED')));
         return;
       }
       if (now() >= deadline) throw failureError('timeout', `${backend.name}: still going down when the wake timed out`);
@@ -397,9 +515,9 @@ export function createController({
   };
 
   // The autoscalers get their modes back whatever a VM's start says.
-  async function wakeBackends(cfg, run, deadline) {
+  async function wakeBackends(cfg, run, deadline, types) {
     try {
-      await each(primariesOf(cfg), (backend) => wakeBackend(backend, deadline, run));
+      await each(primariesOf(cfg), (backend) => wakeBackend(backend, deadline, run, types));
     } finally {
       await giveBackAutoscalers(run);
     }
@@ -438,14 +556,15 @@ export function createController({
     }
   }
 
-  async function sleepBackend(backend, hibernate, deadline, owners) {
+  // `onFallback`: the VMs on a fallback type, stopped, never suspended, so that they get their own type back (AWS's rule).
+  async function sleepBackend(backend, hibernate, deadline, owners, onFallback) {
     if (isPods(backend)) {
       await sleepOwner(clients, backend, recordOf(owners, backend), { now, sleep, deadline });
       return { stopped: [ownerText(backend)], suspended: [] };
     }
     // Only what runs: Google refuses a request naming a VM being created or started, and the whole nap with it.
     const vms = (await vmsOf(backend)).filter((vm) => vm.status === 'RUNNING');
-    const fits = hibernate ? await Promise.all(vms.map(canSuspend)) : vms.map(() => false);
+    const fits = hibernate ? await Promise.all(vms.map(async (vm) => !onFallback.includes(vm.name) && canSuspend(vm))) : vms.map(() => false);
     let suspended = vms.filter((_, i) => fits[i]);
     let stopped = vms.filter((_, i) => !fits[i]);
     try {
@@ -483,13 +602,13 @@ export function createController({
   // Down when this returns, the companions asked to go: an operation's end says little (a managed group's VMs go after it, and its
   // wait may run out before), so the VMs are read until they are. `stillGoing()`: whether the run is still the nap's or the release's:
   // a wake taken over, or asked and kept, needs its database, which is then left alone.
-  async function putToSleep(cfg, { autoscalers, owners, router }, latest, stillGoing) {
+  async function putToSleep(cfg, { autoscalers, owners, router, instanceTypes }, latest, stillGoing) {
     const deadline = Math.min(now() + STOP_TIMEOUT_MS, latest);
     await each(autoscalers, (recorded) => setAutoscaler(recorded, 'OFF'));
     // The workload's own, else none with fallback machine types (the type a VM wakes on may not suspend), else the router's. Its
     // level unreadable, a plain stop, as on AWS: the built-in true could suspend against the router's "off".
     const hibernate = !cfg.levelsUnreadable && resolveHibernation({ workload: cfg.hibernate, fallbackTypes: cfg.fallbackInstanceTypes, router: router?.hibernate }).hibernate;
-    const done = await each(primariesOf(cfg), (backend) => sleepBackend(backend, hibernate, deadline, owners));
+    const done = await each(primariesOf(cfg), (backend) => sleepBackend(backend, hibernate, deadline, owners, Object.keys(instanceTypes ?? {})));
     for (;;) {
       const up = (await allVms(cfg)).filter((vm) => !GONE.has(vm.status));
       if (!up.length) break;
@@ -556,6 +675,7 @@ export function createController({
       const current = await store.getRun(workloadId);
       return current?.state === STATES.WAKING && current.wakeId === wakeId;
     };
+    let types;
     let saidUnread = false;
     const unread = (err) => {
       if (saidUnread) return;
@@ -571,8 +691,10 @@ export function createController({
         if (!(await isCurrent())) return superseded();
       }
       let givenBack = true;
+      // Under a swap the retries end in time for the map's change: a start later than that could not unswap before the deadline.
+      types = wakeTypes(cfg, run, wakeId, deadline - (sw.kind === 'swap' ? sw.waitMs : 0));
       try {
-        await wakeBackends(cfg, run, deadline);
+        await wakeBackends(cfg, run, deadline, types);
       } catch (err) {
         // Under a swap a wake is the only way out of FAILED, and visitors stay at the waker until it ends: a backend that cannot
         // start does not keep them from another that serves. The modes as on an external wake: a record stays until given back.
@@ -599,12 +721,14 @@ export function createController({
         if (now() >= deadline) throw failureError('timeout', 'a VM is healthy, but the wake timed out while the URL map\'s change spread');
       }
       const durationMs = now() - since;
+      const { fallbacks } = types;
       const awake = await transition(workloadId, {
         cond: { state: STATES.WAKING, wakeId },
         // recentWakes, as AWS's: only a wake that ended here counts, for the waiting page's typical time.
         set: { state: STATES.AWAKE, awakeSince: now(), lastWake: { durationMs }, recentWakes: withWake(run.recentWakes, durationMs) },
         remove: ['pendingWake', 'stopped', 'suspended', ...(givenBack ? ['autoscalers', 'owners'] : []), 'failure', 'consecutiveFailures', 'failedAt'],
-        event: { wakeId, durationMs },
+        // The machine types this wake fell back to, as AWS's.
+        event: { wakeId, durationMs, ...(Object.keys(fallbacks).length ? { fallbacks } : {}) },
       });
       if (!awake) return superseded();
       log.info('WakeCompleted', { workloadId, wakeId, durationMs });
@@ -854,6 +978,7 @@ export function createController({
       return { state: STATES.AWAKE, aborted: true, ...(error ? { error } : {}) };
     };
     let slept;
+    let types;
     try {
       // Before the first write as well as after the wait: under a swap an abort after it would hold visitors at the waker for two
       // waits, at each idle period until an offboarding.
@@ -899,10 +1024,12 @@ export function createController({
       }))) {
         return await giveUp(paused ? 'paused' : 'pending-wake', 'info', paused ? { reason: 'paused' } : {});
       }
-      slept = await putToSleep(cfg, { autoscalers, owners, router }, latest, async () => {
+      slept = await putToSleep(cfg, { autoscalers, owners, router, instanceTypes: napping.instanceTypes }, latest, async () => {
         const current = await store.getRun(workloadId);
         return current?.state === STATES.NAPPING && !current.pendingWake;
       });
+      // A fallback machine type is for one wake only (AWS's, FinOps): stopped, a VM gets its own type back.
+      types = await revertTypes(cfg, napping.instanceTypes);
     } catch (err) {
       log.error('NapFailed', { workloadId, error: err.message });
       const at = now();
@@ -919,8 +1046,8 @@ export function createController({
     }
     const asleep = await transition(workloadId, {
       cond: { state: STATES.NAPPING, pendingWake: false },
-      set: { state: STATES.ASLEEP, ...slept },
-      remove: ['stopping'],
+      set: { state: STATES.ASLEEP, ...slept, ...types.set },
+      remove: ['stopping', ...types.remove],
       event: slept,
     });
     if (asleep) {
@@ -932,8 +1059,8 @@ export function createController({
     const wakeId = newId();
     const waking = await transition(workloadId, {
       cond: { state: STATES.NAPPING },
-      set: { state: STATES.WAKING, wakeId, wakeStartedAt: now() },
-      remove: ['stopping', 'pendingWake'],
+      set: { state: STATES.WAKING, wakeId, wakeStartedAt: now(), ...types.set },
+      remove: ['stopping', 'pendingWake', ...types.remove],
       increment: ['wakeCount'],
       cause: 'pending-wake',
     });
@@ -973,8 +1100,11 @@ export function createController({
       const owners = await ownersToRecord(cfg, run);
       // A wake asked meanwhile takes over.
       if (!(await transition(workloadId, { cond: { state: STATES.FAILED }, set: { autoscalers, ...(owners.length ? { owners } : {}) } }))) return { state: 'SUPERSEDED' };
-      const slept = await putToSleep(cfg, { autoscalers, owners, router }, latest, async () => (await store.getRun(workloadId))?.state === STATES.FAILED);
-      const asleep = await transition(workloadId, { cond: { state: STATES.FAILED }, set: { state: STATES.ASLEEP, ...slept }, cause: 'failed-released', event: slept });
+      const slept = await putToSleep(cfg, { autoscalers, owners, router, instanceTypes: run.instanceTypes }, latest, async () => (await store.getRun(workloadId))?.state === STATES.FAILED);
+      const types = await revertTypes(cfg, run.instanceTypes);
+      const asleep = await transition(workloadId, {
+        cond: { state: STATES.FAILED }, set: { state: STATES.ASLEEP, ...slept, ...types.set }, remove: types.remove, cause: 'failed-released', event: slept,
+      });
       if (!asleep) return { state: 'SUPERSEDED' };
       log.warn('FailedReleased', { workloadId, ...slept });
       return { state: STATES.ASLEEP };

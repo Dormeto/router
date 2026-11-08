@@ -114,6 +114,7 @@ function setup({
       if (!world.machineTypes[name]) throw new GoogleError('no machine type', { code: 404 });
       return structuredClone(world.machineTypes[name]);
     },
+    setMachineType: (zone, name, type) => change(`setMachineType ${name} ${type}`, () => { world.vms[name].machineType = `${V1}/zones/${ZONE}/machineTypes/${type}`; }),
     listManagedInstances: async (group) => {
       world.groupsRead.push(group);
       return structuredClone(world.groups[group.name] ?? []);
@@ -310,13 +311,34 @@ test('a managed group\'s location says zonal or regional', async () => {
   ]);
 });
 
-test('a start refused for capacity: FAILED with the kind capacity, the policy kept', async () => {
-  const t = setup({ run: waking(START), vms: { 'vm-a': { status: 'TERMINATED' } }, map: asleepMap() });
-  t.world.on['start vm-a'] = async () => {
-    throw new GoogleError("Google: operation compute.instances.start: ZONE_RESOURCE_POOL_EXHAUSTED: The zone 'europe-west1-b' does not have enough resources", { reason: 'ZONE_RESOURCE_POOL_EXHAUSTED' });
+// Capacity (vision docs/specs/2026-11-08-google-cloud-router-features-design.md, section 6): AWS's retries within the wake, and a VM's
+// fallback machine types, given back after the next stop.
+const stockout = () => new GoogleError("Google: operation compute.instances.start: ZONE_RESOURCE_POOL_EXHAUSTED: The zone 'europe-west1-b' does not have enough resources", { reason: 'ZONE_RESOURCE_POOL_EXHAUSTED' });
+const forbidden = () => new GoogleError("Google: POST setMachineType: 403 Required 'compute.instances.setMachineType' permission for 'projects/p/zones/europe-west1-b/instances/vm-a'", { code: 403 });
+const SET_TYPE_REFUSED = 'the router\'s role lacks compute.instances.setMachineType: run dormeto gcp install again';
+// The next `times` asks of `line` refused, for capacity unless said.
+const refusedFor = (t, line, times, error = stockout) => {
+  let left = times;
+  t.world.on[line] = async () => {
+    if (left <= 0) return;
+    left -= 1;
+    throw error();
   };
+};
+const typeUrl = (type) => `${V1}/zones/${ZONE}/machineTypes/${type}`;
+const typeOf = (t, name) => t.world.vms[name].machineType.slice(t.world.vms[name].machineType.lastIndexOf('/') + 1);
+const FALLBACK = { fallbackInstanceTypes: ['e2-medium'] };
+const ON_FALLBACK = { 'vm-a': { from: 'e2-small', to: 'e2-medium' } };
+const fieldsOf = (lines) => lines.map(({ level, event, ...fields }) => [level, fields]);
+
+test('a start refused for capacity until the wake\'s deadline: tried again after 30 s, 60 s, then every 120 s, then FAILED with the kind capacity, the policy kept', async () => {
+  const t = setup({ run: waking(START), vms: { 'vm-a': { status: 'TERMINATED' } }, map: asleepMap() });
+  t.world.on['start vm-a'] = async () => { throw stockout(); };
   const out = await t.controller.wake('demo', 'w1');
   assert.equal(out.state, STATES.FAILED);
+  // At 570 s, the next wait would pass the 600 s of the wake.
+  assert.deepEqual(t.world.sleeps, [30_000, 60_000, 120_000, 120_000, 120_000, 120_000]);
+  assert.equal(t.world.calls.filter((call) => call === 'start vm-a').length, 7);
   assert.equal(t.run().state, STATES.FAILED);
   assert.equal(JSON.parse(t.run().failure).kind, 'capacity');
   assert.equal(JSON.parse(t.run().failure).step, 'wake');
@@ -324,6 +346,102 @@ test('a start refused for capacity: FAILED with the kind capacity, the policy ke
   assert.equal(t.run().consecutiveFailures, 1);
   assert.equal(hasPolicy(t.world.map), true);
   assert.equal(t.logged('WakeFailed')[0].kind, 'capacity');
+});
+
+test('a start refused for capacity falls back to the list\'s next type: e2-medium set on the stopped VM, started on it, on the run and in the AWAKE event', async () => {
+  const t = setup({ run: waking(START), cfg: FALLBACK, vms: { 'vm-a': { status: 'TERMINATED' } } });
+  refusedFor(t, 'start vm-a', 2);
+  assert.equal((await t.controller.wake('demo', 'w1')).state, STATES.AWAKE);
+  // Refused on its own type, then on e2-medium, the list's last: started on it 30 s later.
+  assert.deepEqual(t.world.calls, ['start vm-a', 'setMachineType vm-a e2-medium', 'start vm-a', 'start vm-a']);
+  assert.deepEqual(t.world.sleeps, [30_000]);
+  assert.equal(typeOf(t, 'vm-a'), 'e2-medium');
+  assert.deepEqual(t.run().instanceTypes, ON_FALLBACK);
+  assert.deepEqual(t.logged('StateChanged').find((l) => l.to === STATES.AWAKE).fallbacks, ON_FALLBACK);
+  assert.deepEqual(fieldsOf(t.logged('InstanceTypeFallback')), [['warn', { workloadId: 'demo', wakeId: 'w1', instance: 'vm-a', from: 'e2-small', to: 'e2-medium' }]]);
+});
+
+test('the record is on the run before the machine type changes, so that a request that dies leaves the next stop what to give back; two VMs falling back at once both stay on it', async () => {
+  const t = setup({ run: waking(START), cfg: { ...FALLBACK, backends: [VM_A, VM_B] }, vms: { 'vm-a': { status: 'TERMINATED' }, 'vm-b': { status: 'TERMINATED' } } });
+  refusedFor(t, 'start vm-a', 1);
+  refusedFor(t, 'start vm-b', 1);
+  let atChange;
+  t.world.on['setMachineType vm-a e2-medium'] = async () => { atChange = t.run().instanceTypes; };
+  assert.equal((await t.controller.wake('demo', 'w1')).state, STATES.AWAKE);
+  assert.deepEqual(atChange?.['vm-a'], { from: 'e2-small', to: 'e2-medium' });
+  const both = { 'vm-a': { from: 'e2-small', to: 'e2-medium' }, 'vm-b': { from: 'e2-small', to: 'e2-medium' } };
+  assert.deepEqual(t.run().instanceTypes, both);
+  assert.deepEqual(t.logged('StateChanged').find((l) => l.to === STATES.AWAKE).fallbacks, both);
+});
+
+test('the list in its order, each type once: from stays the VM\'s own type', async () => {
+  const t = setup({ run: waking(START), cfg: { fallbackInstanceTypes: ['e2-medium', 'e2-standard-2'] }, vms: { 'vm-a': { status: 'TERMINATED' } } });
+  refusedFor(t, 'start vm-a', 2);
+  await t.controller.wake('demo', 'w1');
+  assert.deepEqual(t.world.calls, ['start vm-a', 'setMachineType vm-a e2-medium', 'start vm-a', 'setMachineType vm-a e2-standard-2', 'start vm-a']);
+  assert.deepEqual(t.world.sleeps, []);
+  assert.deepEqual(t.run().instanceTypes, { 'vm-a': { from: 'e2-small', to: 'e2-standard-2' } });
+  assert.deepEqual(t.logged('InstanceTypeFallback').map((l) => l.to), ['e2-medium', 'e2-standard-2']);
+});
+
+test('the list exhausted: the VM stays on its last type, tried again after 30 s, then 60 s', async () => {
+  const t = setup({ run: waking(START), cfg: FALLBACK, vms: { 'vm-a': { status: 'TERMINATED' } } });
+  refusedFor(t, 'start vm-a', 3);
+  assert.equal((await t.controller.wake('demo', 'w1')).state, STATES.AWAKE);
+  assert.deepEqual(t.world.calls, ['start vm-a', 'setMachineType vm-a e2-medium', 'start vm-a', 'start vm-a', 'wait 60 s', 'start vm-a']);
+  assert.deepEqual(t.world.sleeps, [30_000, 60_000]);
+  assert.equal(typeOf(t, 'vm-a'), 'e2-medium');
+  assert.deepEqual(t.run().instanceTypes, ON_FALLBACK);
+});
+
+test('a suspended VM only resumes, on its own type: a resume refused for capacity is tried again, no machine type changed', async () => {
+  const t = setup({ run: waking(START), cfg: FALLBACK, vms: { 'vm-a': { status: 'SUSPENDED' } } });
+  refusedFor(t, 'resume vm-a', 1);
+  assert.equal((await t.controller.wake('demo', 'w1')).state, STATES.AWAKE);
+  assert.deepEqual(t.world.calls, ['resume vm-a', 'resume vm-a']);
+  assert.deepEqual(t.world.sleeps, [30_000]);
+  assert.equal(typeOf(t, 'vm-a'), 'e2-small');
+  assert.equal(t.run().instanceTypes, undefined);
+});
+
+test('a managed group\'s start refused for capacity: tried again after 30 s, no machine type changed', async () => {
+  const t = setup({ run: waking(START), cfg: { backends: [MIG], ...FALLBACK }, groups: { mig: [managed('mig-1', 'TERMINATED')] } });
+  refusedFor(t, 'start mig mig-1', 1);
+  assert.equal((await t.controller.wake('demo', 'w1')).state, STATES.AWAKE);
+  assert.deepEqual(t.world.calls, ['start mig mig-1', 'start mig mig-1']);
+  assert.deepEqual(t.world.sleeps, [30_000]);
+  assert.equal(t.run().instanceTypes, undefined);
+});
+
+test('a start refused for quota (QUOTA_EXCEEDED): no retry, no fallback, FAILED with the kind quota', async () => {
+  const t = setup({ run: waking(START), cfg: FALLBACK, vms: { 'vm-a': { status: 'TERMINATED' } } });
+  t.world.on['start vm-a'] = async () => {
+    throw new GoogleError("Google: operation compute.instances.start: QUOTA_EXCEEDED: Quota 'CPUS' exceeded. Limit: 8.0 in region europe-west1.", { reason: 'QUOTA_EXCEEDED' });
+  };
+  assert.equal((await t.controller.wake('demo', 'w1')).state, STATES.FAILED);
+  assert.equal(JSON.parse(t.run().failure).kind, 'quota');
+  assert.deepEqual(t.world.calls, ['start vm-a']);
+  assert.deepEqual(t.world.sleeps, []);
+});
+
+test('a fallback refused for the permission (403): FAILED with the kind permission, in words that say what to do; the VM on its own type, nothing on the run', async () => {
+  const t = setup({ run: waking(START), cfg: FALLBACK, vms: { 'vm-a': { status: 'TERMINATED' } } });
+  refusedFor(t, 'start vm-a', 1);
+  refusedFor(t, 'setMachineType vm-a e2-medium', 1, forbidden);
+  assert.equal((await t.controller.wake('demo', 'w1')).state, STATES.FAILED);
+  assert.deepEqual(JSON.parse(t.run().failure), { kind: 'permission', step: 'wake', message: SET_TYPE_REFUSED, at: t.clock.now() });
+  assert.equal(typeOf(t, 'vm-a'), 'e2-small');
+  assert.equal(t.run().instanceTypes, undefined);
+  assert.deepEqual(t.logged('InstanceTypeFallback'), []);
+});
+
+test('a VM a nap could not give its own type back: the next wake sets it first and starts it on it, and the run forgets it', async () => {
+  const t = setup({ run: waking(START, { instanceTypes: ON_FALLBACK }), cfg: FALLBACK, vms: { 'vm-a': { status: 'TERMINATED', machineType: typeUrl('e2-medium') } } });
+  assert.equal((await t.controller.wake('demo', 'w1')).state, STATES.AWAKE);
+  assert.deepEqual(t.world.calls, ['setMachineType vm-a e2-small', 'start vm-a']);
+  assert.equal(typeOf(t, 'vm-a'), 'e2-small');
+  assert.equal(t.run().instanceTypes, undefined);
+  assert.equal(t.logged('StateChanged').find((l) => l.to === STATES.AWAKE).fallbacks, undefined);
 });
 
 test('a start refused without the permission: FAILED with the kind permission', async () => {
@@ -1205,6 +1323,21 @@ for (const [kind, lb, base, waitSeconds, healthScope, headers] of SWAPS) {
     assert.equal(t.world.puts, 0);
     assert.deepEqual(t.world.sleeps, []);
     assert.equal(t.logged('BackendsNotWoken').length, 0);
+  });
+
+  // The map's change must still fit the wake once the retries end: a start past that could not unswap in time.
+  test(`${kind} wake: a VM refused for capacity while another is healthy: tried again only while the map's change still fits the wake, then unswapped, AWAKE`, async () => {
+    const t = swapSetup({ run: waking(START), cfg: { backends: [VM_A, VM_B] }, vms: { 'vm-a': { status: 'RUNNING' }, 'vm-b': { status: 'TERMINATED' } }, map: swappedMap() });
+    t.world.on['start vm-b'] = async () => { throw stockout(); };
+    assert.equal((await t.controller.wake('demo', 'w1')).state, STATES.AWAKE);
+    const retries = t.world.sleeps.slice(0, -1);
+    assert.deepEqual(retries.slice(0, 3), [30_000, 60_000, 120_000]);
+    assert.ok(START + retries.reduce((sum, ms) => sum + ms, 0) + 120_000 >= START + 600_000 - WAIT_MS, 'no wait left out that the map\'s change would fit');
+    assert.equal(t.world.sleeps.at(-1), WAIT_MS);
+    assert.ok(t.clock.now() <= START + 600_000);
+    assert.equal(t.logged('BackendsNotWoken').length, 1);
+    assert.match(t.logged('BackendsNotWoken')[0].error, /ZONE_RESOURCE_POOL_EXHAUSTED/);
+    assert.equal(isSwapped(t.world.map), false);
   });
 
   test(`${kind} wake: a VM that cannot start and a health that cannot be read: FAILED with the VM's error`, async () => {
@@ -2298,6 +2431,71 @@ test('the release whose run left FAILED, or is gone, during its wait reads nothi
   assert.equal(gone.world.calls.some((c) => c.startsWith('stop')), false);
   assert.deepEqual(gone.world.autoscalerReads, []);
   assert.deepEqual(gone.logged('ReleaseFailed'), []);
+});
+
+// A fallback machine type is for one wake only (section 6 of the router features' design): stopped, a VM gets its own type back.
+test('the next nap gives a VM its own type back once it is stopped, and the run forgets it', async () => {
+  const t = setup({ run: waking(START), cfg: FALLBACK, vms: { 'vm-a': { status: 'TERMINATED' } } });
+  refusedFor(t, 'start vm-a', 1);
+  await t.controller.wake('demo', 'w1');
+  assert.deepEqual(t.run().instanceTypes, ON_FALLBACK);
+  t.world.calls.length = 0;
+  assert.equal((await t.controller.nap('demo')).state, STATES.ASLEEP);
+  assert.deepEqual(t.world.calls, ['map policy', 'wait 300 s', 'stop vm-a', 'setMachineType vm-a e2-small']);
+  assert.equal(typeOf(t, 'vm-a'), 'e2-small');
+  assert.equal(t.run().instanceTypes, undefined);
+  assert.deepEqual(t.logged('InstanceTypeNotReverted'), []);
+});
+
+test('a revert refused (403): said, the nap ASLEEP all the same, the VM kept on the run; refused again at the wake, it starts on its fallback type; the next nap gives it back', async () => {
+  const t = setup({ run: { state: STATES.AWAKE, awakeSince: 1, instanceTypes: ON_FALLBACK }, cfg: FALLBACK, vms: { 'vm-a': { status: 'RUNNING', machineType: typeUrl('e2-medium') } } });
+  refusedFor(t, 'setMachineType vm-a e2-small', 2, forbidden);
+  assert.equal((await t.controller.nap('demo')).state, STATES.ASLEEP);
+  assert.equal(t.run().state, STATES.ASLEEP);
+  assert.deepEqual(t.run().instanceTypes, ON_FALLBACK);
+  assert.deepEqual(fieldsOf(t.logged('InstanceTypeNotReverted')), [['warn', { workloadId: 'demo', instance: 'vm-a', error: SET_TYPE_REFUSED }]]);
+
+  await t.controller.wakeNow('demo');
+  assert.equal((await t.controller.wake('demo', 'wake-2')).state, STATES.AWAKE);
+  assert.equal(typeOf(t, 'vm-a'), 'e2-medium');
+  assert.deepEqual(t.run().instanceTypes, ON_FALLBACK);
+  assert.equal(t.logged('InstanceTypeNotReverted').length, 2);
+
+  t.world.calls.length = 0;
+  assert.equal((await t.controller.nap('demo')).state, STATES.ASLEEP);
+  assert.deepEqual(t.world.calls, ['map policy', 'wait 300 s', 'stop vm-a', 'setMachineType vm-a e2-small']);
+  assert.equal(t.run().instanceTypes, undefined);
+});
+
+test('hibernate true, a VM on a fallback type: stopped, not suspended, so that it gets its own type back; the others suspended', async () => {
+  const t = setup({
+    run: { state: STATES.AWAKE, awakeSince: 1, instanceTypes: ON_FALLBACK },
+    cfg: { ...FALLBACK, hibernate: true, backends: [VM_A, VM_B] },
+    vms: { 'vm-a': { status: 'RUNNING', machineType: typeUrl('e2-medium') }, 'vm-b': { status: 'RUNNING' } },
+    machineTypes: { 'e2-medium': { memoryMb: 4096 } },
+  });
+  await t.controller.nap('demo');
+  assert.deepEqual(t.run().stopped, ['vm-a']);
+  assert.deepEqual(t.run().suspended, ['vm-b']);
+  assert.equal(t.world.calls.at(-1), 'setMachineType vm-a e2-small');
+  assert.equal(t.run().instanceTypes, undefined);
+});
+
+test('the release gives the VMs their own types back once stopped, and the run forgets them', async () => {
+  const t = setup({
+    run: { ...FAILED_RUN(START - 15 * MINUTE), instanceTypes: ON_FALLBACK }, cfg: FALLBACK, map: asleepMap(),
+    vms: { 'vm-a': { status: 'RUNNING', machineType: typeUrl('e2-medium') } },
+  });
+  assert.deepEqual(await t.controller.release('demo'), { state: STATES.ASLEEP });
+  assert.deepEqual(t.world.calls, ['stop vm-a', 'setMachineType vm-a e2-small']);
+  assert.equal(t.run().instanceTypes, undefined);
+});
+
+test('a wake that fails on a fallback type leaves it on the run, for the release to give back', async () => {
+  const t = setup({ run: waking(START), cfg: FALLBACK, vms: { 'vm-a': { status: 'TERMINATED' } }, unhealthyPolls: Infinity });
+  refusedFor(t, 'start vm-a', 1);
+  assert.equal((await t.controller.wake('demo', 'w1')).state, STATES.FAILED);
+  assert.deepEqual(t.run().instanceTypes, ON_FALLBACK);
 });
 
 test('a release that fails stays failed, logged, for the next check to ask again', async () => {

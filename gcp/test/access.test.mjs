@@ -109,10 +109,10 @@ test('dormetoRouter holds spec section 4\'s permissions, exactly', async () => {
   ]));
 });
 
-test('dormetoRouterBackends holds what starts, stops, suspends and resumes the backends, exactly', async () => {
+test('dormetoRouterBackends holds what starts, stops, suspends and resumes the backends, and changes a stopped VM\'s machine type, exactly', async () => {
   const { roles } = await load();
   assert.deepEqual(sorted(roles.dormetoRouterBackends.permissions), sorted([
-    'compute.instances.start', 'compute.instances.stop', 'compute.instances.suspend', 'compute.instances.resume',
+    'compute.instances.start', 'compute.instances.stop', 'compute.instances.suspend', 'compute.instances.resume', 'compute.instances.setMachineType',
     'compute.instanceGroupManagers.update', 'compute.instanceGroupManagers.use',
   ]));
   // An autoscaler cannot carry a tag: under the tag condition its change would always be refused (ruling 7).

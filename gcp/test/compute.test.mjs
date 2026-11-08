@@ -108,6 +108,15 @@ for (const action of ['stop', 'start', 'suspend', 'resume']) {
   });
 }
 
+test('setMachineType: POST .../setMachineType with the zone\'s machine type, then waits for the operation', async () => {
+  const { calls, compute } = setup(() => ({ selfLink: 'op' }));
+  await compute.setMachineType('europe-west1-b', 'vm', 'e2-medium');
+  assert.deepEqual(calls[0], { method: 'POST', url: `${BASE}/zones/europe-west1-b/instances/vm/setMachineType`, body: { machineType: 'zones/europe-west1-b/machineTypes/e2-medium' } });
+  assert.equal(calls[1].wait.selfLink, 'op');
+  assert.equal(calls[1].deadline, 1000 + 120_000);
+  assert.deepEqual(CALLS.setMachineType, ['compute.instances.setMachineType', 'compute.zoneOperations.get']);
+});
+
 test('setAutoscalerMode: PATCH with the mode, zonal and regional, then waits', async () => {
   const { calls, compute } = setup(() => ({ selfLink: 'op' }));
   await compute.setAutoscalerMode(ZONAL, 'OFF');

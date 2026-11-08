@@ -1071,6 +1071,35 @@ test('offboarding while it wakes or naps is a 409', async () => {
   }
 });
 
+// A VM on a fallback machine type (vision docs/specs/2026-11-08-google-cloud-router-features-design.md, section 6): an offboarding leaves
+// it running on it, and says so with its own type, which no stop of the router's gives back any more.
+const ON_FALLBACK = { 'vm-a': { from: 'e2-small', to: 'e2-medium' } };
+
+test('an offboarding while a VM runs on a fallback machine type names the VM, its type now and its own; a forced one too; none, no field', async () => {
+  for (const force of [false, true]) {
+    const { store, onboarding } = setup();
+    await onboarding.onboard(INPUT);
+    store.runs.get('demo').instanceTypes = structuredClone(ON_FALLBACK);
+    const answer = await onboarding.offboard('demo', { force });
+    assert.deepEqual(answer.instanceTypes, { 'vm-a': { from: 'e2-small', to: 'e2-medium' } }, `force: ${force}`);
+    assert.equal(store.configs.size, 0);
+  }
+  const { onboarding } = setup();
+  await onboarding.onboard(INPUT);
+  assert.deepEqual(await onboarding.offboard('demo'), {});
+});
+
+test('an offboarding of an asleep workload whose VM cannot get its own type back: woken on its fallback type, and named', async () => {
+  const { w, store, onboarding } = setup();
+  await onboarding.onboard(INPUT);
+  Object.assign(w.vms['vm-a'], { status: 'TERMINATED', machineType: `${V1}/zones/${ZONE}/machineTypes/e2-medium` });
+  Object.assign(store.runs.get('demo'), { state: STATES.ASLEEP, stopped: ['vm-a'], instanceTypes: structuredClone(ON_FALLBACK) });
+  w.fail[`POST zones/${ZONE}/instances/vm-a/setMachineType`] = new GoogleError("Google: POST: 403 Required 'compute.instances.setMachineType' permission", { code: 403 });
+  assert.deepEqual(await onboarding.offboard('demo'), { instanceTypes: ON_FALLBACK });
+  assert.equal(w.vms['vm-a'].status, 'RUNNING');
+  assert.ok(w.logs.some((l) => l.event === 'InstanceTypeNotReverted' && l.instance === 'vm-a'));
+});
+
 test('offboard: an unknown workload is a 404, a bad ID a 400', async () => {
   const { onboarding } = setup();
   await assert.rejects(onboarding.offboard('demo'), refused(404, 'not-found', /no workload demo/));

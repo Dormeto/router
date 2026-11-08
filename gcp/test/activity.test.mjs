@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { activityOf, eventOfRequest } from '../src/activity.mjs';
+import { createLogs } from '../src/logs.mjs';
 import { clientIp } from '../../lambda/src/lib/http.mjs';
 
 const BROWSER = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
@@ -26,6 +27,16 @@ test('a HEAD is no activity', () => {
 
 test('an address of a list the waker ignores is no activity', () => {
   assert.equal(activityOf([request('/', { remoteIp: '198.51.100.4' })], { lists: LISTS, rules: [] }), 0);
+});
+
+// M2: the regional load balancer logs the address with its port. Read through logs.mjs, it is the address the list holds.
+test('a listed address with a port in the log is ignored', async () => {
+  const logged = (remoteIp) => ({ httpRequest: { requestMethod: 'GET', requestUrl: 'https://demo.example.com/', userAgent: BROWSER, remoteIp } });
+  const google = { request: async () => ({ entries: [logged('198.51.100.4:56212'), logged('[2001:db8::4]:443')] }) };
+  const log = { info() {}, warn() {}, error() {} };
+  const requests = await createLogs({ google, view: 'v', log }).requests({ backendService: 'app', from: 0, to: 1, limit: 1000 });
+  const lists = [listOf('scanners', 'ignore', ['198.51.100.4', '2001:db8::4'])];
+  assert.equal(activityOf(requests, { lists, rules: [] }), 0);
 });
 
 test('one browser\'s GET of the home page is activity', () => {

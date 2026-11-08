@@ -44,8 +44,12 @@ function filterOf(backendService, lb, from, to) {
 // the query, not normalized. None: `/`.
 const pathOf = (url) => (url ?? '').replace(/^[a-z][a-z0-9+.-]*:\/\/[^/?#]*/i, '').split(/[?#]/)[0] || '/';
 
+// The client's address without the port the regional load balancer logs with it (M2: `82.127.11.49:56212`; the global and classic
+// ones log none): IPv4 `a.b.c.d:port`, IPv6 `[addr]:port`. A bare IPv6 address is left as it is, its colons its own.
+const addressOf = (remoteIp) => remoteIp?.replace(/^(\d{1,3}(?:\.\d{1,3}){3}):\d+$/, '$1').replace(/^\[([^\]]+)\](?::\d+)?$/, '$1');
+
 const requestOf = ({ httpRequest: h = {} }) => ({
-  method: h.requestMethod, url: h.requestUrl, path: pathOf(h.requestUrl), userAgent: h.userAgent, remoteIp: h.remoteIp,
+  method: h.requestMethod, url: h.requestUrl, path: pathOf(h.requestUrl), userAgent: h.userAgent, remoteIp: addressOf(h.remoteIp),
 });
 
 export function createLogs({ google, view, log }) {

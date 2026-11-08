@@ -46,7 +46,9 @@ test('requests: one entries.list on the view, filtered by the resource type, the
 });
 
 // Global and classic log as `http_load_balancer`; a regional one as its own resource, whose labels are its metric's (M5: the
-// service's plain name in `backend_target_name`), with the region, as a regional service's name is unique only there.
+// service's plain name in `backend_target_name`), with the region, as a regional service's name is unique only there. Both internal
+// kinds log as `internal_http_lb_rule` (Google's page: the cross-region one as the regional one), with the same labels: the region for
+// the regional one; none for the cross-region one, whose service is global and whose entries' region is not the service's (M3).
 const GLOBAL_FILTER = `resource.type="http_load_balancer" AND resource.labels.backend_service_name="app" AND ${WINDOW}`;
 const FILTERS = [
   ['no lb, a global workload', undefined, GLOBAL_FILTER],
@@ -54,6 +56,10 @@ const FILTERS = [
   ['classic', { kind: 'classic' }, GLOBAL_FILTER],
   ['regional', { kind: 'regional', region: 'europe-west1' },
     `resource.type="http_external_regional_lb_rule" AND resource.labels.backend_target_name="app" AND resource.labels.region="europe-west1" AND ${WINDOW}`],
+  ['internal', { kind: 'internal', region: 'europe-west1' },
+    `resource.type="internal_http_lb_rule" AND resource.labels.backend_target_name="app" AND resource.labels.region="europe-west1" AND ${WINDOW}`],
+  ['cross-region-internal', { kind: 'cross-region-internal' },
+    `resource.type="internal_http_lb_rule" AND resource.labels.backend_target_name="app" AND ${WINDOW}`],
 ];
 for (const [name, lb, filter] of FILTERS) {
   test(`requests: the exact filter of ${name}`, async () => {
@@ -62,6 +68,15 @@ for (const [name, lb, filter] of FILTERS) {
     assert.equal(calls[0].body.filter, filter);
   });
 }
+
+test('requests: a regional or internal load balancer with no region reads nothing, null: a filter without it would read another region\'s service', async () => {
+  for (const kind of ['regional', 'internal']) {
+    const { calls, logs, reader } = setup(() => assert.fail('nothing to read'));
+    assert.equal(await read(reader, { lb: { kind } }), null);
+    assert.equal(calls.length, 0);
+    assert.match(logs[0].reason, new RegExp(`an? ${kind} load balancer with no region`));
+  }
+});
 
 test('requests: each entry as the method, the URL, its path as received, the user agent and the client\'s address', async () => {
   const { reader } = setup([{

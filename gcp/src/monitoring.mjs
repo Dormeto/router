@@ -4,19 +4,31 @@
 //
 // By the load balancer's kind (M5, the coverage design's section 7): classic has the global one's metric and form; regional has
 // a metric of its own, `backend_target_name` still the service's plain name, and the region in the filter, as a regional
-// service's name is unique only there. A filter that matches nothing reads 0 and naps a busy workload.
+// service's name is unique only there. A filter that matches nothing reads 0 and naps a busy workload. Both internal kinds count in
+// `https/internal/request_count` (vision docs/specs/2026-11-08-google-cloud-router-features-design.md, section 7), with the regional
+// one's labels: the regional one in its region; the cross-region one without, as its service is global and its points' region is
+// where the proxy ran (to measure, M3): a filter on the router's region would miss the requests of other regions' clients.
+import { aKind } from './switch.mjs';
+
 const MONITORING = 'https://monitoring.googleapis.com/v3';
-const METRIC = 'loadbalancing.googleapis.com/https/request_count';
-const REGIONAL_METRIC = 'loadbalancing.googleapis.com/https/external/regional/request_count';
+// By kind: the metric, and whether the region names the service too. A kind not named here (classic), or none, counts as the global one.
+const METRICS = {
+  global: { metric: 'loadbalancing.googleapis.com/https/request_count', inRegion: false },
+  regional: { metric: 'loadbalancing.googleapis.com/https/external/regional/request_count', inRegion: true },
+  internal: { metric: 'loadbalancing.googleapis.com/https/internal/request_count', inRegion: true },
+  'cross-region-internal': { metric: 'loadbalancing.googleapis.com/https/internal/request_count', inRegion: false },
+};
 
 export const CALLS = {
   requestCount: ['monitoring.timeSeries.list'],
 };
 
 function filterOf(backendService, lb) {
-  if (lb?.kind !== 'regional') return `metric.type = "${METRIC}" AND resource.labels.backend_target_name = "${backendService}"`;
-  if (!lb.region) throw new Error(`backend service ${backendService}: a regional load balancer with no region reads no request count`);
-  return `metric.type = "${REGIONAL_METRIC}" AND resource.labels.backend_target_name = "${backendService}" AND resource.labels.region = "${lb.region}"`;
+  const { metric, inRegion } = METRICS[Object.hasOwn(METRICS, lb?.kind) ? lb.kind : 'global'];
+  const filter = `metric.type = "${metric}" AND resource.labels.backend_target_name = "${backendService}"`;
+  if (!inRegion) return filter;
+  if (!lb.region) throw new Error(`backend service ${backendService}: ${aKind(lb.kind)} load balancer with no region reads no request count`);
+  return `${filter} AND resource.labels.region = "${lb.region}"`;
 }
 
 export function createMonitoring({ google, project }) {

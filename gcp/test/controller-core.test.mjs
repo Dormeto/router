@@ -805,16 +805,21 @@ test('a nap\'s heartbeat: a beat 2 minutes old holds; none 90 s after its NAPPIN
   assert.equal(before.logged('NapStuck').length, 0);
 });
 
-// --- A regional or classic workload: the swap (the coverage design's section 7) ------------------------------------------
+// --- A regional, classic or internal workload: the swap (the coverage design's section 7; G5's design, section 7) --------------
 
-// A regional waker's headers are in the map (M4), a classic one's on its backend service.
+// A regional waker's headers are in the map (M4), as an internal one's, regional or cross-region (Google's page), the cross-region
+// one's map global; a classic one's on its backend service. The internal kinds wait as regional does until M3 measures them.
 const SWAP_HEADERS = [['x-dormeto-workload', 'demo'], ['x-dormeto-switch', 'swap']];
 const SWAPS = [
   ['regional', { kind: 'regional', region: 'europe-west1' }, `${V1}/regions/europe-west1`, 100, 'europe-west1', SWAP_HEADERS],
   ['classic', { kind: 'classic' }, `${V1}/global`, 250, 'global', undefined],
+  ['internal', { kind: 'internal', region: 'europe-west1' }, `${V1}/regions/europe-west1`, 100, 'europe-west1', SWAP_HEADERS],
+  ['cross-region-internal', { kind: 'cross-region-internal' }, `${V1}/global`, 100, 'global', SWAP_HEADERS],
 ];
 
 for (const [kind, lb, base, waitSeconds, healthScope, headers] of SWAPS) {
+  // Its map, backend services and waker in the router's region, or global.
+  const regionalScope = healthScope !== 'global';
   const service = (name) => `${base}/backendServices/${name}`;
   const WAIT = `wait ${waitSeconds} s`;
   const WAIT_MS = waitSeconds * 1000;
@@ -876,7 +881,7 @@ for (const [kind, lb, base, waitSeconds, healthScope, headers] of SWAPS) {
 
   test(`${kind} nap: a map of another scope naming the service is no refusal; one of its own scope is`, async () => {
     const own = `${base}/urlMaps`;
-    const elsewhere = kind === 'regional' ? `${V1}/global/urlMaps` : `${V1}/regions/europe-west1/urlMaps`;
+    const elsewhere = regionalScope ? `${V1}/global/urlMaps` : `${V1}/regions/europe-west1/urlMaps`;
     const second = { name: 'second', defaultService: service('app') };
     const free = swapSetup();
     free.world.mapLists[elsewhere] = [second];
@@ -1122,12 +1127,12 @@ for (const [kind, lb, base, waitSeconds, healthScope, headers] of SWAPS) {
   });
 
   test(`${kind} slow legal nap: a lost swap, each write behind another update of its map under way here, each update at its worst: under 22 minutes, no check calls it stuck`, async () => {
-    // A map's update at its worst: the operation's 120 s and the pauses of a map busy with another (urlmaps.mjs).
-    const update = kind === 'classic' ? 180_000 : 240_000;
+    // A map's update at its worst: the operation's 120 s and the pauses of a map busy with another (urlmaps.mjs), by its scope.
+    const update = regionalScope ? 240_000 : 180_000;
     const t = swapSetup();
     t.world.mapLine = (body) => `map ${isSwapped(body) ? 'swapped' : 'unswapped'}${body.description ? ` on ${body.description}` : ''}`;
     // Another workload's change of the map, its update held until the nap's write waits for it.
-    const maps = kind === 'regional' ? t.regionalUrlmaps : t.urlmaps;
+    const maps = regionalScope ? t.regionalUrlmaps : t.urlmaps;
     let others = 0;
     let holding = false;
     const another = () => {
@@ -1160,7 +1165,8 @@ for (const [kind, lb, base, waitSeconds, healthScope, headers] of SWAPS) {
     assert.deepEqual(seen, [{ workloadId: 'demo', state: STATES.NAPPING }]);
     assert.equal(t.logged('NapStuck').length, 0);
     assert.equal(t.world.vms['vm-a'].status, 'TERMINATED');
-    // Regional 2 x 100 s + 2 x (240 s + 240 s) = 1160 s, classic 2 x 250 s + 2 x (180 s + 180 s) = 1220 s: past 15 minutes.
+    // Regional and internal 2 x 100 s + 2 x (240 s + 240 s) = 1160 s, classic 2 x 250 s + 2 x (180 s + 180 s) = 1220 s, cross-region
+    // internal 2 x 100 s + 2 x (180 s + 180 s) = 920 s: past 15 minutes.
     const took = t.clock.now() - START;
     assert.ok(took > 15 * MINUTE && took < 22 * MINUTE, `${took} ms`);
   });
@@ -2682,6 +2688,25 @@ test('the favicon: no host rule sending / to the workload is said and waits a da
   assert.equal((await unread.controller.nap('demo')).state, STATES.ASLEEP);
   assert.deepEqual([unread.network.calls, unread.store.state.favicons], [[], {}]);
   assert.equal(unread.logged('FaviconSkipped').length, 1);
+});
+
+// An internal load balancer's visitors are in the customer's network: no icon is read for them (as on AWS), the map not even read.
+test('the favicon of an internal or a cross-region internal workload: none read, nothing stored, its nap as any swap\'s', async () => {
+  for (const lb of [{ kind: 'internal', region: 'europe-west1' }, { kind: 'cross-region-internal' }]) {
+    const t = setup({ vms: RUNNING, cfg: { lb, hibernate: false } });
+    site(t);
+    const read = [];
+    for (const maps of [t.urlmaps, t.regionalUrlmaps]) {
+      const { get } = maps;
+      maps.get = async (name) => {
+        read.push(name);
+        return get(name);
+      };
+    }
+    assert.equal((await t.controller.nap('demo')).state, STATES.ASLEEP, lb.kind);
+    assert.deepEqual([t.network.calls, t.store.state.favicons, read], [[], {}, []], lb.kind);
+    assert.equal(t.logged('FaviconSkipped').length, 0, lb.kind);
+  }
 });
 
 test('the favicon of a regional workload: its host from the regional URL map', async () => {

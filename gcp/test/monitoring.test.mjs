@@ -32,11 +32,15 @@ test('requestCount: pages, and counts nothing when no series', async () => {
 // Review focus 1 (the plan): a filter that matches nothing reads 0 and naps a busy workload. These are M5's, read back with real
 // traffic (the design's section 7): `backend_target_name` is the plain name on both kinds.
 const GLOBAL_FILTER = 'metric.type = "loadbalancing.googleapis.com/https/request_count" AND resource.labels.backend_target_name = "app"';
+// Both internal kinds count in `https/internal/request_count` (resource `internal_http_lb_rule`), the regional one in its region, the
+// cross-region one without: its service is global, and its points' region is not the service's (M3).
 const FILTERS = [
   ['no lb, a global workload', undefined, GLOBAL_FILTER],
   ['global', { kind: 'global' }, GLOBAL_FILTER],
   ['classic', { kind: 'classic' }, GLOBAL_FILTER],
   ['regional', { kind: 'regional', region: 'europe-west1' }, 'metric.type = "loadbalancing.googleapis.com/https/external/regional/request_count" AND resource.labels.backend_target_name = "app" AND resource.labels.region = "europe-west1"'],
+  ['internal', { kind: 'internal', region: 'europe-west1' }, 'metric.type = "loadbalancing.googleapis.com/https/internal/request_count" AND resource.labels.backend_target_name = "app" AND resource.labels.region = "europe-west1"'],
+  ['cross-region-internal', { kind: 'cross-region-internal' }, 'metric.type = "loadbalancing.googleapis.com/https/internal/request_count" AND resource.labels.backend_target_name = "app"'],
 ];
 for (const [name, lb, filter] of FILTERS) {
   test(`requestCount: the exact filter of ${name} (M5)`, async () => {
@@ -49,7 +53,8 @@ for (const [name, lb, filter] of FILTERS) {
 
 test('requestCount: a regional load balancer with no region throws, nothing read: a filter without it would read 0 and nap a busy workload', async () => {
   const google = { request: async () => assert.fail('nothing to read') };
-  await assert.rejects(createMonitoring({ google, project: 'p' }).requestCount({ backendService: 'app', lb: { kind: 'regional' }, from: 0, to: 1000 }), /regional load balancer with no region/);
+  await assert.rejects(createMonitoring({ google, project: 'p' }).requestCount({ backendService: 'app', lb: { kind: 'regional' }, from: 0, to: 1000 }), /a regional load balancer with no region/);
+  await assert.rejects(createMonitoring({ google, project: 'p' }).requestCount({ backendService: 'app', lb: { kind: 'internal' }, from: 0, to: 1000 }), /an internal load balancer with no region/);
 });
 
 test('CALLS', () => {

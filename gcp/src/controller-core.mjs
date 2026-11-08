@@ -2,14 +2,15 @@
 // the check, with AWS's states, causes and event names (lambda/src/lib/controller-core.mjs). Each action runs within one
 // request of at most 1800 s; the check only enqueues the naps it decides (POST /v1/tasks), never waiting in its 240 s.
 //
-// The map goes through the workload's switch (switch.mjs): the policy of a global load balancer, the swap of a regional or classic
-// one. The order differs: the policy lets visitors reach the application as soon as it is healthy, so AWAKE comes first and its
+// The map goes through the workload's switch (switch.mjs): the policy of a global load balancer, the swap of a regional, classic or
+// internal one. The order differs: the policy lets visitors reach the application as soon as it is healthy, so AWAKE comes first and its
 // removal follows. Under a swap they are at the waker until the application's back has spread, so a wake and a nap given up unswap
 // and wait, then AWAKE.
 //
 // A workload's configuration: `{ workloadId, urlMap, backendService, wakerBackendService (names), backends: [{ kind: 'vm'
 // | 'mig', location, name } | { kind: 'cloudsql', name } | { kind: 'k8s', cluster, namespace, service, owner }], idleMinutes, wakeTimeoutSeconds, hibernate?, lb? }`. `lb`: `{ kind: 'regional',
-// region }` or `{ kind: 'classic' }`, absent for a global load balancer. `config`: `{ project, region, controllerUrl }`.
+// region }`, `{ kind: 'internal', region }`, `{ kind: 'classic' }` or `{ kind: 'cross-region-internal' }`, absent for a global load balancer.
+// `config`: `{ project, region, controllerUrl }`.
 //
 // The check, the wake, the nap and the release act on the settings resolved through the levels (levels.mjs; vision
 // docs/specs/2026-11-08-google-cloud-router-features-design.md, section 4.5), as AWS's `effective()`: the idle window and the wake's
@@ -71,7 +72,7 @@ import { OPERATION_NOT_DONE } from './google.mjs';
 import { resendStale, startHeartbeat, staleness } from './heartbeat.mjs';
 import { effectiveOf, SWAP_WAKE_ROOM_SECONDS, WAKE_TIMEOUT_MAX } from './levels.mjs';
 import { faviconReachable, servedPage } from './pages.mjs';
-import { inOneUpdate, switchOf } from './switch.mjs';
+import { inOneUpdate, isRegionalLb, switchOf } from './switch.mjs';
 import { listenerRulesOf, mapBusy, references, UrlMapRefused } from './urlmaps.mjs';
 
 const POLL_MS = 2000;
@@ -107,7 +108,8 @@ const NAPPING_STUCK_MS = 35 * 60_000;
 // nap's way to its commit with one lost swap and each write at its worst: first the update of its map under way in this process,
 // which it waits for (urlmaps.mjs, F8), then its own, each the operation's 120 s and the pauses of a map busy with another (60 s on
 // a global map, 120 s on a regional one), so 180 s on classic and 240 s on regional. Classic 2 x 250 s + 2 x (180 s + 180 s) =
-// 1220 s, regional 2 x 100 s + 2 x (240 s + 240 s) = 1160 s, and the seconds of its reads. 22 minutes holds both, classic by 100 s,
+// 1220 s, regional 2 x 100 s + 2 x (240 s + 240 s) = 1160 s, and the seconds of its reads; internal as regional, cross-region internal
+// (a global map, regional's wait until M3) 920 s. 22 minutes holds them all, classic by 100 s,
 // and stays under the nap's request (NAP_BUDGET_MS, 29.5 minutes) and the 35 minutes of a nap stopping; the usual nap takes about
 // 5 minutes. Not held: a write behind a shared update that Google refused and that is tried again change by change (a 400 or a
 // 404, rare). Past it, what is called stuck is a nap that lost its swap twice or was given up after one loss (up to 610 s more on
@@ -321,7 +323,8 @@ export function createController({
 
   const setAutoscaler = ({ kind, location, name }, mode) => compute.setAutoscalerMode({ kind, location, name }, mode).catch(stillUnderWay);
 
-  const readService = ({ backendService, lb }) => (lb?.kind === 'regional' ? compute.getRegionBackendService(lb.region, backendService) : compute.getBackendService(backendService));
+  // In the service's scope: a regional or internal load balancer's in its region, the others' global.
+  const readService = ({ backendService, lb }) => (isRegionalLb(lb) ? compute.getRegionBackendService(lb.region, backendService) : compute.getBackendService(backendService));
 
   // The router's lists as the waker holds them (waker.mjs), for the requests the idle check reads in the logs.
   const listCache = lists.length ? createListCache({ store, lists, now, log }) : null;
@@ -378,7 +381,7 @@ export function createController({
   // In the service's scope. A service a classic load balancer holds reads no status while its VM is down (M3): none healthy. M9: a NEG at 0 replicas, whichever it answers,
   // none healthy either.
   async function healthyCount({ backendService, lb }) {
-    const regional = lb?.kind === 'regional';
+    const regional = isRegionalLb(lb);
     const { backends = [] } = await readService({ backendService, lb });
     const answers = await each(backends, ({ group }) => (regional
       ? compute.getRegionBackendServiceHealth(lb.region, backendService, group)

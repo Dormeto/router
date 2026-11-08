@@ -5,17 +5,26 @@
 //
 // By the load balancer's kind: global and classic log as `http_load_balancer`, the service's name in `backend_service_name`; a
 // regional one as its own resource, whose labels are its metric's (monitoring.mjs, M5: `backend_target_name`, the plain name),
-// and the region, as a regional service's name is unique only there. M2 (2026-11-08) read both kinds so.
+// and the region, as a regional service's name is unique only there. M2 (2026-11-08) read both kinds so. Both internal kinds log as
+// `internal_http_lb_rule`, with the regional one's labels (Google's page, "cross-region internal Application Load Balancers are the
+// same"): the regional one with its region; the cross-region one without, as its service is global and its entries' region is where
+// the proxy ran, not where the service is (to measure, M3). Read without the region, a regional internal service of the same name
+// would add its requests: the workload reads busier than it is, never idle by mistake.
 //
 // The entries are the requests, as many as the view holds: no count is compared with them, as Monitoring's is sampled and batched
 // (M2: its points late and in lumps, 13 for minutes that logged 4, gaps of six minutes); the controller reads it for empty logs only.
 // `null` past the limit, when they cannot be read, or when their pages do not end within 10 (or 3 of them empty): then the count
 // decides.
+import { aKind } from './switch.mjs';
+
 const LOGGING = 'https://logging.googleapis.com/v2';
-// The resource type of the entries and the label naming the backend service, by kind; the view's filter names the same types.
+// The resource type of the entries, the label naming the backend service and whether the region names it too, by kind; the view's
+// filter names the same types. A kind not named here (classic), or none, logs as the global one.
 const LOG_RESOURCES = {
-  global: { type: 'http_load_balancer', service: 'backend_service_name' },
-  regional: { type: 'http_external_regional_lb_rule', service: 'backend_target_name' },
+  global: { type: 'http_load_balancer', service: 'backend_service_name', inRegion: false },
+  regional: { type: 'http_external_regional_lb_rule', service: 'backend_target_name', inRegion: true },
+  internal: { type: 'internal_http_lb_rule', service: 'backend_target_name', inRegion: true },
+  'cross-region-internal': { type: 'internal_http_lb_rule', service: 'backend_target_name', inRegion: false },
 };
 
 export const CALLS = {
@@ -29,13 +38,12 @@ const PAGES_MAX = 10;
 const EMPTY_PAGES_MAX = 3;
 
 function filterOf(backendService, lb, from, to) {
-  const regional = lb?.kind === 'regional';
-  if (regional && !lb.region) throw new Error(`backend service ${backendService}: a regional load balancer with no region reads no request logs`);
-  const { type, service } = LOG_RESOURCES[regional ? 'regional' : 'global'];
+  const { type, service, inRegion } = LOG_RESOURCES[Object.hasOwn(LOG_RESOURCES, lb?.kind) ? lb.kind : 'global'];
+  if (inRegion && !lb.region) throw new Error(`backend service ${backendService}: ${aKind(lb.kind)} load balancer with no region reads no request logs`);
   return [
     `resource.type="${type}"`,
     `resource.labels.${service}="${backendService}"`,
-    ...(regional ? [`resource.labels.region="${lb.region}"`] : []),
+    ...(inRegion ? [`resource.labels.region="${lb.region}"`] : []),
     `timestamp>="${new Date(from).toISOString()}"`,
     `timestamp<"${new Date(to).toISOString()}"`,
   ].join(' AND ');

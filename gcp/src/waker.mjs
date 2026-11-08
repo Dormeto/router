@@ -11,7 +11,7 @@
 // matches a request without one, lambda/src/lib/no-wake.mjs) in wake mode browser: only a wake rule on what the fetch does carry
 // or an explicit wake's header wakes there, and the page's probe then does.
 //
-// Behind a swap (a regional or classic one, which `x-dormeto-switch: swap` says, as Firestore may not be readable), it gets the
+// Behind a swap (a regional, classic or internal one, which `x-dormeto-switch: swap` says, as Firestore may not be readable), it gets the
 // visitor's real request with no policy to override its code, and a 200 would tell an API client it succeeded: the page is a 503,
 // whatever the method and for any path but `/_dormeto/*`. That request is decided in the workload's wake mode: in `any`, one
 // the filters let through wakes; in `browser`, only the page's probe, an explicit wake or a wake rule does.

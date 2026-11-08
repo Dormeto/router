@@ -34,6 +34,6 @@ export function servedStore(store, customPages) {
 }
 
 // The load balancers visitors reach from the internet, as the nap's favicon read does. An internal one gets no icon, as on AWS: a kind
-// not named here (the internal kinds, when they come) reads none.
+// not named here (internal, cross-region-internal) reads none.
 const FROM_THE_INTERNET = new Set(['global', 'regional', 'classic']);
 export const faviconReachable = (lb) => FROM_THE_INTERNET.has(lb?.kind ?? 'global');

@@ -9,8 +9,8 @@
 // - for good, the route `/_dormeto/*` to the waker backend service, in each of those matchers (a path rule, or a route
 //   rule where the matcher uses route rules); the map's default alone gets a host rule `*` and a matcher
 //   `dormeto-default` to hold it.
-// - for the regional and classic load balancers, which have no such policy, the swap (below) and, for good, the hold route
-//   `/_dormeto/backend/*` to the application's service.
+// - for the regional, classic and internal load balancers, which have no such policy, the swap (below) and, for good, the hold
+//   route `/_dormeto/backend/*` to the application's service.
 // A customer's own policy on such a matcher or `/_dormeto/` route is refused (UrlMapRefused), never overwritten.
 //
 // The functions take a map as Google returns it and return a copy: `{ map, paths }`, `paths` being what was written
@@ -62,8 +62,10 @@ const soleService = (holder, serviceKey, actionKey) => {
 
 // ---- The regional waker's headers (M4: a regional backend service takes no custom request header) ----
 // On a regional load balancer the map carries the waker's headers instead, wherever it names the waker: a one-entry weighted
-// service whose header action replaces a client's own value. `headers`: [[name, value]], all named x-dormeto-*. A plain
-// reference swapped gets x-dormeto-ref: service too, so that the unswap writes the plain reference back.
+// service whose header action replaces a client's own value. So does an internal one's, regional or cross-region, whose backend
+// services take none either (Google's page), the cross-region one's map global: this regional form is the map's, whatever its
+// scope. `headers`: [[name, value]], all named x-dormeto-*. A plain reference swapped gets x-dormeto-ref: service too, so that the
+// unswap writes the plain reference back.
 const OUR_HEADER = /^x-dormeto-/;
 const REF_HEADER = 'x-dormeto-ref';
 const ourHeaders = (headers) => headers.map(([headerName, headerValue]) => ({ headerName, headerValue, replace: true }));
@@ -426,7 +428,7 @@ export function withoutHoldRoute(map, app, waker) {
   return { map: copy, paths };
 }
 
-// ---- The swap (design section 7): regional and classic load balancers have no custom error response ----
+// ---- The swap (design section 7): regional, classic and internal load balancers have no custom error response ----
 // The application's references become the waker's, at the nap, and back at the wake. Nothing is recorded: the waker backend
 // service is the workload's alone, so what names it outside the /_dormeto/* route was the application. The application's
 // URL, back, is the one its hold route kept in the map (else the waker's prefix: both are in one scope, regional or global).

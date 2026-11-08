@@ -7,7 +7,10 @@
 //
 // Global, classic and regional load balancers (the coverage design's section 7). A workload's `lb`: `{ kind: 'regional', region }`
 // or `{ kind: 'classic' }`, under a swap, with a hold route and a second header on the waker; absent in the configuration for a
-// global one, under the policy. The router reads only its own region's regional maps.
+// global one, under the policy. The router reads only its own region's regional maps. The internal ones (vision
+// docs/specs/2026-11-08-google-cloud-router-features-design.md, section 7) swap too: `{ kind: 'internal', region }`, a regional map whose
+// forwarding rules are INTERNAL_MANAGED, and `{ kind: 'cross-region-internal' }`, a global one whose rules are; their waker's headers
+// are in the map, as a regional one's.
 //
 // Cloud SQL companions (section 9): named at the onboarding, `{ kind: 'cloudsql', name }` among the backends, never without an
 // application. The router reads them at the project; the tag its update needs is the CLI's, bound before this.
@@ -37,15 +40,23 @@ import { beatOf } from './heartbeat.mjs';
 import { effectiveOf, inheritsOf, levelProblems } from './levels.mjs';
 import { SWITCH_HEADER, WORKLOAD_HEADER, WORKLOAD_ID, swapHeaders } from './names.mjs';
 import { CUSTOM_PAGE_NOT_SERVED, CUSTOM_PAGES_REFUSED, notServed, servedPage } from './pages.mjs';
-import { inOneUpdate, SWAP_WAIT_MS } from './switch.mjs';
+import { aKind, headersInMap, inOneUpdate, isRegionalLb, SWAP_WAIT_MS } from './switch.mjs';
 import {
   hostsOf, inMatcher, references, UrlMapRefused, withErrorPolicy, withHoldRoute, withoutErrorPolicy, withoutHoldRoute, withoutSwap, withoutWakerRoute, withSwap, withWakerRoute,
 } from './urlmaps.mjs';
 
 const COMPUTE = 'https://compute.googleapis.com/compute/v1';
-// A load balancer's scheme by its kind: of its forwarding rules, of its backend services, of the waker's.
-const SCHEME_OF = { global: 'EXTERNAL_MANAGED', classic: 'EXTERNAL', regional: 'EXTERNAL_MANAGED' };
-const SUPPORTED = 'only external Application Load Balancers are supported: global (EXTERNAL_MANAGED), classic (EXTERNAL) and regional (EXTERNAL_MANAGED)';
+// A load balancer's scheme by its kind: of its forwarding rules, of its backend services, of the waker's. INTERNAL_SELF_MANAGED (Cloud
+// Service Mesh) is no Application Load Balancer.
+const SCHEME_OF = {
+  global: 'EXTERNAL_MANAGED', classic: 'EXTERNAL', regional: 'EXTERNAL_MANAGED', internal: 'INTERNAL_MANAGED', 'cross-region-internal': 'INTERNAL_MANAGED',
+};
+// The kinds --load-balancer takes, and those of each scope of a map.
+const KINDS = ['global', 'regional', 'classic', 'internal', 'cross-region-internal'];
+const REGIONAL_KINDS = KINDS.filter((kind) => isRegionalLb({ kind }));
+const GLOBAL_KINDS = KINDS.filter((kind) => !isRegionalLb({ kind }));
+const KINDS_TEXT = `${KINDS.slice(0, -1).join(', ')} or ${KINDS.at(-1)}`;
+const SUPPORTED = 'only Application Load Balancers are supported: global (EXTERNAL_MANAGED), classic (EXTERNAL), regional (EXTERNAL_MANAGED), internal (INTERNAL_MANAGED) and cross-region-internal (INTERNAL_MANAGED)';
 const OTHER_ROUTERS = 'regional load balancers are onboarded on the router of their region';
 const GLOBAL_LB = { kind: 'global' };
 const NAME = /^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$/;
@@ -93,7 +104,6 @@ const zoneOf = (url) => /\/zones\/([^/]+)\//.exec(url)?.[1];
 const fromProjects = (url) => url.slice(Math.max(url.indexOf('projects/'), 0));
 const isoOf = (ms) => new Date(ms).toISOString();
 const isSwapped = (lb) => Object.hasOwn(SWAP_WAIT_MS, lb.kind);
-const isRegional = (lb) => lb.kind === 'regional';
 // The CLI sends `requestLogs` when it turned the backend service's logging on: what the logging was before, kept for the offboarding.
 function requestLogsProblems(asked) {
   if (typeof asked !== 'object' || asked === null || Array.isArray(asked)) return ['requestLogs: must be an object'];
@@ -246,19 +256,20 @@ function workloadOf(cfg, run, paused, router) {
 export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regionalUrlmaps, core, config, customPages = false, now = Date.now, log }) {
   const clients = { compute, kubernetesOf: (cluster) => gke.kubernetesOf(cluster) };
   const wakerName = (id) => `dmtr-${config.region}-${id}`;
-  const wakerUrl = (name, lb) => `${COMPUTE}/projects/${config.project}/${isRegional(lb) ? `regions/${lb.region}` : 'global'}/backendServices/${name}`;
-  // A regional backend service takes no custom request header (M4: Google refuses them): its waker's are written in the map,
-  // and the service says whose waker it is in its description, which a later onboarding of the same workload reads.
+  const wakerUrl = (name, lb) => `${COMPUTE}/projects/${config.project}/${isRegionalLb(lb) ? `regions/${lb.region}` : 'global'}/backendServices/${name}`;
+  // A regional backend service takes no custom request header (M4: Google refuses them), nor does an internal one, regional or
+  // cross-region (Google's page): its waker's are written in the map, and the service says whose waker it is in its description,
+  // which a later onboarding of the same workload reads.
   const wakerHeaders = (id, lb) => [`${WORKLOAD_HEADER}: ${id}`, ...(isSwapped(lb) ? [`${SWITCH_HEADER}: swap`] : [])];
   const wakerDescription = (id) => `Dormeto: the waker of workload ${id}`;
-  const mapHeaders = (id, lb) => ({ headers: isRegional(lb) ? swapHeaders(id) : undefined });
-  const isWakerOf = (service, id, lb) => (isRegional(lb)
+  const mapHeaders = (id, lb) => ({ headers: headersInMap(lb) ? swapHeaders(id) : undefined });
+  const isWakerOf = (service, id, lb) => (headersInMap(lb)
     ? service.description === wakerDescription(id) && !service.customRequestHeaders?.length
     : service.customRequestHeaders?.length === wakerHeaders(id, lb).length && wakerHeaders(id, lb).every((h) => service.customRequestHeaders.includes(h)));
-  const mapsOf = (lb) => (isRegional(lb) ? regionalUrlmaps : urlmaps);
-  const getService = (name, lb) => (isRegional(lb) ? compute.getRegionBackendService(lb.region, name) : compute.getBackendService(name));
-  const deleteService = (name, lb) => (isRegional(lb) ? compute.deleteRegionBackendService(lb.region, name) : compute.deleteBackendService(name));
-  const insertService = (body, lb) => (isRegional(lb) ? compute.insertRegionBackendService(lb.region, body) : compute.insertBackendService(body));
+  const mapsOf = (lb) => (isRegionalLb(lb) ? regionalUrlmaps : urlmaps);
+  const getService = (name, lb) => (isRegionalLb(lb) ? compute.getRegionBackendService(lb.region, name) : compute.getBackendService(name));
+  const deleteService = (name, lb) => (isRegionalLb(lb) ? compute.deleteRegionBackendService(lb.region, name) : compute.deleteBackendService(name));
+  const insertService = (body, lb) => (isRegionalLb(lb) ? compute.insertRegionBackendService(lb.region, body) : compute.insertBackendService(body));
 
   // The request's fields, or a 400. Without an ID, the backend service's name, when it is one. `needsAll`: an onboarding's `gke` names all, a dry run's the cluster alone.
   function requested({ urlMap, backendService, id, settings = {}, loadBalancer, cloudSql = [], gke: gkeAsked, requestLogs, fallbackInstanceTypes }, { needsAll = false } = {}) {
@@ -266,7 +277,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     for (const [key, value] of Object.entries({ urlMap, backendService })) {
       if (typeof value !== 'string' || !NAME.test(value)) throw bad(`${key}: ${JSON.stringify(value)} is not a Compute Engine name`);
     }
-    if (loadBalancer !== undefined && !['global', 'regional', 'classic'].includes(loadBalancer)) throw bad(`loadBalancer: ${JSON.stringify(loadBalancer)} is not global, regional or classic`);
+    if (loadBalancer !== undefined && !KINDS.includes(loadBalancer)) throw bad(`loadBalancer: ${JSON.stringify(loadBalancer)} is not ${KINDS_TEXT}`);
     const workloadId = checkedId(id || backendService);
     const waker = wakerName(workloadId);
     if (waker.length > NAME_MAX) throw bad(`workload ID ${workloadId} would name the waker backend service ${waker}, longer than the ${NAME_MAX} characters of a Compute Engine name: use a shorter one`);
@@ -276,15 +287,17 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   }
 
   // The URL map, `{ map, regional }`, or why it is not one: `{ reason }`. A regional one elsewhere than the router's region reads as none.
+  // `asked`: a kind, whose map's scope alone is read.
   async function findMap(urlMap, asked) {
+    const askedRegional = Boolean(asked) && isRegionalLb({ kind: asked });
     const [inGlobal, inRegion] = await Promise.all([
-      asked === 'regional' ? null : urlmaps.get(urlMap).catch(absent),
-      asked && asked !== 'regional' ? null : regionalUrlmaps.get(urlMap).catch(absent),
+      askedRegional ? null : urlmaps.get(urlMap).catch(absent),
+      asked && !askedRegional ? null : regionalUrlmaps.get(urlMap).catch(absent),
     ]);
-    if (inGlobal && inRegion) return { reason: `URL map ${urlMap} exists globally and in region ${config.region}: say which with --load-balancer global, classic or regional` };
+    if (inGlobal && inRegion) return { reason: `URL map ${urlMap} exists globally and in region ${config.region}: say which with --load-balancer ${KINDS_TEXT}` };
     if (inGlobal || inRegion) return { map: inGlobal ?? inRegion, regional: Boolean(inRegion) };
-    if (asked === 'regional') return { reason: `URL map ${urlMap} not found in region ${config.region}: ${OTHER_ROUTERS}` };
-    if (asked) return { reason: `URL map ${urlMap} not found: name a global URL map of this project, or use --load-balancer regional` };
+    if (askedRegional) return { reason: `URL map ${urlMap} not found in region ${config.region}: ${OTHER_ROUTERS}` };
+    if (asked) return { reason: `URL map ${urlMap} not found: name a global URL map of this project, or use --load-balancer ${asked === 'cross-region-internal' ? 'internal' : 'regional'}` };
     return { reason: `URL map ${urlMap} not found: name a global URL map of this project, or a regional one of ${config.region}: ${OTHER_ROUTERS}` };
   }
 
@@ -295,26 +308,27 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     return [...global, ...aggregated.filter((r) => r.region)];
   }
 
-  // The URL map's load balancer: one target proxy, and forwarding rules whose scheme tells a global from a classic one.
-  // `{ kind, reasons }`, `kind` null when there is nothing supported to tell it from.
+  // The URL map's load balancer: one target proxy, and forwarding rules whose scheme tells a global from a classic or a cross-region
+  // internal one, and a regional from an internal one. `{ kind, reasons }`, `kind` null when there is nothing supported to tell it from.
   async function loadBalancerOf(urlMap, regional, asked) {
     const [https, http, rules] = await Promise.all(regional
       ? [compute.listRegionTargetHttpsProxies(config.region), compute.listRegionTargetHttpProxies(config.region), compute.listRegionForwardingRules(config.region)]
       : [compute.listTargetHttpsProxies(), compute.listTargetHttpProxies(), globalRules()]);
     const refused = (...reasons) => ({ kind: null, reasons });
     const proxies = [...https, ...http].filter((p) => nameOf(p.urlMap ?? '') === urlMap);
-    if (!proxies.length) return refused(`URL map ${urlMap} is used by no target proxy: attach it to an external Application Load Balancer, then onboard again`);
+    if (!proxies.length) return refused(`URL map ${urlMap} is used by no target proxy: attach it to an Application Load Balancer, then onboard again`);
     if (proxies.length > 1) return refused(`URL map ${urlMap} is used by ${proxies.length} target proxies (${proxies.map((p) => p.name).join(', ')}): give each load balancer its own URL map`);
     const fronts = rules.filter((r) => fromProjects(r.target ?? '') === fromProjects(proxies[0].selfLink));
     if (!fronts.length) return refused(`no forwarding rule sends to the target proxy of URL map ${urlMap}: add one, then onboard again`);
-    const kinds = regional ? ['regional'] : ['global', 'classic'];
+    const kinds = regional ? REGIONAL_KINDS : GLOBAL_KINDS;
     const kindsOf = (rule) => kinds.filter((kind) => SCHEME_OF[kind] === rule.loadBalancingScheme);
     const unsupported = fronts.filter((r) => !kindsOf(r).length);
     if (unsupported.length) return refused(...unsupported.map((r) => `forwarding rule ${r.name} has the scheme ${r.loadBalancingScheme}: ${SUPPORTED}`));
     const found = new Set(fronts.flatMap(kindsOf));
-    if (found.size > 1) return refused(`URL map ${urlMap} has forwarding rules of a global and of a classic load balancer (${fronts.map((r) => `${r.name} ${r.loadBalancingScheme}`).join(', ')}): finish its migration, then onboard again`);
+    // A proxy migrating from classic to global has rules of both schemes. Google gives an internal one no external rule.
+    if (found.size > 1) return refused(`URL map ${urlMap} has forwarding rules of ${[...found].map(aKind).join(' and of ')} load balancer (${fronts.map((r) => `${r.name} ${r.loadBalancingScheme}`).join(', ')}): finish its migration, then onboard again`);
     const [kind] = found;
-    return { kind, reasons: asked && asked !== kind ? [`URL map ${urlMap} belongs to a ${kind} load balancer, not a ${asked} one: onboard it with --load-balancer ${kind}`] : [] };
+    return { kind, reasons: asked && asked !== kind ? [`URL map ${urlMap} belongs to ${aKind(kind)} load balancer, not ${aKind(asked)} one: onboard it with --load-balancer ${kind}`] : [] };
   }
 
   // What the route and the nap would write, tried on the map as it is, the nap's after the route: the route gives the map's
@@ -527,13 +541,14 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     if (!map) return { reasons: [...reasons, reason], ...nothing };
     const front = await loadBalancerOf(urlMap, regional, loadBalancer);
     reasons.push(...front.reasons);
-    const kind = front.kind ?? (regional ? 'regional' : loadBalancer ?? 'global');
+    // Not told: the kind asked for, whose scope is the map's, else its scope's first.
+    const kind = front.kind ?? loadBalancer ?? (regional ? 'regional' : 'global');
     const lb = regional ? { kind, region: config.region } : { kind };
     const told = front.kind ? { lb } : {};
     if (front.kind) reasons.push(...onboardSettingsProblems(settings, lb));
 
     // A backend service's name is unique in its scope.
-    const owner = others.find((c) => c.backendService === backendService && isRegional(c.lb ?? GLOBAL_LB) === regional);
+    const owner = others.find((c) => c.backendService === backendService && isRegionalLb(c.lb ?? GLOBAL_LB) === regional);
     if (owner) reasons.push(`backend service ${backendService} is already workload ${owner.workloadId}`);
     const service = await getService(backendService, lb).catch(absent);
     if (!service) {
@@ -541,7 +556,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
       return { reasons, ...told, ...nothing };
     }
 
-    if (front.kind && service.loadBalancingScheme !== SCHEME_OF[kind]) reasons.push(`backend service ${backendService} has the scheme ${service.loadBalancingScheme}: the backend services of a ${kind} load balancer have ${SCHEME_OF[kind]}`);
+    if (front.kind && service.loadBalancingScheme !== SCHEME_OF[kind]) reasons.push(`backend service ${backendService} has the scheme ${service.loadBalancingScheme}: the backend services of ${aKind(kind)} load balancer have ${SCHEME_OF[kind]}`);
     if (!references(map, backendService).length) reasons.push(`backend service ${backendService} is not named in URL map ${urlMap}: route to it there, or name the URL map that does`);
     for (const other of await mapsOf(lb).list()) {
       if (other.name !== urlMap && references(other, backendService).length) {
@@ -692,14 +707,16 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     try {
       if (!wakerExists) {
         // M4 (the coverage design's section 10): Google takes a classic backend service with EXTERNAL and its two custom request
-        // headers on the router's serverless NEG, and refuses those headers on a regional one, whose map carries them instead.
+        // headers on the router's serverless NEG, and refuses those headers on a regional one, whose map carries them instead, as an
+        // internal one's does. An internal one's waker is INTERNAL_MANAGED on the same NEG (to measure, M3: else the install makes a
+        // second NEG for them).
         await insertService({
           name,
-          ...(isRegional(lb) ? { description: wakerDescription(id) } : {}),
+          ...(headersInMap(lb) ? { description: wakerDescription(id) } : {}),
           loadBalancingScheme: SCHEME_OF[lb.kind],
           protocol: 'HTTPS',
           backends: [{ group: `${COMPUTE}/projects/${config.project}/regions/${config.region}/networkEndpointGroups/${config.wakerNeg}` }],
-          ...(isRegional(lb) ? {} : { customRequestHeaders: wakerHeaders(id, lb) }),
+          ...(headersInMap(lb) ? {} : { customRequestHeaders: wakerHeaders(id, lb) }),
         }, lb).catch(refusedByGoogle(id, `its waker backend service ${name}`));
       }
       await mapsOf(lb).modify(urlMap, (map) => inOneUpdate(map, isSwapped(lb)

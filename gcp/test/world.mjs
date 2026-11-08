@@ -202,6 +202,21 @@ export function regional(w) {
   w.regions[REGION] = regionOf();
 }
 
+// The regional load balancer as an internal one: `INTERNAL_MANAGED` on its forwarding rule and its backend services.
+export function internal(w) {
+  regional(w);
+  const inRegion = w.regions[REGION];
+  inRegion.forwardingRules[0].loadBalancingScheme = 'INTERNAL_MANAGED';
+  for (const service of Object.values(inRegion.services)) service.loadBalancingScheme = 'INTERNAL_MANAGED';
+}
+
+// The defaults' load balancer as a cross-region internal one: its global map, `INTERNAL_MANAGED` on its global forwarding rule and its
+// backend services.
+export function crossRegionInternal(w) {
+  w.forwardingRules[0].loadBalancingScheme = 'INTERNAL_MANAGED';
+  for (const service of Object.values(w.services)) service.loadBalancingScheme = 'INTERNAL_MANAGED';
+}
+
 const SQLADMIN = 'https://sqladmin.googleapis.com/v1/projects/p/';
 const CONTAINER = 'https://container.googleapis.com/v1/projects/p/';
 const notFound = (what) => new GoogleError(`Google: ${what}: 404 not found`, { code: 404, status: 'NOT_FOUND', reason: 'notFound' });

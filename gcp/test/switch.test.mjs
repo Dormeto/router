@@ -34,10 +34,15 @@ for (const [name, lb] of [['no lb', undefined], ['global', { kind: 'global' }]])
   });
 }
 
-// A regional waker has its headers in the map (M4), a classic one on its backend service.
+// A regional waker has its headers in the map (M4), as an internal one's, regional or cross-region (internal backend services take no
+// custom request header): the cross-region one's map is global. A classic one has them on its backend service. The internal kinds wait
+// as regional does until M3 measures them.
+const MAP_HEADERS = [['x-dormeto-workload', 'demo'], ['x-dormeto-switch', 'swap']];
 for (const [kind, lb, base, adapter, waitMs, headers] of [
-  ['regional', { kind: 'regional', region: 'europe-west1' }, `${V1}/regions/europe-west1`, regionalUrlmaps, 100_000, [['x-dormeto-workload', 'demo'], ['x-dormeto-switch', 'swap']]],
+  ['regional', { kind: 'regional', region: 'europe-west1' }, `${V1}/regions/europe-west1`, regionalUrlmaps, 100_000, MAP_HEADERS],
   ['classic', { kind: 'classic' }, `${V1}/global`, urlmaps, 250_000, undefined],
+  ['internal', { kind: 'internal', region: 'europe-west1' }, `${V1}/regions/europe-west1`, regionalUrlmaps, 100_000, MAP_HEADERS],
+  ['cross-region-internal', { kind: 'cross-region-internal' }, `${V1}/global`, urlmaps, 100_000, MAP_HEADERS],
 ]) {
   const waker = `${base}/backendServices/${WAKER}`;
   const app = `${base}/backendServices/app`;
@@ -65,6 +70,20 @@ for (const [kind, lb, base, adapter, waitMs, headers] of [
     assert.deepEqual(map, inOneUpdate(mapOf(base), [(m) => withHoldRoute(m, 'app', waker), (m) => withWakerRoute(m, 'app', waker, { headers })]).map);
     assert.equal(paths.length, 2);
     assert.deepEqual(sw.route(map).paths, []);
+  });
+
+  test(`${kind}: the waker's headers ${headers ? 'in the map, wherever it names the waker' : 'not in the map'}`, () => {
+    const map = sw.route(mapOf(base)).map;
+    const wakerRule = map.pathMatchers[0].pathRules.find((rule) => rule.paths[0] === '/_dormeto/*');
+    const swapped = sw.asleep(map).map.pathMatchers[0].defaultRouteAction;
+    if (!headers) {
+      assert.deepEqual(wakerRule, { paths: ['/_dormeto/*'], service: waker });
+      assert.equal(swapped, undefined);
+      return;
+    }
+    const written = headers.map(([headerName, headerValue]) => ({ headerName, headerValue, replace: true }));
+    assert.deepEqual(wakerRule.routeAction.weightedBackendServices, [{ backendService: waker, weight: 100, headerAction: { requestHeadersToAdd: written } }]);
+    assert.deepEqual(swapped.weightedBackendServices, [{ backendService: waker, weight: 100, headerAction: { requestHeadersToAdd: [...written, { headerName: 'x-dormeto-ref', headerValue: 'service', replace: true }] } }]);
   });
 
   test(`${kind}: on a swapped map that lost them, the route writes both, the hold naming the application`, () => {
@@ -100,8 +119,14 @@ test('a regional workload elsewhere than the router\'s region is refused: the ad
   assert.throws(() => switchOf(cfgOf({ kind: 'regional' }), place), /regional load balancer of undefined on the router of europe-west1/);
 });
 
+test('an internal workload elsewhere than the router\'s region is refused as a regional one; a cross-region one has no region to be in', () => {
+  assert.throws(() => switchOf(cfgOf({ kind: 'internal', region: 'us-east1' }), place), /an internal load balancer of us-east1 on the router of europe-west1/);
+  assert.equal(switchOf(cfgOf({ kind: 'cross-region-internal' }), place).urlmaps, urlmaps);
+});
+
 test('a kind nobody knows is refused, not taken for a global one', () => {
-  assert.throws(() => switchOf(cfgOf({ kind: 'internal' }), place), /unknown load balancer kind internal/);
+  assert.throws(() => switchOf(cfgOf({ kind: 'unread' }), place), /unknown load balancer kind unread/);
+  assert.throws(() => switchOf(cfgOf({ kind: 'internal-self-managed' }), place), /unknown load balancer kind internal-self-managed/);
 });
 
 test('inOneUpdate: each step on the map of the one before, the places in order', () => {
@@ -112,6 +137,8 @@ test('inOneUpdate: each step on the map of the one before, the places in order',
 test('a regional configuration without its workload ID is refused: its waker\'s headers in the map would name no workload', () => {
   const { workloadId, ...cfg } = cfgOf({ kind: 'regional', region: 'europe-west1' });
   assert.equal(workloadId, 'demo');
-  assert.throws(() => switchOf(cfg, place), /regional workload needs its ID/);
+  assert.throws(() => switchOf(cfg, place), /a regional workload needs its ID/);
+  assert.throws(() => switchOf({ ...cfg, lb: { kind: 'internal', region: 'europe-west1' } }, place), /an internal workload needs its ID/);
+  assert.throws(() => switchOf({ ...cfg, lb: { kind: 'cross-region-internal' } }, place), /a cross-region-internal workload needs its ID/);
   assert.equal(switchOf({ ...cfg, lb: { kind: 'classic' } }, place).kind, 'swap');
 });

@@ -5,7 +5,7 @@ import { STATES } from '../../lambda/src/lib/state.mjs';
 import { GoogleError } from '../src/google.mjs';
 import { Refusal } from '../src/onboarding.mjs';
 import {
-  CLUSTER, CONTROLLER, DEFAULT_FROM, DEFAULT_SETTINGS, GKE_DRY, GKE_INPUT, GKE_NEG, INPUT, K8S_BACKEND, NEG, NEG_READINGS, OWNER, REGION, V1, WAKER, WAKER_URL, ZONE, classic, onGke, regionOf, regional, regionalUrl,
+  CLUSTER, CONTROLLER, DEFAULT_FROM, DEFAULT_SETTINGS, GKE_DRY, GKE_INPUT, GKE_NEG, INPUT, K8S_BACKEND, NEG, NEG_READINGS, OWNER, REGION, V1, WAKER, WAKER_URL, ZONE, classic, crossRegionInternal, internal, onGke, regionOf, regional, regionalUrl,
   serviceUrl, setup, unmanagedUrl,
 } from './world.mjs';
 
@@ -16,6 +16,9 @@ const refused = (status, reason, message) => (err) => {
   if (message) assert.match(err.message, message);
   return true;
 };
+
+// A load balancer's kind in a test's name: a regional, an internal.
+const a = (kind) => `${/^[aeiou]/.test(kind) ? 'an' : 'a'} ${kind}`;
 
 // A map as it was, but for its fingerprint: Google changes it at each write.
 const assertSameMap = (actual, expected) => assert.deepEqual({ ...actual, fingerprint: null }, { ...expected, fingerprint: null });
@@ -38,7 +41,7 @@ const withNeg = (w, { name = 'neg', vm = {}, endpoints = ['neg-vm'], ...fields }
 
 const REFUSALS = [
   ['a URL map that does not exist', (w) => { delete w.urlMaps.lb; }, ['URL map lb not found: name a global URL map of this project, or a regional one of europe-west1: regional load balancers are onboarded on the router of their region']],
-  ['a URL map no target proxy uses', (w) => { w.httpsProxies = []; }, ['URL map lb is used by no target proxy: attach it to an external Application Load Balancer, then onboard again']],
+  ['a URL map no target proxy uses', (w) => { w.httpsProxies = []; }, ['URL map lb is used by no target proxy: attach it to an Application Load Balancer, then onboard again']],
   ['a URL map two target proxies use', (w) => {
     w.httpProxies = [{ name: 'lb-http', selfLink: `${V1}/global/targetHttpProxies/lb-http`, urlMap: `${V1}/global/urlMaps/lb` }];
   }, ['URL map lb is used by 2 target proxies (lb-https, lb-http): give each load balancer its own URL map']],
@@ -291,7 +294,7 @@ test('bad input is a 400 before any read', async () => {
     // A top-level field of the body (ruling 1 of the plan's ledger), not a setting of the levels.
     [{ ...INPUT, settings: { fallbackInstanceTypes: ['e2-medium'] } }, /settings: unknown setting fallbackInstanceTypes/],
     [{ ...INPUT, settings: { joinMinutes: 15 } }, /settings: unknown setting joinMinutes/],
-    [{ ...INPUT, loadBalancer: 'internal' }, /loadBalancer: "internal" is not global, regional or classic/],
+    [{ ...INPUT, loadBalancer: 'internal-self-managed' }, /loadBalancer: "internal-self-managed" is not global, regional, classic, internal or cross-region-internal/],
     [{ ...INPUT, settings: { hibernate: 'yes' } }, /settings: hibernate must be true or false/],
     [{ ...INPUT, settings: { hibernate: null } }, /settings: hibernate must be true or false/],
     [{ ...INPUT, settings: { constructor: 1 } }, /settings: unknown setting constructor/],
@@ -552,8 +555,10 @@ test('onboard: a customer\'s route written between the checks and the update is 
 const REGION_URL = `${V1}/regions/${REGION}`;
 const REGIONAL_WAKER_URL = regionalUrl(WAKER);
 const inRegion = (w) => w.regions[REGION];
-const SUPPORTED = 'only external Application Load Balancers are supported: global (EXTERNAL_MANAGED), classic (EXTERNAL) and regional (EXTERNAL_MANAGED)';
+const SUPPORTED = 'only Application Load Balancers are supported: global (EXTERNAL_MANAGED), classic (EXTERNAL), regional (EXTERNAL_MANAGED), internal (INTERNAL_MANAGED) and cross-region-internal (INTERNAL_MANAGED)';
 const REGIONAL_LB = { kind: 'regional', region: REGION };
+const INTERNAL_LB = { kind: 'internal', region: REGION };
+const CROSS_REGION_LB = { kind: 'cross-region-internal' };
 
 // The same name in both scopes.
 const both = (w) => { w.regions[REGION] = regionOf(); };
@@ -578,7 +583,7 @@ test('a regional rule of another proxy with the same last two segments is not th
 });
 
 const LB_REFUSALS = [
-  ['the same name globally and in the region, without --load-balancer', both, {}, ['URL map lb exists globally and in region europe-west1: say which with --load-balancer global, classic or regional']],
+  ['the same name globally and in the region, without --load-balancer', both, {}, ['URL map lb exists globally and in region europe-west1: say which with --load-balancer global, regional, classic, internal or cross-region-internal']],
   ['a regional map in another region: it reads as not found, and the router of its region is named', (w) => {
     regional(w);
     delete w.regions[REGION];
@@ -587,15 +592,33 @@ const LB_REFUSALS = [
   ['--load-balancer regional with a map only elsewhere', (w) => { w.regions['us-central1'] = regionOf('us-central1'); }, { loadBalancer: 'regional' }, ['URL map lb not found in region europe-west1: regional load balancers are onboarded on the router of their region']],
   ['--load-balancer global with a map only in the region', regional, { loadBalancer: 'global' }, ['URL map lb not found: name a global URL map of this project, or use --load-balancer regional']],
   ['--load-balancer classic with a map only in the region', regional, { loadBalancer: 'classic' }, ['URL map lb not found: name a global URL map of this project, or use --load-balancer regional']],
+  ['--load-balancer internal with a map only global', crossRegionInternal, { loadBalancer: 'internal' }, ['URL map lb not found in region europe-west1: regional load balancers are onboarded on the router of their region']],
+  ['--load-balancer cross-region-internal with a map only in the region', internal, { loadBalancer: 'cross-region-internal' }, ['URL map lb not found: name a global URL map of this project, or use --load-balancer internal']],
   ['a mix of EXTERNAL and EXTERNAL_MANAGED forwarding rules', (w) => {
     w.forwardingRules.push({ name: 'lb-fr2', target: w.forwardingRules[0].target, loadBalancingScheme: 'EXTERNAL' });
   }, {}, ['URL map lb has forwarding rules of a global and of a classic load balancer (lb-fr EXTERNAL_MANAGED, lb-fr2 EXTERNAL): finish its migration, then onboard again']],
-  ['a global INTERNAL_MANAGED', (w) => { w.forwardingRules[0].loadBalancingScheme = 'INTERNAL_MANAGED'; }, {}, [`forwarding rule lb-fr has the scheme INTERNAL_MANAGED: ${SUPPORTED}`]],
-  ['a regional INTERNAL_MANAGED', (w) => {
+  // Cloud Service Mesh: no Application Load Balancer, whatever the map's scope.
+  ['a global INTERNAL_SELF_MANAGED', (w) => {
+    w.forwardingRules[0].loadBalancingScheme = 'INTERNAL_SELF_MANAGED';
+    w.services.app.loadBalancingScheme = 'INTERNAL_SELF_MANAGED';
+  }, {}, [`forwarding rule lb-fr has the scheme INTERNAL_SELF_MANAGED: ${SUPPORTED}`]],
+  ['a regional INTERNAL_SELF_MANAGED', (w) => {
     regional(w);
-    inRegion(w).forwardingRules[0].loadBalancingScheme = 'INTERNAL_MANAGED';
-    inRegion(w).services.app.loadBalancingScheme = 'INTERNAL_MANAGED';
-  }, {}, [`forwarding rule lb-fr has the scheme INTERNAL_MANAGED: ${SUPPORTED}`]],
+    inRegion(w).forwardingRules[0].loadBalancingScheme = 'INTERNAL_SELF_MANAGED';
+    inRegion(w).services.app.loadBalancingScheme = 'INTERNAL_SELF_MANAGED';
+  }, {}, [`forwarding rule lb-fr has the scheme INTERNAL_SELF_MANAGED: ${SUPPORTED}`]],
+  ['--load-balancer regional on an internal load balancer', internal, { loadBalancer: 'regional' }, ['URL map lb belongs to an internal load balancer, not a regional one: onboard it with --load-balancer internal']],
+  ['--load-balancer internal on a regional load balancer', regional, { loadBalancer: 'internal' }, ['URL map lb belongs to a regional load balancer, not an internal one: onboard it with --load-balancer regional']],
+  ['--load-balancer global on a cross-region internal load balancer', crossRegionInternal, { loadBalancer: 'global' }, ['URL map lb belongs to a cross-region-internal load balancer, not a global one: onboard it with --load-balancer cross-region-internal']],
+  ['--load-balancer cross-region-internal on a global load balancer', () => {}, { loadBalancer: 'cross-region-internal' }, ['URL map lb belongs to a global load balancer, not a cross-region-internal one: onboard it with --load-balancer global']],
+  ['an internal load balancer\'s service of an external scheme', (w) => {
+    internal(w);
+    inRegion(w).services.app.loadBalancingScheme = 'EXTERNAL_MANAGED';
+  }, {}, ['backend service app has the scheme EXTERNAL_MANAGED: the backend services of an internal load balancer have INTERNAL_MANAGED']],
+  ['a cross-region internal load balancer\'s service of an external scheme', (w) => {
+    crossRegionInternal(w);
+    w.services.app.loadBalancingScheme = 'EXTERNAL_MANAGED';
+  }, {}, ['backend service app has the scheme EXTERNAL_MANAGED: the backend services of a cross-region-internal load balancer have INTERNAL_MANAGED']],
   ['--load-balancer global on a classic load balancer', classic, { loadBalancer: 'global' }, ['URL map lb belongs to a classic load balancer, not a global one: onboard it with --load-balancer classic']],
   ['--load-balancer classic on a global load balancer', () => {}, { loadBalancer: 'classic' }, ['URL map lb belongs to a global load balancer, not a classic one: onboard it with --load-balancer global']],
   ['a classic load balancer\'s service of the other scheme', (w) => {
@@ -610,7 +633,7 @@ const LB_REFUSALS = [
   ['a regional map no target proxy uses', (w) => {
     regional(w);
     inRegion(w).httpsProxies = [];
-  }, {}, ['URL map lb is used by no target proxy: attach it to an external Application Load Balancer, then onboard again']],
+  }, {}, ['URL map lb is used by no target proxy: attach it to an Application Load Balancer, then onboard again']],
   ['a regional target proxy no forwarding rule sends to', (w) => {
     regional(w);
     inRegion(w).forwardingRules = [];
@@ -630,6 +653,18 @@ const LB_REFUSALS = [
     regional(w);
     inRegion(w).services[WAKER] = { name: WAKER, backends: [] };
   }, {}, [`backend service ${WAKER} exists and is not the waker of demo: rename it, or onboard under another id`]],
+  // The internal kinds' waker is told by its description, as the regional one's.
+  ['an internal waker name taken by another service', (w) => {
+    internal(w);
+    inRegion(w).services[WAKER] = { name: WAKER, backends: [] };
+  }, {}, [`backend service ${WAKER} exists and is not the waker of demo: rename it, or onboard under another id`]],
+  ['a cross-region internal waker name taken by a classic waker, of two headers', (w) => {
+    crossRegionInternal(w);
+    w.services[WAKER] = { name: WAKER, customRequestHeaders: ['x-dormeto-workload: demo', 'x-dormeto-switch: swap'], backends: [] };
+  }, {}, [`backend service ${WAKER} exists and is not the waker of demo: rename it, or onboard under another id`]],
+  ['a global waker name taken by a cross-region internal waker, of a description and no header', (w) => {
+    w.services[WAKER] = { name: WAKER, description: 'Dormeto: the waker of workload demo', backends: [] };
+  }, {}, [`backend service ${WAKER} exists and is not the waker of demo: rename it, or onboard under another id`]],
 ];
 
 for (const [name, change, input, reasons] of LB_REFUSALS) {
@@ -646,6 +681,8 @@ for (const [name, change, input, reasons] of LB_REFUSALS) {
 const SWAPS = [
   ['classic', classic, (w) => w.urlMaps.lb, serviceUrl],
   ['regional', regional, (w) => inRegion(w).urlMaps.lb, regionalUrl],
+  ['internal', internal, (w) => inRegion(w).urlMaps.lb, regionalUrl],
+  ['cross-region-internal', crossRegionInternal, (w) => w.urlMaps.lb, serviceUrl],
 ];
 const SWAP_REFUSALS = [
   ['tests naming the application', (map, url) => { map.tests = [{ host: 'demo.example.com', path: '/', service: url('app') }]; }, /has tests naming backend service app.*: change that, then onboard again$/],
@@ -664,7 +701,7 @@ const SWAP_REFUSALS = [
 ];
 for (const [kind, world, mapOf, url] of SWAPS) {
   for (const [name, write, reason] of SWAP_REFUSALS) {
-    test(`dry run: a ${kind} map with ${name} is refused, as a swap would fail`, async () => {
+    test(`dry run: ${a(kind)} map with ${name} is refused, as a swap would fail`, async () => {
       const { w, onboarding } = setup((x) => {
         world(x);
         write(mapOf(x), url);
@@ -676,7 +713,7 @@ for (const [kind, world, mapOf, url] of SWAPS) {
       assert.deepEqual(w.changes, []);
     });
   }
-  test(`dry run: a ${kind} map naming the application only by a default that a host rule * hides is refused`, async () => {
+  test(`dry run: ${a(kind)} map naming the application only by a default that a host rule * hides is refused`, async () => {
     const { onboarding } = setup((x) => {
       world(x);
       const map = mapOf(x);
@@ -708,6 +745,18 @@ test('dry run: the load balancer it found, by the forwarding rules\' scheme, and
   assert.deepEqual((await setup(classic).onboarding.dryRun({ ...INPUT, loadBalancer: 'classic' })).lb, { kind: 'classic' });
   assert.deepEqual((await setup(regional).onboarding.dryRun(INPUT)).lb, REGIONAL_LB);
   assert.deepEqual((await setup(regional).onboarding.dryRun({ ...INPUT, loadBalancer: 'regional' })).lb, REGIONAL_LB);
+});
+
+// INTERNAL_MANAGED rules: internal on a regional map, in the router's region; cross-region-internal on a global map.
+test('dry run: an INTERNAL_MANAGED regional map is internal, a global one cross-region-internal, found or said; eligible', async () => {
+  for (const [world, lb] of [[internal, INTERNAL_LB], [crossRegionInternal, CROSS_REGION_LB]]) {
+    for (const input of [INPUT, { ...INPUT, loadBalancer: lb.kind }]) {
+      const { w, onboarding } = setup(world);
+      const answer = await onboarding.dryRun(input);
+      assert.deepEqual([answer.eligible, answer.reasons, answer.lb], [true, [], lb], lb.kind);
+      assert.deepEqual(w.changes, []);
+    }
+  }
 });
 
 test('dry run: a load balancer it cannot tell is named as none', async () => {
@@ -761,6 +810,34 @@ test('onboard regional: the waker in the region, EXTERNAL_MANAGED, HTTPS, on the
   assert.deepEqual(w.services, {}, 'nothing global');
 });
 
+// Google's page: the backend services of an internal load balancer, regional or cross-region, take no custom request header. Its
+// waker's are in the map, and the description says whose waker it is, as on a regional one.
+test('onboard internal: the waker in the region, INTERNAL_MANAGED, HTTPS, on the router\'s NEG, with no header but a description naming it', async () => {
+  const { w, onboarding } = setup(internal);
+  await onboarding.onboard(INPUT);
+  assert.deepEqual(inRegion(w).services[WAKER], {
+    name: WAKER,
+    description: 'Dormeto: the waker of workload demo',
+    loadBalancingScheme: 'INTERNAL_MANAGED',
+    protocol: 'HTTPS',
+    backends: [{ group: `${REGION_URL}/networkEndpointGroups/${NEG}` }],
+  });
+  assert.deepEqual(w.services, {}, 'nothing global');
+});
+
+test('onboard cross-region-internal: the waker global, INTERNAL_MANAGED, HTTPS, on the router\'s regional NEG, with no header but a description naming it', async () => {
+  const { w, onboarding } = setup(crossRegionInternal);
+  await onboarding.onboard(INPUT);
+  assert.deepEqual(w.services[WAKER], {
+    name: WAKER,
+    description: 'Dormeto: the waker of workload demo',
+    loadBalancingScheme: 'INTERNAL_MANAGED',
+    protocol: 'HTTPS',
+    backends: [{ group: `${REGION_URL}/networkEndpointGroups/${NEG}` }],
+  });
+  assert.equal(inRegion(w), undefined, 'nothing regional');
+});
+
 test('onboard classic: the waker global, EXTERNAL, HTTPS, on the router\'s regional NEG, with the two headers', async () => {
   const { w, onboarding } = setup(classic);
   await onboarding.onboard(INPUT);
@@ -773,14 +850,18 @@ test('onboard classic: the waker global, EXTERNAL, HTTPS, on the router\'s regio
   });
 });
 
-// The waker's route as each kind writes it: the regional one carries the waker's headers (M4).
-const regionalRoute = { paths: ['/_dormeto/*'], routeAction: { weightedBackendServices: [{ backendService: REGIONAL_WAKER_URL, weight: 100, headerAction: { requestHeadersToAdd: [
-  { headerName: 'x-dormeto-workload', headerValue: 'demo', replace: true }, { headerName: 'x-dormeto-switch', headerValue: 'swap', replace: true }] } }] } };
+// The waker's route as each kind writes it: the regional and internal ones carry the waker's headers (M4; Google's page for the
+// internal ones), on the cross-region one's global map too.
+const headedRoute = (waker) => ({ paths: ['/_dormeto/*'], routeAction: { weightedBackendServices: [{ backendService: waker, weight: 100, headerAction: { requestHeadersToAdd: [
+  { headerName: 'x-dormeto-workload', headerValue: 'demo', replace: true }, { headerName: 'x-dormeto-switch', headerValue: 'swap', replace: true }] } }] } });
+const regionalRoute = headedRoute(REGIONAL_WAKER_URL);
+const DESCRIBED_WAKER = { name: WAKER, description: 'Dormeto: the waker of workload demo', backends: [] };
 const ONBOARDED = [
-  ['regional', regional, (w) => inRegion(w).urlMaps.lb, REGIONAL_WAKER_URL, regionalUrl('app'), REGIONAL_LB, regionalRoute,
-    { name: WAKER, description: 'Dormeto: the waker of workload demo', backends: [] }],
+  ['regional', regional, (w) => inRegion(w).urlMaps.lb, REGIONAL_WAKER_URL, regionalUrl('app'), REGIONAL_LB, regionalRoute, DESCRIBED_WAKER],
   ['classic', classic, (w) => w.urlMaps.lb, WAKER_URL, serviceUrl('app'), { kind: 'classic' }, { paths: ['/_dormeto/*'], service: WAKER_URL },
     { name: WAKER, customRequestHeaders: ['x-dormeto-switch: swap', 'x-dormeto-workload: demo'], backends: [] }],
+  ['internal', internal, (w) => inRegion(w).urlMaps.lb, REGIONAL_WAKER_URL, regionalUrl('app'), INTERNAL_LB, regionalRoute, DESCRIBED_WAKER],
+  ['cross-region-internal', crossRegionInternal, (w) => w.urlMaps.lb, WAKER_URL, serviceUrl('app'), CROSS_REGION_LB, headedRoute(WAKER_URL), DESCRIBED_WAKER],
 ];
 for (const [kind, world, mapOf, wakerUrl, appUrl, lb, route, stopped] of ONBOARDED) {
   test(`onboard ${kind}: the route and the hold route in one update, its lb in the configuration and the Workload`, async () => {
@@ -846,7 +927,7 @@ for (const [kind, world, mapOf, wakerUrl, appUrl, lb, route, stopped] of ONBOARD
   test(`onboard ${kind}: the waker of a stopped run of the same workload, as its kind writes it, is taken over`, async () => {
     const { w, onboarding } = setup((x) => {
       world(x);
-      (kind === 'regional' ? inRegion(x).services : x.services)[WAKER] = stopped;
+      (lb.region ? inRegion(x).services : x.services)[WAKER] = stopped;
     });
     assert.equal((await onboarding.dryRun(INPUT)).eligible, true);
     await onboarding.onboard(INPUT);
@@ -905,12 +986,19 @@ test('wakeTimeoutSeconds: 600 by default on a global load balancer; 60 and 1700 
   }
 });
 
-// The map's change is included in the wake: an explicit timeout must leave room for it (the ruling of R9).
-for (const [kind, world, lowest] of [['regional', regional, 160], ['classic', classic, 310]]) {
+// The map's change is included in the wake: an explicit timeout must leave room for it (the ruling of R9). The internal kinds wait as
+// regional does until M3 measures them. `mapOf`: where the kind's map is.
+const SWAPPED_KINDS = [
+  ['regional', regional, 160, (w) => w.regions[REGION].urlMaps.lb],
+  ['classic', classic, 310, (w) => w.urlMaps.lb],
+  ['internal', internal, 160, (w) => w.regions[REGION].urlMaps.lb],
+  ['cross-region-internal', crossRegionInternal, 160, (w) => w.urlMaps.lb],
+];
+for (const [kind, world, lowest, mapIn] of SWAPPED_KINDS) {
   test(`${kind}: a wakeTimeoutSeconds not above SWAP_WAIT plus 60 s is refused, with the words, at the dry run and the onboarding`, async () => {
     const { w, store, onboarding } = setup(world);
     const input = { ...INPUT, settings: { wakeTimeoutSeconds: lowest } };
-    const words = new RegExp(`settings: wakeTimeoutSeconds ${lowest} is too short for a ${kind} load balancer: its wake includes the URL map's change, ${lowest - 60} s: use more than ${lowest}`);
+    const words = new RegExp(`settings: wakeTimeoutSeconds ${lowest} is too short for an? ${kind} load balancer: its wake includes the URL map's change, ${lowest - 60} s: use more than ${lowest}`);
     const { eligible, reasons } = await onboarding.dryRun(input);
     assert.equal(eligible, false);
     assert.match(reasons.join(), words);
@@ -925,7 +1013,7 @@ for (const [kind, world, lowest] of [['regional', regional, 160], ['classic', cl
     assert.equal(store.configs.get('demo').wakeTimeoutSeconds, lowest + 1);
   });
 
-  test(`nap now of a ${kind} workload: its task asked, as a global one's`, async () => {
+  test(`nap now of ${a(kind)} workload: its task asked, as a global one's`, async () => {
     const { w, clock, onboarding } = setup(world);
     await onboarding.onboard(INPUT);
     w.changes.length = 0;
@@ -934,9 +1022,9 @@ for (const [kind, world, lowest] of [['regional', regional, 160], ['classic', cl
     assert.deepEqual(w.changes, []);
   });
 
-  test(`a ${kind} workload onboarded, napped and woken: the VM down in between, its map at the end as onboarded`, async () => {
+  test(`${a(kind)} workload onboarded, napped and woken: the VM down in between, its map at the end as onboarded`, async () => {
     const { w, store, core, onboarding } = setup(world);
-    const mapOf = () => (kind === 'regional' ? w.regions[REGION].urlMaps.lb : w.urlMaps.lb);
+    const mapOf = () => mapIn(w);
     await onboarding.onboard({ ...INPUT, settings: { hibernate: false } });
     const onboarded = structuredClone(mapOf());
     w.changes.length = 0;
@@ -953,7 +1041,7 @@ for (const [kind, world, lowest] of [['regional', regional, 160], ['classic', cl
     assert.equal(store.runs.get('demo').state, STATES.AWAKE);
   });
 
-  test(`a ${kind} workload stopped by hand: the check writes the swap, and the next one nothing`, async () => {
+  test(`${a(kind)} workload stopped by hand: the check writes the swap, and the next one nothing`, async () => {
     const { w, store, core, onboarding } = setup(world);
     await onboarding.onboard(INPUT);
     w.changes.length = 0;
@@ -967,7 +1055,7 @@ for (const [kind, world, lowest] of [['regional', regional, 160], ['classic', cl
 
   test(`an asleep ${kind} workload offboarded: its wake unswaps, the offboarding removes the routes, the map as it was`, async () => {
     const { w, store, core, onboarding } = setup(world);
-    const mapOf = () => (kind === 'regional' ? w.regions[REGION].urlMaps.lb : w.urlMaps.lb);
+    const mapOf = () => mapIn(w);
     const original = structuredClone(mapOf());
     await onboarding.onboard(INPUT);
     await core.nap('demo');
@@ -2230,14 +2318,18 @@ test('a global onboarding with wakeMode any is refused with the reason, at the d
   assert.deepEqual(w.changes, []);
   assert.equal(store.configs.size, 0);
   assert.equal((await setup(classic).onboarding.dryRun(input)).eligible, true);
+  assert.equal((await setup(internal).onboarding.dryRun(input)).eligible, true);
+  assert.equal((await setup(crossRegionInternal).onboarding.dryRun(input)).eligible, true);
 });
 
-test('the regional onboarding with wakeTimeoutSeconds 120 is refused as before G5: the map\'s change leaves it no room', async () => {
-  const { w, store, onboarding } = setup(regional);
-  await assert.rejects(onboarding.onboard({ ...INPUT, settings: { wakeTimeoutSeconds: 120 } }), refused(400, 'not-eligible',
-    /^cannot onboard demo: settings: wakeTimeoutSeconds 120 is too short for a regional load balancer: its wake includes the URL map's change, 100 s: use more than 160$/));
-  assert.deepEqual(w.changes, []);
-  assert.equal(store.configs.size, 0);
+test('the regional onboarding with wakeTimeoutSeconds 120 is refused as before G5: the map\'s change leaves it no room; the internal ones in the same words', async () => {
+  for (const [world, words] of [[regional, 'a regional'], [internal, 'an internal'], [crossRegionInternal, 'a cross-region-internal']]) {
+    const { w, store, onboarding } = setup(world);
+    await assert.rejects(onboarding.onboard({ ...INPUT, settings: { wakeTimeoutSeconds: 120 } }), refused(400, 'not-eligible',
+      new RegExp(`^cannot onboard demo: settings: wakeTimeoutSeconds 120 is too short for ${words} load balancer: its wake includes the URL map's change, 100 s: use more than 160$`)));
+    assert.deepEqual(w.changes, []);
+    assert.equal(store.configs.size, 0);
+  }
 });
 
 test('PUT settings with idleMinutes null: back to the levels, its built-in value written for a router before G5; the answer is AWS\'s', async () => {
@@ -2284,6 +2376,7 @@ test('PUT settings: what a level refuses is a 400 with the problems, nothing wri
     [setup, { waitSeconds: 0, maxHolders: 0 }, [`settings: ${WAIT_FIXED}`, 'settings: maxHolders is 0 on Google Cloud: no request is held']],
     [setup, { wakeMode: 'any' }, [`settings: ${BROWSER_ONLY}`]],
     [() => setup(regional), { wakeTimeoutSeconds: 120 }, ['settings: wakeTimeoutSeconds 120 is too short for a regional load balancer: its wake includes the URL map\'s change, 100 s: use more than 160']],
+    [() => setup(internal), { wakeTimeoutSeconds: 120 }, ['settings: wakeTimeoutSeconds 120 is too short for an internal load balancer: its wake includes the URL map\'s change, 100 s: use more than 160']],
     [setup, { wakeTimeoutSeconds: 1800 }, ['settings: wakeTimeoutSeconds must be at most 1700: one controller request lasts at most 1800 s']],
     [setup, { joinMinutes: 10 }, ['settings: a workload\'s joinMinutes is on its schedule']],
     [setup, { hibernate: 'yes' }, ['settings: hibernate must be true, false or null']],

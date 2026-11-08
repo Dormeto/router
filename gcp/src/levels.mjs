@@ -1,7 +1,7 @@
 // A Google Cloud workload's settings through AWS's levels (design §3): the shared resolution, with what Google imposes
 // applied on top and named `fixed`. Pure: no store, no Google.
 import { defaultsProblems, effectiveConfig, ownSettings, SCALAR_KEYS } from '../../lambda/src/lib/settings-levels.mjs';
-import { SWAP_WAIT_MS } from './switch.mjs';
+import { aKind, SWAP_WAIT_MS } from './switch.mjs';
 
 // What Google Cloud fixes whatever the level says; the swap's wait + 60 s is the wake's floor behind a swap.
 const FIXED_ZERO = ['waitSeconds', 'maxHolders', 'drainSeconds'];
@@ -23,7 +23,8 @@ const BROWSER_ONLY = 'the global load balancer\'s waiting page can\'t see the vi
 // The global load balancer's policy: the default, when the configuration names no kind.
 export const isPolicy = (lb) => !lb || lb.kind === 'global';
 
-// The smallest whole number of seconds above the swap's wait + 60 s; null where the load balancer is no swap.
+// The smallest whole number of seconds above the swap's wait + 60 s; null where the load balancer is no swap, as a kind not known is
+// (the onboarding's before it reads the load balancer).
 export const swapFloorOf = (lb) => (Object.hasOwn(SWAP_WAIT_MS, lb?.kind) ? SWAP_WAIT_MS[lb.kind] / 1000 + SWAP_WAKE_ROOM_SECONDS + 1 : null);
 
 // The shared code reads a type from the run's kinds and `databases`: give it those, from the backends.
@@ -94,7 +95,7 @@ export function levelProblems(settings, { level, cfg } = {}) {
     if (asked > WAKE_TIMEOUT_MAX) problems.push(`wakeTimeoutSeconds must be at most ${WAKE_TIMEOUT_MAX}: one controller request lasts at most 1800 s`);
     else if (floor && asked < floor) {
       const change = SWAP_WAIT_MS[cfg.lb.kind] / 1000;
-      problems.push(`wakeTimeoutSeconds ${asked} is too short for a ${cfg.lb.kind} load balancer: its wake includes the URL map's change, ${change} s: use more than ${floor - 1}`);
+      problems.push(`wakeTimeoutSeconds ${asked} is too short for ${aKind(cfg.lb.kind)} load balancer: its wake includes the URL map's change, ${change} s: use more than ${floor - 1}`);
     }
   }
   if (workload && settings.wakeMode === 'any' && isPolicy(cfg?.lb)) problems.push(BROWSER_ONLY);

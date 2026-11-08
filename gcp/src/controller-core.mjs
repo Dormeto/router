@@ -30,10 +30,10 @@
 // Schedules and pauses as on AWS (vision docs/specs/2026-10-30-google-cloud-coverage-design.md, section 5). Here a pause is
 // a workload's: the router's and the exclusions wait for G2.
 //
-// The idle check's activity (vision docs/specs/2026-11-07-google-cloud-fixes-design.md, section 5): Monitoring's request count is the
-// gate, and of 1 to 1,000 requests on a backend service that logs every one, the requests the waker would not ignore decide, read in
-// the router's log view (`logs`, absent without DMT_LOG_VIEW). The run says what the last check that counted any request read
-// (`idleReads`).
+// The idle check's activity (vision docs/specs/2026-11-07-google-cloud-fixes-design.md, section 5, amended by M2): on a backend
+// service that logs every request, the requests the waker would not ignore decide alone, read in the router's log view (`logs`,
+// absent without DMT_LOG_VIEW); otherwise, and when they cannot be read, Monitoring's request count. The run says what the last check
+// that read the logs, or counted any request, read (`idleReads`).
 import { randomUUID } from 'node:crypto';
 import { failedSpec, failureError } from '../../lambda/src/lib/failures.mjs';
 import { resolveHibernation } from '../../lambda/src/lib/hibernation.mjs';
@@ -70,7 +70,7 @@ const METRIC_DELAY_MS = 210_000;
 const LOGS_READ_MAX = 1000;
 // Monitoring's request_count is a DELTA metric of 60 s points, and a point whose end is in the window counts the requests of the
 // minute before it: the count can hold requests up to a minute before the window's start. The logs are read from that much earlier,
-// to the window's end, so they hold all it counted; the extra minute can only add requests, which errs toward staying awake.
+// to the window's end, the window the count would read; the extra minute can only add requests, which errs toward staying awake.
 const METRIC_POINT_MS = 60_000;
 // What the idle check reads (`idleReads`, on the run and in the API's Workload).
 const READS = { logs: 'request logs', count: 'request count' };
@@ -267,29 +267,33 @@ export function createController({
   // The router's lists as the waker holds them (waker.mjs), for the requests the idle check reads in the logs.
   const listCache = lists.length ? createListCache({ store, lists, now, log }) : null;
 
-  // The workload's activity over [from, to] (ms), what the idle check and an idle nap's last read go by: `{ activity, reads }`. Its
-  // backend service's request count, through its load balancer's metric. Of 1 to 1,000 requests, on a service that logs every one,
-  // the requests of its logs the waker would not ignore (activity.mjs), read from a metric point before `from`. Logs that cannot be
-  // trusted (past the limit, unreadable, fewer than counted) and a logConfig that cannot be read leave the count to decide.
-  // `reads`: null when none was counted, idle whichever is read.
-  async function activityBetween(cfg, from, to) {
+  // The requests of the backend service's logs over [from, to] (ms), read from a metric point before `from`, when it logs every
+  // one: null without a log view, with logging off or sampled, and with a logConfig or logs that cannot be read (logs.mjs: past the
+  // limit, unreadable).
+  async function loggedRequests(cfg, from, to) {
     const { workloadId, backendService } = cfg;
-    const lb = cfg.lb ? { lb: cfg.lb } : {};
-    const count = await monitoring.requestCount({ backendService, ...lb, from, to });
-    if (count < 1) return { activity: count, reads: null };
-    const counted = { activity: count, reads: READS.count };
-    if (!logs || count > LOGS_READ_MAX) return counted;
+    if (!logs) return null;
     let service;
     try {
       service = await readService(cfg);
     } catch (err) {
       log.warn('LogsUnread', { workloadId, backendService, reason: `its logConfig could not be read: ${err.message}` });
-      return counted;
+      return null;
     }
-    if (!logsEveryRequest(service.logConfig)) return counted;
-    const requests = await logs.requests({ backendService, ...lb, from: from - METRIC_POINT_MS, to, limit: LOGS_READ_MAX, expected: count });
-    if (!requests) return counted;
-    return { activity: activityOf(requests, { lists: listCache ? await listCache.get() : [], rules: [] }), reads: READS.logs };
+    if (!logsEveryRequest(service.logConfig)) return null;
+    return logs.requests({ backendService, ...(cfg.lb ? { lb: cfg.lb } : {}), from: from - METRIC_POINT_MS, to, limit: LOGS_READ_MAX });
+  }
+
+  // The workload's activity over [from, to] (ms), what the idle check and an idle nap's last read go by: `{ activity, reads }`. On
+  // a backend service that logs every request, its logs decide alone, whatever Monitoring counts, none included (M2: the count is
+  // sampled and batched): the requests the waker would not ignore (activity.mjs). Otherwise, and when they cannot be read, the
+  // service's request count decides, through its load balancer's metric, as before the logs. `reads`: null when that count is none,
+  // idle whichever is read.
+  async function activityBetween(cfg, from, to) {
+    const requests = await loggedRequests(cfg, from, to);
+    if (requests) return { activity: activityOf(requests, { lists: listCache ? await listCache.get() : [], rules: [] }), reads: READS.logs };
+    const count = await monitoring.requestCount({ backendService: cfg.backendService, ...(cfg.lb ? { lb: cfg.lb } : {}), from, to });
+    return { activity: count, reads: count < 1 ? null : READS.count };
   }
 
   // What the idle check read, on the run when it changes: a write that fails is said, and the check goes on.

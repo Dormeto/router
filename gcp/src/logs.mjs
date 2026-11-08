@@ -5,11 +5,11 @@
 //
 // By the load balancer's kind: global and classic log as `http_load_balancer`, the service's name in `backend_service_name`; a
 // regional one as its own resource, whose labels are its metric's (monitoring.mjs, M5: `backend_target_name`, the plain name),
-// and the region, as a regional service's name is unique only there. M2 confirms the regional one.
+// and the region, as a regional service's name is unique only there. M2 (2026-11-08) read both kinds so.
 //
-// The entries are trusted only when they hold every request: `null` past the limit, when they cannot be read, when their pages do
-// not end within 10 (or 3 of them empty), or when fewer came back than Monitoring counted over the window (not all written yet).
-// Then the count decides.
+// The entries are the requests, as many as the view holds: no count is compared with them, as Monitoring's is sampled and batched
+// (M2: its points late and in lumps, 13 for minutes that logged 4, gaps of six minutes). `null` past the limit, when they cannot be
+// read, or when their pages do not end within 10 (or 3 of them empty): then the count decides.
 const LOGGING = 'https://logging.googleapis.com/v2';
 // The resource type of the entries and the label naming the backend service, by kind; the view's filter names the same types.
 const LOG_RESOURCES = {
@@ -60,8 +60,7 @@ export function createLogs({ google, view, log }) {
 
   // The requests the backend service's entries hold over [from, to) (ms), oldest first, at most `limit`, through any URL map:
   // `[{ method, url, path, userAgent, remoteIp }]`, or null. `lb`: the workload's load balancer, absent for a global one.
-  // `expected`: the requests Monitoring counted over the window.
-  async function requests({ backendService, lb, from, to, limit, expected = 0 }) {
+  async function requests({ backendService, lb, from, to, limit }) {
     const entries = [];
     try {
       const filter = filterOf(backendService, lb, from, to);
@@ -84,7 +83,6 @@ export function createLogs({ google, view, log }) {
     } catch (err) {
       return unread('warn', backendService, err.message);
     }
-    if (entries.length < expected) return unread('info', backendService, `${entries.length} entries for the ${expected} requests counted`);
     return entries.map(requestOf);
   }
 

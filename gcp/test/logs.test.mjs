@@ -29,7 +29,7 @@ function setup(pages) {
   return { calls, logs, reader: createLogs({ google, view: VIEW, log }) };
 }
 
-const read = (reader, more = {}) => reader.requests({ backendService: 'app', from: FROM, to: TO, limit: 1000, expected: 1, ...more });
+const read = (reader, more = {}) => reader.requests({ backendService: 'app', from: FROM, to: TO, limit: 1000, ...more });
 
 test('requests: one entries.list on the view, filtered by the resource type, the backend service and the window, oldest first', async () => {
   const { calls, reader } = setup([{ entries: [entry('https://demo.example.com/')] }]);
@@ -72,7 +72,7 @@ test('requests: each entry as the method, the URL, its path as received, the use
       { httpRequest: { requestMethod: 'GET', requestUrl: 'https://demo.example.com/shop/cart' } },
     ],
   }]);
-  assert.deepEqual(await read(reader, { expected: 4 }), [
+  assert.deepEqual(await read(reader), [
     { method: 'GET', url: 'https://demo.example.com/.env?x=1', path: '/.env', userAgent: 'curl/8.4.0', remoteIp: '198.51.100.4' },
     { method: 'HEAD', url: 'http://34.120.1.2', path: '/', userAgent: 'Mozilla/5.0', remoteIp: '203.0.113.7' },
     { method: 'GET', url: 'https://demo.example.com/a/../wp-login.php', path: '/a/../wp-login.php', userAgent: 'Mozilla/5.0', remoteIp: '203.0.113.7' },
@@ -100,7 +100,7 @@ test('requests: the pages are read in turn, each asking what the limit leaves', 
     { entries: [], nextPageToken: 'n2' },
     { entries: [entry('https://demo.example.com/3')] },
   ]);
-  const requests = await read(reader, { limit: 5, expected: 3 });
+  const requests = await read(reader, { limit: 5 });
   assert.deepEqual(requests.map((r) => r.path), ['/1', '/2', '/3']);
   assert.deepEqual(calls.map((c) => [c.body.pageSize, c.body.pageToken]), [[5, undefined], [3, 'n1'], [3, 'n2']]);
   assert.ok(calls.every((c) => c.body.filter === calls[0].body.filter));
@@ -115,7 +115,7 @@ test('requests: a token after 10 pages is null, said in LogsUnread: no more page
   assert.deepEqual(logs.map((l) => [l.level, l.event, l.backendService]), [['info', 'LogsUnread', 'app']]);
   assert.match(logs[0].reason, /more than 10 pages/);
   const ten = setup((n) => ({ entries: [entry(`https://demo.example.com/${n}`)], ...(n < 10 ? { nextPageToken: `n${n}` } : {}) }));
-  assert.equal((await read(ten.reader, { expected: 10 })).length, 10);
+  assert.equal((await read(ten.reader)).length, 10);
 });
 
 test('requests: a fourth page with a token and no entries is null, said in LogsUnread; three are read through', async () => {
@@ -128,9 +128,9 @@ test('requests: a fourth page with a token and no entries is null, said in LogsU
   assert.equal(three.calls.length, 4);
 });
 
-test('requests: none in the window reads an empty list when none was counted', async () => {
+test('requests: none in the window reads an empty list', async () => {
   const { reader } = setup([{}]);
-  assert.deepEqual(await read(reader, { expected: 0 }), []);
+  assert.deepEqual(await read(reader), []);
 });
 
 test('requests: more entries than the limit is null, said in LogsUnread', async () => {
@@ -163,15 +163,12 @@ test('requests: any other failure, on a later page too, is null', async () => {
   assert.equal(await read(reader), null);
 });
 
-test('requests: fewer entries than Monitoring counted (not all written yet) is null; as many or more are the requests', async () => {
-  const two = { entries: [entry('https://demo.example.com/1'), entry('https://demo.example.com/2')] };
-  const short = setup([structuredClone(two)]);
-  assert.equal(await read(short.reader, { expected: 3 }), null);
-  assert.equal(short.logs[0].event, 'LogsUnread');
-  assert.match(short.logs[0].reason, /2 entries for the 3 requests counted/);
-  assert.equal((await read(setup([structuredClone(two)]).reader, { expected: 2 })).length, 2);
-  // Monitoring publishes later than Logging: the newest requests are in the logs alone.
-  assert.equal((await read(setup([structuredClone(two)]).reader, { expected: 1 })).length, 2);
+// M2: Monitoring's request_count is sampled and batched (13 for minutes that logged 4, gaps of six minutes), so it tells nothing of
+// whether the logs are complete: the entries the view holds are the requests, none compared with a count.
+test('requests: the entries the view holds are the requests, said in no LogsUnread', async () => {
+  const { logs, reader } = setup([{ entries: [entry('https://demo.example.com/1'), entry('https://demo.example.com/2')] }]);
+  assert.deepEqual((await read(reader)).map((r) => r.path), ['/1', '/2']);
+  assert.deepEqual(logs, []);
 });
 
 test('CALLS: the view\'s read', () => {

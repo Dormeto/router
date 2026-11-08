@@ -1,0 +1,74 @@
+// Cloud Logging: the load balancer's request logs (vision docs/specs/2026-11-07-google-cloud-fixes-design.md, section 5), what
+// the idle check reads of a backend service that logs every request (its `logConfig`). Read through the router's log view
+// (`dmtr-<region>-lb` on the `_Default` bucket, which the install creates, filtered to the load balancers' resource types), on
+// which alone the router holds `roles/logging.viewAccessor`: never the project's logs, the applications' among them.
+//
+// By the load balancer's kind: global and classic log as `http_load_balancer`, the service's name in `backend_service_name`; a
+// regional one as its own resource, whose labels are its metric's (monitoring.mjs, M5: `backend_target_name`, the plain name),
+// and the region, as a regional service's name is unique only there. M2 confirms the regional one.
+//
+// The entries are trusted only when they hold every request: `null` past the limit, when they cannot be read, or when fewer came
+// back than Monitoring counted over the window (not all written yet). Then the count decides.
+const LOGGING = 'https://logging.googleapis.com/v2';
+// The resource type of the entries and the label naming the backend service, by kind; the view's filter names the same types.
+const LOG_RESOURCES = {
+  global: { type: 'http_load_balancer', service: 'backend_service_name' },
+  regional: { type: 'http_external_regional_lb_rule', service: 'backend_target_name' },
+};
+
+export const CALLS = {
+  requests: ['logging.views.access'],
+};
+
+function filterOf(backendService, lb, from, to) {
+  const regional = lb?.kind === 'regional';
+  if (regional && !lb.region) throw new Error(`backend service ${backendService}: a regional load balancer with no region reads no request logs`);
+  const { type, service } = LOG_RESOURCES[regional ? 'regional' : 'global'];
+  return [
+    `resource.type="${type}"`,
+    `resource.labels.${service}="${backendService}"`,
+    ...(regional ? [`resource.labels.region="${lb.region}"`] : []),
+    `timestamp>="${new Date(from).toISOString()}"`,
+    `timestamp<"${new Date(to).toISOString()}"`,
+  ].join(' AND ');
+}
+
+// The path as the load balancer received it, as the waker reads its own (node:http's): what follows the scheme and the host, up to
+// the query, not normalized. None: `/`.
+const pathOf = (url) => (url ?? '').replace(/^[a-z][a-z0-9+.-]*:\/\/[^/?#]*/i, '').split(/[?#]/)[0] || '/';
+
+const requestOf = ({ httpRequest: h = {} }) => ({
+  method: h.requestMethod, url: h.requestUrl, path: pathOf(h.requestUrl), userAgent: h.userAgent, remoteIp: h.remoteIp,
+});
+
+export function createLogs({ google, view, log }) {
+  const unread = (level, backendService, reason) => {
+    log[level]('LogsUnread', { backendService, reason });
+    return null;
+  };
+
+  // The requests the backend service's entries hold over [from, to) (ms), oldest first, at most `limit`, through any URL map:
+  // `[{ method, url, path, userAgent, remoteIp }]`, or null. `lb`: the workload's load balancer, absent for a global one.
+  // `expected`: the requests Monitoring counted over the window.
+  async function requests({ backendService, lb, from, to, limit, expected = 0 }) {
+    const entries = [];
+    try {
+      const filter = filterOf(backendService, lb, from, to);
+      let page = '';
+      do {
+        const answer = await google.request('POST', `${LOGGING}/entries:list`, {
+          resourceNames: [view], filter, orderBy: 'timestamp asc', pageSize: limit - entries.length, ...(page ? { pageToken: page } : {}),
+        });
+        entries.push(...(answer.entries ?? []));
+        page = answer.nextPageToken ?? '';
+        if (entries.length > limit || (page && entries.length >= limit)) return unread('info', backendService, `more than ${limit} entries`);
+      } while (page);
+    } catch (err) {
+      return unread('warn', backendService, err.message);
+    }
+    if (entries.length < expected) return unread('info', backendService, `${entries.length} entries for the ${expected} requests counted`);
+    return entries.map(requestOf);
+  }
+
+  return { requests };
+}

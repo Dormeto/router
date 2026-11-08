@@ -6,6 +6,7 @@ import { readFile } from 'node:fs/promises';
 import * as cloudsql from '../src/cloudsql.mjs';
 import * as compute from '../src/compute.mjs';
 import * as gke from '../src/gke.mjs';
+import * as logs from '../src/logs.mjs';
 import * as urlmaps from '../src/urlmaps.mjs';
 import * as monitoring from '../src/monitoring.mjs';
 import * as tasks from '../src/tasks.mjs';
@@ -13,7 +14,7 @@ import * as firestore from '../src/firestore.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { GKE_DRY, GKE_INPUT, INPUT, REGION, V1, ZONE, onGke, regional, setup } from './world.mjs';
 
-const ADAPTERS = { cloudsql, compute, gke, urlmaps, regionalUrlmaps: { CALLS: urlmaps.CALLS_REGIONAL }, monitoring, tasks, firestore };
+const ADAPTERS = { cloudsql, compute, gke, urlmaps, regionalUrlmaps: { CALLS: urlmaps.CALLS_REGIONAL }, monitoring, logs, tasks, firestore };
 
 async function granted() {
   const manifest = JSON.parse(await readFile(new URL('../access.json', import.meta.url), 'utf8'));
@@ -43,6 +44,20 @@ test('every custom role: every permission is named by a call of an adapter', asy
   for (const [id, role] of Object.entries({ ...roles, ...Object.assign({}, ...Object.values(features).map((f) => f.roles)) })) {
     assert.deepEqual(role.permissions.filter((p) => !named.has(p)), [], id);
   }
+});
+
+// The view-reading call (logs.mjs): granted by roles/logging.viewAccessor alone, on the condition that names the router's view, and by no
+// role on the whole project. The router reads the load balancers' requests, never the project's logs, the applications' among them.
+test('logs: the view\'s read is granted by roles/logging.viewAccessor on the router\'s view alone, never on the project\'s logs', async () => {
+  const manifest = JSON.parse(await readFile(new URL('../access.json', import.meta.url), 'utf8'));
+  const grant = manifest.router.find((g) => g.role === 'roles/logging.viewAccessor');
+  assert.equal(grant.condition.expression, 'resource.name == "projects/{project}/locations/global/buckets/_Default/views/dmtr-{region}-lb"');
+  const custom = [...Object.values(manifest.roles), ...Object.values(manifest.features).flatMap((f) => Object.values(f.roles))].flatMap((r) => r.permissions);
+  for (const p of logs.CALLS.requests) {
+    assert.ok(manifest.predefined['roles/logging.viewAccessor'].includes(p), p);
+    assert.ok(!custom.includes(p), `${p} is in a custom role, unconditioned`);
+  }
+  assert.ok(![...await granted()].some((p) => p.startsWith('logging.') && p !== 'logging.views.access'), 'no other logging permission');
 });
 
 // What a call needs of what it names, though the call's own permission does not say so: a URL map's update needs .use on the backend

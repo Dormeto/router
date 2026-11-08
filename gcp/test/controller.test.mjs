@@ -4,7 +4,9 @@ import { readFile } from 'node:fs/promises';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { silentLog } from '../../lambda/test/fakes.mjs';
 import { createControllerApi, fromEnvironment } from '../src/controller.mjs';
+import { toFields } from '../src/firestore.mjs';
 import { GoogleError } from '../src/google.mjs';
+import { fakeFirestore } from './firestore-fake.mjs';
 import { INPUT, REGION, V1, WAKER, ZONE, serviceUrl, setup, unmanagedUrl } from './world.mjs';
 
 const PACKAGE = JSON.parse(await readFile(new URL('../../package.json', import.meta.url), 'utf8'));
@@ -585,4 +587,63 @@ test('fromEnvironment: the regional URL maps are those of the environment\'s reg
   assert.equal(res.statusCode, 200, res.body);
   assert.ok(seen.includes(`GET ${regionalMap}`), seen.join('\n'));
   assert.match(JSON.parse(res.body).reasons[0], /^URL map lb not found/);
+});
+
+// The router's log view (DMT_LOG_VIEW, set by the CLI's install): what the idle check reads of a backend service logging every
+// request. A check of one AWAKE workload long idle but for two scanners' requests, through the environment's adapters.
+const LOG_VIEW = 'projects/p/locations/global/buckets/_Default/views/dmtr-europe-west1-lb';
+function idleWorld() {
+  const firestore = fakeFirestore();
+  const config = { workloadId: 'demo', urlMap: 'lb', backendService: 'app', wakerBackendService: WAKER, backends: [{ kind: 'vm', location: ZONE, name: 'vm-a' }], idleMinutes: 15, wakeTimeoutSeconds: 600 };
+  firestore.docs.set('workloads/demo', { fields: toFields({ config }), updateTime: 't0' });
+  firestore.docs.set('runs/demo', { fields: toFields({ state: STATES.AWAKE, awakeSince: 1, version: 0 }), updateTime: 't0' });
+  const logBodies = [];
+  const app = serviceUrl('app');
+  const google = fakeFetch((method, url, body) => {
+    if (url.endsWith('/global/urlMaps/lb') && method === 'PUT') return { status: 'DONE' };
+    if (url.endsWith('/global/urlMaps/lb')) {
+      return { name: 'lb', fingerprint: 'f', defaultService: app, hostRules: [{ hosts: ['demo.example.com'], pathMatcher: 'm' }], pathMatchers: [{ name: 'm', defaultService: app, pathRules: [{ paths: ['/_dormeto/*'], service: serviceUrl(WAKER) }] }] };
+    }
+    if (url.endsWith('/global/urlMaps')) return { items: [] };
+    if (url.endsWith('/instances/vm-a')) return { name: 'vm-a', status: 'RUNNING' };
+    if (url.includes('monitoring.googleapis.com')) return { timeSeries: [{ points: [{ value: { int64Value: '2' } }] }] };
+    if (url.endsWith('/global/backendServices/app')) return { name: 'app', logConfig: { enable: true, sampleRate: 1 } };
+    if (url === 'https://logging.googleapis.com/v2/entries:list') {
+      logBodies.push(body);
+      return { entries: ['/.env', '/wp-login.php'].map((path) => ({ httpRequest: { requestMethod: 'GET', requestUrl: `https://demo.example.com${path}`, userAgent: 'Mozilla/5.0', remoteIp: '203.0.113.7' } })) };
+    }
+    if (url.includes('cloudtasks.googleapis.com')) return { name: 'task' };
+    return null;
+  });
+  // Firestore's answers and refusals as its REST API gives them.
+  const fetch = async (url, init = {}) => {
+    if (!url.includes('firestore.googleapis.com')) return google.fetch(url, init);
+    try {
+      return Response.json(await firestore.request(init.method ?? 'GET', url, init.body && JSON.parse(init.body)));
+    } catch (err) {
+      return Response.json({ error: { code: err.code, message: err.message, status: err.status } }, { status: err.code });
+    }
+  };
+  return { firestore, fetch, seen: google.seen, logBodies };
+}
+
+test('fromEnvironment: DMT_LOG_VIEW is the view the idle check reads the request logs in', async () => {
+  const { firestore, fetch, logBodies } = idleWorld();
+  const handler = fromEnvironment({ ...ENV, DMT_LOG_VIEW: LOG_VIEW }, { fetch, log: silentLog });
+  const res = await handler(request('POST', '/v1/check'));
+  assert.equal(res.statusCode, 200, res.body);
+  assert.deepEqual(JSON.parse(res.body).results, [{ workloadId: 'demo', state: STATES.AWAKE, nap: 'requested' }]);
+  assert.equal(logBodies.length, 1);
+  assert.deepEqual(logBodies[0].resourceNames, [LOG_VIEW]);
+  assert.match(logBodies[0].filter, /^resource\.type="http_load_balancer" AND resource\.labels\.backend_service_name="app" AND /);
+  assert.equal(firestore.docs.get('runs/demo').fields.idleReads.stringValue, 'request logs');
+});
+
+test('fromEnvironment: without DMT_LOG_VIEW, no log is read and the count decides', async () => {
+  const { fetch, seen, logBodies } = idleWorld();
+  const handler = fromEnvironment(ENV, { fetch, log: silentLog });
+  const res = await handler(request('POST', '/v1/check'));
+  assert.deepEqual(JSON.parse(res.body).results, [{ workloadId: 'demo', state: STATES.AWAKE }]);
+  assert.deepEqual(logBodies, []);
+  assert.equal(seen.some((line) => line.includes('/global/backendServices/app')), false);
 });

@@ -79,6 +79,16 @@ export const heartbeatStore = (runOf, now) => ({
   },
 });
 
+// What the idle check read, on the run (firestore.mjs): written when it changes, on an existing run only.
+export const idleReadsStore = (runOf) => ({
+  setIdleReads: async (id, reads) => {
+    const run = runOf(id);
+    if (!run || run.idleReads === reads) return false;
+    run.idleReads = reads;
+    return true;
+  },
+});
+
 // The store's daily sweep of old counters (firestore.mjs) on a fake: the day claimed once, the `before` of each sweep kept.
 export const sweepStore = (now) => {
   const swept = [];
@@ -590,6 +600,7 @@ export function setup(change = () => {}, { clock = fakeClock() } = {}) {
     },
     ...heartbeatStore((id) => runs.get(id), clock.now),
     ...sweepStore(clock.now),
+    ...idleReadsStore((id) => runs.get(id)),
   };
   const { every, timers } = clockTimers(clock);
   const log = Object.fromEntries(['info', 'warn', 'error'].map((level) => [level, (event, fields = {}) => { w.logs.push({ level, event, ...fields }); }]));

@@ -29,13 +29,20 @@
 //
 // Schedules and pauses as on AWS (vision docs/specs/2026-10-30-google-cloud-coverage-design.md, section 5). Here a pause is
 // a workload's: the router's and the exclusions wait for G2.
+//
+// The idle check's activity (vision docs/specs/2026-11-07-google-cloud-fixes-design.md, section 5): Monitoring's request count is the
+// gate, and of 1 to 1,000 requests on a backend service that logs every one, the requests the waker would not ignore decide, read in
+// the router's log view (`logs`, absent without DMT_LOG_VIEW). The run says what the last check that counted any request read
+// (`idleReads`).
 import { randomUUID } from 'node:crypto';
 import { failedSpec, failureError } from '../../lambda/src/lib/failures.mjs';
 import { resolveHibernation } from '../../lambda/src/lib/hibernation.mjs';
+import { createListCache } from '../../lambda/src/lib/list-cache.mjs';
 import { awakeStartWithin, CLOSE_START_MS, maintenanceDue, occurrenceAt } from '../../lambda/src/lib/schedule.mjs';
 import { DAY_MS, STATES, utcDay } from '../../lambda/src/lib/state.mjs';
 import { createListRefresher } from '../../lambda/src/lib/list-refresh.mjs';
 import { createWakeWatch } from '../../lambda/src/lib/wake-watch.mjs';
+import { activityOf } from './activity.mjs';
 import { COMPANION_GONE, companionGone, companionLost, isCompanion, startDatabase, statusOf, stopDatabase } from './cloudsql.mjs';
 import {
   giveBackOwner, isPods, ownerAsVm, ownerChanged, ownerRecord, ownerText, podsUnhealthy, recordOf, sleepOwner, wakeOwner, watchRecord,
@@ -59,6 +66,10 @@ const STOP_ROOM_MS = 200_000;
 // metric as not visible for up to 210 seconds: the newest requests cannot be seen, so the idle read goes this much further back,
 // and the run must have been awake for all of it. An idle nap reads again from its request less this, up to its commit.
 const METRIC_DELAY_MS = 210_000;
+// The most requests the idle check reads in the logs: past it, the count decides (a busy workload is no idle one anyway).
+const LOGS_READ_MAX = 1000;
+// What the idle check reads (`idleReads`, on the run and in the API's Workload).
+const READS = { logs: 'request logs', count: 'request count' };
 const WAKING_STUCK_GRACE_MS = 60_000;
 const NAPPING_STUCK_MS = 35 * 60_000;
 // Under a swap, while no VM has been asked to go: visitors are at the waker, so a nap whose request died is a full outage until a
@@ -147,7 +158,12 @@ export class PauseRefused extends Error {
 // A day's counters are kept this long, as the DynamoDB store's (lambda/src/lib/state.mjs).
 const STATS_KEPT_DAYS = 35;
 
-export function createController({ store, compute, cloudsql, gke, urlmaps, regionalUrlmaps, monitoring, tasks, config, lists = [], download, now = Date.now, sleep, every = repeat, newId = randomUUID, log }) {
+// Every request is logged: Google's `sampleRate` is 1.0 when logging is on and none is set.
+const logsEveryRequest = (logConfig) => logConfig?.enable === true && (logConfig.sampleRate ?? 1) === 1;
+
+export function createController({
+  store, compute, cloudsql, gke, urlmaps, regionalUrlmaps, monitoring, logs, tasks, config, lists = [], download, now = Date.now, sleep, every = repeat, newId = randomUUID, log,
+}) {
   const clients = { compute, kubernetesOf: (cluster) => gke.kubernetesOf(cluster) };
   const enqueue = (body) => tasks.enqueue({ url: `${config.controllerUrl}/v1/tasks`, body });
 
@@ -244,9 +260,43 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
 
   const readService = ({ backendService, lb }) => (lb?.kind === 'regional' ? compute.getRegionBackendService(lb.region, backendService) : compute.getBackendService(backendService));
 
-  // The workload's requests over [from, to] (ms), what the idle check and an idle nap's last read go by: its backend service's
-  // request count, through its load balancer's metric.
-  const activityBetween = (cfg, from, to) => monitoring.requestCount({ backendService: cfg.backendService, ...(cfg.lb ? { lb: cfg.lb } : {}), from, to });
+  // The router's lists as the waker holds them (waker.mjs), for the requests the idle check reads in the logs.
+  const listCache = lists.length ? createListCache({ store, lists, now, log }) : null;
+
+  // The workload's activity over [from, to] (ms), what the idle check and an idle nap's last read go by: `{ activity, reads }`. Its
+  // backend service's request count, through its load balancer's metric. Of 1 to 1,000 requests, on a service that logs every one,
+  // the requests of its logs the waker would not ignore (activity.mjs). Logs that cannot be trusted (past the limit, unreadable,
+  // fewer than counted) and a logConfig that cannot be read leave the count to decide. `reads`: null when none was counted, idle
+  // whichever is read.
+  async function activityBetween(cfg, from, to) {
+    const { workloadId, backendService } = cfg;
+    const lb = cfg.lb ? { lb: cfg.lb } : {};
+    const count = await monitoring.requestCount({ backendService, ...lb, from, to });
+    if (count < 1) return { activity: count, reads: null };
+    const counted = { activity: count, reads: READS.count };
+    if (!logs || count > LOGS_READ_MAX) return counted;
+    let service;
+    try {
+      service = await readService(cfg);
+    } catch (err) {
+      log.warn('LogsUnread', { workloadId, backendService, reason: `its logConfig could not be read: ${err.message}` });
+      return counted;
+    }
+    if (!logsEveryRequest(service.logConfig)) return counted;
+    const requests = await logs.requests({ backendService, ...lb, from, to, limit: LOGS_READ_MAX, expected: count });
+    if (!requests) return counted;
+    return { activity: activityOf(requests, { lists: listCache ? await listCache.get() : [], rules: [] }), reads: READS.logs };
+  }
+
+  // What the idle check read, on the run when it changes: a write that fails is said, and the check goes on.
+  async function recordReads(workloadId, run, reads) {
+    if (!reads || run.idleReads === reads) return;
+    try {
+      await store.setIdleReads(workloadId, reads);
+    } catch (err) {
+      log.warn('IdleReadsNotRecorded', { workloadId, error: err.message });
+    }
+  }
 
   // In the service's scope. A service a classic load balancer holds reads no status while its VM is down (M3): none healthy. M9: a NEG at 0 replicas, whichever it answers,
   // none healthy either.
@@ -749,7 +799,7 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
       if (cause === 'idle') {
         let requests;
         try {
-          requests = await activityBetween(cfg, (requestedAt ?? started) - METRIC_DELAY_MS, now());
+          requests = (await activityBetween(cfg, (requestedAt ?? started) - METRIC_DELAY_MS, now())).activity;
         } catch (err) {
           const message = `the requests could not be read: ${err.message}`;
           return await giveUp('traffic-unread', 'warn', { reason: message, error: message });
@@ -1195,7 +1245,9 @@ export function createController({ store, compute, cloudsql, gke, urlmaps, regio
     if (kept) return { state: run.state, ...kept };
     const from = t - idleMs - METRIC_DELAY_MS;
     if ((run.awakeSince ?? 0) > from) return { state: run.state };
-    if ((await activityBetween(cfg, from, t)) > 0) return { state: run.state };
+    const { activity, reads } = await activityBetween(cfg, from, t);
+    await recordReads(workloadId, run, reads);
+    if (activity > 0) return { state: run.state };
     // Its place among the naps in flight, taken before its task is asked: two workloads checked at once cannot both take the last
     // one. Given back when the task is refused.
     if (ctx.flight.naps >= NAPS_MAX) {

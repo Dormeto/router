@@ -1260,6 +1260,17 @@ test('show and list: the running wake\'s or nap\'s last beat, an ISO time; none 
   assert.equal((await onboarding.show('demo')).beatAt, undefined);
 });
 
+test('show and list: what the idle check read, request logs or request count, as the last check that counted a request said', async () => {
+  const { store, onboarding } = setup();
+  await onboarding.onboard(INPUT);
+  assert.equal((await onboarding.show('demo')).idleReads, undefined);
+  store.runs.get('demo').idleReads = 'request logs';
+  assert.equal((await onboarding.show('demo')).idleReads, 'request logs');
+  assert.equal((await onboarding.list()).find((x) => x.id === 'demo').idleReads, 'request logs');
+  Object.assign(store.runs.get('demo'), { state: STATES.ASLEEP, idleReads: 'request count' });
+  assert.equal((await onboarding.show('demo')).idleReads, 'request count');
+});
+
 test('show: an unknown workload, a bad ID', async () => {
   const { onboarding } = setup();
   await assert.rejects(onboarding.show('demo'), refused(404, 'not-found', /no workload demo/));

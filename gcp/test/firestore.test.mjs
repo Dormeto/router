@@ -260,6 +260,22 @@ test('setBackendKinds and setHibernated: written apart from the transitions, on 
   assert.equal(run.version, 0);
 });
 
+test('setIdleReads: written apart from the transitions, when it changes and on an existing run only', async () => {
+  const { store, calls, docs } = setup();
+  assert.equal(await store.setIdleReads('gone', 'request logs'), false);
+  assert.equal(docs.size, 0);
+  await store.initRun('app', 1);
+  const before = await store.getRun('app');
+  assert.equal(await store.setIdleReads('app', 'request logs'), true);
+  assert.deepEqual(await store.getRun('app'), { ...before, idleReads: 'request logs' });
+  assert.deepEqual(commits(calls).at(-1).body.writes[0].updateMask, { fieldPaths: ['idleReads'] });
+  const count = commits(calls).length;
+  assert.equal(await store.setIdleReads('app', 'request logs'), false);
+  assert.equal(commits(calls).length, count);
+  assert.equal(await store.setIdleReads('app', 'request count'), true);
+  assert.equal((await store.getRun('app')).idleReads, 'request count');
+});
+
 test('listConfigs and listWorkloads: every configuration across pages; no schedule, an empty map', async () => {
   const { store } = setup();
   for (let i = 0; i < 5; i += 1) await store.putConfig(`w${i}`, { workloadId: `w${i}` });

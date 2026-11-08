@@ -100,8 +100,9 @@ const LIST_GROUP = 'https://compute.googleapis.com/compute/v1/projects/p/zones/z
 const LIST_ENDPOINTS = 'https://compute.googleapis.com/compute/v1/projects/p/zones/z/networkEndpointGroups/neg/listNetworkEndpoints';
 const LIST_ENDPOINTS_PAGE = `${LIST_ENDPOINTS}?pageToken=next`;
 const BATCH_GET = 'https://firestore.googleapis.com/v1/projects/p/databases/d/documents:batchGet';
+const LOG_ENTRIES = 'https://logging.googleapis.com/v2/entries:list';
 
-for (const [name, method, url] of [['a GET', 'GET', 'https://x/1'], ['an operation\'s wait', 'POST', OPERATION_WAIT], ['getHealth', 'POST', GET_HEALTH], ['listManagedInstances', 'POST', LIST_MANAGED], ['an unmanaged group\'s listInstances', 'POST', LIST_GROUP], ['a NEG\'s listNetworkEndpoints', 'POST', LIST_ENDPOINTS], ['a NEG\'s listNetworkEndpoints page', 'POST', LIST_ENDPOINTS_PAGE], ['Firestore\'s batchGet', 'POST', BATCH_GET]]) {
+for (const [name, method, url] of [['a GET', 'GET', 'https://x/1'], ['an operation\'s wait', 'POST', OPERATION_WAIT], ['getHealth', 'POST', GET_HEALTH], ['listManagedInstances', 'POST', LIST_MANAGED], ['an unmanaged group\'s listInstances', 'POST', LIST_GROUP], ['a NEG\'s listNetworkEndpoints', 'POST', LIST_ENDPOINTS], ['a NEG\'s listNetworkEndpoints page', 'POST', LIST_ENDPOINTS_PAGE], ['Firestore\'s batchGet', 'POST', BATCH_GET], ['Cloud Logging\'s entries.list', 'POST', LOG_ENTRIES]]) {
   for (const [what, failure] of [['a 503', unavailable], ['a 429', throttled], ['a network error', lost]]) {
     test(`${name} is tried again after ${what}, with a pause`, async () => {
       const { google, state, api } = harness({ api: failingOnce(failure) });

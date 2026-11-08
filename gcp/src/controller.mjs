@@ -12,6 +12,7 @@ import { createController } from './controller-core.mjs';
 import { createFirestoreStore } from './firestore.mjs';
 import { createGke } from './gke.mjs';
 import { createGoogle } from './google.mjs';
+import { createLogs } from './logs.mjs';
 import { createMonitoring } from './monitoring.mjs';
 import { createOnboarding, Refusal } from './onboarding.mjs';
 import { createTasks } from './tasks.mjs';
@@ -119,7 +120,8 @@ export function createControllerApi({ core, onboarding, config }) {
   };
 }
 
-// The handler of the `controller` role (server.mjs), on the router's environment.
+// The handler of the `controller` role (server.mjs), on the router's environment. `DMT_LOG_VIEW`: the router's log view, set by the
+// CLI's install (`projects/<p>/locations/global/buckets/_Default/views/dmtr-<region>-lb`); unset, the idle check reads no request log.
 export function fromEnvironment(env = process.env, { fetch, log = logger } = {}) {
   const google = createGoogle({ fetch });
   const project = env.DMT_PROJECT;
@@ -138,6 +140,7 @@ export function fromEnvironment(env = process.env, { fetch, log = logger } = {})
     urlmaps,
     regionalUrlmaps,
     monitoring: createMonitoring({ google, project }),
+    ...(env.DMT_LOG_VIEW ? { logs: createLogs({ google, view: env.DMT_LOG_VIEW, log }) } : {}),
     tasks: createTasks({ google, project, region: env.DMT_REGION, queue: env.DMT_QUEUE, serviceAccount: env.DMT_SERVICE_ACCOUNT }),
     config,
     lists: parseLists(env.DMT_IP_LISTS, (error) => log.error('IpListsUnreadable', { error })),

@@ -8,7 +8,7 @@ import { fromFields, toFields } from '../src/firestore.mjs';
 import { GoogleError, OPERATION_NOT_DONE } from '../src/google.mjs';
 import { createUrlMaps, withErrorPolicy, withSwap } from '../src/urlmaps.mjs';
 import {
-  CLUSTER, GKE_INPUT, GKE_NEG, NEG_READINGS, OWNER, REGION, classic, clockTimers, heartbeatStore, onGke, sweepStore, regional as regionalWorld, regionalUrl, setup as worldOf,
+  CLUSTER, GKE_INPUT, GKE_NEG, NEG_READINGS, OWNER, REGION, classic, clockTimers, heartbeatStore, idleReadsStore, onGke, sweepStore, regional as regionalWorld, regionalUrl, setup as worldOf,
   unmanagedUrl, virtualClock,
 } from './world.mjs';
 
@@ -41,10 +41,11 @@ const notDone = () => new GoogleError('Google: operation op not done in time', {
 
 // The world as Compute Engine, the URL map and Monitoring see it. `calls`: what changed, in order, with the nap's wait.
 // `on[line]`: runs when that change is asked; it may throw (refused), or answer 'under way' (done later): not applied.
-// `nodeTimers`: the heartbeat on the controller's own timer, Node's, not on the fake clock.
+// `nodeTimers`: the heartbeat on the controller's own timer, Node's, not on the fake clock. `logs`: the router's log view (DMT_LOG_VIEW),
+// what it answers (requests, null, or a function of the query); none, no view. `logConfig`: the backend service's.
 function setup({
   run = { state: STATES.AWAKE, awakeSince: 1 }, cfg = {}, vms = {}, groups = {}, autoscalers = {}, machineTypes = {}, map = mapOf(), requests = 0, unhealthyPolls = 0, lists, download,
-  nodeTimers = false,
+  nodeTimers = false, logs, logConfig,
 } = {}) {
   const clock = fakeClock();
   const world = {
@@ -54,6 +55,8 @@ function setup({
     machineTypes: { 'e2-small': { memoryMb: 2048 }, ...machineTypes },
     map,
     requests,
+    logEntries: logs,
+    logConfig,
     unhealthyPolls,
     calls: [],
     on: {},
@@ -64,6 +67,8 @@ function setup({
     puts: 0,
     healthReads: 0,
     metricReads: [],
+    logReads: [],
+    serviceReads: [],
     tasks: [],
     sleeps: [],
     logs: [],
@@ -79,7 +84,7 @@ function setup({
   };
   const store = fakeStore({ config, run, clock });
   const { every, timers } = clockTimers(clock);
-  Object.assign(store, heartbeatStore(() => store.state.run, clock.now), sweepStore(clock.now));
+  Object.assign(store, heartbeatStore(() => store.state.run, clock.now), sweepStore(clock.now), idleReadsStore(() => store.state.run));
   // The Firestore store's names, and what its fields do to a value: an `undefined` comes back null.
   store.addPause = (id, pause) => store.putPause(id, fromFields(toFields(pause)));
   store.removePauses = async (id, { at } = {}) => {
@@ -119,17 +124,20 @@ function setup({
       return { name, autoscalingPolicy: { mode: world.autoscalers[name] } };
     },
     setAutoscalerMode: ({ name }, mode) => change(`autoscaler ${name} ${mode}`, () => { world.autoscalers[name] = mode; }),
-    getBackendService: async () => {
+    getBackendService: async (name) => {
       world.healthScopes.add('global');
-      return { backends: [{ group: 'ig-url' }] };
+      world.serviceReads.push(`global ${name}`);
+      if (world.serviceRefused) throw world.serviceRefused;
+      return { backends: [{ group: 'ig-url' }], ...(world.logConfig ? { logConfig: structuredClone(world.logConfig) } : {}) };
     },
     getBackendServiceHealth: async () => {
       world.healthScopes.add('global');
       return health();
     },
-    getRegionBackendService: async (region) => {
+    getRegionBackendService: async (region, name) => {
       world.healthScopes.add(region);
-      return { backends: [{ group: 'ig-url' }] };
+      world.serviceReads.push(`${region} ${name}`);
+      return { backends: [{ group: 'ig-url' }], ...(world.logConfig ? { logConfig: structuredClone(world.logConfig) } : {}) };
     },
     getRegionBackendServiceHealth: async (region) => {
       world.healthScopes.add(region);
@@ -182,6 +190,14 @@ function setup({
         return typeof world.requests === 'function' ? world.requests(query) : world.requests;
       },
     },
+    ...(logs === undefined ? {} : {
+      logs: {
+        requests: async (query) => {
+          world.logReads.push(query);
+          return structuredClone(typeof world.logEntries === 'function' ? world.logEntries(query) : world.logEntries);
+        },
+      },
+    }),
     tasks: {
       enqueue: async (task) => {
         if (world.taskRefused) throw world.taskRefused;
@@ -214,6 +230,17 @@ function beatsOf(t) {
 
 const waking = (at, more = {}) => ({ state: STATES.WAKING, wakeId: 'w1', wakeStartedAt: at, ...more });
 const START = 1_700_000_000_000;
+
+// The request logs (L): what the log view answers (logs.mjs), scanners, a bot and a HEAD, and a backend service logging every request.
+const BROWSER = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
+// A request as the log view answers it (logs.mjs).
+const entry = (path, { method = 'GET', userAgent = BROWSER, remoteIp = '203.0.113.7' } = {}) => ({
+  method, url: `https://demo.example.com${path}`, path, userAgent, remoteIp,
+});
+const SCANNERS = [
+  entry('/.env'), entry('/wp-login.php'), entry('/', { userAgent: 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)' }), entry('/', { method: 'HEAD' }),
+];
+const EVERY_REQUEST = { enable: true, sampleRate: 1 };
 
 // --- The wake ------------------------------------------------------------------------------------------------------
 
@@ -1210,6 +1237,13 @@ for (const [kind, lb, base, waitSeconds, healthScope, headers] of SWAPS) {
     assert.deepEqual(t.world.metricReads.map((read) => read.lb), [lb]);
     assert.deepEqual(t.world.calls, []);
     assert.equal(t.logged('RouteDrift').length, 0);
+  });
+
+  test(`${kind} check: the logConfig read at the service's scope, the request logs through its load balancer`, async () => {
+    const t = swapSetup({ run: { state: STATES.AWAKE, awakeSince: 1 }, requests: 4, logConfig: EVERY_REQUEST, logs: SCANNERS });
+    assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.AWAKE, nap: 'requested' }]);
+    assert.deepEqual(t.world.serviceReads, [`${healthScope} app`]);
+    assert.deepEqual(t.world.logReads.map((read) => read.lb), [lb]);
   });
 
   test(`${kind} repair, awake and swapped: unswapped, RouteDrift, no wait`, async () => {
@@ -2933,6 +2967,136 @@ test('a second refreshLists task for a list the first just refreshed downloads n
   await t.controller.refreshLists(['scanners']);
   assert.deepEqual(await t.controller.refreshLists(['scanners']), { results: [] });
   assert.equal(downloads, 1);
+});
+
+// --- The request logs (L) ------------------------------------------------------------------------------------------------
+
+const IDLE_WINDOW = { from: START - 15 * MINUTE - 210_000, to: START };
+const RUNNING = { 'vm-a': { status: 'RUNNING' } };
+
+test('request logs: scanners and bots only, on a backend service logging every request: the nap asked, the run says request logs', async () => {
+  const t = setup({ run: AWAKE_LONG, vms: RUNNING, requests: 4, logConfig: EVERY_REQUEST, logs: SCANNERS });
+  assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.AWAKE, nap: 'requested' }]);
+  assert.deepEqual(t.world.metricReads, [{ backendService: 'app', ...IDLE_WINDOW }]);
+  assert.deepEqual(t.world.serviceReads, ['global app']);
+  assert.deepEqual(t.world.logReads, [{ backendService: 'app', ...IDLE_WINDOW, limit: 1000, expected: 4 }]);
+  assert.equal(t.world.tasks[0].body.action, 'nap');
+  assert.equal(t.run().idleReads, 'request logs');
+});
+
+test('request logs: a browser\'s GET among the scanners keeps the workload awake', async () => {
+  const t = setup({ run: AWAKE_LONG, vms: RUNNING, requests: 5, logConfig: EVERY_REQUEST, logs: [...SCANNERS, entry('/')] });
+  assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.AWAKE }]);
+  assert.deepEqual(t.world.tasks, []);
+  assert.equal(t.run().idleReads, 'request logs');
+});
+
+test('request logs that cannot be trusted (null): the count decides, the workload awake, the run says request count', async () => {
+  const t = setup({ run: AWAKE_LONG, vms: RUNNING, requests: 4, logConfig: EVERY_REQUEST, logs: null });
+  assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.AWAKE }]);
+  assert.equal(t.world.logReads.length, 1);
+  assert.deepEqual(t.world.tasks, []);
+  assert.equal(t.run().idleReads, 'request count');
+});
+
+test('logging off, or sampled below 1.0, or no logConfig: no read of the logs, the count decides', async () => {
+  for (const logConfig of [{ enable: false }, { enable: false, sampleRate: 1 }, { enable: true, sampleRate: 0.5 }, undefined]) {
+    const t = setup({ run: AWAKE_LONG, vms: RUNNING, requests: 4, logConfig, logs: SCANNERS });
+    assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.AWAKE }], JSON.stringify(logConfig));
+    assert.deepEqual(t.world.serviceReads, ['global app']);
+    assert.deepEqual(t.world.logReads, [], JSON.stringify(logConfig));
+    assert.equal(t.run().idleReads, 'request count');
+  }
+});
+
+test('logging on with no sampleRate logs every request (Google\'s default, 1.0): the logs are read', async () => {
+  const t = setup({ run: AWAKE_LONG, vms: RUNNING, requests: 4, logConfig: { enable: true }, logs: SCANNERS });
+  assert.equal((await t.controller.check())[0].nap, 'requested');
+  assert.equal(t.world.logReads.length, 1);
+});
+
+test('no log view (DMT_LOG_VIEW unset): neither the backend service nor the logs are read, the count decides', async () => {
+  const t = setup({ run: AWAKE_LONG, vms: RUNNING, requests: 4, logConfig: EVERY_REQUEST });
+  assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.AWAKE }]);
+  assert.deepEqual(t.world.serviceReads, []);
+  assert.equal(t.run().idleReads, 'request count');
+});
+
+test('a logConfig that cannot be read: the count decides, said in LogsUnread, and the check goes on', async () => {
+  const t = setup({ run: AWAKE_LONG, vms: RUNNING, requests: 4, logConfig: EVERY_REQUEST, logs: SCANNERS });
+  t.world.serviceRefused = new GoogleError('Google: GET: 503 unavailable', { code: 503 });
+  assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.AWAKE }]);
+  assert.deepEqual(t.world.logReads, []);
+  assert.match(t.logged('LogsUnread')[0].reason, /logConfig.*503 unavailable/);
+  assert.equal(t.logged('CheckFailed').length, 0);
+});
+
+test('logs are read for a count of 1 to 1,000: none at 0, the run left as it says; none past 1,000, the count decides', async () => {
+  const idle = setup({ run: { ...AWAKE_LONG, idleReads: 'request logs' }, vms: RUNNING, requests: 0, logConfig: EVERY_REQUEST, logs: SCANNERS });
+  assert.equal((await idle.controller.check())[0].nap, 'requested');
+  assert.deepEqual(idle.world.serviceReads, []);
+  assert.deepEqual(idle.world.logReads, []);
+  assert.equal(idle.run().idleReads, 'request logs');
+  const one = setup({ run: AWAKE_LONG, vms: RUNNING, requests: 1, logConfig: EVERY_REQUEST, logs: SCANNERS.slice(0, 1) });
+  assert.equal((await one.controller.check())[0].nap, 'requested');
+  const cap = setup({ run: AWAKE_LONG, vms: RUNNING, requests: 1000, logConfig: EVERY_REQUEST, logs: Array(1000).fill(SCANNERS[0]) });
+  assert.equal((await cap.controller.check())[0].nap, 'requested');
+  assert.equal(cap.world.logReads.length, 1);
+  const busy = setup({ run: AWAKE_LONG, vms: RUNNING, requests: 1001, logConfig: EVERY_REQUEST, logs: SCANNERS });
+  assert.deepEqual(await busy.controller.check(), [{ workloadId: 'demo', state: STATES.AWAKE }]);
+  assert.deepEqual(busy.world.serviceReads, []);
+  assert.deepEqual(busy.world.logReads, []);
+  assert.equal(busy.run().idleReads, 'request count');
+});
+
+test('what the idle check read is written when it changes only', async () => {
+  const t = setup({ run: AWAKE_LONG, vms: RUNNING, requests: 5, logConfig: EVERY_REQUEST, logs: [...SCANNERS, entry('/')] });
+  const written = [];
+  const { setIdleReads } = t.store;
+  t.store.setIdleReads = (...args) => {
+    written.push(args);
+    return setIdleReads(...args);
+  };
+  await t.controller.check();
+  t.clock.advance(MINUTE);
+  await t.controller.check();
+  t.world.logEntries = null;
+  t.clock.advance(MINUTE);
+  await t.controller.check();
+  assert.deepEqual(written, [['demo', 'request logs'], ['demo', 'request count']]);
+});
+
+test('what the idle check read that cannot be written: logged, and the nap asked all the same', async () => {
+  const t = setup({ run: AWAKE_LONG, vms: RUNNING, requests: 4, logConfig: EVERY_REQUEST, logs: SCANNERS });
+  t.store.setIdleReads = async () => { throw new Error('Firestore down'); };
+  assert.equal((await t.controller.check())[0].nap, 'requested');
+  assert.match(t.logged('IdleReadsNotRecorded')[0].error, /Firestore down/);
+});
+
+test('request logs: an address of a list the waker ignores is no activity, the lists read as the waker holds them', async () => {
+  const t = setup({
+    run: AWAKE_LONG, vms: RUNNING, requests: 2, logConfig: EVERY_REQUEST, lists: LISTS, download: async () => '1.2.3.4\n',
+    logs: [entry('/', { remoteIp: '1.2.3.4' }), entry('/shop', { remoteIp: '1.2.3.4' })],
+  });
+  await t.controller.refreshLists(['scanners']);
+  assert.equal((await t.controller.check())[0].nap, 'requested');
+  t.world.logEntries = [entry('/', { remoteIp: '1.2.3.4' }), entry('/', { remoteIp: '198.51.100.9' })];
+  t.world.tasks = [];
+  t.store.state.run = structuredClone(AWAKE_LONG);
+  t.clock.advance(MINUTE);
+  assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.AWAKE }]);
+});
+
+test('an idle nap\'s last read goes by the request logs too: scanners during the wait, it naps; a browser, AWAKE (traffic)', async () => {
+  for (const [during, state] of [[SCANNERS, STATES.ASLEEP], [[entry('/')], STATES.AWAKE]]) {
+    let reads = 0;
+    const t = setup({ run: AWAKE_LONG, cfg: { hibernate: false }, vms: RUNNING, requests: () => (reads++ ? during.length : 0), logConfig: EVERY_REQUEST, logs: during });
+    await t.controller.check();
+    const out = await t.controller.nap('demo', t.world.tasks[0].body);
+    assert.equal(out.state, state);
+    assert.deepEqual(t.world.logReads, [{ backendService: 'app', from: START - 210_000, to: t.world.metricReads[1].to, limit: 1000, expected: during.length }]);
+    if (state === STATES.AWAKE) assert.deepEqual(t.run().napAborted, { reason: 'traffic', at: t.clock.now() });
+  }
 });
 
 // --- A zonal NEG's VM -----------------------------------------------------------------------------------------------------

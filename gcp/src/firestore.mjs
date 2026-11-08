@@ -350,6 +350,11 @@ export function createFirestoreStore({ google, project, database, now = Date.now
       return (await modifyRun(workloadId, () => ({ set: { hibernated: JSON.stringify({ ids, at }) } }))) !== null;
     },
 
+    // What the idle check read (controller-core.mjs), written apart from the transitions when it changes. On an existing run only.
+    async setIdleReads(workloadId, reads) {
+      return (await modifyRun(workloadId, (run) => (run.idleReads === reads ? null : { set: { idleReads: reads } }))) !== null;
+    },
+
     async setPendingWake(workloadId) {
       // Only the first request of a nap marks it: one log line and one counted wake per pending wake.
       return (await modifyRun(workloadId, (run) => (run.state === STATES.NAPPING && run.pendingWake !== true ? { set: { pendingWake: true } } : null))) !== null;

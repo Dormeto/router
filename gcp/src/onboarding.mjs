@@ -132,7 +132,8 @@ function failureOf(run) {
 
 // The API's Workload. `awakeSince` is a time the CLI prints, and left on the run by a nap. `paused`: its active pause. `companionsGone`:
 // the Cloud SQL instances named at its onboarding that no longer exist, as last read. `napAborted`: why the last nap was given up and
-// when, until a nap commits. `beatAt`: the running wake's or nap's last heartbeat (heartbeat.mjs), WAKING or NAPPING only.
+// when, until a nap commits. `beatAt`: the running wake's or nap's last heartbeat (heartbeat.mjs), WAKING or NAPPING only. `idleReads`:
+// what the idle check read at the last check that counted a request, `request logs` or `request count` (controller-core.mjs).
 function workloadOf(cfg, run, paused) {
   const failure = failureOf(run);
   const beatAt = run ? beatOf(run) : undefined;
@@ -153,6 +154,7 @@ function workloadOf(cfg, run, paused) {
     ...(run?.companionsGone?.length ? { companionsGone: run.companionsGone } : {}),
     ...(run?.napAborted ? { napAborted: { reason: run.napAborted.reason, at: isoOf(run.napAborted.at) } } : {}),
     ...(beatAt !== undefined ? { beatAt: isoOf(beatAt) } : {}),
+    ...(run?.idleReads ? { idleReads: run.idleReads } : {}),
   };
 }
 

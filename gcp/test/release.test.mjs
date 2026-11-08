@@ -253,6 +253,7 @@ test('the Compute Engine page: schedules, pauses and IP lists, with what they do
 test('the Compute Engine page: the fixes of router 0.38.0 and the idle check that reads request logs', () => {
   const page = flat(read(CE));
   assert.match(page, /A running wake or nap beats on its run every minute/);
+  assert.match(page, /a beat that fails is tried again once, 10 s later/);
   assert.match(page, /sent again or called stuck within minutes/);
   assert.match(page, /A stale wake is sent again with its wakeId, twice at most, which a duplicate cannot disturb: after that, its deadline alone acts/);
   assert.match(page, /22 minutes under a swap/);

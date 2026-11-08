@@ -494,16 +494,75 @@ test('a beat whose write throws: said each time, and the wake goes on to AWAKE; 
   const t = setup({ run: waking(START), vms: { 'vm-a': { status: 'TERMINATED' } }, unhealthyPolls: 40 });
   t.store.beat = async () => { throw new GoogleError('Google: POST: 503 firestore', { code: 503 }); };
   assert.equal((await t.controller.wake('demo', 'w1')).state, STATES.AWAKE);
-  assert.deepEqual(t.logged('BeatFailed').map(({ level, workloadId, wakeId, error }) => [level, workloadId, wakeId, error]), [
+  // The beats at 0 and 60 s, each tried again 10 s later.
+  assert.deepEqual(t.logged('BeatFailed').map(({ level, workloadId, wakeId, error }) => [level, workloadId, wakeId, error]), Array(4).fill(
     ['warn', 'demo', 'w1', 'Google: POST: 503 firestore'],
-    ['warn', 'demo', 'w1', 'Google: POST: 503 firestore'],
-  ]);
+  ));
   assert.equal(t.timers.size, 0);
 
   const nap = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
   nap.store.beat = () => { throw new TypeError('no beat here'); };
   assert.equal((await nap.controller.nap('demo')).state, STATES.ASLEEP);
-  assert.deepEqual(nap.logged('BeatFailed').map((l) => [l.napId, l.error]), [['wake-2', 'no beat here'], ['wake-2', 'no beat here']]);
+  // The first beat, its retry, and the beat of the policy's one 300 s sleep (whose retry the nap's end stops).
+  assert.deepEqual(nap.logged('BeatFailed').map((l) => [l.napId, l.error]), Array(3).fill(['wake-2', 'no beat here']));
+  assert.equal(nap.timers.size, 0);
+});
+
+// A late task's first beat matters most: one that fails would leave the run without a beat for a minute, past the 90 s, and a
+// visitor's poll would send a healthy wake again.
+test('a beat that fails is tried again once, 10 s later, without holding the wake: the run beats within seconds', async () => {
+  const t = setup({ run: waking(START - 40_000), vms: { 'vm-a': { status: 'TERMINATED' } }, unhealthyPolls: 40 });
+  const { beat } = t.store;
+  let failures = 1;
+  t.store.beat = async (...args) => {
+    if (failures-- > 0) throw oops();
+    return beat(...args);
+  };
+  const beats = beatsOf(t);
+  let startedAt;
+  t.world.on['start vm-a'] = async () => { startedAt = t.clock.now(); };
+  assert.equal((await t.controller.wake('demo', 'w1')).state, STATES.AWAKE);
+  assert.equal(startedAt, START);
+  assert.deepEqual(beats.map((at) => at - START), [0, 10_000, 60_000]);
+  assert.equal(t.logged('BeatFailed').length, 1);
+  assert.equal(t.timers.size, 0);
+});
+
+test('the retry on Node\'s interval ticks once: 10 s after the failed beat, and never again', async (context) => {
+  context.mock.timers.enable({ apis: ['setInterval'] });
+  const t = setup({ run: waking(START), vms: { 'vm-a': { status: 'TERMINATED' } }, nodeTimers: true });
+  const { beat } = t.store;
+  let failures = 1;
+  t.store.beat = async (...args) => {
+    if (failures-- > 0) throw oops();
+    return beat(...args);
+  };
+  const beats = beatsOf(t);
+  t.world.on['start vm-a'] = async () => {
+    for (let s = 0; s < 50; s += 1) {
+      context.mock.timers.tick(1000);
+      await new Promise(setImmediate);
+    }
+  };
+  assert.equal((await t.controller.wake('demo', 'w1')).state, STATES.AWAKE);
+  assert.equal(beats.length, 2);
+  assert.equal(t.run().beatAt, START);
+  context.mock.timers.tick(10 * 60_000);
+  await new Promise(setImmediate);
+  assert.equal(beats.length, 2);
+});
+
+test('a beat tried again that fails too waits for the next minute\'s: once per failed beat, none pending once the wake ends', async () => {
+  const t = setup({ run: waking(START), vms: { 'vm-a': { status: 'TERMINATED' } }, unhealthyPolls: 40 });
+  t.store.beat = async () => { throw oops(); };
+  const beats = beatsOf(t);
+  assert.equal((await t.controller.wake('demo', 'w1')).state, STATES.AWAKE);
+  assert.deepEqual(beats.map((at) => at - START), [0, 10_000, 60_000, 70_000]);
+  assert.equal(t.timers.size, 0);
+  const ended = setup({ run: waking(START), vms: { 'vm-a': { status: 'TERMINATED' } }, unhealthyPolls: 2 });
+  ended.store.beat = async () => { throw oops(); };
+  assert.equal((await ended.controller.wake('demo', 'w1')).state, STATES.AWAKE);
+  assert.equal(ended.timers.size, 0);
 });
 
 test('the check sweeps the counters older than 35 days once a UTC day, logging StatsSwept with the count', async () => {

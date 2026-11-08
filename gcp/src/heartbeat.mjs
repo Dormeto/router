@@ -9,6 +9,9 @@
 import { STATES } from '../../lambda/src/lib/state.mjs';
 
 const BEAT_MS = 60_000;
+// A beat that fails is tried again once, this much later: a late task's first beat would otherwise leave the run a minute without
+// one, past the 90 s, and a visitor's poll would send a healthy wake again.
+const BEAT_RETRY_MS = 10_000;
 const STALE_MS = 3 * 60_000;
 const FIRST_BEAT_MS = 90_000;
 const RESEND_MS = 60_000;
@@ -53,19 +56,40 @@ export const resendable = (run, wakeId, t) => run.state === STATES.WAKING && run
 // What claiming the wake's resend at `t` writes on the run: when, and the wake's count. Null when it may not be sent again.
 export const resendClaim = (run, wakeId, t) => (resendable(run, wakeId, t) ? { resentAt: t, resends: { wakeId, count: resendsOf(run, wakeId) + 1 } } : null);
 
-// The heartbeat of `field` `id` on the run, from now: its first beat written before this returns, then one every 60 s through
-// `every(ms, fn)` (a timer; its answer stops it). Answers the stop, for every way out of the wake or the nap. A beat that fails is
-// said, and nothing else: the wake or the nap goes on.
+// The heartbeat of `field` `id` on the run, from now: its first beat tried before this returns, then one every 60 s through
+// `every(ms, fn)` (a timer; its answer stops it). Answers the stop, for every way out of the wake or the nap, which stops a retry
+// too. A beat that fails is said, and tried again once 10 s later, on a timer of its own that ticks once, so nothing waits for it:
+// the wake or the nap goes on.
 export async function startHeartbeat({ store, every, log }, workloadId, field, id) {
-  const beat = async () => {
+  let stopped = false;
+  // The stop of the retry's timer, while one is pending.
+  let retry = null;
+  const write = async () => {
     try {
       await store.beat(workloadId, field, id);
+      return true;
     } catch (err) {
       log.warn('BeatFailed', { workloadId, [field]: id, error: err.message });
+      return false;
     }
   };
+  const beat = async () => {
+    if ((await write()) || stopped || retry) return;
+    const stop = every(BEAT_RETRY_MS, async () => {
+      stop();
+      retry = null;
+      if (!stopped) await write();
+    });
+    retry = stop;
+  };
   await beat();
-  return every(BEAT_MS, beat);
+  const stopBeats = every(BEAT_MS, beat);
+  return () => {
+    stopped = true;
+    stopBeats();
+    retry?.();
+    retry = null;
+  };
 }
 
 // A stale wake sent again with its wakeId, `enqueue(body)` its task, by the check or the waker (`by`): one resend a minute between

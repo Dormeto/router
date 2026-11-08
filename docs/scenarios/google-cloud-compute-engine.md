@@ -138,13 +138,14 @@ started by hand makes the workload awake, and VMs all stopped by hand while it i
 VMs are going down, the workload wakes as soon as the nap ends.
 
 **A wake or a nap that dies.** A wake or a nap runs in one request of the controller. A running wake or nap beats on its
-run every minute (`beatAt`, in `dormeto gcp workloads show --json`). One whose beat is older than 3 minutes, or absent 90 s after it
-was asked, is stale: its task was lost or its request died. The check, and the waker when a visitor polls, act on it at
-most once a minute. A stale wake is sent again with its `wakeId`, twice at most, which a duplicate cannot disturb: after
-that, its deadline alone acts. A stale nap is called stuck: the workload is then `FAILED`, and the next wake works. So
-both are sent again or called stuck within minutes. The deadlines stay as the last resort, for a run from before the
-beat or one that beats on: the wake's timeout, and for a nap called stuck after 35 minutes, or 22 under a swap with no VM
-stopping yet ([the swap's limits](#limits-of-the-swap)). Until then a visitor's wake waits for the nap.
+run every minute (`beatAt`, in `dormeto gcp workloads show --json`), and a beat that fails is tried again once, 10 s
+later. One whose beat is older than 3 minutes, or absent 90 s after it was asked, is stale: its task was lost or its
+request died. The check, and the waker when a visitor polls, act on it at most once a minute. A stale wake is sent again
+with its `wakeId`, twice at most, which a duplicate cannot disturb: after that, its deadline alone acts. A stale nap is
+called stuck: the workload is then `FAILED`, and the next wake works. So both are sent again or called stuck within
+minutes. The deadlines stay as the last resort, for a run from before the beat or one that beats on: the wake's timeout,
+and for a nap called stuck after 35 minutes, or 22 under a swap with no VM stopping yet
+([the swap's limits](#limits-of-the-swap)). Until then a visitor's wake waits for the nap.
 
 **A nap that gives up.** Before it stops anything, a nap checks that nothing changed since the onboarding, and gives up
 otherwise: nothing is stopped and the workload stays awake. The run says why in `napAborted` (`reason` and `at`),

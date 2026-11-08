@@ -17,7 +17,7 @@ resource "google_compute_subnetwork" "proxy_global" {
   name          = "${local.name}-proxy-global"
   network       = google_compute_network.dev.id
   region        = var.region
-  ip_cidr_range = "10.10.2.0/24"
+  ip_cidr_range = "10.10.3.0/24"
   purpose       = "GLOBAL_MANAGED_PROXY"
   role          = "ACTIVE"
 }

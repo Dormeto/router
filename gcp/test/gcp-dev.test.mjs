@@ -253,3 +253,32 @@ test('the internal outputs live in their own file, are null unless enable_intern
   for (const key of ['url_map', 'address', 'client']) assert.match(outputs, new RegExp(`\\b${key}\\b`));
   assert.match(outputs, /zone/);
 });
+
+test('no two address ranges of the root overlap: subnets and secondary ranges share one network', async () => {
+  const code = uncommented((await terraformFiles()).map(([, text]) => text).join('\n'));
+  const ranges = [...code.matchAll(/ip_cidr_range\s*=\s*"(\d+)\.(\d+)\.(\d+)\.(\d+)\/(\d+)"/g)].map(([text, a, b, c, d, bits]) => {
+    const start = ((+a * 256 + +b) * 256 + +c) * 256 + +d;
+    return { text: text.match(/"([^"]+)"/)[1], start, end: start + 2 ** (32 - +bits) - 1 };
+  });
+  assert.ok(ranges.length >= 6, 'the ranges were found');
+  for (let i = 0; i < ranges.length; i += 1) {
+    for (let j = i + 1; j < ranges.length; j += 1) {
+      assert.ok(ranges[i].end < ranges[j].start || ranges[j].end < ranges[i].start, `${ranges[i].text} overlaps ${ranges[j].text}`);
+    }
+  }
+});
+
+test('the internal demo\'s firewall rules admit only Google\'s checkers, the proxies and IAP, to their own tags', async () => {
+  const code = uncommented(await readFile(join(ROOT, 'internal.tf'), 'utf8'));
+  const rules = Object.fromEntries(bodies(code, 'google_compute_firewall'));
+  const internal = rules.internal;
+  assert.match(internal, /source_ranges\s*=\s*\["35\.191\.0\.0\/16", "130\.211\.0\.0\/22", google_compute_subnetwork\.proxy\.ip_cidr_range, google_compute_subnetwork\.proxy_global\[0\]\.ip_cidr_range\]/);
+  assert.match(internal, /target_tags\s*=\s*\[local\.internal_tag\]/);
+  assert.match(internal, /ports\s*=\s*\["80"\]/);
+  assert.match(rules.internal_client, /source_ranges\s*=\s*\["35\.235\.240\.0\/20"\]/);
+  assert.match(rules.internal_client, /target_tags\s*=\s*\[local\.client_tag\]/);
+  assert.match(rules.internal_client, /ports\s*=\s*\["22"\]/);
+  assert.doesNotMatch(code, /0\.0\.0\.0\/0/);
+  assert.match(code, /internal_tag\s*=\s*"\$\{local\.demo\}-internal"/);
+  assert.match(code, /client_tag\s*=\s*"\$\{local\.demo\}-client"/);
+});

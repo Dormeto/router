@@ -71,6 +71,17 @@ const fromProjects = (url) => url.slice(Math.max(url.indexOf('projects/'), 0));
 const isoOf = (ms) => new Date(ms).toISOString();
 const isSwapped = (lb) => Object.hasOwn(SWAP_WAIT_MS, lb.kind);
 const isRegional = (lb) => lb.kind === 'regional';
+// The CLI sends `requestLogs` when it turned the backend service's logging on: what the logging was before, kept for the offboarding.
+function requestLogsProblems(asked) {
+  if (typeof asked !== 'object' || asked === null || Array.isArray(asked)) return ['requestLogs: must be an object'];
+  const { before } = asked;
+  if (typeof before !== 'object' || before === null || Array.isArray(before)) return ['requestLogs: before must be an object with enable and sampleRate'];
+  return [
+    ...(typeof before.enable === 'boolean' ? [] : ['requestLogs: before.enable must be true or false']),
+    ...(typeof before.sampleRate === 'number' && before.sampleRate >= 0 && before.sampleRate <= 1 ? [] : ['requestLogs: before.sampleRate must be a number from 0 to 1']),
+  ];
+}
+
 // The map's change is included in the wake's time.
 const defaultWakeSeconds = (lb, companions, pods) => Math.min((companions ? COMPANION_WAKE_SECONDS : pods ? PODS_WAKE_SECONDS : VMS_WAKE_SECONDS) + (isSwapped(lb) ? SWAP_WAIT_MS[lb.kind] / 1000 : 0), RANGES.wakeTimeoutSeconds[1]);
 const backendText = (backend) => (isPods(backend) ? ownerText(backend) : backend.name);
@@ -147,6 +158,7 @@ function workloadOf(cfg, run, paused) {
     lb: cfg.lb ?? GLOBAL_LB,
     settings: Object.fromEntries(SETTINGS.filter((name) => cfg[name] !== undefined).map((name) => [name, cfg[name]])),
     backends: cfg.backends,
+    ...(cfg.requestLogs ? { requestLogs: cfg.requestLogs } : {}),
     ...(run?.state === STATES.AWAKE && run.awakeSince !== undefined ? { awakeSince: isoOf(run.awakeSince) } : {}),
     ...(run?.lastWake ? { lastWake: run.lastWake } : {}),
     ...(failure ? { failure } : {}),
@@ -176,7 +188,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   const insertService = (body, lb) => (isRegional(lb) ? compute.insertRegionBackendService(lb.region, body) : compute.insertBackendService(body));
 
   // The request's fields, or a 400. Without an ID, the backend service's name, when it is one. `needsAll`: an onboarding's `gke` names all, a dry run's the cluster alone.
-  function requested({ urlMap, backendService, id, settings = {}, loadBalancer, cloudSql = [], gke: gkeAsked }, { needsAll = false } = {}) {
+  function requested({ urlMap, backendService, id, settings = {}, loadBalancer, cloudSql = [], gke: gkeAsked, requestLogs }, { needsAll = false } = {}) {
     if (!urlMap || !backendService) throw bad('urlMap and backendService are needed');
     for (const [key, value] of Object.entries({ urlMap, backendService })) {
       if (typeof value !== 'string' || !NAME.test(value)) throw bad(`${key}: ${JSON.stringify(value)} is not a Compute Engine name`);
@@ -185,9 +197,9 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     const workloadId = checkedId(id || backendService);
     const waker = wakerName(workloadId);
     if (waker.length > NAME_MAX) throw bad(`workload ID ${workloadId} would name the waker backend service ${waker}, longer than the ${NAME_MAX} characters of a Compute Engine name: use a shorter one`);
-    const problems = [...settingsProblems(settings), ...cloudSqlProblems(cloudSql), ...(gkeAsked === undefined ? [] : gkeProblems(gkeAsked, { needsAll }))];
+    const problems = [...settingsProblems(settings), ...cloudSqlProblems(cloudSql), ...(requestLogs === undefined ? [] : requestLogsProblems(requestLogs)), ...(gkeAsked === undefined ? [] : gkeProblems(gkeAsked, { needsAll }))];
     if (problems.length) throw bad(problems.join('; '));
-    return { id: workloadId, urlMap, backendService, settings, loadBalancer, cloudSql, gkeAsked };
+    return { id: workloadId, urlMap, backendService, settings, loadBalancer, cloudSql, gkeAsked, requestLogs };
   }
 
   // The URL map, `{ map, regional }`, or why it is not one: `{ reason }`. A regional one elsewhere than the router's region reads as none.
@@ -510,7 +522,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   }
 
   async function onboard(input) {
-    const { id, urlMap, backendService, settings, loadBalancer, cloudSql, gkeAsked } = requested(input, { needsAll: true });
+    const { id, urlMap, backendService, settings, loadBalancer, cloudSql, gkeAsked, requestLogs } = requested(input, { needsAll: true });
     if (await store.getConfig(id)) throw new Refusal(409, 'exists', `workload ${id} is onboarded already`);
     const { reasons, vms, groups, negs, memberOf, serviceBackends, podNegs, databases, hosts, wakerExists, lb } = await inspect({ id, urlMap, backendService, loadBalancer, settings, cloudSql, gkeAsked });
     if (reasons.length) throw new Refusal(400, 'not-eligible', `cannot onboard ${id}: ${reasons.join('; ')}`);
@@ -538,6 +550,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
       // What a nap checks again before it stops anything: the unmanaged groups' VMs and the service's backends as read now.
       ...(Object.keys(memberOf).length ? { groups: memberOf } : {}),
       ...(pods ? {} : { serviceBackends }),
+      ...(requestLogs ? { requestLogs: { before: { enable: requestLogs.before.enable, sampleRate: requestLogs.before.sampleRate } } } : {}),
       backends: [
         ...vms.map((vm) => ({
           kind: 'vm',

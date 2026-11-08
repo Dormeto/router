@@ -284,6 +284,10 @@ test('bad input is a 400 before any read', async () => {
     [{ ...INPUT, settings: { constructor: 1 } }, /settings: unknown setting constructor/],
     [{ ...INPUT, settings: JSON.parse('{"__proto__": 1}') }, /settings: unknown setting __proto__/],
     [{ ...INPUT, settings: [] }, /settings: must be an object/],
+    [{ ...INPUT, requestLogs: { before: { enable: true, sampleRate: 2 } } }, /requestLogs: before.sampleRate must be a number from 0 to 1/],
+    [{ ...INPUT, requestLogs: { before: { enable: 'yes', sampleRate: 1 } } }, /requestLogs: before.enable must be true or false/],
+    [{ ...INPUT, requestLogs: {} }, /requestLogs: before must be an object with enable and sampleRate/],
+    [{ ...INPUT, requestLogs: 'on' }, /requestLogs: must be an object/],
   ];
   for (const [input, message] of cases) {
     for (const call of [onboarding.dryRun, onboarding.onboard]) await assert.rejects(call(input), refused(400, 'bad-request', message));
@@ -353,6 +357,27 @@ test('onboard: the service, then the route, then the configuration and AWAKE; no
     backends: [{ kind: 'vm', location: ZONE, name: 'vm-a', id: '1001' }],
     awakeSince: new Date(clock.now()).toISOString(),
   });
+});
+
+test('onboard: requestLogs.before is kept in the configuration and returned by show; without it, no field', async () => {
+  const requestLogs = { before: { enable: false, sampleRate: 0.5 } };
+  const { store, onboarding } = setup();
+  const workload = await onboarding.onboard({ ...INPUT, requestLogs });
+  assert.deepEqual(store.configs.get('demo').requestLogs, requestLogs);
+  assert.deepEqual(workload.requestLogs, requestLogs);
+  assert.deepEqual((await onboarding.show('demo')).requestLogs, requestLogs);
+  assert.deepEqual((await onboarding.list()).find((w) => w.id === 'demo').requestLogs, requestLogs);
+  const plain = setup();
+  const without = await plain.onboarding.onboard(INPUT);
+  assert.ok(!('requestLogs' in plain.store.configs.get('demo')));
+  assert.ok(!('requestLogs' in without));
+  assert.ok(!('requestLogs' in await plain.onboarding.show('demo')));
+});
+
+test('dry run: requestLogs is accepted and ignored', async () => {
+  const { onboarding } = setup();
+  const withLogs = await onboarding.dryRun({ ...INPUT, requestLogs: { before: { enable: false, sampleRate: 1 } } });
+  assert.deepEqual(withLogs, await onboarding.dryRun(INPUT));
 });
 
 test('onboard: default settings, a managed group as a backend, the map\'s default in the hosts', async () => {

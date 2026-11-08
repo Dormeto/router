@@ -92,6 +92,28 @@ test('requests: the pages are read in turn, each asking what the limit leaves', 
   assert.ok(calls.every((c) => c.body.filter === calls[0].body.filter));
 });
 
+// The one loop on an idle nap's path while visitors may be at the waker, and each page spends the project's entries.list quota,
+// which other workloads' reads need: cut short, and the count decides.
+test('requests: a token after 10 pages is null, said in LogsUnread: no more pages read', async () => {
+  const { calls, logs, reader } = setup((n) => ({ entries: [entry(`https://demo.example.com/${n}`)], nextPageToken: `n${n}` }));
+  assert.equal(await read(reader), null);
+  assert.equal(calls.length, 10);
+  assert.deepEqual(logs.map((l) => [l.level, l.event, l.backendService]), [['info', 'LogsUnread', 'app']]);
+  assert.match(logs[0].reason, /more than 10 pages/);
+  const ten = setup((n) => ({ entries: [entry(`https://demo.example.com/${n}`)], ...(n < 10 ? { nextPageToken: `n${n}` } : {}) }));
+  assert.equal((await read(ten.reader, { expected: 10 })).length, 10);
+});
+
+test('requests: a fourth page with a token and no entries is null, said in LogsUnread; three are read through', async () => {
+  const { calls, logs, reader } = setup(() => ({ nextPageToken: 'n' }));
+  assert.equal(await read(reader), null);
+  assert.equal(calls.length, 4);
+  assert.match(logs[0].reason, /more than 3 empty pages/);
+  const three = setup((n) => (n <= 3 ? { entries: [], nextPageToken: `n${n}` } : { entries: [entry('https://demo.example.com/')] }));
+  assert.equal((await read(three.reader)).length, 1);
+  assert.equal(three.calls.length, 4);
+});
+
 test('requests: none in the window reads an empty list when none was counted', async () => {
   const { reader } = setup([{}]);
   assert.deepEqual(await read(reader, { expected: 0 }), []);

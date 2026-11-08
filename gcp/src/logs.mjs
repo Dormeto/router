@@ -7,8 +7,9 @@
 // regional one as its own resource, whose labels are its metric's (monitoring.mjs, M5: `backend_target_name`, the plain name),
 // and the region, as a regional service's name is unique only there. M2 confirms the regional one.
 //
-// The entries are trusted only when they hold every request: `null` past the limit, when they cannot be read, or when fewer came
-// back than Monitoring counted over the window (not all written yet). Then the count decides.
+// The entries are trusted only when they hold every request: `null` past the limit, when they cannot be read, when their pages do
+// not end within 10 (or 3 of them empty), or when fewer came back than Monitoring counted over the window (not all written yet).
+// Then the count decides.
 const LOGGING = 'https://logging.googleapis.com/v2';
 // The resource type of the entries and the label naming the backend service, by kind; the view's filter names the same types.
 const LOG_RESOURCES = {
@@ -19,6 +20,12 @@ const LOG_RESOURCES = {
 export const CALLS = {
   requests: ['logging.views.access'],
 };
+
+// The pages of one read, and those of them that carry a token and no entry (Logging's partial answers): past either, the read is cut
+// short, null, and the count decides. It runs on an idle nap's path while visitors may be at the waker, and every page spends the
+// project's entries.list quota, which other workloads' reads need in the same minute.
+const PAGES_MAX = 10;
+const EMPTY_PAGES_MAX = 3;
 
 function filterOf(backendService, lb, from, to) {
   const regional = lb?.kind === 'regional';
@@ -55,13 +62,20 @@ export function createLogs({ google, view, log }) {
     try {
       const filter = filterOf(backendService, lb, from, to);
       let page = '';
+      let pages = 0;
+      let empty = 0;
       do {
         const answer = await google.request('POST', `${LOGGING}/entries:list`, {
           resourceNames: [view], filter, orderBy: 'timestamp asc', pageSize: limit - entries.length, ...(page ? { pageToken: page } : {}),
         });
-        entries.push(...(answer.entries ?? []));
+        const found = answer.entries ?? [];
+        entries.push(...found);
         page = answer.nextPageToken ?? '';
+        pages += 1;
+        if (page && !found.length) empty += 1;
         if (entries.length > limit || (page && entries.length >= limit)) return unread('info', backendService, `more than ${limit} entries`);
+        if (page && empty > EMPTY_PAGES_MAX) return unread('info', backendService, `more than ${EMPTY_PAGES_MAX} empty pages`);
+        if (page && pages >= PAGES_MAX) return unread('info', backendService, `more than ${PAGES_MAX} pages`);
       } while (page);
     } catch (err) {
       return unread('warn', backendService, err.message);

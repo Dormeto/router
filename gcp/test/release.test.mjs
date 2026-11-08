@@ -52,15 +52,36 @@ test('gcp-image.sh builds linux/amd64 with podman and tags the version', () => {
   assert.doesNotMatch(run.stdout, /push|login/);
 });
 
-test('gcp-image.sh --push logs in with the dormeto-dev token, tags and pushes the repository', () => {
-  const run = image('1.2.3', '--push', 'europe-west1-docker.pkg.dev/dormeto-dev/dormeto/router');
+test('gcp-image.sh --push logs in with the named configuration\'s token and pushes router:<version> to the repository', () => {
+  const run = image('1.2.3', '--push', '--configuration', 'dormeto-dev', '--repository', 'europe-west1-docker.pkg.dev/dormeto-dev/dormeto');
   assert.equal(run.status, 0, run.stderr);
   assert.match(run.stdout, /gcloud --configuration dormeto-dev auth print-access-token \| podman login -u oauth2accesstoken --password-stdin europe-west1-docker\.pkg\.dev/);
-  assert.match(run.stdout, /podman push dormeto-router:1\.2\.3 docker:\/\/europe-west1-docker\.pkg\.dev\/dormeto-dev\/dormeto\/router:1\.2\.3/);
+  assert.match(run.stdout, /podman push --digestfile \S+ dormeto-router:1\.2\.3 docker:\/\/europe-west1-docker\.pkg\.dev\/dormeto-dev\/dormeto\/router:1\.2\.3/);
+});
+
+test('gcp-image.sh --push pushes to every repository given, logging in once per registry', () => {
+  const hosts = ['europe', 'us', 'asia'].map((location) => `${location}-docker.pkg.dev`);
+  const run = image('1.2.3', '--push', '--configuration', 'dormeto-releases', ...hosts.flatMap((host) => ['--repository', `${host}/dormeto-releases/router`]), '--repository', `${hosts[0]}/dormeto-releases/other`);
+  assert.equal(run.status, 0, run.stderr);
+  for (const host of hosts) {
+    assert.equal(run.stdout.match(new RegExp(`--configuration dormeto-releases auth print-access-token \\| podman login .* ${host.replace(/\./g, '\\.')}$`, 'gm'))?.length, 1, host);
+    assert.match(run.stdout, new RegExp(`docker://${host.replace(/\./g, '\\.')}/dormeto-releases/router/router:1\\.2\\.3$`, 'm'));
+  }
+  assert.match(run.stdout, /docker:\/\/europe-docker\.pkg\.dev\/dormeto-releases\/other\/router:1\.2\.3$/m);
+});
+
+test('gcp-image.sh --push has no default configuration and no default project', () => {
+  const repository = ['--repository', 'europe-docker.pkg.dev/dormeto-releases/router'];
+  for (const args of [['--push', ...repository], ['--push', '--configuration', 'dormeto-releases'], ['--push', '--configuration', 'dormeto-releases', '--repository', 'europe-docker.pkg.dev/router']]) {
+    const run = image('1.2.3', ...args);
+    assert.equal(run.status, 2, args.join(' '));
+    assert.match(run.stderr, /usage: /);
+    assert.doesNotMatch(run.stdout, /podman push|auth print-access-token/);
+  }
 });
 
 test('gcp-image.sh refuses a missing or odd argument with exit 2', () => {
-  for (const args of [[], ['1.2.3', '--push'], ['1.2.3', '--other'], ['v1'], ['1.2.3', '--push', 'a', 'b']]) {
+  for (const args of [[], ['1.2.3', '--push'], ['1.2.3', '--other'], ['v1'], ['1.2.3', '--configuration', 'c'], ['1.2.3', '--repository', 'a/b/c'], ['1.2.3', '--push', '--configuration'], ['1.2.3', '--push', '--configuration', 'c', '--repository', 'a/b/c', 'd']]) {
     const run = image(...args);
     assert.equal(run.status, 2, args.join(' '));
     assert.match(run.stderr, /usage: /);

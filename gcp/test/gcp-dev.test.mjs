@@ -94,7 +94,7 @@ test('the demo backend services drain connections for 30 s, as the router does, 
   const code = uncommented((await terraformFiles()).map(([, text]) => text).join('\n'));
   const services = [...bodies(code, 'google_compute_backend_service'), ...bodies(code, 'google_compute_region_backend_service')];
   // The demo's three (global app, stand-in, managed group are one for_each), the regional one, and the optional ones.
-  assert.deepEqual(services.map(([name]) => name).sort(), ['classic', 'demo', 'demo', 'gke', 'neg']);
+  assert.deepEqual(services.map(([name]) => name).sort(), ['classic', 'classic_standard', 'demo', 'demo', 'gke', 'neg', 'ten', 'ten']);
   for (const [name, body] of services) assert.match(body, /^\s*connection_draining_timeout_sec\s*=\s*30\s*$/m, name);
 });
 
@@ -119,7 +119,7 @@ const variableBlock = (variables, name) => new RegExp(`variable\\s+"${name}"\\s*
 
 test('each optional part is behind a variable that is false by default, and the regional map ignores what Dormeto writes', async () => {
   const variables = uncommented(await readFile(join(ROOT, 'variables.tf'), 'utf8'));
-  for (const name of ['enable_classic', 'enable_neg', 'enable_sql', 'enable_gke']) {
+  for (const name of ['enable_classic', 'enable_classic_standard', 'enable_ten', 'enable_neg', 'enable_sql', 'enable_gke']) {
     const block = variableBlock(variables, name);
     assert.ok(block, `${name} is declared`);
     assert.match(block, /^\s*type\s*=\s*bool\s*$/m, name);
@@ -132,7 +132,7 @@ test('each optional part is behind a variable that is false by default, and the 
 });
 
 test('every resource of an optional file has a count or a for_each on its own variable, so a plan with the defaults shows no change', async () => {
-  const optional = { 'classic.tf': 'enable_classic', 'neg.tf': 'enable_neg', 'sql.tf': 'enable_sql', 'gke.tf': 'enable_gke' };
+  const optional = { 'classic.tf': 'enable_classic', 'classic-standard.tf': 'enable_classic_standard', 'neg.tf': 'enable_neg', 'sql.tf': 'enable_sql', 'gke.tf': 'enable_gke' };
   for (const [file, variable] of Object.entries(optional)) {
     const code = uncommented(await readFile(join(ROOT, file), 'utf8'));
     const resources = [...code.matchAll(/^resource\s+"([^"]+)"\s+"([^"]+)"/gm)];
@@ -142,6 +142,36 @@ test('every resource of an optional file has a count or a for_each on its own va
       assert.match(body, new RegExp(`^\\s*(?:count\\s*=\\s*var\\.${variable}\\s*\\?\\s*1\\s*:\\s*0|for_each\\s*=\\s*var\\.${variable}\\s*\\?[^\\n]*:\\s*\\{\\}|for_each\\s*=\\s*var\\.${variable}\\s*\\?[^\\n]*:\\s*toset\\(\\[\\]\\))\\s*$`, 'm'), `${type}.${name}`);
     }
   }
+});
+
+test('ten.tf: ten VMs, each with its own group and backend service, on a map of its own, global by default, nothing at the defaults', async () => {
+  const variables = uncommented(await readFile(join(ROOT, 'variables.tf'), 'utf8'));
+  assert.match(variableBlock(variables, 'ten_map'), /^\s*default\s*=\s*"global"\s*$/m);
+  assert.match(variableBlock(variables, 'ten_map'), /contains\(\["global", "regional"\], var\.ten_map\)/);
+  const ten = uncommented(await readFile(join(ROOT, 'ten.tf'), 'utf8'));
+  assert.match(ten, /range\(1, 11\)/);
+  assert.match(ten, /ten_ids\s*=\s*var\.enable_ten \?[^\n]*: toset\(\[\]\)/);
+  assert.match(ten, /ten_global\s*=\s*var\.enable_ten && var\.ten_map == "global" \?/);
+  assert.match(ten, /ten_regional\s*=\s*var\.enable_ten && var\.ten_map == "regional" \?/);
+  assert.match(ten, /"ten-\$\{host_rule\.key\}\.\$\{var\.domain\}"/);
+  // Every resource is counted from the ten_* sets, so the defaults create none.
+  const resources = [...ten.matchAll(/^resource\s+"([^"]+)"\s+"([^"]+)"/gm)];
+  assert.ok(resources.length >= 10);
+  for (const [, type, name] of resources) {
+    const [[, body]] = bodies(ten, type).filter(([n]) => n === name);
+    assert.match(body, /^\s*(?:for_each\s*=\s*local\.ten_(?:ids|global|regional)|count\s*=\s*length\(local\.ten_(?:global|regional)\) > 0 \? 1 : 0)\s*$/m, `${type}.${name}`);
+  }
+  assert.match(bodies(ten, 'google_compute_instance').find(([n]) => n === 'ten')[1], /machine_type\s*=\s*local\.ten_machine/);
+});
+
+test('classic-standard.tf is the classic map on the Standard tier: a regional address and rule on the global proxy', async () => {
+  const code = uncommented(await readFile(join(ROOT, 'classic-standard.tf'), 'utf8'));
+  assert.match(bodies(code, 'google_compute_address')[0][1], /network_tier\s*=\s*"STANDARD"/);
+  const rule = bodies(code, 'google_compute_forwarding_rule')[0][1];
+  assert.match(rule, /network_tier\s*=\s*"STANDARD"/);
+  assert.match(rule, /load_balancing_scheme\s*=\s*"EXTERNAL"/);
+  assert.match(rule, /target\s*=\s*google_compute_target_http_proxy\.classic_standard\[0\]\.id/);
+  assert.doesNotMatch(code, /google_compute_global_forwarding_rule|ssl_certificate|https_proxy/);
 });
 
 test('the optional resources are the ones asked for: Cloud SQL smallest and deletable, GKE zonal Standard with one small node', async () => {

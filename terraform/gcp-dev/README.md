@@ -48,7 +48,7 @@ backend service out of service.
 
 ## Optional parts
 
-Four variables, `false` by default: a plan with the defaults shows no change (nothing above is renamed or moved, and
+Six variables, `false` by default: a plan with the defaults shows no change (nothing above is renamed or moved, and
 `gcp/test/gcp-dev.test.mjs` checks that each variable defaults to false and that every resource of the optional files
 is behind its own). They cost money while they exist, so they are turned on for the measures of the Google Cloud
 coverage (vision `docs/specs/2026-10-30-google-cloud-coverage-design.md`, sections 10 and 11) and for its acceptance, on
@@ -59,6 +59,8 @@ binding for a resource it makes (a service agent's).
 | Variable | Adds | About, per month (list prices) |
 |---|---|---|
 | `enable_classic` | `classic.tf`: a classic external Application Load Balancer (`EXTERNAL`, HTTP on port 80, no certificate) on the demo group: the backend services `dmt-demo-classic-app` and `dmt-demo-classic-standin`, the URL map `dmt-dev-classic`, its HTTP proxy, address and forwarding rule | $18 (the forwarding rule) |
+| `enable_classic_standard` | `classic-standard.tf`: the classic external Application Load Balancer again, on the Standard network tier (M1): the backend services `dmt-demo-classic-std-app` and `-standin`, the URL map `dmt-dev-classic-std`, its HTTP proxy, a regional address and a regional forwarding rule (Standard tier) targeting that global proxy | $18 (the forwarding rule) |
+| `enable_ten` | `ten.tf`, for the ten-workloads measure (M4): ten VMs `dmt-demo-ten-<n>` (`var.machine_type`, no service account), each in its own unmanaged group with its own backend service, and a host rule `ten-<n>.<domain>` on a URL map of their own (`dmt-dev-ten`) behind an HTTP load balancer of its own, global, or regional on the Standard tier with `-var ten_map=regional` (the demo's maps ignore their host rules, so the rules live on a map that does not). No DNS record: send the Host header to the address | $150: ten VMs $130 (`e2-small`), their disks $10, the forwarding rule $18 |
 | `enable_neg` | `neg.tf`: the VM `dmt-demo-neg` (`var.machine_type`, no service account), the zonal `GCE_VM_IP_PORT` NEG `dmt-demo-neg` holding it, the `EXTERNAL_MANAGED` backend service `dmt-demo-neg` on it, and a global load balancer of its own: the URL map `dmt-dev-neg`, an HTTP proxy, an address and a forwarding rule on port 80 | $32: the VM $13, its disk $1, the forwarding rule $18 |
 | `enable_sql` | `sql.tf`: the PostgreSQL 16 instance `dmt-demo-sql`, `db-f1-micro`, 10 GB on a hard disk, `deletion_protection = false`, a public address and no authorized network (no connection can be made; no user, no database) | $12 (Cloud SQL keeps a deleted instance's name for about a week) |
 | `enable_gke` | `gke.tf`: the zonal Standard cluster `dmt-demo-gke` (its own subnet `dmt-dev-gke`, the DNS endpoint on and reachable from outside, Gateway API standard channel, `deletion_protection = false`), one node pool of one `e2-small` node on the default compute service account, a firewall rule for Google's health checkers to the pods' port 8080, and a global load balancer for the Service's NEG: the backend service `dmt-demo-gke`, its health check, the URL map `dmt-dev-gke`, an HTTP proxy, an address and a forwarding rule on port 80 | $32: the node $13, its disk $1, the forwarding rule $18; the cluster's fee ($73) is within the free tier of one zonal cluster per billing account, if this account's is unused. The Gateway of `gke-demo.yaml` makes GKE create another forwarding rule, about $18 more while it exists: delete the Gateway and the HTTPRoute right after M10 |
@@ -66,7 +68,7 @@ binding for a resource it makes (a service agent's).
 **Needs first.** `enable_sql` and `enable_gke` need the `sqladmin` and `container` APIs, which this root does not turn on
 (no `google_project_service`, by design): `dormeto gcp install --with cloud-sql,gke` does, and **not in `europe-west1`
 before 2026-11-02**. The probe's Cloud Run job (below) needs a router image holding `probe.mjs`: one built and pushed
-for the measures (`scripts/gcp-image.sh <version> --push <repository>`).
+for the measures (`scripts/gcp-image.sh <version> --push --configuration dormeto-dev --repository <host>/<project>/<repo>`, which pushes `<repository>/router:<version>`).
 
 The NEG VM and the GKE load balancer have no domain name, and the root has no output for them (an output the defaults do
 not store would show in a plan): read an address with `gcloud compute addresses describe dmt-dev-neg --global

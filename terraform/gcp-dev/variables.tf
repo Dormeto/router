@@ -67,6 +67,29 @@ variable "enable_classic" {
   default     = false
 }
 
+variable "enable_classic_standard" {
+  description = "A classic external Application Load Balancer on the Standard network tier: a regional address and forwarding rule on a global HTTP proxy."
+  type        = bool
+  default     = false
+}
+
+variable "enable_ten" {
+  description = "Ten small VMs, each in its own instance group with its own backend service, and a host rule ten-<n>.<domain> on a URL map of their own (ten_map)."
+  type        = bool
+  default     = false
+}
+
+variable "ten_map" {
+  description = "The kind of load balancer and URL map for enable_ten: global or regional."
+  type        = string
+  default     = "global"
+
+  validation {
+    condition     = contains(["global", "regional"], var.ten_map)
+    error_message = "global or regional."
+  }
+}
+
 variable "enable_neg" {
   description = "A VM, a zonal NEG holding it and a global backend service on it, behind a load balancer of its own."
   type        = bool

@@ -616,9 +616,17 @@ map, which was not run: each page says what was accepted and measured.
 ./scripts/gcp-image.sh 0.37.0
 # Run the controller's health locally: GET /v1/health -> {"version","project","region"}
 podman run --rm -p 8080:8080 -e DMT_ROLE=controller -e DMT_PROJECT=p -e DMT_REGION=europe-west1 -e DMT_DATABASE=d -e DMT_QUEUE=q dormeto-router:0.37.0
-# Build and push to the dev Artifact Registry repository (the gcloud configuration dormeto-dev's own access)
-./scripts/gcp-image.sh 0.37.0 --push europe-west1-docker.pkg.dev/dormeto-dev/dormeto/router
+# Build and push europe-west1-docker.pkg.dev/dormeto-dev/dormeto/router:<version> (repository `dormeto`; the named gcloud
+# configuration's own access; no default configuration, no default project; --repository can be repeated, and each
+# pushed image's digest is printed)
+./scripts/gcp-image.sh 0.37.0 --push --configuration dormeto-dev --repository europe-west1-docker.pkg.dev/dormeto-dev/dormeto
 ```
+
+Dormeto publishes the image, public, at `<europe|us|asia>-docker.pkg.dev/dormeto-releases/router/router:<version>` from
+router 0.38.0 (`terraform/gcp-releases` creates the three repositories), and `dormeto gcp install` uses it by default.
+Building your own is for `--image`, for example inside a VPC Service Controls perimeter, which keeps the public
+repository out. An image in another project needs Artifact Registry Reader for the project's Cloud Run service agent,
+which the customer gives.
 
 The dev repository `dormeto` is created once, by hand, in `dormeto-dev`. Creating it grants nothing of ours, but it can
 create Artifact Registry's service agent and its binding: Google's own, the CLI shows it at its next run. Cloud Run's
@@ -632,7 +640,7 @@ The image carries `package.json`, `lambda/src/lib` and `gcp/src` only, on `gcr.i
 24.2 or later: `server.mjs` uses `import.meta.main`). `gcp/access.json` is the manifest of the access the router needs.
 `terraform/gcp-dev` is the demo VMs and load balancers of the acceptance, with no IAM; its classic load balancer, zonal
 NEG, Cloud SQL instance and GKE cluster are behind variables that default to off (`enable_classic`, `enable_neg`,
-`enable_sql`, `enable_gke`).
+`enable_sql`, `enable_gke`, plus `enable_classic_standard` and `enable_ten` with `ten_map` for the measures).
 
 ## Version
 

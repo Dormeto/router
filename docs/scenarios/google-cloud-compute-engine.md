@@ -165,10 +165,12 @@ The counts are kept 35 days and swept once a day, and an offboarding deletes its
   the window to its end: the extra minute can only add requests. It counts only the requests the waker would not
   ignore: not scanners, not `HEAD` requests, not an IP list's addresses. If none is left, the workload is idle. With
   logs that cannot be read or hold more than 1,000 entries, or with logging off or sampled, Monitoring's count decides.
+  An empty log while Monitoring counts requests leaves the count deciding: a log lost upstream (a `_Default` sink's
+  exclusion of the load balancers' logs, say) is caught that way, said in `LogsEmpty` at most once an hour per workload.
   `workloads show` says which it read: `idle check: request logs` or `idle check: request count`.
 - **Why the logs alone.** Monitoring's `request_count` is sampled and batched: its one-minute points came late and in
   lumps (13 for minutes that logged 4), with gaps of six minutes (measured on 2026-11-08). It cannot tell whether the
-  logs are complete, so they are not compared with it.
+  logs are complete, so they are not compared with it, but for an empty log.
 - **The newest requests.** An entry reaches the logs after its request: 0.6 to 1.5 s later on a classic load balancer,
   about 10 s on a regional one (measured). A request the check could not see yet is read by an idle nap's last read,
   before anything stops.
@@ -180,8 +182,9 @@ The counts are kept 35 days and swept once a day, and an offboarding deletes its
   alone, by an IAM condition: never the project's other logs. `dormeto gcp workloads onboard --request-logs` turns the
   backend service's logging on at sample rate 1.0, as the operator; the offboarding sets it back. Without the flag, the
   onboarding warns that every request counts, scanners included. On a regional load balancer, logging begins a few
-  minutes after the change (2 to 5 minutes, measured): a request in those minutes is not in the logs, and the first idle
-  window after the onboarding does not see it.
+  minutes after the change (2 to 5 minutes, measured): a request in those minutes is not in the logs. So the count
+  decides while the window's logs are empty, and once they hold an entry, the first idle window after the onboarding
+  does not see that request.
 - **Terraform.** If you write the backend service in Terraform, keep this block in it. Then an apply does not turn the
   logs off.
 

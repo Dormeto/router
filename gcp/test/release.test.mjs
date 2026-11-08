@@ -283,6 +283,9 @@ test('the Compute Engine page: the fixes of router 0.38.0 and the idle check tha
   assert.match(page, /On a backend service that logs every request \(logConfig enabled, sample rate 1\.0\), the request logs decide alone, whatever Monitoring counts, none included/);
   assert.match(page, /The check reads the log entries from a minute before the window to its end: the extra minute can only add requests/);
   assert.match(page, /With logs that cannot be read or hold more than 1,000 entries, or with logging off or sampled, Monitoring's count decides/);
+  // The controller's ruling (2026-11-08): an empty log naps no busy workload.
+  assert.match(page, /An empty log while Monitoring counts requests leaves the count deciding: a log lost upstream \(a _Default sink's exclusion of the load balancers' logs, say\) is caught that way, said in LogsEmpty at most once an hour per workload/);
+  assert.match(page, /the count decides while the window's logs are empty/);
   assert.doesNotMatch(page, /When Monitoring counts 1 to 1,000 requests|fewer entries than Monitoring counted/);
   assert.match(page, /Monitoring's request_count is sampled and batched: its one-minute points came late and in lumps \(13 for minutes that logged 4\), with gaps of six minutes/);
   assert.match(page, /0\.6 to 1\.5 s later on a classic load balancer, about 10 s on a regional one/);
@@ -383,5 +386,5 @@ test('the README\'s Google Cloud section names the three pages and what router 0
   // M1 and M2 (2026-11-08).
   assert.doesNotMatch(flat(section), /unmeasured/);
   assert.match(flat(section), /a classic load balancer on the Standard tier is found, and Google accepts it for the swap \(measured\)/);
-  assert.match(flat(section), /the logs decide alone, as Monitoring's count is sampled/);
+  assert.match(flat(section), /the logs decide alone, as Monitoring's count is sampled, but an empty log leaves the count to decide/);
 });

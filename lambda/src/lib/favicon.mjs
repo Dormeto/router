@@ -1,7 +1,9 @@
 // The application's favicon, read while it was awake (branded waiting page design §6): one GET of its home page, the page's icon
 // link, else /favicon.ico. Everything inside one time budget, and any error ends the read as a sentence: it never throws, so
-// a nap that asks for it is never failed, held or changed by it. Pure but for the injected fetch (tests use none from the network).
-import { iconTypeOf } from './page-settings.mjs';
+// a nap that asks for it is never failed, held or changed by it. Pure but for the injected fetch (tests use none from the network),
+// and the nap's step that caches it (cacheFavicon), shared by AWS's controller and Google Cloud's.
+import { iconTypeOf, resolvePage } from './page-settings.mjs';
+import { STATES } from './state.mjs';
 
 const PAGE_BYTES = 256 * 1024;
 // What a read icon may weigh (uploads may be 64 KiB): it travels in every waiting page.
@@ -9,6 +11,10 @@ const ICON_BYTES = 32 * 1024;
 const REDIRECTS = 3;
 const AGENT = 'dormeto-router';
 const LIMITS = 'the icon is not a PNG, JPEG, WebP, SVG or ICO image';
+// The nap's step: a read at most once in this time, within this budget, and the grace after it that lets the result be written.
+const EVERY_MS = 86_400_000;
+export const FAVICON_BUDGET_MS = 3000;
+const GRACE_MS = 200;
 
 // An error that is a sentence for the dashboard (others are network errors, said as they come).
 class Refused extends Error {}
@@ -220,4 +226,42 @@ export function hostOfRules(rules) {
     if (host) return host;
   }
   return null;
+}
+
+// The nap's step (design §6): the favicon read and cached when the page would show it (a template with icon auto) and the last read,
+// successful or not, is over 24 hours old. The workload must be awake (the route reaches it only then): its run is read first, then
+// the favicon's record, the levels only when due, the host after them. One budget for all of it, store calls included: once it is
+// spent nothing more is read or sent (a late store answer ends here), the nap goes on and the give-up is logged. Whatever goes wrong
+// is logged and never thrown: it never changes the nap. The grace after the budget lets the result be written.
+// levels({ signal }) -> [organization, router, workload], each a page or null; host({ signal }) -> the host name to read, or null.
+export async function cacheFavicon(workloadId, { store, levels, host, fetch, now, budgetMs = FAVICON_BUDGET_MS, log }) {
+  const budget = new AbortController();
+  const spent = () => budget.signal.aborted;
+  let timers = [];
+  const work = (async () => {
+    if ((await store.getRun(workloadId))?.state !== STATES.AWAKE || spent()) return spent() ? 'gave up' : 'done';
+    const last = await store.getFavicon(workloadId);
+    if (spent()) return 'gave up';
+    if (last?.fetchedAt > now() - EVERY_MS) return 'done';
+    const [organization, router, workload] = await levels({ signal: budget.signal });
+    if (spent()) return 'gave up';
+    const page = resolvePage(organization, router, workload);
+    if (page.mode !== 'template' || page.icon !== 'auto') return 'done';
+    const name = await host({ signal: budget.signal });
+    if (spent()) return 'gave up';
+    const { icon, error } = await readFavicon(name, { fetch, now, budgetMs, signal: budget.signal });
+    await store.putFavicon(workloadId, { icon: icon ?? last?.icon ?? null, fetchedAt: now(), error });
+    return 'done';
+  })();
+  work.catch(() => {});
+  try {
+    const timeout = new Promise((resolve) => {
+      timers = [setTimeout(() => budget.abort(), budgetMs), setTimeout(() => resolve('gave up'), budgetMs + GRACE_MS)];
+    });
+    if ((await Promise.race([work, timeout])) === 'gave up') log.warn('FaviconGaveUp', { workloadId, budgetMs });
+  } catch (err) {
+    log.warn('FaviconSkipped', { workloadId, error: err.message });
+  } finally {
+    timers.forEach(clearTimeout);
+  }
 }

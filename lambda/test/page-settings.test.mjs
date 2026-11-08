@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { cleanPage, iconTypeOf, medianOf, pageWarnings, resolvePage, validatePage, withWake } from '../src/lib/page-settings.mjs';
+import { cleanPage, iconTypeOf, medianOf, pageViewOf, pageWarnings, resolvePage, validatePage, wakeHeaders, wakeProgress, withWake } from '../src/lib/page-settings.mjs';
 
 const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(32)]);
 const JPEG = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(32)]);
@@ -348,4 +348,36 @@ test('withWake appends, keeps the last 10, and starts afresh from a bad value', 
   assert.equal(withWake('[1,"x",null,2,-3]', 4), '[1,2,4]', 'unusable entries dropped');
   assert.equal(withWake('[1]', NaN), '[1]', 'an unusable duration changes nothing');
   assert.equal(withWake('[1]', undefined), '[1]');
+});
+
+test('wakeProgress: in WAKING with a start, the time since it and the median of the recent wakes; anything else, none', () => {
+  const run = { state: 'WAKING', wakeStartedAt: 1000, recentWakes: '[20000,30000,40000]' };
+  assert.deepEqual(wakeProgress('WAKING', run, 11_000), { elapsedMs: 10_000, typicalMs: 30_000 });
+  assert.deepEqual(wakeHeaders(wakeProgress('WAKING', run, 11_000)), { 'x-dormeto-wake-elapsed': '10000', 'x-dormeto-wake-typical': '30000' });
+  assert.deepEqual(wakeProgress('WAKING', { ...run, recentWakes: undefined }, 500), { elapsedMs: 0, typicalMs: null }, 'a start ahead of the clock is 0');
+  assert.deepEqual(wakeHeaders(wakeProgress('WAKING', { ...run, recentWakes: '{bad' }, 2000)), { 'x-dormeto-wake-elapsed': '1000' });
+  for (const [state, value] of [['ASLEEP', run], ['WAKING', { state: 'WAKING' }], ['WAKING', null]]) {
+    assert.equal(wakeProgress(state, value, 11_000), null, state);
+  }
+  assert.deepEqual(wakeHeaders(null), {});
+});
+
+test('pageViewOf: AWS\'s answer of a level; served(page) leaves a page out of what is shown, never out of the level\'s own', () => {
+  const at = Date.parse('2026-11-08T10:00:00Z');
+  const router = { page: template({ title: 'Router' }), by: 'adm', at };
+  const own = { page: custom('<p data-dormeto="status"></p>'), by: 'ops', at };
+  const favicon = { icon: 'data:image/png;base64,AA==', fetchedAt: at, error: null };
+  const shown = pageViewOf({ router, own, favicon, workload: true });
+  assert.deepEqual(shown, {
+    own: own.page, inherited: resolvePage(null, router.page, null), effective: resolvePage(null, router.page, own.page), from: { mode: 'workload', html: 'workload' },
+    favicon: { icon: favicon.icon, fetchedAt: '2026-11-08T10:00:00.000Z', error: null }, warnings: [], terraform: false, by: 'ops', at: '2026-11-08T10:00:00.000Z',
+  });
+  const hidden = pageViewOf({ router, own, workload: true, served: (page) => (page?.mode === 'custom' ? null : page) });
+  assert.deepEqual(hidden.own, own.page);
+  assert.deepEqual([hidden.effective.mode, hidden.effective.title, hidden.from], ['template', 'Router', { mode: 'router', icon: 'default', title: 'router' }]);
+  assert.equal(hidden.favicon, null);
+  const level = pageViewOf({ own: { page: custom('<p>x</p>'), by: null, at: null }, terraform: true, served: () => null });
+  assert.deepEqual([level.effective, level.inherited, level.terraform, level.by, level.at], [resolvePage(null, null, null), resolvePage(null, null, null), true, null, null]);
+  assert.equal(level.warnings.length, 1, 'the level\'s own warnings stay');
+  assert.deepEqual(pageViewOf({}), { own: null, inherited: resolvePage(null, null, null), effective: resolvePage(null, null, null), from: resolvePage(null, null, null).from, favicon: null, warnings: [], terraform: false, by: null, at: null });
 });

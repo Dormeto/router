@@ -163,6 +163,30 @@ export function resolvePage(organization, router, workload) {
   return { mode: page.mode, icon: page.icon, ...(page.title ? { title: page.title } : {}), ...(page.description ? { description: page.description } : {}), from: page.from };
 }
 
+const isoOrNull = (ms) => (typeof ms === 'number' && ms > 0 ? new Date(ms).toISOString() : null);
+
+// A level's page as people read it (the waiting-page action's answer, AWS's and Google Cloud's): the level's own document (what is
+// valid of it), what it would inherit, the effective page and where each field comes from, the cached favicon, the warnings and who
+// wrote it. Never throws on a bad stored value. `organization` is a page; `router` and `own` are the store's { page, by, at }, `own`
+// the router's at the router's level (`workload` false). `served(page)`: the page as visitors may be shown it, null when they may not
+// (Google Cloud's custom pages turned off): what is shown is resolved without it, the level's own document is shown whatever it says.
+export function pageViewOf({ organization = null, router = null, own = null, favicon = null, workload = false, terraform = false, served = (page) => page }) {
+  const [above, upper, mine] = [organization, router?.page, own?.page].map((page) => served(page ?? null));
+  const inherited = workload ? resolvePage(above, upper, null) : resolvePage(above, null, null);
+  const effective = workload ? resolvePage(above, upper, mine) : resolvePage(above, mine, null);
+  return {
+    own: cleanPage(own?.page),
+    inherited,
+    effective,
+    from: effective.from,
+    favicon: favicon && { icon: favicon.icon ?? null, fetchedAt: isoOrNull(favicon.fetchedAt), error: favicon.error ?? null },
+    warnings: pageWarnings(own?.page),
+    terraform,
+    by: own?.by ?? null,
+    at: isoOrNull(own?.at),
+  };
+}
+
 const usable = (value) => typeof value === 'number' && Number.isFinite(value) && value >= 0;
 
 export function medianOf(durations) {
@@ -184,3 +208,23 @@ export function withWake(recentWakes, durationMs) {
   if (usable(durationMs)) list.push(durationMs);
   return JSON.stringify(list.slice(-WAKES_KEPT));
 }
+
+// What the page and its probe's answers say of a wake under way (waiting page design §9): the time since it started and the
+// workload's typical wake, the median of the run's recent ones (null with none, or with a value of no use). Null in any other state,
+// or without a start.
+export function wakeProgress(state, run, now) {
+  if (state !== 'WAKING' || !Number.isFinite(run?.wakeStartedAt)) return null;
+  let typicalMs = null;
+  try {
+    typicalMs = medianOf(JSON.parse(run.recentWakes));
+  } catch {
+    // None recorded, or a value of no use.
+  }
+  return { elapsedMs: Math.max(0, now - run.wakeStartedAt), typicalMs };
+}
+
+// Its headers, which the page's script reads from the probe's answers: none without a wake under way, no typical time without one.
+export const wakeHeaders = (progress) => ({
+  ...(progress ? { 'x-dormeto-wake-elapsed': String(Math.round(progress.elapsedMs)) } : {}),
+  ...(progress?.typicalMs ? { 'x-dormeto-wake-typical': String(Math.round(progress.typicalMs)) } : {}),
+});

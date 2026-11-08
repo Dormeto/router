@@ -3,7 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { STATES } from './state.mjs';
 import { checkName } from './names.mjs';
 import { currentTarget, hostOf, setRoute } from './route.mjs';
-import { hostOfRules, readFavicon } from './favicon.mjs';
+import { cacheFavicon, FAVICON_BUDGET_MS, hostOfRules } from './favicon.mjs';
 import { dormetoTargetGroup, ingressDrift, routeIngress } from './kube-route.mjs';
 import { checkRights } from './kube-access.mjs';
 import { pingProxy } from './k8s.mjs';
@@ -22,7 +22,7 @@ import { STATS_DAYS, totals, workloadSummary } from './summary.mjs';
 import { lastRequestAt } from './metrics.mjs';
 import { checkScope } from './check-scope.mjs';
 import { healthOf, lambdaMetrics, queueDepths } from './health.mjs';
-import { cleanPage, pageWarnings, resolvePage, validatePage, withWake } from './page-settings.mjs';
+import { pageViewOf, validatePage, withWake } from './page-settings.mjs';
 import { HIBERNATION_MAX_DAYS, hibernationDue, resolveHibernation, settingsProblems, workloadSettingsProblems } from './hibernation.mjs';
 import { joinLevels } from './manager-settings.mjs';
 import { describedRules, effectiveConfig } from './settings-levels.mjs';
@@ -36,10 +36,6 @@ const STOP_TIMEOUT_MS = 5 * 60_000;
 // Longest wait for the target group to drop the stopped backends (deregistration delay included).
 const RELEASE_TIMEOUT_MS = 2 * 60_000;
 const NAPPING_STUCK_MS = 15 * 60_000;
-// The application's favicon (waiting page design §6): read at a nap at most once in this time, within this budget.
-const FAVICON_EVERY_MS = 86_400_000;
-const FAVICON_BUDGET_MS = 3000;
-const FAVICON_GRACE_MS = 200;
 const WAKING_STUCK_GRACE_MS = 60_000;
 // Stop working this long before the Lambda timeout, so that a failure is recorded instead of a silent kill.
 const TIMEOUT_MARGIN_MS = 30_000;
@@ -262,7 +258,7 @@ export function createController({
       return { state: 'SKIPPED', reason: 'rules not instrumented', issues: reasons(issues) };
     }
     // The nap is decided, and the route still reaches the application: the only moment its home page can be read.
-    await cacheFavicon(cfg, rules);
+    await faviconAtNap(cfg, rules);
     const napping = await store.transition(workloadId, {
       cond: { state: STATES.AWAKE },
       set: { state: STATES.NAPPING, napBackends: JSON.stringify(backends.map(toRecord)) },
@@ -342,40 +338,18 @@ export function createController({
     return wake(workloadId, wakeId, cfg);
   }
 
-  // The application's favicon for the waiting page (design §6), when the page would show it (a template with icon auto) and the
-  // last read, successful or not, is over 24 hours old. The workload must be awake (the route reaches it only then), the
-  // FAVICON item is read first, the levels only when due. One budget for all of it, store calls included: once it is spent
-  // nothing more is read or sent (a late store answer ends here), the nap goes on and the give-up is logged. Whatever
-  // goes wrong is logged and never changes the nap. The grace after the budget lets the result be written.
-  async function cacheFavicon(cfg, rules) {
+  // The application's favicon for the waiting page (design §6), read at the nap by the shared step (favicon.mjs's cacheFavicon): the
+  // levels with the organization's inside its budget, the host from the rules read.
+  function faviconAtNap(cfg, rules) {
     const { workloadId } = cfg;
-    const budget = new AbortController();
-    const spent = () => budget.signal.aborted;
-    let timers = [];
-    const work = (async () => {
-      if ((await store.getRun(workloadId))?.state !== STATES.AWAKE || spent()) return spent() ? 'gave up' : 'done';
-      const last = await store.getFavicon(workloadId);
-      if (spent()) return 'gave up';
-      if (last?.fetchedAt > now() - FAVICON_EVERY_MS) return 'done';
-      const [organization, router_, workload] = await Promise.all([organizationPage ? organizationPage.read({ signal: budget.signal }) : null, store.getWaitingPage('router'), store.getWaitingPage({ workloadId })]);
-      if (spent()) return 'gave up';
-      const page = resolvePage(organization, router_?.page, workload?.page);
-      if (page.mode !== 'template' || page.icon !== 'auto') return 'done';
-      const { icon, error } = await readFavicon(hostOfRules(rules), { fetch, now, budgetMs: faviconBudgetMs, signal: budget.signal });
-      await store.putFavicon(workloadId, { icon: icon ?? last?.icon ?? null, fetchedAt: now(), error });
-      return 'done';
-    })();
-    work.catch(() => {});
-    try {
-      const timeout = new Promise((resolve) => {
-        timers = [setTimeout(() => budget.abort(), faviconBudgetMs), setTimeout(() => resolve('gave up'), faviconBudgetMs + FAVICON_GRACE_MS)];
-      });
-      if ((await Promise.race([work, timeout])) === 'gave up') log.warn('FaviconGaveUp', { workloadId, budgetMs: faviconBudgetMs });
-    } catch (err) {
-      log.warn('FaviconSkipped', { workloadId, error: err.message });
-    } finally {
-      timers.forEach(clearTimeout);
-    }
+    return cacheFavicon(workloadId, {
+      store, fetch, now, budgetMs: faviconBudgetMs, log,
+      levels: async ({ signal }) => {
+        const [organization, router_, workload] = await Promise.all([organizationPage ? organizationPage.read({ signal }) : null, store.getWaitingPage('router'), store.getWaitingPage({ workloadId })]);
+        return [organization, router_?.page, workload?.page];
+      },
+      host: () => hostOfRules(rules),
+    });
   }
 
   // A wake that completes after the run was hibernated HIBERNATION_MAX_DAYS or more (whatever woke it: a schedule's
@@ -977,9 +951,8 @@ export function createController({
   // --- Waiting page (branded waiting page design §5, §11): one document per level, in its own item ----------------------
 
   const pageLevel = (workloadId) => (workloadId ? { workloadId } : 'router');
-  const isoOrNull = (ms) => (typeof ms === 'number' && ms > 0 ? new Date(ms).toISOString() : null);
 
-  // What people read: the level's own document (what is valid of it), what it would inherit, the effective page and where
+  // What people read (page-settings.mjs's pageViewOf): the level's own document, what it would inherit, the effective page and where
   // each field comes from, the cached favicon, the warnings and who wrote it. Never throws on a bad stored value.
   async function pageView(workloadId, cfg) {
     const [organization, upper, favicon] = await Promise.all([
@@ -992,19 +965,7 @@ export function createController({
     ]);
     // The level read: the workload's, or the router's (its upper levels then are the organization's alone).
     const own = workloadId ? await store.getWaitingPage({ workloadId }) : upper;
-    const inherited = workloadId ? resolvePage(organization, upper?.page, null) : resolvePage(organization, null, null);
-    const effective = workloadId ? resolvePage(organization, upper?.page, own?.page) : resolvePage(organization, own?.page, null);
-    return {
-      own: cleanPage(own?.page),
-      inherited,
-      effective,
-      from: effective.from,
-      favicon: favicon && { icon: favicon.icon ?? null, fetchedAt: isoOrNull(favicon.fetchedAt), error: favicon.error ?? null },
-      warnings: pageWarnings(own?.page),
-      terraform: Boolean(cfg && !cfg.source),
-      by: own?.by ?? null,
-      at: isoOrNull(own?.at),
-    };
+    return pageViewOf({ organization, router: upper, own, favicon, workload: Boolean(workloadId), terraform: Boolean(cfg && !cfg.source) });
   }
 
   // { action: 'waiting-page', op: 'get' | 'put' | 'delete', workloadId?, page?, by }: the router's level, or a workload's.

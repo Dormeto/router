@@ -1,4 +1,4 @@
-// The AWS waker: the shared core with the branded waiting page on (Google Cloud's keeps the built-in one). Its own file so that
+// The AWS waker: the shared core with the branded waiting page on (Google Cloud's wires it in gcp/src/waker.mjs). Its own file so that
 // the entry point (waker.mjs, which builds AWS clients at load) holds no wiring a test cannot reach.
 import { createWaitingPages } from './waiting-pages.mjs';
 import { createWaker } from './waker-core.mjs';

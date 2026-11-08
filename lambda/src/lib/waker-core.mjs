@@ -3,7 +3,7 @@ import { failedSpec, failureKind, nextAttemptAt } from './failures.mjs';
 import { STATES } from './state.mjs';
 import { WAKE_HEADER, acceptsHtml, classify, headerValues, redirectCount, requestOrigin, requestTarget, response, workloadIdFromEvent } from './http.mjs';
 import { PAGE_CSP, languageOf, renderJson, renderPage } from './page.mjs';
-import { medianOf } from './page-settings.mjs';
+import { wakeHeaders, wakeProgress } from './page-settings.mjs';
 import { ADMIN_PREFIX, parseAdminPath } from './admin.mjs';
 import { compileRules } from './no-wake.mjs';
 import { STATS_DAYS } from './summary.mjs';
@@ -22,7 +22,7 @@ const ENSURE_INTERVAL_MS = 10_000;
 // workloadIdOf(event): how a request names its workload; by default, its target group under the prefix.
 export function createWaker({ store, invokeController, prefix, workloadIdOf = (event) => workloadIdFromEvent(event, prefix), now = Date.now, sleep, newId = randomUUID, log, getAdmin, defaultRules = [], listCache = null,
   // The branded waiting page (lib/waiting-pages.mjs): its settings, the visitor's language and the progress. Without it the page is
-  // the built-in one in English (Google Cloud's), as before.
+  // the built-in one in English, as before. Google Cloud's waker passes it for the wake's headers, and renders its own page.
   waitingPages = null,
   // onWaking(workloadId, run): asked when a request that would wake finds the run WAKING within its timeout, before it is answered;
   // it never throws. Google Cloud's waker sends a lost wake again there (gcp/src/heartbeat.mjs); AWS's passes none.
@@ -156,15 +156,6 @@ export function createWaker({ store, invokeController, prefix, workloadIdOf = (e
     return current;
   }
 
-  // The typical wake time of the workload, the median of the run's recent wakes; null with none, or a value no use.
-  function typicalWake(run) {
-    try {
-      return medianOf(JSON.parse(run.recentWakes));
-    } catch {
-      return null;
-    }
-  }
-
   // What the page is made of (branded waiting page design §9): never throws, the built-in page when it cannot be read.
   async function pageSettings(workloadId) {
     try {
@@ -181,16 +172,13 @@ export function createWaker({ store, invokeController, prefix, workloadIdOf = (e
   // The settings are read only for the HTML page, which is answered after the wake was triggered and the hold ended.
   async function waiter(event, pollSeconds, state, wakeHeader, failed = null, napUntil = null, { workloadId = null, run = null } = {}) {
     // Seconds since the wake started and the typical time of the workload, in WAKING (the probe's answer brings them to the page).
-    const wake = waitingPages && state === STATES.WAKING && Number.isFinite(run?.wakeStartedAt)
-      ? { elapsedMs: Math.max(0, now() - run.wakeStartedAt), typicalMs: typicalWake(run) }
-      : null;
+    const wake = waitingPages ? wakeProgress(state, run, now()) : null;
     const headers = {
       ...(napUntil ? { 'x-dormeto-nap-until': napEndHeader(napUntil) } : {}),
       'cache-control': 'no-store', 'retry-after': String(pollSeconds), 'x-dormeto-state': state,
       ...(failed?.kind ? { 'x-dormeto-failure': failed.kind } : {}),
       ...(failed?.retryAt ? { 'x-dormeto-retry-at': new Date(failed.retryAt).toISOString() } : {}),
-      ...(wake ? { 'x-dormeto-wake-elapsed': String(Math.round(wake.elapsedMs)) } : {}),
-      ...(wake?.typicalMs ? { 'x-dormeto-wake-typical': String(Math.round(wake.typicalMs)) } : {}),
+      ...wakeHeaders(wake),
     };
     if (event.httpMethod === 'HEAD') return response(503, headers);
     if (acceptsHtml(event)) {

@@ -54,3 +54,11 @@ test('its state is in the S3 backend, under router/gcp-releases.tfstate', async 
   assert.match(versions, /key\s*=\s*"router\/gcp-releases\.tfstate"/);
   assert.match(versions, /region\s*=\s*"eu-west-1"/);
 });
+
+// No google_project_service here, as in gcp-dev: the first apply needs the API on, which the README says to do first.
+test('the README says to turn the Artifact Registry API on in dormeto-releases before the first apply', async () => {
+  const readme = (await readFile(join(ROOT, 'README.md'), 'utf8')).replace(/\s+/g, ' ');
+  assert.ok(readme.includes('gcloud services enable artifactregistry.googleapis.com --project dormeto-releases --configuration dormeto-releases'));
+  assert.match(readme, /before the first apply/);
+  assert.doesNotMatch(await code(), /google_project_service/);
+});

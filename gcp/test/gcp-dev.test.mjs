@@ -94,7 +94,7 @@ test('the demo backend services drain connections for 30 s, as the router does, 
   const code = uncommented((await terraformFiles()).map(([, text]) => text).join('\n'));
   const services = [...bodies(code, 'google_compute_backend_service'), ...bodies(code, 'google_compute_region_backend_service')];
   // The demo's three (global app, stand-in, managed group are one for_each), the regional one, and the optional ones.
-  assert.deepEqual(services.map(([name]) => name).sort(), ['classic', 'classic_standard', 'demo', 'demo', 'gke', 'neg', 'ten', 'ten']);
+  assert.deepEqual(services.map(([name]) => name).sort(), ['classic', 'classic_standard', 'demo', 'demo', 'gke', 'internal_global', 'internal_regional', 'neg', 'ten', 'ten']);
   for (const [name, body] of services) assert.match(body, /^\s*connection_draining_timeout_sec\s*=\s*30\s*$/m, name);
 });
 
@@ -119,7 +119,7 @@ const variableBlock = (variables, name) => new RegExp(`variable\\s+"${name}"\\s*
 
 test('each optional part is behind a variable that is false by default, and the regional map ignores what Dormeto writes', async () => {
   const variables = uncommented(await readFile(join(ROOT, 'variables.tf'), 'utf8'));
-  for (const name of ['enable_classic', 'enable_classic_standard', 'enable_ten', 'enable_neg', 'enable_sql', 'enable_gke']) {
+  for (const name of ['enable_classic', 'enable_classic_standard', 'enable_ten', 'enable_neg', 'enable_sql', 'enable_gke', 'enable_internal']) {
     const block = variableBlock(variables, name);
     assert.ok(block, `${name} is declared`);
     assert.match(block, /^\s*type\s*=\s*bool\s*$/m, name);
@@ -132,7 +132,7 @@ test('each optional part is behind a variable that is false by default, and the 
 });
 
 test('every resource of an optional file has a count or a for_each on its own variable, so a plan with the defaults shows no change', async () => {
-  const optional = { 'classic.tf': 'enable_classic', 'classic-standard.tf': 'enable_classic_standard', 'neg.tf': 'enable_neg', 'sql.tf': 'enable_sql', 'gke.tf': 'enable_gke' };
+  const optional = { 'classic.tf': 'enable_classic', 'classic-standard.tf': 'enable_classic_standard', 'neg.tf': 'enable_neg', 'sql.tf': 'enable_sql', 'gke.tf': 'enable_gke', 'internal.tf': 'enable_internal' };
   for (const [file, variable] of Object.entries(optional)) {
     const code = uncommented(await readFile(join(ROOT, file), 'utf8'));
     const resources = [...code.matchAll(/^resource\s+"([^"]+)"\s+"([^"]+)"/gm)];
@@ -218,4 +218,38 @@ test('outputs.tf gains nothing conditional: an output a plan with the defaults w
   const outputs = uncommented(await readFile(join(ROOT, 'outputs.tf'), 'utf8'));
   assert.doesNotMatch(outputs, /enable_|\boptional\b|\bone\(|\[0\]|\[\*\]|google_sql_|google_container_|\.(?:classic|neg|gke)\b/);
   assert.deepEqual([...outputs.matchAll(/^output\s+"([^"]+)"/gm)].map((m) => m[1]), ['urls', 'addresses', 'url_maps', 'backend_services']);
+});
+
+test('internal.tf: both internal load balancers are INTERNAL_MANAGED over HTTP, each on its own VM, with a client VM that has no address and is reached through IAP', async () => {
+  const code = uncommented(await readFile(join(ROOT, 'internal.tf'), 'utf8'));
+  const purposes = bodies(code, 'google_compute_subnetwork').map(([, body]) => /purpose\s*=\s*"([^"]+)"/.exec(body)?.[1]);
+  assert.deepEqual(purposes, ['GLOBAL_MANAGED_PROXY']);
+  const rules = [...bodies(code, 'google_compute_forwarding_rule'), ...bodies(code, 'google_compute_global_forwarding_rule')];
+  assert.equal(rules.length, 2);
+  for (const [name, body] of rules) {
+    assert.match(body, /load_balancing_scheme\s*=\s*"INTERNAL_MANAGED"/, name);
+    assert.match(body, /port_range\s*=\s*"80"/, name);
+    assert.match(body, /subnetwork\s*=\s*google_compute_subnetwork\.dev\.id/, name);
+  }
+  const backends = [...bodies(code, 'google_compute_backend_service'), ...bodies(code, 'google_compute_region_backend_service')];
+  assert.equal(backends.length, 2);
+  for (const [name, body] of backends) {
+    assert.match(body, /load_balancing_scheme\s*=\s*"INTERNAL_MANAGED"/, name);
+    assert.match(body, /^\s*connection_draining_timeout_sec\s*=\s*30\s*$/m, name);
+  }
+  assert.deepEqual(bodies(code, 'google_compute_instance').map(([name]) => name), ['internal', 'internal_client']);
+  const client = bodies(code, 'google_compute_instance').find(([name]) => name === 'internal_client')[1];
+  assert.doesNotMatch(client, /access_config/);
+  assert.match(code, /35\.235\.240\.0\/20/);
+  assert.match(code, /ports\s*=\s*\["22"\]/);
+  assert.doesNotMatch(code, /google_compute_global_forwarding_rule"\s+"[^"]+"\s*\{[\s\S]*EXTERNAL/);
+});
+
+test('the internal outputs live in their own file, are null unless enable_internal, and outputs.tf is untouched', async () => {
+  const outputs = uncommented(await readFile(join(ROOT, 'outputs-internal.tf'), 'utf8'));
+  const names = [...outputs.matchAll(/^output\s+"([^"]+)"/gm)].map((m) => m[1]);
+  assert.deepEqual(names, ['internal']);
+  assert.match(outputs, /var\.enable_internal \?[\s\S]*: null/);
+  for (const key of ['url_map', 'address', 'client']) assert.match(outputs, new RegExp(`\\b${key}\\b`));
+  assert.match(outputs, /zone/);
 });

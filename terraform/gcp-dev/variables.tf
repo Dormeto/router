@@ -124,3 +124,9 @@ locals {
     unhealthy = 2
   }
 }
+
+variable "enable_internal" {
+  description = "Internal Application Load Balancers: a regional one and a cross-region one, each in front of a VM of its own, a global proxy-only subnet, and a client VM in the subnet (no external address, reached through IAP)."
+  type        = bool
+  default     = false
+}

@@ -16,12 +16,18 @@ import { createGoogle } from './google.mjs';
 import { createLogs } from './logs.mjs';
 import { createMonitoring } from './monitoring.mjs';
 import { createOnboarding, Refusal } from './onboarding.mjs';
+import { customPagesOf } from './pages.mjs';
 import { createTasks } from './tasks.mjs';
 import { createUrlMaps } from './urlmaps.mjs';
 
 const WORKLOADS = '/v1/workloads';
 // The router level of the settings (vision docs/specs/2026-11-08-google-cloud-router-features-design.md, section 4.5).
 const SETTINGS = '/v1/settings';
+// The router's waiting page, and a workload's under its verb (the design's section 5.2).
+const WAITING_PAGE = '/v1/waiting-page';
+const PAGE_VERB = 'waiting-page';
+// The waiting page's operations by method: PUT's body is `{ page, by }`, DELETE's `{ by }` or none.
+const PAGE_OPS = { GET: 'get', PUT: 'put', DELETE: 'delete' };
 const WORKLOAD = /^\/v1\/workloads\/([^/]+)(?:\/([^/]+))?$/;
 const MAX_BODY_BYTES = 1024 * 1024;
 
@@ -85,6 +91,14 @@ export function createControllerApi({ core, onboarding, config }) {
     return TASKS[body.action](body);
   }
 
+  // A level's waiting page, 'router' or { workloadId }; null for a method it has no operation for.
+  async function waitingPage(level, request) {
+    const op = PAGE_OPS[request.method];
+    if (!op) return null;
+    const { page, by } = op === 'get' ? {} : await bodyOf(request);
+    return onboarding.waitingPage(level, { op, page, by });
+  }
+
   // The route's answer, or null when there is none.
   async function route(request, path, query) {
     const { method } = request;
@@ -93,6 +107,7 @@ export function createControllerApi({ core, onboarding, config }) {
     if (path === '/v1/tasks' && method === 'POST') return task(await bodyOf(request));
     if (path === SETTINGS && method === 'GET') return onboarding.routerSettings();
     if (path === SETTINGS && method === 'PUT') return onboarding.setRouterSettings(await bodyOf(request));
+    if (path === WAITING_PAGE) return waitingPage('router', request);
     if (path === WORKLOADS && method === 'GET') return onboarding.list();
     if (path === WORKLOADS && method === 'POST') {
       const body = await bodyOf(request);
@@ -108,6 +123,7 @@ export function createControllerApi({ core, onboarding, config }) {
     if (verb === 'schedule' && method === 'PUT') return onboarding.setSchedule(idOf(encoded), await bodyOf(request));
     if (verb === 'schedule' && method === 'DELETE') return onboarding.clearSchedule(idOf(encoded));
     if (verb === 'settings' && method === 'PUT') return onboarding.setSettings(idOf(encoded), await bodyOf(request));
+    if (verb === PAGE_VERB) return waitingPage({ workloadId: idOf(encoded) }, request);
     if (verb === 'pause' && method === 'POST') return onboarding.pause(idOf(encoded), await bodyOf(request));
     if (verb === 'resume' && method === 'POST') return onboarding.resume(idOf(encoded), await bodyOf(request));
     return null;
@@ -128,9 +144,11 @@ export function createControllerApi({ core, onboarding, config }) {
 
 // The handler of the `controller` role (server.mjs), on the router's environment. `DMT_LOG_VIEW`: the router's log view, set by the
 // CLI's install (`projects/<p>/locations/global/buckets/_Default/views/dmtr-<region>-lb`); unset, the idle check reads no request log.
+// `DMT_CUSTOM_PAGES=1`: the install turned custom waiting pages on (pages.mjs). `fetch` also reads the application's favicon at a nap.
 export function fromEnvironment(env = process.env, { fetch, log = logger } = {}) {
   const google = createGoogle({ fetch });
   const project = env.DMT_PROJECT;
+  const customPages = customPagesOf(env);
   const config = { project, region: env.DMT_REGION, wakerNeg: env.DMT_WAKER_NEG, controllerUrl: env.DMT_CONTROLLER_URL };
   const store = createFirestoreStore({ google, project, database: env.DMT_DATABASE, log });
   const compute = createCompute({ google, project });
@@ -152,9 +170,11 @@ export function fromEnvironment(env = process.env, { fetch, log = logger } = {})
     lists: parseLists(env.DMT_IP_LISTS, (error) => log.error('IpListsUnreadable', { error })),
     download: (url) => downloadText(url, { fetch }),
     sleep: (ms) => new Promise((resolve) => { setTimeout(resolve, ms); }),
+    fetch,
+    customPages,
     log,
   });
-  const handler = createControllerApi({ core, onboarding: createOnboarding({ store, compute, cloudsql, gke, urlmaps, regionalUrlmaps, core, config, log }), config });
+  const handler = createControllerApi({ core, onboarding: createOnboarding({ store, compute, cloudsql, gke, urlmaps, regionalUrlmaps, core, config, customPages, log }), config });
   // SIGTERM commits the buffered stats (server.mjs).
   handler.flush = () => store.flushStats();
   return handler;

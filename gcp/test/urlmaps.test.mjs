@@ -1,8 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { fakeClock } from '../../lambda/test/fakes.mjs';
+import { hostOfRules } from '../../lambda/src/lib/favicon.mjs';
 import {
-  hostsOf, references, UrlMapRefused, withErrorPolicy, withoutErrorPolicy, withWakerRoute, withoutWakerRoute, createUrlMaps, CALLS,
+  hostsOf, listenerRulesOf, references, UrlMapRefused, withErrorPolicy, withoutErrorPolicy, withWakerRoute, withoutWakerRoute, createUrlMaps, CALLS,
 } from '../src/urlmaps.mjs';
 
 const V1 = 'https://www.googleapis.com/compute/v1/projects/p/global/backendServices';
@@ -176,6 +177,40 @@ test('hostsOf: the hosts of the matchers naming the service, and the map\'s defa
   // A host rule * means the map's default is never reached.
   const all = { defaultService: `${V1}/${APP}`, hostRules: [{ hosts: ['*'], pathMatcher: 'one' }], pathMatchers: [{ name: 'one', defaultService: `${V1}/other` }] };
   assert.deepEqual(hostsOf(all, APP), []);
+});
+
+test('listenerRulesOf: the hosts whose / goes to the service, as AWS\'s rules of a host and /*; the favicon\'s host the first literal one', () => {
+  const whole = (...hosts) => ({ Conditions: [{ Field: 'host-header', Values: hosts }, { Field: 'path-pattern', Values: ['/*'] }] });
+  // Only the plain matcher sends / to the application: a path rule's /api/*, a two-way split and a route rule's /r leave it elsewhere.
+  assert.deepEqual(listenerRulesOf(fixture(), APP), [whole('a.example.com')]);
+  assert.equal(hostOfRules(listenerRulesOf(fixture(), APP)), 'a.example.com');
+  const service = (name) => `${V1}/${name}`;
+  const mapOf = (...matchers) => ({
+    defaultService: service(APP),
+    hostRules: matchers.map((_, i) => ({ hosts: [`*.h${i}.example.com`, `h${i}.example.com`], pathMatcher: `m${i}` })),
+    pathMatchers: matchers.map((matcher, i) => ({ name: `m${i}`, ...matcher })),
+  });
+  const cases = [
+    ['a path rule for /* to it', { defaultService: service('other'), pathRules: [{ paths: ['/*'], service: service(APP) }] }, true],
+    ['its default, other paths elsewhere', { defaultService: service(APP), pathRules: [{ paths: ['/static/*'], service: service('bucket') }] }, true],
+    ['its default, but / elsewhere', { defaultService: service(APP), pathRules: [{ paths: ['/', '/home'], service: service('other') }] }, false],
+    ['its default, but /* elsewhere', { defaultService: service(APP), pathRules: [{ paths: ['/*'], service: service('other') }] }, false],
+    ['its default behind Dormeto\'s route rule', { defaultService: service(APP), routeRules: [{ priority: 0, matchRules: [{ prefixMatch: '/_dormeto/' }], service: WAKER }] }, true],
+    ['a route rule for / to it', { defaultService: service('other'), routeRules: [{ priority: 3, matchRules: [{ prefixMatch: '/' }], service: service(APP) }] }, true],
+    ['a route rule for / on a header first', { defaultService: service(APP), routeRules: [
+      { priority: 1, matchRules: [{ prefixMatch: '/', headerMatches: [{ headerName: 'x-beta', exactMatch: '1' }] }], service: service('beta') },
+      { priority: 2, matchRules: [{ prefixMatch: '/' }], service: service(APP) },
+    ] }, false],
+    ['a route rule with a pattern', { defaultService: service(APP), routeRules: [{ priority: 1, matchRules: [{ regexMatch: '/api/.*' }], service: service('api') }] }, false],
+    ['a redirect for /', { defaultService: service(APP), routeRules: [{ priority: 1, matchRules: [{ fullPathMatch: '/' }], urlRedirect: { pathRedirect: '/home' } }] }, false],
+  ];
+  for (const [name, matcher, sent] of cases) {
+    assert.deepEqual(listenerRulesOf(mapOf(matcher), APP), sent ? [whole('*.h0.example.com', 'h0.example.com')] : [], name);
+    assert.equal(hostOfRules(listenerRulesOf(mapOf(matcher), APP)), sent ? 'h0.example.com' : null, name);
+  }
+  // The map's own default holds no host, and a host rule's missing matcher none either.
+  assert.deepEqual(listenerRulesOf({ defaultService: service(APP) }, APP), []);
+  assert.deepEqual(listenerRulesOf({ defaultService: service(APP), hostRules: [{ hosts: ['x.example.com'], pathMatcher: 'gone' }] }, APP), []);
 });
 
 test('createUrlMaps.list: every page of the project\'s global URL maps', async () => {

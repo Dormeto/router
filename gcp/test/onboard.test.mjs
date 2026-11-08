@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { GoogleError } from '../src/google.mjs';
 import { Refusal } from '../src/onboarding.mjs';
@@ -2390,4 +2391,126 @@ test('PUT the router level: what it refuses is a 400 with the problems, nothing 
     assert.equal(store.router.settings, null);
   }
   assert.equal((await onboarding.setRouterSettings({ defaults: { wakeMode: 'any' } })).settings.defaults.wakeMode, 'any');
+});
+
+// --- The waiting page (vision docs/specs/2026-11-08-google-cloud-router-features-design.md, section 5) ------------------------------
+
+const CUSTOM_REFUSED = 'custom pages are off on this router: an administrator turns them on with dormeto gcp install --custom-pages';
+const NOT_SERVED = 'custom pages are off on this router: this page is not served';
+const PAGE_HTML = '<!doctype html><p data-dormeto="status"></p>';
+const DEFAULT_PAGE = { mode: 'template', icon: 'auto', from: { mode: 'default', icon: 'default' } };
+const withCustomPages = (w) => { w.customPages = true; };
+
+test('waiting page: a template put at the router\'s level and a workload\'s, read back in AWS\'s answer, by and at; nothing without one', async () => {
+  const { store, clock, onboarding } = setup();
+  await onboarding.onboard(INPUT);
+  const at = new Date(clock.now()).toISOString();
+  assert.deepEqual(await onboarding.waitingPage('router', { op: 'get' }), {
+    own: null, inherited: DEFAULT_PAGE, effective: DEFAULT_PAGE, from: DEFAULT_PAGE.from, favicon: null, warnings: [], terraform: false, by: null, at: null,
+  });
+  const router = await onboarding.waitingPage('router', { op: 'put', page: { mode: 'template', title: 'Acme', description: 'Back soon.' }, by: 'adm' });
+  assert.deepEqual(router.own, { mode: 'template', title: 'Acme', description: 'Back soon.' });
+  assert.deepEqual([router.by, router.at, router.terraform], ['adm', at, false]);
+  const workload = await onboarding.waitingPage({ workloadId: 'demo' }, { op: 'put', page: { mode: 'template', title: 'Shop' }, by: 'ops' });
+  const effective = { mode: 'template', icon: 'auto', title: 'Shop', description: 'Back soon.', from: { mode: 'workload', icon: 'default', title: 'workload', description: 'router' } };
+  assert.deepEqual(workload, {
+    own: { mode: 'template', title: 'Shop' },
+    inherited: { mode: 'template', icon: 'auto', title: 'Acme', description: 'Back soon.', from: { mode: 'router', icon: 'default', title: 'router', description: 'router' } },
+    effective, from: effective.from, favicon: null, warnings: [], terraform: false, by: 'ops', at,
+  });
+  assert.deepEqual(await onboarding.waitingPage({ workloadId: 'demo' }, { op: 'get' }), workload);
+  assert.deepEqual(store.pages.get('pages/demo'), { page: { mode: 'template', title: 'Shop' }, by: 'ops', at: clock.now() });
+  store.favicons.set('demo', { icon: 'data:image/png;base64,AA==', fetchedAt: clock.now() - 1000, error: null });
+  assert.deepEqual((await onboarding.waitingPage({ workloadId: 'demo' }, { op: 'get' })).favicon, { icon: 'data:image/png;base64,AA==', fetchedAt: new Date(clock.now() - 1000).toISOString(), error: null });
+});
+
+test('waiting page: a put without by is set by unknown, as a schedule; the log holds the mode, and of a custom page its size and SHA-256, never the page', async () => {
+  const { w, onboarding } = setup(withCustomPages);
+  await onboarding.onboard(INPUT);
+  assert.equal((await onboarding.waitingPage('router', { op: 'put', page: { mode: 'template', title: 'Acme' } })).by, 'unknown');
+  await onboarding.waitingPage({ workloadId: 'demo' }, { op: 'put', page: { mode: 'custom', html: PAGE_HTML }, by: 'ops' });
+  const set = w.logs.filter((l) => l.event === 'WaitingPageSet');
+  assert.deepEqual(set.map(({ level, workloadId, mode, bytes, sha256, by }) => ({ level, workloadId, mode, bytes, sha256, by })), [
+    { level: 'router', workloadId: null, mode: 'template', bytes: undefined, sha256: undefined, by: 'unknown' },
+    { level: 'workload', workloadId: 'demo', mode: 'custom', bytes: 44, sha256: createHash('sha256').update(PAGE_HTML).digest('hex'), by: 'ops' },
+  ]);
+  assert.equal(JSON.stringify(w.logs).includes('data-dormeto'), false);
+});
+
+test('waiting page: a custom put without the switch is a 400 with the verbatim text, nothing written; with it, stored and shown', async () => {
+  const off = setup();
+  await off.onboarding.onboard(INPUT);
+  for (const level of ['router', { workloadId: 'demo' }]) {
+    await assert.rejects(off.onboarding.waitingPage(level, { op: 'put', page: { mode: 'custom', html: PAGE_HTML }, by: 'ops' }), refusedWith([CUSTOM_REFUSED]));
+  }
+  await assert.rejects(off.onboarding.waitingPage('router', { op: 'put', page: { mode: 'custom', html: ' ' } }), refusedWith([CUSTOM_REFUSED, 'html must be a page, not blank']));
+  assert.equal(off.store.pages.size, 0);
+  const on = setup(withCustomPages);
+  await on.onboarding.onboard(INPUT);
+  const view = await on.onboarding.waitingPage({ workloadId: 'demo' }, { op: 'put', page: { mode: 'custom', html: PAGE_HTML }, by: 'ops' });
+  assert.deepEqual([view.own, view.effective, view.from, view.warnings], [{ mode: 'custom', html: PAGE_HTML }, { mode: 'custom', html: PAGE_HTML, from: { mode: 'workload', html: 'workload' } }, { mode: 'workload', html: 'workload' }, []]);
+  assert.deepEqual(on.store.pages.get('pages/demo').page, { mode: 'custom', html: PAGE_HTML });
+});
+
+test('waiting page: with the switch off, a custom page stored is shown as its level\'s own, said not served, and what is shown is resolved without it', async () => {
+  const { store, onboarding } = setup();
+  await onboarding.onboard(INPUT);
+  store.pages.set('router/page', { page: { mode: 'template', title: 'Acme' }, by: 'adm', at: 1 });
+  store.pages.set('pages/demo', { page: { mode: 'custom', html: '<p>no hook</p>' }, by: 'ops', at: 2 });
+  const view = await onboarding.waitingPage({ workloadId: 'demo' }, { op: 'get' });
+  assert.deepEqual(view.own, { mode: 'custom', html: '<p>no hook</p>' });
+  assert.deepEqual(view.effective, { mode: 'template', icon: 'auto', title: 'Acme', from: { mode: 'router', icon: 'default', title: 'router' } });
+  assert.deepEqual(view.from, view.effective.from);
+  assert.deepEqual(view.warnings, [NOT_SERVED, 'the page has no element data-dormeto="status": the visitor will not read why it waits']);
+  store.pages.set('router/page', { page: { mode: 'custom', html: PAGE_HTML }, by: 'adm', at: 1 });
+  const router = await onboarding.waitingPage('router', { op: 'get' });
+  assert.deepEqual([router.own, router.effective, router.warnings], [{ mode: 'custom', html: PAGE_HTML }, DEFAULT_PAGE, [NOT_SERVED]]);
+  assert.deepEqual((await onboarding.waitingPage({ workloadId: 'demo' }, { op: 'get' })).inherited, DEFAULT_PAGE);
+  // Cleared, the level is back to what it inherits.
+  assert.equal((await onboarding.waitingPage({ workloadId: 'demo' }, { op: 'delete', by: 'ops' })).own, null);
+  assert.equal(store.pages.has('pages/demo'), false);
+});
+
+test('waiting page: what the page\'s rules refuse is a 400 with every problem, nothing written', async () => {
+  const { store, onboarding } = setup(withCustomPages);
+  await onboarding.onboard(INPUT);
+  const cases = [
+    [undefined, ['the page must be an object']],
+    [{ mode: 'fancy' }, ['mode must be template or custom']],
+    [{ mode: 'template', title: 'x'.repeat(81), html: '<p>' }, ['html is not a field of a template page', 'title must be at most 80 characters']],
+    [{ mode: 'template', icon: 'data:image/png;base64,AAAA' }, ['icon is not a png image']],
+    [{ mode: 'custom', html: 'a'.repeat(256 * 1024 + 1) }, ['html must be at most 256 KiB']],
+  ];
+  for (const [page, problems] of cases) {
+    await assert.rejects(onboarding.waitingPage({ workloadId: 'demo' }, { op: 'put', page, by: 'ops' }), refusedWith(problems), JSON.stringify(page)?.slice(0, 80));
+  }
+  assert.equal(store.pages.size, 0);
+});
+
+test('waiting page: delete clears the level, the router\'s back, and says whether there was one; an unknown workload or op refused, nothing read', async () => {
+  const { w, store, onboarding } = setup();
+  await onboarding.onboard(INPUT);
+  await onboarding.waitingPage('router', { op: 'put', page: { mode: 'template', title: 'Acme' }, by: 'adm' });
+  await onboarding.waitingPage({ workloadId: 'demo' }, { op: 'put', page: { mode: 'template', title: 'Shop' }, by: 'ops' });
+  const cleared = await onboarding.waitingPage({ workloadId: 'demo' }, { op: 'delete', by: 'ops' });
+  assert.deepEqual([cleared.own, cleared.effective.title, cleared.from.title, cleared.by, cleared.at], [null, 'Acme', 'router', null, null]);
+  await onboarding.waitingPage({ workloadId: 'demo' }, { op: 'delete' });
+  assert.deepEqual(w.logs.filter((l) => l.event === 'WaitingPageCleared').map(({ level, workloadId, cleared: was, by }) => [level, workloadId, was, by]), [
+    ['workload', 'demo', true, 'ops'], ['workload', 'demo', false, 'unknown'],
+  ]);
+  assert.ok(store.pages.has('router/page'));
+  await assert.rejects(onboarding.waitingPage({ workloadId: 'nope' }, { op: 'get' }), refused(404, 'not-found', /^no workload nope$/));
+  await assert.rejects(onboarding.waitingPage({ workloadId: 'Bad_ID' }, { op: 'put', page: { mode: 'template' } }), refused(400, 'bad-request'));
+  await assert.rejects(onboarding.waitingPage('router', { op: 'patch' }), refused(400, 'bad-request', /^unknown waiting-page op: patch$/));
+});
+
+test('waiting page: an offboarding takes the workload\'s page and favicon with it, the router\'s stays', async () => {
+  const { store, onboarding } = setup();
+  await onboarding.onboard(INPUT);
+  await onboarding.waitingPage('router', { op: 'put', page: { mode: 'template', title: 'Acme' }, by: 'adm' });
+  await onboarding.waitingPage({ workloadId: 'demo' }, { op: 'put', page: { mode: 'template', title: 'Shop' }, by: 'ops' });
+  store.favicons.set('demo', { icon: null, fetchedAt: 1, error: null });
+  await onboarding.offboard('demo');
+  assert.deepEqual([...store.pages.keys()], ['router/page']);
+  assert.equal(store.favicons.size, 0);
 });

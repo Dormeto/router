@@ -15,7 +15,8 @@ const CONTROLLER = 'https://dmtr-europe-west1-controller-123.europe-west1.run.ap
 const SERVICE_ACCOUNT = 'dmtr-europe-west1@p.iam.gserviceaccount.com';
 const BROWSER = 'Mozilla/5.0';
 
-function setup({ run = { state: STATES.ASLEEP }, cfg = testConfig(), enqueue, lists = [], seed } = {}) {
+// `customPages`: the install's switch (DMT_CUSTOM_PAGES).
+function setup({ run = { state: STATES.ASLEEP }, cfg = testConfig(), enqueue, lists = [], seed, customPages } = {}) {
   const clock = fakeClock();
   const store = fakeStore({ config: cfg, run, clock });
   Object.assign(store, heartbeatStore(() => store.state.run, clock.now));
@@ -25,7 +26,7 @@ function setup({ run = { state: STATES.ASLEEP }, cfg = testConfig(), enqueue, li
   const logged = [];
   const warned = [];
   const log = { ...silentLog, error: (event, fields) => logged.push({ event, ...fields }), warn: (event, fields) => warned.push({ event, ...fields }) };
-  const handler = createCloudRunWaker({ store: seed ? seed(store) : store, tasks, controllerUrl: CONTROLLER, lists, now: clock.now, log });
+  const handler = createCloudRunWaker({ store: seed ? seed(store) : store, tasks, controllerUrl: CONTROLLER, lists, now: clock.now, log, ...(customPages === undefined ? {} : { customPages }) });
   return { handler, store, clock, created, logged, warned };
 }
 
@@ -427,6 +428,100 @@ test('the waiting page of a failed workload says why and when, in Google Cloud\'
   assert.match(res.body, /<h1[^>]*>Google Cloud has no capacity for this application right now: the start is retried, next attempt in 1 minute\.<\/h1>/);
   assert.doesNotMatch(res.body, /AWS/);
   assert.equal(created.length, 0);
+});
+
+// --- The branded waiting page (G5, design §5.3): the levels' pages, the visitor's language, the wake's progress --------------------
+
+const PAGE_CSP = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+const CUSTOM = { mode: 'custom', html: '<!doctype html><html><head></head><body><p data-dormeto="status">Our own page</p></body></html>' };
+const pages = (store, levels) => {
+  for (const [level, page] of Object.entries(levels)) store.state.pages[level] = { page, by: 'ops', at: 1 };
+};
+
+test('Accept-Language: fr → the page in French, vary: accept-language and the policy; none or another language → English', async () => {
+  for (const [language, expected] of [['fr-CA,fr;q=0.9,en;q=0.5', 'fr'], ['de,en;q=0.5', 'en'], [undefined, 'en']]) {
+    for (const event of [request({ headers: { 'accept-language': language } }), visitor({ headers: { 'accept-language': language } })]) {
+      const { handler } = setup({ cfg: event.headers['x-dormeto-switch'] ? swapped() : testConfig() });
+      const res = await handler(event);
+      assert.match(res.body, new RegExp(`<html lang="${expected}">`), String(language));
+      assert.match(res.body, expected === 'fr' ? /Démarrage de l/ : /Waking up the application/);
+      assert.equal(headerOf(res, 'vary'), 'accept-language');
+      assert.equal(headerOf(res, 'content-security-policy'), PAGE_CSP);
+    }
+  }
+});
+
+test('the levels\' pages: a workload\'s title over the router\'s template, its description and the favicon read at the nap', async () => {
+  const { handler, store } = setup();
+  pages(store, { router: { mode: 'template', title: 'Acme', description: 'Back **soon**.' }, 'WL#demo': { mode: 'template', title: 'Shop' } });
+  store.state.favicons.demo = { icon: 'data:image/png;base64,iVBORw0KGgo=', fetchedAt: 1, error: null };
+  const res = await handler(request());
+  assert.match(res.body, /<title>Shop<\/title>/);
+  assert.match(res.body, /<h1>Shop<\/h1>/);
+  assert.match(res.body, /Back <strong>soon<\/strong>\./);
+  assert.match(res.body, /<img class="icon" alt="" src="data:image\/png;base64,iVBORw0KGgo=">/);
+  assert.doesNotMatch(res.body, /Acme/);
+  assert.match(res.body, /fetch\("\/_dormeto\/wake", /);
+});
+
+test('a custom page: served with the switch on, without our policy; with it off, the router\'s template shown, as if it were not stored', async () => {
+  const on = setup({ customPages: true });
+  pages(on.store, { router: { mode: 'template', title: 'Acme' }, 'WL#demo': CUSTOM });
+  const served = await on.handler(request());
+  assert.match(served.body, /<p data-dormeto="status">Our own page<\/p>/);
+  assert.match(served.body, /fetch\("\/_dormeto\/wake", /);
+  assert.equal(headerOf(served, 'content-security-policy'), undefined);
+  assert.equal(headerOf(served, 'vary'), 'accept-language');
+  for (const customPages of [false, undefined]) {
+    const off = setup({ customPages });
+    pages(off.store, { router: { mode: 'template', title: 'Acme' }, 'WL#demo': CUSTOM });
+    const shown = await off.handler(request());
+    assert.doesNotMatch(shown.body, /Our own page/);
+    assert.match(shown.body, /<h1>Acme<\/h1>/);
+    assert.equal(headerOf(shown, 'content-security-policy'), PAGE_CSP);
+  }
+  const router = setup();
+  pages(router.store, { router: CUSTOM });
+  assert.match((await router.handler(request())).body, /<h1 id="message"[^>]*>Waking up the application/, 'the default page');
+});
+
+test('WAKING with recentWakes [20000, 30000, 40000], begun 10 s ago: the page, its HEAD and /_dormeto/wake say 10000 and 30000, and the bar', async () => {
+  const clock = fakeClock();
+  const run = { state: STATES.WAKING, wakeId: 'w1', wakeStartedAt: clock.now() - 10_000, beatAt: clock.now(), recentWakes: JSON.stringify([20_000, 30_000, 40_000]) };
+  for (const event of [request(), request({ method: 'HEAD' }), probe(), visitor()]) {
+    const { handler } = setup({ run, cfg: event.headers['x-dormeto-switch'] ? swapped() : testConfig() });
+    const res = await handler(event);
+    assert.equal(headerOf(res, 'x-dormeto-wake-elapsed'), '10000', `${event.method} ${event.url}`);
+    assert.equal(headerOf(res, 'x-dormeto-wake-typical'), '30000', `${event.method} ${event.url}`);
+    if (event.url !== '/_dormeto/wake' && event.method !== 'HEAD') assert.match(res.body, /role="progressbar"[^>]*aria-valuenow="33"/);
+  }
+  const first = setup({ run: { ...run, recentWakes: undefined } });
+  const res = await first.handler(request());
+  assert.equal(headerOf(res, 'x-dormeto-wake-elapsed'), '10000');
+  assert.equal(headerOf(res, 'x-dormeto-wake-typical'), undefined, 'no wake recorded yet: no bar');
+  assert.doesNotMatch(res.body, /role="progressbar"/);
+  const asleep = setup({ run: { state: STATES.ASLEEP, recentWakes: run.recentWakes } });
+  assert.equal(headerOf(await asleep.handler(request()), 'x-dormeto-wake-elapsed'), undefined);
+});
+
+test('a failed workload\'s next attempt on the page comes from its settings resolved through the levels, the router\'s failedRetrySeconds', async () => {
+  const clock = fakeClock();
+  const run = { state: STATES.FAILED, failedAt: clock.now(), consecutiveFailures: 1, failure: JSON.stringify({ kind: 'capacity' }) };
+  const { handler, store } = setup({ run, cfg: testConfig({ inherits: ['failedRetrySeconds'] }) });
+  store.state.routerSettings = { defaults: { failedRetrySeconds: 600 }, by: 'ops', at: 1 };
+  const res = await handler(request());
+  assert.match(res.body, /the start is retried, next attempt in 10 minutes\./);
+});
+
+test('the pages of a workload not configured: the router\'s; Firestore unreadable: the built-in page, its levels not waited for', async () => {
+  const { handler, store } = setup();
+  pages(store, { router: { mode: 'template', title: 'Acme' } });
+  assert.match((await handler(request({ headers: { 'x-dormeto-workload': 'other' } }))).body, /<h1>Acme<\/h1>/);
+  const broken = setup();
+  pages(broken.store, { router: { mode: 'template', title: 'Acme' } });
+  broken.store.getRun = async () => { throw new Error('Google: 503 firestore'); };
+  broken.store.getWaitingPage = async () => assert.fail('no page read');
+  assert.doesNotMatch((await broken.handler(request())).body, /Acme/);
 });
 
 test('a probe from a browser → one task for the controller: service account, audience', async () => {
@@ -910,6 +1005,25 @@ test('fromEnvironment wires the store and the queue on the environment\'s names'
   assert.equal(tasks[0].body.task.httpRequest.url, `${CONTROLLER}/v1/tasks`);
   assert.equal(tasks[0].body.task.httpRequest.oidcToken.serviceAccountEmail, SERVICE_ACCOUNT);
   assert.ok(calls.some((call) => call.url === `${documents}:commit`));
+});
+
+test('fromEnvironment: DMT_CUSTOM_PAGES=1 serves a custom page; without it, the template', async () => {
+  const documents = 'https://firestore.googleapis.com/v1/projects/p/databases/dmtr-europe-west1/documents';
+  const stored = {
+    [`${documents}/workloads/demo`]: { config: testConfig() },
+    [`${documents}/runs/demo`]: { state: STATES.ASLEEP },
+    [`${documents}/pages/demo`]: { ...CUSTOM, by: 'ops', at: 1 },
+  };
+  const fetch = async (url) => {
+    if (url.includes('metadata.google.internal')) return Response.json({ access_token: 'token', expires_in: 3600 });
+    if (stored[url]) return Response.json({ fields: toFields(stored[url]), updateTime: '2026-10-30T00:00:00Z' });
+    return Response.json({ error: { code: 404, message: 'not found', status: 'NOT_FOUND' } }, { status: 404 });
+  };
+  const env = { DMT_PROJECT: 'p', DMT_REGION: 'europe-west1', DMT_DATABASE: 'dmtr-europe-west1', DMT_QUEUE: 'dmtr-europe-west1', DMT_CONTROLLER_URL: CONTROLLER, DMT_SERVICE_ACCOUNT: SERVICE_ACCOUNT };
+  for (const [more, custom] of [[{ DMT_CUSTOM_PAGES: '1' }, true], [{}, false]]) {
+    const res = await fromEnvironment({ ...env, ...more }, { fetch, log: silentLog })(request());
+    assert.equal(/Our own page/.test(res.body), custom, JSON.stringify(more));
+  }
 });
 
 // --- IP lists -------------------------------------------------------------------------------------------------------------

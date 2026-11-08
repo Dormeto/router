@@ -44,10 +44,13 @@ const notDone = () => new GoogleError('Google: operation op not done in time', {
 // `on[line]`: runs when that change is asked; it may throw (refused), or answer 'under way' (done later): not applied.
 // `nodeTimers`: the heartbeat on the controller's own timer, Node's, not on the fake clock. `logs`: the router's log view (DMT_LOG_VIEW),
 // what it answers (requests, null, or a function of the query); none, no view. `logConfig`: the backend service's.
+// `network.fetch`: the favicon's network at a nap, none unless a test sets it, so that no test reaches one. `customPages`: the install's
+// switch (DMT_CUSTOM_PAGES).
 function setup({
   run = { state: STATES.AWAKE, awakeSince: 1 }, cfg = {}, vms = {}, groups = {}, autoscalers = {}, machineTypes = {}, map = mapOf(), requests = 0, unhealthyPolls = 0, lists, download,
-  nodeTimers = false, logs, logConfig,
+  nodeTimers = false, logs, logConfig, customPages = false,
 } = {}) {
+  const network = { fetch: async () => { throw new Error('no network in tests'); }, calls: [] };
   const clock = fakeClock();
   const world = {
     vms: Object.fromEntries(Object.entries(vms).map(([name, vm]) => [name, { machineType: `${V1}/zones/${ZONE}/machineTypes/e2-small`, ...vm }])),
@@ -214,8 +217,13 @@ function setup({
     ...(nodeTimers ? {} : { every }),
     log,
     newId: () => 'wake-2',
+    fetch: (...args) => {
+      network.calls.push(args[0]);
+      return network.fetch(...args);
+    },
+    customPages,
   });
-  return { controller, store, clock, world, timers, urlmaps, regionalUrlmaps, run: () => store.state.run, logged: (event) => world.logs.filter((l) => l.event === event) };
+  return { controller, store, clock, world, timers, urlmaps, regionalUrlmaps, network, run: () => store.state.run, logged: (event) => world.logs.filter((l) => l.event === event) };
 }
 
 // When each beat was asked, written or not.
@@ -2336,6 +2344,122 @@ test('the check stops at its 240 s, and one workload\'s failure does not stop th
   assert.match(out.find((r) => r.workloadId === 'w01').error, /unreadable/);
   assert.equal(logs.find((l) => l.event === 'CheckFailed').workloadId, 'w01');
   assert.equal(logs.find((l) => l.event === 'CheckBudgetReached').workloads, 12);
+});
+
+// --- The waiting page (G5, design §5.2): the wakes' durations, the favicon read at the nap ----------------------------------------
+
+test('three wakes leave three recentWakes, beside lastWake; a failed wake adds none', async () => {
+  const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
+  for (const durationMs of [20_000, 30_000, 40_000]) {
+    t.store.state.run = { ...t.run(), ...waking(t.clock.now() - durationMs) };
+    assert.equal((await t.controller.wake('demo', 'w1')).state, STATES.AWAKE);
+  }
+  assert.equal(t.run().recentWakes, '[20000,30000,40000]');
+  assert.deepEqual(t.run().lastWake, { durationMs: 40_000 });
+  t.store.state.run = { ...t.run(), ...waking(t.clock.now() - 5000) };
+  t.world.on['start vm-a'] = async () => { throw new GoogleError('Google: POST: 403 denied', { code: 403 }); };
+  t.world.vms['vm-a'].status = 'TERMINATED';
+  assert.equal((await t.controller.wake('demo', 'w1')).state, STATES.FAILED);
+  assert.equal(t.run().recentWakes, '[20000,30000,40000]');
+});
+
+const PNG_BYTES = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+const PNG_URI = `data:image/png;base64,${PNG_BYTES.toString('base64')}`;
+// The application at demo.example.com, its home page linking /f.png. What each request found: the run's state and whether the map
+// held the nap's policy.
+function site(t) {
+  const seen = [];
+  t.network.fetch = async (url) => {
+    seen.push([url, t.run().state, hasPolicy(t.world.map) ? 'policy' : 'no policy']);
+    if (url === 'https://demo.example.com/') return new Response('<link rel="icon" href="/f.png">', { status: 200 });
+    if (url === 'https://demo.example.com/f.png') return new Response(PNG_BYTES, { status: 200 });
+    return new Response('', { status: 404 });
+  };
+  return seen;
+}
+test('a nap reads the favicon before its NAPPING, the route still the application\'s, from the host the URL map sends / to the workload', async () => {
+  const t = setup({ vms: RUNNING, cfg: { hibernate: false } });
+  const seen = site(t);
+  const at = t.clock.now();
+  assert.equal((await t.controller.nap('demo')).state, STATES.ASLEEP);
+  assert.deepEqual(seen, [['https://demo.example.com/', STATES.AWAKE, 'no policy'], ['https://demo.example.com/f.png', STATES.AWAKE, 'no policy']]);
+  assert.deepEqual(t.store.state.favicons.demo, { icon: PNG_URI, fetchedAt: at, error: null });
+  assert.deepEqual(t.world.calls, ['map policy', 'wait 300 s', 'stop vm-a']);
+});
+
+test('a nap reads the favicon at most once a day, successful or not; the levels only when it is due', async () => {
+  const t = setup({ vms: RUNNING });
+  site(t);
+  const levels = [];
+  const { getWaitingPage } = t.store;
+  t.store.getWaitingPage = async (level, ...rest) => {
+    levels.push(level);
+    return getWaitingPage(level, ...rest);
+  };
+  t.store.state.favicons.demo = { icon: null, fetchedAt: t.clock.now() - DAY + 60_000, error: 'the page answered 401' };
+  assert.equal((await t.controller.nap('demo')).state, STATES.ASLEEP);
+  assert.deepEqual([t.network.calls, levels], [[], []]);
+  const again = setup({ vms: RUNNING });
+  site(again);
+  again.store.state.favicons.demo = { icon: PNG_URI, fetchedAt: again.clock.now() - DAY - 1, error: null };
+  await again.controller.nap('demo');
+  assert.equal(again.network.calls.length, 2);
+  assert.equal(again.store.state.favicons.demo.fetchedAt, again.clock.now() - 300_000);
+});
+
+test('the favicon is read for a template with icon auto only; a custom page the switch keeps off is none, and its template shows', async () => {
+  const CUSTOM = { mode: 'custom', html: '<p data-dormeto="status"></p>' };
+  for (const [name, pages, customPages, reads] of [
+    ['an icon of its own at the router', { router: { mode: 'template', icon: PNG_URI } }, false, 0],
+    ['none at the workload', { 'WL#demo': { mode: 'template', icon: 'none' } }, false, 0],
+    ['a custom page, the switch on', { 'WL#demo': CUSTOM }, true, 0],
+    ['a custom page, the switch off', { 'WL#demo': CUSTOM }, false, 2],
+    ['a custom router page over a template, the switch off', { router: CUSTOM, 'WL#demo': { mode: 'template', title: 'Shop' } }, false, 2],
+  ]) {
+    const t = setup({ vms: RUNNING, customPages });
+    site(t);
+    for (const [level, page] of Object.entries(pages)) t.store.state.pages[level] = { page, by: 'ops', at: 1 };
+    assert.equal((await t.controller.nap('demo')).state, STATES.ASLEEP, name);
+    assert.equal(t.network.calls.length, reads, name);
+  }
+});
+
+test('the favicon: no host rule sending / to the workload is said and waits a day; a skipped nap reads none; a map that cannot be read changes nothing', async () => {
+  const none = setup({ vms: RUNNING, map: { ...mapOf(), hostRules: [{ hosts: ['*'], pathMatcher: 'm' }] } });
+  site(none);
+  const at = none.clock.now();
+  assert.equal((await none.controller.nap('demo')).state, STATES.ASLEEP);
+  assert.deepEqual([none.network.calls, none.store.state.favicons.demo], [[], { icon: null, fetchedAt: at, error: 'no rule for the whole of a host name' }]);
+
+  const paused = setup({ vms: RUNNING });
+  site(paused);
+  await paused.store.putPause('demo', { by: 'ops', at: 1, reason: 'x', keepAsleep: false });
+  assert.equal((await paused.controller.nap('demo')).state, 'SKIPPED');
+  assert.deepEqual([paused.network.calls, paused.store.state.favicons], [[], {}]);
+
+  const unread = setup({ vms: RUNNING });
+  site(unread);
+  unread.urlmaps.get = async () => { throw new GoogleError('Google: GET: 503 unavailable', { code: 503 }); };
+  assert.equal((await unread.controller.nap('demo')).state, STATES.ASLEEP);
+  assert.deepEqual([unread.network.calls, unread.store.state.favicons], [[], {}]);
+  assert.equal(unread.logged('FaviconSkipped').length, 1);
+});
+
+test('the favicon of a regional workload: its host from the regional URL map', async () => {
+  const lb = { kind: 'regional', region: 'europe-west1' };
+  const t = setup({ vms: RUNNING, cfg: { lb, hibernate: false } });
+  site(t);
+  const read = [];
+  t.urlmaps.get = async () => assert.fail('the global scope');
+  const { get } = t.regionalUrlmaps;
+  t.regionalUrlmaps.get = async (name) => {
+    read.push(name);
+    return get(name);
+  };
+  t.world.map = { ...mapOf(), pathMatchers: [{ name: 'm', defaultService: `${V1}/regions/europe-west1/backendServices/app` }] };
+  assert.equal((await t.controller.nap('demo')).state, STATES.ASLEEP);
+  assert.deepEqual(read, ['lb']);
+  assert.equal(t.store.state.favicons.demo.icon, PNG_URI);
 });
 
 // --- The levels (G5, design §4.5): what the check, the wake, the nap and the release act on is resolved ---------------------

@@ -27,21 +27,30 @@
 //
 // A wake whose task was lost, or whose request died, no longer beats on its run (heartbeat.mjs): a visitor's poll of it sends it
 // again with its wakeId, as the check does, one resend a minute between them and every instance of this waker.
+//
+// The page is AWS's branded one (the G5 design's section 5.3): the levels' pages and the favicon through waiting-pages.mjs's cache (60 s,
+// 1 s per read, the last value kept on a failure), custom pages only with the install's switch (pages.mjs); the language from
+// Accept-Language, with `vary`; our policy on a template page, never on a customer's; and while WAKING, the time since the wake began
+// and the median of the last ones, on the page's answers and on `/_dormeto/wake`'s, where the bar is drawn from.
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createListCache, parseLists } from '../../lambda/src/lib/list-cache.mjs';
 import { failureKind, nextAttemptAt } from '../../lambda/src/lib/failures.mjs';
-import { WAKE_HEADER, header, response } from '../../lambda/src/lib/http.mjs';
+import { WAKE_HEADER, header, headerValues, response } from '../../lambda/src/lib/http.mjs';
 import { logger } from '../../lambda/src/lib/log.mjs';
 import { createJoinLevelsCache } from '../../lambda/src/lib/manager-settings.mjs';
-import { renderPage } from '../../lambda/src/lib/page.mjs';
+import { PAGE_CSP, languageOf, renderPage } from '../../lambda/src/lib/page.mjs';
+import { wakeHeaders, wakeProgress } from '../../lambda/src/lib/page-settings.mjs';
 import { napEndHeader, napEndOf, occurrenceAt } from '../../lambda/src/lib/schedule.mjs';
+import { effectiveConfig } from '../../lambda/src/lib/settings-levels.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
+import { createWaitingPages } from '../../lambda/src/lib/waiting-pages.mjs';
 import { createWaker } from '../../lambda/src/lib/waker-core.mjs';
 import { createFirestoreStore } from './firestore.mjs';
 import { createGoogle } from './google.mjs';
 import { resendStale } from './heartbeat.mjs';
 import { wakerConfigOf } from './levels.mjs';
 import { SWITCH_HEADER, WORKLOAD_HEADER, WORKLOAD_ID } from './names.mjs';
+import { customPagesOf, servedStore } from './pages.mjs';
 import { createTasks } from './tasks.mjs';
 import { WAITING_PATH } from './urlmaps.mjs';
 
@@ -92,7 +101,8 @@ export function workloadIdOf(event) {
 // As the workload's: the header's last value is the load balancer's.
 const underSwap = (event) => (header(event, SWITCH_HEADER) ?? '').split(',').at(-1).trim() === 'swap';
 
-export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], now = Date.now, log }) {
+// customPages: the install's switch (DMT_CUSTOM_PAGES, pages.mjs).
+export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], customPages = false, now = Date.now, log }) {
   // A request names one workload, and both the shared code and this file's words ask for its nap window: one read per
   // request, a failed one included.
   const thisRequest = new AsyncLocalStorage();
@@ -111,15 +121,19 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], n
   const levels = createJoinLevelsCache({ router: () => store.getRouterSettings?.(), manager: () => store.getManagerSettings?.(), now, log });
   const levelsCache = { ...levels, records: (fields) => (thisRequest.getStore().levels ??= levels.records(fields)) };
 
+  // Whatever the levels say, what Google Cloud fixes: no request is held, and the wake mode is browser behind the policy and on its
+  // fetch. The rest the core resolves, and so does the page.
+  const wakerConfig = (cfg, router) => wakerConfigOf(cfg, { router, policyFetch: thisRequest.getStore().policyFetch });
+  // The levels' pages and the favicon, kept per instance: the core reads them for the wake's headers, the page for itself.
+  const pages = createWaitingPages({ store: servedStore(store, customPages), now, log });
+
   const enqueue = (body) => tasks.enqueue({ url: `${controllerUrl}/v1/tasks`, body });
   const core = createWaker({
-    // Whatever the levels say, what Google Cloud fixes: no request is held, and the wake mode is browser behind the policy and on
-    // its fetch. The rest the core resolves.
     store: {
       ...store,
       getConfig: async (workloadId) => {
         const [cfg, { router }] = await Promise.all([readConfig(workloadId), levelsCache.records({ workloadId })]);
-        return cfg && wakerConfigOf(cfg, { router, policyFetch: thisRequest.getStore().policyFetch });
+        return cfg && wakerConfig(cfg, router);
       },
       getRun: readRun,
       transition: async (workloadId, change) => {
@@ -139,6 +153,7 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], n
     // The lists' data is read from the store; one that cannot be read counts as none (the cache logs it) and wakes go on.
     listCache: lists.length ? createListCache({ store, lists, now, log }) : null,
     levelsCache,
+    waitingPages: pages,
     now,
     log,
   });
@@ -205,27 +220,42 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], n
     }
   }
 
+  // The configuration the page says the poll and the next attempt from: the core's, resolved through the levels on the record of them
+  // this request read.
+  async function resolvedOf(workloadId, cfg, run) {
+    const { router, manager } = await levelsCache.records({ workloadId });
+    return effectiveConfig(wakerConfig(cfg, router), { run, router, organization: manager });
+  }
+
   // The error response's fetch, which may carry nothing of the visitor's request, or under a swap that request itself: the page
-  // whatever the path, method and headers, once the wake is decided, with the state the decision left.
+  // whatever the path, method and headers, once the wake is decided, with the state the decision left. The levels' pages: a workload
+  // not configured has the router's; with Firestore unreadable, the built-in page is not kept waiting for them.
   async function waiting(event, workloadId) {
     const statusCode = underSwap(event) && !event.path.startsWith(NAMESPACE) ? 503 : 200;
     const read = await Promise.all([readConfig(workloadId), readRun(workloadId)]).catch((err) => {
       log.error('WaitingPageUnread', { workloadId, error: err.message });
       return null;
     });
-    const [cfg, run] = read ?? [];
-    if (read && (!cfg || !run)) log.error('WorkloadNotConfigured', { workloadId });
-    const state = cfg && run ? run.state : read ? STATES.FAILED : UNREAD_STATE;
-    const pollSeconds = cfg && run ? cfg.pollSeconds : UNKNOWN_POLL_SECONDS;
-    const retryAt = cfg && run ? nextAttemptAt(cfg, run) : null;
+    const [stored, run] = read ?? [];
+    if (read && (!stored || !run)) log.error('WorkloadNotConfigured', { workloadId });
+    const cfg = stored && run ? await resolvedOf(workloadId, stored, run) : null;
+    const state = cfg ? run.state : read ? STATES.FAILED : UNREAD_STATE;
+    const pollSeconds = cfg ? cfg.pollSeconds : UNKNOWN_POLL_SECONDS;
+    const retryAt = cfg ? nextAttemptAt(cfg, run) : null;
     const failed = retryAt === null ? {} : { failure: failureKind(run), retryInMs: Math.max(0, retryAt - now()) };
-    const napUntil = cfg && run ? await napUntilOf(workloadId, state) : null;
+    const napUntil = cfg ? await napUntilOf(workloadId, state) : null;
+    const progress = cfg ? wakeProgress(state, run, now()) : null;
     const headers = {
       ...(napUntil ? { [NAP_UNTIL_HEADER]: napEndHeader(napUntil) } : {}),
       'cache-control': 'no-store', 'retry-after': String(pollSeconds), 'x-dormeto-state': state, 'content-type': 'text/html; charset=utf-8',
+      ...wakeHeaders(progress),
     };
     if (event.httpMethod === 'HEAD') return response(statusCode, headers);
-    return response(statusCode, headers, renderPage({ state, pollSeconds, ...failed, napUntil, probeUrl: WAKE_PATH, cloud: CLOUD }));
+    const { page, icon } = read ? await pages.pageOf(cfg ? workloadId : null) : { page: null, icon: null };
+    const language = languageOf(headerValues(event, 'accept-language').join(','));
+    const body = renderPage({ state, pollSeconds, ...failed, napUntil, probeUrl: WAKE_PATH, cloud: CLOUD, language, page, icon, progress });
+    // A custom page is the customer's: our policy would break it. Any other is ours, and so is its policy.
+    return response(statusCode, { ...headers, vary: 'accept-language', ...(page?.mode === 'custom' ? {} : { 'content-security-policy': PAGE_CSP }) }, body);
   }
 
   return async function handler(request) {
@@ -245,7 +275,8 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], n
   };
 }
 
-// The handler of the `waker` role (server.mjs), on the router's environment.
+// The handler of the `waker` role (server.mjs), on the router's environment. `DMT_CUSTOM_PAGES=1`: the install turned custom waiting
+// pages on (pages.mjs).
 export function fromEnvironment(env = process.env, { fetch, log = logger } = {}) {
   const google = createGoogle({ fetch });
   const store = createFirestoreStore({ google, project: env.DMT_PROJECT, database: env.DMT_DATABASE, log });
@@ -254,6 +285,7 @@ export function fromEnvironment(env = process.env, { fetch, log = logger } = {})
     tasks: createTasks({ google, project: env.DMT_PROJECT, region: env.DMT_REGION, queue: env.DMT_QUEUE, serviceAccount: env.DMT_SERVICE_ACCOUNT }),
     controllerUrl: env.DMT_CONTROLLER_URL,
     lists: parseLists(env.DMT_IP_LISTS, (error) => log.error('IpListsUnreadable', { error })),
+    customPages: customPagesOf(env),
     log,
   });
   // SIGTERM commits the buffered stats (server.mjs).

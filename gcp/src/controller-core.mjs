@@ -29,7 +29,7 @@
 //
 // What the run adds to AWS's: `stopped`, `suspended` (the VMs a nap acted on, names), `autoscalers` (`[{ kind, location,
 // name (the autoscaler's), mode }]`, what the wake gives back), `owners` (k8sRecord's: what a nap read of its k8s backends, replicas and KEDA, for
-// the wake), `lastWake` (`{ durationMs }`), `scheduleApplied` (the last nap or awake window's occurrence applied), `napAborted`
+// the wake), `lastWake` (`{ durationMs }`), `recentWakes` (AWS's: the last 10 wakes' durations, for the waiting page's progress bar), `scheduleApplied` (the last nap or awake window's occurrence applied), `napAborted`
 // (`{ reason, at }`: the last nap given up, its cause, until a nap commits), and the heartbeat's (heartbeat.mjs): `napId` (the
 // running nap's, as `wakeId` is the wake's), `beatAt`, `resentAt` and `resends`. The cause and the event of a state change are
 // logged (`StateChanged`): the state history in the manager comes with G2.
@@ -37,17 +37,23 @@
 // Schedules and pauses as on AWS (vision docs/specs/2026-10-30-google-cloud-coverage-design.md, section 5). Here a pause is
 // a workload's: the router's and the exclusions wait for G2.
 //
+// The waiting page (vision docs/specs/2026-11-08-google-cloud-router-features-design.md, section 5.2): a nap reads the application's
+// favicon before its NAPPING, while the route still reaches the application, as AWS's (favicon.mjs's step), from the host the URL map
+// sends `/` to it; with custom pages off (pages.mjs), a custom page is none there too.
+//
 // The idle check's activity (vision docs/specs/2026-11-07-google-cloud-fixes-design.md, section 5, amended by M2): on a backend
 // service that logs every request, the requests the waker would not ignore decide alone, read in the router's log view (`logs`,
 // absent without DMT_LOG_VIEW); otherwise, and when they cannot be read or are empty, Monitoring's request count. The run says what
 // the last check that read log entries, or counted any request, read (`idleReads`).
 import { randomUUID } from 'node:crypto';
 import { failedSpec, failureError } from '../../lambda/src/lib/failures.mjs';
+import { cacheFavicon, FAVICON_BUDGET_MS, hostOfRules } from '../../lambda/src/lib/favicon.mjs';
 import { resolveHibernation } from '../../lambda/src/lib/hibernation.mjs';
 import { createListCache } from '../../lambda/src/lib/list-cache.mjs';
 import { awakeStartWithin, CLOSE_START_MS, maintenanceDue, occurrenceAt } from '../../lambda/src/lib/schedule.mjs';
 import { DAY_MS, STATES, utcDay } from '../../lambda/src/lib/state.mjs';
 import { createListRefresher } from '../../lambda/src/lib/list-refresh.mjs';
+import { withWake } from '../../lambda/src/lib/page-settings.mjs';
 import { createWakeWatch } from '../../lambda/src/lib/wake-watch.mjs';
 import { activityOf } from './activity.mjs';
 import { COMPANION_GONE, companionGone, companionLost, isCompanion, startDatabase, statusOf, stopDatabase } from './cloudsql.mjs';
@@ -57,8 +63,9 @@ import {
 import { OPERATION_NOT_DONE } from './google.mjs';
 import { resendStale, startHeartbeat, staleness } from './heartbeat.mjs';
 import { effectiveOf, WAKE_TIMEOUT_MAX } from './levels.mjs';
+import { faviconReachable, servedPage } from './pages.mjs';
 import { inOneUpdate, switchOf } from './switch.mjs';
-import { mapBusy, references, UrlMapRefused } from './urlmaps.mjs';
+import { listenerRulesOf, mapBusy, references, UrlMapRefused } from './urlmaps.mjs';
 
 const POLL_MS = 2000;
 // Until the VMs are down, from the moment they are asked to go. G0: 106 s, 96 s suspended, 198 s for a managed group's.
@@ -178,6 +185,8 @@ const logsEveryRequest = (logConfig) => logConfig?.enable === true && (logConfig
 
 export function createController({
   store, compute, cloudsql, gke, urlmaps, regionalUrlmaps, monitoring, logs, tasks, config, lists = [], download, now = Date.now, sleep, every = repeat, newId = randomUUID, log,
+  // The favicon read at a nap (favicon.mjs): the network and its time budget, injected for the tests. customPages: the install's switch.
+  fetch = globalThis.fetch, faviconBudgetMs = FAVICON_BUDGET_MS, customPages = false,
 }) {
   const clients = { compute, kubernetesOf: (cluster) => gke.kubernetesOf(cluster) };
   const enqueue = (body) => tasks.enqueue({ url: `${config.controllerUrl}/v1/tasks`, body });
@@ -592,7 +601,8 @@ export function createController({
       const durationMs = now() - since;
       const awake = await transition(workloadId, {
         cond: { state: STATES.WAKING, wakeId },
-        set: { state: STATES.AWAKE, awakeSince: now(), lastWake: { durationMs } },
+        // recentWakes, as AWS's: only a wake that ended here counts, for the waiting page's typical time.
+        set: { state: STATES.AWAKE, awakeSince: now(), lastWake: { durationMs }, recentWakes: withWake(run.recentWakes, durationMs) },
         remove: ['pendingWake', 'stopped', 'suspended', ...(givenBack ? ['autoscalers', 'owners'] : []), 'failure', 'consecutiveFailures', 'failedAt'],
         event: { wakeId, durationMs },
       });
@@ -791,12 +801,29 @@ export function createController({
       log.warn('NapSkipped', { workloadId, reason: refusal });
       return { state: 'SKIPPED', reason: refusal };
     }
+    // The nap is decided, and the route still reaches the application: the only moment its home page can be read.
+    if (faviconReachable(cfg.lb)) await faviconAtNap(cfg, sw);
     // Its id: what its heartbeat holds the run by, from NAPPING to its end.
     const napId = newId();
     const napping = await transition(workloadId, { cond: { state: STATES.AWAKE }, set: { state: STATES.NAPPING, napId }, remove: ['pendingWake'], cause });
     if (!napping) return { state: 'SKIPPED' };
     log.info('NapStarted', { workloadId });
     return beating(workloadId, 'napId', napId, () => napBeating(workloadId, { cfg, router, sw, napping, cause, requestedAt, started, latest }));
+  }
+
+  // The application's favicon for the waiting page, by AWS's step (favicon.mjs's cacheFavicon): the levels as the waiting page shows
+  // them, the host from the URL map read once the read is due.
+  function faviconAtNap(cfg, sw) {
+    const { workloadId } = cfg;
+    const served = servedPage(customPages);
+    return cacheFavicon(workloadId, {
+      store, fetch, now, budgetMs: faviconBudgetMs, log,
+      levels: async () => {
+        const [router, workload] = await Promise.all([store.getWaitingPage('router'), store.getWaitingPage({ workloadId })]);
+        return [null, served(router?.page), served(workload?.page)];
+      },
+      host: async () => hostOfRules(listenerRulesOf(await sw.urlmaps.get(cfg.urlMap), cfg.backendService)),
+    });
   }
 
   // A nap from its NAPPING on.

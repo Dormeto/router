@@ -18,7 +18,12 @@
 // Settings by level (vision docs/specs/2026-11-08-google-cloud-router-features-design.md, section 4): AWS's keys in the configuration, with
 // `inherits` (the keys that follow the levels) and `source: 'cli'`; the router level in `router/settings`. The routes that set them are
 // AWS's `settings` action, with what Google Cloud fixes (levels.mjs); a Workload shows each setting resolved and where it comes from.
+//
+// The waiting page (section 5): AWS's `waiting-page` action, the router's level or a workload's, its answer AWS's (page-settings.mjs's
+// pageViewOf); custom pages need the install's switch (pages.mjs).
+import { createHash } from 'node:crypto';
 import { resolveHibernation, settingsProblems, workloadSettingsProblems } from '../../lambda/src/lib/hibernation.mjs';
+import { pageViewOf, validatePage } from '../../lambda/src/lib/page-settings.mjs';
 import { nextEvents, normalizeSchedule, resolveJoin, scheduleProblems } from '../../lambda/src/lib/schedule.mjs';
 import { describedRules, SCALAR_KEYS } from '../../lambda/src/lib/settings-levels.mjs';
 import { mergedRouterSettings, resolvedSettings, routerSettingsView, withSettings, writtenRouterView } from '../../lambda/src/lib/settings-writes.mjs';
@@ -31,6 +36,7 @@ import {
 import { beatOf } from './heartbeat.mjs';
 import { effectiveOf, inheritsOf, levelProblems } from './levels.mjs';
 import { SWITCH_HEADER, WORKLOAD_HEADER, WORKLOAD_ID, swapHeaders } from './names.mjs';
+import { CUSTOM_PAGE_NOT_SERVED, CUSTOM_PAGES_REFUSED, notServed, servedPage } from './pages.mjs';
 import { inOneUpdate, SWAP_WAIT_MS } from './switch.mjs';
 import {
   hostsOf, inMatcher, references, UrlMapRefused, withErrorPolicy, withHoldRoute, withoutErrorPolicy, withoutHoldRoute, withoutSwap, withoutWakerRoute, withSwap, withWakerRoute,
@@ -216,7 +222,8 @@ function workloadOf(cfg, run, paused, router) {
   };
 }
 
-export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regionalUrlmaps, core, config, now = Date.now, log }) {
+// customPages: the install's switch (DMT_CUSTOM_PAGES, pages.mjs).
+export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regionalUrlmaps, core, config, customPages = false, now = Date.now, log }) {
   const clients = { compute, kubernetesOf: (cluster) => gke.kubernetesOf(cluster) };
   const wakerName = (id) => `dmtr-${config.region}-${id}`;
   const wakerUrl = (name, lb) => `${COMPUTE}/projects/${config.project}/${isRegional(lb) ? `regions/${lb.region}` : 'global'}/backendServices/${name}`;
@@ -853,7 +860,47 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     return { level: 'router', settings: writtenRouterView(record) };
   }
 
+  // A level's page as AWS's action answers it. Every workload here is the CLI's: none is Terraform's. A custom page the switch keeps
+  // from visitors is its level's own still, said not served, and what the page shows is resolved without it.
+  async function pageView(level) {
+    const workloadId = level === 'router' ? null : level.workloadId;
+    const [router, favicon] = await Promise.all([store.getWaitingPage('router'), workloadId ? store.getFavicon(workloadId) : null]);
+    const own = workloadId ? await store.getWaitingPage(level) : router;
+    const view = pageViewOf({ router, own, favicon, workload: Boolean(workloadId), served: servedPage(customPages) });
+    return notServed(customPages, own?.page) ? { ...view, warnings: [CUSTOM_PAGE_NOT_SERVED, ...view.warnings] } : view;
+  }
+
+  // AWS's waiting-page action: `level` is 'router' or { workloadId } (as the store's), `op` get, put or delete. A put refused names
+  // every problem, with nothing written; a custom one needs the switch. `by` says who sets it, as a schedule's. The log holds the size
+  // and the SHA-256 of a custom page, never the page.
+  async function waitingPage(level, { op, page, by } = {}) {
+    const workloadId = level === 'router' ? null : level.workloadId;
+    if (workloadId !== null) await find(workloadId);
+    const fields = { level: workloadId ? 'workload' : 'router', workloadId, by: by ?? 'unknown' };
+    switch (op) {
+      case 'get':
+        break;
+      case 'put': {
+        const problems = [...(page?.mode === 'custom' && !customPages ? [CUSTOM_PAGES_REFUSED] : []), ...validatePage(page)];
+        if (problems.length) throw refusedSettings(problems);
+        await store.putWaitingPage(level, page, { by: fields.by, at: now() });
+        const custom = page.mode === 'custom';
+        log.info('WaitingPageSet', {
+          ...fields, mode: page.mode, bytes: custom ? Buffer.byteLength(page.html) : undefined, sha256: custom ? createHash('sha256').update(page.html).digest('hex') : undefined,
+        });
+        break;
+      }
+      case 'delete':
+        log.info('WaitingPageCleared', { ...fields, cleared: await store.deleteWaitingPage(level) });
+        break;
+      default:
+        throw bad(`unknown waiting-page op: ${op}`);
+    }
+    return pageView(level);
+  }
+
   return {
     dryRun, onboard, offboard, find, show, list, nap, wake, showSchedule, setSchedule, clearSchedule, pause, resume, setSettings, routerSettings, setRouterSettings,
+    waitingPage,
   };
 }

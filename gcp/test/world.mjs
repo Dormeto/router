@@ -553,12 +553,18 @@ export function setup(change = () => {}, { clock = fakeClock() } = {}) {
   const pauses = new Map();
   // The router level (`router/settings`): `router.settings`, null when unset.
   const router = { settings: null };
+  // The waiting pages by level, as Firestore's documents (`router/page`, `pages/<id>`), and the favicons by workload.
+  const pages = new Map();
+  const favicons = new Map();
+  const pagePath = (level) => (level === 'router' ? 'router/page' : `pages/${level.workloadId}`);
   const store = w.store ?? {
     configs,
     runs,
     schedules,
     pauses,
     router,
+    pages,
+    favicons,
     getConfig: async (id) => structuredClone(configs.get(id) ?? null),
     listConfigs: async () => [...configs.values()].map((c) => structuredClone(c)),
     listWorkloads: async () => ({ configs: [...configs.values()].map((c) => structuredClone(c)), schedules: structuredClone(schedules) }),
@@ -596,8 +602,18 @@ export function setup(change = () => {}, { clock = fakeClock() } = {}) {
       runs.set(id, { state: STATES.AWAKE, version: 0, awakeSince: at, holders: 0, wakeCount: 0 });
       return true;
     },
+    getWaitingPage: async (level) => structuredClone(pages.get(pagePath(level)) ?? null),
+    putWaitingPage: async (level, page, { by, at }) => {
+      pages.set(pagePath(level), { page: structuredClone(page), by: String(by ?? ''), at });
+    },
+    deleteWaitingPage: async (level) => pages.delete(pagePath(level)),
+    getFavicon: async (id) => structuredClone(favicons.get(id) ?? null),
+    putFavicon: async (id, favicon) => {
+      favicons.set(id, structuredClone(favicon));
+    },
     deleteWorkload: async (id) => {
-      for (const kind of [configs, runs, schedules, pauses]) kind.delete(id);
+      for (const kind of [configs, runs, schedules, pauses, favicons]) kind.delete(id);
+      pages.delete(pagePath({ workloadId: id }));
     },
     transition: async (id, { cond, set = {}, remove = [], increment = [] }) => {
       const run = runs.get(id);
@@ -636,10 +652,14 @@ export function setup(change = () => {}, { clock = fakeClock() } = {}) {
   };
   const cloudsql = recorded('cloudsql', createCloudSql({ google, project: 'p', now: clock.now, sleep: clock.sleep }));
   const gke = recorded('gke', createGke({ google, project: 'p', fetch: kubeFetch(w), now: clock.now }));
+  // The favicon's network (the nap's read): none unless a test sets `w.fetch`, so that no test reaches one. `w.customPages`: the
+  // install's switch (DMT_CUSTOM_PAGES).
+  const fetch = (...args) => (w.fetch ?? (async () => { throw new Error('no network in tests'); }))(...args);
   const core = createController({
     store, compute, cloudsql, gke, urlmaps, regionalUrlmaps, monitoring: { requestCount: async () => 0 }, tasks, config, now: clock.now, sleep: clock.sleep, every, newId: () => 'wake-1', log,
+    fetch, customPages: w.customPages === true,
   });
-  const onboarding = createOnboarding({ store, compute, cloudsql, gke, urlmaps, regionalUrlmaps, core, config, now: clock.now, log });
+  const onboarding = createOnboarding({ store, compute, cloudsql, gke, urlmaps, regionalUrlmaps, core, config, now: clock.now, log, customPages: w.customPages === true });
   return { w, clock, store, core, onboarding, config, log, compute, cloudsql, gke, urlmaps, regionalUrlmaps, google, timers };
 }
 

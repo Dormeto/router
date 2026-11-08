@@ -519,6 +519,45 @@ test('GET /v1/settings: the router level, none as AWS\'s empty answer; PUT: stor
   for (const body of ['{', '[]']) assert.equal((await call('PUT', '/v1/settings', body)).status, 400);
 });
 
+// --- The waiting page (vision docs/specs/2026-11-08-google-cloud-router-features-design.md, section 5.2) ---------------------------
+
+const CUSTOM_REFUSED = 'custom pages are off on this router: an administrator turns them on with dormeto gcp install --custom-pages';
+const PAGE_HTML = '<!doctype html><p data-dormeto="status"></p>';
+
+test('GET|PUT|DELETE /v1/waiting-page and /v1/workloads/:id/waiting-page: AWS\'s answer; the page\'s refusal: 400 with the problems; unknown: 404', async () => {
+  const { call, store, clock } = api();
+  assert.equal((await call('GET', '/v1/workloads/demo/waiting-page')).status, 404);
+  assert.equal((await call('PUT', '/v1/workloads/Bad_ID/waiting-page', { page: { mode: 'template' } })).status, 400);
+  await call('POST', '/v1/workloads', INPUT);
+  const at = new Date(clock.now()).toISOString();
+  const router = await call('PUT', '/v1/waiting-page', { page: { mode: 'template', title: 'Acme' }, by: 'adm' });
+  assert.equal(router.status, 200);
+  assert.deepEqual(Object.keys(router.body), ['own', 'inherited', 'effective', 'from', 'favicon', 'warnings', 'terraform', 'by', 'at']);
+  assert.deepEqual([router.body.own, router.body.by, router.body.at, router.body.terraform], [{ mode: 'template', title: 'Acme' }, 'adm', at, false]);
+  assert.deepEqual((await call('GET', '/v1/waiting-page')).body, router.body);
+  const own = await call('PUT', '/v1/workloads/demo/waiting-page', { page: { mode: 'template', description: 'Back soon.' }, by: 'ops' });
+  assert.deepEqual([own.body.effective.title, own.body.effective.description, own.body.from], ['Acme', 'Back soon.', { mode: 'workload', icon: 'default', title: 'router', description: 'workload' }]);
+  assert.deepEqual((await call('GET', '/v1/workloads/demo/waiting-page')).body, own.body);
+  const refused = await call('PUT', '/v1/workloads/demo/waiting-page', { page: { mode: 'custom', html: PAGE_HTML } });
+  assert.deepEqual([refused.status, refused.body], [400, { error: CUSTOM_REFUSED, reason: 'bad-request', problems: [CUSTOM_REFUSED] }]);
+  const bad = await call('PUT', '/v1/waiting-page', { page: { mode: 'template', title: '' } });
+  assert.deepEqual([bad.status, bad.body.problems], [400, ['title must be one line of text']]);
+  const cleared = await call('DELETE', '/v1/workloads/demo/waiting-page', { by: 'ops' });
+  assert.deepEqual([cleared.status, cleared.body.own, cleared.body.effective.title], [200, null, 'Acme']);
+  assert.equal((await call('DELETE', '/v1/waiting-page')).body.own, null);
+  assert.equal(store.pages.size, 0);
+  for (const body of ['{', '[]']) assert.equal((await call('PUT', '/v1/waiting-page', body)).status, 400);
+});
+
+test('PUT /v1/workloads/:id/waiting-page: a custom page, with the switch on, stored and answered', async () => {
+  const { call, store } = api((w) => { w.customPages = true; });
+  await call('POST', '/v1/workloads', INPUT);
+  const res = await call('PUT', '/v1/workloads/demo/waiting-page', { page: { mode: 'custom', html: PAGE_HTML }, by: 'ops' });
+  assert.equal(res.status, 200);
+  assert.deepEqual([res.body.effective.mode, res.body.warnings], ['custom', []]);
+  assert.deepEqual(store.pages.get('pages/demo').page, { mode: 'custom', html: PAGE_HTML });
+});
+
 test('POST /v1/workloads: the regional onboarding with wakeTimeoutSeconds 120 is refused as before G5', async () => {
   const { call, store } = api(regional);
   const res = await call('POST', '/v1/workloads', { ...INPUT, settings: { wakeTimeoutSeconds: 120 } });
@@ -537,6 +576,7 @@ test('any other route or method: a 404 in the same shape', async () => {
     ['POST', '/v1/workloads/demo'], ['PUT', '/v1/workloads/demo'], ['GET', '/v1/workloads/demo/nap'], ['POST', '/v1/workloads/demo/other'], ['POST', '/v1/workloads/demo/nap/x'],
     ['GET', '/v1/tasks'], ['GET', '/v1/check'], ['POST', '/v1/workloads/demo/schedule'], ['GET', '/v1/workloads/demo/pause'], ['PUT', '/v1/workloads/demo/pause'], ['GET', '/v1/workloads/demo/resume'],
     ['GET', '/v1/workloads/demo/settings'], ['POST', '/v1/workloads/demo/settings'], ['DELETE', '/v1/workloads/demo/settings'], ['POST', '/v1/settings'], ['DELETE', '/v1/settings'], ['GET', '/v1/settings/x'],
+    ['POST', '/v1/waiting-page'], ['PATCH', '/v1/waiting-page'], ['GET', '/v1/waiting-page/x'], ['POST', '/v1/workloads/demo/waiting-page'],
   ]) {
     const res = await call(method, path);
     assert.equal(res.status, 404, `${method} ${path}`);
@@ -722,4 +762,16 @@ test('fromEnvironment: without DMT_LOG_VIEW, no log is read and the count decide
   assert.deepEqual(JSON.parse(res.body).results, [{ workloadId: 'demo', state: STATES.AWAKE }]);
   assert.deepEqual(logBodies, []);
   assert.equal(seen.some((line) => line.includes('/global/backendServices/app')), false);
+});
+
+test('fromEnvironment: DMT_CUSTOM_PAGES=1 is the install\'s switch: a custom page is taken; without it, refused with the verbatim text', async () => {
+  const page = { mode: 'custom', html: PAGE_HTML };
+  for (const [env, status] of [[{ ...ENV, DMT_CUSTOM_PAGES: '1' }, 200], [ENV, 400], [{ ...ENV, DMT_CUSTOM_PAGES: 'true' }, 400]]) {
+    const { firestore, fetch } = idleWorld();
+    const handler = fromEnvironment(env, { fetch, log: silentLog });
+    const res = await handler(request('PUT', '/v1/waiting-page', JSON.stringify({ page, by: 'adm' })));
+    assert.equal(res.statusCode, status, res.body);
+    if (status === 400) assert.equal(JSON.parse(res.body).error, CUSTOM_REFUSED);
+    assert.equal(firestore.docs.has('router/page'), status === 200);
+  }
 });

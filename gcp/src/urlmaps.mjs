@@ -113,6 +113,39 @@ export function hostsOf(map, service) {
   return named && !hostRules.some((h) => (h.hosts ?? []).includes('*')) ? [...hosts, '*'] : hosts;
 }
 
+// How a route rule's match rule takes `/`: 'path' on the path alone, 'more' when it may with a header or query condition or a pattern
+// (which is not read here), false when it can't.
+const PATH_ONLY = new Set(['prefixMatch', 'fullPathMatch', 'ignoreCase']);
+function rootMatch(match) {
+  if (match.regexMatch !== undefined || match.pathTemplateMatch !== undefined) return 'more';
+  if (match.prefixMatch !== '/' && match.fullPathMatch !== '/') return false;
+  return Object.keys(match).every((key) => PATH_ONLY.has(key)) ? 'path' : 'more';
+}
+
+// The one service a matcher sends `/` to: a path rule for `/`, else for `/*`, else its default; with route rules, the first by priority
+// whose match takes `/`, else its default. Undefined when it sends to more than one, or by more than the path.
+function rootServiceOf(matcher) {
+  const pathRules = matcher.pathRules ?? [];
+  const byPath = pathRules.find((r) => r.paths?.includes('/')) ?? pathRules.find((r) => r.paths?.includes('/*'));
+  if (byPath) return soleService(byPath, 'service', 'routeAction');
+  for (const rule of [...(matcher.routeRules ?? [])].sort((a, b) => (a.priority ?? 0) - (b.priority ?? 0))) {
+    const takes = (rule.matchRules ?? []).map(rootMatch).filter(Boolean);
+    if (takes.length) return takes.includes('path') ? soleService(rule, 'service', 'routeAction') : undefined;
+  }
+  return soleService(matcher, 'defaultService', 'defaultRouteAction');
+}
+
+// The map's whole hosts sent to the service, as AWS's listener rules of a host and the path `/*` (lambda/src/lib/favicon.mjs's
+// hostOfRules reads them, for the favicon read at a nap): each host rule whose path matcher sends `/` to it alone. A host whose `/`
+// goes elsewhere, or depends on more than the path, is another application's maybe: reading `/` there could wake it. The map's own
+// default holds no host.
+export function listenerRulesOf(map, service) {
+  const matchers = new Map((map.pathMatchers ?? []).map((matcher) => [matcher.name, matcher]));
+  return (map.hostRules ?? [])
+    .filter(({ pathMatcher }) => matchers.has(pathMatcher) && nameOf(rootServiceOf(matchers.get(pathMatcher))) === service)
+    .map(({ hosts }) => ({ Conditions: [{ Field: 'host-header', Values: hosts ?? [] }, { Field: 'path-pattern', Values: ['/*'] }] }));
+}
+
 const isOurs = (policy, waker) => nameOf(policy?.errorService) === nameOf(waker);
 
 // Whether a matcher names the service: what the policy needs. The map's default gets one from withWakerRoute.

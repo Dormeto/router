@@ -2,7 +2,9 @@
 // schedule's read per request and the two lists per check were accepted rather than a "has a schedule" flag to keep in step:
 // these counts keep them from growing. The router level (`router/settings`) is read at most once a minute per waker instance (the
 // shared core's 60-second cache, which the configuration's fixed values read too): each count below is a new instance's first
-// request, so it holds that read; the next requests of the minute don't. A commit is no read; a run's transition reads the run first.
+// request, so it holds that read; the next requests of the minute don't. So are the waiting page's levels and the favicon (the router's
+// page, the workload's, and its favicon while its icon is auto: waiting-pages.mjs's cache), read for a page only, never for a probe.
+// A commit is no read; a run's transition reads the run first.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { STATES } from '../../lambda/src/lib/state.mjs';
@@ -49,11 +51,11 @@ const AWAKE = { state: STATES.AWAKE, awakeSince: 1 };
 const BACKED_OFF = (clock) => ({ state: STATES.FAILED, failedAt: clock.now(), consecutiveFailures: 1, failure: JSON.stringify({ kind: 'capacity' }) });
 
 for (const [name, run, send, count] of [
-  ['the page\'s fetch, ASLEEP', ASLEEP, pageFetch, 4],
-  ['the page\'s fetch, NAPPING', NAPPING, pageFetch, 4],
-  ['the page\'s fetch, FAILED', BACKED_OFF, pageFetch, 4],
-  ['the page\'s fetch, WAKING', WAKING, pageFetch, 3],
-  ['the page\'s fetch, AWAKE', AWAKE, pageFetch, 3],
+  ['the page\'s fetch, ASLEEP', ASLEEP, pageFetch, 7],
+  ['the page\'s fetch, NAPPING', NAPPING, pageFetch, 7],
+  ['the page\'s fetch, FAILED', BACKED_OFF, pageFetch, 7],
+  ['the page\'s fetch, WAKING', WAKING, pageFetch, 6],
+  ['the page\'s fetch, AWAKE', AWAKE, pageFetch, 6],
   ['a probe that wakes', ASLEEP, probe, 5],
   ['a backed-off probe', BACKED_OFF, probe, 4],
   ['a probe, NAPPING', NAPPING, probe, 5],
@@ -88,6 +90,22 @@ test('the router level is read once a minute per instance, whatever the requests
   clock.advance(2_000);
   await handler(probe());
   assert.equal(routerReads(firestore), 2);
+});
+
+const pageReads = (firestore) => firestore.calls.filter((c) => c.method === 'GET' && /\/(router\/page|pages\/demo|favicons\/demo)$/.test(c.url)).length;
+
+test('the waiting page\'s levels and favicon are read once a minute per instance, for a page only', async () => {
+  const clock = fakeClock();
+  const { firestore, store } = firestoreWith(ASLEEP);
+  const handler = createCloudRunWaker({ store, tasks: { enqueue: async () => {} }, controllerUrl: CONTROLLER, now: clock.now, log: silentLog });
+  await handler(probe());
+  assert.equal(pageReads(firestore), 0);
+  await handler(pageFetch());
+  await handler(pageFetch());
+  assert.equal(pageReads(firestore), 3);
+  clock.advance(61_000);
+  await handler(pageFetch());
+  assert.equal(pageReads(firestore), 6);
 });
 
 const scheduleReads = (firestore) => firestore.calls.filter((c) => c.method === 'GET' && c.url.includes('/schedules/')).length;

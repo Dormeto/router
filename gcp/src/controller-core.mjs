@@ -15,7 +15,8 @@
 // docs/specs/2026-11-08-google-cloud-router-features-design.md, section 4.5), as AWS's `effective()`: the idle window and the wake's
 // timeout from the workload, its type, the router level (`router/settings`) and the built-in values, with what Google Cloud fixes;
 // whether a nap suspends from the workload, its `fallbackInstanceTypes`, then the router level. The stored configuration stays what
-// the writes read. `failedRetrySeconds` is the waker's backoff (failures.mjs), not read here.
+// the writes read. `failedRetrySeconds` is the waker's backoff (failures.mjs), not read here. A router level this instance never
+// read is unreadable, as on AWS: no idle nap or release decision, the longest wake timeout, and a plain stop.
 //
 // A `cloudsql` backend is a companion (cloudsql.mjs): the VMs and groups, the primaries, alone decide the state and serve; it goes
 // after them and comes back before them, as on AWS. One deleted without an offboarding is the customer's own state: a nap does not go
@@ -55,7 +56,7 @@ import {
 } from './gke.mjs';
 import { OPERATION_NOT_DONE } from './google.mjs';
 import { resendStale, startHeartbeat, staleness } from './heartbeat.mjs';
-import { effectiveOf } from './levels.mjs';
+import { effectiveOf, WAKE_TIMEOUT_MAX } from './levels.mjs';
 import { inOneUpdate, switchOf } from './switch.mjs';
 import { mapBusy, references, UrlMapRefused } from './urlmaps.mjs';
 
@@ -206,17 +207,29 @@ export function createController({
     return cfg;
   }
 
-  // The router level (`router/settings`): read once by a check for all its workloads, once by a wake, a nap or a release. A read
-  // that fails is said, and keeps the last record this instance read, else none: the built-in values. Never a failed check or wake.
-  let lastRouterLevel = null;
+  // The router level (`router/settings`): `{ router, unreadable? }`, read once by a check for all its workloads, once by a wake, a
+  // nap or a release. A read that fails is said, and keeps the last record this instance read; never read, the level is unreadable
+  // (AWS's `readLevels`): the built-in values could act against the router's, an idle window shorter than its own, a suspend
+  // against its "off", a wake failed before its timeout. Never a failed check or wake.
+  let lastRouterLevel;
   async function routerLevel() {
     try {
       lastRouterLevel = (await store.getRouterSettings?.()) ?? null;
     } catch (err) {
-      log.warn('RouterSettingsUnread', { error: err.message });
+      log.warn('RouterSettingsUnread', { level: 'router', error: err.message });
+      if (lastRouterLevel === undefined) return { router: null, unreadable: true };
     }
-    return lastRouterLevel;
+    return { router: lastRouterLevel };
   }
+
+  // The configuration a check, a wake, a nap or a release acts on: the stored one resolved through the levels (levels.mjs), marked
+  // when its router level is unreadable.
+  const effective = (stored, run, { router, unreadable }) => {
+    const cfg = effectiveOf(stored, { run, router });
+    return unreadable ? { ...cfg, levelsUnreadable: true } : cfg;
+  };
+  // The longest a wake may take when its levels are unreadable: the longest Google Cloud allows.
+  const wakeTimeoutS = (cfg) => (cfg.levelsUnreadable ? WAKE_TIMEOUT_MAX : cfg.wakeTimeoutSeconds);
 
   // --- The URL map ---------------------------------------------------------------------------------------------------
 
@@ -464,8 +477,9 @@ export function createController({
   async function putToSleep(cfg, { autoscalers, owners, router }, latest, stillGoing) {
     const deadline = Math.min(now() + STOP_TIMEOUT_MS, latest);
     await each(autoscalers, (recorded) => setAutoscaler(recorded, 'OFF'));
-    // The workload's own, else none with fallback machine types (the type a VM wakes on may not suspend), else the router's.
-    const { hibernate } = resolveHibernation({ workload: cfg.hibernate, fallbackTypes: cfg.fallbackInstanceTypes, router: router?.hibernate });
+    // The workload's own, else none with fallback machine types (the type a VM wakes on may not suspend), else the router's. Its
+    // level unreadable, a plain stop, as on AWS: the built-in true could suspend against the router's "off".
+    const hibernate = !cfg.levelsUnreadable && resolveHibernation({ workload: cfg.hibernate, fallbackTypes: cfg.fallbackInstanceTypes, router: router?.hibernate }).hibernate;
     const done = await each(primariesOf(cfg), (backend) => sleepBackend(backend, hibernate, deadline, owners));
     for (;;) {
       const up = (await allVms(cfg)).filter((vm) => !GONE.has(vm.status));
@@ -521,14 +535,14 @@ export function createController({
       run = await store.getRun(workloadId);
       // A delayed or duplicated task must not touch anything once its wake is no longer the current one.
       if (run?.state !== STATES.WAKING || run.wakeId !== wakeId) return superseded();
-      const [stored, router] = await Promise.all([getConfig(workloadId), routerLevel()]);
-      cfg = effectiveOf(stored, { run, router });
+      const [stored, levels] = await Promise.all([getConfig(workloadId), routerLevel()]);
+      cfg = effective(stored, run, levels);
       sw = switchFor(cfg);
     } catch (err) {
       return fail(err);
     }
     const since = run.wakeStartedAt ?? started;
-    const deadline = Math.min(since + cfg.wakeTimeoutSeconds * 1000, started + WAKE_BUDGET_MS);
+    const deadline = Math.min(since + wakeTimeoutS(cfg) * 1000, started + WAKE_BUDGET_MS);
     const isCurrent = async () => {
       const current = await store.getRun(workloadId);
       return current?.state === STATES.WAKING && current.wakeId === wakeId;
@@ -768,8 +782,9 @@ export function createController({
   async function nap(workloadId, { cause = 'idle', requestedAt, until } = {}) {
     const started = now();
     const latest = started + NAP_BUDGET_MS;
-    const [stored, router] = await Promise.all([getConfig(workloadId), routerLevel()]);
-    const cfg = effectiveOf(stored, { router });
+    const [stored, levels] = await Promise.all([getConfig(workloadId), routerLevel()]);
+    const { router } = levels;
+    const cfg = effective(stored, null, levels);
     const sw = switchFor(cfg);
     const refusal = await napRefusal(workloadId, requestedAt, until);
     if (refusal) {
@@ -911,8 +926,9 @@ export function createController({
     let run = await store.getRun(workloadId);
     if (run?.state !== STATES.FAILED) return { state: 'SKIPPED', reason: run?.state ?? 'unknown' };
     if (await isPaused(workloadId)) return { state: 'SKIPPED', reason: 'paused' };
-    const [stored, router] = await Promise.all([getConfig(workloadId), routerLevel()]);
-    const cfg = effectiveOf(stored, { run, router });
+    const [stored, levels] = await Promise.all([getConfig(workloadId), routerLevel()]);
+    const { router } = levels;
+    const cfg = effective(stored, run, levels);
     try {
       const { paths } = await writeOnlyAsleep(cfg);
       if (paths.length) {
@@ -1242,7 +1258,7 @@ export function createController({
     const { workloadId } = stored;
     let run = await store.getRun(workloadId);
     if (!run) return { state: 'UNKNOWN' };
-    const cfg = effectiveOf(stored, { run, router: ctx.router });
+    const cfg = effective(stored, run, ctx.levels);
     if (run.state === STATES.NAPPING) {
       // A nap whose request no longer beats is stuck now (heartbeat.mjs). Its deadline stays, the last resort: for a nap from before
       // the heartbeat, or one that still beats past it.
@@ -1263,18 +1279,20 @@ export function createController({
       // resort, sent again or not.
       const sw = switchFor(cfg);
       const grace = WAKING_STUCK_GRACE_MS + (sw.kind === 'swap' ? sw.waitMs : 0);
-      if ((run.wakeStartedAt ?? 0) >= now() - cfg.wakeTimeoutSeconds * 1000 - grace) {
+      if ((run.wakeStartedAt ?? 0) >= now() - wakeTimeoutS(cfg) * 1000 - grace) {
         const resent = await resendStale({ store, enqueue, now, log }, workloadId, run, 'check');
         return { state: run.state, ...(resent ? { wake: 'resent' } : {}) };
       }
       log.warn('WakeStuck', { workloadId, wakeId: run.wakeId });
-      const message = `the wake did not finish within ${cfg.wakeTimeoutSeconds} s (its request stopped)`;
+      const message = `the wake did not finish within ${wakeTimeoutS(cfg)} s (its request stopped)`;
       return { state: (await failStuck(workloadId, { state: STATES.WAKING, wakeId: run.wakeId }, 'wake', message, 'wake-stuck'))?.state };
     }
     // The nap this check just asked for may have started since the run was read: a repair on that read would remove its policy.
     if (ctx.applied.get(workloadId) === 'nap') return { state: run.state };
     run = await reconcile(cfg, run, deadline);
     await companionsFollow(cfg, run);
+    // Its router level unreadable (never read here): no decision on an idle window it may not have, as on AWS.
+    if (cfg.levelsUnreadable) return { state: run?.state ?? 'UNKNOWN', settings: 'unreadable' };
     const t = now();
     const idleMs = cfg.idleMinutes * 60_000;
     // Still paying for backends that run without a healthy instance: released once its idle window has passed; a paused one
@@ -1333,13 +1351,13 @@ export function createController({
     const pauses = await activePauses();
     const paused = (workloadId) => pauses === null || pauses.some((p) => p.workloadId === workloadId);
     const keptAsleep = (workloadId) => pauses === null || pauses.some((p) => p.keepAsleep && p.workloadId === workloadId);
-    const [{ configs, schedules }, router] = await Promise.all([store.listWorkloads(), routerLevel()]);
+    const [{ configs, schedules }, levels] = await Promise.all([store.listWorkloads(), routerLevel()]);
     const order = [...configs].sort((a, b) => a.workloadId.localeCompare(b.workloadId));
     // A workload holds one nap in flight at most: with no more workloads than NAPS_MAX, their runs are not read for it.
     const flight = { naps: order.length > NAPS_MAX ? await napsInFlight(order) : 0, deferred: 0 };
     const { applied, readable } = await applySchedules(order, schedules, (id) => ({ paused: paused(id), keepAsleep: keptAsleep(id) }), now(), deadline, flight);
     await requestListRefresh();
-    const ctx = { schedules: readable, applied, flight, router };
+    const ctx = { schedules: readable, applied, flight, levels };
     const passed = (workloadId) => (applied.has(workloadId) ? { schedule: applied.get(workloadId) } : {});
     const results = [];
     let next = 0;

@@ -5,7 +5,7 @@ import { SWAP_WAIT_MS } from './switch.mjs';
 
 // What Google Cloud fixes whatever the level says; the swap's wait + 60 s is the wake's floor behind a swap.
 const FIXED_ZERO = ['waitSeconds', 'maxHolders', 'drainSeconds'];
-const WAKE_TIMEOUT_MAX = 1700;
+export const WAKE_TIMEOUT_MAX = 1700;
 const SWAP_WAKE_ROOM_SECONDS = 60;
 // The workload's backends' kinds, by the names AWS gives its types.
 const TYPE_NAMES = { vm: 'instance', mig: 'asg', k8s: 'k8s', cloudsql: 'databases' };

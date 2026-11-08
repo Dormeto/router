@@ -2400,13 +2400,49 @@ test('a workload with fallback machine types: the nap stops, whatever the router
   assert.deepEqual(own.world.calls, ['map policy', 'wait 300 s', 'suspend vm-a']);
 });
 
-test('a router level that cannot be read: the check goes on with the built-in values, said, and no CheckFailed', async () => {
-  const t = setup({ run: AWAKE_LONG, cfg: { inherits: ['idleMinutes'] }, vms: RUNNING_VM });
+// A router level this instance never read (AWS's rule): nothing falls back to the built-in values, which could act against the
+// router's (an idle window shorter than its own, a suspend against its "off", a wake failed before its timeout).
+const neverRead = (options) => {
+  const t = setup(options);
   t.store.getRouterSettings = async () => { throw unreadable(); };
-  assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.AWAKE, nap: 'requested' }]);
-  assert.deepEqual(t.world.metricReads, [{ backendService: 'app', from: START - 15 * MINUTE - 210_000, to: START }]);
-  assert.deepEqual(t.logged('CheckFailed'), []);
-  assert.deepEqual(t.logged('RouterSettingsUnread').map((l) => l.error), ['Google: GET: 503 unavailable']);
+  return t;
+};
+
+test('a router level never read on this instance: the check asks no idle nap and no release, says so, and no CheckFailed; the reconcile still runs', async () => {
+  const idle = neverRead({ run: AWAKE_LONG, vms: RUNNING_VM });
+  assert.deepEqual(await idle.controller.check(), [{ workloadId: 'demo', state: STATES.AWAKE, settings: 'unreadable' }]);
+  assert.deepEqual(idle.world.tasks, []);
+  assert.deepEqual(idle.world.metricReads, []);
+  assert.deepEqual(idle.logged('CheckFailed'), []);
+  assert.deepEqual(idle.logged('RouterSettingsUnread').map(({ level, error }) => ({ level, error })), [{ level: 'router', error: 'Google: GET: 503 unavailable' }]);
+  const failed = neverRead({ run: FAILED_RUN(START - 60 * MINUTE), vms: RUNNING_VM, map: asleepMap(), unhealthyPolls: Infinity });
+  assert.deepEqual(await failed.controller.check(), [{ workloadId: 'demo', state: STATES.FAILED, settings: 'unreadable' }]);
+  assert.deepEqual(failed.world.tasks, []);
+  assert.deepEqual(failed.logged('CheckFailed'), []);
+  const stopped = neverRead({ run: AWAKE_LONG, vms: { 'vm-a': { status: 'TERMINATED' } } });
+  assert.deepEqual(await stopped.controller.check(), [{ workloadId: 'demo', state: STATES.ASLEEP, settings: 'unreadable' }]);
+  assert.equal(stopped.logged('ExternalStop').length, 1);
+});
+
+test('a router level never read on this instance: a wake waits the longest timeout Google Cloud allows, 1700 s, and the check calls it stuck only past it', async () => {
+  const wake = neverRead({ run: waking(START), vms: { 'vm-a': { status: 'TERMINATED' } }, unhealthyPolls: Infinity });
+  assert.equal((await wake.controller.wake('demo', 'w1')).state, STATES.FAILED);
+  assert.equal(wake.clock.now() - START, 1_700_000);
+  const within = neverRead({ run: waking(START - 1_760_000, { beatAt: START - 30_000 }), vms: { 'vm-a': { status: 'TERMINATED' } }, map: asleepMap() });
+  assert.deepEqual(await within.controller.check(), [{ workloadId: 'demo', state: STATES.WAKING }]);
+  const stuck = neverRead({ run: waking(START - 1_760_001, { beatAt: START - 30_000 }), vms: { 'vm-a': { status: 'TERMINATED' } }, map: asleepMap() });
+  assert.equal((await stuck.controller.check())[0].state, STATES.FAILED);
+  assert.equal(JSON.parse(stuck.run().failure).message, 'the wake did not finish within 1700 s (its request stopped)');
+});
+
+test('a router level never read on this instance: the nap and the release stop the VMs plainly, never suspend', async () => {
+  const nap = neverRead({ vms: RUNNING_VM });
+  assert.equal((await nap.controller.nap('demo')).state, STATES.ASLEEP);
+  assert.deepEqual(nap.world.calls, ['map policy', 'wait 300 s', 'stop vm-a']);
+  assert.deepEqual(nap.run().suspended, []);
+  const release = neverRead({ run: FAILED_RUN(START - 15 * MINUTE), vms: RUNNING_VM, map: asleepMap() });
+  assert.deepEqual(await release.controller.release('demo'), { state: STATES.ASLEEP });
+  assert.deepEqual(release.world.calls, ['stop vm-a']);
 });
 
 test('a router level that cannot be read keeps the last one this instance read: for the next check, a wake and a nap', async () => {
@@ -2497,6 +2533,14 @@ test('a nap window naps once, whatever the traffic: its task says its cause and 
   t.clock.advance(FIVE_MINUTES);
   assert.equal((await check(t)).schedule, undefined);
   assert.equal(t.world.tasks.length, 1);
+});
+
+test('a router level never read on this instance: a nap window still asks its nap, as on AWS (the window is no setting of the levels)', async () => {
+  const t = scheduled(scheduleOf(NAP));
+  t.store.getRouterSettings = async () => { throw unreadable(); };
+  assert.equal((await check(t)).schedule, 'nap');
+  assert.deepEqual(t.world.tasks, [napTask]);
+  assert.deepEqual(t.logged('CheckFailed'), []);
 });
 
 test('an idle workload in its nap window gets the scheduled nap only, not an idle one too', async () => {

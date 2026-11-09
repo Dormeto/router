@@ -663,7 +663,7 @@ answered with what is wrong.
 
 - **A scheduled nap's occurrence is spent once its task is accepted.** A pause, a refused nap or a lost task costs that
   window's nap: it does not come back when the pause ends. The idle check still naps the workload by its idle window.
-- **A pause is a workload's or the router's:** `dormeto gcp routers pause` pauses every workload of the router.
+- **A pause is a workload's or the router's:** `dormeto gcp routers pause` pauses every workload of the router. The manager's exclusions don't reach Google Cloud routers yet.
 - **Many workloads of one regional URL map in one nap window:** see [the swap's limits](#limits-of-the-swap). Ten on one
   map all napped in the acceptance of 2026-11-08.
 

@@ -656,3 +656,12 @@ test('the manager page\'s numbers are the code\'s: the journal\'s 7 days, 1 to 5
   assert.match(page, /\bETag\b.*1 to 256 characters/);
   assert.match(ACTIONS_SRC, /const ETAG_MAX = 256;/);
 });
+
+test('the manager page says what a pause and a request-nap do, from the code, and the Compute Engine page keeps the exclusions limit', () => {
+  const page = flat(read(MANAGER));
+  assert.match(ACTIONS_SRC, /return \{ requested: false, reason: pauseText\(first\) \};/);
+  assert.match(page, /is not a refusal: it answers \{ "requested": false, "reason" \} with the pause's words/);
+  assert.match(page, /a pause carries by too, and writes no event/);
+  assert.match(page, /plus pauses that cannot be read/);
+  assert.match(flat(read(CE)), /The manager's exclusions don't reach Google Cloud routers yet\./);
+});

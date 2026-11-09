@@ -16,8 +16,8 @@ documented in the CLI's README, not here.
   Events are kept 7 days: the daily sweep that removes the old counters removes them too.
 - **The check summary**, `router/check`: replaced whole at each check (every 5 minutes, `checkSchedule` is
   `*/5 * * * *`) with the time of the check and how long it took, the time of the last check the schedule started, the
-  router's health (the same problems AWS's health names, with the Google Cloud ones: a manager settings document that
-  cannot be read, pauses that cannot be read), the active pauses and the count of workloads by state. A summary that
+  router's health (the same problems as AWS's health that apply here, such as a manager settings document that cannot be
+  read, plus pauses that cannot be read), the active pauses and the count of workloads by state. A summary that
   cannot be written fails nothing: the check's work is done.
 - **The organization's level**, `router/manager`: the manager's whole `settings.json` as it pushed it, with its ETag and
   the time it was stored. Without a push, the organization level reads as unset.
@@ -39,8 +39,8 @@ service: the manager calls it with an ID token of its command service account, w
 - **Refusals.** With `"refusals": true`, a refusal is a 200 `{ "refused": { "code", "message" } }` with AWS's codes,
   `invalid`, `not_found` and `conflict`; without it, the REST routes' status and `{ "error", "reason" }`. The problems
   AWS answers as `{ "problems": […] }` (a settings write, a waiting page, a schedule) are answers either way.
-- **The manager's own actions say who asked**: a wake, a nap or a pause from the manager carries `by`, and its events
-  the cause `manager`.
+- **The manager's own actions say who asked**: a wake or a nap from the manager carries `by`, and its events the cause
+  `manager`; a pause carries `by` too, and writes no event.
 
 ### `events`
 
@@ -70,7 +70,7 @@ view of `status` as the manager's level.
 The `pause` action without a `workloadId` pauses the whole router, and `resume` without one lifts it; the pause is
 kept in `router/pause`, and shows in `list` (`router.pauses`) and in the workloads' own pauses with the scope
 `router`. It is the same pause `dormeto gcp routers pause` sets (`--reason`, `--for`, `--until`, `--keep-asleep`).
-A `request-nap` for a workload a pause holds is refused with the pause's words, as on AWS.
+A `request-nap` for a workload a pause holds is not a refusal: it answers `{ "requested": false, "reason" }` with the pause's words, as on AWS.
 
 ## Names and tags
 

@@ -557,7 +557,7 @@
     ],
     "federation": {
       "pool": "dmt-{env}",
-      "provider": "aws",
+      "provider": "aws-{account}",
       "condition": "assertion.arn.startsWith('arn:aws:sts::{account}:assumed-role/dmt-{env}-manager-')",
       "mapping": {
         "google.subject": "assertion.arn",

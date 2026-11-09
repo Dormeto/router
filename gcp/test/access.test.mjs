@@ -367,11 +367,19 @@ test('manager: the federation and the two accounts, as design 4.1 names them', a
   const { manager } = await load();
   assert.deepEqual(manager.federation, {
     pool: 'dmt-{env}',
-    provider: 'aws',
+    provider: 'aws-{account}',
     condition: "assertion.arn.startsWith('arn:aws:sts::{account}:assumed-role/dmt-{env}-manager-')",
     mapping: { 'google.subject': 'assertion.arn', 'attribute.aws_role': "assertion.arn.extract('assumed-role/{role}/')" },
   });
   assert.deepEqual(manager.serviceAccounts, { discovery: 'dmt-{env}-discovery', command: 'dmt-{env}-command' });
+});
+
+test('manager: the provider ID, filled for a 12-digit account, matches Google\'s rule and does not start with gcp-', async () => {
+  const { manager } = await load();
+  const id = manager.federation.provider.replaceAll('{account}', '121014831971');
+  assert.equal(id, 'aws-121014831971');
+  assert.match(id, /^[a-z0-9-]{4,32}$/);
+  assert.ok(!id.startsWith('gcp-'));
 });
 
 test('manager: dormetoDiscovery holds only get, list and monitoring.timeSeries.list', async () => {

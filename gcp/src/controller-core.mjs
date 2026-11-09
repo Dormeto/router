@@ -121,7 +121,7 @@ const NAPPING_SWAP_STUCK_MS = 22 * 60_000;
 const CHECK_BUDGET_MS = 240_000;
 const CHECK_CONCURRENCY = 8;
 // The Cloud Scheduler job's schedule (the CLI's install); the check late after three of its periods.
-const CHECK_SCHEDULE = '*/5 * * * *';
+export const CHECK_SCHEDULE = '*/5 * * * *';
 // Where a configuration value comes from, as AWS's `terraform`: the CLI's install.
 const CLI = 'cli';
 const SUSPEND_MAX_MEMORY_MB = 208 * 1024;
@@ -232,10 +232,10 @@ export function createController({
     const tags = change.set?.state ? tagsOf.get(workloadId) : undefined;
     const next = await store.transition(workloadId, tags ? { ...change, event: { ...change.event, tags } } : change);
     if (next && change.set?.state) {
-      const { cond, set, cause, event } = change;
-      // The journal's event is the store's (committed with the run); the line says the same: when, and which router.
+      const { cond, set, cause, by, event } = change;
+      // The journal's event is the store's (committed with the run); the line says the same: when, which router, and who asked.
       log.info('StateChanged', {
-        workloadId, from: cond.state, to: set.state, ...(cause ? { cause } : {}), ...event,
+        workloadId, from: cond.state, to: set.state, ...(cause ? { cause } : {}), ...(by ? { by } : {}), ...event,
         at: new Date(next.stateAt ?? now()).toISOString(), router: `dmtr-${config.region}`, region: config.region, project: config.project,
       });
     }
@@ -780,8 +780,9 @@ export function createController({
     }
   }
 
-  // The run to WAKING for a wake asked here, not by a request (the waker's). Null when its state changed meanwhile.
-  async function beginWake(workloadId, from, cause) {
+  // The run to WAKING for a wake asked here, not by a request (the waker's). Null when its state changed meanwhile. `by`: who asked
+  // (the manager's actions, a pause), in its event as AWS's.
+  async function beginWake(workloadId, from, cause, by) {
     const wakeId = newId();
     const waking = await transition(workloadId, {
       cond: { state: from },
@@ -789,9 +790,10 @@ export function createController({
       remove: ['failedAt'],
       increment: ['wakeCount'],
       cause,
+      ...(by ? { by } : {}),
     });
     if (!waking) return null;
-    log.info('WakeRequested', { workloadId, wakeId, reason: cause });
+    log.info('WakeRequested', { workloadId, wakeId, reason: cause, ...(by ? { by } : {}) });
     return wakeId;
   }
 
@@ -805,9 +807,9 @@ export function createController({
   }
 
   // A napping workload's wake is kept for the nap's end. True when this call kept it: one log line and one counted wake.
-  async function pendingWake(workloadId, kind) {
+  async function pendingWake(workloadId, kind, by) {
     if (!(await store.setPendingWake(workloadId))) return false;
-    log.info('PendingWake', { workloadId, reason: kind });
+    log.info('PendingWake', { workloadId, reason: kind, ...(by ? { by } : {}) });
     await count(workloadId, `wake:${kind}`);
     return true;
   }
@@ -815,8 +817,8 @@ export function createController({
   // The wake of an asleep or failed workload from the run read, in a request of its own. True when its task was accepted;
   // false when the state changed since, or when the task cannot be enqueued, which fails the wake now rather than at the
   // check.
-  async function startWake(workloadId, run, kind) {
-    const wakeId = await beginWake(workloadId, run.state, kind);
+  async function startWake(workloadId, run, kind, by) {
+    const wakeId = await beginWake(workloadId, run.state, kind, by);
     if (!wakeId) return false;
     await count(workloadId, `wake:${kind}`);
     try {
@@ -837,11 +839,12 @@ export function createController({
     }
   }
 
-  // The wake of an operator or a pause, whatever the backoff; this request answers at once.
-  async function wakeNow(workloadId, kind = 'operator') {
+  // The wake of an operator, the manager's (`kind` 'manager', `by` who asked) or a pause, whatever the backoff; this request answers
+  // at once.
+  async function wakeNow(workloadId, kind = 'operator', by) {
     const run = await store.getRun(workloadId);
-    if (run?.state === STATES.NAPPING) await pendingWake(workloadId, kind);
-    else if ([STATES.ASLEEP, STATES.FAILED].includes(run?.state)) await startWake(workloadId, run, kind);
+    if (run?.state === STATES.NAPPING) await pendingWake(workloadId, kind, by);
+    else if ([STATES.ASLEEP, STATES.FAILED].includes(run?.state)) await startWake(workloadId, run, kind, by);
   }
 
   // --- The nap -------------------------------------------------------------------------------------------------------
@@ -954,7 +957,8 @@ export function createController({
     return ((await store.getRun(workloadId))?.awakeSince ?? 0) > requestedAt ? 'woken since it was requested' : null;
   }
 
-  async function nap(workloadId, { cause = 'idle', requestedAt, until } = {}) {
+  // `by`: who asked (the manager's request-nap), in its NAPPING event as AWS's.
+  async function nap(workloadId, { cause = 'idle', requestedAt, until, by } = {}) {
     const started = now();
     const latest = started + NAP_BUDGET_MS;
     const [stored, levels] = await Promise.all([getConfig(workloadId), routerLevel()]);
@@ -970,7 +974,7 @@ export function createController({
     if (faviconReachable(cfg.lb)) await faviconAtNap(cfg, sw);
     // Its id: what its heartbeat holds the run by, from NAPPING to its end.
     const napId = newId();
-    const napping = await transition(workloadId, { cond: { state: STATES.AWAKE }, set: { state: STATES.NAPPING, napId }, remove: ['pendingWake'], cause });
+    const napping = await transition(workloadId, { cond: { state: STATES.AWAKE }, set: { state: STATES.NAPPING, napId }, remove: ['pendingWake'], cause, ...(by ? { by } : {}) });
     if (!napping) return { state: 'SKIPPED' };
     log.info('NapStarted', { workloadId });
     return beating(workloadId, 'napId', napId, () => napBeating(workloadId, { cfg, router, organization, sw, napping, cause, requestedAt, started, latest }));
@@ -1111,8 +1115,9 @@ export function createController({
     return { state: STATES.WAKING, wakeId };
   }
 
-  // The operator's nap, in a request of its own: it takes minutes. Asked for, not idle: it does not read the traffic again.
-  const napNow = (workloadId) => enqueue({ action: 'nap', workloadId, cause: 'operator', requestedAt: now() });
+  // The operator's nap, or the manager's (`cause` 'manager', `by` who asked), in a request of its own: it takes minutes. Asked for, not
+  // idle: it does not read the traffic again.
+  const napNow = (workloadId, { cause = 'operator', by } = {}) => enqueue({ action: 'nap', workloadId, cause, requestedAt: now(), ...(by ? { by } : {}) });
 
   // A failed workload whose backends run for nothing is stopped like a nap and left asleep behind the switch, its failure
   // kept (requests wake it again, backed off). The switch is there since its nap, unless the nap failed before writing it.
@@ -1381,7 +1386,7 @@ export function createController({
       for (const id of ids) {
         try {
           const state = (await store.getRun(id))?.state;
-          await wakeNow(id, 'pause');
+          await wakeNow(id, 'pause', record.by);
           if ([STATES.ASLEEP, STATES.FAILED, STATES.NAPPING].includes(state)) woken.push(id);
         } catch (err) {
           log.error('PauseWakeFailed', { workloadId: id, error: err.message });

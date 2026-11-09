@@ -948,20 +948,27 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     return scheduleView(id, await store.getSchedule(id));
   }
 
-  // The body is the schedule, as on AWS; `by` says who sets it.
+  // The body is the schedule, as on AWS; `by` says who sets it. A refusal names every problem, as AWS's schedule action answers them.
   async function setSchedule(id, schedule) {
     await find(id);
     const problems = scheduleProblems(schedule, { now: now() });
-    if (problems.length) throw bad(problems.join('; '));
+    if (problems.length) throw refusedSettings(problems);
     const stored = { ...normalizeSchedule(schedule), by: schedule.by ?? 'unknown', at: now() };
     await store.putSchedule(id, stored);
     log.info('Scheduled', { workloadId: id, by: stored.by });
     return scheduleView(id, stored);
   }
 
-  async function clearSchedule(id) {
+  // AWS's clear-schedule answer, `{ cleared }`: whether there was one. `by` says who clears it.
+  async function deleteSchedule(id, { by } = {}) {
     await find(id);
-    log.info('ScheduleCleared', { workloadId: id, cleared: await store.deleteSchedule(id) });
+    const cleared = await store.deleteSchedule(id);
+    log.info('ScheduleCleared', { workloadId: id, cleared, ...(by ? { by } : {}) });
+    return { cleared };
+  }
+
+  async function clearSchedule(id) {
+    await deleteSchedule(id);
     return scheduleView(id, null);
   }
 
@@ -1070,7 +1077,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   }
 
   return {
-    dryRun, onboard, offboard, find, setName, setTags, show, list, nap, wake, showSchedule, setSchedule, clearSchedule, pause, resume, pauseRouter, resumeRouter, setSettings, routerSettings, setRouterSettings,
-    waitingPage,
+    dryRun, onboard, offboard, find, setName, setTags, show, list, nap, wake, showSchedule, setSchedule, clearSchedule, deleteSchedule, pause, resume, pauseRouter, resumeRouter, setSettings,
+    routerSettings, setRouterSettings, waitingPage,
   };
 }

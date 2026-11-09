@@ -1,12 +1,14 @@
 // The controller on Cloud Run (vision docs/plans/2026-10-29-google-cloud.md, the controller API): the operator's calls, the
 // tasks of Cloud Tasks and the check job. Cloud Run's IAM checks the caller. Errors are `{ error, reason }`: what is wrong,
 // and a short reason for a program, with `problems` for refused settings (AWS's list); a failure is left to `serve`, which logs it
-// and answers a 500.
+// and answers a 500. The manager's calls are AWS's controller actions on one route, `POST /v1/actions` (actions.mjs), answered as
+// that module says.
 import { response } from '../../lambda/src/lib/http.mjs';
 import { logger } from '../../lambda/src/lib/log.mjs';
 import { parseLists } from '../../lambda/src/lib/list-cache.mjs';
 import { downloadText } from '../../lambda/src/lib/list-refresh.mjs';
 import PACKAGE from '../../package.json' with { type: 'json' };
+import { createActions } from './actions.mjs';
 import { createCloudSql } from './cloudsql.mjs';
 import { createCompute } from './compute.mjs';
 import { createController } from './controller-core.mjs';
@@ -21,6 +23,8 @@ import { createTasks } from './tasks.mjs';
 import { createUrlMaps } from './urlmaps.mjs';
 
 const WORKLOADS = '/v1/workloads';
+// The manager's: AWS's controller actions (G2 spec §5.1).
+const ACTIONS = '/v1/actions';
 // The router level of the settings (vision docs/specs/2026-11-08-google-cloud-router-features-design.md, section 4.5).
 const SETTINGS = '/v1/settings';
 // The router's waiting page, and a workload's under its verb (the design's section 5.2).
@@ -71,13 +75,15 @@ function forceOf(query) {
   return force === 'true';
 }
 
-export function createControllerApi({ core, onboarding, config }) {
+// `actions`: actions.mjs's `act`, the manager's route; none, the route is not there.
+export function createControllerApi({ core, onboarding, config, actions }) {
   const TASKS = {
     wake: ({ workloadId, wakeId }) => {
       if (typeof wakeId !== 'string' || !wakeId) throw bad('a wake task needs its wakeId');
       return core.wake(workloadId, wakeId);
     },
-    nap: ({ workloadId, cause, requestedAt, until }) => core.nap(workloadId, { cause, requestedAt, until }),
+    // `by`: who asked a nap of the manager's.
+    nap: ({ workloadId, cause, requestedAt, until, by }) => core.nap(workloadId, { cause, requestedAt, until, by }),
     release: ({ workloadId }) => core.release(workloadId),
     refreshLists: ({ names }) => {
       if (!Array.isArray(names) || names.some((name) => typeof name !== 'string')) throw bad('a refreshLists task needs its names');
@@ -137,6 +143,11 @@ export function createControllerApi({ core, onboarding, config }) {
   return async function handler(request) {
     const { pathname, searchParams } = new URL(request.url, 'http://controller');
     try {
+      // An action answers its own status: AWS's answer, a refusal, or the REST error (actions.mjs).
+      if (pathname === ACTIONS && request.method === 'POST' && actions) {
+        const { status, body } = await actions(await bodyOf(request));
+        return json(status, body);
+      }
       const answer = await route(request, pathname, searchParams);
       if (answer === null) return json(404, { error: `no route for ${request.method} ${pathname}`, reason: 'not-found' });
       return json(200, answer);
@@ -158,6 +169,7 @@ export function fromEnvironment(env = process.env, { fetch, log = logger } = {})
     project, region: env.DMT_REGION, wakerNeg: env.DMT_WAKER_NEG, controllerUrl: env.DMT_CONTROLLER_URL, version: PACKAGE.version, build: env.DMT_BUILD ?? null,
   };
   const store = createFirestoreStore({ google, project, database: env.DMT_DATABASE, region: env.DMT_REGION, log });
+  const lists = parseLists(env.DMT_IP_LISTS, (error) => log.error('IpListsUnreadable', { error }));
   const compute = createCompute({ google, project });
   const cloudsql = createCloudSql({ google, project });
   const gke = createGke({ google, project, fetch });
@@ -174,14 +186,17 @@ export function fromEnvironment(env = process.env, { fetch, log = logger } = {})
     ...(env.DMT_LOG_VIEW ? { logs: createLogs({ google, view: env.DMT_LOG_VIEW, log }) } : {}),
     tasks: createTasks({ google, project, region: env.DMT_REGION, queue: env.DMT_QUEUE, serviceAccount: env.DMT_SERVICE_ACCOUNT }),
     config,
-    lists: parseLists(env.DMT_IP_LISTS, (error) => log.error('IpListsUnreadable', { error })),
+    lists,
     download: (url) => downloadText(url, { fetch }),
     sleep: (ms) => new Promise((resolve) => { setTimeout(resolve, ms); }),
     fetch,
     customPages,
     log,
   });
-  const handler = createControllerApi({ core, onboarding: createOnboarding({ store, compute, cloudsql, gke, urlmaps, regionalUrlmaps, core, config, customPages, log }), config });
+  const onboarding = createOnboarding({ store, compute, cloudsql, gke, urlmaps, regionalUrlmaps, core, config, customPages, log });
+  const router = { name: `dmtr-${config.region}`, version: config.version, build: config.build };
+  const actions = createActions({ controller: core, onboarding, store, router, lists, log });
+  const handler = createControllerApi({ core, onboarding, config, actions });
   // SIGTERM commits the buffered stats (server.mjs).
   handler.flush = () => store.flushStats();
   return handler;

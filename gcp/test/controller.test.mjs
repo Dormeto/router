@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { silentLog } from '../../lambda/test/fakes.mjs';
+import { createActions } from '../src/actions.mjs';
 import { createControllerApi, fromEnvironment } from '../src/controller.mjs';
 import { toFields } from '../src/firestore.mjs';
 import { GoogleError } from '../src/google.mjs';
@@ -21,10 +22,12 @@ const request = (method, url, body = '', headers = {}) => {
   return Object.assign(stream, { method, url, headers });
 };
 
-// The API over the world, as the CLI and Cloud Tasks call it.
+// The API over the world, as the CLI, Cloud Tasks and the manager (POST /v1/actions) call it.
 function api(change) {
   const world = setup(change);
-  const handler = createControllerApi({ core: world.core, onboarding: world.onboarding, config: world.config });
+  const router = { name: `dmtr-${world.config.region}`, version: null, build: null };
+  const actions = createActions({ controller: world.core, onboarding: world.onboarding, store: world.store, router, now: world.clock.now, log: world.log });
+  const handler = createControllerApi({ core: world.core, onboarding: world.onboarding, config: world.config, actions });
   const call = async (method, path, body) => {
     const res = await handler(request(method, path, typeof body === 'object' ? JSON.stringify(body) : body));
     return { status: res.statusCode, body: JSON.parse(res.body), type: res.multiValueHeaders['content-type'][0], cache: res.multiValueHeaders['cache-control'][0] };
@@ -653,9 +656,25 @@ test('POST /v1/workloads: the regional onboarding with wakeTimeoutSeconds 120 is
   assert.equal(store.configs.size, 0);
 });
 
+test('POST /v1/actions: the manager\'s action, its answer; a body that is no JSON object: 400 as any route\'s; none: no action', async () => {
+  const { call } = api();
+  await call('POST', '/v1/workloads', INPUT);
+  const res = await call('POST', '/v1/actions', { action: 'rename', workloadId: 'demo', name: 'Shop', by: 'ann', refusals: true });
+  assert.deepEqual([res.status, res.body, res.type, res.cache], [200, { workloadId: 'demo', name: 'Shop' }, 'application/json', 'no-store']);
+  for (const body of ['{', '[]', 'null', '"router"', '7']) {
+    const refused = await call('POST', '/v1/actions', body);
+    assert.equal(refused.status, 400, body);
+    assert.equal(refused.body.reason, 'bad-request', body);
+  }
+  assert.deepEqual((await call('POST', '/v1/actions', JSON.stringify({ action: 'rename', padding: 'x'.repeat(2_000_000) }))).status, 400);
+  const none = await call('POST', '/v1/actions');
+  assert.deepEqual([none.status, none.body], [400, { error: 'unknown-action', message: 'unknown action: undefined' }]);
+});
+
 test('any other route or method: a 404 in the same shape', async () => {
   const { call } = api();
   for (const [method, path] of [
+    ['GET', '/v1/actions'], ['PUT', '/v1/actions'], ['POST', '/v1/actions/router'],
     ['GET', '/'], ['GET', '/v1'], ['POST', '/v1/health'], ['PUT', '/v1/workloads'], ['DELETE', '/v1/workloads'],
     ['POST', '/v1/workloads/demo'], ['PUT', '/v1/workloads/demo'], ['GET', '/v1/workloads/demo/nap'], ['POST', '/v1/workloads/demo/other'], ['POST', '/v1/workloads/demo/nap/x'],
     ['GET', '/v1/tasks'], ['GET', '/v1/check'], ['POST', '/v1/workloads/demo/schedule'], ['GET', '/v1/workloads/demo/pause'], ['PUT', '/v1/workloads/demo/pause'], ['GET', '/v1/workloads/demo/resume'],
@@ -858,4 +877,23 @@ test('fromEnvironment: DMT_CUSTOM_PAGES=1 is the install\'s switch: a custom pag
     if (status === 400) assert.equal(JSON.parse(res.body).error, CUSTOM_REFUSED);
     assert.equal(firestore.docs.has('router/page'), status === 200);
   }
+});
+
+test('fromEnvironment: POST /v1/actions over the router\'s Firestore: manager-settings stored in router/manager, then events and router read it', async () => {
+  const { firestore, fetch } = idleWorld();
+  const handler = fromEnvironment({ ...ENV, DMT_BUILD: 'b7' }, { fetch, log: silentLog });
+  const act = async (payload) => {
+    const res = await handler(request('POST', '/v1/actions', JSON.stringify({ ...payload, refusals: true })));
+    assert.equal(res.statusCode, 200, res.body);
+    return JSON.parse(res.body);
+  };
+  const settings = { workloads: { hibernate: false, joinMinutes: 10 } };
+  assert.deepEqual(await act({ action: 'manager-settings', settings, etag: '"e1"' }), { etag: '"e1"' });
+  assert.ok(firestore.docs.has('router/manager'));
+  assert.deepEqual(await act({ action: 'events', after: null, limit: 10 }), { events: [], next: null, check: null, managerSettings: { etag: '"e1"' } });
+  const { router, managerSettings } = await act({ action: 'router' });
+  assert.deepEqual(router, { name: `dmtr-${REGION}`, version: PACKAGE.version, build: 'b7' });
+  assert.deepEqual([managerSettings.hibernate, managerSettings.joinMinutes, managerSettings.error], [false, 10, null]);
+  const listed = await act({ action: 'list' });
+  assert.deepEqual([listed.router.name, listed.router.version, listed.router.build, listed.workloads.map((w) => w.workloadId)], [`dmtr-${REGION}`, PACKAGE.version, 'b7', ['demo']]);
 });

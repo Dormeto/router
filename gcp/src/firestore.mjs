@@ -3,11 +3,13 @@
 // machine), `schedules/<id>`, `pauses/<id>` (a workload's pause), `stats/<id>-<day>` (the day's counters, committed in
 // batches, kept 35 days), `router/sweep` (the day of the last sweep of the old counters), `router/settings` (the router level of the settings:
 // hibernate, joinMinutes, defaults, by, at), `router/page` (the router's waiting page) and, per workload, `pages/<id>` (its
-// waiting page) and `favicons/<id>` (the favicon read while it was awake); and the IP lists:
+// waiting page) and `favicons/<id>` (the favicon read while it was awake); `events/<stateAt, 13 digits>-<id>-<to>` (the journal: a
+// state change, committed with the run's, kept 7 days); and the IP lists:
 // `lists/<name>` (the meta) and `listParts/<name>-<version>-<index>` (the packed parts, 350 kB at most). A transition reads the run, checks its condition, and commits
 // with the document's `updateTime` as precondition: the conditional write of DynamoDB.
 import { STATES, matches, addStats, emptyStats, utcDay, DAY_MS } from '../../lambda/src/lib/state.mjs';
 import { beats, resendClaim } from './heartbeat.mjs';
+import { eventOf } from './rows.mjs';
 
 const BASE = 'https://firestore.googleapis.com/v1';
 // Reads again after a lost precondition (another writer changed the run between the read and the commit).
@@ -78,11 +80,12 @@ const pagePath = (level) => {
 const lostPrecondition = (err) => err?.status === 'FAILED_PRECONDITION' || err?.status === 'ABORTED';
 const isStatus = (status) => (err) => err?.status === status;
 
-export function createFirestoreStore({ google, project, database, now = Date.now, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), log = null, after = (ms, fn) => setTimeout(fn, ms).unref(), cancel = clearTimeout }) {
+export function createFirestoreStore({ google, project, database, region = database?.replace(/^dmtr-/, ''), now = Date.now, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), log = null, after = (ms, fn) => setTimeout(fn, ms).unref(), cancel = clearTimeout }) {
   const root = `projects/${project}/databases/${database}/documents`;
   const url = (path) => `${BASE}/${root}/${path}`;
   const commit = (writes) => google.request('POST', `${BASE}/${root}:commit`, { writes });
   const named = (path) => `${root}/${path}`;
+  const router = { name: `dmtr-${region}`, region, project };
   const partId = (name, version, index) => `listParts/${encodeURIComponent(name)}-${version}-${String(index).padStart(4, '0')}`;
 
   // Every document of a collection, as { name (the path below the root), fields }; `mask` limits the fields.
@@ -142,13 +145,14 @@ export function createFirestoreStore({ google, project, database, now = Date.now
   }
 
   // Read-decide-commit on a run, under the `updateTime` precondition. `decide(run)` returns { set, remove } or null (no
-  // write); the answer is the new run, or null when there is no run or nothing to do.
+  // write), and `event: { id, detail }` for a document of the journal committed with the run; the answer is the new run, or null when
+  // there is no run or nothing to do.
   async function modifyRun(workloadId, decide) {
     const path = `runs/${workloadId}`;
     for (let attempt = 1; ; attempt += 1) {
       const doc = await read(path);
       if (!doc) return null;
-      const change = decide(doc.value);
+      const change = await decide(doc.value);
       if (!change) return null;
       const next = { ...doc.value, ...change.set };
       for (const name of change.remove ?? []) delete next[name];
@@ -158,7 +162,7 @@ export function createFirestoreStore({ google, project, database, now = Date.now
           update: { name: named(path), fields: toFields(change.set) },
           updateMask: { fieldPaths: names.map(fieldPath) },
           currentDocument: { updateTime: doc.updateTime },
-        }]);
+        }, ...(change.event ? [{ update: { name: named(`events/${change.event.id}`), fields: toFields(change.event.detail) } }] : [])]);
         return next;
       } catch (err) {
         if (!lostPrecondition(err) || attempt >= ATTEMPTS) throw err;
@@ -234,14 +238,50 @@ export function createFirestoreStore({ google, project, database, now = Date.now
       return (await read(`runs/${workloadId}`))?.value ?? null;
     },
 
-    transition(workloadId, { cond, set = {}, remove = [], increment = [] }) {
-      return modifyRun(workloadId, (run) => {
+    // A change of state commits its event with the run (`events/…`), so that none is missed whoever transitions it. `cause` (what started
+    // a wake or a nap), `by` (who asked it) and `event` (the wake id and its duration, the failure, the VMs suspended) go in the event
+    // only, never on the run.
+    transition(workloadId, { cond, set = {}, remove = [], increment = [], cause, by, event }) {
+      let tags;
+      return modifyRun(workloadId, async (run) => {
         if (!matches(run, cond)) return null;
         const counted = Object.fromEntries(increment.map((name) => [name, (run[name] ?? 0) + 1]));
         // A state change dates the run (`maintenanceDue` reads it); a caller that dates it itself is kept.
         const dated = set.state !== undefined && set.state !== run.state && !('stateAt' in set) ? { stateAt: now() } : {};
-        return { set: { ...set, ...dated, ...counted, version: (run.version ?? 0) + 1, updatedAt: now() }, remove };
+        const changed = { ...set, ...dated, ...counted, version: (run.version ?? 0) + 1, updatedAt: now() };
+        if (set.state === undefined || set.state === run.state) return { set: changed, remove };
+        // The workload's tags go in the event: those the caller has (the waker read the configuration), else read; a configuration that
+        // cannot be read sends none.
+        tags ??= event?.tags ?? (await this.getConfig(workloadId).catch(() => null))?.tags ?? {};
+        const detail = eventOf({
+          workloadId, from: run.state, to: set.state, stateAt: changed.stateAt, cause, tags, router,
+          event: { ...(set.wakeId ? { wakeId: set.wakeId } : {}), ...(by ? { by } : {}), ...event },
+        });
+        return { set: changed, remove, event: { id: `${String(changed.stateAt).padStart(13, '0')}-${workloadId}-${set.state}`, detail } };
       });
+    },
+
+    // The journal after the event `after` (null: from the oldest kept), oldest first, `limit` at most: `{ events: [{ id, …detail }], next }`,
+    // `next` the last id of a full page (there may be more), else null.
+    async listEvents({ after = null, limit }) {
+      const answers = await google.request('POST', `${BASE}/${root}:runQuery`, {
+        structuredQuery: {
+          from: [{ collectionId: 'events' }],
+          ...(after ? { where: { fieldFilter: { field: { fieldPath: '__name__' }, op: 'GREATER_THAN', value: { referenceValue: named(`events/${after}`) } } } } : {}),
+          orderBy: [{ field: { fieldPath: '__name__' }, direction: 'ASCENDING' }],
+          limit,
+        },
+      });
+      const events = answers.filter((a) => a.document).map(({ document }) => ({ id: document.name.slice(`${root}/events/`.length), ...fromFields(document.fields) }));
+      return { events, next: events.length === limit ? events.at(-1).id : null };
+    },
+
+    // Deletes the events of changes before `beforeMs`, in batches; the count deleted.
+    async sweepEvents(beforeMs) {
+      const cut = String(beforeMs).padStart(13, '0');
+      const old = (await listAll('events', { mask: ['workloadId'] })).filter((doc) => doc.name.slice('events/'.length) < cut);
+      await deleteDocuments(old.map((doc) => doc.name));
+      return old.length;
     },
 
     // Daily counter (`ignored:<reason>`, `deferred:<reason>`, `wake:<trigger>`) in `stats/<id>-<day>`. Added up in memory and

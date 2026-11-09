@@ -137,7 +137,9 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], c
       },
       getRun: readRun,
       transition: async (workloadId, change) => {
-        const next = await store.transition(workloadId, change);
+        // The event of a state change carries the workload's tags; the configuration is the request's, read already.
+        const tags = change.set?.state ? (await readConfig(workloadId).catch(() => null))?.tags ?? {} : undefined;
+        const next = await store.transition(workloadId, tags ? { ...change, event: { ...change.event, tags } } : change);
         thisRequest.getStore().run = next ? Promise.resolve(next) : undefined;
         return next;
       },
@@ -282,7 +284,7 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], c
 // pages on (pages.mjs).
 export function fromEnvironment(env = process.env, { fetch, log = logger } = {}) {
   const google = createGoogle({ fetch });
-  const store = createFirestoreStore({ google, project: env.DMT_PROJECT, database: env.DMT_DATABASE, log });
+  const store = createFirestoreStore({ google, project: env.DMT_PROJECT, database: env.DMT_DATABASE, region: env.DMT_REGION, log });
   const handler = createCloudRunWaker({
     store,
     tasks: createTasks({ google, project: env.DMT_PROJECT, region: env.DMT_REGION, queue: env.DMT_QUEUE, serviceAccount: env.DMT_SERVICE_ACCOUNT }),

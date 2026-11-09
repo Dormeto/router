@@ -194,6 +194,8 @@ export class PauseRefused extends Error {
 // `every(ms, fn)`: the heartbeat's timer, which its answer stops; tests run it on their clock.
 // A day's counters are kept this long, as the DynamoDB store's (lambda/src/lib/state.mjs).
 const STATS_KEPT_DAYS = 35;
+// The journal's events (G2 §5.3).
+const EVENTS_KEPT_DAYS = 7;
 
 // Every request is logged: Google's `sampleRate` is 1.0 when logging is on and none is set.
 const logsEveryRequest = (logConfig) => logConfig?.enable === true && (logConfig.sampleRate ?? 1) === 1;
@@ -220,7 +222,11 @@ export function createController({
     const next = await store.transition(workloadId, change);
     if (next && change.set?.state) {
       const { cond, set, cause, event } = change;
-      log.info('StateChanged', { workloadId, from: cond.state, to: set.state, ...(cause ? { cause } : {}), ...event });
+      // The journal's event is the store's (committed with the run); the line says the same: when, and which router.
+      log.info('StateChanged', {
+        workloadId, from: cond.state, to: set.state, ...(cause ? { cause } : {}), ...event,
+        at: new Date(next.stateAt ?? now()).toISOString(), router: `dmtr-${config.region}`, region: config.region, project: config.project,
+      });
     }
     return next;
   }
@@ -1563,12 +1569,20 @@ export function createController({
   async function sweepStats() {
     const day = utcDay(now());
     if (sweepDay === day) return;
+    let claimed = false;
     try {
-      const claimed = await store.claimSweep();
+      claimed = await store.claimSweep();
       sweepDay = day;
       if (claimed) log.info('StatsSwept', { swept: await store.sweepStats(now() - STATS_KEPT_DAYS * DAY_MS) });
     } catch (err) {
       log.warn('StatsSweepFailed', { error: err.message });
+    }
+    // The journal's events go with them, kept 7 days: the day's claim is theirs too.
+    if (!claimed) return;
+    try {
+      log.info('EventsSwept', { swept: await store.sweepEvents(now() - EVENTS_KEPT_DAYS * DAY_MS) });
+    } catch (err) {
+      log.warn('EventsSweepFailed', { error: err.message });
     }
   }
 

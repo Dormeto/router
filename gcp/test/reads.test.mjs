@@ -154,7 +154,7 @@ test('a nap window: the probe reads it once, and says it', async () => {
 
 // The controller's Cloud Scheduler call: the pauses, the configurations and the schedules listed, the router level (router/settings),
 // once for every workload, then the workload's run.
-test('Firestore reads: a check, one AWAKE workload, 5; the first of the day 2 more, the router\'s sweep claimed and the counters listed', async () => {
+test('Firestore reads: a check, one AWAKE workload, 5; the first of the day 3 more, the router\'s sweep claimed, the counters and the events listed', async () => {
   const clock = fakeClock();
   const { reads, store } = firestoreWith({ state: STATES.AWAKE, version: 0, awakeSince: clock.now(), holders: 0, wakeCount: 0 });
   await store.putConfig('demo', {
@@ -166,9 +166,9 @@ test('Firestore reads: a check, one AWAKE workload, 5; the first of the day 2 mo
   });
   const out = await core.check();
   assert.deepEqual(out.map((r) => [r.workloadId, r.state]), [['demo', STATES.AWAKE]]);
-  assert.equal(reads(), 7);
+  assert.equal(reads(), 8);
   await core.check();
-  assert.equal(reads(), 12);
+  assert.equal(reads(), 13);
 });
 
 // Past 20 workloads, the naps in flight can pass their cap (F8): each run is read once more as the check starts, for the NAPPING ones.

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createFirestoreStore } from '../src/firestore.mjs';
+import { createFirestoreStore, fromFields, toFields } from '../src/firestore.mjs';
 import { GoogleError } from '../src/google.mjs';
 import { BASE, ROOT, fakeFirestore } from './firestore-fake.mjs';
 
@@ -101,7 +101,7 @@ test('transition: two from ASLEEP to WAKING, one wins and the other gets null', 
   assert.equal(run.wakeId, winner.wakeId);
   assert.equal(run.wakeCount, 1);
   assert.equal(run.version, 2);
-  assert.equal(docs.size, 1);
+  assert.equal([...docs.keys()].filter((name) => name.startsWith('runs/')).length, 1);
 });
 
 test('transition: a condition that does not hold is null without a write; wakeId, pendingWake and olderThan are checked', async () => {
@@ -159,7 +159,7 @@ test('transition: the precondition failing for good is read 5 times, then the er
     project: 'p', database: 'dmtr-europe-west1',
   });
   await assert.rejects(stale.transition('app', { cond: { state: 'AWAKE' }, set: { state: 'NAPPING' } }), (err) => err.status === 'FAILED_PRECONDITION');
-  assert.equal(calls.filter((c) => c.method === 'GET').length, 5);
+  assert.equal(calls.filter((c) => c.method === 'GET' && c.url.includes('/runs/')).length, 5);
 });
 
 test('transition: any other refusal is thrown at once', async () => {
@@ -176,7 +176,7 @@ test('transition: any other refusal is thrown at once', async () => {
     project: 'p', database: 'dmtr-europe-west1',
   });
   await assert.rejects(denied.transition('app', { cond: { state: 'AWAKE' }, set: { state: 'NAPPING' } }), (err) => err.status === 'PERMISSION_DENIED');
-  assert.equal(calls.filter((c) => c.method === 'GET').length, 1);
+  assert.equal(calls.filter((c) => c.method === 'GET' && c.url.includes('/runs/')).length, 1);
 });
 
 test('count: the day\'s counters, created by the first, added by the next; getStats adds up the last days', async () => {
@@ -743,4 +743,100 @@ test('deleteWorkload: the waiting page and the favicon go too, the router\'s pag
   await store.putRouterSettings({ hibernate: true, by: 'ops', at: 1 });
   await store.deleteWorkload('app');
   assert.deepEqual([...docs.keys()].sort(), ['pages/keep', 'router/page', 'router/settings']);
+});
+
+// --- The journal (G2 §5.3) -----------------------------------------------------------------------------------------
+
+const T0 = Date.parse('2026-03-10T12:00:00Z');
+const eventIds = (docs) => [...docs.keys()].filter((name) => name.startsWith('events/')).sort();
+const eventOfDoc = (docs, id) => fromFields(docs.get(id).fields);
+
+test('a transition AWAKE to NAPPING commits the run and events/<13 digits>-<workloadId>-NAPPING in one commit', async () => {
+  const { store, docs, calls } = setup();
+  await store.initRun('app', 1);
+  await store.putConfig('app', { workloadId: 'app', tags: { team: 'a' } });
+  calls.length = 0;
+  await store.transition('app', { cond: { state: 'AWAKE' }, set: { state: 'NAPPING', wakeId: 'w1' }, cause: 'idle' });
+  const writes = commits(calls).flatMap((c) => c.body.writes);
+  assert.equal(commits(calls).length, 1);
+  assert.deepEqual(writes.map((w) => w.update.name), [`${ROOT}/runs/app`, `${ROOT}/events/${T0}-app-NAPPING`]);
+  assert.deepEqual(eventIds(docs), [`events/${T0}-app-NAPPING`]);
+  assert.deepEqual(eventOfDoc(docs, `events/${T0}-app-NAPPING`), {
+    workloadId: 'app', from: 'AWAKE', to: 'NAPPING', router: 'dmtr-europe-west1', region: 'europe-west1', project: 'p',
+    at: '2026-03-10T12:00:00.000Z', cause: 'idle', wakeId: 'w1', tags: { team: 'a' },
+  });
+});
+
+test('a transition that does not change the state writes no event', async () => {
+  const { store, docs } = setup();
+  await store.initRun('app', 1);
+  await store.transition('app', { cond: { state: 'AWAKE' }, set: { holders: 2 } });
+  await store.transition('app', { cond: { state: 'AWAKE' }, set: { state: 'AWAKE' } });
+  assert.deepEqual(eventIds(docs), []);
+});
+
+test('a state change dated by its caller names its event by that date; the event keeps by, failure, durationMs and the suspended VMs as hibernated', async () => {
+  const { store, docs } = setup();
+  await store.initRun('app', 1);
+  const failure = { kind: 'capacity', step: 'wake', message: 'no room', at: '2026-03-10T12:00:00.000Z' };
+  await store.transition('app', {
+    cond: { state: 'AWAKE' }, set: { state: 'ASLEEP', stateAt: 5 }, by: 'ada', event: { stopped: ['a'], suspended: ['vm-1'], failure, durationMs: 7 },
+  });
+  assert.deepEqual(eventIds(docs), ['events/0000000000005-app-ASLEEP']);
+  assert.deepEqual(eventOfDoc(docs, 'events/0000000000005-app-ASLEEP'), {
+    workloadId: 'app', from: 'AWAKE', to: 'ASLEEP', router: 'dmtr-europe-west1', region: 'europe-west1', project: 'p',
+    at: '1970-01-01T00:00:00.005Z', by: 'ada', durationMs: 7, failure, hibernated: ['vm-1'], tags: {},
+  });
+});
+
+test('a lost precondition retries the run and its event together; the event is written once', async () => {
+  const { store, request, docs } = setup();
+  await store.initRun('app', 1);
+  const rival = createFirestoreStore({ google: { request }, project: 'p', database: 'dmtr-europe-west1' });
+  const commitsSeen = [];
+  let raced = false;
+  const racing = createFirestoreStore({
+    google: {
+      request: async (method, url, body) => {
+        if (url.endsWith(':commit')) {
+          commitsSeen.push(body.writes.length);
+          if (!raced) {
+            raced = true;
+            await rival.tryAcquireHolder('app', 5);
+          }
+        }
+        return request(method, url, body);
+      },
+    },
+    project: 'p', database: 'dmtr-europe-west1', now: () => 1,
+  });
+  await racing.transition('app', { cond: { state: 'AWAKE' }, set: { state: 'NAPPING' } });
+  assert.deepEqual(commitsSeen.slice(-2), [2, 2]);
+  assert.deepEqual(eventIds(docs), ['events/0000000000001-app-NAPPING']);
+});
+
+test('listEvents: the ids after `after`, oldest first, at most `limit`; next is the last id of a full page', async () => {
+  const { store, docs } = setup();
+  for (const id of ['0000000000003-b-AWAKE', '0000000000001-a-NAPPING', '0000000000002-a-ASLEEP', '0000000000004-a-WAKING']) {
+    docs.set(`events/${id}`, { fields: toFields({ workloadId: id.split('-')[1], to: id.split('-')[2] }), updateTime: 'x' });
+  }
+  docs.set('stats/a-2026-03-10', { fields: {}, updateTime: 'x' });
+  const first = await store.listEvents({ after: null, limit: 3 });
+  assert.deepEqual(first.events.map((e) => e.id), ['0000000000001-a-NAPPING', '0000000000002-a-ASLEEP', '0000000000003-b-AWAKE']);
+  assert.deepEqual(first.events[0], { id: '0000000000001-a-NAPPING', workloadId: 'a', to: 'NAPPING' });
+  assert.equal(first.next, '0000000000003-b-AWAKE');
+  const second = await store.listEvents({ after: first.next, limit: 3 });
+  assert.deepEqual(second.events.map((e) => e.id), ['0000000000004-a-WAKING']);
+  assert.equal(second.next, null);
+  assert.deepEqual(await store.listEvents({ after: '0000000000004-a-WAKING', limit: 3 }), { events: [], next: null });
+});
+
+test('sweepEvents: an event older than the date goes, a newer one stays; the count comes back', async () => {
+  const { store, docs } = setup();
+  const DAY = 86_400_000;
+  for (const [days, id] of [[8, 'old'], [6, 'new']]) docs.set(`events/${String(T0 - days * DAY).padStart(13, '0')}-${id}-AWAKE`, { fields: {}, updateTime: 'x' });
+  docs.set('stats/app-2026-01-01', { fields: {}, updateTime: 'x' });
+  assert.equal(await store.sweepEvents(T0 - 7 * DAY), 1);
+  assert.deepEqual(eventIds(docs), [`events/${T0 - 6 * DAY}-new-AWAKE`]);
+  assert.equal(docs.has('stats/app-2026-01-01'), true);
 });

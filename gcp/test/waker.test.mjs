@@ -1066,3 +1066,17 @@ test('DMT_IP_LISTS names the lists of the waker; unreadable, none and logged', (
   assert.equal(typeof fromEnvironment({ DMT_PROJECT: 'p', DMT_REGION: 'r', DMT_QUEUE: 'q', DMT_IP_LISTS: 'not json' }, { fetch: async () => ({}), log }), 'function');
   assert.equal(logged[0].event, 'IpListsUnreadable');
 });
+
+// The waker's transitions go to the store with their cause, as the controller's do: the store writes the event (G2 §5.3).
+test('a visitor\'s wake writes ASLEEP to WAKING with its cause, for the journal', async () => {
+  const { handler, store } = setup();
+  const asked = [];
+  const { transition } = store;
+  store.transition = (id, change) => {
+    asked.push(change);
+    return transition.call(store, id, change);
+  };
+  await handler(probe());
+  const start = asked.find((change) => change.set?.state === STATES.WAKING);
+  assert.deepEqual([start.cond.state, start.cause], [STATES.ASLEEP, 'probe']);
+});

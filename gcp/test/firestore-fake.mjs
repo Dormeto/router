@@ -67,6 +67,15 @@ export function fakeFirestore() {
         return docs.has(name) ? { found: wire(name) } : { missing: full };
       });
     }
+    // A collection's documents after a name, by name: the structured query the journal reads with.
+    if (method === 'POST' && path === ':runQuery') {
+      const { from, where, orderBy, limit } = body.structuredQuery;
+      assert.deepEqual(orderBy, [{ field: { fieldPath: '__name__' }, direction: 'ASCENDING' }]);
+      const after = where?.fieldFilter?.value.referenceValue;
+      assert.ok(!where || (where.fieldFilter.op === 'GREATER_THAN' && where.fieldFilter.field.fieldPath === '__name__'));
+      const names = [...docs.keys()].filter((n) => n.startsWith(`${from[0].collectionId}/`) && (!after || `${ROOT}/${n}` > after)).sort().slice(0, limit);
+      return names.length ? names.map((name) => ({ document: wire(name), readTime: 'x' })) : [{ readTime: 'x' }];
+    }
     if (method === 'GET') {
       const [route, query = ''] = path.slice(1).split('?');
       if (docs.has(route)) return wire(route);

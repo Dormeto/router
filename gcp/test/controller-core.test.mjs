@@ -5,6 +5,7 @@ import { STATES } from '../../lambda/src/lib/state.mjs';
 import { fakeClock, fakeStore } from '../../lambda/test/fakes.mjs';
 import { createController, PauseRefused } from '../src/controller-core.mjs';
 import { fromFields, toFields } from '../src/firestore.mjs';
+import { eventOf } from '../src/rows.mjs';
 import { GoogleError, OPERATION_NOT_DONE } from '../src/google.mjs';
 import { createLogs } from '../src/logs.mjs';
 import { createUrlMaps, withErrorPolicy, withSwap } from '../src/urlmaps.mjs';
@@ -704,6 +705,23 @@ test('the check sweeps the counters older than 35 days once a UTC day, logging S
   t.clock.advance(25 * 3_600_000);
   await t.controller.check();
   assert.equal(t.store.swept.length, 2);
+});
+
+test('the day\'s sweep also removes the events older than 7 days, once', async () => {
+  const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
+  await t.controller.check();
+  assert.deepEqual(t.store.sweptEvents, [t.clock.now() - 7 * 86_400_000]);
+  assert.deepEqual(t.logged('EventsSwept'), [{ level: 'info', event: 'EventsSwept', swept: 2 }]);
+  t.clock.advance(60_000);
+  await t.controller.check();
+  assert.equal(t.store.sweptEvents.length, 1);
+});
+
+test('an events sweep that fails is logged EventsSweepFailed and the check goes on', async () => {
+  const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
+  t.store.sweepEvents = async () => { throw new Error('firestore down'); };
+  assert.equal((await t.controller.check()).length, 1);
+  assert.deepEqual(t.logged('EventsSweepFailed').map((l) => l.error), ['firestore down']);
 });
 
 test('a sweep that fails is logged StatsSweepFailed and the check goes on', async () => {
@@ -5595,4 +5613,48 @@ test('pods ready, the load balancer\'s health check failing: unhealthy at the wa
   assert.equal((await wakePods(t)).state, STATES.FAILED);
   assert.equal(failureOfRun(t).kind, 'unhealthy');
   assert.ok(t.clock.now() - started >= 300_000);
+});
+
+// --- The journal (G2 §5.3): what a transition hands the store for its event, and the line it logs ----------------------------
+
+// The state changes the controller asked of the store, as { to, cause, event }.
+function changesOf(t) {
+  const asked = [];
+  const { transition } = t.store;
+  t.store.transition = (id, change) => {
+    if (change.set?.state) asked.push({ to: change.set.state, cause: change.cause, event: change.event });
+    return transition.call(t.store, id, change);
+  };
+  return asked;
+}
+
+test('a wake to AWAKE hands the store its wakeId and duration for the event; the log says when, and which router', async () => {
+  const t = setup({ run: waking(START - 5000), vms: { 'vm-a': { status: 'TERMINATED' } }, map: asleepMap() });
+  const asked = changesOf(t);
+  await t.controller.wake('demo', 'w1');
+  assert.deepEqual(asked.find((c) => c.to === STATES.AWAKE).event, { wakeId: 'w1', durationMs: 5000 });
+  const line = t.logged('StateChanged').find((l) => l.to === STATES.AWAKE);
+  assert.deepEqual([line.router, line.region, line.project], ['dmtr-europe-west1', 'europe-west1', 'p']);
+  assert.equal(line.at, new Date(t.run().stateAt ?? t.clock.now()).toISOString());
+});
+
+test('a wake to FAILED hands the store its failure with an ISO `at`, and the log carries it', async () => {
+  const t = setup({ run: waking(START), vms: { 'vm-a': { status: 'TERMINATED' } }, map: asleepMap() });
+  t.world.on['start vm-a'] = async () => { throw stockout(); };
+  const asked = changesOf(t);
+  await t.controller.wake('demo', 'w1');
+  const { event } = asked.find((c) => c.to === STATES.FAILED);
+  assert.equal(event.wakeId, 'w1');
+  assert.equal(event.failure.kind, 'capacity');
+  assert.equal(event.failure.at, new Date(t.clock.now()).toISOString());
+  assert.equal(t.logged('StateChanged').find((l) => l.to === STATES.FAILED).failure.at, event.failure.at);
+});
+
+test('a nap to ASLEEP hands the store the VMs it suspended, which the event lists as hibernated', async () => {
+  const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
+  const asked = changesOf(t);
+  await t.controller.nap('demo');
+  const change = asked.find((c) => c.to === STATES.ASLEEP);
+  assert.deepEqual(change.event.suspended, ['vm-a']);
+  assert.deepEqual(eventOf({ workloadId: 'demo', from: 'NAPPING', to: 'ASLEEP', stateAt: START, event: change.event, router: { name: 'dmtr-europe-west1', region: 'europe-west1', project: 'p' } }).hibernated, ['vm-a']);
 });

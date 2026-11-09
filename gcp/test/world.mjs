@@ -92,9 +92,11 @@ export const idleReadsStore = (runOf) => ({
 // The store's daily sweep of old counters (firestore.mjs) on a fake: the day claimed once, the `before` of each sweep kept.
 export const sweepStore = (now) => {
   const swept = [];
+  const sweptEvents = [];
   let day = null;
   return {
     swept,
+    sweptEvents,
     claimSweep: async () => {
       const today = new Date(now()).toISOString().slice(0, 10);
       if (day !== null && day >= today) return false;
@@ -104,6 +106,10 @@ export const sweepStore = (now) => {
     sweepStats: async (before) => {
       swept.push(before);
       return 3;
+    },
+    sweepEvents: async (before) => {
+      sweptEvents.push(before);
+      return 2;
     },
   };
 };

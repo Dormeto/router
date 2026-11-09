@@ -150,7 +150,7 @@ export function fromEnvironment(env = process.env, { fetch, log = logger } = {})
   const project = env.DMT_PROJECT;
   const customPages = customPagesOf(env);
   const config = { project, region: env.DMT_REGION, wakerNeg: env.DMT_WAKER_NEG, controllerUrl: env.DMT_CONTROLLER_URL };
-  const store = createFirestoreStore({ google, project, database: env.DMT_DATABASE, log });
+  const store = createFirestoreStore({ google, project, database: env.DMT_DATABASE, region: env.DMT_REGION, log });
   const compute = createCompute({ google, project });
   const cloudsql = createCloudSql({ google, project });
   const gke = createGke({ google, project, fetch });

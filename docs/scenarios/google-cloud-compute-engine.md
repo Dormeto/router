@@ -9,8 +9,7 @@ groups](#zonal-network-endpoint-groups), [the regional and classic load balancer
 [schedules and pauses](#schedules-and-pauses) and [IP lists](#ip-lists). The router also has AWS's [settings by
 level](#settings-and-their-levels), the wake mode and the rules, [the branded waiting page](#the-waiting-page), [a capacity
 retry with fallback machine types](#capacity-and-fallback-machine-types) and [the internal load
-balancers](#internal-load-balancers). These were accepted in `dormeto-dev` on 2026-11-09, with router image 0.39.0-dev.3 and CLI
-0.13.0-dev.2, builds of `main`: the settings by level, the wake mode and rules, the waiting page, the fallback's machine type change
+balancers](#internal-load-balancers). These were accepted in `dormeto-dev` on 2026-11-08 and 2026-11-09, on dev builds of `main` (router 0.39.0-dev.2, then 0.39.0-dev.3 with the final review's fixes): the settings by level, the wake mode and rules, the waiting page, the fallback's machine type change
 through the router's own role, both internal kinds (measured, napped by the idle check, woken by the page's probe) and GKE's
 refusal. They are not released.
 

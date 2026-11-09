@@ -610,9 +610,9 @@ test('the Compute Engine page: the idle check leaves out what a no-wake rule mat
 });
 
 // G5's last docs pass: the acceptance of 2026-11-09 and the measures it settled.
-test('the Compute Engine page: G5 was accepted in dormeto-dev on 2026-11-09 and is not released, the wake header is measured, the waker holds no request', () => {
+test('the Compute Engine page: G5 was accepted in dormeto-dev on 2026-11-08 and 2026-11-09 and is not released, the wake header is measured, the waker holds no request', () => {
   const page = flat(read(CE));
-  assert.match(page, /These were accepted in dormeto-dev on 2026-11-09, with router image 0\.39\.0-dev\.3 and CLI 0\.13\.0-dev\.2, builds of main: the settings by level, the wake mode and rules, the waiting page, the fallback's machine type change through the router's own role, both internal kinds \(measured, napped by the idle check, woken by the page's probe\) and GKE's refusal\. They are not released\./);
+  assert.match(page, /These were accepted in dormeto-dev on 2026-11-08 and 2026-11-09, on dev builds of main \(router 0\.39\.0-dev\.2, then 0\.39\.0-dev\.3 with the final review's fixes\): the settings by level, the wake mode and rules, the waiting page, the fallback's machine type change through the router's own role, both internal kinds \(measured, napped by the idle check, woken by the page's probe\) and GKE's refusal\. They are not released\./);
   assert.doesNotMatch(page, /the switch back takes longer than any hold/);
   assert.doesNotMatch(page, /was not measured: the headers/);
 });

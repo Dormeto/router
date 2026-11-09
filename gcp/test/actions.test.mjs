@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { createActions } from '../src/actions.mjs';
 import { createControllerApi } from '../src/controller.mjs';
-import { INPUT, REGION, WAKER, ZONE, setup } from './world.mjs';
+import { INPUT, REGION, WAKER, ZONE, setup, virtualClock } from './world.mjs';
 
 const iso = (ms) => new Date(ms).toISOString();
 const DAY = 86_400_000;
@@ -23,8 +23,8 @@ const request = (method, url, body = '') => {
 
 // The world as the manager reaches it, POST /v1/actions beside the REST routes, over a store with what the Firestore one adds for the
 // manager: router/manager (`store.manager`), the journal (`store.events`) and the stats/ counters (`store.stats`, 7 days added up).
-function world(change) {
-  const t = setup(change);
+function world(change, options) {
+  const t = setup(change, options);
   const { store, core, onboarding, config, clock, log } = t;
   Object.assign(config, { version: '0.40.0', build: 'b7' });
   Object.assign(store, {
@@ -234,6 +234,51 @@ test('pause and resume: a workload\'s or, without workloadId, the router\'s, in 
   assert.equal(store.pauses.size, 0);
   assert.deepEqual((await act({ action: 'pause', workloadId: 'demo', by: 'ann', refusals: true })).body, { refused: { code: 'invalid', message: 'reason required (1 to 256 characters)' } });
   assert.deepEqual((await act({ action: 'pause', workloadId: 'nope', reason: 'r', refusals: true })).body.refused.code, 'not_found');
+});
+
+// A router of asleep workloads, each read and write of the store taking 100 ms (a Firestore call), on a clock where time passes
+// only once every request waits: what a call to the router lasts is its longest chain of awaits.
+function asleepRouter(count) {
+  const clock = virtualClock();
+  const t = world(() => {}, { clock });
+  const ids = Array.from({ length: count }, (_, i) => `w${String(i).padStart(2, '0')}`);
+  for (const id of ids) {
+    t.store.configs.set(id, { workloadId: id, urlMap: 'lb', backendService: 'app', wakerBackendService: `dmtr-${REGION}-${id}`, backends: [{ kind: 'vm', location: ZONE, name: 'vm-a' }] });
+    t.store.runs.set(id, { state: STATES.ASLEEP, version: 1, stateAt: 1 });
+  }
+  for (const name of ['getRun', 'transition', 'setPendingWake', 'listConfigs', 'addPause']) {
+    const call = t.store[name];
+    t.store[name] = async (...args) => {
+      await clock.sleep(100);
+      return call(...args);
+    };
+  }
+  return { ...t, clock, ids };
+}
+
+test('pause: the router\'s wakes run 8 at a time, so 40 asleep workloads are woken within the manager\'s 10 s call bound, each once', async () => {
+  const { act, clock, ids, w } = asleepRouter(40);
+  const started = clock.now();
+  const { status, body } = await clock.until(act({ action: 'pause', reason: 'freeze', by: 'ops', refusals: true }));
+  assert.equal(status, 200);
+  assert.ok(clock.now() - started <= 10_000, `the pause answered after ${clock.now() - started} ms`);
+  assert.deepEqual(body.woken, ids);
+  assert.deepEqual(w.tasks.map((task) => task.body.workloadId).sort(), ids);
+  assert.equal(w.logs.filter((l) => l.event === 'WakeRequested' && l.reason === 'pause').length, 40);
+});
+
+test('pause: the router\'s woken lists only the wakes it started: one a waker started first is not listed, a napping one\'s pending wake is', async () => {
+  const { act, clock, store } = asleepRouter(3);
+  store.runs.get('w02').state = STATES.NAPPING;
+  // w01's wake is taken by another between the pause's read and its own write.
+  const transition = store.transition;
+  store.transition = async (id, change) => {
+    if (id === 'w01' && change.set?.state === STATES.WAKING) store.runs.get('w01').state = STATES.WAKING;
+    return transition(id, change);
+  };
+  const { body } = await clock.until(act({ action: 'pause', reason: 'freeze', by: 'ops', refusals: true }));
+  assert.deepEqual(body.woken, ['w00', 'w02']);
+  assert.equal(store.runs.get('w02').pendingWake, true);
 });
 
 test('rename and tag: AWS\'s answers, setName\'s and setTags\'; the REST Workload shows them; a bad tag refused in AWS\'s words', async () => {

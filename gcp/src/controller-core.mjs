@@ -840,11 +840,13 @@ export function createController({
   }
 
   // The wake of an operator, the manager's (`kind` 'manager', `by` who asked) or a pause, whatever the backoff; this request answers
-  // at once.
+  // at once. True when this call started the wake or kept the napping workload's: false when there was nothing to wake, or another
+  // got there first.
   async function wakeNow(workloadId, kind = 'operator', by) {
     const run = await store.getRun(workloadId);
-    if (run?.state === STATES.NAPPING) await pendingWake(workloadId, kind, by);
-    else if ([STATES.ASLEEP, STATES.FAILED].includes(run?.state)) await startWake(workloadId, run, kind, by);
+    if (run?.state === STATES.NAPPING) return pendingWake(workloadId, kind, by);
+    if ([STATES.ASLEEP, STATES.FAILED].includes(run?.state)) return startWake(workloadId, run, kind, by);
+    return false;
   }
 
   // --- The nap -------------------------------------------------------------------------------------------------------
@@ -1375,25 +1377,27 @@ export function createController({
 
   // Pauses the workload, or the router when `workloadId` is null. Unless keepAsleep, an asleep or failed workload (each one of a
   // paused router) is woken and a napping one gets a pending wake. keepAsleep holds the scheduled and maintenance wakes only: a
-  // visitor still wakes it (the waker knows nothing of pauses). Answers the pause as shown and the workloads woken, as AWS's action.
+  // visitor still wakes it (the waker knows nothing of pauses). Answers the pause as shown and the workloads woken, as AWS's action:
+  // those whose wake this pause started, in the configurations' order. A router's wakes go 8 at a time, as the check's reads (AWS
+  // queues them 10 at a time), so that a router of many sleepers answers within the manager's call.
   async function pause(workloadId, input) {
     const record = pauseRecord(input);
     await store.addPause(workloadId, record);
     log.info('Paused', { workloadId, ...record });
-    const woken = [];
-    if (!record.keepAsleep) {
-      const ids = workloadId ? [workloadId] : (await store.listConfigs()).map((c) => c.workloadId);
-      for (const id of ids) {
+    const started = new Set();
+    const ids = record.keepAsleep ? [] : workloadId ? [workloadId] : (await store.listConfigs()).map((c) => c.workloadId);
+    let next = 0;
+    await Promise.all(Array.from({ length: Math.min(CHECK_CONCURRENCY, ids.length) }, async () => {
+      while (next < ids.length) {
+        const id = ids[next++];
         try {
-          const state = (await store.getRun(id))?.state;
-          await wakeNow(id, 'pause', record.by);
-          if ([STATES.ASLEEP, STATES.FAILED, STATES.NAPPING].includes(state)) woken.push(id);
+          if (await wakeNow(id, 'pause', record.by)) started.add(id);
         } catch (err) {
           log.error('PauseWakeFailed', { workloadId: id, error: err.message });
         }
       }
-    }
-    return { pause: shown({ workloadId, ...record }), woken };
+    }));
+    return { pause: shown({ workloadId, ...record }), woken: ids.filter((id) => started.has(id)) };
   }
 
   // Removes the workload's pause, or the router's when `workloadId` is null: only that one. Answers whether there was one.

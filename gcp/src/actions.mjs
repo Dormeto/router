@@ -35,7 +35,8 @@ const EVENTS_MAX = 500;
 const EVENT_ID = /^\d{13}-[a-z0-9-]+-[A-Z]+$/;
 const ETAG_MAX = 256;
 const WAKEABLE = [STATES.ASLEEP, STATES.FAILED, STATES.NAPPING];
-const EXCLUSIONS_REFUSED = 'exclusions don\'t reach Google Cloud routers yet';
+const TARGET_GROUP_REFUSED = 'a Google Cloud router has no targetGroupArn: name the backendService';
+const EXCLUSION_ID_MAX = 64;
 
 const iso = (ms) => new Date(ms).toISOString();
 const isoOrNull = (ms) => (typeof ms === 'number' && ms > 0 ? iso(ms) : null);
@@ -43,14 +44,15 @@ const isObject = (value) => !!value && typeof value === 'object' && !Array.isArr
 const invalid = (message) => new Refusal(400, 'bad-request', message);
 
 // A stored pause as AWS shows it (controller-core.mjs's shownPauses), its scope the workload's or the router's.
-const pauseOf = ({ workloadId, by, at, reason, until, keepAsleep }) => ({
+const pauseOf = ({ workloadId, by, at, reason, until, keepAsleep, exclusionId }) => ({
   scope: workloadId === null ? 'router' : 'workload', by, at: iso(at), reason, until: until === undefined ? null : iso(until), keepAsleep: keepAsleep === true,
+  ...(exclusionId ? { exclusionId } : {}),
 });
 // One as the controller shows it, which names the router's scope only.
 const scoped = (pause) => ({ scope: pause.scope ?? 'workload', ...pause });
-// The workload's own first, then the router's; the newest first within each.
-const RANK = { workload: 0, router: 1 };
-const inOrder = (pauses) => pauses.sort((a, b) => RANK[a.scope] - RANK[b.scope] || b.at.localeCompare(a.at));
+// The exclusions' first, then the workload's own, then the router's; the newest first within each.
+const rankOf = (pause) => (pause.exclusionId ? 0 : pause.scope === 'router' ? 2 : 1);
+const inOrder = (pauses) => pauses.sort((a, b) => rankOf(a) - rankOf(b) || b.at.localeCompare(a.at));
 // A pause in AWS's words, as its request-nap answers it (controller-core.mjs's pauseText).
 const pauseText = (p) => `${p.scope === 'router' ? 'router ' : ''}paused by ${p.by}: ${p.reason}`;
 
@@ -245,32 +247,51 @@ export function createActions({ controller, onboarding, store, router, lists = [
     return { state: run?.state };
   }
 
-  // The manager's exclusions are AWS's workload pauses with an exclusionId (and the target group they matched), several per workload;
-  // a Google Cloud router keeps one pause per workload and has none of them yet (plan 2): refused, so that an exclusion's pause cannot
-  // replace an operator's, nor its lift remove it.
-  const noExclusion = ({ exclusionId, targetGroupArn }) => {
-    if (exclusionId != null || targetGroupArn != null) throw invalid(EXCLUSIONS_REFUSED);
-  };
+  // The manager's exclusions are AWS's workload pauses with an exclusionId, several per workload beside the operator's. The id is a part
+  // of the pause's document id (`<workloadId>#<exclusionId>`): no `/` or `#`. A Google Cloud router has no target group: an exclusion
+  // names the backend service it matched instead.
+  function exclusionOf({ exclusionId, targetGroupArn }) {
+    if (targetGroupArn != null) throw invalid(TARGET_GROUP_REFUSED);
+    if (exclusionId == null) return undefined;
+    if (typeof exclusionId !== 'string' || !exclusionId || exclusionId.length > EXCLUSION_ID_MAX || /[/#]/.test(exclusionId)) {
+      throw invalid(`exclusionId must be 1 to ${EXCLUSION_ID_MAX} characters, with no / or #`);
+    }
+    return exclusionId;
+  }
 
-  // AWS's pause: the workload's, or without workloadId the router's (§5.6): `{ pause, woken }`.
+  // AWS's pause: the workload's, or without workloadId the router's (§5.6): `{ pause, woken }`. An exclusion's names its workload's
+  // backend service (a path or a name, compared by name): another workload of the same id is not it.
   async function pause(payload) {
-    noExclusion(payload);
+    const exclusionId = exclusionOf(payload);
     const workloadId = payload.workloadId ?? null;
-    if (workloadId !== null) await onboarding.find(workloadId);
-    const answer = workloadId === null ? await onboarding.pauseRouter(payload) : await controller.pause(workloadId, payload).catch((err) => {
+    if (exclusionId !== undefined && workloadId === null) throw invalid('an exclusion pauses a workload: workloadId is needed');
+    if (workloadId !== null) {
+      const cfg = await onboarding.find(workloadId).catch((err) => {
+        if (err instanceof Refusal && err.status === 404) throw new Refusal(404, err.reason, `workload not configured: ${workloadId}`);
+        throw err;
+      });
+      const { backendService } = payload;
+      if (backendService != null && (typeof backendService !== 'string' || backendService.split('/').at(-1) !== cfg.backendService)) {
+        throw new Refusal(404, 'not-found', `workload not configured: ${workloadId}`);
+      }
+    }
+    const answer = workloadId === null ? await onboarding.pauseRouter(payload) : await controller.pause(workloadId, { ...payload, exclusionId }).catch((err) => {
       if (err instanceof PauseRefused) throw invalid(err.message);
       throw err;
     });
     return { ...answer, pause: scoped(answer.pause) };
   }
 
-  // AWS's resume: whether there was the pause, the workload's or the router's.
+  // AWS's resume: whether there was the pause, the workload's (the exclusion's when `exclusionId` is given) or the router's.
   async function resume(payload) {
-    noExclusion(payload);
+    const exclusionId = exclusionOf(payload);
     const { workloadId = null, by } = payload;
-    if (workloadId === null) return onboarding.resumeRouter({ by });
+    if (workloadId === null) {
+      if (exclusionId !== undefined) throw invalid('an exclusion pauses a workload: workloadId is needed');
+      return onboarding.resumeRouter({ by });
+    }
     await onboarding.find(workloadId);
-    return controller.resume(workloadId, by ?? 'unknown');
+    return controller.resume(workloadId, by ?? 'unknown', { exclusionId });
   }
 
   // AWS's settings action: without a workload the router's level, with one the workload's, its hibernation in AWS's shape.

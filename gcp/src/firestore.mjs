@@ -83,7 +83,8 @@ const isStatus = (status) => (err) => err?.status === status;
 
 export function createFirestoreStore({ google, project, database, region = database?.replace(/^dmtr-/, ''), now = Date.now, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), log = null, after = (ms, fn) => setTimeout(fn, ms).unref(), cancel = clearTimeout }) {
   const root = `projects/${project}/databases/${database}/documents`;
-  const url = (path) => `${BASE}/${root}/${path}`;
+  // A document id may hold a `#` (an exclusion's pause), which a URL would take for its fragment.
+  const url = (path) => `${BASE}/${root}/${path.replaceAll('#', '%23')}`;
   const commit = (writes) => google.request('POST', `${BASE}/${root}:commit`, { writes });
   const named = (path) => `${root}/${path}`;
   const router = { name: `dmtr-${region}`, region, project };
@@ -134,6 +135,12 @@ export function createFirestoreStore({ google, project, database, region = datab
 
   const pauseOf = (workloadId, doc) => ({ workloadId, ...doc.value.pause });
   const ROUTER_PAUSE = 'router/pause';
+  // A workload's pauses are `pauses/<id>` (the operator's) and `pauses/<id>#<exclusionId>` (an exclusion's; an id never holds `#`).
+  const pausePath = (workloadId, exclusionId) => `pauses/${workloadId}${exclusionId ? `#${exclusionId}` : ''}`;
+  const pauseDocOf = (doc) => {
+    const [workloadId] = doc.name.slice('pauses/'.length).split('#');
+    return { workloadId, ...doc.fields.pause };
+  };
 
   // Deletes a pause's document, with its time as precondition; false when `at` is given and differs, or when there is none.
   async function removeDoc(path, at) {
@@ -237,8 +244,11 @@ export function createFirestoreStore({ google, project, database, region = datab
     // A workload's pause (one per workload) and the router's (`router/pause`, workloadId null): [{ workloadId, by, at, reason, until?,
     // keepAsleep }], expired ones included (the controller filters them).
     async getPauses(workloadId) {
-      const doc = workloadId ? await read(`pauses/${workloadId}`) : await read(ROUTER_PAUSE);
-      return doc ? [pauseOf(workloadId || null, doc)] : [];
+      if (!workloadId) {
+        const doc = await read(ROUTER_PAUSE);
+        return doc ? [pauseOf(null, doc)] : [];
+      }
+      return (await listAll('pauses')).map(pauseDocOf).filter((p) => p.workloadId === workloadId);
     },
 
     // Every pause, the router's first when there is one.
@@ -246,7 +256,7 @@ export function createFirestoreStore({ google, project, database, region = datab
       const router = await read(ROUTER_PAUSE);
       return [
         ...(router ? [pauseOf(null, router)] : []),
-        ...(await listAll('pauses')).map((doc) => ({ workloadId: doc.name.slice('pauses/'.length), ...doc.fields.pause })),
+        ...(await listAll('pauses')).map(pauseDocOf),
       ];
     },
 
@@ -262,15 +272,16 @@ export function createFirestoreStore({ google, project, database, region = datab
       return removeDoc(ROUTER_PAUSE, at);
     },
 
-    // A workload's pause is written by its id; null is the router's.
+    // A workload's pause is written by its id, an exclusion's (`pause.exclusionId`) beside it; null is the router's.
     async addPause(workloadId, pause) {
       if (!workloadId) return this.putRouterPause(pause);
-      await commit([{ update: { name: named(`pauses/${workloadId}`), fields: toFields({ pause, at: pause.at }) } }]);
+      await commit([{ update: { name: named(pausePath(workloadId, pause.exclusionId)), fields: toFields({ pause, at: pause.at }) } }]);
     },
 
     // false when `at` is given and the pause changed meanwhile (a newer pause is kept), or when there was none.
-    async removePauses(workloadId, { at } = {}) {
-      return removeDoc(workloadId ? `pauses/${workloadId}` : ROUTER_PAUSE, at);
+    // `exclusionId` names an exclusion's pause; without, the operator's (or the router's).
+    async removePauses(workloadId, { at, exclusionId } = {}) {
+      return removeDoc(workloadId ? pausePath(workloadId, exclusionId) : ROUTER_PAUSE, at);
     },
 
     async getRun(workloadId) {
@@ -427,9 +438,13 @@ export function createFirestoreStore({ google, project, database, region = datab
       }
     },
 
-    // Offboarding: configuration, run, schedule, pause and the daily counters, as AWS's offboarding.
+    // Offboarding: configuration, run, schedule, every pause (the operator's and the exclusions') and the daily counters, as AWS's offboarding.
     async deleteWorkload(workloadId) {
-      await commit(['workloads', 'runs', 'schedules', 'pauses', 'pages', 'favicons'].map((kind) => ({ delete: named(`${kind}/${workloadId}`) })));
+      const exclusions = (await listAll('pauses', { mask: ['at'] })).filter((doc) => doc.name.startsWith(`pauses/${workloadId}#`));
+      await commit([
+        ...['workloads', 'runs', 'schedules', 'pauses', 'pages', 'favicons'].map((kind) => ({ delete: named(`${kind}/${workloadId}`) })),
+        ...exclusions.map((doc) => ({ delete: named(doc.name) })),
+      ]);
       await this.deleteStats(workloadId);
     },
 

@@ -98,8 +98,8 @@ function setup({
   store.getManagerSettings = async () => structuredClone(store.state.managerSettings ?? null);
   store.getRouterPause = async () => structuredClone(store.state.pauses.find((p) => p.workloadId === null) ?? null);
   store.addPause = (id, pause) => store.putPause(id, fromFields(toFields(pause)));
-  store.removePauses = async (id, { at } = {}) => {
-    const found = store.state.pauses.find((p) => p.workloadId === id && (at === undefined || p.at === at));
+  store.removePauses = async (id, { at, exclusionId } = {}) => {
+    const found = store.state.pauses.find((p) => p.workloadId === id && (p.exclusionId ?? null) === (exclusionId ?? null) && (at === undefined || p.at === at));
     store.state.pauses = store.state.pauses.filter((p) => p !== found);
     return Boolean(found);
   };
@@ -3579,6 +3579,32 @@ test('a pause past its until no longer holds, and the check deletes it, unless a
   broken.store.removePauses = async () => { throw new Error('Google: 503 firestore'); };
   await check(broken);
   assert.equal(broken.logged('PauseDeleteFailed').length, 1);
+});
+
+test('resume by an exclusion\'s id lifts that pause alone: the operator\'s still holds, no nap asked, no wake; again, nothing to lift', async () => {
+  const t = scheduled(scheduleOf(NAP));
+  pauseFor(t);
+  const { pause: shownPause } = await t.controller.pause('demo', { by: 'mgr', reason: 'excluded: batch', keepAsleep: true, exclusionId: 'x1' });
+  assert.equal(shownPause.exclusionId, 'x1');
+  assert.deepEqual((await t.controller.pausesFor('demo')).map((p) => [p.by, p.exclusionId ?? null]), [['mgr', 'x1'], ['ops', null]]);
+  assert.deepEqual(await t.controller.resume('demo', 'mgr', { exclusionId: 'x1' }), { resumed: true });
+  assert.deepEqual((await t.controller.pausesFor('demo')).map((p) => p.by), ['ops']);
+  assert.deepEqual(await t.controller.resume('demo', 'mgr', { exclusionId: 'x1' }), { resumed: false });
+  assert.deepEqual(t.world.tasks, []);
+  assert.equal((await check(t)).schedule, 'held by a pause');
+  // The operator's own is lifted without an id, and the exclusion's stays.
+  await t.controller.pause('demo', { by: 'mgr', reason: 'excluded: batch', keepAsleep: true, exclusionId: 'x1' });
+  assert.deepEqual(await t.controller.resume('demo', 'ann'), { resumed: true });
+  assert.deepEqual((await t.controller.pausesFor('demo')).map((p) => [p.by, p.exclusionId]), [['mgr', 'x1']]);
+});
+
+test('an expired exclusion\'s pause goes alone: the operator\'s stays, and the log names the exclusion', async () => {
+  const t = scheduled(scheduleOf(NAP));
+  pauseFor(t);
+  pauseFor(t, { by: 'mgr', reason: 'excluded: batch', exclusionId: 'x1', until: START });
+  await check(t);
+  assert.deepEqual(t.store.state.pauses.map((p) => [p.by, p.exclusionId ?? null]), [['ops', null]]);
+  assert.deepEqual(t.logged('PauseExpired').map((l) => [l.by, l.exclusionId]), [['mgr', 'x1']]);
 });
 
 test('a pause with no until goes through the store without one, and never expires', async () => {

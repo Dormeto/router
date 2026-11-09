@@ -42,7 +42,7 @@
 // logged (`StateChanged`) and committed with it in the journal (`events/`), which the manager reads (G2 spec §5.3).
 //
 // Schedules and pauses as on AWS (vision docs/specs/2026-10-30-google-cloud-coverage-design.md, section 5): a workload's pause and
-// the router's (`router/pause`, G2 spec §5.6). The manager's exclusions are not on Google Cloud yet.
+// the router's (`router/pause`, G2 spec §5.6), and the manager's exclusions' (`exclusionId`), several per workload.
 //
 // The waiting page (vision docs/specs/2026-11-08-google-cloud-router-features-design.md, section 5.2): a nap reads the application's
 // favicon before its NAPPING, while the route still reaches the application, as AWS's (favicon.mjs's step), from the host the URL map
@@ -1330,15 +1330,20 @@ export function createController({
 
   const expired = (p) => p.until !== undefined && p.until <= now();
 
-  // A pause as people read it; the router's says so (`scope: 'router'`), a workload's is the one it was.
-  const shown = ({ workloadId, by, at, reason, until, keepAsleep }) => ({
+  // A pause as people read it; the router's says so (`scope: 'router'`), a workload's is the one it was, an exclusion's names it.
+  const shown = ({ workloadId, by, at, reason, until, keepAsleep, exclusionId }) => ({
     ...(workloadId === null ? { scope: 'router' } : {}), by, at: iso(at), reason, until: until === undefined ? null : iso(until), keepAsleep: keepAsleep === true,
+    ...(exclusionId ? { exclusionId } : {}),
   });
 
-  // A workload's active pauses, as people read them: its own (at most one), then its router's.
+  // AWS's order (shownPauses): the exclusions first, then the workload's own, then the router's; the newest first within each.
+  const rank = (p) => (p.exclusionId ? 0 : p.workloadId ? 1 : 2);
+
+  // A workload's active pauses, as people read them: its exclusions', its own, then its router's.
   async function pausesFor(workloadId) {
     const [own, router] = await Promise.all([store.getPauses(workloadId), store.getRouterPause()]);
-    return [...own, ...(router ? [{ workloadId: null, ...router }] : [])].filter((p) => !expired(p)).map(shown);
+    return [...own, ...(router ? [{ workloadId: null, ...router }] : [])].filter((p) => !expired(p))
+      .sort((a, b) => rank(a) - rank(b) || b.at - a.at).map(shown);
   }
 
   // A nap needs to know: pauses that cannot be read count as a pause.
@@ -1362,17 +1367,17 @@ export function createController({
       return { pauses: null, error: err.message };
     }
     for (const p of pauses.filter(expired)) {
-      const deleted = await store.removePauses(p.workloadId, { at: p.at }).catch((err) => {
-        log.warn('PauseDeleteFailed', { workloadId: p.workloadId, error: err.message });
+      const deleted = await store.removePauses(p.workloadId, { at: p.at, exclusionId: p.exclusionId }).catch((err) => {
+        log.warn('PauseDeleteFailed', { workloadId: p.workloadId, ...(p.exclusionId ? { exclusionId: p.exclusionId } : {}), error: err.message });
         return false;
       });
-      if (deleted) log.info('PauseExpired', { workloadId: p.workloadId, by: p.by, reason: p.reason });
+      if (deleted) log.info('PauseExpired', { workloadId: p.workloadId, by: p.by, reason: p.reason, ...(p.exclusionId ? { exclusionId: p.exclusionId } : {}) });
     }
     return { pauses: pauses.filter((p) => !expired(p)) };
   }
 
   // The record as stored. No `until` when none is asked for: the store would make `undefined` a null, read as expired.
-  function pauseRecord({ by, reason, until, keepAsleep }) {
+  function pauseRecord({ by, reason, until, keepAsleep, exclusionId }) {
     const text = typeof reason === 'string' ? reason.trim() : '';
     if (!text || text.length > REASON_MAX) throw new PauseRefused(`reason required (1 to ${REASON_MAX} characters)`);
     if (keepAsleep !== undefined && typeof keepAsleep !== 'boolean') throw new PauseRefused('keepAsleep must be true or false');
@@ -1381,7 +1386,8 @@ export function createController({
       untilMs = typeof until === 'number' ? until : Date.parse(until);
       if (!(untilMs > now() && untilMs <= now() + PAUSE_MAX_MS)) throw new PauseRefused('until must be in the future, within 366 days');
     }
-    return { by: by ?? 'unknown', at: now(), reason: text, ...(untilMs === undefined ? {} : { until: untilMs }), keepAsleep: keepAsleep === true };
+    return { by: by ?? 'unknown', at: now(), reason: text, ...(untilMs === undefined ? {} : { until: untilMs }), keepAsleep: keepAsleep === true,
+      ...(exclusionId ? { exclusionId: String(exclusionId) } : {}) };
   }
 
   // Pauses the workload, or the router when `workloadId` is null. Unless keepAsleep, an asleep or failed workload (each one of a
@@ -1409,10 +1415,11 @@ export function createController({
     return { pause: shown({ workloadId, ...record }), woken: ids.filter((id) => started.has(id)) };
   }
 
-  // Removes the workload's pause, or the router's when `workloadId` is null: only that one. Answers whether there was one.
-  async function resume(workloadId, by) {
-    const resumed = Boolean(await store.removePauses(workloadId));
-    if (resumed) log.info('Resumed', { workloadId, by });
+  // Removes the workload's pause (the exclusion's when `exclusionId` is given, else the operator's), or the router's when `workloadId`
+  // is null: only that one. Answers whether there was one.
+  async function resume(workloadId, by, { exclusionId } = {}) {
+    const resumed = Boolean(await store.removePauses(workloadId, { exclusionId }));
+    if (resumed) log.info('Resumed', { workloadId, by, ...(exclusionId ? { exclusionId } : {}) });
     return { resumed };
   }
 

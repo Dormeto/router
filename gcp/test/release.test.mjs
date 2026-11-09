@@ -658,7 +658,7 @@ test('the manager page\'s numbers are the code\'s: the journal\'s 7 days, 1 to 5
   assert.match(ACTIONS_SRC, /const ETAG_MAX = 256;/);
 });
 
-test('the manager page says what a pause and a request-nap do, from the code, and the Compute Engine page keeps the exclusions limit', () => {
+test('the manager page says what a pause and a request-nap do, from the code, and the Compute Engine page says the exclusions pause beside the operator', () => {
   const page = flat(read(MANAGER));
   assert.match(ACTIONS_SRC, /return \{ requested: false, reason: pauseText\(first\) \};/);
   assert.match(page, /is not a refusal: it answers \{ "requested": false, "reason" \} with the pause's words/);
@@ -667,10 +667,12 @@ test('the manager page says what a pause and a request-nap do, from the code, an
   assert.doesNotMatch(page, /a pause carries by too, and writes no event/);
   assert.match(page, /a pause carries by too: the pause itself writes no event, and the wakes it starts write theirs, with the cause pause and its by/);
   assert.match(page, /plus pauses that cannot be read/);
-  assert.match(flat(read(CE)), /The manager's exclusions don't reach Google Cloud routers yet\./);
-  // actions.mjs's noExclusion: AWS's exclusion fields on pause and resume.
-  assert.match(ACTIONS_SRC, /const EXCLUSIONS_REFUSED = 'exclusions don\\'t reach Google Cloud routers yet';/);
-  assert.match(page, /Exclusions don't reach Google Cloud routers yet: a pause or a resume that names an exclusionId or a targetGroupArn is refused \(invalid\), so it neither replaces nor lifts an operator's pause/);
+  assert.match(flat(read(CE)), /The manager's exclusions pause a workload beside the operator's pause, and lifting one leaves the other\./);
+  // actions.mjs's exclusionOf: the id is a part of the pause's document id, and a target group has no meaning here.
+  assert.match(ACTIONS_SRC, /const EXCLUSION_ID_MAX = 64;/);
+  assert.match(ACTIONS_SRC, /const TARGET_GROUP_REFUSED = 'a Google Cloud router has no targetGroupArn: name the backendService';/);
+  assert.match(page, /an exclusionId \(1 to 64 characters, no \/ or #\)/);
+  assert.match(page, /another backend service, or an unknown workload, is refused workload not configured: <id>/);
 });
 
 // The final review of G2 plan 1: what the pages said that the code no longer does.

@@ -606,13 +606,14 @@ export function setup(change = () => {}, { clock = fakeClock() } = {}) {
       else schedules.delete(id);
       return true;
     },
-    getPauses: async (id) => (pauses.has(id) ? [{ workloadId: id, ...structuredClone(pauses.get(id)) }] : []),
+    // The Firestore store's documents: the operator's pause at the workload's id, an exclusion's at `<id>#<exclusionId>`.
+    getPauses: async (id) => [...pauses].filter(([key]) => key === id || (id !== null && key !== null && key.startsWith(`${id}#`))).map(([key, pause]) => ({ workloadId: id, ...structuredClone(pause) })),
     getRouterPause: async () => structuredClone(pauses.get(null) ?? null),
-    listPauses: async () => [...pauses].map(([workloadId, pause]) => ({ workloadId, ...structuredClone(pause) })),
+    listPauses: async () => [...pauses].map(([key, pause]) => ({ workloadId: key === null ? null : key.split('#')[0], ...structuredClone(pause) })),
     addPause: async (id, pause) => {
-      pauses.set(id, structuredClone(pause));
+      pauses.set(pause.exclusionId && id ? `${id}#${pause.exclusionId}` : id, structuredClone(pause));
     },
-    removePauses: async (id) => pauses.delete(id),
+    removePauses: async (id, { exclusionId } = {}) => pauses.delete(exclusionId && id ? `${id}#${exclusionId}` : id),
     count: async () => {},
     getRun: async (id) => structuredClone(runs.get(id) ?? null),
     // As Firestore's: with mustExist, false when the workload is gone, nothing written.
@@ -651,7 +652,8 @@ export function setup(change = () => {}, { clock = fakeClock() } = {}) {
       favicons.set(id, structuredClone(favicon));
     },
     deleteWorkload: async (id) => {
-      for (const kind of [configs, runs, schedules, pauses, favicons]) kind.delete(id);
+      for (const kind of [configs, runs, schedules, favicons]) kind.delete(id);
+      for (const key of [...pauses.keys()]) if (key === id || key?.startsWith(`${id}#`)) pauses.delete(key);
       pages.delete(pagePath({ workloadId: id }));
     },
     transition: async (id, { cond, set = {}, remove = [], increment = [] }) => {

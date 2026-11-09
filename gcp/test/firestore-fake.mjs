@@ -112,7 +112,8 @@ export function fakeFirestore() {
       return names.length ? names.map((name) => ({ document: wire(name), readTime: 'x' })) : [{ readTime: 'x' }];
     }
     if (method === 'GET') {
-      const [route, query = ''] = path.slice(1).split('?');
+      const [encoded, query = ''] = path.slice(1).split('?');
+      const route = encoded.replaceAll('%23', '#');
       if (docs.has(route)) return wire(route);
       if (!route.includes('/')) {
         const params = new URLSearchParams(query);

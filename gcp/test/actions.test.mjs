@@ -239,22 +239,46 @@ test('pause and resume: a workload\'s or, without workloadId, the router\'s, in 
   assert.deepEqual((await act({ action: 'pause', workloadId: 'nope', reason: 'r', refusals: true })).body.refused.code, 'not_found');
 });
 
-test('pause and resume: an exclusion\'s, with exclusionId or targetGroupArn, is refused as invalid, so it neither replaces nor lifts the operator\'s pause', async () => {
-  const { call, act, store } = world();
+test('pause and resume: an exclusion\'s, with its exclusionId and the workload\'s backend service, sits beside the operator\'s and is listed first; lifting it leaves the operator\'s, and the operator\'s resume leaves it', async () => {
+  const { call, act, store, clock } = world();
   await call('POST', '/v1/workloads', INPUT);
   await act({ action: 'pause', workloadId: 'demo', reason: 'deploy', by: 'ops' });
-  const refused = { refused: { code: 'invalid', message: 'exclusions don\'t reach Google Cloud routers yet' } };
-  for (const payload of [
-    { action: 'pause', workloadId: 'demo', reason: 'excluded: batch', exclusionId: 'x1', by: 'mgr' },
-    { action: 'pause', workloadId: 'demo', reason: 'excluded: batch', targetGroupArn: 'arn:aws:elasticloadbalancing:eu-west-1:1:targetgroup/demo/1', by: 'mgr' },
-    { action: 'pause', reason: 'excluded: batch', exclusionId: 'x1', by: 'mgr' },
-    { action: 'resume', workloadId: 'demo', exclusionId: 'x1', by: 'mgr' },
-    { action: 'resume', workloadId: 'demo', targetGroupArn: 'arn:aws:elasticloadbalancing:eu-west-1:1:targetgroup/demo/1', by: 'mgr' },
-  ]) {
-    assert.deepEqual(await act({ ...payload, refusals: true }), { status: 200, body: refused }, JSON.stringify(payload));
+  const path = 'projects/p/global/backendServices/app';
+  const asked = { action: 'pause', workloadId: 'demo', reason: 'excluded: batch', exclusionId: 'x1', backendService: path, by: 'mgr' };
+  const answer = await act({ ...asked, refusals: true });
+  const exclusion = { scope: 'workload', by: 'mgr', at: iso(clock.now()), reason: 'excluded: batch', until: null, keepAsleep: false, exclusionId: 'x1' };
+  assert.deepEqual(answer, { status: 200, body: { pause: exclusion, woken: [] } });
+  assert.deepEqual([...store.pauses.keys()].sort(), ['demo', 'demo#x1']);
+  const { body } = await act({ action: 'status', workloadId: 'demo' });
+  assert.deepEqual(body.pauses.map((p) => [p.by, p.exclusionId ?? null]), [['mgr', 'x1'], ['ops', null]]);
+  // A name is compared as the path's last part.
+  assert.equal((await act({ ...asked, backendService: 'app', refusals: true })).body.pause.exclusionId, 'x1');
+  assert.deepEqual(await act({ action: 'resume', workloadId: 'demo', exclusionId: 'x1', by: 'mgr' }), { status: 200, body: { resumed: true } });
+  assert.deepEqual(await act({ action: 'resume', workloadId: 'demo', exclusionId: 'x1', by: 'mgr' }), { status: 200, body: { resumed: false } });
+  assert.deepEqual([...store.pauses.keys()], ['demo']);
+  await act({ ...asked });
+  assert.deepEqual((await act({ action: 'resume', workloadId: 'demo', by: 'ops' })).body, { resumed: true });
+  assert.deepEqual([...store.pauses.keys()], ['demo#x1']);
+});
+
+test('pause: another backend service, or an unknown workload, is refused "workload not configured", whatever the exclusion; a targetGroupArn is a bad request', async () => {
+  const { call, act, store } = world();
+  await call('POST', '/v1/workloads', INPUT);
+  const notConfigured = { refused: { code: 'not_found', message: 'workload not configured: demo' } };
+  const exclusion = { action: 'pause', reason: 'excluded: batch', exclusionId: 'x1', by: 'mgr', refusals: true };
+  assert.deepEqual((await act({ ...exclusion, workloadId: 'demo', backendService: 'projects/p/global/backendServices/other' })).body, notConfigured);
+  assert.deepEqual((await act({ ...exclusion, workloadId: 'nope', backendService: 'projects/p/global/backendServices/app' })).body, { refused: { code: 'not_found', message: 'workload not configured: nope' } });
+  assert.equal(store.pauses.size, 0);
+  const arn = 'arn:aws:elasticloadbalancing:eu-west-1:1:targetgroup/demo/1';
+  for (const action of ['pause', 'resume']) {
+    assert.deepEqual(await act({ action, workloadId: 'demo', reason: 'r', exclusionId: 'x1', targetGroupArn: arn, by: 'mgr' }), { status: 400, body: { error: 'a Google Cloud router has no targetGroupArn: name the backendService', reason: 'bad-request' } });
   }
-  assert.deepEqual(await act({ action: 'resume', workloadId: 'demo', exclusionId: 'x1', by: 'mgr' }), { status: 400, body: { error: refused.refused.message, reason: 'bad-request' } });
-  assert.deepEqual([...store.pauses].map(([id, p]) => [id, p.by, p.reason]), [['demo', 'ops', 'deploy']]);
+  // An exclusionId is a document id's part: not empty, not long, no / or #.
+  for (const exclusionId of ['', 'a/b', 'a#b', 'x'.repeat(65)]) {
+    const res = await act({ action: 'pause', workloadId: 'demo', reason: 'r', exclusionId, by: 'mgr' });
+    assert.equal(res.status, 400, JSON.stringify(exclusionId));
+  }
+  assert.equal(store.pauses.size, 0);
 });
 
 // A router of asleep workloads, each read and write of the store taking 100 ms (a Firestore call), on a clock where time passes

@@ -518,6 +518,27 @@ test('pauses: two workloads paused, one expired; the store gives both, the expir
   assert.deepEqual(await store.listPauses(), []);
 });
 
+test('pauses: an operator\'s pause and an exclusion\'s on one workload both hold; removing the exclusion\'s keeps the operator\'s; offboarding removes both', async () => {
+  const { store, docs } = setup();
+  const operator = { by: 'ops', at: 1000, reason: 'deploy', keepAsleep: false };
+  const exclusion = { by: 'mgr', at: 2000, reason: 'excluded: batch', keepAsleep: false, exclusionId: 'x1' };
+  await store.addPause('w1', operator);
+  await store.addPause('w1', exclusion);
+  await store.addPause('w10', { ...exclusion, exclusionId: 'x2' });
+  assert.ok(docs.has('pauses/w1') && docs.has('pauses/w1#x1'));
+  assert.deepEqual((await store.getPauses('w1')).sort((a, b) => a.at - b.at), [{ workloadId: 'w1', ...operator }, { workloadId: 'w1', ...exclusion }]);
+  assert.deepEqual((await store.listPauses()).map((p) => [p.workloadId, p.exclusionId ?? null]).sort(), [['w1', 'x1'], ['w1', null], ['w10', 'x2']].sort());
+  // The exclusion's removal names its id; a newer one is kept; the operator's stays.
+  assert.equal(await store.removePauses('w1', { exclusionId: 'x1', at: 1 }), false);
+  assert.equal(await store.removePauses('w1', { exclusionId: 'x1' }), true);
+  assert.equal(await store.removePauses('w1', { exclusionId: 'x1' }), false);
+  assert.deepEqual(await store.getPauses('w1'), [{ workloadId: 'w1', ...operator }]);
+  await store.addPause('w1', exclusion);
+  await store.deleteWorkload('w1');
+  assert.deepEqual(await store.getPauses('w1'), []);
+  assert.deepEqual((await store.listPauses()).map((p) => p.workloadId), ['w10']);
+});
+
 test('the router pause (router/pause): put, read with no workload, listed among the pauses, removed once; a newer one is kept', async () => {
   const { store } = setup();
   assert.equal(await store.getRouterPause(), null);

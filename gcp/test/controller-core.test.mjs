@@ -452,6 +452,23 @@ test('a VM a nap could not give its own type back: the next wake sets it first a
   assert.equal(t.logged('StateChanged').find((l) => l.to === STATES.AWAKE).fallbacks, undefined);
 });
 
+// The live acceptance (2026-11-09): the start's operation failed on the global quota, its status 403.
+const GLOBAL_QUOTA = "Google: operation start https://www.googleapis.com/compute/v1/projects/dormeto-dev/zones/europe-west1-b/instances/dmt-demo: QUOTA_EXCEEDED: Quota 'CPUS_ALL_REGIONS' exceeded.  Limit: 32.0 globally.";
+for (const [name, error, kind] of [
+  ['the live message, its operation\'s status 403', () => new GoogleError(GLOBAL_QUOTA, { code: 403, reason: 'QUOTA_EXCEEDED' }), 'quota'],
+  ['a call\'s reason quotaExceeded on a 403', () => new GoogleError('Google: POST: 403 Quota exceeded', { code: 403, reason: 'quotaExceeded' }), 'quota'],
+  ['a call\'s reason rateLimitExceeded on a 403', () => new GoogleError('Google: POST: 403 Rate limit exceeded', { code: 403, reason: 'rateLimitExceeded' }), 'throttled'],
+  ['a stockout on a 403 stays capacity', () => new GoogleError('Google: operation start: ZONE_RESOURCE_POOL_EXHAUSTED: no capacity', { code: 403, reason: 'ZONE_RESOURCE_POOL_EXHAUSTED' }), 'capacity'],
+  ['a real refusal stays permission', () => new GoogleError("Google: POST: 403 Required 'compute.instances.start' permission", { code: 403, reason: 'forbidden' }), 'permission'],
+]) {
+  test(`a start's failure, ${name}: the kind ${kind}`, async () => {
+    const t = setup({ run: waking(START), vms: { 'vm-a': { status: 'TERMINATED' } } });
+    t.world.on['start vm-a'] = async () => { throw error(); };
+    await t.controller.wake('demo', 'w1');
+    assert.equal(JSON.parse(t.run().failure).kind, kind);
+  });
+}
+
 test('a start refused without the permission: FAILED with the kind permission', async () => {
   const t = setup({ run: waking(START), vms: { 'vm-a': { status: 'TERMINATED' } } });
   t.world.on['start vm-a'] = async () => { throw new GoogleError("Google: POST: 403 Required 'compute.instances.start' permission", { code: 403 }); };

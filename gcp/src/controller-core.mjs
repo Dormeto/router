@@ -148,6 +148,14 @@ const COMPANION_DRIFT = {
 };
 // What the shared classification cannot read in a Google error.
 const KIND_OF_CODE = { 403: 'permission', 429: 'throttled' };
+// Google's own code of an error (an operation's `errors[0].code`, a call's `reason`) says more than the HTTP status: Compute
+// Engine answers a quota or a stockout with a 403 too. It decides before the status.
+const KIND_OF_REASON = [
+  [/^(QUOTA_EXCEEDED|quotaExceeded)$|_QUOTA_EXCEEDED$/, 'quota'],
+  [/^(rateLimitExceeded|userRateLimitExceeded|RATE_LIMIT_EXCEEDED)$/, 'throttled'],
+  [/RESOURCE_POOL_EXHAUSTED|POOL_CAPACITY_INSUFFICIENT/, 'capacity'],
+];
+const kindOfReason = (reason) => KIND_OF_REASON.find(([pattern]) => pattern.test(reason ?? ''))?.[1];
 // A machine type's change refused for the permission: a router installed before it was in its role.
 const SET_TYPE_REFUSED = 'the router\'s role lacks compute.instances.setMachineType: run dormeto gcp install again';
 // Google refused the change itself, its operation's error included: nothing changed.
@@ -186,7 +194,7 @@ async function each(items, action) {
 
 function failedFrom(err, options) {
   // The URL map kept changing, as a throttled switch.
-  const kind = err.kind ?? (err.reason === OPERATION_NOT_DONE ? 'timeout' : mapBusy(err) ? 'throttled' : KIND_OF_CODE[err.code]);
+  const kind = err.kind ?? (err.reason === OPERATION_NOT_DONE ? 'timeout' : mapBusy(err) ? 'throttled' : kindOfReason(err.reason) ?? KIND_OF_CODE[err.code]);
   return failedSpec(kind ? Object.assign(err, { kind }) : err, options);
 }
 

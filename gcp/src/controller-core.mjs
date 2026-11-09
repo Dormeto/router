@@ -63,7 +63,7 @@ import { DAY_MS, STATES, utcDay } from '../../lambda/src/lib/state.mjs';
 import { createListRefresher } from '../../lambda/src/lib/list-refresh.mjs';
 import { withWake } from '../../lambda/src/lib/page-settings.mjs';
 import { createWakeWatch } from '../../lambda/src/lib/wake-watch.mjs';
-import { activityOf } from './activity.mjs';
+import { activityOf, createNoWakeRules } from './activity.mjs';
 import { COMPANION_GONE, companionGone, companionLost, isCompanion, startDatabase, statusOf, stopDatabase } from './cloudsql.mjs';
 import {
   giveBackOwner, isPods, ownerAsVm, ownerChanged, ownerRecord, ownerText, podsUnhealthy, recordOf, sleepOwner, wakeOwner, watchRecord,
@@ -326,8 +326,10 @@ export function createController({
   // In the service's scope: a regional or internal load balancer's in its region, the others' global.
   const readService = ({ backendService, lb }) => (isRegionalLb(lb) ? compute.getRegionBackendService(lb.region, backendService) : compute.getBackendService(backendService));
 
-  // The router's lists as the waker holds them (waker.mjs), for the requests the idle check reads in the logs.
+  // The router's lists as the waker holds them (waker.mjs), for the requests the idle check reads in the logs, and the no-wake rules of
+  // every level as it compiles them (activity.mjs).
   const listCache = lists.length ? createListCache({ store, lists, now, log }) : null;
+  const noWakeRules = createNoWakeRules(log);
   // When each workload's empty logs were last said (LOGS_EMPTY_EVERY_MS).
   const logsEmptySaid = new Map();
 
@@ -350,15 +352,16 @@ export function createController({
 
   // The workload's activity over [from, to] (ms), what the idle check and an idle nap's last read go by: `{ activity, reads }`. On
   // a backend service that logs every request, any entry of its logs makes them decide alone, whatever Monitoring counts (M2: the
-  // count is sampled and batched): the requests the waker would not ignore (activity.mjs). Otherwise the service's request count
-  // decides, through its load balancer's metric, as before the logs: without logs, when they cannot be read, and when they are empty,
-  // so that a log lost upstream (a _Default sink's exclusion, the first minutes of regional logging) naps no busy workload, said in
-  // `LogsEmpty`. A log lost only in part is not caught: an exclusion that keeps a sample, one added during the window, or a long
-  // ingestion delay leaves entries, and they decide. `reads`: null when that count is none, idle whichever is read.
+  // count is sampled and batched): the requests the waker would not ignore (activity.mjs), the no-wake rules of every level of the
+  // resolved `cfg` included. Otherwise the service's request count decides, through its load balancer's metric, as before the logs:
+  // without logs, when they cannot be read, and when they are empty, so that a log lost upstream (a _Default sink's exclusion, the first
+  // minutes of regional logging) naps no busy workload, said in `LogsEmpty`. A log lost only in part is not caught: an exclusion that
+  // keeps a sample, one added during the window, or a long ingestion delay leaves entries, and they decide. `reads`: null when that
+  // count is none, idle whichever is read.
   async function activityBetween(cfg, from, to) {
     const { workloadId, backendService } = cfg;
     const requests = await loggedRequests(cfg, from, to);
-    if (requests?.length) return { activity: activityOf(requests, { lists: listCache ? await listCache.get() : [], rules: [] }), reads: READS.logs };
+    if (requests?.length) return { activity: activityOf(requests, { lists: listCache ? await listCache.get() : [], rules: noWakeRules(cfg) }), reads: READS.logs };
     const count = await monitoring.requestCount({ backendService, ...(cfg.lb ? { lb: cfg.lb } : {}), from, to });
     const said = logsEmptySaid.get(workloadId);
     if (requests && count > 0 && (said === undefined || now() - said >= LOGS_EMPTY_EVERY_MS)) {

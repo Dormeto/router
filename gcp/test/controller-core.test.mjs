@@ -3826,6 +3826,50 @@ test('request logs: an address of a list the waker ignores is no activity, the l
   assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.AWAKE }]);
 });
 
+// G4's design left the no-wake rules to G5 (vision docs/specs/2026-11-07-google-cloud-fixes-design.md, section 5): a request a rule of
+// any level ignores is no activity, as the waker ignores it.
+const PARTNER = 'AcmeSync/2.1 (+https://acme.example/sync)';
+const PARTNER_RULE = { name: 'partner', userAgentPattern: '^AcmeSync/' };
+const PARTNER_LOGS = [entry('/', { userAgent: PARTNER }), entry('/api/orders', { userAgent: PARTNER }), entry('/api/orders', { method: 'POST', userAgent: PARTNER })];
+
+test('request logs: entries all from a user agent a no-wake rule names, the workload\'s or the router\'s, are no activity: the nap asked; without the rule, awake', async () => {
+  const logged = { run: AWAKE_LONG, vms: RUNNING, requests: 3, logConfig: EVERY_REQUEST, logs: PARTNER_LOGS };
+  const workload = setup({ ...logged, cfg: { noWakeRules: [PARTNER_RULE] } });
+  assert.deepEqual(await workload.controller.check(), [{ workloadId: 'demo', state: STATES.AWAKE, nap: 'requested' }]);
+  assert.equal(workload.run().idleReads, 'request logs');
+  const router = leveled({ defaults: { noWakeRules: [PARTNER_RULE] } }, logged);
+  assert.deepEqual(await router.controller.check(), [{ workloadId: 'demo', state: STATES.AWAKE, nap: 'requested' }]);
+  assert.equal(router.run().idleReads, 'request logs');
+  const none = setup(logged);
+  assert.deepEqual(await none.controller.check(), [{ workloadId: 'demo', state: STATES.AWAKE }]);
+  assert.deepEqual(none.world.tasks, []);
+  assert.equal(none.run().idleReads, 'request logs');
+});
+
+test('an idle nap\'s last read applies the no-wake rules too: the partner\'s requests during the wait, it naps', async () => {
+  const t = setup({
+    run: AWAKE_LONG, cfg: { hibernate: false, noWakeRules: [PARTNER_RULE] }, vms: RUNNING, logConfig: EVERY_REQUEST,
+    logs: logView(PARTNER_LOGS.map((request) => [START + 1000, request])),
+  });
+  assert.equal((await t.controller.check())[0].nap, 'requested');
+  assert.equal((await t.controller.nap('demo', t.world.tasks[0].body)).state, STATES.ASLEEP);
+  assert.equal(t.world.logReads.length, 2);
+});
+
+// As the waker compiles them (lambda/src/lib/waker-core.mjs): an invalid rule is skipped, so its requests are activity (more wakes,
+// never fewer), and said once, not at each check.
+test('request logs: an invalid no-wake rule is skipped, its requests activity, and said once in NoWakeRuleInvalid', async () => {
+  const logged = { run: AWAKE_LONG, vms: RUNNING, requests: 3, logConfig: EVERY_REQUEST, logs: PARTNER_LOGS };
+  const BROKEN = { name: 'broken', userAgentPattern: '(' };
+  const beside = setup({ ...logged, cfg: { noWakeRules: [BROKEN, PARTNER_RULE] } });
+  assert.equal((await beside.controller.check())[0].nap, 'requested');
+  const alone = setup({ ...logged, cfg: { noWakeRules: [BROKEN] } });
+  assert.deepEqual(await alone.controller.check(), [{ workloadId: 'demo', state: STATES.AWAKE }]);
+  alone.clock.advance(MINUTE);
+  await alone.controller.check();
+  assert.deepEqual(alone.logged('NoWakeRuleInvalid').map(({ level, rule }) => ({ level, rule })), [{ level: 'workload', rule: 'broken' }]);
+});
+
 // `timed`: `[at (ms), request]`, what the log view holds; read as logs.mjs reads it, over [from, to).
 const logView = (timed) => ({ from, to }) => timed.filter(([at]) => at >= from && at < to).map(([, request]) => request);
 

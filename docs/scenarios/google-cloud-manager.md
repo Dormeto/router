@@ -87,6 +87,17 @@ that one alone; without it, a `resume` lifts the operator's. `status` lists the 
 (`dormeto gcp workloads onboard --name --set-tag`), and shown in the rows and in each event's `tags`. An onboarding says where
 it came from, `source: "cli"` or `"manager"`.
 
+## Onboarding through the manager
+
+`preview` and `onboard` take AWS's onboarder payload: `databases` is a list of Cloud SQL instance names (the CLI's) or of
+AWS's entries `{ "kind": "cloudsql-instance", "id": <name> }`, not both in one list, and an entry of another kind is
+refused (`invalid`); the fallback machine types are `settings.fallbackInstanceTypes`, or `fallbackInstanceTypes` at the
+top level, not both. GKE access and request logs are not taken: they stay with the CLI. An onboarding from the manager
+records `onboardedBy`, who asked (`unknown` when the payload names no one), which the workload's `status` and rows carry;
+one from the CLI records no one. `status`'s `instance` and `asg` backends carry `resourceId`, the numeric id the
+onboarding stored (the manager removes the tag it bound on that id at an offboarding), and their `location`; an
+onboarding older than that has no `resourceId`. `status` also keeps the workload's `requestLogs`.
+
 ## Ended windows
 
 An ended window (a schedule's window with a date that is past) is removed from its schedule at a check, once it ended

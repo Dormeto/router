@@ -716,3 +716,22 @@ test('the README and the Compute Engine page give Google Cloud the organization\
   assert.match(readme, /On Google Cloud too \(router 0\.40\.0\), with the endedWindowDays of the settings the manager pushes to the router: 365 days without them, and 0 keeps them\./);
   for (const [file, stale] of [['gcp/src/controller-core.mjs', /comes with G2|wait for G2/], ['gcp/src/onboarding.mjs', /until G2/]]) assert.doesNotMatch(read(file), stale, file);
 });
+
+// G2 plan 2 (D2): the onboarder's payload, the backends' ids and who onboarded, from the code.
+test('the manager page says what preview and onboard take, and what status keeps, as the code does', () => {
+  const page = flat(read(MANAGER));
+  // actions.mjs's databaseNames and onboardingOf.
+  assert.match(ACTIONS_SRC, /databases: a list of names or a list of \{ kind, id \} entries, not both/);
+  assert.match(ACTIONS_SRC, /is not a Cloud SQL instance name: the kind is cloudsql-instance/);
+  assert.match(ACTIONS_SRC, /fallbackInstanceTypes: given in the settings and at the top level, give one/);
+  assert.match(ACTIONS_SRC, /source: 'manager', by: by \?\? 'unknown'/);
+  assert.match(page, /preview and onboard take AWS's onboarder payload: databases is a list of Cloud SQL instance names \(the CLI's\) or of AWS's entries \{ "kind": "cloudsql-instance", "id": <name> \}, not both in one list, and an entry of another kind is refused \(invalid\)/);
+  assert.match(page, /the fallback machine types are settings\.fallbackInstanceTypes, or fallbackInstanceTypes at the top level, not both/);
+  assert.match(page, /GKE access and request logs are not taken: they stay with the CLI/);
+  // onboarding.mjs's onboardedBy, actions.mjs's resourceIdOf.
+  assert.match(read('gcp/src/onboarding.mjs'), /\.\.\.\(by \? \{ onboardedBy: by \} : \{\}\),/);
+  assert.match(page, /An onboarding from the manager records onboardedBy, who asked \(unknown when the payload names no one\), which the workload's status and rows carry; one from the CLI records no one/);
+  assert.match(ACTIONS_SRC, /\{ resourceId: String\(id\) \}/);
+  assert.match(page, /status's instance and asg backends carry resourceId, the numeric id the onboarding stored \(the manager removes the tag it bound on that id at an offboarding\), and their location; an onboarding older than that has no resourceId/);
+  assert.match(page, /status also keeps the workload's requestLogs/);
+});

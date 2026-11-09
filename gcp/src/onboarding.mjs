@@ -304,7 +304,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     ]);
     if (inGlobal && inRegion) return { reason: `URL map ${urlMap} exists globally and in region ${config.region}: say which with --load-balancer ${KINDS_TEXT}` };
     if (inGlobal || inRegion) return { map: inGlobal ?? inRegion, regional: Boolean(inRegion) };
-    if (askedRegional) return { reason: `URL map ${urlMap} not found in region ${config.region}: ${OTHER_ROUTERS}` };
+    if (askedRegional) return { reason: `URL map ${urlMap} not found in region ${config.region}: ${OTHER_ROUTERS}${asked === 'internal' ? ', or use --load-balancer cross-region-internal' : ''}` };
     if (asked) return { reason: `URL map ${urlMap} not found: name a global URL map of this project, or use --load-balancer ${asked === 'cross-region-internal' ? 'internal' : 'regional'}` };
     return { reason: `URL map ${urlMap} not found: name a global URL map of this project, or a regional one of ${config.region}: ${OTHER_ROUTERS}` };
   }

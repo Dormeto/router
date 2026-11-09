@@ -620,7 +620,8 @@ const LB_REFUSALS = [
   ['--load-balancer regional with a map only elsewhere', (w) => { w.regions['us-central1'] = regionOf('us-central1'); }, { loadBalancer: 'regional' }, ['URL map lb not found in region europe-west1: regional load balancers are onboarded on the router of their region']],
   ['--load-balancer global with a map only in the region', regional, { loadBalancer: 'global' }, ['URL map lb not found: name a global URL map of this project, or use --load-balancer regional']],
   ['--load-balancer classic with a map only in the region', regional, { loadBalancer: 'classic' }, ['URL map lb not found: name a global URL map of this project, or use --load-balancer regional']],
-  ['--load-balancer internal with a map only global', crossRegionInternal, { loadBalancer: 'internal' }, ['URL map lb not found in region europe-west1: regional load balancers are onboarded on the router of their region']],
+  // The likeliest mix-up of the internal kinds: the cross-region one is named.
+  ['--load-balancer internal with a map only global', crossRegionInternal, { loadBalancer: 'internal' }, ['URL map lb not found in region europe-west1: regional load balancers are onboarded on the router of their region, or use --load-balancer cross-region-internal']],
   ['--load-balancer cross-region-internal with a map only in the region', internal, { loadBalancer: 'cross-region-internal' }, ['URL map lb not found: name a global URL map of this project, or use --load-balancer internal']],
   ['a mix of EXTERNAL and EXTERNAL_MANAGED forwarding rules', (w) => {
     w.forwardingRules.push({ name: 'lb-fr2', target: w.forwardingRules[0].target, loadBalancingScheme: 'EXTERNAL' });

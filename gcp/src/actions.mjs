@@ -21,11 +21,13 @@ import { maintenanceDue } from '../../lambda/src/lib/schedule.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { STATS_DAYS } from '../../lambda/src/lib/summary.mjs';
 import { CHECK_SCHEDULE, PauseRefused } from './controller-core.mjs';
+import { INSTANCE_NAME } from './cloudsql.mjs';
 import { isPods } from './gke.mjs';
 import { Refusal } from './onboarding.mjs';
 import { organizationOf } from './organization.mjs';
 import { CUSTOM_PAGES_REFUSED } from './pages.mjs';
 import { rowOf } from './rows.mjs';
+import { isRegionalLb } from './switch.mjs';
 
 // A refusal's status as AWS's code (lambda/src/lib/refusal.mjs).
 const CODES = { 400: 'invalid', 404: 'not_found', 409: 'conflict' };
@@ -39,6 +41,7 @@ const TARGET_GROUP_REFUSED = 'a Google Cloud router has no targetGroupArn: name 
 const EXCLUSION_ID_MAX = 64;
 // The manager's are UUIDs; part of a document id, so no character a URL or a path changes.
 const EXCLUSION_ID = /^[A-Za-z0-9._-]+$/;
+const BACKEND_SERVICE_PATH = /^projects\/([^/]+)\/(global|regions\/[^/]+)\/backendServices\/([^/]+)$/;
 
 const iso = (ms) => new Date(ms).toISOString();
 const isoOrNull = (ms) => (typeof ms === 'number' && ms > 0 ? iso(ms) : null);
@@ -97,7 +100,9 @@ function databaseNames(databases) {
   if (!entries.length) return databases;
   if (entries.length !== databases.length) throw invalid('databases: a list of names or a list of { kind, id } entries, not both');
   const other = entries.find((entry) => entry.kind !== 'cloudsql-instance');
-  if (other) throw invalid(`databases: kind ${JSON.stringify(other.kind)} is not a Cloud SQL instance name: the kind is cloudsql-instance`);
+  if (other) throw invalid(`databases: ${JSON.stringify(other.kind)} is not a Cloud SQL instance's kind: the kind is cloudsql-instance`);
+  const unnamed = entries.find((entry) => typeof entry.id !== 'string' || !INSTANCE_NAME.test(entry.id));
+  if (unnamed) throw invalid(unnamed.id === undefined ? 'databases: an entry needs an id: the Cloud SQL instance name' : `databases: ${JSON.stringify(unnamed.id)} is not a Cloud SQL instance name`);
   return entries.map((entry) => entry.id);
 }
 
@@ -282,8 +287,20 @@ export function createActions({ controller, onboarding, store, router, lists = [
     return exclusionId;
   }
 
+  // Whether `backendService` is the workload's: a bare name is compared as it is; a path `projects/<p>/(global|regions/<r>)/backendServices/<n>`
+  // must be the router's project, the workload's name and its scope (a regional or internal load balancer's region, else global), since
+  // routers of one project may each hold a `web` of their own.
+  function isBackendServiceOf(cfg, backendService) {
+    if (typeof backendService !== 'string') return false;
+    const path = BACKEND_SERVICE_PATH.exec(backendService);
+    if (!path) return backendService.split('/').at(-1) === cfg.backendService;
+    const [, project, scope, name] = path;
+    const region = isRegionalLb(cfg.lb) ? (cfg.lb.region ?? router.region) : null;
+    return project === router.project && name === cfg.backendService && scope === (region === null ? 'global' : `regions/${region}`);
+  }
+
   // AWS's pause: the workload's, or without workloadId the router's (§5.6): `{ pause, woken }`. An exclusion's names its workload's
-  // backend service (a path or a name, compared by name): another workload of the same id is not it.
+  // backend service (a path or a name): another workload of the same id is not it.
   async function pause(payload) {
     const exclusionId = exclusionOf(payload);
     const workloadId = payload.workloadId ?? null;
@@ -294,8 +311,8 @@ export function createActions({ controller, onboarding, store, router, lists = [
         throw err;
       });
       const { backendService } = payload;
-      if (backendService != null && (typeof backendService !== 'string' || backendService.split('/').at(-1) !== cfg.backendService)) {
-        throw new Refusal(404, 'not-found', `workload not configured: ${workloadId}`);
+      if (backendService != null && !isBackendServiceOf(cfg, backendService)) {
+        throw new Refusal(404, 'not-found', `workload not configured: ${workloadId} (its backend service is not ${backendService})`);
       }
     }
     const answer = workloadId === null ? await onboarding.pauseRouter(payload) : await controller.pause(workloadId, payload, { exclusionId }).catch((err) => {

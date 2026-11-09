@@ -74,12 +74,16 @@ The `pause` action without a `workloadId` pauses the whole router, and `resume` 
 kept in `router/pause`, and shows in `list` (`router.pauses`) and in the workloads' own pauses with the scope
 `router`. It is the same pause `dormeto gcp routers pause` sets (`--reason`, `--for`, `--until`, `--keep-asleep`).
 A `request-nap` for a workload a pause holds is not a refusal: it answers `{ "requested": false, "reason" }` with the pause's words, as on AWS.
+## Exclusions
+
 A manager's exclusion pauses a workload as it does on AWS: a `pause` with an `exclusionId` (1 to 64 characters: letters, digits, `.`, `_` and `-`)
 keeps its own pause, `pauses/<workloadId>#<exclusionId>`, beside the operator's, and a `resume` with the `exclusionId` lifts
 that one alone; without it, a `resume` lifts the operator's. `status` lists the exclusions' pauses first, with their
 `exclusionId`. An exclusion's `pause` names the workload's `backendService` (a path or a name) where AWS's names the
-`targetGroupArn`: another backend service, or an unknown workload, is refused `workload not configured: <id>`, and a
-`targetGroupArn` is refused (`invalid`). Offboarding removes every pause of the workload.
+`targetGroupArn`: another backend service, or an unknown workload, is refused `workload not configured: <id>` (with
+`(its backend service is not <path>)` for a backend service), and a `targetGroupArn` is refused (`invalid`). A backend
+service path must be the workload's own: the router's project, its name, and its scope (`global`, or `regions/<region>` of
+a regional or internal load balancer); a bare name is compared by name alone. Offboarding removes every pause of the workload.
 
 ## Names and tags
 
@@ -93,10 +97,10 @@ it came from, `source: "cli"` or `"manager"`.
 AWS's entries `{ "kind": "cloudsql-instance", "id": <name> }`, not both in one list, and an entry of another kind is
 refused (`invalid`); the fallback machine types are `settings.fallbackInstanceTypes`, or `fallbackInstanceTypes` at the
 top level, not both. GKE access and request logs are not taken: they stay with the CLI. An onboarding from the manager
-records `onboardedBy`, who asked (`unknown` when the payload names no one), which the workload's `status` and rows carry;
+records `onboardedBy`, who asked (`unknown` when the payload names no one), which the workload's `status` and the REST Workload carry, not the rows of `list`;
 one from the CLI records no one. `status`'s `instance` and `asg` backends carry `resourceId`, the numeric id the
-onboarding stored (the manager removes the tag it bound on that id at an offboarding), and their `location`; an
-onboarding older than that has no `resourceId`. `status` also keeps the workload's `requestLogs`.
+onboarding stored (the manager removes the `dormeto/managed` binding on that id at an offboarding, whoever bound it, the
+CLI too), and their `location`; a backend stored without its id has none. `status` also keeps the workload's `requestLogs`.
 
 ## Ended windows
 

@@ -673,6 +673,8 @@ test('the manager page says what a pause and a request-nap do, from the code, an
   assert.match(ACTIONS_SRC, /const TARGET_GROUP_REFUSED = 'a Google Cloud router has no targetGroupArn: name the backendService';/);
   assert.match(page, /an exclusionId \(1 to 64 characters: letters, digits, \., _ and -\)/);
   assert.match(page, /another backend service, or an unknown workload, is refused workload not configured: <id>/);
+  assert.match(read(MANAGER), /^## Exclusions$/m);
+  assert.match(page, /A backend service path must be the workload's own: the router's project, its name, and its scope/);
 });
 
 // The final review of G2 plan 1: what the pages said that the code no longer does.
@@ -722,7 +724,7 @@ test('the manager page says what preview and onboard take, and what status keeps
   const page = flat(read(MANAGER));
   // actions.mjs's databaseNames and onboardingOf.
   assert.match(ACTIONS_SRC, /databases: a list of names or a list of \{ kind, id \} entries, not both/);
-  assert.match(ACTIONS_SRC, /is not a Cloud SQL instance name: the kind is cloudsql-instance/);
+  assert.match(ACTIONS_SRC, /is not a Cloud SQL instance's kind: the kind is cloudsql-instance/);
   assert.match(ACTIONS_SRC, /fallbackInstanceTypes: given in the settings and at the top level, give one/);
   assert.match(ACTIONS_SRC, /source: 'manager', by: by \?\? 'unknown'/);
   assert.match(page, /preview and onboard take AWS's onboarder payload: databases is a list of Cloud SQL instance names \(the CLI's\) or of AWS's entries \{ "kind": "cloudsql-instance", "id": <name> \}, not both in one list, and an entry of another kind is refused \(invalid\)/);
@@ -730,8 +732,8 @@ test('the manager page says what preview and onboard take, and what status keeps
   assert.match(page, /GKE access and request logs are not taken: they stay with the CLI/);
   // onboarding.mjs's onboardedBy, actions.mjs's resourceIdOf.
   assert.match(read('gcp/src/onboarding.mjs'), /\.\.\.\(by \? \{ onboardedBy: by \} : \{\}\),/);
-  assert.match(page, /An onboarding from the manager records onboardedBy, who asked \(unknown when the payload names no one\), which the workload's status and rows carry; one from the CLI records no one/);
+  assert.match(page, /An onboarding from the manager records onboardedBy, who asked \(unknown when the payload names no one\), which the workload's status and the REST Workload carry, not the rows of list; one from the CLI records no one/);
   assert.match(ACTIONS_SRC, /\{ resourceId: String\(id\) \}/);
-  assert.match(page, /status's instance and asg backends carry resourceId, the numeric id the onboarding stored \(the manager removes the tag it bound on that id at an offboarding\), and their location; an onboarding older than that has no resourceId/);
+  assert.match(page, /status's instance and asg backends carry resourceId, the numeric id the onboarding stored \(the manager removes the dormeto\/managed binding on that id at an offboarding, whoever bound it, the CLI too\), and their location; a backend stored without its id has none/);
   assert.match(page, /status also keeps the workload's requestLogs/);
 });

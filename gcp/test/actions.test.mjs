@@ -109,6 +109,20 @@ test('list: AWS\'s answer, the router and a row per workload in the AWS row\'s k
   assert.deepEqual([row.scheduled, row.url, row.source, row.backends], [true, 'https://demo.example.com/', 'cli', ['instance']]);
 });
 
+test('list: a row\'s pauses show an exclusion\'s first, with its exclusionId, then the workload\'s own, then the router\'s', async () => {
+  const { call, act, clock } = world();
+  await call('POST', '/v1/workloads', INPUT);
+  await act({ action: 'pause', workloadId: 'demo', reason: 'deploy', by: 'ops' });
+  clock.advance(1000);
+  await act({ action: 'pause', workloadId: 'demo', reason: 'excluded: a', exclusionId: 'x1', by: 'mgr' });
+  clock.advance(1000);
+  await call('POST', '/v1/pause', { reason: 'maintenance', by: 'adm' });
+  clock.advance(1000);
+  await act({ action: 'pause', workloadId: 'demo', reason: 'excluded: b', exclusionId: 'x2', by: 'mgr' });
+  const [row] = (await act({ action: 'list' })).body.workloads;
+  assert.deepEqual(row.pauses.map((p) => [p.scope, p.by, p.exclusionId ?? null]), [['workload', 'mgr', 'x2'], ['workload', 'mgr', 'x1'], ['workload', 'ops', null], ['router', 'adm', null]]);
+});
+
 test('list: an unreadable pause store is said in pausesError, the rows without pauses, as AWS\'s', async () => {
   const { call, act, store } = world();
   await call('POST', '/v1/workloads', INPUT);
@@ -263,10 +277,38 @@ test('pause and resume: an exclusion\'s, with its exclusionId and the workload\'
   assert.deepEqual([...store.pauses.keys()], ['demo#x1']);
 });
 
+test('pause: an exclusion\'s backend service path must be the workload\'s own, by project and scope: the same name in another region, another project or the global scope is refused, and a regional one is paused', async () => {
+  const { call, act, store } = world();
+  await call('POST', '/v1/workloads', INPUT);
+  const exclusion = { action: 'pause', workloadId: 'demo', reason: 'excluded: batch', exclusionId: 'x1', by: 'mgr', refusals: true };
+  const notConfigured = (path) => ({ refused: { code: 'not_found', message: `workload not configured: demo (its backend service is not ${path})` } });
+  // The global workload: its scope is global, in the router's project.
+  for (const path of ['projects/other/global/backendServices/app', `projects/p/regions/${REGION}/backendServices/app`]) {
+    assert.deepEqual((await act({ ...exclusion, backendService: path })).body, notConfigured(path), path);
+  }
+  assert.equal(store.pauses.size, 0);
+  assert.equal((await act({ ...exclusion, backendService: 'projects/p/global/backendServices/app' })).body.pause.exclusionId, 'x1');
+  // A regional workload: its region, not the router\'s other ones, and not the global scope.
+  store.configs.get('demo').lb = { kind: 'regional', region: 'europe-west2' };
+  store.pauses.clear();
+  for (const path of ['projects/p/regions/europe-west1/backendServices/app', 'projects/p/global/backendServices/app', 'projects/other/regions/europe-west2/backendServices/app']) {
+    assert.deepEqual((await act({ ...exclusion, backendService: path })).body, notConfigured(path), path);
+  }
+  assert.equal(store.pauses.size, 0);
+  assert.equal((await act({ ...exclusion, backendService: 'projects/p/regions/europe-west2/backendServices/app' })).body.pause.exclusionId, 'x1');
+  store.configs.get('demo').lb = { kind: 'internal', region: 'europe-west2' };
+  assert.equal((await act({ ...exclusion, exclusionId: 'x2', backendService: 'projects/p/regions/europe-west2/backendServices/app' })).body.pause.exclusionId, 'x2');
+  for (const kind of ['classic', 'cross-region-internal']) {
+    store.configs.get('demo').lb = { kind };
+    assert.equal((await act({ ...exclusion, exclusionId: 'x3', backendService: 'projects/p/global/backendServices/app' })).body.pause.exclusionId, 'x3', kind);
+    assert.equal((await act({ ...exclusion, backendService: 'projects/p/regions/europe-west2/backendServices/app' })).body.refused.code, 'not_found', kind);
+  }
+});
+
 test('pause: another backend service, or an unknown workload, is refused "workload not configured", whatever the exclusion; a targetGroupArn is a bad request', async () => {
   const { call, act, store } = world();
   await call('POST', '/v1/workloads', INPUT);
-  const notConfigured = { refused: { code: 'not_found', message: 'workload not configured: demo' } };
+  const notConfigured = { refused: { code: 'not_found', message: 'workload not configured: demo (its backend service is not projects/p/global/backendServices/other)' } };
   const exclusion = { action: 'pause', reason: 'excluded: batch', exclusionId: 'x1', by: 'mgr', refusals: true };
   assert.deepEqual((await act({ ...exclusion, workloadId: 'demo', backendService: 'projects/p/global/backendServices/other' })).body, notConfigured);
   assert.deepEqual((await act({ ...exclusion, workloadId: 'nope', backendService: 'projects/p/global/backendServices/app' })).body, { refused: { code: 'not_found', message: 'workload not configured: nope' } });
@@ -279,6 +321,12 @@ test('pause: another backend service, or an unknown workload, is refused "worklo
   for (const exclusionId of ['', 'a/b', 'a#b', 'a?b', 'a%b', 'a b', 'x'.repeat(65)]) {
     const res = await act({ action: 'pause', workloadId: 'demo', reason: 'r', exclusionId, by: 'mgr' });
     assert.equal(res.status, 400, JSON.stringify(exclusionId));
+    assert.equal(res.body.error, 'exclusionId must be 1 to 64 characters, with only letters, digits, . _ and -', JSON.stringify(exclusionId));
+  }
+  // An exclusion pauses a workload: without workloadId, pause and resume refuse it.
+  for (const action of ['pause', 'resume']) {
+    const res = await act({ action, reason: 'r', exclusionId: 'x1', by: 'mgr' });
+    assert.deepEqual([res.status, res.body.error], [400, 'an exclusion pauses a workload: workloadId is needed'], action);
   }
   assert.equal(store.pauses.size, 0);
 });
@@ -537,6 +585,7 @@ test('onboard and offboard: who asked is kept in the configuration as AWS\'s onb
   await act({ action: 'offboard', workloadId: 'demo', by: 'bob' });
   await act(asked);
   assert.equal(store.configs.get('demo').onboardedBy, 'unknown');
+  assert.equal((await act({ action: 'status', workloadId: 'demo' })).body.onboardedBy, 'unknown');
   await act({ action: 'offboard', workloadId: 'demo', force: true, by: 'bob' });
   // The CLI's names no one: nothing kept, its lines say unknown.
   await call('POST', '/v1/workloads', INPUT);
@@ -772,7 +821,13 @@ test('preview and onboard: AWS\'s databases entries name a Cloud SQL instance be
   assert.deepEqual(store.configs.get('demo').backends.filter((b) => b.kind === 'cloudsql'), [{ kind: 'cloudsql', name: 'db1' }]);
   const other = await act({ ...asked, databases: [{ kind: 'rds-instance', id: 'db1' }], refusals: true });
   assert.equal(other.body.refused.code, 'invalid');
-  assert.match(other.body.refused.message, /"rds-instance" is not a Cloud SQL instance name/);
+  assert.equal(other.body.refused.message, 'databases: "rds-instance" is not a Cloud SQL instance\'s kind: the kind is cloudsql-instance');
+  for (const entry of [{ kind: 'cloudsql-instance' }, { kind: 'cloudsql-instance', id: 'Bad_Name' }]) {
+    const bad = await act({ ...asked, databases: [entry], refusals: true });
+    assert.equal(bad.body.refused.code, 'invalid', JSON.stringify(entry));
+    assert.match(bad.body.refused.message, /^databases: /, JSON.stringify(entry));
+    assert.doesNotMatch(bad.body.refused.message, /undefined|cloudSql/, JSON.stringify(entry));
+  }
   const mixed = await act({ ...asked, databases: ['db1', { kind: 'cloudsql-instance', id: 'db1' }], refusals: true });
   assert.equal(mixed.body.refused.code, 'invalid');
 });

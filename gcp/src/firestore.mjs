@@ -1,6 +1,6 @@
 // The router's state on Google Cloud: the DynamoDB store's methods over Firestore's REST API (Native mode, one database
 // per router). One document per workload and kind: `workloads/<id>` (the configuration), `runs/<id>` (the state
-// machine), `schedules/<id>`, `pauses/<id>` (a workload's pause), `router/pause` (the router's), `stats/<id>-<day>` (the day's counters, committed in
+// machine), `schedules/<id>`, `pauses/<id>` (a workload's pause, or `<id>#<exclusionId>`: a manager's exclusion's), `router/pause` (the router's), `stats/<id>-<day>` (the day's counters, committed in
 // batches, kept 35 days), `router/sweep` (the day of the last sweep of the old counters), `router/settings` (the router level of the settings:
 // hibernate, joinMinutes, defaults, by, at), `router/check` (the last check's summary), `router/manager` (the organization's settings,
 // pushed by the manager, as one JSON string), `router/page` (the router's waiting page) and, per workload, `pages/<id>` (its
@@ -242,7 +242,7 @@ export function createFirestoreStore({ google, project, database, region = datab
       return true;
     },
 
-    // A workload's pauses (its operator's, and an exclusion's each) and the router's (`router/pause`, workloadId null): [{ workloadId, by, at, reason, until?,
+    // A workload's pauses (its operator's, and an exclusion's each) and the router's (`router/pause`, workloadId null): [{ workloadId, exclusionId?, by, at, reason, until?,
     // keepAsleep }], expired ones included (the controller filters them).
     async getPauses(workloadId) {
       if (!workloadId) {

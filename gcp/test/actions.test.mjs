@@ -134,7 +134,7 @@ test('status: AWS\'s status keys, the Google Cloud resources instead of the targ
   const rest = (await call('GET', '/v1/workloads/demo')).body;
   for (const key of Object.keys(rest).filter((k) => k !== 'backends' && k !== 'hibernation')) assert.deepEqual(body[key], rest[key], key);
   assert.deepEqual(body.hibernation, { ...rest.hibernation, manager: { hibernate: false, readAt: iso(clock.now() - 1000), error: null }, instances: null, freshBoot: false });
-  assert.deepEqual(body.backends, [{ kind: 'instance', id: 'vm-a', status: null, location: ZONE }]);
+  assert.deepEqual(body.backends, [{ kind: 'instance', id: 'vm-a', status: null, location: ZONE, resourceId: '1001' }]);
   assert.deepEqual([body.wakeMode, body.wakeRules, body.noWakeRules], [rest.settings.wakeMode, rest.wakeRules, rest.noWakeRules]);
   // The schedule's answer, AWS's `next` for the REST nextEvents, and the maintenance wake its maxNapDays asks.
   const schedule = (await call('GET', '/v1/workloads/demo/schedule')).body;
@@ -159,13 +159,15 @@ test('status: each backend in AWS\'s kinds, a database a companion', async () =>
   cfg.backends = [
     { kind: 'vm', location: ZONE, name: 'vm-a', id: '1001' },
     { kind: 'mig', location: REGION, name: 'web' },
+    { kind: 'mig', location: REGION, name: 'api', id: 77 },
     { kind: 'k8s', cluster: { location: ZONE, name: 'shop' }, namespace: 'shop', service: 'web', owner: { kind: 'Deployment', name: 'web' } },
     { kind: 'cloudsql', name: 'db' },
   ];
   const { body } = await act({ action: 'status', workloadId: 'demo' });
   assert.deepEqual(body.backends, [
-    { kind: 'instance', id: 'vm-a', status: null, location: ZONE },
+    { kind: 'instance', id: 'vm-a', status: null, location: ZONE, resourceId: '1001' },
     { kind: 'asg', id: 'web', status: null, location: REGION },
+    { kind: 'asg', id: 'api', status: null, location: REGION, resourceId: '77' },
     { kind: 'k8s', id: `${ZONE}/shop/shop/Deployment/web`, status: null, cluster: `${ZONE}/shop`, namespace: 'shop', owner: { kind: 'Deployment', name: 'web' } },
     { kind: 'cloudsql-instance', id: 'db', status: null, companion: true },
   ]);
@@ -758,4 +760,41 @@ test('a refusal: with refusals, AWS\'s answer { refused: { code, message } } and
     assert.deepEqual(res, { status: 200, body: { refused: { code, message: without.body.error } } });
     assert.deepEqual(w.logs.findLast((l) => l.event === 'Refused'), { level: 'info', event: 'Refused', action: payload.action, workloadId: payload.workloadId, code, message: without.body.error });
   }
+});
+
+test('preview and onboard: AWS\'s databases entries name a Cloud SQL instance beside the names; another kind, or a mixed list, is refused', async () => {
+  const { act, store } = world((w) => { w.sql.db1 = {}; });
+  const asked = { action: 'preview', urlMap: 'lb', backendService: 'app', workloadId: 'demo' };
+  const entries = await act({ ...asked, databases: [{ kind: 'cloudsql-instance', id: 'db1' }], refusals: true });
+  assert.deepEqual([entries.body.ok, entries.body.databases.map((d) => d.id)], [true, ['db1']]);
+  assert.deepEqual((await act({ ...asked, databases: ['db1'] })).body.databases, entries.body.databases);
+  await act({ ...asked, action: 'onboard', databases: [{ kind: 'cloudsql-instance', id: 'db1' }] });
+  assert.deepEqual(store.configs.get('demo').backends.filter((b) => b.kind === 'cloudsql'), [{ kind: 'cloudsql', name: 'db1' }]);
+  const other = await act({ ...asked, databases: [{ kind: 'rds-instance', id: 'db1' }], refusals: true });
+  assert.equal(other.body.refused.code, 'invalid');
+  assert.match(other.body.refused.message, /"rds-instance" is not a Cloud SQL instance name/);
+  const mixed = await act({ ...asked, databases: ['db1', { kind: 'cloudsql-instance', id: 'db1' }], refusals: true });
+  assert.equal(mixed.body.refused.code, 'invalid');
+});
+
+test('onboard: settings.fallbackInstanceTypes is stored as the workload\'s fallback types, and given twice is refused', async () => {
+  const { act, store } = world((w) => { w.machineTypes['e2-medium'] = { name: 'e2-medium', memoryMb: 4096 }; });
+  const asked = { action: 'onboard', urlMap: 'lb', backendService: 'app', workloadId: 'demo' };
+  assert.equal((await act({ ...asked, settings: { idleMinutes: 30, fallbackInstanceTypes: ['e2-medium'] }, refusals: true })).body.refused, undefined);
+  assert.deepEqual(store.configs.get('demo').fallbackInstanceTypes, ['e2-medium']);
+  assert.equal(Object.hasOwn(store.configs.get('demo').settings ?? {}, 'fallbackInstanceTypes'), false);
+  const twice = await act({ ...asked, action: 'preview', settings: { fallbackInstanceTypes: ['e2-medium'] }, fallbackInstanceTypes: ['e2-small'], refusals: true });
+  assert.equal(twice.body.refused.code, 'invalid');
+  assert.match(twice.body.refused.message, /fallbackInstanceTypes/);
+});
+
+test('status: a workload the manager onboarded shows who onboarded it, and one onboarded with request logs shows requestLogs.before', async () => {
+  const { act, call } = world();
+  await act({ action: 'onboard', urlMap: 'lb', backendService: 'app', workloadId: 'demo', by: 'ann' });
+  assert.equal((await act({ action: 'status', workloadId: 'demo' })).body.onboardedBy, 'ann');
+  assert.equal((await call('GET', '/v1/workloads/demo')).body.onboardedBy, 'ann');
+  await act({ action: 'offboard', workloadId: 'demo', by: 'ann' });
+  await call('POST', '/v1/workloads', { ...INPUT, requestLogs: { before: { enable: false, sampleRate: 1 } } });
+  const { body } = await act({ action: 'status', workloadId: 'demo' });
+  assert.deepEqual(body.requestLogs, { before: { enable: false, sampleRate: 1 } });
 });

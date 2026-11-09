@@ -255,6 +255,7 @@ function workloadOf(cfg, run, paused, { router = null, organization = null } = {
     ...(Array.isArray(cfg.fallbackInstanceTypes) && cfg.fallbackInstanceTypes.length ? { fallbackInstanceTypes: cfg.fallbackInstanceTypes } : {}),
     ...(fallbacks.length ? { fallbacks } : {}),
     ...(cfg.requestLogs ? { requestLogs: cfg.requestLogs } : {}),
+    ...(cfg.onboardedBy ? { onboardedBy: cfg.onboardedBy } : {}),
     ...(run?.state === STATES.AWAKE && run.awakeSince !== undefined ? { awakeSince: isoOf(run.awakeSince) } : {}),
     ...(run?.lastWake ? { lastWake: run.lastWake } : {}),
     ...(failure ? { failure } : {}),

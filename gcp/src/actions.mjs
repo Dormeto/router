@@ -58,11 +58,14 @@ const inOrder = (pauses) => pauses.sort((a, b) => rankOf(a) - rankOf(b) || b.at.
 // A pause in AWS's words, as its request-nap answers it (controller-core.mjs's pauseText).
 const pauseText = (p) => `${p.scope === 'router' ? 'router ' : ''}paused by ${p.by}: ${p.reason}`;
 
+// The numeric id the onboarding stored, as a string: the manager removes the tag it bound on that id. An older onboarding stored none.
+const resourceIdOf = ({ id }) => (id === undefined || id === null ? {} : { resourceId: String(id) });
+
 // A backend as AWS's status names it (status.mjs): AWS's kind, the Google Cloud location. Its status is not read here.
 function backendOf(backend) {
   switch (backend.kind) {
-    case 'vm': return { kind: 'instance', id: backend.name, status: null, location: backend.location };
-    case 'mig': return { kind: 'asg', id: backend.name, status: null, location: backend.location };
+    case 'vm': return { kind: 'instance', id: backend.name, status: null, location: backend.location, ...resourceIdOf(backend) };
+    case 'mig': return { kind: 'asg', id: backend.name, status: null, location: backend.location, ...resourceIdOf(backend) };
     case 'k8s': {
       const cluster = `${backend.cluster.location}/${backend.cluster.name}`;
       return { kind: 'k8s', id: k8sId({ cluster, namespace: backend.namespace, owner: backend.owner }), status: null, cluster, namespace: backend.namespace, owner: backend.owner };
@@ -86,12 +89,30 @@ function scheduleAnswer({ schedule, nextEvents, joinMinutes, joinFrom, joinInher
 // router/check with its times as the manager reads every router's, ISO.
 const checkOf = (check) => check && { ...check, checkedAt: iso(check.checkedAt), lastScheduledCheckAt: isoOrNull(check.lastScheduledCheckAt) };
 
+// The databases as Cloud SQL instance names: a list of names (the CLI's) or of AWS's entries `{ kind, id }`, not both in one list; an
+// entry of another kind is no Cloud SQL instance. Anything else is left to the onboarding's own check.
+function databaseNames(databases) {
+  if (!Array.isArray(databases)) return databases;
+  const entries = databases.filter(isObject);
+  if (!entries.length) return databases;
+  if (entries.length !== databases.length) throw invalid('databases: a list of names or a list of { kind, id } entries, not both');
+  const other = entries.find((entry) => entry.kind !== 'cloudsql-instance');
+  if (other) throw invalid(`databases: kind ${JSON.stringify(other.kind)} is not a Cloud SQL instance name: the kind is cloudsql-instance`);
+  return entries.map((entry) => entry.id);
+}
+
 // An onboarding in AWS's onboarder's words (`workloadId`, `databases`: here the Cloud SQL instances), with the Google Cloud resources
 // it names, onboarded by the manager, by who asked (`unknown` when the payload names no one, as AWS's onboardedBy). GKE access and
 // request logs stay with the CLI (§8): not taken here.
-const onboardingOf = ({ workloadId, name, tags, settings, urlMap, backendService, loadBalancer, databases, fallbackInstanceTypes, by }) => ({
-  urlMap, backendService, id: workloadId, name, tags, settings, loadBalancer, cloudSql: databases, fallbackInstanceTypes, source: 'manager', by: by ?? 'unknown',
-});
+const onboardingOf = ({ workloadId, name, tags, settings, urlMap, backendService, loadBalancer, databases, fallbackInstanceTypes, by }) => {
+  // AWS's onboarder takes the fallback types inside the settings; the REST body's are at the top. Not both.
+  const { fallbackInstanceTypes: inSettings, ...rest } = isObject(settings) ? settings : {};
+  if (inSettings !== undefined && fallbackInstanceTypes !== undefined) throw invalid('fallbackInstanceTypes: given in the settings and at the top level, give one');
+  return {
+    urlMap, backendService, id: workloadId, name, tags, settings: isObject(settings) ? rest : settings, loadBalancer, cloudSql: databaseNames(databases),
+    fallbackInstanceTypes: inSettings ?? fallbackInstanceTypes, source: 'manager', by: by ?? 'unknown',
+  };
+};
 
 // AWS's preview (lambda/src/lib/onboarding.mjs's preview, :392 and :451): the workload's id, name and tags; instead of the target
 // groups and the load balancer, the Google Cloud resources (the URL map, the backend service, the waker's, `lb`); its backends and

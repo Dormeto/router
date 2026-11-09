@@ -357,7 +357,7 @@ test('manager: its keys, in order', async () => {
   assert.deepEqual(Object.keys(manager.roles), ['dormetoDiscovery', 'dormetoCommand']);
   for (const [id, role] of Object.entries(manager.roles)) {
     assert.match(id, ROLE_ID);
-    assert.deepEqual(Object.keys(role), id === 'dormetoDiscovery' ? ['title', 'description', 'permissions', 'organizationPermissions'] : ['title', 'description', 'permissions'], id);
+    assert.deepEqual(Object.keys(role), id === 'dormetoDiscovery' ? ['title', 'description', 'permissions', 'organizationPermissions', 'note'] : ['title', 'description', 'permissions'], id);
     assert.ok(role.title.length > 0 && role.title.length <= 100, `${id}: title`);
     assert.ok(role.description.length > 0 && role.description.length <= 256, `${id}: description`);
   }
@@ -382,6 +382,8 @@ test('manager: dormetoDiscovery holds only get, list and monitoring.timeSeries.l
   assert.deepEqual(list.filter((p) => /^resourcemanager\.(folders|organizations)\./.test(p) || p === 'resourcemanager.projects.list'), []);
   assert.deepEqual(org, ['resourcemanager.folders.get', 'resourcemanager.folders.list', 'resourcemanager.organizations.get']);
   assert.deepEqual(org.filter((p) => list.includes(p)), []);
+  // The manifest says so itself, for the CLI and the website that read it.
+  assert.equal(manager.roles.dormetoDiscovery.note, 'organizationPermissions are added only where the role is defined in an organization: Google refuses folder and organization permissions in a role defined in a project.');
   includesAll(list, ['resourcemanager.projects.get', 'run.services.get', 'run.services.list', 'monitoring.timeSeries.list'], 'dormetoDiscovery');
   for (const kind of ['urlMaps', 'regionUrlMaps', 'backendServices', 'regionBackendServices', 'targetHttpProxies', 'targetHttpsProxies', 'regionTargetHttpProxies', 'regionTargetHttpsProxies', 'globalForwardingRules', 'forwardingRules', 'instanceGroups', 'instanceGroupManagers', 'instances', 'networkEndpointGroups']) {
     includesAll(list, [`compute.${kind}.get`, `compute.${kind}.list`], 'dormetoDiscovery');

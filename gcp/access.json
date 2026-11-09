@@ -610,7 +610,8 @@
           "resourcemanager.folders.get",
           "resourcemanager.folders.list",
           "resourcemanager.organizations.get"
-        ]
+        ],
+        "note": "organizationPermissions are added only where the role is defined in an organization: Google refuses folder and organization permissions in a role defined in a project."
       },
       "dormetoCommand": {
         "title": "Dormeto manager command",

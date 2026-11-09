@@ -25,7 +25,7 @@ const request = (method, url, body = '', headers = {}) => {
 // The API over the world, as the CLI, Cloud Tasks and the manager (POST /v1/actions) call it.
 function api(change) {
   const world = setup(change);
-  const router = { name: `dmtr-${world.config.region}`, version: null, build: null };
+  const router = { name: `dmtr-${world.config.region}`, version: null, build: null, project: world.config.project, region: world.config.region };
   const actions = createActions({ controller: world.core, onboarding: world.onboarding, store: world.store, router, now: world.clock.now, log: world.log });
   const handler = createControllerApi({ core: world.core, onboarding: world.onboarding, config: world.config, actions });
   const call = async (method, path, body) => {

@@ -194,7 +194,7 @@ export function fromEnvironment(env = process.env, { fetch, log = logger } = {})
     log,
   });
   const onboarding = createOnboarding({ store, compute, cloudsql, gke, urlmaps, regionalUrlmaps, core, config, customPages, log });
-  const router = { name: `dmtr-${config.region}`, version: config.version, build: config.build };
+  const router = { name: `dmtr-${config.region}`, version: config.version, build: config.build, project: config.project, region: config.region };
   const actions = createActions({ controller: core, onboarding, store, router, lists, log });
   const handler = createControllerApi({ core, onboarding, config, actions });
   // SIGTERM commits the buffered stats (server.mjs).

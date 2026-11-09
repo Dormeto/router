@@ -674,6 +674,13 @@ test('the manager page says what a pause and a request-nap do, from the code, an
 });
 
 // The final review of G2 plan 1: what the pages said that the code no longer does.
+test('the manager page says which offboardings are the CLI\'s, with the command the refusal names', () => {
+  const page = flat(read(MANAGER));
+  // actions.mjs's offboard.
+  assert.match(ACTIONS_SRC, /const command = `dormeto gcp workloads offboard \$\{cfg\.workloadId\} --project \$\{router\.project\} --region \$\{router\.region\}`;/);
+  assert.match(page, /offboard refuses \(conflict\) a GKE workload, whose Kubernetes access is the operator's, and a workload whose onboarding turned its backend service's request logs on, which the manager's accounts can't set back; the refusal names the command that offboards it, dormeto gcp workloads offboard <id> --project <p> --region <r>/);
+});
+
 test('the manager page names the CLI\'s onboarding flags as the CLI has them, --name and --set-tag', () => {
   const page = flat(read(MANAGER));
   assert.match(page, /dormeto gcp workloads onboard --name --set-tag/);

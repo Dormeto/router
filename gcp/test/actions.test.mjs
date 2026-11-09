@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { createActions } from '../src/actions.mjs';
 import { createControllerApi } from '../src/controller.mjs';
-import { INPUT, REGION, WAKER, ZONE, setup, virtualClock } from './world.mjs';
+import { GKE_INPUT, INPUT, REGION, WAKER, ZONE, onGke, setup, virtualClock } from './world.mjs';
 
 const iso = (ms) => new Date(ms).toISOString();
 const DAY = 86_400_000;
@@ -41,7 +41,7 @@ function world(change, options) {
     },
     getStats: async (id, days) => ({ days, since: '2023-11-08', today: NO_COUNTS(), total: structuredClone(store.stats.get(id) ?? NO_COUNTS()) }),
   });
-  const router = { name: `dmtr-${config.region}`, version: config.version, build: config.build };
+  const router = { name: `dmtr-${config.region}`, version: config.version, build: config.build, project: config.project, region: config.region };
   const actions = createActions({ controller: core, onboarding, store, router, now: clock.now, log });
   const handler = createControllerApi({ core, onboarding, config, actions });
   const call = async (method, path, body) => {
@@ -542,7 +542,28 @@ test('offboard with force: AWS\'s steps beside the REST forced offboarding\'s an
   assert.equal(store.configs.size, 0);
 });
 
-const EVENT_A = { id: '1700000000000-demo-NAPPING', workloadId: 'demo', from: STATES.AWAKE, to: STATES.NAPPING, router: `dmtr-${REGION}`, region: REGION, project: 'p', at: iso(1_700_000_000_000), cause: 'idle', tags: {} };
+// Design §8: setting the request logs back needs compute.backendServices.update, and a GKE workload's RBAC objects are the operator's.
+test('offboard: a GKE workload, or one whose onboarding turned its request logs on, is refused as a conflict naming the CLI\'s command; nothing removed, the REST route still offboards', async () => {
+  const command = `dormeto gcp workloads offboard demo --project p --region ${REGION}`;
+  const logs = world();
+  await logs.call('POST', '/v1/workloads', { ...INPUT, requestLogs: { before: { enable: false, sampleRate: 1 } } });
+  const gke = world((w) => onGke(w));
+  await gke.call('POST', '/v1/workloads', GKE_INPUT);
+  for (const [t, why] of [
+    [logs, 'its onboarding turned its backend service\'s request logs on, which the CLI sets back'],
+    [gke, 'a GKE workload\'s Kubernetes access is the CLI\'s to remove'],
+  ]) {
+    const message = `cannot offboard demo through the manager: ${why}: ${command}`;
+    for (const force of [undefined, true]) {
+      assert.deepEqual(await t.act({ action: 'offboard', workloadId: 'demo', force, by: 'ann', refusals: true }), { status: 200, body: { refused: { code: 'conflict', message } } }, why);
+    }
+    assert.deepEqual(await t.act({ action: 'offboard', workloadId: 'demo', by: 'ann' }), { status: 409, body: { error: message, reason: 'cli-only' } });
+    assert.ok(t.store.configs.has('demo'), why);
+    assert.equal((await t.call('DELETE', '/v1/workloads/demo')).status, 200, why);
+  }
+});
+
+const EVENT_A ={ id: '1700000000000-demo-NAPPING', workloadId: 'demo', from: STATES.AWAKE, to: STATES.NAPPING, router: `dmtr-${REGION}`, region: REGION, project: 'p', at: iso(1_700_000_000_000), cause: 'idle', tags: {} };
 const EVENT_B = { ...EVENT_A, id: '1700000060000-demo-ASLEEP', from: STATES.NAPPING, to: STATES.ASLEEP, at: iso(1_700_000_060_000) };
 
 test('events: the journal after `after`, `limit` at most, with the last check\'s summary and the etag of the organization\'s settings', async () => {

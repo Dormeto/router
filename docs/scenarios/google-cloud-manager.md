@@ -98,3 +98,7 @@ logged, `EndedWindowsRemoved`.
 - **The journal is 7 days.** A manager that cannot read the router for longer loses the changes in between; its history
   is inferred from the next check's states.
 - **The IP lists stay the router's:** the manager's catalog is in S3, which a Google Cloud router cannot read.
+- **What only the CLI undoes:** `offboard` refuses (`conflict`) a GKE workload, whose Kubernetes access is the
+  operator's, and a workload whose onboarding turned its backend service's request logs on, which the manager's accounts
+  can't set back; the refusal names the command that offboards it, `dormeto gcp workloads offboard <id> --project <p>
+  --region <r>`.

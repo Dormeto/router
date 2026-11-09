@@ -21,6 +21,7 @@ import { maintenanceDue } from '../../lambda/src/lib/schedule.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { STATS_DAYS } from '../../lambda/src/lib/summary.mjs';
 import { CHECK_SCHEDULE, PauseRefused } from './controller-core.mjs';
+import { isPods } from './gke.mjs';
 import { Refusal } from './onboarding.mjs';
 import { organizationOf } from './organization.mjs';
 import { CUSTOM_PAGES_REFUSED } from './pages.mjs';
@@ -113,8 +114,8 @@ async function problemsAnswered(write) {
   }
 }
 
-// `controller`: controller-core.mjs's; `onboarding`: onboarding.mjs's; `router`: `{ name, version, build }`; `lists`: the router's IP
-// lists (DMT_IP_LISTS). `act(payload)` answers `{ status, body }`.
+// `controller`: controller-core.mjs's; `onboarding`: onboarding.mjs's; `router`: `{ name, version, build, project, region }`; `lists`:
+// the router's IP lists (DMT_IP_LISTS). `act(payload)` answers `{ status, body }`.
 export function createActions({ controller, onboarding, store, router, lists = [], now = Date.now, log }) {
   const expired = (p) => p.until !== undefined && p.until <= now();
 
@@ -298,6 +299,22 @@ export function createActions({ controller, onboarding, store, router, lists = [
     return scheduleAnswer(view, await store.getRun(workloadId));
   }
 
+  // AWS's offboard (:793): its steps, with the REST answer's fields (the VMs left on a fallback type, and a forced one's backends left).
+  // What only the CLI undoes is refused with its command (design §8): the request logs the onboarding turned on (setting them back
+  // needs compute.backendServices.update, which the manager's accounts don't hold) and a GKE workload's Kubernetes access (its RBAC
+  // objects are the operator's). The REST route, the CLI's, offboards both.
+  async function offboard({ workloadId, force }) {
+    const cfg = await onboarding.find(workloadId);
+    const why = cfg.backends.some(isPods) ? 'a GKE workload\'s Kubernetes access is the CLI\'s to remove'
+      : cfg.requestLogs?.before ? 'its onboarding turned its backend service\'s request logs on, which the CLI sets back' : null;
+    if (why) {
+      const command = `dormeto gcp workloads offboard ${cfg.workloadId} --project ${router.project} --region ${router.region}`;
+      throw new Refusal(409, 'cli-only', `cannot offboard ${cfg.workloadId} through the manager: ${why}: ${command}`);
+    }
+    const { answer, steps } = await onboarding.offboardWithSteps(cfg.workloadId, { force: force === true });
+    return { steps, ...answer };
+  }
+
   // The journal after `after` (null: from the oldest kept), `limit` at most (§5.3), with what the poll compares: the last check's
   // summary and the etag of the organization's settings the router holds.
   async function events({ after = null, limit }) {
@@ -337,11 +354,7 @@ export function createActions({ controller, onboarding, store, router, lists = [
       const { workload, steps } = await onboarding.onboardWithSteps(onboardingOf(payload));
       return { steps, workload: { workloadId: workload.id, ...workload } };
     },
-    // AWS's offboard (:793): its steps, with the REST answer's fields (the VMs left on a fallback type, and a forced one's backends left).
-    offboard: async ({ workloadId, force }) => {
-      const { answer, steps } = await onboarding.offboardWithSteps(workloadId, { force: force === true });
-      return { steps, ...answer };
-    },
+    offboard,
     events,
     'manager-settings': pushManagerSettings,
   };

@@ -3,7 +3,7 @@
 // machine), `schedules/<id>`, `pauses/<id>` (a workload's pause), `router/pause` (the router's), `stats/<id>-<day>` (the day's counters, committed in
 // batches, kept 35 days), `router/sweep` (the day of the last sweep of the old counters), `router/settings` (the router level of the settings:
 // hibernate, joinMinutes, defaults, by, at), `router/check` (the last check's summary), `router/manager` (the organization's settings,
-// pushed by the manager), `router/page` (the router's waiting page) and, per workload, `pages/<id>` (its
+// pushed by the manager, as one JSON string), `router/page` (the router's waiting page) and, per workload, `pages/<id>` (its
 // waiting page) and `favicons/<id>` (the favicon read while it was awake); `events/<stateAt, 13 digits>-<id>-<to>` (the journal: a
 // state change, committed with the run's, kept 7 days); and the IP lists:
 // `lists/<name>` (the meta) and `listParts/<name>-<version>-<index>` (the packed parts, 350 kB at most). A transition reads the run, checks its condition, and commits
@@ -504,18 +504,21 @@ export function createFirestoreStore({ google, project, database, region = datab
       await commit([{ update: { name: named('router/check'), fields: toFields(summary) } }]);
     },
 
-    // The organization's settings as the manager pushed them (router/manager {settings, etag, at}), as stored: the reader judges whether
-    // `settings` is an object. None before the manager pushed any.
+    // The organization's settings as the manager pushed them (router/manager {settingsJson, etag, at}), `settings` parsed from its one
+    // JSON string: the reader judges whether it is an object. A document written before, its settings a map (`settings`), reads as it
+    // was. None before the manager pushed any.
     async getManagerSettings() {
       const doc = await read('router/manager');
       if (!doc) return null;
-      const { settings, etag, at } = doc.value;
-      return { settings, etag: etag ?? null, at: at ?? 0 };
+      const { settingsJson, settings, etag, at } = doc.value;
+      return { settings: typeof settingsJson === 'string' ? JSON.parse(settingsJson) : settings, etag: etag ?? null, at: at ?? 0 };
     },
 
-    // The manager's push: its whole settings.json, replacing the last. The only writer is the router's `manager-settings` action.
+    // The manager's push: its whole settings.json, replacing the last, as one JSON string, since Firestore refuses as fields what a
+    // settings.json may hold (a reserved name such as a custom type's tag key `__x__`, an array in an array). The only writer is the
+    // router's `manager-settings` action.
     async putManagerSettings({ settings, etag, at }) {
-      await commit([{ update: { name: named('router/manager'), fields: toFields({ settings, etag: etag ?? null, at }) } }]);
+      await commit([{ update: { name: named('router/manager'), fields: toFields({ settingsJson: JSON.stringify(settings), etag: etag ?? null, at }) } }]);
     },
 
     // The kinds of a workload's backends, written apart from the transitions (no version change).

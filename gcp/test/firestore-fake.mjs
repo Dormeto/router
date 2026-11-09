@@ -4,9 +4,37 @@ import { GoogleError } from '../src/google.mjs';
 
 export const ROOT = 'projects/p/databases/dmtr-europe-west1/documents';
 export const BASE = `https://firestore.googleapis.com/v1/${ROOT}`;
+// Firestore's limits (its "Usage and limits" and "Storage size calculations" pages): a document of at most 1 MiB, field names
+// matching __.*__ reserved, no array directly in an array.
+export const DOCUMENT_MAX_BYTES = 1_048_576;
+const RESERVED = /^__.*__$/;
+
+const textSize = (text) => Buffer.byteLength(text) + 1;
+// A value's size as Firestore counts it, refusing what Firestore refuses; `inArray`: the value is an array's element.
+function valueSize(value, inArray = false) {
+  if ('stringValue' in value) return textSize(value.stringValue);
+  if ('booleanValue' in value || 'nullValue' in value) return 1;
+  if ('integerValue' in value || 'doubleValue' in value || 'timestampValue' in value) return 8;
+  if ('bytesValue' in value) return Buffer.from(value.bytesValue, 'base64').length;
+  if ('referenceValue' in value) return nameSize(value.referenceValue.slice(ROOT.length + 1));
+  if ('arrayValue' in value) {
+    if (inArray) throw new Error('an array cannot directly contain another array');
+    return (value.arrayValue.values ?? []).reduce((n, v) => n + valueSize(v, true), 0);
+  }
+  if ('mapValue' in value) return fieldsSize(value.mapValue.fields ?? {});
+  throw new Error(`unsupported Firestore value: ${Object.keys(value).join(', ')}`);
+}
+function fieldsSize(fields) {
+  return Object.entries(fields).reduce((n, [name, value]) => {
+    if (RESERVED.test(name)) throw new Error(`the field name ${name} is reserved`);
+    return n + textSize(name) + valueSize(value);
+  }, 0);
+}
+const nameSize = (name) => name.split('/').reduce((n, segment) => n + textSize(segment), 16);
 
 // A Firestore REST server in memory: documents, `updateTime` preconditions, `exists` preconditions, update masks and
-// `increment` transforms; every request yields once, so that concurrent callers interleave.
+// `increment` transforms, and Firestore's limits on what a document holds (a write that breaks one is refused whole, as
+// Firestore's 400); every request yields once, so that concurrent callers interleave.
 export function fakeFirestore() {
   const docs = new Map();
   const calls = [];
@@ -45,6 +73,13 @@ export function fakeFirestore() {
         const key = fieldPath.replace(/^`(.*)`$/, '$1');
         fields[key] = { integerValue: String(Number(fields[key]?.integerValue ?? 0) + Number(increment.integerValue)) };
       }
+      let size;
+      try {
+        size = nameSize(name) + fieldsSize(fields) + 32;
+      } catch (err) {
+        throw fail(400, 'INVALID_ARGUMENT', `${name}: ${err.message}`);
+      }
+      if (size > DOCUMENT_MAX_BYTES) throw fail(400, 'INVALID_ARGUMENT', `${name} cannot be written because its size (${size} bytes) exceeds the maximum allowed size of ${DOCUMENT_MAX_BYTES} bytes`);
       staged.set(name, { fields });
     }
     clock += 1;

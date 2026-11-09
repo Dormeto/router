@@ -19,8 +19,9 @@ documented in the CLI's README, not here.
   router's health (the same problems as AWS's health that apply here, such as a manager settings document that cannot be
   read, plus pauses that cannot be read), the router's own pauses (a workload's are in its row) and the count of
   workloads by state. A summary that cannot be written fails nothing: the check's work is done.
-- **The organization's level**, `router/manager`: the manager's whole `settings.json` as it pushed it, with its ETag and
-  the time it was stored. Without a push, the organization level reads as unset.
+- **The organization's level**, `router/manager`: the manager's whole `settings.json` as it pushed it, kept as one JSON
+  string (Firestore refuses as a field name some keys a `settings.json` may hold, such as a custom type's tag key
+  `__x__`), with its ETag and the time it was stored. Without a push, the organization level reads as unset.
 
 ## `POST /v1/actions`
 

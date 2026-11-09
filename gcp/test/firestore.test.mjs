@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createFirestoreStore, fromFields, toFields } from '../src/firestore.mjs';
 import { GoogleError } from '../src/google.mjs';
-import { BASE, ROOT, fakeFirestore } from './firestore-fake.mjs';
+import { BASE, DOCUMENT_MAX_BYTES, ROOT, fakeFirestore } from './firestore-fake.mjs';
 
 // `timers` holds the stats' flush timers: `fire()` runs those due, as the 10 s passing.
 function setup({ now = () => Date.parse('2026-03-10T12:00:00Z'), log = null } = {}) {
@@ -926,4 +926,30 @@ test('putManagerSettings stores the manager\'s whole settings.json with its etag
   await store.putManagerSettings({ settings: { workloads: {} }, etag: 'e2', at: 8 });
   assert.deepEqual(await store.getManagerSettings(), { settings: { workloads: {} }, etag: 'e2', at: 8 });
   assert.deepEqual([...docs.keys()], ['router/manager']);
+});
+
+test('the fake refuses what Firestore refuses: a reserved field name, an array in an array, a document over 1 MiB; nothing is written', async () => {
+  const { store, docs } = setup();
+  for (const [config, refused] of [
+    [{ workloadId: 'app', tags: { __x__: 'yes' } }, /400 workloads\/app: the field name __x__ is reserved/],
+    [{ workloadId: 'app', windows: [[1, 2]] }, /400 workloads\/app: an array cannot directly contain another array/],
+    [{ workloadId: 'app', html: 'x'.repeat(DOCUMENT_MAX_BYTES) }, /400 workloads\/app cannot be written because its size \(\d+ bytes\) exceeds the maximum allowed size of 1048576 bytes/],
+  ]) {
+    await assert.rejects(store.putConfig('app', config), (err) => err.status === 'INVALID_ARGUMENT' && refused.test(err.message), refused.source);
+  }
+  assert.deepEqual([...docs.keys()], []);
+  await store.putConfig('app', { workloadId: 'app', windows: [{ days: [1, 2] }], html: 'x'.repeat(DOCUMENT_MAX_BYTES - 200) });
+  assert.deepEqual([...docs.keys()], ['workloads/app']);
+});
+
+test('putManagerSettings: a settings.json Firestore would refuse as fields, a custom type\'s tag key __x__ or an array in an array, is stored as one JSON string and read back whole', async () => {
+  const { store, docs } = setup();
+  const settings = { workloads: { types: [{ name: 'batch', tags: { __x__: 'yes', team: 'data' }, settings: { idleMinutes: 30 } }] }, waitingPage: { mode: 'template', title: 'Acme' }, extra: [[1, 2], []] };
+  await store.putManagerSettings({ settings, etag: 'e1', at: 7 });
+  assert.deepEqual(await store.getManagerSettings(), { settings, etag: 'e1', at: 7 });
+  assert.deepEqual(Object.keys(docs.get('router/manager').fields), ['settingsJson', 'etag', 'at']);
+  assert.equal(fromFields(docs.get('router/manager').fields).settingsJson, JSON.stringify(settings));
+  // A document written before, its settings a map, reads as it was.
+  docs.set('router/manager', { fields: toFields({ settings: { workloads: { hibernate: false } }, etag: 'e0', at: 6 }), updateTime: 't' });
+  assert.deepEqual(await store.getManagerSettings(), { settings: { workloads: { hibernate: false } }, etag: 'e0', at: 6 });
 });

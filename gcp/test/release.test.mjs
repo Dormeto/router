@@ -687,6 +687,12 @@ test('the manager page names the CLI\'s onboarding flags as the CLI has them, --
   assert.doesNotMatch(page, /--tag\b/);
 });
 
+test('the manager page says router/manager keeps the settings.json as one JSON string, and why', () => {
+  // firestore.mjs's putManagerSettings.
+  assert.match(read('gcp/src/firestore.mjs'), /toFields\(\{ settingsJson: JSON\.stringify\(settings\), etag: etag \?\? null, at \}\)/);
+  assert.match(flat(read(MANAGER)), /the manager's whole settings\.json as it pushed it, kept as one JSON string \(Firestore refuses as a field name some keys a settings\.json may hold, such as a custom type's tag key __x__\), with its ETag and the time it was stored/);
+});
+
 test('the manager page says which pauses the check summary holds, which keys the rows and status carry', () => {
   const page = flat(read(MANAGER));
   // controller-core.mjs's check: router/check's pauses are the router's own, a workload's are not in it.

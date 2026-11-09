@@ -269,7 +269,9 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   const wakerHeaders = (id, lb) => [`${WORKLOAD_HEADER}: ${id}`, ...(isSwapped(lb) ? [`${SWITCH_HEADER}: swap`] : [])];
   const wakerDescription = (id) => `Dormeto: the waker of workload ${id}`;
   const mapHeaders = (id, lb) => ({ headers: headersInMap(lb) ? swapHeaders(id) : undefined });
-  const isWakerOf = (service, id, lb) => (headersInMap(lb)
+  // A waker the workload's kind would write: of its scheme (a regional and an internal one share their description, and the map takes
+  // no service of another scheme), with its headers or, where they are in the map, its description.
+  const isWakerOf = (service, id, lb) => service.loadBalancingScheme === SCHEME_OF[lb.kind] && (headersInMap(lb)
     ? service.description === wakerDescription(id) && !service.customRequestHeaders?.length
     : service.customRequestHeaders?.length === wakerHeaders(id, lb).length && wakerHeaders(id, lb).every((h) => service.customRequestHeaders.includes(h)));
   const mapsOf = (lb) => (isRegionalLb(lb) ? regionalUrlmaps : urlmaps);

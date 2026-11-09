@@ -87,7 +87,7 @@ const REFUSALS = [
   ['a route of the customer under /_dormeto/', (w) => {
     w.urlMaps.lb.pathMatchers[0].pathRules = [{ paths: ['/_dormeto/own'], service: serviceUrl('other') }];
   }, ['the URL map has its own /_dormeto/ route at pathMatchers[0].pathRules[0]: change that, then onboard again']],
-  ['a waker name taken by another backend service', (w) => { w.services[WAKER] = { name: WAKER, backends: [] }; }, [`backend service ${WAKER} exists and is not the waker of demo: rename it, or onboard under another id`]],
+  ['a waker name taken by another backend service', (w) => { w.services[WAKER] = { name: WAKER, loadBalancingScheme: 'EXTERNAL_MANAGED', backends: [] }; }, [`backend service ${WAKER} exists and is not the waker of demo: rename it, or onboard under another id`]],
 ];
 
 for (const [name, change, reasons] of REFUSALS) {
@@ -452,7 +452,7 @@ test('onboard twice: a 409, nothing changed', async () => {
 
 test('onboard: a waker backend service of a stopped run of the same workload is taken over', async () => {
   const { w, onboarding } = setup((world) => {
-    world.services[WAKER] = { name: WAKER, customRequestHeaders: ['x-dormeto-workload: demo'], backends: [] };
+    world.services[WAKER] = { name: WAKER, loadBalancingScheme: 'EXTERNAL_MANAGED', customRequestHeaders: ['x-dormeto-workload: demo'], backends: [] };
   });
   assert.equal((await onboarding.dryRun(INPUT)).eligible, true);
   await onboarding.onboard(INPUT);
@@ -679,12 +679,12 @@ const LB_REFUSALS = [
   }, {}, [`backend service ${WAKER} exists and is not the waker of demo: rename it, or onboard under another id`]],
   ['a regional waker name taken by another service', (w) => {
     regional(w);
-    inRegion(w).services[WAKER] = { name: WAKER, backends: [] };
+    inRegion(w).services[WAKER] = { name: WAKER, loadBalancingScheme: 'EXTERNAL_MANAGED', backends: [] };
   }, {}, [`backend service ${WAKER} exists and is not the waker of demo: rename it, or onboard under another id`]],
   // The internal kinds' waker is told by its description, as the regional one's.
   ['an internal waker name taken by another service', (w) => {
     internal(w);
-    inRegion(w).services[WAKER] = { name: WAKER, backends: [] };
+    inRegion(w).services[WAKER] = { name: WAKER, loadBalancingScheme: 'INTERNAL_MANAGED', backends: [] };
   }, {}, [`backend service ${WAKER} exists and is not the waker of demo: rename it, or onboard under another id`]],
   ['a cross-region internal waker name taken by a classic waker, of two headers', (w) => {
     crossRegionInternal(w);
@@ -692,6 +692,19 @@ const LB_REFUSALS = [
   }, {}, [`backend service ${WAKER} exists and is not the waker of demo: rename it, or onboard under another id`]],
   ['a global waker name taken by a cross-region internal waker, of a description and no header', (w) => {
     w.services[WAKER] = { name: WAKER, description: 'Dormeto: the waker of workload demo', backends: [] };
+  }, {}, [`backend service ${WAKER} exists and is not the waker of demo: rename it, or onboard under another id`]],
+  // A regional and an internal waker have the same description: the scheme tells them, or Google would refuse the map's update.
+  ['an internal waker name taken by a regional external waker, of the same description', (w) => {
+    internal(w);
+    inRegion(w).services[WAKER] = { name: WAKER, description: 'Dormeto: the waker of workload demo', loadBalancingScheme: 'EXTERNAL_MANAGED', backends: [] };
+  }, {}, [`backend service ${WAKER} exists and is not the waker of demo: rename it, or onboard under another id`]],
+  ['a regional waker name taken by an internal waker, of the same description', (w) => {
+    regional(w);
+    inRegion(w).services[WAKER] = { name: WAKER, description: 'Dormeto: the waker of workload demo', loadBalancingScheme: 'INTERNAL_MANAGED', backends: [] };
+  }, {}, [`backend service ${WAKER} exists and is not the waker of demo: rename it, or onboard under another id`]],
+  ['a classic waker name taken by a waker of its two headers, but EXTERNAL_MANAGED', (w) => {
+    classic(w);
+    w.services[WAKER] = { name: WAKER, customRequestHeaders: ['x-dormeto-workload: demo', 'x-dormeto-switch: swap'], loadBalancingScheme: 'EXTERNAL_MANAGED', backends: [] };
   }, {}, [`backend service ${WAKER} exists and is not the waker of demo: rename it, or onboard under another id`]],
 ];
 
@@ -883,13 +896,14 @@ test('onboard classic: the waker global, EXTERNAL, HTTPS, on the router\'s regio
 const headedRoute = (waker) => ({ paths: ['/_dormeto/*'], routeAction: { weightedBackendServices: [{ backendService: waker, weight: 100, headerAction: { requestHeadersToAdd: [
   { headerName: 'x-dormeto-workload', headerValue: 'demo', replace: true }, { headerName: 'x-dormeto-switch', headerValue: 'swap', replace: true }] } }] } });
 const regionalRoute = headedRoute(REGIONAL_WAKER_URL);
-const DESCRIBED_WAKER = { name: WAKER, description: 'Dormeto: the waker of workload demo', backends: [] };
+// A waker of the kind's scheme, which Google answers on every backend service.
+const describedWaker = (loadBalancingScheme) => ({ name: WAKER, description: 'Dormeto: the waker of workload demo', loadBalancingScheme, backends: [] });
 const ONBOARDED = [
-  ['regional', regional, (w) => inRegion(w).urlMaps.lb, REGIONAL_WAKER_URL, regionalUrl('app'), REGIONAL_LB, regionalRoute, DESCRIBED_WAKER],
+  ['regional', regional, (w) => inRegion(w).urlMaps.lb, REGIONAL_WAKER_URL, regionalUrl('app'), REGIONAL_LB, regionalRoute, describedWaker('EXTERNAL_MANAGED')],
   ['classic', classic, (w) => w.urlMaps.lb, WAKER_URL, serviceUrl('app'), { kind: 'classic' }, { paths: ['/_dormeto/*'], service: WAKER_URL },
-    { name: WAKER, customRequestHeaders: ['x-dormeto-switch: swap', 'x-dormeto-workload: demo'], backends: [] }],
-  ['internal', internal, (w) => inRegion(w).urlMaps.lb, REGIONAL_WAKER_URL, regionalUrl('app'), INTERNAL_LB, regionalRoute, DESCRIBED_WAKER],
-  ['cross-region-internal', crossRegionInternal, (w) => w.urlMaps.lb, WAKER_URL, serviceUrl('app'), CROSS_REGION_LB, headedRoute(WAKER_URL), DESCRIBED_WAKER],
+    { name: WAKER, loadBalancingScheme: 'EXTERNAL', customRequestHeaders: ['x-dormeto-switch: swap', 'x-dormeto-workload: demo'], backends: [] }],
+  ['internal', internal, (w) => inRegion(w).urlMaps.lb, REGIONAL_WAKER_URL, regionalUrl('app'), INTERNAL_LB, regionalRoute, describedWaker('INTERNAL_MANAGED')],
+  ['cross-region-internal', crossRegionInternal, (w) => w.urlMaps.lb, WAKER_URL, serviceUrl('app'), CROSS_REGION_LB, headedRoute(WAKER_URL), describedWaker('INTERNAL_MANAGED')],
 ];
 for (const [kind, world, mapOf, wakerUrl, appUrl, lb, route, stopped] of ONBOARDED) {
   test(`onboard ${kind}: the route and the hold route in one update, its lb in the configuration and the Workload`, async () => {

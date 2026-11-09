@@ -29,8 +29,8 @@ const STEPS = {
   workloads: ['invoke'],
   onboard: ['invoke', 'tag', 'requestLogs'],
   offboard: ['invoke', 'tag', 'requestLogs'],
-  connect: ['read', 'apis', 'federation', 'serviceAccounts', 'roles', 'scopeBindings', 'controller', 'tag'],
-  disconnect: ['read', 'controller', 'tag', 'scopeBindings', 'roles', 'serviceAccounts', 'federation'],
+  connect: ['read', 'apis', 'federation', 'serviceAccounts', 'roles', 'projectBindings', 'folderBindings', 'organizationBindings', 'controller', 'tag'],
+  disconnect: ['read', 'controller', 'tag', 'projectBindings', 'folderBindings', 'organizationBindings', 'roles', 'serviceAccounts', 'federation'],
 };
 
 // Every list of permissions in the manifest, named for the failure messages.
@@ -40,6 +40,7 @@ function permissionLists(m) {
     ...Object.entries(m.predefined).map(([role, list]) => [`predefined.${role}`, list]),
     ...Object.entries(m.operator).flatMap(([command, steps]) => Object.entries(steps).map(([step, list]) => [`operator.${command}.${step}`, list])),
     ...Object.entries(m.manager.roles).map(([id, role]) => [`manager.roles.${id}`, role.permissions]),
+    ['manager.roles.dormetoDiscovery.organizationPermissions', m.manager.roles.dormetoDiscovery.organizationPermissions],
     ...Object.entries(m.features ?? {}).flatMap(([name, f]) => [
       ...Object.entries(f.roles).map(([id, role]) => [`features.${name}.roles.${id}`, role.permissions]),
       ...Object.entries(f.operator).flatMap(([command, steps]) => Object.entries(steps).map(([step, list]) => [`features.${name}.operator.${command}.${step}`, list])),
@@ -356,7 +357,7 @@ test('manager: its keys, in order', async () => {
   assert.deepEqual(Object.keys(manager.roles), ['dormetoDiscovery', 'dormetoCommand']);
   for (const [id, role] of Object.entries(manager.roles)) {
     assert.match(id, ROLE_ID);
-    assert.deepEqual(Object.keys(role), ['title', 'description', 'permissions'], id);
+    assert.deepEqual(Object.keys(role), id === 'dormetoDiscovery' ? ['title', 'description', 'permissions', 'organizationPermissions'] : ['title', 'description', 'permissions'], id);
     assert.ok(role.title.length > 0 && role.title.length <= 100, `${id}: title`);
     assert.ok(role.description.length > 0 && role.description.length <= 256, `${id}: description`);
   }
@@ -375,9 +376,13 @@ test('manager: the federation and the two accounts, as design 4.1 names them', a
 
 test('manager: dormetoDiscovery holds only get, list and monitoring.timeSeries.list', async () => {
   const { manager } = await load();
-  const list = manager.roles.dormetoDiscovery.permissions;
-  for (const p of list) assert.ok(/\.(get|list)$/.test(p) || p === 'monitoring.timeSeries.list', p);
-  includesAll(list, ['resourcemanager.projects.get', 'resourcemanager.projects.list', 'resourcemanager.folders.get', 'resourcemanager.folders.list', 'resourcemanager.organizations.get', 'run.services.get', 'run.services.list', 'monitoring.timeSeries.list'], 'dormetoDiscovery');
+  const { permissions: list, organizationPermissions: org } = manager.roles.dormetoDiscovery;
+  for (const p of [...list, ...org]) assert.ok(/\.(get|list)$/.test(p) || p === 'monitoring.timeSeries.list', p);
+  // A role defined in a project takes only permissions testable on a project; folders' and organizations' are added where the role is defined in an organization.
+  assert.deepEqual(list.filter((p) => /^resourcemanager\.(folders|organizations)\./.test(p) || p === 'resourcemanager.projects.list'), []);
+  assert.deepEqual(org, ['resourcemanager.folders.get', 'resourcemanager.folders.list', 'resourcemanager.organizations.get']);
+  assert.deepEqual(org.filter((p) => list.includes(p)), []);
+  includesAll(list, ['resourcemanager.projects.get', 'run.services.get', 'run.services.list', 'monitoring.timeSeries.list'], 'dormetoDiscovery');
   for (const kind of ['urlMaps', 'regionUrlMaps', 'backendServices', 'regionBackendServices', 'targetHttpProxies', 'targetHttpsProxies', 'regionTargetHttpProxies', 'regionTargetHttpsProxies', 'globalForwardingRules', 'forwardingRules', 'instanceGroups', 'instanceGroupManagers', 'instances', 'networkEndpointGroups']) {
     includesAll(list, [`compute.${kind}.get`, `compute.${kind}.list`], 'dormetoDiscovery');
   }
@@ -433,6 +438,12 @@ test('manager: connect and disconnect never ask for a policy the manager would c
   includesAll(operator.connect.serviceAccounts, ['iam.serviceAccounts.create', 'iam.serviceAccounts.setIamPolicy'], 'connect.serviceAccounts');
   includesAll(operator.disconnect.serviceAccounts, ['iam.serviceAccounts.delete'], 'disconnect.serviceAccounts');
   includesAll(operator.connect.apis, ['serviceusage.services.enable'], 'connect.apis');
-  for (const c of ['connect', 'disconnect']) includesAll(operator[c].scopeBindings, ['resourcemanager.projects.setIamPolicy', 'resourcemanager.folders.setIamPolicy', 'resourcemanager.organizations.setIamPolicy'], `${c}.scopeBindings`);
+  // Each scope kind's step holds only that resource's permissions, so a check at a project asks for nothing of a folder's.
+  for (const c of ['connect', 'disconnect']) {
+    for (const kind of ['project', 'folder', 'organization']) {
+      assert.deepEqual(operator[c][`${kind}Bindings`], [`resourcemanager.${kind}s.getIamPolicy`, `resourcemanager.${kind}s.setIamPolicy`], `${c}.${kind}Bindings`);
+    }
+    assert.ok(!operator[c].read.includes('resourcemanager.projects.list'), `${c}.read`);
+  }
   assert.ok(manager);
 });

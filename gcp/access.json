@@ -332,7 +332,6 @@
       "read": [
         "resourcemanager.projects.get",
         "resourcemanager.projects.getIamPolicy",
-        "resourcemanager.projects.list",
         "serviceusage.services.list",
         "serviceusage.services.use",
         "run.services.list"
@@ -363,11 +362,15 @@
         "iam.roles.update",
         "iam.roles.undelete"
       ],
-      "scopeBindings": [
+      "projectBindings": [
         "resourcemanager.projects.getIamPolicy",
-        "resourcemanager.projects.setIamPolicy",
+        "resourcemanager.projects.setIamPolicy"
+      ],
+      "folderBindings": [
         "resourcemanager.folders.getIamPolicy",
-        "resourcemanager.folders.setIamPolicy",
+        "resourcemanager.folders.setIamPolicy"
+      ],
+      "organizationBindings": [
         "resourcemanager.organizations.getIamPolicy",
         "resourcemanager.organizations.setIamPolicy"
       ],
@@ -386,7 +389,6 @@
       "read": [
         "resourcemanager.projects.get",
         "resourcemanager.projects.getIamPolicy",
-        "resourcemanager.projects.list",
         "serviceusage.services.list",
         "serviceusage.services.use",
         "run.services.list"
@@ -401,11 +403,15 @@
         "resourcemanager.tagValues.getIamPolicy",
         "resourcemanager.tagValues.setIamPolicy"
       ],
-      "scopeBindings": [
+      "projectBindings": [
         "resourcemanager.projects.getIamPolicy",
-        "resourcemanager.projects.setIamPolicy",
+        "resourcemanager.projects.setIamPolicy"
+      ],
+      "folderBindings": [
         "resourcemanager.folders.getIamPolicy",
-        "resourcemanager.folders.setIamPolicy",
+        "resourcemanager.folders.setIamPolicy"
+      ],
+      "organizationBindings": [
         "resourcemanager.organizations.getIamPolicy",
         "resourcemanager.organizations.setIamPolicy"
       ],
@@ -568,10 +574,6 @@
         "description": "Lets the Dormeto manager's discovery account read the projects, folders and organizations of its scopes, their load balancers, VMs and groups, their Cloud Run services and their request counts. Read only.",
         "permissions": [
           "resourcemanager.projects.get",
-          "resourcemanager.projects.list",
-          "resourcemanager.folders.get",
-          "resourcemanager.folders.list",
-          "resourcemanager.organizations.get",
           "compute.urlMaps.get",
           "compute.urlMaps.list",
           "compute.regionUrlMaps.get",
@@ -603,6 +605,11 @@
           "run.services.get",
           "run.services.list",
           "monitoring.timeSeries.list"
+        ],
+        "organizationPermissions": [
+          "resourcemanager.folders.get",
+          "resourcemanager.folders.list",
+          "resourcemanager.organizations.get"
         ]
       },
       "dormetoCommand": {

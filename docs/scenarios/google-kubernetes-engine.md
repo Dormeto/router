@@ -150,10 +150,13 @@ label is refused at the onboarding and left alone.
 - **Standard clusters save less.** Scaling pods saves money only on Autopilot, or with the node autoscaler freeing a
   node: a Standard cluster's fixed nodes are paid all the same. The onboarding warns of it.
 - **Standalone NEGs on a load balancer of your own.** A load balancer GKE owns, from a Gateway, an Ingress or a Multi Cluster
-  Ingress, is refused: GKE writes its map back. It is told by a URL map named `k8s2-`, `k8s-um-`, `gkegw1-`, `gkemcg1-` or `mci-`
-  (`k8s-um-` is an older Ingress's, `mci-` a Multi Cluster Ingress's), and by the descriptions GKE writes: a map whose description
+  Ingress, is refused: GKE writes its map back. It is told by a URL map named `k8s2-`, `k8s-um-`, `gkegw1-`, `gkemcg1-`, or `mci-`
+  and six letters or digits, then a dash or the name's end (`k8s-um-` is an older Ingress's, `mci-` and its hash a Multi Cluster
+  Ingress's: a map of yours named `mci-prod` is not taken for one), and by the descriptions GKE writes: a map whose description
   names `k8sResource` (a Gateway's), or whose target proxy or forwarding rule carries `kubernetes.io/ingress-name` (an Ingress's),
-  whatever its name. Measured: a custom error response policy
+  whatever its name. Measured on 2026-11-09: a Gateway's map, `gkegw1-…`, described `{"k8sResource": …}`, and an Ingress's
+  map, `k8s2-um-…`, with no description, its target proxy and forwarding rule described `{"kubernetes.io/ingress-name": …}`; an
+  onboarding's dry run refused each. Measured: a custom error response policy
   written on a Gateway's map stayed 20 minutes, through an annotation of the HTTPRoute, and GKE took it away, without a
   word, 48 s after the HTTPRoute's rules changed. It lasts until the next change of the Gateway or its routes, which a
   sleeping workload cannot trust. Give the Service a standalone network endpoint group (`cloud.google.com/neg`), name it in a backend

@@ -115,9 +115,11 @@ waking on it would let every scanner wake the workload. The page reloads the vis
 awake.
 
 What the error response's fetch carries (measured): always a `GET` of `/_dormeto/waiting`, whatever the visitor's method and
-path, with the visitor's query string, `Host`, `User-Agent`, `Referer` and address. So the waker could read who asks but not
-what for, which is why a plain request still does not wake. A wake rule on what the fetch does carry (the user agent, the
-address) wakes.
+path, with the visitor's query string and address, and these headers (measured on 2026-11-08; `referer` in an earlier
+measure): `accept`, `accept-language`, `cookie`, `forwarded`, `host`, `referer`, `traceparent`, `user-agent`, `via`,
+`x-cloud-trace-context`, `x-dormeto-workload`, `x-forwarded-for` and `x-forwarded-proto`. So the waker could read who asks but
+not what for, which is why a plain request still does not wake. A wake rule on what the fetch does carry (the user agent, the
+address, a header such as a cookie) wakes.
 
 **Wake.**
 1. The waker asks the controller for the wake through a task. The first request wins, as on AWS.
@@ -169,9 +171,10 @@ The counts are kept 35 days and swept once a day, and an offboarding deletes its
 - **What it reads.** On a backend service that logs every request (`logConfig` enabled, sample rate 1.0), any entry in
   the window's request logs makes them decide alone, whatever Monitoring counts. The check reads the log entries from a
   minute before the window to its end: the extra minute can only add requests. It counts only the requests the waker
-  would not ignore: not scanners, not `HEAD` requests, not an IP list's addresses. If none is left, the workload is
-  idle. With logs that cannot be read or hold more than 1,000 entries, or with logging off or sampled, Monitoring's
-  count decides.
+  would not ignore: not scanners, not `HEAD` requests, not an IP list's addresses, not what a no-wake rule of any level
+  matches. A logged request holds its method, path, user agent and address, and no other header: a rule with a `headers`
+  condition never matches a logged request, which then counts. If none is left, the workload is idle. With logs that cannot
+  be read or hold more than 1,000 entries, or with logging off or sampled, Monitoring's count decides.
   An empty log while Monitoring counts requests leaves the count deciding: a log lost upstream (a `_Default` sink's
   exclusion of the load balancers' logs, say) is caught that way, said in `LogsEmpty` at most once an hour per workload
   and controller instance. A log lost only in part is not caught: an exclusion that keeps part of the load balancers'
@@ -456,7 +459,8 @@ AWS's bodies, answers and checks.
   record this controller instance read, and the failure is logged the same way.
 - **The controller resolves before it acts.** The check, the nap, the wake and the release use the resolved values
   (`idleMinutes`, `wakeTimeoutSeconds`, `failedRetrySeconds`, `hibernate`), and the waker resolves the same ones, so the two
-  never disagree. The controller reads the router level from the store, once per check and once per wake, nap or release, and keeps the last record it read; the waker keeps it 60 s in a cache.
+  agree, but for up to 60 s after a change of the router level, which the waker keeps 60 s in a cache. The controller reads the
+  router level from the store, once per check and once per wake, nap or release, and keeps the last record it read.
 - **A configuration written before the levels** has no `inherits`: an `idleMinutes` of 15 and a `failedRetrySeconds` of 60 are
   read as inherited, its wake timeout stays its own, and nothing is rewritten. A new onboarding writes `inherits` for every
   key it is not given.
@@ -492,8 +496,9 @@ is accepted: it applies to the workloads behind a swap, and a workload behind th
   wakes the workload and is answered with the waiting page at once, with no hold. In `browser`, only the page's probe, an
   explicit wake or a wake rule wakes it, as G1's waker did for every workload: set `browser` at the router or the workload to keep
   that. `/_dormeto/backend/*` goes to the application and never comes here.
-- **The wake header and the probe header.** The wake header `x-dormeto-wake: 1` and the probe header wake on the policy's fetch
-  and under a swap, as on AWS.
+- **The wake header and the probe header.** The wake header `x-dormeto-wake: 1` and the probe header wake under a swap and on the
+  policy's fetch, as on AWS. Whether Google's error fetch passes a visitor's header of its own was not measured: the headers
+  measured are in [Behavior](#behavior).
 - **A decision that fails** is logged `WakeDecisionFailed` and the page is answered all the same: a visitor never gets an error
   for it.
 
@@ -508,7 +513,7 @@ rules, the IP lists, the probe and the wake mode. What a condition sees depends 
 |---|---|---|---|
 | A visitor's request behind a swap | the client's address | the request's own | the visitor's path |
 | The page's probe | the client's address | the browser's request | the visitor's path, sent by the page in `x-dormeto-path` from `location.pathname` |
-| The policy's error fetch | the client's address | what the fetch carries: `Host`, `User-Agent`, `Referer` | none: a path condition never matches |
+| The policy's error fetch | the client's address | the headers the fetch carries, `accept-language`, `cookie`, `referer` and `user-agent` among them ([measured](#behavior)) | none: a path condition never matches |
 | An explicit `POST /_dormeto/wake` | the client's address | the request's own | `/_dormeto/wake` |
 
 The client's address is read as [the IP lists](#limits-of-ip-lists) read it. The page's script sends `x-dormeto-path` only on
@@ -543,8 +548,9 @@ characters, a description of 500, HTML of 256 KiB.
   is read from the first host rule whose path matcher sends the whole of `/` to the workload's backend
   service by the path alone. A host whose `/` goes elsewhere or depends on more than the path (a regex or a path template match, a
   header), or a wildcard host, gives no favicon: `no rule for the whole of a host name`, kept in `favicons/<id>`. The internal kinds get none.
-- **Not measured yet.** Whether the policy's error fetch carries `Accept-Language` and `Cookie`, whether its page's
-  `Content-Security-Policy` and `Vary` reach the visitor, and the largest answer that passes whole, are not measured yet.
+- **Measured on 2026-11-08** behind the global load balancer: the policy's error fetch carries the visitor's `Accept-Language`
+  and `Cookie`, the page's `Content-Security-Policy` and `vary: accept-language` reach the browser, and a 256 KiB custom page
+  (268,112 bytes with the probe the router adds) and a template with a 59,023-byte icon arrived whole.
 
 ## Capacity and fallback machine types
 
@@ -561,15 +567,17 @@ network endpoint groups, gives a VM other machine types to run on:
   its own type is tried again at the next wake. A suspended VM resumes on its own type, with the retry only: Google changes no
   machine type while a VM is suspended. A list turns hibernation off unless the workload says `true`.
 - **Checked at the onboarding.** Each type exists in the VM's zone, the VM has no local SSD and no accelerator, and the type is of the
-  VM's series, or both series are first or second generation ones (N1, N2, N2D, E2, C2, C2D, M1, M2, T2D), from Google's page on changing
-  the machine type of a stopped VM; any other is refused with Google's rule. A managed group is refused, as are GKE pods:
-  `fallback machine types are for VMs of unmanaged instance groups: a managed group's machine type is its template's`. The list can't
-  be changed after the onboarding.
+  VM's series, or both series are first or second generation ones (N1, F1, G1, N2, N2D, E2, C2, C2D, M1, M2, T2D), from Google's page on
+  changing the machine type of a stopped VM; any other is refused with Google's rule. A managed group is refused,
+  `fallback machine types are for VMs of unmanaged instance groups: a managed group's machine type is its template's`, and so are GKE
+  pods, `fallback machine types are for VMs of unmanaged instance groups: the pods of a GKE cluster have no machine type of their own`.
+  The list can't be changed after the onboarding.
 - **The record.** The run's `instanceTypes` (`{<vm>: {from, to}}`), the log `InstanceTypeFallback`, and `fallbacks` in the `AWAKE`
-  event; `dormeto gcp workloads show` names the type a VM runs on. The Firestore run is durable, so no label keeps the own type.
+  event; `dormeto gcp workloads show` names the type a VM runs on. The Workload view and the offboarding's answer list them in AWS's
+  shape, `fallbacks: [{instance, from, to}]`, while a VM runs on one. The Firestore run is durable, so no label keeps the own type.
 - **Given back at the next stop.** The nap, after the VMs stop, and the release give each VM its own type back. A failure is logged
   `InstanceTypeNotReverted`, and the run keeps the type for the next try. An offboarding while a VM runs on a fallback type names the VM, its
-  type and its own: it keeps that type until you change it by hand.
+  type and its own, in its answer's `fallbacks`: it keeps that type until you change it by hand.
 - **The permission** is `compute.instances.setMachineType`, in `dormetoRouterBackends` under its `dormeto=managed` condition, in
   `gcp/access.json`. `dormeto gcp install` adds it to an installed router. Without it, a wake that needs a fallback fails with `the router's
   role lacks compute.instances.setMachineType: run dormeto gcp install again`.
@@ -602,12 +610,12 @@ Two kinds join the external ones, told from Google by the forwarding rules' sche
 - **What the waker reads.** Measured 2026-11-08: a forged `X-Forwarded-For` of `1.2.3.4` was ignored and the client's private address named,
   behind both kinds. The wake mode `any` woke on a plain request behind the cross-region kind.
 - **The request logs.** Measured 2026-11-08: the resource `internal_http_lb_rule`, log `requests`, `backend_target_name` the plain name,
-  `remoteIp` with a port, about 7.5 s late. The cross-region kind's entries carry the forwarding rule's region, its metric points
-  `region: global`.
+  `remoteIp` with a port, 2 to 4 s late on `internal` and about 7.5 s on `cross-region-internal`. The cross-region kind's entries carry the
+  forwarding rule's region, its metric points `region: global`.
 - **The limits.** The visitors' addresses are private, so an IP list is for private ranges. A project's regional serverless network
   endpoint groups share 5,000 queries a second (Google's documentation). A cross-region internal load balancer's waker is in one region. The page has no favicon.
   `terraform/gcp-dev` has a demo behind `enable_internal` (off by default): the proxy-only subnets, a regional and a cross-region internal load
-  balancer, each in front of a small VM, and a client VM reached through IAP.
+  balancer, each in front of a small VM; the measures reach them from a Cloud Run job with Direct VPC egress.
 
 ## Schedules and pauses
 
@@ -632,6 +640,9 @@ answered with what is wrong.
   awake window wakes it, and a nap within 30 minutes of an awake window's start is skipped. Inside a nap window nothing
   wakes the workload on traffic, `POST /_dormeto/wake` included, unless the window's `wake` is `header` (its default is
   `never`); the waiting page tells the visitor when the window ends.
+- **Joined windows.** Two windows of one kind with a short gap between them are one, as on AWS. The gap that joins is the
+  schedule's own `joinMinutes`, else the router level's (`dormeto gcp routers settings --join-minutes`), else 15: the check,
+  the waker and `schedule show` read it so, and `schedule show` says which (`joinFrom`).
 - **Scheduled naps are spread.** A nap holds a controller request for minutes, so the check enqueues at most 10
   scheduled naps each run, oldest occurrence first, and the next check takes the rest: 30 workloads in one nap window nap
   within 15 minutes. Wakes are never held back.
@@ -745,6 +756,10 @@ wakes the workload, from any address.
   keeping its name, IP addresses or disks unless they are stateful, and a stateful group is refused at onboarding: what
   such a VM's disks held is gone. A regional managed group with the target shape `EVEN` and instance redistribution on is
   refused at onboarding: Google cannot stop or suspend its VMs one by one.
+- **Two VMs of one name in two zones.** A VM's name is unique in its zone only, and Dormeto records a workload's VMs by name. So a
+  backend service whose unmanaged groups or zonal network endpoint groups hold two VMs of one name in two zones is refused at the
+  onboarding: `backend service <service> has two VMs named <name> (zones <zone> and <zone>): Dormeto records a workload's VMs by name;
+  rename one`.
 - **One router per project and region**, named `dmtr-<region>`. A workload's ID matches
   `^[a-z]([a-z0-9-]{0,38}[a-z0-9])?$` so that its backend service's name fits Compute Engine's 63 characters; it
   defaults to the application's backend service's name when that matches, else `--id` names it.

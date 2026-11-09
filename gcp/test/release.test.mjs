@@ -3,10 +3,20 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import { JOIN_DEFAULT_MINUTES } from '../../lambda/src/lib/schedule.mjs';
+import { SWAP_WAKE_ROOM_SECONDS } from '../src/levels.mjs';
+import { SWAP_WAIT_MS } from '../src/switch.mjs';
 
 const ROOT = new URL('../../', import.meta.url).pathname;
 const read = (path) => readFileSync(`${ROOT}${path}`, 'utf8');
 const PACKAGE = JSON.parse(read('package.json'));
+// The pages' numbers and quoted texts, from the code: a change there fails a test here instead of leaving a page stale.
+const SWAP = Object.fromEntries(Object.entries(SWAP_WAIT_MS).map(([kind, ms]) => [kind, ms / 1000]));
+const REFUSED = Object.fromEntries(Object.entries(SWAP).map(([kind, s]) => [kind, s + SWAP_WAKE_ROOM_SECONDS]));
+const ONBOARDING = read('gcp/src/onboarding.mjs');
+const SERIES = JSON.parse(`[${/const CHANGEABLE_SERIES = new Set\(\[([^\]]+)\]\)/.exec(ONBOARDING)[1].replace(/'/g, '"')}]`).map((s) => s.toUpperCase());
+const PODS_REFUSAL = /`(fallback machine types are for VMs of unmanaged instance groups: the pods of a GKE cluster have no machine type of their own)`/.exec(ONBOARDING)[1];
+const TWO_VMS = /`backend service \$\{service\.name\} has two VMs named \$\{name\} \(zones \$\{first\} and \$\{second\}\): ([^`]+)`/.exec(ONBOARDING)[1];
 
 test('the router has an x.y.z version and needs the Node that has import.meta.main', () => {
   assert.match(PACKAGE.version, /^\d+\.\d+\.\d+$/);
@@ -217,7 +227,7 @@ test('the Compute Engine page: the swap of regional and classic load balancers, 
   for (const needle of ['`/_dormeto/backend/*`', '`x-dormeto-switch: swap`', '`x-dormeto-ref: service`', '`Dormeto: the waker of workload <id>`', '`replace: true`']) {
     assert.ok(spaced(read(CE)).includes(needle), needle);
   }
-  assert.match(page, /SWAP_WAIT: 100 s on a regional load balancer, 250 s on a classic one/);
+  assert.ok(page.includes(`SWAP_WAIT: ${SWAP.regional} s on a regional load balancer, ${SWAP.classic} s on a classic one, ${SWAP.internal} s on an internal one and ${SWAP['cross-region-internal']} s on a cross-region internal one`), 'switch.mjs\'s SWAP_WAIT_MS');
   // G5: the built-in wake timeout is 600 s for every kind; the swap's wait is a floor, not an addition.
   assert.doesNotMatch(page, /The default wake timeout adds SWAP_WAIT|700 s for VMs on a regional/);
   assert.match(page, /The built-in wake timeout is 600 s, whatever the load balancer; behind a swap it can't be less than SWAP_WAIT plus 60 s/);
@@ -235,7 +245,7 @@ test('the Compute Engine page: the swap of regional and classic load balancers, 
   assert.match(page, /Ten naps on one regional URL map/);
   assert.match(spaced(read(CE)), /A header of your own named `x-dormeto-\*` on a regional map's swapped entry is replaced at the swap and not given back/);
   assert.match(page, /about 250 s or more on a regional load balancer and 340 s or more on a classic one/);
-  assert.match(page, /A wake timeout of SWAP_WAIT plus 60 s or less \(160 s regional, 310 s classic, 90 s internal, 210 s cross-region internal\) is refused/);
+  assert.ok(page.includes(`A wake timeout of SWAP_WAIT plus ${SWAP_WAKE_ROOM_SECONDS} s or less (${REFUSED.regional} s regional, ${REFUSED.classic} s classic, ${REFUSED.internal} s internal, ${REFUSED['cross-region-internal']} s cross-region internal) is refused`), 'levels.mjs\'s floor');
 });
 
 test('the Compute Engine page: schedules, pauses and IP lists, with what they do not hold', () => {
@@ -440,7 +450,9 @@ test('the Compute Engine page: the settings by level, what Google Cloud fixes an
   assert.match(page, /In browser, only the page's probe, an explicit wake or a wake rule wakes it/);
   assert.match(page, /scanners' requests count as deferred:browser mode/);
   assert.match(page, /A visitor on a \.php URL or on a path a no-wake rule keeps gets a page whose probe never wakes the workload/);
-  assert.match(page, /The wake header x-dormeto-wake: 1 and the probe header wake on the policy's fetch and under a swap/);
+  // M1 lists the headers the policy's fetch carried: none of a visitor's own, so the wake header there is the code's, not a measure.
+  assert.doesNotMatch(page, /The wake header x-dormeto-wake: 1 and the probe header wake on the policy's fetch and under a swap/);
+  assert.match(page, /The wake header x-dormeto-wake: 1 and the probe header wake under a swap and on the policy's fetch, as on AWS\. Whether Google's error fetch passes a visitor's header of its own was not measured: the headers measured are in \[Behavior\]\(#behavior\)/);
   assert.match(page, /A decision that fails is logged WakeDecisionFailed and the page is answered all the same/);
   assert.doesNotMatch(page, /A plain request still does not wake/);
 });
@@ -452,9 +464,13 @@ test('the Compute Engine page: what a rule sees on each request', () => {
   for (const row of [
     '| A visitor\'s request behind a swap | the client\'s address | the request\'s own | the visitor\'s path |',
     '| The page\'s probe | the client\'s address | the browser\'s request | the visitor\'s path, sent by the page in x-dormeto-path from location.pathname |',
-    '| The policy\'s error fetch | the client\'s address | what the fetch carries: Host, User-Agent, Referer | none: a path condition never matches |',
+    // M1 (2026-11-08): the fetch carries the visitor's accept-language and cookie, among others.
+    '| The policy\'s error fetch | the client\'s address | the headers the fetch carries, accept-language, cookie, referer and user-agent among them ([measured](#behavior)) | none: a path condition never matches |',
     '| An explicit POST /_dormeto/wake | the client\'s address | the request\'s own | /_dormeto/wake |',
   ]) assert.ok(page.includes(row), row);
+  assert.doesNotMatch(page, /what the fetch carries: Host, User-Agent, Referer/);
+  assert.match(page, /with the visitor's query string and address, and these headers \(measured on 2026-11-08; referer in an earlier measure\): accept, accept-language, cookie, forwarded, host, referer, traceparent, user-agent, via, x-cloud-trace-context, x-dormeto-workload, x-forwarded-for and x-forwarded-proto/);
+  assert.match(page, /A wake rule on what the fetch does carry \(the user agent, the address, a header such as a cookie\) wakes/);
   assert.match(page, /A forged x-dormeto-path bypasses nothing a client couldn't bypass by requesting another path/);
   assert.match(page, /The router level holds the router-wide rules: there is no Terraform level on Google Cloud/);
 });
@@ -481,7 +497,9 @@ test('the Compute Engine page: the waiting page, its storage and its custom-page
   assert.match(page, /A host whose \/ goes elsewhere or depends on more than the path \(a regex or a path template match, a header\), or a wildcard host, gives no favicon: no rule for the whole of a host name/);
   assert.match(page, /The internal kinds get none/);
   assert.match(page, /An offboarding deletes pages\/<id> and favicons\/<id>/);
-  assert.match(page, /Whether the policy's error fetch carries Accept-Language and Cookie, whether its page's Content-Security-Policy and Vary reach the visitor, and the largest answer that passes whole, are not measured yet/);
+  // M1 (2026-11-08) measured what the page said it had not.
+  assert.doesNotMatch(page, /not measured yet/i);
+  assert.match(page, /Measured on 2026-11-08 behind the global load balancer: the policy's error fetch carries the visitor's Accept-Language and Cookie, the page's Content-Security-Policy and vary: accept-language reach the browser, and a 256 KiB custom page \(268,112 bytes with the probe the router adds\) and a template with a 59,023-byte icon arrived whole/);
 });
 
 test('the Compute Engine page: the capacity retry and the fallback machine types', () => {
@@ -492,12 +510,18 @@ test('the Compute Engine page: the capacity retry and the fallback machine types
   assert.match(page, /A quota error is never retried this way/);
   assert.match(page, /fallbackInstanceTypes, set at the onboarding with --fallback-type, at most 5, for the VMs of unmanaged instance groups and zonal network endpoint groups/);
   assert.match(page, /fallback machine types are for VMs of unmanaged instance groups: a managed group's machine type is its template's/);
+  // The pods get their own text (onboarding.mjs), not the managed group's.
+  assert.ok(page.includes(`and so are GKE pods, ${PODS_REFUSAL}`), PODS_REFUSAL);
+  assert.doesNotMatch(page, /A managed group is refused, as are GKE pods:/);
   assert.match(page, /Each VM starts on its own type first\. On a capacity error the router sets the next type of its own and the list on the stopped VM \(instances\.setMachineType\) and starts it again/);
   assert.match(page, /Past the list the VM stays on its last type, and the retry's waits apply to it/);
   assert.match(page, /A suspended VM resumes on its own type, with the retry only: Google changes no machine type while a VM is suspended/);
   assert.match(page, /A list turns hibernation off unless the workload says true/);
-  assert.match(page, /the type is of the VM's series, or both series are first or second generation ones \(N1, N2, N2D, E2, C2, C2D, M1, M2, T2D\)/);
+  // onboarding.mjs's CHANGEABLE_SERIES, F1 and G1 included.
+  assert.ok(page.includes(`the type is of the VM's series, or both series are first or second generation ones (${SERIES.join(', ')})`), SERIES.join(', '));
   assert.match(page, /instanceTypes \(\{<vm>: \{from, to\}\}\)/);
+  // The Workload view and the offboarding's answer give AWS's shape (fix wave A, I6).
+  assert.match(page, /The Workload view and the offboarding's answer list them in AWS's shape, fallbacks: \[\{instance, from, to\}\], while a VM runs on one/);
   assert.match(page, /InstanceTypeFallback/);
   assert.match(page, /InstanceTypeNotReverted/);
   assert.match(page, /The nap, after the VMs stop, and the release give each VM its own type back/);
@@ -516,12 +540,17 @@ test('the Compute Engine page: the internal Application Load Balancers', () => {
   assert.match(page, /internal_http_lb_rule/);
   assert.doesNotMatch(page, /are not measured yet: both use a regional load balancer's 100 s|regional's 100 s until measured|to be confirmed by the measure/);
   assert.match(page, /Google accepts an INTERNAL_MANAGED waker backend service, regional and global, on the router's serverless network endpoint group \(measured 2026-11-08\)/);
-  assert.match(page, /SWAP_WAIT is 30 s on an internal load balancer and 150 s on a cross-region one/);
+  assert.ok(page.includes(`SWAP_WAIT is ${SWAP.internal} s on an internal load balancer and ${SWAP['cross-region-internal']} s on a cross-region one`), 'switch.mjs\'s internal waits');
   assert.match(page, /regional internal, the other side's first answer came 0 to 3 s after the map write's operation ended \(six writes, each 5 to 7 s\); cross-region internal, 28 to 120 s \(nine writes, each about 40 s\)/);
-  assert.match(page, /A wake timeout of 90 s or less on an internal load balancer, or 210 s or less on a cross-region one, is refused/);
+  assert.ok(page.includes(`A wake timeout of ${REFUSED.internal} s or less on an internal load balancer, or ${REFUSED['cross-region-internal']} s or less on a cross-region one, is refused`), 'levels.mjs\'s internal floors');
   assert.match(page, /the waker's ingress admits both internal kinds/);
   assert.match(page, /forged X-Forwarded-For of 1\.2\.3\.4 was ignored and the client's private address named, behind both kinds/);
-  assert.match(page, /Measured 2026-11-08: the resource internal_http_lb_rule, log requests, backend_target_name the plain name, remoteIp with a port, about 7\.5 s late/);
+  // M3: 2 to 4 s on the regional internal kind, about 7.5 s on the cross-region one.
+  assert.match(page, /Measured 2026-11-08: the resource internal_http_lb_rule, log requests, backend_target_name the plain name, remoteIp with a port, 2 to 4 s late on internal and about 7\.5 s on cross-region-internal/);
+  assert.doesNotMatch(page, /remoteIp with a port, about 7\.5 s late\./);
+  // R12 removed the client VM: the measures' client is a Cloud Run job with Direct VPC egress.
+  assert.doesNotMatch(page, /client VM|through IAP/);
+  assert.match(page, /the measures reach them from a Cloud Run job with Direct VPC egress/);
   assert.match(page, /The cross-region kind's entries carry the forwarding rule's region, its metric points region: global/);
   assert.match(page, /wake mode any woke on a plain request behind the cross-region kind/);
   assert.match(page, /The visitors' addresses are private/);
@@ -534,7 +563,12 @@ test('the Compute Engine page: the internal Application Load Balancers', () => {
 
 test('the GKE page: the exact refusal of GKE\'s own load balancers, and the way', () => {
   const page = flat(read(GKE));
-  assert.match(page, /a URL map named k8s2-, k8s-um-, gkegw1-, gkemcg1- or mci-/);
+  // gke.mjs's GKE_MAP: mci- and a six-character hash, so a customer's mci-prod is not refused.
+  assert.match(read('gcp/src/gke.mjs'), /mci-\[a-z0-9\]\{6\}\(-\|\$\)/);
+  assert.match(page, /a URL map named k8s2-, k8s-um-, gkegw1-, gkemcg1-, or mci- and six letters or digits, then a dash or the name's end/);
+  assert.match(page, /a map of yours named mci-prod is not taken for one/);
+  // M4 (2026-11-09): the names and descriptions GKE writes, read on a Gateway's and an Ingress's load balancers.
+  assert.match(page, /Measured on 2026-11-09: a Gateway's map, gkegw1-…, described \{"k8sResource": …\}, and an Ingress's map, k8s2-um-…, with no description, its target proxy and forwarding rule described \{"kubernetes\.io\/ingress-name": …\}/);
   assert.match(page, /a map whose description names k8sResource \(a Gateway's\), or whose target proxy or forwarding rule carries kubernetes\.io\/ingress-name \(an Ingress's\), whatever its name/);
   assert.match(page, /Give the Service a standalone network endpoint group \(cloud\.google\.com\/neg\)/);
   assert.match(page, /The default wake timeout is 600 s, whatever the load balancer; 1700 s with a Cloud SQL companion/);
@@ -552,8 +586,25 @@ test('the README and the Cloud SQL page say the G5 features and the 1700 s fixed
 test('the Compute Engine page: the controller reads the router level without a cache, the waker through one; two claims are Google\'s documentation', () => {
   const page = flat(read(CE));
   assert.doesNotMatch(page, /The router level is read once per check, through a 60 s cache/);
-  assert.match(page, /The controller reads the router level from the store, once per check and once per wake, nap or release, and keeps the last record it read; the waker keeps it 60 s in a cache/);
+  assert.match(page, /The controller reads the router level from the store, once per check and once per wake, nap or release, and keeps the last record it read\./);
+  // The waker's 60 s cache: they may disagree for that long after a change.
+  assert.doesNotMatch(page, /so the two never disagree/);
+  assert.match(page, /the waker resolves the same ones, so the two agree, but for up to 60 s after a change of the router level, which the waker keeps 60 s in a cache/);
   assert.match(page, /the databases type's built-in is AWS's 1800 s, brought to Google Cloud's cap of 1700 s and shown fixed/);
   assert.match(page, /5,000 queries a second \(Google's documentation\)/);
   assert.match(page, /the waker's ingress admits both internal kinds \(measured 2026-11-08\)/);
+});
+
+// G5's fix wave A (router c41b16f..f0c86da): what the pages say of the idle check's rules, the router level's join and two VMs of one name.
+test('the Compute Engine page: the idle check leaves out what a no-wake rule matches, the router level joins windows, two VMs of one name are refused', () => {
+  const page = flat(read(CE));
+  // activity.mjs: the no-wake rules of every level; a logged request holds no header but its user agent.
+  assert.match(page, /It counts only the requests the waker would not ignore: not scanners, not HEAD requests, not an IP list's addresses, not what a no-wake rule of any level matches/);
+  assert.match(page, /a rule with a headers condition never matches a logged request, which then counts/);
+  // controller-core.mjs and onboarding.mjs's scheduleView: AWS's joinLevels.
+  assert.ok(page.includes(`the schedule's own joinMinutes, else the router level's (dormeto gcp routers settings --join-minutes), else ${JOIN_DEFAULT_MINUTES}`), 'resolveJoin');
+  assert.match(page, /schedule show says which \(joinFrom\)/);
+  // onboarding.mjs's refusal, word for word.
+  assert.ok(page.includes(`has two VMs named <name> (zones <zone> and <zone>): ${TWO_VMS}`), TWO_VMS);
+  assert.match(page, /Two VMs of one name in two zones/);
 });

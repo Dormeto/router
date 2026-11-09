@@ -137,7 +137,7 @@ test('the waker\'s configuration is browser on the policy\'s fetch, and not forc
 
 test('levelProblems refuses what Google Cloud fixes, with the reason', () => {
   const [waits] = levelProblems({ waitSeconds: 30 }, { level: 'workload', cfg: regional });
-  assert.match(waits, /^waitSeconds is 0 on Google Cloud: the waker holds no request/);
+  assert.equal(waits, 'waitSeconds is 0 on Google Cloud: the waker holds no request, it answers the waiting page at once and the page waits for the wake');
   assert.equal(levelProblems({ maxHolders: 5 }, { level: 'router' }).length, 1);
   assert.equal(levelProblems({ drainSeconds: 5 }, { level: 'router' }).length, 1);
   assert.deepEqual(levelProblems({ waitSeconds: null, maxHolders: null }, { level: 'router' }), []);

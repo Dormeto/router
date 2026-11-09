@@ -9,7 +9,10 @@ groups](#zonal-network-endpoint-groups), [the regional and classic load balancer
 [schedules and pauses](#schedules-and-pauses) and [IP lists](#ip-lists). The router also has AWS's [settings by
 level](#settings-and-their-levels), the wake mode and the rules, [the branded waiting page](#the-waiting-page), [a capacity
 retry with fallback machine types](#capacity-and-fallback-machine-types) and [the internal load
-balancers](#internal-load-balancers).
+balancers](#internal-load-balancers). These were accepted in `dormeto-dev` on 2026-11-09, with router image 0.39.0-dev.3 and CLI
+0.13.0-dev.2, builds of `main`: the settings by level, the wake mode and rules, the waiting page, the fallback's machine type change
+through the router's own role, both internal kinds (measured, napped by the idle check, woken by the page's probe) and GKE's
+refusal. They are not released.
 
 The global load balancer keeps the application's backend service in its URL map and serves the waiting page through a
 custom error response (the diagram, and [Behavior](#behavior)). The regional and classic ones have no custom error
@@ -172,8 +175,9 @@ The counts are kept 35 days and swept once a day, and an offboarding deletes its
   the window's request logs makes them decide alone, whatever Monitoring counts. The check reads the log entries from a
   minute before the window to its end: the extra minute can only add requests. It counts only the requests the waker
   would not ignore: not scanners, not `HEAD` requests, not an IP list's addresses, not what a no-wake rule of any level
-  matches. A logged request holds its method, path, user agent and address, and no other header: a rule with a `headers`
-  condition never matches a logged request, which then counts. If none is left, the workload is idle. With logs that cannot
+  matches. A logged request holds its method, path, user agent and address, and its only headers are `user-agent` and
+  `x-forwarded-for` (the address): a rule's `headers` condition on either can match it, and one on any other header never
+  does, so the request counts. If none is left, the workload is idle. With logs that cannot
   be read or hold more than 1,000 entries, or with logging off or sampled, Monitoring's count decides.
   An empty log while Monitoring counts requests leaves the count deciding: a log lost upstream (a `_Default` sink's
   exclusion of the load balancers' logs, say) is caught that way, said in `LogsEmpty` at most once an hour per workload
@@ -472,7 +476,7 @@ Some values can't be chosen on Google Cloud. The router resolves them to the val
 
 | Key | On Google Cloud | Why |
 |---|---|---|
-| `waitSeconds` | 0 | The waker holds no request. Behind a swap, the switch back takes longer than any hold (regional 100 s, classic 250 s). Behind the policy, the waker receives only the error fetch. |
+| `waitSeconds` | 0 | The waker holds no request: it answers the waiting page at once, and the page waits for the wake. |
 | `maxHolders` | 0 | No request is held. |
 | `drainSeconds` | 0 | The nap's switch is a URL map change, and the backend service's own connection draining applies. |
 | `wakeMode` | `browser` behind the global load balancer's policy | The error fetch carries neither the visitor's path nor its method: waking on it would let every scanner wake the workload. |
@@ -497,8 +501,9 @@ is accepted: it applies to the workloads behind a swap, and a workload behind th
   explicit wake or a wake rule wakes it, as G1's waker did for every workload: set `browser` at the router or the workload to keep
   that. `/_dormeto/backend/*` goes to the application and never comes here.
 - **The wake header and the probe header.** The wake header `x-dormeto-wake: 1` and the probe header wake under a swap and on the
-  policy's fetch, as on AWS. Whether Google's error fetch passes a visitor's header of its own was not measured: the headers
-  measured are in [Behavior](#behavior).
+  policy's fetch, as on AWS. Google's error fetch passes a visitor's header of its own (measured on 2026-11-09: a browser's
+  `GET /` with `x-dormeto-wake: 1` to the global load balancer woke an asleep workload, trigger `header`); the headers it
+  carries are in [Behavior](#behavior).
 - **A decision that fails** is logged `WakeDecisionFailed` and the page is answered all the same: a visitor never gets an error
   for it.
 

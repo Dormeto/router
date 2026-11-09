@@ -509,7 +509,7 @@ test('an offboarding takes the schedule and the pause with it', async () => {
 
 // --- Settings by level (vision docs/specs/2026-11-08-google-cloud-router-features-design.md, section 4.5) --------------------------
 
-const WAIT_FIXED = 'settings: waitSeconds is 0 on Google Cloud: the waker holds no request (behind a swap the switch back takes longer than any hold; behind the policy it receives only the error fetch)';
+const WAIT_FIXED = 'settings: waitSeconds is 0 on Google Cloud: the waker holds no request, it answers the waiting page at once and the page waits for the wake';
 const BROWSER_ONLY = 'settings: the global load balancer\'s waiting page can\'t see the visitor\'s request, so only the page\'s probe, an explicit wake or a wake rule wakes it (wake mode browser)';
 
 test('PUT /v1/workloads/:id/settings: AWS\'s answer; a level\'s refusal: 400 with the problems, nothing written; unknown: 404; a bad ID or body: 400', async () => {

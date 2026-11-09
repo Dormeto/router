@@ -431,7 +431,7 @@ test('the Compute Engine page: the settings by level, what Google Cloud fixes an
   assert.match(page, /instance is a VM of an unmanaged instance group or of a zonal network endpoint group, asg a managed instance group, k8s GKE pods and databases a Cloud SQL companion/);
   assert.match(page, /The built-in wake timeout is 600 s for every kind, but the databases type's built-in is AWS's 1800 s/);
   for (const row of [
-    '| waitSeconds | 0 | The waker holds no request. Behind a swap, the switch back takes longer than any hold (regional 100 s, classic 250 s). Behind the policy, the waker receives only the error fetch. |',
+    '| waitSeconds | 0 | The waker holds no request: it answers the waiting page at once, and the page waits for the wake. |',
     '| maxHolders | 0 | No request is held. |',
     '| drainSeconds | 0 | The nap\'s switch is a URL map change, and the backend service\'s own connection draining applies. |',
     '| wakeMode | browser behind the global load balancer\'s policy |',
@@ -450,9 +450,9 @@ test('the Compute Engine page: the settings by level, what Google Cloud fixes an
   assert.match(page, /In browser, only the page's probe, an explicit wake or a wake rule wakes it/);
   assert.match(page, /scanners' requests count as deferred:browser mode/);
   assert.match(page, /A visitor on a \.php URL or on a path a no-wake rule keeps gets a page whose probe never wakes the workload/);
-  // M1 lists the headers the policy's fetch carried: none of a visitor's own, so the wake header there is the code's, not a measure.
+  // The wake header on the policy's fetch was measured on 2026-11-09: Google passes a visitor's own header to the error service.
   assert.doesNotMatch(page, /The wake header x-dormeto-wake: 1 and the probe header wake on the policy's fetch and under a swap/);
-  assert.match(page, /The wake header x-dormeto-wake: 1 and the probe header wake under a swap and on the policy's fetch, as on AWS\. Whether Google's error fetch passes a visitor's header of its own was not measured: the headers measured are in \[Behavior\]\(#behavior\)/);
+  assert.match(page, /The wake header x-dormeto-wake: 1 and the probe header wake under a swap and on the policy's fetch, as on AWS\. Google's error fetch passes a visitor's header of its own \(measured on 2026-11-09: a browser's GET \/ with x-dormeto-wake: 1 to the global load balancer woke an asleep workload, trigger header\); the headers it carries are in \[Behavior\]\(#behavior\)/);
   assert.match(page, /A decision that fails is logged WakeDecisionFailed and the page is answered all the same/);
   assert.doesNotMatch(page, /A plain request still does not wake/);
 });
@@ -598,13 +598,21 @@ test('the Compute Engine page: the controller reads the router level without a c
 // G5's fix wave A (router c41b16f..f0c86da): what the pages say of the idle check's rules, the router level's join and two VMs of one name.
 test('the Compute Engine page: the idle check leaves out what a no-wake rule matches, the router level joins windows, two VMs of one name are refused', () => {
   const page = flat(read(CE));
-  // activity.mjs: the no-wake rules of every level; a logged request holds no header but its user agent.
+  // activity.mjs: the no-wake rules of every level; a logged request holds the headers user-agent and x-forwarded-for, and no other.
   assert.match(page, /It counts only the requests the waker would not ignore: not scanners, not HEAD requests, not an IP list's addresses, not what a no-wake rule of any level matches/);
-  assert.match(page, /a rule with a headers condition never matches a logged request, which then counts/);
+  assert.match(page, /its only headers are user-agent and x-forwarded-for \(the address\): a rule's headers condition on either can match it, and one on any other header never does, so the request counts/);
   // controller-core.mjs and onboarding.mjs's scheduleView: AWS's joinLevels.
   assert.ok(page.includes(`the schedule's own joinMinutes, else the router level's (dormeto gcp routers settings --join-minutes), else ${JOIN_DEFAULT_MINUTES}`), 'resolveJoin');
   assert.match(page, /schedule show says which \(joinFrom\)/);
   // onboarding.mjs's refusal, word for word.
   assert.ok(page.includes(`has two VMs named <name> (zones <zone> and <zone>): ${TWO_VMS}`), TWO_VMS);
   assert.match(page, /Two VMs of one name in two zones/);
+});
+
+// G5's last docs pass: the acceptance of 2026-11-09 and the measures it settled.
+test('the Compute Engine page: G5 was accepted in dormeto-dev on 2026-11-09 and is not released, the wake header is measured, the waker holds no request', () => {
+  const page = flat(read(CE));
+  assert.match(page, /These were accepted in dormeto-dev on 2026-11-09, with router image 0\.39\.0-dev\.3 and CLI 0\.13\.0-dev\.2, builds of main: the settings by level, the wake mode and rules, the waiting page, the fallback's machine type change through the router's own role, both internal kinds \(measured, napped by the idle check, woken by the page's probe\) and GKE's refusal\. They are not released\./);
+  assert.doesNotMatch(page, /the switch back takes longer than any hold/);
+  assert.doesNotMatch(page, /was not measured: the headers/);
 });

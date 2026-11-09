@@ -14,7 +14,7 @@ const TYPE_NAMES = { vm: 'instance', mig: 'asg', k8s: 'k8s', cloudsql: 'database
 const LEGACY_DEFAULTS = { idleMinutes: 15, failedRetrySeconds: 60 };
 
 const REASONS = {
-  waitSeconds: 'waitSeconds is 0 on Google Cloud: the waker holds no request (behind a swap the switch back takes longer than any hold; behind the policy it receives only the error fetch)',
+  waitSeconds: 'waitSeconds is 0 on Google Cloud: the waker holds no request, it answers the waiting page at once and the page waits for the wake',
   maxHolders: 'maxHolders is 0 on Google Cloud: no request is held',
   drainSeconds: 'drainSeconds is 0 on Google Cloud: the nap\'s switch is a URL map change, and the backend service\'s own connection draining applies',
 };

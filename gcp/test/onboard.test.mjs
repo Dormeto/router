@@ -2314,7 +2314,7 @@ test('a forced offboarding of an asleep owner logs the replicas it had: its reco
 const NO_WAKE = { name: 'health', pathPrefixes: ['/health'] };
 const WAKE = { name: 'office', sourceIps: ['10.0.0.0/8'] };
 const BROWSER_ONLY = 'the global load balancer\'s waiting page can\'t see the visitor\'s request, so only the page\'s probe, an explicit wake or a wake rule wakes it (wake mode browser)';
-const WAIT_FIXED = 'waitSeconds is 0 on Google Cloud: the waker holds no request (behind a swap the switch back takes longer than any hold; behind the policy it receives only the error fetch)';
+const WAIT_FIXED = 'waitSeconds is 0 on Google Cloud: the waker holds no request, it answers the waiting page at once and the page waits for the wake';
 const NO_ROUTER = { hibernate: null, joinMinutes: null, by: null, at: null };
 const ALL_KEYS = ['idleMinutes', 'waitSeconds', 'drainSeconds', 'wakeTimeoutSeconds', 'maxHolders', 'failedRetrySeconds', 'wakeMode'];
 

@@ -218,8 +218,12 @@ export function createController({
     }
   }
 
+  // The tags of the configurations read, for the events of the state changes that follow (no read of their own).
+  const tagsOf = new Map();
+
   async function transition(workloadId, change) {
-    const next = await store.transition(workloadId, change);
+    const tags = change.set?.state ? tagsOf.get(workloadId) : undefined;
+    const next = await store.transition(workloadId, tags ? { ...change, event: { ...change.event, tags } } : change);
     if (next && change.set?.state) {
       const { cond, set, cause, event } = change;
       // The journal's event is the store's (committed with the run); the line says the same: when, and which router.
@@ -233,6 +237,7 @@ export function createController({
 
   async function getConfig(workloadId) {
     const cfg = await store.getConfig(workloadId);
+    if (cfg) tagsOf.set(workloadId, cfg.tags ?? {});
     if (!cfg) throw new Error(`workload not configured: ${workloadId}`);
     return cfg;
   }
@@ -1526,6 +1531,7 @@ export function createController({
     const paused = (workloadId) => pauses === null || pauses.some((p) => p.workloadId === workloadId);
     const keptAsleep = (workloadId) => pauses === null || pauses.some((p) => p.keepAsleep && p.workloadId === workloadId);
     const [{ configs, schedules }, levels] = await Promise.all([store.listWorkloads(), routerLevel()]);
+    for (const cfg of configs) tagsOf.set(cfg.workloadId, cfg.tags ?? {});
     const order = [...configs].sort((a, b) => a.workloadId.localeCompare(b.workloadId));
     // A workload holds one nap in flight at most: with no more workloads than NAPS_MAX, their runs are not read for it.
     const flight = { naps: order.length > NAPS_MAX ? await napsInFlight(order) : 0, deferred: 0 };

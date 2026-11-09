@@ -138,7 +138,10 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], c
       getRun: readRun,
       transition: async (workloadId, change) => {
         // The event of a state change carries the workload's tags; the configuration is the request's, read already.
-        const tags = change.set?.state ? (await readConfig(workloadId).catch(() => null))?.tags ?? {} : undefined;
+        const tags = change.set?.state ? (await readConfig(workloadId).catch((err) => {
+          log.warn('EventTagsUnreadable', { workloadId, error: err.message });
+          return null;
+        }))?.tags ?? {} : undefined;
         const next = await store.transition(workloadId, tags ? { ...change, event: { ...change.event, tags } } : change);
         thisRequest.getStore().run = next ? Promise.resolve(next) : undefined;
         return next;

@@ -840,3 +840,24 @@ test('sweepEvents: an event older than the date goes, a newer one stays; the cou
   assert.deepEqual(eventIds(docs), [`events/${T0 - 6 * DAY}-new-AWAKE`]);
   assert.equal(docs.has('stats/app-2026-01-01'), true);
 });
+
+test('an event takes the tags the caller gives with no read of the configuration; one that cannot be read is logged EventTagsUnreadable and sends none', async () => {
+  const warned = [];
+  const { store, request, calls, docs } = setup({ log: { warn: (event, fields) => warned.push({ event, ...fields }) } });
+  await store.initRun('app', 1);
+  await store.putConfig('app', { workloadId: 'app', tags: { team: 'z' } });
+  calls.length = 0;
+  await store.transition('app', { cond: { state: 'AWAKE' }, set: { state: 'NAPPING' }, event: { tags: { team: 'a' } } });
+  assert.equal(calls.filter((c) => c.url.includes('/workloads/')).length, 0);
+  assert.deepEqual(eventOfDoc(docs, `events/${T0}-app-NAPPING`).tags, { team: 'a' });
+  const broken = createFirestoreStore({
+    google: { request: async (method, url, body) => {
+      if (url.includes('/workloads/')) throw new GoogleError('Google: 500 down', { code: 500, status: 'INTERNAL' });
+      return request(method, url, body);
+    } },
+    project: 'p', database: 'dmtr-europe-west1', now: () => T0 + 1, log: { warn: (event, fields) => warned.push({ event, ...fields }) },
+  });
+  await broken.transition('app', { cond: { state: 'NAPPING' }, set: { state: 'ASLEEP' } });
+  assert.deepEqual(eventOfDoc(docs, `events/${T0 + 1}-app-ASLEEP`).tags, {});
+  assert.deepEqual(warned.map((w) => [w.event, w.workloadId]), [['EventTagsUnreadable', 'app']]);
+});

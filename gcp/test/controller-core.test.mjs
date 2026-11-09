@@ -5632,7 +5632,7 @@ test('a wake to AWAKE hands the store its wakeId and duration for the event; the
   const t = setup({ run: waking(START - 5000), vms: { 'vm-a': { status: 'TERMINATED' } }, map: asleepMap() });
   const asked = changesOf(t);
   await t.controller.wake('demo', 'w1');
-  assert.deepEqual(asked.find((c) => c.to === STATES.AWAKE).event, { wakeId: 'w1', durationMs: 5000 });
+  assert.deepEqual(asked.find((c) => c.to === STATES.AWAKE).event, { wakeId: 'w1', durationMs: 5000, tags: {} });
   const line = t.logged('StateChanged').find((l) => l.to === STATES.AWAKE);
   assert.deepEqual([line.router, line.region, line.project], ['dmtr-europe-west1', 'europe-west1', 'p']);
   assert.equal(line.at, new Date(t.run().stateAt ?? t.clock.now()).toISOString());
@@ -5657,4 +5657,18 @@ test('a nap to ASLEEP hands the store the VMs it suspended, which the event list
   const change = asked.find((c) => c.to === STATES.ASLEEP);
   assert.deepEqual(change.event.suspended, ['vm-a']);
   assert.deepEqual(eventOf({ workloadId: 'demo', from: 'NAPPING', to: 'ASLEEP', stateAt: START, event: change.event, router: { name: 'dmtr-europe-west1', region: 'europe-west1', project: 'p' } }).hibernated, ['vm-a']);
+});
+
+test('a state change reads no configuration of its own: its event carries the tags the wake read', async () => {
+  const t = setup({ run: waking(START - 5000), vms: { 'vm-a': { status: 'TERMINATED' } }, map: asleepMap(), cfg: { tags: { team: 'a' } } });
+  const asked = changesOf(t);
+  let reads = 0;
+  const { getConfig } = t.store;
+  t.store.getConfig = (...args) => {
+    reads += 1;
+    return getConfig.apply(t.store, args);
+  };
+  await t.controller.wake('demo', 'w1');
+  assert.equal(reads, 1);
+  assert.deepEqual(asked.find((c) => c.to === STATES.AWAKE).event.tags, { team: 'a' });
 });

@@ -252,7 +252,10 @@ export function createFirestoreStore({ google, project, database, region = datab
         if (set.state === undefined || set.state === run.state) return { set: changed, remove };
         // The workload's tags go in the event: those the caller has (the waker read the configuration), else read; a configuration that
         // cannot be read sends none.
-        tags ??= event?.tags ?? (await this.getConfig(workloadId).catch(() => null))?.tags ?? {};
+        tags ??= event?.tags ?? (await this.getConfig(workloadId).catch((err) => {
+          log?.warn('EventTagsUnreadable', { workloadId, error: err.message });
+          return null;
+        }))?.tags ?? {};
         const detail = eventOf({
           workloadId, from: run.state, to: set.state, stateAt: changed.stateAt, cause, tags, router,
           event: { ...(set.wakeId ? { wakeId: set.wakeId } : {}), ...(by ? { by } : {}), ...event },

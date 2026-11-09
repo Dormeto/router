@@ -427,7 +427,7 @@ test('the Compute Engine page: the settings by level, what Google Cloud fixes an
   assert.match(page, /A workload's settings come from AWS's levels: the workload, its type, the router, then the built-in value/);
   assert.match(page, /PUT \/v1\/workloads\/\{id\}\/settings/);
   assert.match(page, /GET and PUT \/v1\/settings/);
-  assert.match(page, /The organization level and the custom types are the manager's, so on Google Cloud the organization level reads as unset and only the built-in types exist/);
+  assert.match(page, /The organization level and the custom types are the manager's: it pushes its settings\.json to the router \(see \[the manager page\]\(google-cloud-manager\.md\)\), and until it does the organization level reads as unset and only the built-in types exist/);
   assert.match(page, /instance is a VM of an unmanaged instance group or of a zonal network endpoint group, asg a managed instance group, k8s GKE pods and databases a Cloud SQL companion/);
   assert.match(page, /The built-in wake timeout is 600 s for every kind, but the databases type's built-in is AWS's 1800 s/);
   for (const row of [
@@ -615,4 +615,44 @@ test('the Compute Engine page: G5 was accepted in dormeto-dev on 2026-11-08 and 
   assert.match(page, /These were accepted in dormeto-dev on 2026-11-08 and 2026-11-09, on dev builds of main \(router 0\.39\.0-dev\.2, then 0\.39\.0-dev\.3 with the final review's fixes\): the settings by level, the wake mode and rules, the waiting page, the fallback's machine type change through the router's own role, both internal kinds \(measured, napped by the idle check, woken by the page's probe\) and GKE's refusal\. They are not released\./);
   assert.doesNotMatch(page, /the switch back takes longer than any hold/);
   assert.doesNotMatch(page, /was not measured: the headers/);
+});
+
+// G2 (vision docs/specs/2026-11-09-google-cloud-manager-design.md, section 5): the manager's page says what the code does.
+const MANAGER = 'docs/scenarios/google-cloud-manager.md';
+const ACTIONS_SRC = read('gcp/src/actions.mjs');
+const CORE_SRC = read('gcp/src/controller-core.mjs');
+
+test('the manager page is linked from the scenarios index and the Compute Engine page, and calls nothing unreleased', () => {
+  assert.match(read('docs/scenarios/README.md'), /\]\(google-cloud-manager\.md\)/);
+  assert.match(read(CE), /\]\(google-cloud-manager\.md\)/);
+  assert.doesNotMatch(read(MANAGER), /unreleased/i);
+});
+
+test('the manager page names every action the router answers, from the code, and the two that are Google Cloud\'s', () => {
+  const page = flat(read(MANAGER));
+  const table = /const ACTIONS = \{([\s\S]*?)\n  \};/.exec(ACTIONS_SRC)[1];
+  const names = [...table.matchAll(/^    (?:'([a-z-]+)'|([a-z]+))[:,]/gm)].map((m) => m[1] ?? m[2]);
+  assert.ok(names.length >= 18, names.join());
+  for (const name of names) assert.ok(page.includes(name), name);
+  assert.match(page, /The two Google Cloud ones: events and manager-settings/);
+  assert.match(page, /\{ "error": "unknown-action" \}/);
+  assert.match(page, /invalid, not_found and conflict/);
+});
+
+test('the manager page\'s numbers are the code\'s: the journal\'s 7 days, 1 to 500 events, the check every 5 minutes, a year of ended windows', () => {
+  const page = flat(read(MANAGER));
+  assert.match(CORE_SRC, /const EVENTS_KEPT_DAYS = 7;/);
+  assert.match(page, /Events are kept 7 days/);
+  assert.match(ACTIONS_SRC, /const EVENTS_MAX = 500;/);
+  assert.match(page, /"limit": 1\.\.500/);
+  assert.match(CORE_SRC, /export const CHECK_SCHEDULE = '\*\/5 \* \* \* \*';/);
+  assert.ok(read(MANAGER).includes('`checkSchedule` is\n  `*/5 * * * *`'));
+  assert.match(page, /\bevents\/ in the router's Firestore database/);
+  assert.match(page, /<stateAt padded to 13 digits>-<workloadId>-<state>/);
+  assert.match(page, /router\/check/);
+  assert.match(page, /router\/manager/);
+  assert.match(page, /router\/pause/);
+  assert.match(page, /endedWindowDays days ago: the organization's value, 365 days when it sets none, and 0 keeps them/);
+  assert.match(page, /\bETag\b.*1 to 256 characters/);
+  assert.match(ACTIONS_SRC, /const ETAG_MAX = 256;/);
 });

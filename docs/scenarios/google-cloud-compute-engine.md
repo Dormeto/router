@@ -448,8 +448,9 @@ AWS's bodies, answers and checks.
 
 - **The levels.** The workload's own values are in its configuration, which lists in `inherits` the keys that follow the levels;
   the router's are in the Firestore document `router/settings` (`hibernate`, `joinMinutes`, `defaults`, `by`, `at`). The
-  organization level and the custom types are the manager's, so on Google Cloud the organization level reads as unset and only
-  the built-in types exist. The router level is one per project and region, and applies to the workloads it serves.
+  organization level and the custom types are the manager's: it pushes its `settings.json` to the router (see
+  [the manager page](google-cloud-manager.md)), and until it does the organization level reads as unset and only the built-in
+  types exist. The router level is one per project and region, and applies to the workloads it serves.
 - **The types** keep AWS's names: `instance` is a VM of an unmanaged instance group or of a zonal network endpoint group, `asg` a managed
   instance group, `k8s` GKE pods and `databases` a Cloud SQL companion (on AWS an EC2 instance, an Auto Scaling group, Kubernetes on EKS, and RDS or
   Aurora). A workload's type is read from its primary backends, databases first, unless `--type` names another.
@@ -528,7 +529,7 @@ every rule with its level.
 ## The waiting page
 
 The page is AWS's branded one: a template (`icon`, `title`, `description`) or a custom HTML page, per level, the workload's and the
-router's (the organization's comes with the manager). The most specific level with a page decides the mode, and a template
+router's (the organization's is the manager's, pushed to the router). The most specific level with a page decides the mode, and a template
 takes each field from the most specific template that has it. The limits are AWS's: an icon of 64 KiB at most, a title of 80
 characters, a description of 500, HTML of 256 KiB.
 
@@ -662,7 +663,7 @@ answered with what is wrong.
 
 - **A scheduled nap's occurrence is spent once its task is accepted.** A pause, a refused nap or a lost task costs that
   window's nap: it does not come back when the pause ends. The idle check still naps the workload by its idle window.
-- **A pause is a workload's.** Router-wide pauses and exclusions wait for the manager on Google Cloud.
+- **A pause is a workload's or the router's:** `dormeto gcp routers pause` pauses every workload of the router.
 - **Many workloads of one regional URL map in one nap window:** see [the swap's limits](#limits-of-the-swap). Ten on one
   map all napped in the acceptance of 2026-11-08.
 
@@ -689,7 +690,7 @@ wakes the workload, from any address.
 
 - **An IP list stops browsers and scanners on those addresses, not an API client that means to wake** with
   `POST /_dormeto/wake`.
-- **The lists are the router's,** for all its workloads; a catalog of lists waits for the manager on Google Cloud.
+- **The lists are the router's,** for all its workloads; the manager's catalog is in S3, which a Google Cloud router cannot read.
 - **The address the waker reads** is the last entry of `X-Forwarded-For` before the load balancer's own: the client's
   behind the global, regional and classic load balancers, a forged `X-Forwarded-For` included behind the global and
   classic ones (measured: the regional one in the acceptance of 2026-11-04, from real wakes, with no forged header; the
@@ -767,8 +768,9 @@ wakes the workload, from any address.
 - **One router per project and region**, named `dmtr-<region>`. A workload's ID matches
   `^[a-z]([a-z0-9-]{0,38}[a-z0-9])?$` so that its backend service's name fits Compute Engine's 63 characters; it
   defaults to the application's backend service's name when that matches, else `--id` names it.
-- **No manager yet.** The CLI talks to the controller with the operator's identity; the manager, discovery and the
-  dashboard come with the next increment. A failed wake therefore notifies nobody: it shows in the router's logs and in
+- **The manager polls, the router notifies nobody.** The CLI talks to the controller with the operator's identity; the
+  manager, once connected, reads the router's journal and summary every minute ([the manager page](google-cloud-manager.md)),
+  and a failed wake reaches its alerts from there. The wake also shows in the router's logs and in
   `dormeto gcp workloads show`.
 
 ## Setup

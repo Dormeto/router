@@ -6,6 +6,9 @@ import assert from 'node:assert/strict';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { createActions } from '../src/actions.mjs';
 import { createControllerApi } from '../src/controller.mjs';
+import { createFirestoreStore } from '../src/firestore.mjs';
+import { organizationOf } from '../src/organization.mjs';
+import { fakeFirestore } from './firestore-fake.mjs';
 import { GKE_INPUT, INPUT, REGION, WAKER, ZONE, onGke, setup, virtualClock } from './world.mjs';
 
 const iso = (ms) => new Date(ms).toISOString();
@@ -648,6 +651,42 @@ test('manager-settings: without settings or a string etag, 400, nothing stored',
     assert.deepEqual(await act({ action: 'manager-settings', ...payload }), { status: 400, body: { error, reason: 'bad-request' } });
   }
   assert.equal(store.manager, null);
+});
+
+// The manager's push over the Firestore store (firestore.mjs) on the fake Firestore, which holds Firestore's limits, through the
+// controller's route as the manager calls it.
+function overFirestore() {
+  const firestore = fakeFirestore();
+  const store = createFirestoreStore({ google: { request: firestore.request }, project: 'p', database: `dmtr-${REGION}` });
+  const log = { info: () => {}, warn: () => {}, error: () => {} };
+  const actions = createActions({ controller: null, onboarding: null, store, router: { name: `dmtr-${REGION}` }, now: () => 7, log });
+  const handler = createControllerApi({ core: null, onboarding: null, config: {}, actions });
+  const post = async (payload) => {
+    const res = await handler(request('POST', '/v1/actions', JSON.stringify(payload)));
+    return { status: res.statusCode, body: JSON.parse(res.body) };
+  };
+  return { store, post, actions };
+}
+
+// A page of exactly 256 KiB, and a PNG icon of 64 KiB once decoded: the most the manager's waiting page takes.
+const PAGE_256K = `${PAGE_HTML}${'x'.repeat(256 * 1024 - PAGE_HTML.length)}`;
+const ICON_64K = `data:image/png;base64,${Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(64 * 1024 - 8, 7)]).toString('base64')}`;
+
+test('manager-settings over Firestore: a large organization document, 20 custom types, a 256 KiB custom page and a 64 KiB icon, is stored and read back whole; a body over 1 MiB leaves the last one in place', async () => {
+  const { store, post, actions } = overFirestore();
+  const types = Array.from({ length: 20 }, (_, i) => ({ name: `type-${i}`, description: 'd'.repeat(200), tags: { team: `t${i}`, tier: 'batch' }, settings: { idleMinutes: 30 + i, wakeTimeoutSeconds: 900 } }));
+  const settings = { workloads: { hibernate: false, joinMinutes: 10, defaults: { idleMinutes: 30 }, types }, waitingPage: { mode: 'custom', html: PAGE_256K, icon: ICON_64K, title: 'Acme' } };
+  assert.deepEqual(await post({ action: 'manager-settings', settings, etag: 'e1', refusals: true }), { status: 200, body: { etag: 'e1' } });
+  const stored = await store.getManagerSettings();
+  assert.deepEqual(stored, { settings, etag: 'e1', at: 7 });
+  const { level, page, error } = organizationOf(stored);
+  assert.deepEqual([error, level.hibernate, level.joinMinutes, level.types.length, page], [null, false, 10, 20, { mode: 'custom', html: PAGE_256K }]);
+  // Over 1 MiB: the controller refuses the body before any action, and Firestore a document it cannot hold.
+  const big = { ...settings, waitingPage: { mode: 'custom', html: 'x'.repeat(1024 * 1024) } };
+  assert.deepEqual(await post({ action: 'manager-settings', settings: big, etag: 'e2', refusals: true }), { status: 400, body: { error: 'the body is larger than 1048576 bytes', reason: 'bad-request' } });
+  await assert.rejects(actions({ action: 'manager-settings', settings: big, etag: 'e2' }), /exceeds the maximum allowed size of 1048576 bytes/);
+  assert.deepEqual(await store.getManagerSettings(), { settings, etag: 'e1', at: 7 });
+  assert.deepEqual((await post({ action: 'events', after: null, limit: 1 })).body.managerSettings, { etag: 'e1' });
 });
 
 test('an action the router does not serve: 400 unknown-action, with refusals or without', async () => {

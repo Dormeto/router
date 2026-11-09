@@ -29,6 +29,8 @@ const STEPS = {
   workloads: ['invoke'],
   onboard: ['invoke', 'tag', 'requestLogs'],
   offboard: ['invoke', 'tag', 'requestLogs'],
+  connect: ['read', 'apis', 'federation', 'serviceAccounts', 'roles', 'scopeBindings', 'controller', 'tag'],
+  disconnect: ['read', 'controller', 'tag', 'scopeBindings', 'roles', 'serviceAccounts', 'federation'],
 };
 
 // Every list of permissions in the manifest, named for the failure messages.
@@ -37,6 +39,7 @@ function permissionLists(m) {
     ...Object.entries(m.roles).map(([id, role]) => [`roles.${id}`, role.permissions]),
     ...Object.entries(m.predefined).map(([role, list]) => [`predefined.${role}`, list]),
     ...Object.entries(m.operator).flatMap(([command, steps]) => Object.entries(steps).map(([step, list]) => [`operator.${command}.${step}`, list])),
+    ...Object.entries(m.manager.roles).map(([id, role]) => [`manager.roles.${id}`, role.permissions]),
     ...Object.entries(m.features ?? {}).flatMap(([name, f]) => [
       ...Object.entries(f.roles).map(([id, role]) => [`features.${name}.roles.${id}`, role.permissions]),
       ...Object.entries(f.operator).flatMap(([command, steps]) => Object.entries(steps).map(([step, list]) => [`features.${name}.operator.${command}.${step}`, list])),
@@ -49,9 +52,9 @@ const includesAll = (list, wanted, where) => {
   assert.deepEqual(missing, [], `${where} lacks ${missing.join(', ')}`);
 };
 
-test('the manifest is valid JSON, version 1, with its seven sections', async () => {
+test('the manifest is valid JSON, version 1, with its eight sections', async () => {
   const m = await load();
-  assert.deepEqual(Object.keys(m), ['version', 'apis', 'roles', 'predefined', 'router', 'operator', 'features']);
+  assert.deepEqual(Object.keys(m), ['version', 'apis', 'roles', 'predefined', 'router', 'operator', 'features', 'manager']);
   assert.equal(m.version, 1);
 });
 
@@ -182,7 +185,8 @@ test('placeholders appear only in the conditions and in the custom roles\' names
       for (const [k, v] of Object.entries(value)) walk(v, `${path}.${k}`);
     }
   };
-  walk(m, '');
+  // The manager section has its own placeholders (its test below).
+  walk({ ...m, manager: undefined }, '');
   assert.ok(found.length > 0);
   for (const [path, placeholder, value] of found) {
     assert.ok(PLACEHOLDERS.includes(placeholder), `${path}: unknown placeholder ${placeholder}`);
@@ -339,4 +343,96 @@ test('features: the operator permissions of Cloud SQL and GKE', async () => {
     onboard: { cluster: ['container.clusters.get', 'container.roles.create', 'container.roles.update', 'container.roleBindings.create', 'container.roleBindings.update', 'container.services.get', 'container.roles.escalate', 'container.roles.bind', 'container.clusters.connect', 'container.replicaSets.list', 'container.pods.list', 'container.roles.get', 'container.roleBindings.get', 'container.roles.delete', 'container.roleBindings.delete', 'datastore.databases.get', 'datastore.entities.get', 'datastore.entities.update'] },
     offboard: { cluster: ['container.roles.delete', 'container.roleBindings.delete', 'container.roleBindings.update', 'container.roles.bind', 'container.clusters.connect', 'container.clusters.get', 'container.roles.get', 'container.roleBindings.get', 'datastore.databases.get', 'datastore.entities.get', 'datastore.entities.update'] },
   });
+});
+
+// Design 2026-11-09-google-cloud-manager, sections 4.1, 4.2 and 4.4: what `dormeto gcp connect` turns on, creates and
+// grants for the manager.
+const MANAGER_PLACEHOLDERS = ['{env}', '{account}', '{hostNumber}', '{awsRole}', '{project}', '{role}'];
+
+test('manager: its keys, in order', async () => {
+  const { manager } = await load();
+  assert.deepEqual(Object.keys(manager), ['apis', 'federation', 'serviceAccounts', 'roles', 'grants', 'impersonation']);
+  assert.deepEqual(manager.apis, ['iam', 'iamcredentials', 'sts', 'cloudresourcemanager', 'cloudbilling'].map((a) => `${a}.googleapis.com`));
+  assert.deepEqual(Object.keys(manager.roles), ['dormetoDiscovery', 'dormetoCommand']);
+  for (const [id, role] of Object.entries(manager.roles)) {
+    assert.match(id, ROLE_ID);
+    assert.deepEqual(Object.keys(role), ['title', 'description', 'permissions'], id);
+    assert.ok(role.title.length > 0 && role.title.length <= 100, `${id}: title`);
+    assert.ok(role.description.length > 0 && role.description.length <= 256, `${id}: description`);
+  }
+});
+
+test('manager: the federation and the two accounts, as design 4.1 names them', async () => {
+  const { manager } = await load();
+  assert.deepEqual(manager.federation, {
+    pool: 'dmt-{env}',
+    provider: 'aws',
+    condition: "assertion.arn.startsWith('arn:aws:sts::{account}:assumed-role/dmt-{env}-manager-')",
+    mapping: { 'google.subject': 'assertion.arn', 'attribute.aws_role': "assertion.arn.extract('assumed-role/{role}/')" },
+  });
+  assert.deepEqual(manager.serviceAccounts, { discovery: 'dmt-{env}-discovery', command: 'dmt-{env}-command' });
+});
+
+test('manager: dormetoDiscovery holds only get, list and monitoring.timeSeries.list', async () => {
+  const { manager } = await load();
+  const list = manager.roles.dormetoDiscovery.permissions;
+  for (const p of list) assert.ok(/\.(get|list)$/.test(p) || p === 'monitoring.timeSeries.list', p);
+  includesAll(list, ['resourcemanager.projects.get', 'resourcemanager.projects.list', 'resourcemanager.folders.get', 'resourcemanager.folders.list', 'resourcemanager.organizations.get', 'run.services.get', 'run.services.list', 'monitoring.timeSeries.list'], 'dormetoDiscovery');
+  for (const kind of ['urlMaps', 'regionUrlMaps', 'backendServices', 'regionBackendServices', 'targetHttpProxies', 'targetHttpsProxies', 'regionTargetHttpProxies', 'regionTargetHttpsProxies', 'globalForwardingRules', 'forwardingRules', 'instanceGroups', 'instanceGroupManagers', 'instances', 'networkEndpointGroups']) {
+    includesAll(list, [`compute.${kind}.get`, `compute.${kind}.list`], 'dormetoDiscovery');
+  }
+});
+
+test('manager: each dormetoCommand permission is a tag permission the onboarding, the offboarding or the Cloud SQL feature already needs', async () => {
+  const { manager, operator, features } = await load();
+  const allowed = new Set([...operator.onboard.tag, ...operator.offboard.tag, ...features['cloud-sql'].operator.onboard.tag, ...features['cloud-sql'].operator.offboard.tag]);
+  const list = manager.roles.dormetoCommand.permissions;
+  for (const p of list) assert.ok(allowed.has(p), `${p} is no tag permission of the operator`);
+  // The tag value's own permissions come from roles/resourcemanager.tagUser, the invoke from roles/run.invoker.
+  assert.deepEqual(list.filter((p) => /^resourcemanager\./.test(p) || p === 'run.routes.invoke'), []);
+  includesAll(list, ['compute.instances.listTagBindings', 'compute.instances.createTagBinding', 'compute.instances.deleteTagBinding', 'compute.instanceGroupManagers.listTagBindings', 'compute.instanceGroupManagers.createTagBinding', 'compute.instanceGroupManagers.deleteTagBinding', 'cloudsql.instances.get', 'cloudsql.instances.listTagBindings', 'cloudsql.instances.createTagBinding', 'cloudsql.instances.deleteTagBinding'], 'dormetoCommand');
+});
+
+test('manager: the grants at the scopes and in each router project', async () => {
+  const { manager } = await load();
+  assert.deepEqual(manager.grants, {
+    scopes: [{ account: 'discovery', role: 'dormetoDiscovery', on: 'scope' }],
+    routerProjects: [
+      { account: 'command', role: 'roles/run.invoker', on: 'controller' },
+      { account: 'command', role: 'roles/resourcemanager.tagUser', on: 'tagValue' },
+      { account: 'command', role: 'dormetoCommand', on: 'project' },
+    ],
+  });
+});
+
+test('manager: the impersonation, workloadIdentityUser per account for its roles only', async () => {
+  const { manager } = await load();
+  const i = manager.impersonation;
+  assert.equal(i.role, 'roles/iam.workloadIdentityUser');
+  assert.equal(i.principalSet, 'principalSet://iam.googleapis.com/projects/{hostNumber}/locations/global/workloadIdentityPools/dmt-{env}/attribute.aws_role/{awsRole}');
+  assert.deepEqual(i.discovery, ['dmt-{env}-manager-discovery', 'dmt-{env}-manager-api', 'dmt-{env}-manager-savings']);
+  assert.deepEqual(i.command, ['dmt-{env}-manager-operations', 'dmt-{env}-manager-api', 'dmt-{env}-manager-fleet']);
+  assert.match(i.note, /iam\.serviceAccountOpenIdTokenCreator/);
+  assert.doesNotMatch(JSON.stringify(manager.grants), /serviceAccountOpenIdTokenCreator/);
+});
+
+test('manager: placeholders are the known few, and the roles carry none', async () => {
+  const { manager } = await load();
+  const found = JSON.stringify(manager).match(/\{[A-Za-z]*\}/g) ?? [];
+  assert.ok(found.length > 0);
+  for (const p of found) assert.ok(MANAGER_PLACEHOLDERS.includes(p), `unknown placeholder ${p}`);
+  assert.doesNotMatch(JSON.stringify(manager.roles), /\{[A-Za-z]*\}/);
+});
+
+test('manager: connect and disconnect never ask for a policy the manager would change at run time', async () => {
+  const { operator, manager } = await load();
+  // testIamPermissions needs no permission; the tag value's grant is the only one at a tag.
+  assert.deepEqual(operator.connect.tag, ['resourcemanager.tagValues.get', 'resourcemanager.tagValues.getIamPolicy', 'resourcemanager.tagValues.setIamPolicy']);
+  includesAll(operator.connect.federation, ['iam.workloadIdentityPools.create', 'iam.workloadIdentityPools.undelete', 'iam.workloadIdentityPoolProviders.create', 'iam.workloadIdentityPoolProviders.undelete'], 'connect.federation');
+  includesAll(operator.disconnect.federation, ['iam.workloadIdentityPools.delete', 'iam.workloadIdentityPoolProviders.delete'], 'disconnect.federation');
+  includesAll(operator.connect.serviceAccounts, ['iam.serviceAccounts.create', 'iam.serviceAccounts.setIamPolicy'], 'connect.serviceAccounts');
+  includesAll(operator.disconnect.serviceAccounts, ['iam.serviceAccounts.delete'], 'disconnect.serviceAccounts');
+  includesAll(operator.connect.apis, ['serviceusage.services.enable'], 'connect.apis');
+  for (const c of ['connect', 'disconnect']) includesAll(operator[c].scopeBindings, ['resourcemanager.projects.setIamPolicy', 'resourcemanager.folders.setIamPolicy', 'resourcemanager.organizations.setIamPolicy'], `${c}.scopeBindings`);
+  assert.ok(manager);
 });

@@ -327,6 +327,102 @@
         "compute.globalOperations.get",
         "compute.regionOperations.get"
       ]
+    },
+    "connect": {
+      "read": [
+        "resourcemanager.projects.get",
+        "resourcemanager.projects.getIamPolicy",
+        "resourcemanager.projects.list",
+        "serviceusage.services.list",
+        "serviceusage.services.use",
+        "run.services.list"
+      ],
+      "apis": [
+        "serviceusage.services.enable",
+        "serviceusage.operations.get"
+      ],
+      "federation": [
+        "iam.workloadIdentityPools.get",
+        "iam.workloadIdentityPools.create",
+        "iam.workloadIdentityPools.update",
+        "iam.workloadIdentityPools.undelete",
+        "iam.workloadIdentityPoolProviders.get",
+        "iam.workloadIdentityPoolProviders.create",
+        "iam.workloadIdentityPoolProviders.update",
+        "iam.workloadIdentityPoolProviders.undelete"
+      ],
+      "serviceAccounts": [
+        "iam.serviceAccounts.get",
+        "iam.serviceAccounts.create",
+        "iam.serviceAccounts.getIamPolicy",
+        "iam.serviceAccounts.setIamPolicy"
+      ],
+      "roles": [
+        "iam.roles.get",
+        "iam.roles.create",
+        "iam.roles.update",
+        "iam.roles.undelete"
+      ],
+      "scopeBindings": [
+        "resourcemanager.projects.getIamPolicy",
+        "resourcemanager.projects.setIamPolicy",
+        "resourcemanager.folders.getIamPolicy",
+        "resourcemanager.folders.setIamPolicy",
+        "resourcemanager.organizations.getIamPolicy",
+        "resourcemanager.organizations.setIamPolicy"
+      ],
+      "controller": [
+        "run.services.get",
+        "run.services.getIamPolicy",
+        "run.services.setIamPolicy"
+      ],
+      "tag": [
+        "resourcemanager.tagValues.get",
+        "resourcemanager.tagValues.getIamPolicy",
+        "resourcemanager.tagValues.setIamPolicy"
+      ]
+    },
+    "disconnect": {
+      "read": [
+        "resourcemanager.projects.get",
+        "resourcemanager.projects.getIamPolicy",
+        "resourcemanager.projects.list",
+        "serviceusage.services.list",
+        "serviceusage.services.use",
+        "run.services.list"
+      ],
+      "controller": [
+        "run.services.get",
+        "run.services.getIamPolicy",
+        "run.services.setIamPolicy"
+      ],
+      "tag": [
+        "resourcemanager.tagValues.get",
+        "resourcemanager.tagValues.getIamPolicy",
+        "resourcemanager.tagValues.setIamPolicy"
+      ],
+      "scopeBindings": [
+        "resourcemanager.projects.getIamPolicy",
+        "resourcemanager.projects.setIamPolicy",
+        "resourcemanager.folders.getIamPolicy",
+        "resourcemanager.folders.setIamPolicy",
+        "resourcemanager.organizations.getIamPolicy",
+        "resourcemanager.organizations.setIamPolicy"
+      ],
+      "roles": [
+        "iam.roles.get",
+        "iam.roles.delete"
+      ],
+      "serviceAccounts": [
+        "iam.serviceAccounts.get",
+        "iam.serviceAccounts.delete"
+      ],
+      "federation": [
+        "iam.workloadIdentityPools.get",
+        "iam.workloadIdentityPools.delete",
+        "iam.workloadIdentityPoolProviders.get",
+        "iam.workloadIdentityPoolProviders.delete"
+      ]
     }
   },
   "features": {
@@ -443,6 +539,129 @@
           ]
         }
       }
+    }
+  },
+  "manager": {
+    "apis": [
+      "iam.googleapis.com",
+      "iamcredentials.googleapis.com",
+      "sts.googleapis.com",
+      "cloudresourcemanager.googleapis.com",
+      "cloudbilling.googleapis.com"
+    ],
+    "federation": {
+      "pool": "dmt-{env}",
+      "provider": "aws",
+      "condition": "assertion.arn.startsWith('arn:aws:sts::{account}:assumed-role/dmt-{env}-manager-')",
+      "mapping": {
+        "google.subject": "assertion.arn",
+        "attribute.aws_role": "assertion.arn.extract('assumed-role/{role}/')"
+      }
+    },
+    "serviceAccounts": {
+      "discovery": "dmt-{env}-discovery",
+      "command": "dmt-{env}-command"
+    },
+    "roles": {
+      "dormetoDiscovery": {
+        "title": "Dormeto manager discovery",
+        "description": "Lets the Dormeto manager's discovery account read the projects, folders and organizations of its scopes, their load balancers, VMs and groups, their Cloud Run services and their request counts. Read only.",
+        "permissions": [
+          "resourcemanager.projects.get",
+          "resourcemanager.projects.list",
+          "resourcemanager.folders.get",
+          "resourcemanager.folders.list",
+          "resourcemanager.organizations.get",
+          "compute.urlMaps.get",
+          "compute.urlMaps.list",
+          "compute.regionUrlMaps.get",
+          "compute.regionUrlMaps.list",
+          "compute.backendServices.get",
+          "compute.backendServices.list",
+          "compute.regionBackendServices.get",
+          "compute.regionBackendServices.list",
+          "compute.targetHttpProxies.get",
+          "compute.targetHttpProxies.list",
+          "compute.targetHttpsProxies.get",
+          "compute.targetHttpsProxies.list",
+          "compute.regionTargetHttpProxies.get",
+          "compute.regionTargetHttpProxies.list",
+          "compute.regionTargetHttpsProxies.get",
+          "compute.regionTargetHttpsProxies.list",
+          "compute.globalForwardingRules.get",
+          "compute.globalForwardingRules.list",
+          "compute.forwardingRules.get",
+          "compute.forwardingRules.list",
+          "compute.instanceGroups.get",
+          "compute.instanceGroups.list",
+          "compute.instanceGroupManagers.get",
+          "compute.instanceGroupManagers.list",
+          "compute.instances.get",
+          "compute.instances.list",
+          "compute.networkEndpointGroups.get",
+          "compute.networkEndpointGroups.list",
+          "run.services.get",
+          "run.services.list",
+          "monitoring.timeSeries.list"
+        ]
+      },
+      "dormetoCommand": {
+        "title": "Dormeto manager command",
+        "description": "Lets the Dormeto manager's command account bind and unbind the managed tag on the compute resources and Cloud SQL instances of a router project. Granted with the invoker role on the controller and the tag user role on the tag value.",
+        "permissions": [
+          "compute.instances.listTagBindings",
+          "compute.instances.createTagBinding",
+          "compute.instances.deleteTagBinding",
+          "compute.instanceGroupManagers.listTagBindings",
+          "compute.instanceGroupManagers.createTagBinding",
+          "compute.instanceGroupManagers.deleteTagBinding",
+          "cloudsql.instances.get",
+          "cloudsql.instances.listTagBindings",
+          "cloudsql.instances.createTagBinding",
+          "cloudsql.instances.deleteTagBinding"
+        ]
+      }
+    },
+    "grants": {
+      "scopes": [
+        {
+          "account": "discovery",
+          "role": "dormetoDiscovery",
+          "on": "scope"
+        }
+      ],
+      "routerProjects": [
+        {
+          "account": "command",
+          "role": "roles/run.invoker",
+          "on": "controller"
+        },
+        {
+          "account": "command",
+          "role": "roles/resourcemanager.tagUser",
+          "on": "tagValue"
+        },
+        {
+          "account": "command",
+          "role": "dormetoCommand",
+          "on": "project"
+        }
+      ]
+    },
+    "impersonation": {
+      "role": "roles/iam.workloadIdentityUser",
+      "principalSet": "principalSet://iam.googleapis.com/projects/{hostNumber}/locations/global/workloadIdentityPools/dmt-{env}/attribute.aws_role/{awsRole}",
+      "discovery": [
+        "dmt-{env}-manager-discovery",
+        "dmt-{env}-manager-api",
+        "dmt-{env}-manager-savings"
+      ],
+      "command": [
+        "dmt-{env}-manager-operations",
+        "dmt-{env}-manager-api",
+        "dmt-{env}-manager-fleet"
+      ],
+      "note": "Granted on each service account to the principal set of each of its roles, and to no other. Whether roles/iam.workloadIdentityUser alone lets a principal set mint the ID token is measured live (M1); if not, roles/iam.serviceAccountOpenIdTokenCreator is added on the command account."
     }
   }
 }

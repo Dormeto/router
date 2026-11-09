@@ -312,8 +312,10 @@ aws lambda invoke --function-name dmt-dev-controller --cli-binary-format raw-in-
     joins. The gap is elapsed time, so a clock change counts as it passes.
   - The most specific level that sets it wins: `joinMinutes` on the workload's schedule, the router's (the controller's
     `settings` action), the organization's (`workloads.joinMinutes` in the manager's `settings.json`, within 5 minutes), else
-    15. A level that cannot be read counts as unset, logged `JoinLevelUnreadable`. On Google Cloud: the workload's, else 15.
-    The waker keeps the router's and the organization's values for 60 seconds, so a change there reaches it within a minute.
+    15. A level that cannot be read counts as unset, logged `JoinLevelUnreadable`. On Google Cloud the same levels
+    apply: the schedule's, the router's (`dormeto gcp routers settings --join-minutes`) and the organization's, which the
+    manager pushes to the router, else 15. The waker keeps the router's and the organization's values for 60 seconds, so
+    a change there reaches it within a minute.
   - Not joined: two kinds, a gap where the other kind starts, a start an exception date or a range removes. The overlap
     check on save compares windows as written.
   - `status` and the `schedule` action answer `joinMinutes`, `joinFrom` (`workload`, `router`, `organization` or `default`) and
@@ -328,7 +330,8 @@ aws lambda invoke --function-name dmt-dev-controller --cli-binary-format raw-in-
     days, 365 by default and without a manager. While the settings were never read, or cannot be, nothing is removed.
   - Only between occurrences, since an occurrence's id holds its window's index; and only over the schedule as the check read
     it (a conditional write), so a save since is kept. Logged `EndedWindowsRemoved` with the counts. Who set the schedule
-    and when stay as they were. Not on Google Cloud yet.
+    and when stay as they were. On Google Cloud too (router 0.40.0), with the `endedWindowDays` of the settings the
+    manager pushes to the router: 365 days without them, and 0 keeps them.
 - **The check applies it** on the clock's 5-minute marks: the `check_schedule` of the `router` module is
   `cron(0/5 * * * ? *)` (not `rate(5 minutes)`), so 08:45 is met at the 08:45 check, within its latency. Each occurrence
   of a window is applied once (the run item records the last one, `scheduleApplied`), so a missed check or a deploy

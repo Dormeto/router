@@ -199,7 +199,7 @@ function cloudSqlProblems(cloudSql) {
 const builtInsOf = (cfg) => effectiveOf({ ...cfg, inherits: SCALAR_KEYS });
 
 // AWS's hibernation of a workload, as its status and its settings answer give it: the resolution (its own, none with fallback machine
-// types, the router's, the built-in), each level's value, and the manager's, none until G2.
+// types, the router's, the built-in), each level's value, and the manager's (the organization's level, router/manager).
 function hibernationOf(cfg, router, organization) {
   return {
     ...resolveHibernation({ workload: cfg.hibernate, fallbackTypes: cfg.fallbackInstanceTypes, router: router?.hibernate, manager: organization }),

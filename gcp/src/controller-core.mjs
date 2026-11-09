@@ -39,10 +39,10 @@
 // the wake), `lastWake` (`{ durationMs }`), `recentWakes` (AWS's: the last 10 wakes' durations, for the waiting page's progress bar), `scheduleApplied` (the last nap or awake window's occurrence applied), `napAborted`
 // (`{ reason, at }`: the last nap given up, its cause, until a nap commits), and the heartbeat's (heartbeat.mjs): `napId` (the
 // running nap's, as `wakeId` is the wake's), `beatAt`, `resentAt` and `resends`. The cause and the event of a state change are
-// logged (`StateChanged`): the state history in the manager comes with G2.
+// logged (`StateChanged`) and committed with it in the journal (`events/`), which the manager reads (G2 spec §5.3).
 //
-// Schedules and pauses as on AWS (vision docs/specs/2026-10-30-google-cloud-coverage-design.md, section 5). Here a pause is
-// a workload's: the router's and the exclusions wait for G2.
+// Schedules and pauses as on AWS (vision docs/specs/2026-10-30-google-cloud-coverage-design.md, section 5): a workload's pause and
+// the router's (`router/pause`, G2 spec §5.6). The manager's exclusions are not on Google Cloud yet.
 //
 // The waiting page (vision docs/specs/2026-11-08-google-cloud-router-features-design.md, section 5.2): a nap reads the application's
 // favicon before its NAPPING, while the route still reaches the application, as AWS's (favicon.mjs's step), from the host the URL map

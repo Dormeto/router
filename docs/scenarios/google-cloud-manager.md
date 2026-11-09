@@ -17,8 +17,8 @@ documented in the CLI's README, not here.
 - **The check summary**, `router/check`: replaced whole at each check (every 5 minutes, `checkSchedule` is
   `*/5 * * * *`) with the time of the check and how long it took, the time of the last check the schedule started, the
   router's health (the same problems as AWS's health that apply here, such as a manager settings document that cannot be
-  read, plus pauses that cannot be read), the active pauses and the count of workloads by state. A summary that
-  cannot be written fails nothing: the check's work is done.
+  read, plus pauses that cannot be read), the router's own pauses (a workload's are in its row) and the count of
+  workloads by state. A summary that cannot be written fails nothing: the check's work is done.
 - **The organization's level**, `router/manager`: the manager's whole `settings.json` as it pushed it, with its ETag and
   the time it was stored. Without a push, the organization level reads as unset.
 
@@ -30,9 +30,10 @@ service: the manager calls it with an ID token of its command service account, w
 (the grant `dormeto gcp connect` makes).
 
 - **The AWS actions it answers:** `router`, `list`, `status`, `request-nap`, `force-wake`, `pause`, `resume`, `rename`,
-  `tag`, `settings`, `waiting-page`, `schedule`, `clear-schedule`, `preview`, `onboard` and `offboard`. The rows carry
-  AWS's keys: what AWS reads live and Google Cloud does not (the last request, the load balancer's rules, the targets)
-  keeps its key, empty. A Google Cloud row names its backend service where AWS's names its target group.
+  `tag`, `settings`, `waiting-page`, `schedule`, `clear-schedule`, `preview`, `onboard` and `offboard`. The rows of
+  `list` carry AWS's row keys, and `status` AWS's status keys: what AWS's status reads live and Google Cloud does not
+  (the last request, the load balancer's rules, the targets) keeps its key, empty. A Google Cloud row names its backend
+  service where AWS's names its target group.
 - **The two Google Cloud ones:** `events` and `manager-settings` (below).
 - **Any other action** is a 400, `{ "error": "unknown-action" }`: the wake, nap, release, check and list refresh that AWS
   receives as invocations are this router's own work, started by its Cloud Scheduler job and its waker.
@@ -40,7 +41,8 @@ service: the manager calls it with an ID token of its command service account, w
   `invalid`, `not_found` and `conflict`; without it, the REST routes' status and `{ "error", "reason" }`. The problems
   AWS answers as `{ "problems": […] }` (a settings write, a waiting page, a schedule) are answers either way.
 - **The manager's own actions say who asked**: a wake or a nap from the manager carries `by`, and its events the cause
-  `manager`; a pause carries `by` too, and writes no event.
+  `manager`; a pause carries `by` too: the pause itself writes no event, and the wakes it starts write theirs, with the
+  cause `pause` and its `by`.
 
 ### `events`
 
@@ -75,7 +77,7 @@ A `request-nap` for a workload a pause holds is not a refusal: it answers `{ "re
 ## Names and tags
 
 `rename` and `tag` set a workload's name and tags, kept in its configuration beside the ones the CLI's onboarding sets
-(`dormeto gcp workloads onboard --name --tag`), and shown in the rows and in each event's `tags`. An onboarding says where
+(`dormeto gcp workloads onboard --name --set-tag`), and shown in the rows and in each event's `tags`. An onboarding says where
 it came from, `source: "cli"` or `"manager"`.
 
 ## Ended windows

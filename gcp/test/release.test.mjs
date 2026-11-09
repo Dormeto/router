@@ -424,7 +424,8 @@ test('the Compute Engine page: the settings by level, what Google Cloud fixes an
   assert.match(page, /A router level never read on this controller instance takes no idle nap or release decision, waits the longest wake timeout \(1700 s\) and stops plainly, logged SettingsLevelUnreadable, as on AWS/);
   assert.doesNotMatch(page, /A level that cannot be read counts as unset/);
   assert.match(page, /## Settings and their levels/);
-  assert.match(page, /A workload's settings come from AWS's levels: the workload, its type, the router, then the built-in value/);
+  // levels.mjs's effectiveOf: the organization's level (router/manager) between the router's and the built-in value.
+  assert.match(page, /A workload's settings come from AWS's levels: the workload, its type, the router, the organization, then the built-in value/);
   assert.match(page, /PUT \/v1\/workloads\/\{id\}\/settings/);
   assert.match(page, /GET and PUT \/v1\/settings/);
   assert.match(page, /The organization level and the custom types are the manager's: it pushes its settings\.json to the router \(see \[the manager page\]\(google-cloud-manager\.md\)\), and until it does the organization level reads as unset and only the built-in types exist/);
@@ -601,8 +602,8 @@ test('the Compute Engine page: the idle check leaves out what a no-wake rule mat
   // activity.mjs: the no-wake rules of every level; a logged request holds the headers user-agent and x-forwarded-for, and no other.
   assert.match(page, /It counts only the requests the waker would not ignore: not scanners, not HEAD requests, not an IP list's addresses, not what a no-wake rule of any level matches/);
   assert.match(page, /its only headers are user-agent and x-forwarded-for \(the address\): a rule's headers condition on either can match it, and one on any other header never does, so the request counts/);
-  // controller-core.mjs and onboarding.mjs's scheduleView: AWS's joinLevels.
-  assert.ok(page.includes(`the schedule's own joinMinutes, else the router level's (dormeto gcp routers settings --join-minutes), else ${JOIN_DEFAULT_MINUTES}`), 'resolveJoin');
+  // controller-core.mjs and onboarding.mjs's scheduleView: AWS's joinLevels, the organization's from router/manager.
+  assert.ok(page.includes(`the schedule's own joinMinutes, else the router level's (dormeto gcp routers settings --join-minutes), else the organization's (the manager's workloads.joinMinutes, pushed to the router), else ${JOIN_DEFAULT_MINUTES}`), 'resolveJoin');
   assert.match(page, /schedule show says which \(joinFrom\)/);
   // onboarding.mjs's refusal, word for word.
   assert.ok(page.includes(`has two VMs named <name> (zones <zone> and <zone>): ${TWO_VMS}`), TWO_VMS);
@@ -661,7 +662,39 @@ test('the manager page says what a pause and a request-nap do, from the code, an
   const page = flat(read(MANAGER));
   assert.match(ACTIONS_SRC, /return \{ requested: false, reason: pauseText\(first\) \};/);
   assert.match(page, /is not a refusal: it answers \{ "requested": false, "reason" \} with the pause's words/);
-  assert.match(page, /a pause carries by too, and writes no event/);
+  // controller-core.mjs's pause: its wakes are the wakes of the cause pause, with who paused.
+  assert.match(CORE_SRC, /if \(await wakeNow\(id, 'pause', record\.by\)\) started\.add\(id\);/);
+  assert.doesNotMatch(page, /a pause carries by too, and writes no event/);
+  assert.match(page, /a pause carries by too: the pause itself writes no event, and the wakes it starts write theirs, with the cause pause and its by/);
   assert.match(page, /plus pauses that cannot be read/);
   assert.match(flat(read(CE)), /The manager's exclusions don't reach Google Cloud routers yet\./);
+});
+
+// The final review of G2 plan 1: what the pages said that the code no longer does.
+test('the manager page names the CLI\'s onboarding flags as the CLI has them, --name and --set-tag', () => {
+  const page = flat(read(MANAGER));
+  assert.match(page, /dormeto gcp workloads onboard --name --set-tag/);
+  assert.doesNotMatch(page, /--tag\b/);
+});
+
+test('the manager page says which pauses the check summary holds, which keys the rows and status carry', () => {
+  const page = flat(read(MANAGER));
+  // controller-core.mjs's check: router/check's pauses are the router's own, a workload's are not in it.
+  assert.match(CORE_SRC, /pauses: \(pauses \?\? \[\]\)\.filter\(\(p\) => p\.workloadId === null\)/);
+  assert.doesNotMatch(page, /the active pauses/);
+  assert.match(page, /the router's own pauses \(a workload's are in its row\)/);
+  // actions.mjs: list's rows are AWS's rows (rows.mjs), status AWS's status keys, the live ones empty.
+  assert.match(page, /The rows of list carry AWS's row keys, and status AWS's status keys: what AWS's status reads live and Google Cloud does not \(the last request, the load balancer's rules, the targets\) keeps its key, empty/);
+});
+
+test('the README and the Compute Engine page give Google Cloud the organization\'s level, its joined windows and its ended windows', () => {
+  const readme = flat(read('README.md'));
+  // controller-core.mjs's check and onboarding.mjs's scheduleView: the schedule's, the router's, the organization's, the default.
+  assert.doesNotMatch(readme, /On Google Cloud: the workload's, else 15/);
+  assert.ok(readme.includes(`On Google Cloud the same levels apply: the schedule's, the router's (dormeto gcp routers settings --join-minutes) and the organization's, which the manager pushes to the router, else ${JOIN_DEFAULT_MINUTES}.`));
+  // controller-core.mjs's endedDaysOf: the organization's endedWindowDays, a year by default (ENDED_DAYS_DEFAULT), 0 keeps them.
+  assert.match(CORE_SRC, /return managerState\?\.level\?\.endedWindowDays \?\? ENDED_DAYS_DEFAULT;/);
+  assert.doesNotMatch(readme, /Not on Google Cloud yet\./);
+  assert.match(readme, /On Google Cloud too \(router 0\.40\.0\), with the endedWindowDays of the settings the manager pushes to the router: 365 days without them, and 0 keeps them\./);
+  for (const [file, stale] of [['gcp/src/controller-core.mjs', /comes with G2|wait for G2/], ['gcp/src/onboarding.mjs', /until G2/]]) assert.doesNotMatch(read(file), stale, file);
 });

@@ -440,9 +440,9 @@ earlier runs), with one answer `503`.
 
 ## Settings and their levels
 
-A workload's settings come from AWS's levels: the workload, its type, the router, then the built-in value. The
-names, the values and the answers are AWS's (`idleMinutes`, `settingsFrom`, `type`, `noWakeRules`, `inherits`), so one model
-describes both clouds. The CLI sets them with `dormeto gcp workloads settings` and `dormeto gcp routers settings` (the README has the
+A workload's settings come from AWS's levels: the workload, its type, the router, the organization, then the built-in
+value. The names, the values and the answers are AWS's (`idleMinutes`, `settingsFrom`, `type`, `noWakeRules`, `inherits`),
+so one model describes both clouds. The CLI sets them with `dormeto gcp workloads settings` and `dormeto gcp routers settings` (the README has the
 flags); the controller's routes are `PUT /v1/workloads/{id}/settings`, and `GET` and `PUT /v1/settings` for the router's level, with
 AWS's bodies, answers and checks.
 
@@ -646,8 +646,9 @@ answered with what is wrong.
   wakes the workload on traffic, `POST /_dormeto/wake` included, unless the window's `wake` is `header` (its default is
   `never`); the waiting page tells the visitor when the window ends.
 - **Joined windows.** Two windows of one kind with a short gap between them are one, as on AWS. The gap that joins is the
-  schedule's own `joinMinutes`, else the router level's (`dormeto gcp routers settings --join-minutes`), else 15: the check,
-  the waker and `schedule show` read it so, and `schedule show` says which (`joinFrom`).
+  schedule's own `joinMinutes`, else the router level's (`dormeto gcp routers settings --join-minutes`), else the
+  organization's (the manager's `workloads.joinMinutes`, pushed to the router), else 15: the check, the waker and
+  `schedule show` read it so, and `schedule show` says which (`joinFrom`).
 - **Scheduled naps are spread.** A nap holds a controller request for minutes, so the check enqueues at most 10
   scheduled naps each run, oldest occurrence first, and the next check takes the rest: 30 workloads in one nap window nap
   within 15 minutes. Wakes are never held back.

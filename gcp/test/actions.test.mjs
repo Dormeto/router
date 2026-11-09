@@ -236,6 +236,24 @@ test('pause and resume: a workload\'s or, without workloadId, the router\'s, in 
   assert.deepEqual((await act({ action: 'pause', workloadId: 'nope', reason: 'r', refusals: true })).body.refused.code, 'not_found');
 });
 
+test('pause and resume: an exclusion\'s, with exclusionId or targetGroupArn, is refused as invalid, so it neither replaces nor lifts the operator\'s pause', async () => {
+  const { call, act, store } = world();
+  await call('POST', '/v1/workloads', INPUT);
+  await act({ action: 'pause', workloadId: 'demo', reason: 'deploy', by: 'ops' });
+  const refused = { refused: { code: 'invalid', message: 'exclusions don\'t reach Google Cloud routers yet' } };
+  for (const payload of [
+    { action: 'pause', workloadId: 'demo', reason: 'excluded: batch', exclusionId: 'x1', by: 'mgr' },
+    { action: 'pause', workloadId: 'demo', reason: 'excluded: batch', targetGroupArn: 'arn:aws:elasticloadbalancing:eu-west-1:1:targetgroup/demo/1', by: 'mgr' },
+    { action: 'pause', reason: 'excluded: batch', exclusionId: 'x1', by: 'mgr' },
+    { action: 'resume', workloadId: 'demo', exclusionId: 'x1', by: 'mgr' },
+    { action: 'resume', workloadId: 'demo', targetGroupArn: 'arn:aws:elasticloadbalancing:eu-west-1:1:targetgroup/demo/1', by: 'mgr' },
+  ]) {
+    assert.deepEqual(await act({ ...payload, refusals: true }), { status: 200, body: refused }, JSON.stringify(payload));
+  }
+  assert.deepEqual(await act({ action: 'resume', workloadId: 'demo', exclusionId: 'x1', by: 'mgr' }), { status: 400, body: { error: refused.refused.message, reason: 'bad-request' } });
+  assert.deepEqual([...store.pauses].map(([id, p]) => [id, p.by, p.reason]), [['demo', 'ops', 'deploy']]);
+});
+
 // A router of asleep workloads, each read and write of the store taking 100 ms (a Firestore call), on a clock where time passes
 // only once every request waits: what a call to the router lasts is its longest chain of awaits.
 function asleepRouter(count) {

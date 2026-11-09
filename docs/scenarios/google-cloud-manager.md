@@ -73,6 +73,8 @@ The `pause` action without a `workloadId` pauses the whole router, and `resume` 
 kept in `router/pause`, and shows in `list` (`router.pauses`) and in the workloads' own pauses with the scope
 `router`. It is the same pause `dormeto gcp routers pause` sets (`--reason`, `--for`, `--until`, `--keep-asleep`).
 A `request-nap` for a workload a pause holds is not a refusal: it answers `{ "requested": false, "reason" }` with the pause's words, as on AWS.
+Exclusions don't reach Google Cloud routers yet: a `pause` or a `resume` that names an `exclusionId` or a `targetGroupArn`
+is refused (`invalid`), so it neither replaces nor lifts an operator's pause.
 
 ## Names and tags
 

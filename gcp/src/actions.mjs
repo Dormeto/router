@@ -34,6 +34,7 @@ const EVENTS_MAX = 500;
 const EVENT_ID = /^\d{13}-[a-z0-9-]+-[A-Z]+$/;
 const ETAG_MAX = 256;
 const WAKEABLE = [STATES.ASLEEP, STATES.FAILED, STATES.NAPPING];
+const EXCLUSIONS_REFUSED = 'exclusions don\'t reach Google Cloud routers yet';
 
 const iso = (ms) => new Date(ms).toISOString();
 const isoOrNull = (ms) => (typeof ms === 'number' && ms > 0 ? iso(ms) : null);
@@ -242,8 +243,16 @@ export function createActions({ controller, onboarding, store, router, lists = [
     return { state: run?.state };
   }
 
+  // The manager's exclusions are AWS's workload pauses with an exclusionId (and the target group they matched), several per workload;
+  // a Google Cloud router keeps one pause per workload and has none of them yet (plan 2): refused, so that an exclusion's pause cannot
+  // replace an operator's, nor its lift remove it.
+  const noExclusion = ({ exclusionId, targetGroupArn }) => {
+    if (exclusionId != null || targetGroupArn != null) throw invalid(EXCLUSIONS_REFUSED);
+  };
+
   // AWS's pause: the workload's, or without workloadId the router's (§5.6): `{ pause, woken }`.
   async function pause(payload) {
+    noExclusion(payload);
     const workloadId = payload.workloadId ?? null;
     if (workloadId !== null) await onboarding.find(workloadId);
     const answer = workloadId === null ? await onboarding.pauseRouter(payload) : await controller.pause(workloadId, payload).catch((err) => {
@@ -254,7 +263,9 @@ export function createActions({ controller, onboarding, store, router, lists = [
   }
 
   // AWS's resume: whether there was the pause, the workload's or the router's.
-  async function resume({ workloadId = null, by }) {
+  async function resume(payload) {
+    noExclusion(payload);
+    const { workloadId = null, by } = payload;
     if (workloadId === null) return onboarding.resumeRouter({ by });
     await onboarding.find(workloadId);
     return controller.resume(workloadId, by ?? 'unknown');

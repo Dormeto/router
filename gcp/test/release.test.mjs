@@ -668,6 +668,9 @@ test('the manager page says what a pause and a request-nap do, from the code, an
   assert.match(page, /a pause carries by too: the pause itself writes no event, and the wakes it starts write theirs, with the cause pause and its by/);
   assert.match(page, /plus pauses that cannot be read/);
   assert.match(flat(read(CE)), /The manager's exclusions don't reach Google Cloud routers yet\./);
+  // actions.mjs's noExclusion: AWS's exclusion fields on pause and resume.
+  assert.match(ACTIONS_SRC, /const EXCLUSIONS_REFUSED = 'exclusions don\\'t reach Google Cloud routers yet';/);
+  assert.match(page, /Exclusions don't reach Google Cloud routers yet: a pause or a resume that names an exclusionId or a targetGroupArn is refused \(invalid\), so it neither replaces nor lifts an operator's pause/);
 });
 
 // The final review of G2 plan 1: what the pages said that the code no longer does.

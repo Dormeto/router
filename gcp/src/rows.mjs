@@ -51,6 +51,10 @@ function lastFailure(run) {
 // The VMs a wake left on a fallback machine type, `[{ instance, from, to }]` (the run's `instanceTypes` is a map here).
 const fallbacksOf = (run) => Object.entries(run?.instanceTypes ?? {}).map(([instance, { from, to }]) => ({ instance, from, to }));
 
+// The AWS kind names of the backends (G5's type names map the same way), in AWS's order; the Cloud SQL twin of `rds-instance`.
+const KIND_OF = { vm: 'instance', mig: 'asg', k8s: 'k8s', cloudsql: 'cloudsql-instance' };
+const KINDS = Object.values(KIND_OF);
+
 // The AWS `list` row (lambda/src/lib/summary.mjs's workloadSummary) of a workload, from its configuration and run. `stats7d`: the
 // store's `getStats(id, 7)`, or null when it could not be read. `router`: the router level, for the resolved settings; `pauses`
 // and `scheduled`: the workload's active pauses and whether it has a schedule. Instead of `targetGroupArn`, its Google resources.
@@ -84,7 +88,7 @@ export function rowOf({ cfg, run, stats7d = null, routerName, router = null, pau
     ...(fallbacks.length ? { fallbacks } : {}),
     updatedAt: isoOrNull(run?.updatedAt),
     pendingWake: run?.pendingWake === true,
-    backends: [...new Set((cfg.backends ?? []).map((b) => b.kind))],
+    backends: KINDS.filter((kind) => (cfg.backends ?? []).some((b) => KIND_OF[b.kind] === kind)),
     pauses,
     ...(scheduled ? { scheduled: true } : {}),
     ...(run?.state === STATES.ASLEEP && run.suspended?.length ? { hibernated: true } : {}),

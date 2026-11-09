@@ -43,7 +43,7 @@ test('rowOf: a workload asleep with a suspended VM is the AWS row, hibernated, w
   assert.equal(row.url, 'https://app.example.com/');
   assert.deepEqual([row.backendService, row.wakerBackendService, row.urlMap, row.lb], ['app', 'dmtr-europe-west1-app', 'lb', { kind: 'global' }]);
   assert.equal('targetGroupArn' in row, false);
-  assert.deepEqual(row.backends, ['vm', 'cloudsql']);
+  assert.deepEqual(row.backends, ['instance', 'cloudsql-instance']);
   assert.deepEqual(row.stats7d, { wakes: 8, ignored: 14, deferred: 21 });
   assert.deepEqual(row.pauses, []);
   assert.equal(row.settings.idleMinutes, 15);
@@ -69,4 +69,10 @@ test('rowOf: the last failure with its time as ISO, the retry time, the fallback
   assert.ok(row.nextAttemptAt > row.failedAt);
   assert.deepEqual(row.fallbacks, [{ instance: 'vm-a', from: 'n2', to: 'e2' }]);
   assert.deepEqual(row.lb, { kind: 'regional', region: 'europe-west1' });
+});
+
+test('rowOf: the backends are the AWS kind names, once each, in AWS\'s order: instance, asg, k8s, then the databases', () => {
+  const backends = [{ kind: 'cloudsql', name: 'db' }, { kind: 'k8s' }, { kind: 'mig', name: 'g' }, { kind: 'vm', name: 'a' }, { kind: 'vm', name: 'b' }];
+  const row = rowOf({ cfg: { ...cfg, backends }, run: { state: 'AWAKE', stateAt: AT }, stats7d: null, routerName: 'r', now: AT });
+  assert.deepEqual(row.backends, ['instance', 'asg', 'k8s', 'cloudsql-instance']);
 });

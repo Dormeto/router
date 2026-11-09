@@ -29,8 +29,9 @@ const OWNER_KINDS = ['Deployment', 'StatefulSet'];
 // M11: the token goes there, so nothing else may.
 const DNS_ENDPOINT = /^[a-z0-9-]+(\.[a-z0-9-]+)*\.gke\.goog$/;
 // M10 only confirms why: GKE's controllers write these maps back at their next sync.
-// K14: k8s2- (v1 Ingress, internal), k8s-um- (v1 Ingress's map), gkegw1- and gkemcg1- (Gateways), mci- plus six characters (Multi Cluster Ingress).
-const GKE_MAP = /^(k8s2-|k8s-um-|gkegw1-|gkemcg1-|mci-)/;
+// K14: k8s2- (v1 Ingress, internal), k8s-um- (v1 Ingress's map), gkegw1- and gkemcg1- (Gateways), mci- plus six characters (Multi Cluster
+// Ingress's hash), then the name's end or a dash: a customer's mci-prod is no MCI map.
+const GKE_MAP = /^(k8s2-|k8s-um-|gkegw1-|gkemcg1-|mci-[a-z0-9]{6}(-|$))/;
 // What GKE writes in the descriptions: a Gateway's map names its `k8sResource`; an Ingress's proxies and rules, `kubernetes.io/ingress-name`.
 const GKE_MAP_FIELD = 'k8sResource';
 const GKE_INGRESS_FIELD = 'kubernetes.io/ingress-name';

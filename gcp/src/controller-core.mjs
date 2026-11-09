@@ -1377,7 +1377,7 @@ export function createController({
   }
 
   // The record as stored. No `until` when none is asked for: the store would make `undefined` a null, read as expired.
-  function pauseRecord({ by, reason, until, keepAsleep, exclusionId }) {
+  function pauseRecord({ by, reason, until, keepAsleep }, exclusionId) {
     const text = typeof reason === 'string' ? reason.trim() : '';
     if (!text || text.length > REASON_MAX) throw new PauseRefused(`reason required (1 to ${REASON_MAX} characters)`);
     if (keepAsleep !== undefined && typeof keepAsleep !== 'boolean') throw new PauseRefused('keepAsleep must be true or false');
@@ -1395,8 +1395,9 @@ export function createController({
   // visitor still wakes it (the waker knows nothing of pauses). Answers the pause as shown and the workloads woken, as AWS's action:
   // those whose wake this pause started, in the configurations' order. A router's wakes go 8 at a time, as the check's reads (AWS
   // queues them 10 at a time), so that a router of many sleepers answers within the manager's call.
-  async function pause(workloadId, input) {
-    const record = pauseRecord(input);
+  // `exclusionId` is the manager's action's alone (actions.mjs checks it): the REST routes never pass one.
+  async function pause(workloadId, input, { exclusionId } = {}) {
+    const record = pauseRecord(input, exclusionId);
     await store.addPause(workloadId, record);
     log.info('Paused', { workloadId, ...record });
     const started = new Set();

@@ -671,7 +671,7 @@ test('the manager page says what a pause and a request-nap do, from the code, an
   // actions.mjs's exclusionOf: the id is a part of the pause's document id, and a target group has no meaning here.
   assert.match(ACTIONS_SRC, /const EXCLUSION_ID_MAX = 64;/);
   assert.match(ACTIONS_SRC, /const TARGET_GROUP_REFUSED = 'a Google Cloud router has no targetGroupArn: name the backendService';/);
-  assert.match(page, /an exclusionId \(1 to 64 characters, no \/ or #\)/);
+  assert.match(page, /an exclusionId \(1 to 64 characters: letters, digits, \., _ and -\)/);
   assert.match(page, /another backend service, or an unknown workload, is refused workload not configured: <id>/);
 });
 

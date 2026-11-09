@@ -83,8 +83,7 @@ const isStatus = (status) => (err) => err?.status === status;
 
 export function createFirestoreStore({ google, project, database, region = database?.replace(/^dmtr-/, ''), now = Date.now, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), log = null, after = (ms, fn) => setTimeout(fn, ms).unref(), cancel = clearTimeout }) {
   const root = `projects/${project}/databases/${database}/documents`;
-  // A document id may hold a `#` (an exclusion's pause), which a URL would take for its fragment.
-  const url = (path) => `${BASE}/${root}/${path.replaceAll('#', '%23')}`;
+  const url = (path) => `${BASE}/${root}/${path}`;
   const commit = (writes) => google.request('POST', `${BASE}/${root}:commit`, { writes });
   const named = (path) => `${root}/${path}`;
   const router = { name: `dmtr-${region}`, region, project };
@@ -137,15 +136,17 @@ export function createFirestoreStore({ google, project, database, region = datab
   const ROUTER_PAUSE = 'router/pause';
   // A workload's pauses are `pauses/<id>` (the operator's) and `pauses/<id>#<exclusionId>` (an exclusion's; an id never holds `#`).
   const pausePath = (workloadId, exclusionId) => `pauses/${workloadId}${exclusionId ? `#${exclusionId}` : ''}`;
+  // The same document in a URL: its id's characters encoded (a `#` would be taken for the fragment).
+  const pauseUrlPath = (workloadId, exclusionId) => `pauses/${encodeURIComponent(`${workloadId}${exclusionId ? `#${exclusionId}` : ''}`)}`;
   const pauseDocOf = (doc) => {
     const [workloadId] = doc.name.slice('pauses/'.length).split('#');
     return { workloadId, ...doc.fields.pause };
   };
 
   // Deletes a pause's document, with its time as precondition; false when `at` is given and differs, or when there is none.
-  async function removeDoc(path, at) {
+  async function removeDoc(path, at, readPath = path) {
     for (let attempt = 1; ; attempt += 1) {
-      const doc = await read(path);
+      const doc = await read(readPath);
       if (!doc || (at !== undefined && doc.value.at !== at)) return false;
       try {
         await commit([{ delete: named(path), currentDocument: { updateTime: doc.updateTime } }]);
@@ -241,7 +242,7 @@ export function createFirestoreStore({ google, project, database, region = datab
       return true;
     },
 
-    // A workload's pause (one per workload) and the router's (`router/pause`, workloadId null): [{ workloadId, by, at, reason, until?,
+    // A workload's pauses (its operator's, and an exclusion's each) and the router's (`router/pause`, workloadId null): [{ workloadId, by, at, reason, until?,
     // keepAsleep }], expired ones included (the controller filters them).
     async getPauses(workloadId) {
       if (!workloadId) {
@@ -281,7 +282,7 @@ export function createFirestoreStore({ google, project, database, region = datab
     // false when `at` is given and the pause changed meanwhile (a newer pause is kept), or when there was none.
     // `exclusionId` names an exclusion's pause; without, the operator's (or the router's).
     async removePauses(workloadId, { at, exclusionId } = {}) {
-      return removeDoc(workloadId ? pausePath(workloadId, exclusionId) : ROUTER_PAUSE, at);
+      return workloadId ? removeDoc(pausePath(workloadId, exclusionId), at, pauseUrlPath(workloadId, exclusionId)) : removeDoc(ROUTER_PAUSE, at);
     },
 
     async getRun(workloadId) {

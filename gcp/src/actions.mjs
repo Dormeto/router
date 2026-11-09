@@ -37,6 +37,8 @@ const ETAG_MAX = 256;
 const WAKEABLE = [STATES.ASLEEP, STATES.FAILED, STATES.NAPPING];
 const TARGET_GROUP_REFUSED = 'a Google Cloud router has no targetGroupArn: name the backendService';
 const EXCLUSION_ID_MAX = 64;
+// The manager's are UUIDs; part of a document id, so no character a URL or a path changes.
+const EXCLUSION_ID = /^[A-Za-z0-9._-]+$/;
 
 const iso = (ms) => new Date(ms).toISOString();
 const isoOrNull = (ms) => (typeof ms === 'number' && ms > 0 ? iso(ms) : null);
@@ -248,13 +250,13 @@ export function createActions({ controller, onboarding, store, router, lists = [
   }
 
   // The manager's exclusions are AWS's workload pauses with an exclusionId, several per workload beside the operator's. The id is a part
-  // of the pause's document id (`<workloadId>#<exclusionId>`): no `/` or `#`. A Google Cloud router has no target group: an exclusion
+  // of the pause's document id (`<workloadId>#<exclusionId>`): letters, digits, `.`, `_` and `-`. A Google Cloud router has no target group: an exclusion
   // names the backend service it matched instead.
   function exclusionOf({ exclusionId, targetGroupArn }) {
     if (targetGroupArn != null) throw invalid(TARGET_GROUP_REFUSED);
     if (exclusionId == null) return undefined;
-    if (typeof exclusionId !== 'string' || !exclusionId || exclusionId.length > EXCLUSION_ID_MAX || /[/#]/.test(exclusionId)) {
-      throw invalid(`exclusionId must be 1 to ${EXCLUSION_ID_MAX} characters, with no / or #`);
+    if (typeof exclusionId !== 'string' || !exclusionId || exclusionId.length > EXCLUSION_ID_MAX || !EXCLUSION_ID.test(exclusionId)) {
+      throw invalid(`exclusionId must be 1 to ${EXCLUSION_ID_MAX} characters, with only letters, digits, . _ and -`);
     }
     return exclusionId;
   }
@@ -275,7 +277,7 @@ export function createActions({ controller, onboarding, store, router, lists = [
         throw new Refusal(404, 'not-found', `workload not configured: ${workloadId}`);
       }
     }
-    const answer = workloadId === null ? await onboarding.pauseRouter(payload) : await controller.pause(workloadId, { ...payload, exclusionId }).catch((err) => {
+    const answer = workloadId === null ? await onboarding.pauseRouter(payload) : await controller.pause(workloadId, payload, { exclusionId }).catch((err) => {
       if (err instanceof PauseRefused) throw invalid(err.message);
       throw err;
     });
@@ -290,7 +292,14 @@ export function createActions({ controller, onboarding, store, router, lists = [
       if (exclusionId !== undefined) throw invalid('an exclusion pauses a workload: workloadId is needed');
       return onboarding.resumeRouter({ by });
     }
-    await onboarding.find(workloadId);
+    // A workload offboarded since: an exclusion's lift has nothing to lift, as AWS's resume answers; the operator's names it, as pause does.
+    try {
+      await onboarding.find(workloadId);
+    } catch (err) {
+      if (!(err instanceof Refusal && err.status === 404)) throw err;
+      if (exclusionId !== undefined) return { resumed: false };
+      throw new Refusal(404, err.reason, `workload not configured: ${workloadId}`);
+    }
     return controller.resume(workloadId, by ?? 'unknown', { exclusionId });
   }
 

@@ -274,11 +274,29 @@ test('pause: another backend service, or an unknown workload, is refused "worklo
     assert.deepEqual(await act({ action, workloadId: 'demo', reason: 'r', exclusionId: 'x1', targetGroupArn: arn, by: 'mgr' }), { status: 400, body: { error: 'a Google Cloud router has no targetGroupArn: name the backendService', reason: 'bad-request' } });
   }
   // An exclusionId is a document id's part: not empty, not long, no / or #.
-  for (const exclusionId of ['', 'a/b', 'a#b', 'x'.repeat(65)]) {
+  for (const exclusionId of ['', 'a/b', 'a#b', 'a?b', 'a%b', 'a b', 'x'.repeat(65)]) {
     const res = await act({ action: 'pause', workloadId: 'demo', reason: 'r', exclusionId, by: 'mgr' });
     assert.equal(res.status, 400, JSON.stringify(exclusionId));
   }
   assert.equal(store.pauses.size, 0);
+});
+
+test('REST pause routes act on the operator\'s pause only: an exclusionId in the body is dropped, the router\'s pause keeps none', async () => {
+  const { call, act, store } = world();
+  await call('POST', '/v1/workloads', INPUT);
+  await call('POST', '/v1/workloads/demo/pause', { reason: 'deploy', by: 'ops', exclusionId: 'x?1' });
+  assert.deepEqual([...store.pauses.keys()], ['demo']);
+  assert.equal(store.pauses.get('demo').exclusionId, undefined);
+  await call('POST', '/v1/workloads/demo/resume');
+  assert.equal(store.pauses.has('demo'), false);
+  await call('POST', '/v1/pause', { reason: 'maintenance', by: 'adm', exclusionId: 'x1' });
+  assert.equal(store.pauses.get(null).exclusionId, undefined);
+});
+
+test('resume of a workload offboarded since: an exclusion\'s lift answers resumed false as AWS\'s; without an exclusionId, "workload not configured"', async () => {
+  const { act } = world();
+  assert.deepEqual(await act({ action: 'resume', workloadId: 'gone', exclusionId: 'x1', by: 'mgr' }), { status: 200, body: { resumed: false } });
+  assert.deepEqual(await act({ action: 'resume', workloadId: 'gone', by: 'mgr', refusals: true }), { status: 200, body: { refused: { code: 'not_found', message: 'workload not configured: gone' } } });
 });
 
 // A router of asleep workloads, each read and write of the store taking 100 ms (a Firestore call), on a clock where time passes

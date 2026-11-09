@@ -113,7 +113,7 @@ export function fakeFirestore() {
     }
     if (method === 'GET') {
       const [encoded, query = ''] = path.slice(1).split('?');
-      const route = encoded.replaceAll('%23', '#');
+      const route = encoded.startsWith('pauses/') ? decodeURIComponent(encoded) : encoded;
       if (docs.has(route)) return wire(route);
       if (!route.includes('/')) {
         const params = new URLSearchParams(query);

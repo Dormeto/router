@@ -539,6 +539,15 @@ test('pauses: an operator\'s pause and an exclusion\'s on one workload both hold
   assert.deepEqual((await store.listPauses()).map((p) => p.workloadId), ['w10']);
 });
 
+test('pauses: an exclusion id holding characters a URL changes (? and %) is found again and removed', async () => {
+  const { store, docs } = setup();
+  const pause = { by: 'mgr', at: 1000, reason: 'excluded', keepAsleep: false, exclusionId: 'a?b%c' };
+  await store.addPause('w1', pause);
+  assert.ok(docs.has('pauses/w1#a?b%c'));
+  assert.equal(await store.removePauses('w1', { exclusionId: 'a?b%c', at: 1000 }), true);
+  assert.deepEqual(await store.getPauses('w1'), []);
+});
+
 test('the router pause (router/pause): put, read with no workload, listed among the pauses, removed once; a newer one is kept', async () => {
   const { store } = setup();
   assert.equal(await store.getRouterPause(), null);

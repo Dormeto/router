@@ -74,7 +74,7 @@ The `pause` action without a `workloadId` pauses the whole router, and `resume` 
 kept in `router/pause`, and shows in `list` (`router.pauses`) and in the workloads' own pauses with the scope
 `router`. It is the same pause `dormeto gcp routers pause` sets (`--reason`, `--for`, `--until`, `--keep-asleep`).
 A `request-nap` for a workload a pause holds is not a refusal: it answers `{ "requested": false, "reason" }` with the pause's words, as on AWS.
-A manager's exclusion pauses a workload as it does on AWS: a `pause` with an `exclusionId` (1 to 64 characters, no `/` or `#`)
+A manager's exclusion pauses a workload as it does on AWS: a `pause` with an `exclusionId` (1 to 64 characters: letters, digits, `.`, `_` and `-`)
 keeps its own pause, `pauses/<workloadId>#<exclusionId>`, beside the operator's, and a `resume` with the `exclusionId` lifts
 that one alone; without it, a `resume` lifts the operator's. `status` lists the exclusions' pauses first, with their
 `exclusionId`. An exclusion's `pause` names the workload's `backendService` (a path or a name) where AWS's names the

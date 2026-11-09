@@ -494,6 +494,14 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
       if (negsOf.has(url)) negs[vm.name] = negsOf.get(url);
       else if (groupOf.has(url)) memberOf[vm.name] = groupOf.get(url);
     }
+    // A VM's name is unique in its zone only, and the workload's records (its backends, the run's machine types, its NEGs and groups) are
+    // keyed by it: a second VM of that name would take the first one's.
+    const zonesOf = new Map();
+    for (const { zone, name } of vms) zonesOf.set(name, new Set([...(zonesOf.get(name) ?? []), zone]));
+    for (const [name, zones] of zonesOf) {
+      const [first, second] = zones;
+      if (second) reasons.push(`backend service ${service.name} has two VMs named ${name} (zones ${first} and ${second}): Dormeto records a workload's VMs by name; rename one`);
+    }
     return { reasons, vms, groups, negs, memberOf };
   }
 

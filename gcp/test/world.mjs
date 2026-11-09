@@ -139,6 +139,7 @@ export const defaults = () => ({
     app: { name: 'app', loadBalancingScheme: 'EXTERNAL_MANAGED', healthChecks: [`${V1}/global/healthChecks/hc`], backends: [{ group: unmanagedUrl('ig') }] },
     other: { name: 'other', loadBalancingScheme: 'EXTERNAL_MANAGED', healthChecks: [`${V1}/global/healthChecks/hc`], backends: [] },
   },
+  // Unmanaged groups by name, their VMs' keys in `vms`: a VM's name, or `<zone>/<name>` for one of a name another zone holds too.
   unmanaged: { ig: ['vm-a'] },
   managed: {},
   // By region: `{ urlMaps, httpsProxies, httpProxies, forwardingRules, services }`.
@@ -368,10 +369,12 @@ function kubeFetch(w) {
 export function setup(change = () => {}, { clock = fakeClock() } = {}) {
   const w = { ...defaults(), changes: [], tasks: [], healthGroups: [], fail: {}, on: {}, logs: [], used: new Set(), routerToken: 'router-token' };
   change(w);
-  const instance = (name) => {
-    const vm = w.vms[name];
+  // A VM by its name, or by `<zone>/<name>` where another zone holds a VM of that name.
+  const instance = (name, asked) => {
+    const zoned = asked && w.vms[`${asked}/${name}`];
+    const vm = zoned ?? w.vms[name];
     if (!vm) throw notFound(`instance ${name}`);
-    const zone = vm.zone ?? ZONE;
+    const zone = zoned ? asked : vm.zone ?? ZONE;
     return { name, zone: `${V1}/zones/${zone}`, selfLink: vmUrl(name, zone), machineType: `${V1}/zones/${zone}/machineTypes/e2-small`, disks: [{ type: 'PERSISTENT' }], ...vm };
   };
   const STATUS = { start: 'RUNNING', stop: 'TERMINATED', suspend: 'SUSPENDED', resume: 'RUNNING' };
@@ -511,7 +514,7 @@ export function setup(change = () => {}, { clock = fakeClock() } = {}) {
       return done(`delete ${name}`);
     }],
     ['POST', /^global\/backendServices\/([^/]+)\/getHealth$/, ([name], body) => healthOf(w.services[name], body)],
-    ['GET', /^zones\/[^/]+\/instances\/([^/]+)$/, ([name]) => instance(name)],
+    ['GET', /^zones\/([^/]+)\/instances\/([^/]+)$/, ([zone, name]) => instance(name, zone)],
     ['POST', /^zones\/[^/]+\/instances\/([^/]+)\/(start|stop|suspend|resume)$/, ([name, action]) => {
       w.vms[name].status = STATUS[action];
       return done(`${action} ${name}`);
@@ -521,7 +524,10 @@ export function setup(change = () => {}, { clock = fakeClock() } = {}) {
       return w.machineTypes[name];
     }],
     ['POST', /^zones\/[^/]+\/instanceGroups\/([^/]+)\/listInstances$/, ([name]) => ({
-      items: w.unmanaged[name].map((vm) => ({ instance: vmUrl(vm, w.vms[vm]?.zone), status: w.vms[vm]?.status })),
+      items: w.unmanaged[name].map((vm) => {
+        const [zone, named] = vm.includes('/') ? vm.split('/') : [w.vms[vm]?.zone, vm];
+        return { instance: vmUrl(named, zone), status: w.vms[vm]?.status };
+      }),
     })],
     ['GET', /^zones\/([^/]+)\/networkEndpointGroups\/([^/]+)$/, ([zone, name]) => {
       const { endpoints, zone: own = ZONE, type = 'GCE_VM_IP_PORT', gkeOwner, foreign, empty, ...fields } = w.negs[name] ?? {};

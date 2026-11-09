@@ -240,6 +240,34 @@ test('onboard: a NEG\'s VMs are the workload\'s vm backends, beside a group\'s',
   ]);
 });
 
+// The run's records (a VM's machine types, its NEGs, its group) are keyed by a VM's name, which is unique in its zone only: a second
+// VM of that name would take the first one's (the G5 review's I5).
+const OTHER_ZONE = 'europe-west1-c';
+const SAME_NAMES = `backend service app has two VMs named app (zones ${ZONE} and ${OTHER_ZONE}): Dormeto records a workload's VMs by name; rename one`;
+const sameNames = (more = () => {}) => (world) => {
+  world.vms = { app: { id: '1001', status: 'RUNNING' }, [`${OTHER_ZONE}/app`]: { id: '1002', status: 'RUNNING' } };
+  world.unmanaged = { 'ig-b': ['app'], 'ig-c': [`${OTHER_ZONE}/app`] };
+  world.services.app.backends = [{ group: unmanagedUrl('ig-b') }, { group: `${V1}/zones/${OTHER_ZONE}/instanceGroups/ig-c` }];
+  more(world);
+};
+
+test('two groups in two zones, each with a VM app: refused, naming the zones, nothing written', async () => {
+  const { w, store, onboarding } = setup(sameNames());
+  assert.deepEqual((await onboarding.dryRun(INPUT)).reasons, [SAME_NAMES]);
+  await assert.rejects(onboarding.onboard(INPUT), refused(400, 'not-eligible', new RegExp(SAME_NAMES.replace(/[()]/g, '\\$&'))));
+  assert.deepEqual(w.changes, []);
+  assert.equal(store.configs.size, 0);
+  assert.equal(store.runs.size, 0);
+});
+
+test('two NEGs in two zones, each with a VM app: refused all the same', async () => {
+  const { onboarding } = setup(sameNames((world) => {
+    world.negs = { 'neg-b': { endpoints: ['app'] }, 'neg-c': { zone: OTHER_ZONE, endpoints: ['app'] } };
+    world.services.app.backends = [{ group: `${V1}/zones/${ZONE}/networkEndpointGroups/neg-b` }, { group: `${V1}/zones/${OTHER_ZONE}/networkEndpointGroups/neg-c` }];
+  }));
+  assert.deepEqual((await onboarding.dryRun(INPUT)).reasons, [SAME_NAMES]);
+});
+
 test('onboard: a VM in two NEGs records the first and the other', async () => {
   const { store, onboarding } = setup((world) => {
     withNeg(world);

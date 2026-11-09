@@ -40,6 +40,7 @@ import {
   clusterProblems, clusterRead, giveBackOwner, gkeDescriptionRefusal, gkeMapRefusal, gkeProblems, isGkeNeg, isPods, negsOfService, ownerAsVm, ownerText, pauseLeft,
 } from './gke.mjs';
 import { beatOf } from './heartbeat.mjs';
+import { organizationOf } from './organization.mjs';
 import { effectiveOf, inheritsOf, levelProblems } from './levels.mjs';
 import { SWITCH_HEADER, WORKLOAD_HEADER, WORKLOAD_ID, swapHeaders } from './names.mjs';
 import { CUSTOM_PAGE_NOT_SERVED, CUSTOM_PAGES_REFUSED, notServed, servedPage } from './pages.mjs';
@@ -196,12 +197,12 @@ const builtInsOf = (cfg) => effectiveOf({ ...cfg, inherits: SCALAR_KEYS });
 
 // AWS's hibernation of a workload, as its status and its settings answer give it: the resolution (its own, none with fallback machine
 // types, the router's, the built-in), each level's value, and the manager's, none until G2.
-function hibernationOf(cfg, router) {
+function hibernationOf(cfg, router, organization) {
   return {
-    ...resolveHibernation({ workload: cfg.hibernate, fallbackTypes: cfg.fallbackInstanceTypes, router: router?.hibernate }),
+    ...resolveHibernation({ workload: cfg.hibernate, fallbackTypes: cfg.fallbackInstanceTypes, router: router?.hibernate, manager: organization }),
     workload: typeof cfg.hibernate === 'boolean' ? cfg.hibernate : null,
     router: typeof router?.hibernate === 'boolean' ? router.hibernate : null,
-    manager: null,
+    manager: typeof organization?.hibernate === 'boolean' ? organization.hibernate : null,
   };
 }
 
@@ -226,11 +227,11 @@ function failureOf(run) {
 // (controller-core.mjs). With the router level (`router`): each setting resolved (`settings`), where it comes from, the type and the
 // rules of every level, as AWS's status gives them, and its hibernation; its fallback machine types, and `fallbacks`, as AWS's, while a
 // VM runs on one.
-function workloadOf(cfg, run, paused, router) {
+function workloadOf(cfg, run, paused, { router = null, organization = null } = {}) {
   const failure = failureOf(run);
   const fallbacks = fallbacksOf(run);
   const beatAt = run ? beatOf(run) : undefined;
-  const effective = effectiveOf(cfg, { run, router });
+  const effective = effectiveOf(cfg, { run, router, organization });
   const { settings, settingsFrom, type } = resolvedSettings(effective);
   return {
     id: cfg.workloadId,
@@ -246,7 +247,7 @@ function workloadOf(cfg, run, paused, router) {
     settingsFrom,
     type,
     ...describedRules(effective),
-    hibernation: hibernationOf(cfg, router),
+    hibernation: hibernationOf(cfg, router, organization),
     backends: cfg.backends,
     ...(Array.isArray(cfg.fallbackInstanceTypes) && cfg.fallbackInstanceTypes.length ? { fallbackInstanceTypes: cfg.fallbackInstanceTypes } : {}),
     ...(fallbacks.length ? { fallbacks } : {}),
@@ -695,7 +696,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
       if (problems.length) throw new Refusal(400, 'not-eligible', `cannot onboard ${id}: ${problems.join('; ')}`);
     }
     // The level the answer resolves with, read before anything is written.
-    const router = await routerLevel();
+    const above = await levelsOf();
     const name = wakerName(id);
     const waker = wakerUrl(name, lb);
     // A setting sent null is left to the levels, as one not sent.
@@ -766,7 +767,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
       throw err;
     }
     log.info('Onboarded', { workloadId: id, urlMap, backendService });
-    return workloadOf(cfg, await store.getRun(id), undefined, router);
+    return workloadOf(cfg, await store.getRun(id), undefined, above);
   }
 
   // The configuration, or a 400 or a 404.
@@ -778,6 +779,21 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
 
   // The router level (`router/settings`), null when unset. A read that fails fails the request, as any other read of it.
   const routerLevel = async () => (await store.getRouterSettings()) ?? null;
+  // The organization's level (`router/manager`, the manager's settings.json) as the shared levels read it: what AWS's manager settings
+  // answer. One that cannot be read counts as unset and is said, as the join levels count it: a status or a settings answer is not
+  // failed for it.
+  const organizationLevel = async () => {
+    try {
+      return organizationOf((await store.getManagerSettings?.()) ?? null).level;
+    } catch (err) {
+      log.warn('SettingsLevelUnreadable', { level: 'organization', error: err.message });
+      return null;
+    }
+  };
+  const levelsOf = async () => {
+    const [router, organization] = await Promise.all([routerLevel(), organizationLevel()]);
+    return { router, organization };
+  };
 
   // The VMs a wake left on a fallback machine type (`fallbacks`, fallbacksOf's), named in the offboarding's answer: no stop of the router's
   // gives them their own back once it is offboarded (vision docs/specs/2026-11-08-google-cloud-router-features-design.md, section 6).
@@ -855,10 +871,10 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     return onFallback(run);
   }
 
-  // The Workload as it is now. `router`: the router level, already read.
-  async function current(cfg, { router } = {}) {
-    const [run, [paused], level] = await Promise.all([store.getRun(cfg.workloadId), core.pausesFor(cfg.workloadId), router === undefined ? routerLevel() : router]);
-    return workloadOf(cfg, run, paused, level);
+  // The Workload as it is now. `levels`: the router's and the organization's, already read.
+  async function current(cfg, { levels } = {}) {
+    const [run, [paused], read] = await Promise.all([store.getRun(cfg.workloadId), core.pausesFor(cfg.workloadId), levels ?? levelsOf()]);
+    return workloadOf(cfg, run, paused, read);
   }
 
   // The name people see, for a workload onboarded here (AWS's rename answer). A write racing an offboarding puts nothing back.
@@ -886,8 +902,8 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   const show = async (id) => current(await find(id));
 
   async function list() {
-    const [configs, router] = await Promise.all([store.listConfigs(), routerLevel()]);
-    const workloads = await Promise.all(configs.map((cfg) => current(cfg, { router })));
+    const [configs, levels] = await Promise.all([store.listConfigs(), levelsOf()]);
+    const workloads = await Promise.all(configs.map((cfg) => current(cfg, { levels })));
     return workloads.sort((a, b) => a.id.localeCompare(b.id));
   }
 
@@ -911,11 +927,11 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   const wake = (id) => move(id, { acts: [STATES.ASLEEP, STATES.FAILED, STATES.NAPPING], there: STATES.AWAKE, act: (workloadId) => core.wakeNow(workloadId) });
 
   // A schedule's answer. One the router cannot read (a time zone Intl refuses) is shown, with no next event. Its joinMinutes as AWS's
-  // answer resolves it: the schedule's own value, then the router level's (`router/settings`), then the default, with no manager here
+  // answer resolves it: the schedule's own value, then the router level's (`router/settings`), then the organization's (`router/manager`), then the default
   // (design, section 11); a router level that cannot be read counts as unset, said in `JoinLevelUnreadable`, as AWS's join levels.
   async function scheduleView(id, schedule) {
     const shown = schedule && { ...schedule, at: isoOf(schedule.at) };
-    const joins = await joinLevels({ router: () => store.getRouterSettings(), manager: null, log, fields: { workloadId: id } });
+    const joins = await joinLevels({ router: () => store.getRouterSettings(), manager: async () => organizationOf((await store.getManagerSettings?.()) ?? null).level, log, fields: { workloadId: id } });
     const { joinMinutes, from } = resolveJoin({ workload: schedule?.joinMinutes, ...joins });
     const inherited = resolveJoin(joins);
     const join = { joinMinutes, joinFrom: from, joinInherited: { joinMinutes: inherited.joinMinutes, joinFrom: inherited.from } };
@@ -991,10 +1007,10 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     const next = withSettings(cfg, settings, { inheritsOf, builtIns: builtInsOf });
     if (Object.hasOwn(next, 'inherits')) next.source ??= 'cli';
     // The level the answer resolves with, read before the write: a failed read changes nothing.
-    const router = await routerLevel();
+    const levels = await levelsOf();
     if (!(await store.putConfig(id, next, { mustExist: true }))) throw notFound(id);
     log.info('WorkloadSettings', { workloadId: id, keys: Object.keys(settings), hibernate: next.hibernate ?? null, previous: cfg.hibernate ?? null, by: by ?? 'unknown' });
-    return { level: 'workload', settings: { ...settings }, hibernation: hibernationOf(next, router), resolved: resolvedSettings(effectiveOf(next, { router })) };
+    return { level: 'workload', settings: { ...settings }, hibernation: hibernationOf(next, levels.router, levels.organization), resolved: resolvedSettings(effectiveOf(next, levels)) };
   }
 
   const routerSettings = async () => ({ level: 'router', settings: routerSettingsView(await routerLevel()) });

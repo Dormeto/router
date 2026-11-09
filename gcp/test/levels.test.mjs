@@ -174,3 +174,37 @@ test('levelProblems names a key of Object\'s prototype an unknown setting, as an
   }
   assert.deepEqual(levelProblems({ constructor: 1, idleMinutes: 4 }, { level: 'router' }), ['unknown setting constructor', 'idleMinutes must be a whole number from 5 to 1440']);
 });
+
+// --- The organization level (G2 §5.5): the manager's settings.json as the router holds it -------------------------------------------
+
+test('an organization idleMinutes of 30 under no router value: 30, from organization (AWS\'s word)', () => {
+  const got = effectiveOf({ ...regional, inherits: ['idleMinutes'] }, { router: null, organization: { defaults: { idleMinutes: 30 } } });
+  assert.deepEqual([got.idleMinutes, got.settingsFrom.idleMinutes], [30, 'organization']);
+});
+
+test('a router value wins over the organization\'s', () => {
+  const got = effectiveOf({ ...regional, inherits: ['idleMinutes'] }, { router: { defaults: { idleMinutes: 5 } }, organization: { defaults: { idleMinutes: 30 } } });
+  assert.deepEqual([got.idleMinutes, got.settingsFrom.idleMinutes], [5, 'router']);
+});
+
+test('a custom organization type batch with idleMinutes 60 applies to a workload of that type', () => {
+  const organization = { types: [{ name: 'batch', settings: { idleMinutes: 60 } }], defaults: { idleMinutes: 30 } };
+  const got = effectiveOf({ ...regional, type: 'batch', inherits: ['idleMinutes'] }, { organization });
+  assert.deepEqual([got.idleMinutes, got.settingsFrom.idleMinutes, got.type.name], [60, 'type', 'batch']);
+});
+
+test('an organization waitSeconds of 30: 0, fixed; the waker\'s configuration carries it too', () => {
+  const organization = { defaults: { waitSeconds: 30, idleMinutes: 40 } };
+  const got = effectiveOf({ ...regional, inherits: ['waitSeconds', 'idleMinutes'] }, { organization });
+  assert.deepEqual([got.waitSeconds, got.settingsFrom.waitSeconds], [0, 'fixed']);
+  assert.deepEqual([got.idleMinutes, got.settingsFrom.idleMinutes], [40, 'organization']);
+  const waker = wakerConfigOf({ ...regional, inherits: ['waitSeconds'] }, { organization });
+  assert.equal(waker.waitSeconds, 0);
+});
+
+test('the waker\'s configuration sees the organization\'s type: a swap floor still lifts the type\'s wake timeout', () => {
+  const organization = { types: [{ name: 'batch', settings: { wakeTimeoutSeconds: 60 } }] };
+  const waker = wakerConfigOf({ ...regional, type: 'batch', inherits: ['wakeTimeoutSeconds'] }, { organization });
+  assert.equal(waker.wakeTimeoutSeconds, effectiveOf({ ...regional, type: 'batch', inherits: ['wakeTimeoutSeconds'] }, { organization }).wakeTimeoutSeconds);
+  assert.ok(waker.wakeTimeoutSeconds > 60);
+});

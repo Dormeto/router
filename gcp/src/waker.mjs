@@ -50,7 +50,8 @@ import { createGoogle } from './google.mjs';
 import { resendStale } from './heartbeat.mjs';
 import { wakerConfigOf } from './levels.mjs';
 import { SWITCH_HEADER, WORKLOAD_HEADER, WORKLOAD_ID } from './names.mjs';
-import { customPagesOf, servedStore } from './pages.mjs';
+import { organizationOf } from './organization.mjs';
+import { customPagesOf, servedPage, servedStore } from './pages.mjs';
 import { createTasks } from './tasks.mjs';
 import { WAITING_PATH } from './urlmaps.mjs';
 
@@ -118,23 +119,38 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], c
 
   // The levels above the workload's, kept 60 s by the instance in the cache the shared core reads too: a request reads one record
   // of them, so that the values Google Cloud fixes below and the core's resolution agree. Never throws.
-  // The organization's level is not read here yet: the router holds it (router/manager) for its health only, until it gives it meaning (G2 §5.5).
-  const levels = createJoinLevelsCache({ router: () => store.getRouterSettings?.(), manager: undefined, now, log });
+  // The organization's level is the manager's settings.json in router/manager, read once for both of its consumers here, the levels and
+  // the page, and kept by their caches: a request never reads it from Firestore. The page of the organization is not served when it is
+  // custom and the install's switch is off.
+  const managerRead = { at: -Infinity };
+  const managerDoc = () => {
+    if (now() - managerRead.at >= 5_000 || !managerRead.pending) {
+      managerRead.at = now();
+      managerRead.pending = Promise.resolve().then(() => store.getManagerSettings?.()).then((stored) => organizationOf(stored));
+    }
+    return managerRead.pending;
+  };
+  const levels = createJoinLevelsCache({ router: () => store.getRouterSettings?.(), manager: async () => (await managerDoc()).level, now, log });
   const levelsCache = { ...levels, records: (fields) => (thisRequest.getStore().levels ??= levels.records(fields)) };
 
   // Whatever the levels say, what Google Cloud fixes: no request is held, and the wake mode is browser behind the policy and on its
   // fetch. The rest the core resolves, and so does the page.
-  const wakerConfig = (cfg, router) => wakerConfigOf(cfg, { router, policyFetch: thisRequest.getStore().policyFetch });
+  const wakerConfig = (cfg, router, organization) => wakerConfigOf(cfg, { router, organization, policyFetch: thisRequest.getStore().policyFetch });
   // The levels' pages and the favicon, kept per instance: the core reads them for the wake's headers, the page for itself.
-  const pages = createWaitingPages({ store: servedStore(store, customPages), now, log });
+  const pages = createWaitingPages({
+    store: servedStore(store, customPages),
+    organizationPage: { read: async () => servedPage(customPages)((await managerDoc()).page) },
+    now,
+    log,
+  });
 
   const enqueue = (body) => tasks.enqueue({ url: `${controllerUrl}/v1/tasks`, body });
   const core = createWaker({
     store: {
       ...store,
       getConfig: async (workloadId) => {
-        const [cfg, { router }] = await Promise.all([readConfig(workloadId), levelsCache.records({ workloadId })]);
-        return cfg && wakerConfig(cfg, router);
+        const [cfg, { router, manager }] = await Promise.all([readConfig(workloadId), levelsCache.records({ workloadId })]);
+        return cfg && wakerConfig(cfg, router, manager);
       },
       getRun: readRun,
       transition: async (workloadId, change) => {
@@ -233,7 +249,7 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], c
   // this request read.
   async function resolvedOf(workloadId, cfg, run) {
     const { router, manager } = await levelsCache.records({ workloadId });
-    return effectiveConfig(wakerConfig(cfg, router), { run, router, organization: manager });
+    return effectiveConfig(wakerConfig(cfg, router, manager), { run, router, organization: manager });
   }
 
   // The error response's fetch, which may carry nothing of the visitor's request, or under a swap that request itself: the page

@@ -2820,6 +2820,54 @@ test('a workload with fallback machine types: the nap stops, whatever the router
   assert.deepEqual(own.world.calls, ['map policy', 'wait 300 s', 'suspend vm-a']);
 });
 
+// The organization's level (G2 §5.5): the manager's settings.json in router/manager.
+const organized = (settings, router, options) => {
+  const t = leveled(router ?? null, options);
+  t.store.state.managerSettings = { settings, etag: 'e', at: START - MINUTE };
+  return t;
+};
+
+test('the organization\'s idleMinutes 5 under no router value: the check reads [t - 5 min - 210 s, t]; the router\'s 20 wins over it', async () => {
+  const t = organized({ workloads: { defaults: { idleMinutes: 5 } } }, null, { run: { state: STATES.AWAKE, awakeSince: START - 5 * MINUTE - 210_000 }, cfg: { inherits: ['idleMinutes'] }, vms: RUNNING_VM });
+  assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', state: STATES.AWAKE, nap: 'requested' }]);
+  assert.deepEqual(t.world.metricReads.map((q) => q.from), [START - 5 * MINUTE - 210_000]);
+  const router = organized({ workloads: { defaults: { idleMinutes: 5 } } }, { defaults: { idleMinutes: 20 } }, { run: AWAKE_LONG, cfg: { inherits: ['idleMinutes'] }, vms: RUNNING_VM });
+  await router.controller.check();
+  assert.deepEqual(router.world.metricReads.map((q) => q.from), [START - 20 * MINUTE - 210_000]);
+});
+
+test('the organization\'s hibernate false, no workload or router setting: the nap stops; the router\'s true wins over it', async () => {
+  const nap = organized({ workloads: { hibernate: false } }, null, { vms: RUNNING_VM });
+  await nap.controller.nap('demo');
+  assert.deepEqual(nap.world.calls, ['map policy', 'wait 300 s', 'stop vm-a']);
+  const router = organized({ workloads: { hibernate: false } }, { hibernate: true }, { vms: RUNNING_VM });
+  await router.controller.nap('demo');
+  assert.deepEqual(router.world.calls, ['map policy', 'wait 300 s', 'suspend vm-a']);
+});
+
+test('router/manager a document that is not an object, or unreadable: the organization is unset, the nap is the built-in suspend', async () => {
+  const bad = organized('oops', null, { vms: RUNNING_VM });
+  await bad.controller.nap('demo');
+  assert.deepEqual(bad.world.calls, ['map policy', 'wait 300 s', 'suspend vm-a']);
+  const unread = setup({ vms: RUNNING_VM });
+  unread.store.getManagerSettings = async () => { throw unreadable(); };
+  await unread.controller.nap('demo');
+  assert.equal(unread.run().state, STATES.ASLEEP);
+});
+
+test('routerInfo reads router/manager once for the settings and the health', async () => {
+  const t = organized({ workloads: { hibernate: false } }, null, {});
+  t.store.state.check = { lastScheduledCheckAt: START };
+  let reads = 0;
+  const { getManagerSettings } = t.store;
+  t.store.getManagerSettings = (...args) => {
+    reads += 1;
+    return getManagerSettings(...args);
+  };
+  await t.controller.routerInfo();
+  assert.equal(reads, 1);
+});
+
 // A router level this instance never read (AWS's rule): nothing falls back to the built-in values, which could act against the
 // router's (an idle window shorter than its own, a suspend against its "off", a wake failed before its timeout).
 const neverRead = (options) => {

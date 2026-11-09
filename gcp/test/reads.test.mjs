@@ -2,7 +2,8 @@
 // schedule's read per request and the two lists per check were accepted rather than a "has a schedule" flag to keep in step:
 // these counts keep them from growing. The router level (`router/settings`) is read at most once a minute per waker instance (the
 // shared core's 60-second cache, which the configuration's fixed values read too): each count below is a new instance's first
-// request, so it holds that read; the next requests of the minute don't. So are the waiting page's levels and the favicon (the router's
+// request, so it holds that read; the next requests of the minute don't. The organization's level (`router/manager`) is read the same way, once for the levels and
+// the page together. So are the waiting page's levels and the favicon (the router's
 // page, the workload's, and its favicon while its icon is auto: waiting-pages.mjs's cache), read for a page only, never for a probe.
 // A commit is no read; a run's transition reads the run first.
 import { test } from 'node:test';
@@ -51,21 +52,21 @@ const AWAKE = { state: STATES.AWAKE, awakeSince: 1 };
 const BACKED_OFF = (clock) => ({ state: STATES.FAILED, failedAt: clock.now(), consecutiveFailures: 1, failure: JSON.stringify({ kind: 'capacity' }) });
 
 for (const [name, run, send, count] of [
-  ['the page\'s fetch, ASLEEP', ASLEEP, pageFetch, 7],
-  ['the page\'s fetch, NAPPING', NAPPING, pageFetch, 7],
-  ['the page\'s fetch, FAILED', BACKED_OFF, pageFetch, 7],
-  ['the page\'s fetch, WAKING', WAKING, pageFetch, 6],
-  ['the page\'s fetch, AWAKE', AWAKE, pageFetch, 6],
-  ['a probe that wakes', ASLEEP, probe, 5],
-  ['a backed-off probe', BACKED_OFF, probe, 4],
-  ['a probe, NAPPING', NAPPING, probe, 5],
-  ['a probe, WAKING', WAKING, probe, 3],
-  ['a probe, WAKING with no beat', STALE, probe, 4],
-  ['a probe, WAKING with no beat, sent again within the minute', RESENT, probe, 3],
-  ['a probe, AWAKE', AWAKE, probe, 3],
-  ['a POST, ASLEEP', ASLEEP, post, 5],
-  ['a POST, backed off', BACKED_OFF, post, 4],
-  ['a POST, NAPPING', NAPPING, post, 5],
+  ['the page\'s fetch, ASLEEP', ASLEEP, pageFetch, 8],
+  ['the page\'s fetch, NAPPING', NAPPING, pageFetch, 8],
+  ['the page\'s fetch, FAILED', BACKED_OFF, pageFetch, 8],
+  ['the page\'s fetch, WAKING', WAKING, pageFetch, 7],
+  ['the page\'s fetch, AWAKE', AWAKE, pageFetch, 7],
+  ['a probe that wakes', ASLEEP, probe, 6],
+  ['a backed-off probe', BACKED_OFF, probe, 5],
+  ['a probe, NAPPING', NAPPING, probe, 6],
+  ['a probe, WAKING', WAKING, probe, 4],
+  ['a probe, WAKING with no beat', STALE, probe, 5],
+  ['a probe, WAKING with no beat, sent again within the minute', RESENT, probe, 4],
+  ['a probe, AWAKE', AWAKE, probe, 4],
+  ['a POST, ASLEEP', ASLEEP, post, 6],
+  ['a POST, backed off', BACKED_OFF, post, 5],
+  ['a POST, NAPPING', NAPPING, post, 6],
 ]) {
   test(`Firestore reads: ${name}, ${count}`, async () => {
     const { handler, reads } = wakerOn(run);
@@ -90,6 +91,24 @@ test('the router level is read once a minute per instance, whatever the requests
   clock.advance(2_000);
   await handler(probe());
   assert.equal(routerReads(firestore), 2);
+});
+
+const managerReads = (firestore) => firestore.calls.filter((c) => c.method === 'GET' && c.url.endsWith('/router/manager')).length;
+
+test('the organization\'s level is read once a minute per instance for the levels and the page together, never per request', async () => {
+  const clock = fakeClock();
+  const { firestore, store } = firestoreWith(ASLEEP);
+  firestore.docs.set('router/manager', { fields: toFields({ settings: { workloads: { joinMinutes: 30 }, waitingPage: { mode: 'template', title: 'Org' } }, etag: 'e', at: 1 }), updateTime: 't0' });
+  const handler = createCloudRunWaker({ store, tasks: { enqueue: async () => {} }, controllerUrl: CONTROLLER, now: clock.now, log: silentLog });
+  await Promise.all([handler(pageFetch()), handler(probe()), handler(pageFetch())]);
+  await handler(post());
+  assert.equal(managerReads(firestore), 1);
+  clock.advance(59_000);
+  await handler(pageFetch());
+  assert.equal(managerReads(firestore), 1);
+  clock.advance(2_000);
+  await handler(pageFetch());
+  assert.equal(managerReads(firestore), 2);
 });
 
 const pageReads = (firestore) => firestore.calls.filter((c) => c.method === 'GET' && /\/(router\/page|pages\/demo|favicons\/demo)$/.test(c.url)).length;
@@ -149,11 +168,11 @@ test('a nap window: the probe reads it once, and says it', async () => {
   firestore.docs.set('schedules/demo', { fields: toFields({ schedule }), updateTime: 't0' });
   const res = await handler(probe());
   assert.equal(res.multiValueHeaders['x-dormeto-nap-until']?.[0], '2023-11-14T23:00:00.000Z');
-  assert.equal(reads(), 4);
+  assert.equal(reads(), 5);
 });
 
 // The controller's Cloud Scheduler call: the pauses, the configurations and the schedules listed, the router level (router/settings),
-// once for every workload, then the workload's run; then the summary's: the organization's settings (router/manager), and, for a check
+// once for every workload, then the workload's run; then the organization's settings (router/manager), read with the levels and kept for the summary, and, for a check
 // the schedule did not start, the last scheduled check's date (router/check). The runs it counts are those the check read.
 test('Firestore reads: a check, one AWAKE workload, 8; the first of the day 3 more, the router\'s sweep claimed, the counters and the events listed', async () => {
   const clock = fakeClock();

@@ -498,6 +498,11 @@ export function createFirestoreStore({ google, project, database, region = datab
       return { settings, etag: etag ?? null, at: at ?? 0 };
     },
 
+    // The manager's push: its whole settings.json, replacing the last. The only writer is the router's `manager-settings` action.
+    async putManagerSettings({ settings, etag, at }) {
+      await commit([{ update: { name: named('router/manager'), fields: toFields({ settings, etag: etag ?? null, at }) } }]);
+    },
+
     // The kinds of a workload's backends, written apart from the transitions (no version change).
     async setBackendKinds(workloadId, kinds) {
       return (await modifyRun(workloadId, () => ({ set: { backendKinds: kinds } }))) !== null;

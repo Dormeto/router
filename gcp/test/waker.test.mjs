@@ -485,6 +485,58 @@ test('a custom page: served with the switch on, without our policy; with it off,
   assert.match((await router.handler(request())).body, /<h1 id="message"[^>]*>Waking up the application/, 'the default page');
 });
 
+// The organization's level: the manager's settings.json in router/manager (G2 §5.5), read apart from the router's.
+const pushed = (store, settings, counter = { reads: 0 }) => {
+  store.getManagerSettings = async () => {
+    counter.reads += 1;
+    return { settings: structuredClone(settings), etag: 'e', at: 1 };
+  };
+  return counter;
+};
+
+test('the organization\'s template page shown when no lower level has one; the router\'s wins over it', async () => {
+  const org = setup();
+  pushed(org.store, { waitingPage: { mode: 'template', title: 'Org' } });
+  assert.match((await org.handler(request())).body, /<h1>Org<\/h1>/);
+  const router = setup();
+  pushed(router.store, { waitingPage: { mode: 'template', title: 'Org' } });
+  pages(router.store, { router: { mode: 'template', title: 'Acme' } });
+  assert.match((await router.handler(request())).body, /<h1>Acme<\/h1>/);
+});
+
+test('the organization\'s custom page: served with the switch on; with it off, not served, the template levels apply', async () => {
+  const on = setup({ customPages: true });
+  pushed(on.store, { waitingPage: CUSTOM });
+  assert.match((await on.handler(request())).body, /Our own page/);
+  for (const customPages of [false, undefined]) {
+    const off = setup({ customPages });
+    pushed(off.store, { waitingPage: CUSTOM });
+    pages(off.store, { router: { mode: 'template', title: 'Acme' } });
+    const shown = await off.handler(request());
+    assert.doesNotMatch(shown.body, /Our own page/);
+    assert.match(shown.body, /<h1>Acme<\/h1>/);
+    assert.equal(headerOf(shown, 'content-security-policy'), PAGE_CSP);
+  }
+});
+
+test('router/manager is read once for the levels and the page together, and again after the cache\'s time', async () => {
+  const { handler, store, clock } = setup();
+  const counter = pushed(store, { workloads: { joinMinutes: 30 }, waitingPage: { mode: 'template', title: 'Org' } });
+  for (let i = 0; i < 5; i += 1) await handler(request());
+  assert.equal(counter.reads, 1, 'one read for five requests');
+  clock.advance?.(61_000);
+  await handler(request());
+  assert.equal(counter.reads, 2, 'read again after the cache\'s time');
+});
+
+test('router/manager unreadable: the page answers, the failure is logged, the level is unset', async () => {
+  const { handler, store, warned } = setup();
+  store.getManagerSettings = async () => { throw new Error('unavailable'); };
+  const res = await handler(request());
+  assert.equal(res.statusCode, 200);
+  assert.ok(warned.some((w) => w.level === 'organization'), JSON.stringify(warned));
+});
+
 test('WAKING with recentWakes [20000, 30000, 40000], begun 10 s ago: the page, its HEAD and /_dormeto/wake say 10000 and 30000, and the bar', async () => {
   const clock = fakeClock();
   const run = { state: STATES.WAKING, wakeId: 'w1', wakeStartedAt: clock.now() - 10_000, beatAt: clock.now(), recentWakes: JSON.stringify([20_000, 30_000, 40_000]) };

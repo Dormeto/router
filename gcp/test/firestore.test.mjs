@@ -903,3 +903,13 @@ test('router/manager: the organization\'s settings as the manager pushed them; n
   docs.set('router/manager', { fields: toFields({ settings: 'oops', etag: 'e2', at: 8 }), updateTime: 't' });
   assert.deepEqual(await store.getManagerSettings(), { settings: 'oops', etag: 'e2', at: 8 });
 });
+
+test('putManagerSettings stores the manager\'s whole settings.json with its etag and date, replacing the last; getManagerSettings returns it', async () => {
+  const { store, docs } = setup();
+  const settings = { workloads: { hibernate: false, defaults: { idleMinutes: 30 }, types: [{ name: 'batch', tags: { team: 'data' } }] }, waitingPage: { mode: 'template', title: 'Acme' }, updatedAt: '2026-11-09T10:00:00Z', updatedBy: 'ops' };
+  await store.putManagerSettings({ settings, etag: 'e1', at: 7 });
+  assert.deepEqual(await store.getManagerSettings(), { settings, etag: 'e1', at: 7 });
+  await store.putManagerSettings({ settings: { workloads: {} }, etag: 'e2', at: 8 });
+  assert.deepEqual(await store.getManagerSettings(), { settings: { workloads: {} }, etag: 'e2', at: 8 });
+  assert.deepEqual([...docs.keys()], ['router/manager']);
+});

@@ -2349,6 +2349,23 @@ test('an onboarding without idleMinutes: inherits lists it, the configuration is
   assert.equal((await onboarding.list())[0].settingsFrom.idleMinutes, 'router');
 });
 
+test('the organization\'s level (router/manager) shows in the workload: its settings, from organization, its hibernate as the manager\'s; the router\'s wins; unreadable counts as unset', async () => {
+  const { store, onboarding } = setup();
+  await onboarding.onboard(INPUT);
+  let pushed = { settings: { workloads: { hibernate: false, defaults: { idleMinutes: 45 } } }, etag: 'e', at: 1 };
+  store.getManagerSettings = async () => structuredClone(pushed);
+  const shown = await onboarding.show('demo');
+  assert.deepEqual([shown.settings.idleMinutes, shown.settingsFrom.idleMinutes], [45, 'organization']);
+  assert.deepEqual(shown.hibernation, { hibernate: false, from: 'manager', workload: null, router: null, manager: false });
+  assert.equal((await onboarding.list())[0].settingsFrom.idleMinutes, 'organization');
+  store.router.settings = { defaults: { idleMinutes: 5 }, hibernate: true, by: 'ops', at: 1 };
+  const router = await onboarding.show('demo');
+  assert.deepEqual([router.settings.idleMinutes, router.settingsFrom.idleMinutes, router.hibernation.from], [5, 'router', 'router']);
+  store.getManagerSettings = async () => { throw new Error('unavailable'); };
+  assert.equal((await onboarding.show('demo')).hibernation.manager, null);
+  pushed = null;
+});
+
 test('an onboarding\'s own settings leave inherits; its wake mode, rules and type are kept and shown', async () => {
   const { store, onboarding } = setup(regional);
   await onboarding.onboard({ ...INPUT, settings: { idleMinutes: 30, wakeMode: 'any', failedRetrySeconds: 120, noWakeRules: [NO_WAKE], wakeRules: [WAKE], type: 'asg', hibernate: false } });

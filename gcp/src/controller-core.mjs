@@ -57,7 +57,7 @@ import { retryCapacity } from '../../lambda/src/lib/capacity.mjs';
 import { classify, failedSpec, failureError } from '../../lambda/src/lib/failures.mjs';
 import { cacheFavicon, FAVICON_BUDGET_MS, hostOfRules } from '../../lambda/src/lib/favicon.mjs';
 import { healthOf } from '../../lambda/src/lib/health.mjs';
-import { parseManagerSettings, resolveHibernation } from '../../lambda/src/lib/hibernation.mjs';
+import { resolveHibernation } from '../../lambda/src/lib/hibernation.mjs';
 import { createListCache, describeStoredLists } from '../../lambda/src/lib/list-cache.mjs';
 import { awakeStartWithin, CLOSE_START_MS, maintenanceDue, occurrenceAt, resolveJoin } from '../../lambda/src/lib/schedule.mjs';
 import { DAY_MS, STATES, utcDay } from '../../lambda/src/lib/state.mjs';
@@ -72,6 +72,7 @@ import {
 } from './gke.mjs';
 import { OPERATION_NOT_DONE } from './google.mjs';
 import { resendStale, startHeartbeat, staleness } from './heartbeat.mjs';
+import { organizationOf } from './organization.mjs';
 import { effectiveOf, SWAP_WAKE_ROOM_SECONDS, WAKE_TIMEOUT_MAX } from './levels.mjs';
 import { faviconReachable, servedPage } from './pages.mjs';
 import { inOneUpdate, isRegionalLb, switchOf } from './switch.mjs';
@@ -251,25 +252,38 @@ export function createController({
     return cfg;
   }
 
-  // The router level (`router/settings`): `{ router, unreadable? }`, read once by a check for all its workloads, once by a wake, a
-  // nap or a release. A read that fails is said, and keeps the last record this instance read; never read, the level is unreadable
-  // (AWS's `readLevels`): the built-in values could act against the router's, an idle window shorter than its own, a suspend
-  // against its "off", a wake failed before its timeout. Never a failed check or wake.
+  // The levels above a workload's: `{ router, organization, managerState, unreadable? }`. The router level (`router/settings`) and the
+  // organization's (`router/manager`, the manager's settings.json, parsed once by organizationOf: `organization` is what AWS's
+  // manager settings answer, `managerState` the whole answer the health and routerInfo read), read once by a check for all its
+  // workloads, once by a wake, a nap or a release. A read that fails is said, and keeps the last record this instance read; never
+  // read, the levels are unreadable (AWS's `readLevels`): the built-in values could act against the router's or the
+  // organization's, an idle window shorter than its own, a suspend against its "off", a wake failed before its timeout. Never a
+  // failed check or wake.
   let lastRouterLevel;
+  let lastManagerState;
   async function routerLevel() {
-    try {
-      lastRouterLevel = (await store.getRouterSettings?.()) ?? null;
-    } catch (err) {
-      log.warn('SettingsLevelUnreadable', { level: 'router', error: err.message });
-      if (lastRouterLevel === undefined) return { router: null, unreadable: true };
+    const [routerRead, managerRead] = await Promise.allSettled([store.getRouterSettings?.(), store.getManagerSettings?.()]);
+    let unreadable = false;
+    if (routerRead.status === 'fulfilled') lastRouterLevel = routerRead.value ?? null;
+    else {
+      log.warn('SettingsLevelUnreadable', { level: 'router', error: routerRead.reason.message });
+      unreadable ||= lastRouterLevel === undefined;
     }
-    return { router: lastRouterLevel };
+    if (managerRead.status === 'fulfilled') lastManagerState = organizationOf(managerRead.value ?? null);
+    else {
+      log.warn('SettingsLevelUnreadable', { level: 'organization', error: managerRead.reason.message });
+      unreadable ||= lastManagerState === undefined;
+    }
+    // A read that failed keeps the last level, and the health says it could not be read.
+    const known = lastManagerState ?? { level: null, page: null, error: null, readAt: null };
+    const managerState = managerRead.status === 'rejected' ? { ...known, error: managerRead.reason.message } : known;
+    return { router: lastRouterLevel ?? null, organization: managerState.level, managerState, ...(unreadable ? { unreadable } : {}) };
   }
 
   // The configuration a check, a wake, a nap or a release acts on: the stored one resolved through the levels (levels.mjs), marked
   // when its router level is unreadable.
-  const effective = (stored, run, { router, unreadable }) => {
-    const cfg = effectiveOf(stored, { run, router });
+  const effective = (stored, run, { router, organization, unreadable }) => {
+    const cfg = effectiveOf(stored, { run, router, organization });
     return unreadable ? { ...cfg, levelsUnreadable: true } : cfg;
   };
   // The longest a wake may take when its levels are unreadable: the longest Google Cloud allows.
@@ -628,12 +642,12 @@ export function createController({
   // Down when this returns, the companions asked to go: an operation's end says little (a managed group's VMs go after it, and its
   // wait may run out before), so the VMs are read until they are. `stillGoing()`: whether the run is still the nap's or the release's:
   // a wake taken over, or asked and kept, needs its database, which is then left alone.
-  async function putToSleep(cfg, { autoscalers, owners, router, instanceTypes }, latest, stillGoing) {
+  async function putToSleep(cfg, { autoscalers, owners, router, organization, instanceTypes }, latest, stillGoing) {
     const deadline = Math.min(now() + STOP_TIMEOUT_MS, latest);
     await each(autoscalers, (recorded) => setAutoscaler(recorded, 'OFF'));
     // The workload's own, else none with fallback machine types (the type a VM wakes on may not suspend), else the router's. Its
     // level unreadable, a plain stop, as on AWS: the built-in true could suspend against the router's "off".
-    const hibernate = !cfg.levelsUnreadable && resolveHibernation({ workload: cfg.hibernate, fallbackTypes: cfg.fallbackInstanceTypes, router: router?.hibernate }).hibernate;
+    const hibernate = !cfg.levelsUnreadable && resolveHibernation({ workload: cfg.hibernate, fallbackTypes: cfg.fallbackInstanceTypes, router: router?.hibernate, manager: organization }).hibernate;
     const done = await each(primariesOf(cfg), (backend) => sleepBackend(backend, hibernate, deadline, owners, Object.keys(instanceTypes ?? {})));
     for (;;) {
       const up = (await allVms(cfg)).filter((vm) => !GONE.has(vm.status));
@@ -944,7 +958,7 @@ export function createController({
     const started = now();
     const latest = started + NAP_BUDGET_MS;
     const [stored, levels] = await Promise.all([getConfig(workloadId), routerLevel()]);
-    const { router } = levels;
+    const { router, organization } = levels;
     const cfg = effective(stored, null, levels);
     const sw = switchFor(cfg);
     const refusal = await napRefusal(workloadId, requestedAt, until);
@@ -959,7 +973,7 @@ export function createController({
     const napping = await transition(workloadId, { cond: { state: STATES.AWAKE }, set: { state: STATES.NAPPING, napId }, remove: ['pendingWake'], cause });
     if (!napping) return { state: 'SKIPPED' };
     log.info('NapStarted', { workloadId });
-    return beating(workloadId, 'napId', napId, () => napBeating(workloadId, { cfg, router, sw, napping, cause, requestedAt, started, latest }));
+    return beating(workloadId, 'napId', napId, () => napBeating(workloadId, { cfg, router, organization, sw, napping, cause, requestedAt, started, latest }));
   }
 
   // The application's favicon for the waiting page, by AWS's step (favicon.mjs's cacheFavicon): the levels as the waiting page shows
@@ -978,7 +992,7 @@ export function createController({
   }
 
   // A nap from its NAPPING on.
-  async function napBeating(workloadId, { cfg, router, sw, napping, cause, requestedAt, started, latest }) {
+  async function napBeating(workloadId, { cfg, router, organization, sw, napping, cause, requestedAt, started, latest }) {
     // The run moved on while this request held it (a nap called stuck, a forced offboarding): the map and the state are another's.
     const superseded = () => {
       log.warn('NapSuperseded', { workloadId });
@@ -1051,7 +1065,7 @@ export function createController({
       }))) {
         return await giveUp(paused ? 'paused' : 'pending-wake', 'info', paused ? { reason: 'paused' } : {});
       }
-      slept = await putToSleep(cfg, { autoscalers, owners, router, instanceTypes: napping.instanceTypes }, latest, async () => {
+      slept = await putToSleep(cfg, { autoscalers, owners, router, organization, instanceTypes: napping.instanceTypes }, latest, async () => {
         const current = await store.getRun(workloadId);
         return current?.state === STATES.NAPPING && !current.pendingWake;
       });
@@ -1108,7 +1122,7 @@ export function createController({
     if (run?.state !== STATES.FAILED) return { state: 'SKIPPED', reason: run?.state ?? 'unknown' };
     if (await isPaused(workloadId)) return { state: 'SKIPPED', reason: 'paused' };
     const [stored, levels] = await Promise.all([getConfig(workloadId), routerLevel()]);
-    const { router } = levels;
+    const { router, organization } = levels;
     const cfg = effective(stored, run, levels);
     try {
       const { paths } = await writeOnlyAsleep(cfg);
@@ -1127,7 +1141,7 @@ export function createController({
       const owners = await ownersToRecord(cfg, run);
       // A wake asked meanwhile takes over.
       if (!(await transition(workloadId, { cond: { state: STATES.FAILED }, set: { autoscalers, ...(owners.length ? { owners } : {}) } }))) return { state: 'SUPERSEDED' };
-      const slept = await putToSleep(cfg, { autoscalers, owners, router, instanceTypes: run.instanceTypes }, latest, async () => (await store.getRun(workloadId))?.state === STATES.FAILED);
+      const slept = await putToSleep(cfg, { autoscalers, owners, router, organization, instanceTypes: run.instanceTypes }, latest, async () => (await store.getRun(workloadId))?.state === STATES.FAILED);
       const types = await revertTypes(cfg, run.instanceTypes);
       const asleep = await transition(workloadId, {
         cond: { state: STATES.FAILED }, set: { state: STATES.ASLEEP, ...slept, ...types.set }, remove: types.remove, cause: 'failed-released', event: slept,
@@ -1181,8 +1195,8 @@ export function createController({
     if (deferred.length) log.info('ScheduledNapsDeferred', { workloads: deferred });
   }
 
-  // How far a schedule's windows join (AWS's joinOf): its own joinMinutes, else the levels' above it, `joins` (`{ router }`, the
-  // router level's value or null: no organization level here), else the default.
+  // How far a schedule's windows join (AWS's joinOf): its own joinMinutes, else the levels' above it, `joins` (`{ router, manager }`, the
+  // levels' values or null), else the default.
   const joinOf = (schedule, joins) => ({ joinMinutes: resolveJoin({ workload: schedule?.joinMinutes, ...joins }).joinMinutes });
 
   // Before the check's loop, every scheduled workload whatever the loop's budget: 8 at a time, one run read each, nothing
@@ -1566,7 +1580,7 @@ export function createController({
     // A workload holds one nap in flight at most: with no more workloads than NAPS_MAX, their runs are not read for it.
     const flight = { naps: order.length > NAPS_MAX ? await napsInFlight(order) : 0, deferred: 0 };
     // The router level's joinMinutes, read with the levels: one never read is unset, as AWS's join levels count a level they cannot read.
-    const joins = { router: levels.router?.joinMinutes ?? null };
+    const joins = { router: levels.router?.joinMinutes ?? null, manager: levels.organization?.joinMinutes ?? null };
     const { applied, readable } = await applySchedules(order, schedules, (id) => ({ paused: paused(id), keepAsleep: keptAsleep(id) }), now(), deadline, flight, joins);
     await requestListRefresh();
     const ctx = { schedules: readable, applied, flight, levels, joins };
@@ -1596,7 +1610,7 @@ export function createController({
     const reached = new Set(results.map((r) => r.workloadId));
     for (const workloadId of applied.keys()) if (!reached.has(workloadId)) results.push({ workloadId, ...passed(workloadId) });
     await sweepStats();
-    await recordCheck({ started, scheduled, order, results, pauses: (pauses ?? []).filter((p) => p.workloadId === null), pausesError: pauses === null ? 'see the controller\'s log' : undefined });
+    await recordCheck({ started, scheduled, order, results, pauses: (pauses ?? []).filter((p) => p.workloadId === null), pausesError: pauses === null ? 'see the controller\'s log' : undefined, managerState: levels.managerState });
     return results;
   }
 
@@ -1619,33 +1633,26 @@ export function createController({
     return { byState: Object.fromEntries(Object.entries(byState).sort(([a], [b]) => a.localeCompare(b))), lastActivity };
   }
 
-  // The organization's level as the router holds it (router/manager, pushed by the manager): what AWS's manager settings answer. None
-  // pushed: unset, no problem. Not a JSON object (or invalid): the error the health warns of; the manager gives it its meaning (G2 §5.5).
-  async function managerLevel() {
-    let stored;
-    try {
-      stored = await store.getManagerSettings?.();
-    } catch (err) {
-      return { hibernate: null, readAt: null, error: err.message };
+  // The organization's level for the health and routerInfo: what AWS's manager settings answer (organizationOf, the reading the levels
+  // share). None pushed: unset, no problem. Not a JSON object (or invalid): the error the health warns of (G2 §5.5). `managerState`:
+  // an answer routerLevel already read.
+  async function managerLevel(managerState) {
+    let state = managerState;
+    if (!state) {
+      try {
+        state = organizationOf((await store.getManagerSettings?.()) ?? null);
+      } catch (err) {
+        return { hibernate: null, readAt: null, error: err.message };
+      }
     }
-    if (!stored) return { hibernate: null, readAt: null, error: null };
-    const readAt = stored.at ? stored.at : null;
-    try {
-      const { problems, defaults = {}, types = [], ...values } = parseManagerSettings(JSON.stringify(stored.settings));
-      return {
-        ...values, ...(Object.keys(defaults).length ? { defaults } : {}), ...(types.length ? { types } : {}), readAt,
-        error: problems ? `settings.json: ${problems[0]}` : null,
-      };
-    } catch (err) {
-      return { hibernate: null, readAt, error: `settings.json is invalid: ${err.message}` };
-    }
+    return { hibernate: null, ...state.level, readAt: state.readAt, error: state.error };
   }
 
   // The router's health through the shared healthOf: the check late, the failed workloads, the manager's settings, the IP lists. No
   // Lambda, queue or concurrency figure (AWS's), and no Cloud Run request error (the router holds no role to read them).
-  async function healthSummary({ t, byState, lastScheduledCheckAt, pausesError }) {
+  async function healthSummary({ t, byState, lastScheduledCheckAt, pausesError, managerState }) {
     const ipLists = lists.length ? await describeStoredLists(store, lists) : [];
-    const manager = await managerLevel();
+    const manager = await managerLevel(managerState);
     const health = healthOf({
       checkSchedule: CHECK_SCHEDULE, lastScheduledCheckAt, now: t, failed: byState[STATES.FAILED] ?? 0, ipLists, managerSettingsError: manager.error,
     });
@@ -1658,14 +1665,14 @@ export function createController({
 
   // router/check: written at the end of each check, the date of the last one the schedule started kept by the others. A summary that
   // cannot be written fails nothing: the check's work is done.
-  async function recordCheck({ started, scheduled, order, results, pauses, pausesError }) {
+  async function recordCheck({ started, scheduled, order, results, pauses, pausesError, managerState }) {
     if (!store.putCheck) return;
     try {
       const t = now();
       const lastScheduledCheckAt = scheduled ? started : (await store.getCheck?.().catch(() => null))?.lastScheduledCheckAt ?? null;
       const known = new Map(results.filter((r) => ANY_STATE.includes(r.state)).map((r) => [r.workloadId, r.state]));
       const { byState } = await stateCounts(order, known);
-      const { health } = await healthSummary({ t, byState, lastScheduledCheckAt, pausesError });
+      const { health } = await healthSummary({ t, byState, lastScheduledCheckAt, pausesError, managerState });
       await store.putCheck({ checkedAt: started, durationMs: t - started, checkSchedule: CHECK_SCHEDULE, lastScheduledCheckAt, health, pauses: pauses.map(shown), counts: byState });
     } catch (err) {
       log.warn('CheckNotRecorded', { error: err.message });
@@ -1684,7 +1691,7 @@ export function createController({
       pausesError = err.message;
       return [];
     });
-    const { health, ipLists, manager } = await healthSummary({ t, byState, lastScheduledCheckAt: checked?.lastScheduledCheckAt ?? null, pausesError });
+    const { health, ipLists, manager } = await healthSummary({ t, byState, lastScheduledCheckAt: checked?.lastScheduledCheckAt ?? null, pausesError, managerState: level.managerState });
     return {
       router: { name: `dmtr-${config.region}`, version: config.version ?? null, build: config.build ?? null },
       settings: routerSettingsView(level.router),

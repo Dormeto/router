@@ -56,13 +56,13 @@ const KIND_OF = { vm: 'instance', mig: 'asg', k8s: 'k8s', cloudsql: 'cloudsql-in
 const KINDS = Object.values(KIND_OF);
 
 // The AWS `list` row (lambda/src/lib/summary.mjs's workloadSummary) of a workload, from its configuration and run. `stats7d`: the
-// store's `getStats(id, 7)`, or null when it could not be read. `router`: the router level, for the resolved settings; `pauses`
+// store's `getStats(id, 7)`, or null when it could not be read. `router` and `organization`: the router's level and the organization's, for the resolved settings; `pauses`
 // and `scheduled`: the workload's active pauses and whether it has a schedule. Instead of `targetGroupArn`, its Google resources.
 // Its `hibernated` is true only while it is asleep with a VM suspended, as AWS's.
-export function rowOf({ cfg, run, stats7d = null, routerName, router = null, pauses = [], scheduled = false }) {
+export function rowOf({ cfg, run, stats7d = null, routerName, router = null, organization = null, pauses = [], scheduled = false }) {
   const failure = lastFailure(run);
   const fallbacks = fallbacksOf(run);
-  const effective = effectiveOf(cfg, { run, router });
+  const effective = effectiveOf(cfg, { run, router, organization });
   const { settings, settingsFrom, type } = resolvedSettings(effective);
   const nextAttempt = nextAttemptAt(effective, run);
   return {

@@ -47,9 +47,9 @@ export function inheritsOf(cfg) {
   return SCALAR_KEYS.filter((key) => !Object.hasOwn(own, key));
 }
 
-export function effectiveOf(cfg, { run = null, router = null } = {}) {
+export function effectiveOf(cfg, { run = null, router = null, organization = null } = {}) {
   const view = sharedView(cfg, run);
-  const got = effectiveConfig(view.cfg, { run: view.run, router });
+  const got = effectiveConfig(view.cfg, { run: view.run, router, organization });
   // The result is the configuration's own, not the view's.
   if (Array.isArray(cfg?.inherits)) got.inherits = cfg.inherits;
   else delete got.inherits;
@@ -69,8 +69,8 @@ export function effectiveOf(cfg, { run = null, router = null } = {}) {
 // The configuration the shared waker gets, from the STORED one (as the store returns it) and the router level: every key
 // Google Cloud fixes is the workload's own value there, out of `inherits`, so whatever the waker then resolves, it gets the
 // fixed values. `wakeMode` is browser on the policy's error fetch (and behind the policy, where effectiveOf fixes it).
-export function wakerConfigOf(cfg, { run = null, router = null, policyFetch = false } = {}) {
-  const effective = effectiveOf(cfg, { run, router });
+export function wakerConfigOf(cfg, { run = null, router = null, organization = null, policyFetch = false } = {}) {
+  const effective = effectiveOf(cfg, { run, router, organization });
   const fixed = new Set(Object.entries(effective.settingsFrom).filter(([, origin]) => origin === 'fixed').map(([key]) => key));
   if (policyFetch) fixed.add('wakeMode');
   const out = { ...cfg };

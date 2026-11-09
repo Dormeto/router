@@ -1188,8 +1188,10 @@ test('offboarding while it wakes or naps is a 409', async () => {
 });
 
 // A VM on a fallback machine type (vision docs/specs/2026-11-08-google-cloud-router-features-design.md, section 6): an offboarding leaves
-// it running on it, and says so with its own type, which no stop of the router's gives back any more.
+// it running on it, and says so with its own type, which no stop of the router's gives back any more. The run's record, and the answers'
+// `fallbacks` in AWS's shape (lambda/src/lib/summary.mjs's fallbacksOf).
 const ON_FALLBACK = { 'vm-a': { from: 'e2-small', to: 'e2-medium' } };
+const FALLBACKS = [{ instance: 'vm-a', from: 'e2-small', to: 'e2-medium' }];
 
 test('an offboarding while a VM runs on a fallback machine type names the VM, its type now and its own; a forced one too; none, no field', async () => {
   for (const force of [false, true]) {
@@ -1197,7 +1199,8 @@ test('an offboarding while a VM runs on a fallback machine type names the VM, it
     await onboarding.onboard(INPUT);
     store.runs.get('demo').instanceTypes = structuredClone(ON_FALLBACK);
     const answer = await onboarding.offboard('demo', { force });
-    assert.deepEqual(answer.instanceTypes, { 'vm-a': { from: 'e2-small', to: 'e2-medium' } }, `force: ${force}`);
+    assert.deepEqual(answer.fallbacks, FALLBACKS, `force: ${force}`);
+    assert.equal(answer.instanceTypes, undefined, `force: ${force}`);
     assert.equal(store.configs.size, 0);
   }
   const { onboarding } = setup();
@@ -1211,7 +1214,7 @@ test('an offboarding of an asleep workload whose VM cannot get its own type back
   Object.assign(w.vms['vm-a'], { status: 'TERMINATED', machineType: `${V1}/zones/${ZONE}/machineTypes/e2-medium` });
   Object.assign(store.runs.get('demo'), { state: STATES.ASLEEP, stopped: ['vm-a'], instanceTypes: structuredClone(ON_FALLBACK) });
   w.fail[`POST zones/${ZONE}/instances/vm-a/setMachineType`] = new GoogleError("Google: POST: 403 Required 'compute.instances.setMachineType' permission", { code: 403 });
-  assert.deepEqual(await onboarding.offboard('demo'), { instanceTypes: ON_FALLBACK });
+  assert.deepEqual(await onboarding.offboard('demo'), { fallbacks: FALLBACKS });
   assert.equal(w.vms['vm-a'].status, 'RUNNING');
   assert.ok(w.logs.some((l) => l.event === 'InstanceTypeNotReverted' && l.instance === 'vm-a'));
 });
@@ -2515,20 +2518,22 @@ test('show: the hibernation as AWS\'s, from the workload, its fallback machine t
   assert.deepEqual((await onboarding.show('demo')).hibernation, { hibernate: false, from: 'fallback-types', workload: null, router: true, manager: null });
 });
 
-test('show and list: the fallback machine types, and the types the VMs run on while one runs on a fallback', async () => {
+test('show and list: the fallback machine types, and the VMs on a fallback type as AWS\'s fallbacks, while one runs on one', async () => {
   const { store, onboarding } = setup();
   await onboarding.onboard(INPUT);
   const before = await onboarding.show('demo');
   assert.equal(before.fallbackInstanceTypes, undefined);
-  assert.equal(before.instanceTypes, undefined);
+  assert.equal(before.fallbacks, undefined);
   store.configs.get('demo').fallbackInstanceTypes = ['e2-medium'];
-  store.runs.get('demo').instanceTypes = { 'vm-a': { from: 'e2-small', to: 'e2-medium' } };
+  store.runs.get('demo').instanceTypes = { 'vm-a': { from: 'e2-small', to: 'e2-medium' }, 'vm-b': { from: 'e2-small', to: 'n2d-standard-2' } };
   for (const shown of [await onboarding.show('demo'), (await onboarding.list())[0]]) {
     assert.deepEqual(shown.fallbackInstanceTypes, ['e2-medium']);
-    assert.deepEqual(shown.instanceTypes, { 'vm-a': { from: 'e2-small', to: 'e2-medium' } });
+    assert.deepEqual(shown.fallbacks, [{ instance: 'vm-a', from: 'e2-small', to: 'e2-medium' }, { instance: 'vm-b', from: 'e2-small', to: 'n2d-standard-2' }]);
+    // The run's field, not the view's.
+    assert.equal(shown.instanceTypes, undefined);
   }
   store.runs.get('demo').instanceTypes = {};
-  assert.equal((await onboarding.show('demo')).instanceTypes, undefined);
+  assert.equal((await onboarding.show('demo')).fallbacks, undefined);
 });
 
 test('GET the router level with none: AWS\'s empty answer', async () => {

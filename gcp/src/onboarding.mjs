@@ -203,6 +203,10 @@ function hibernationOf(cfg, router) {
   };
 }
 
+// The VMs a wake left on a fallback machine type, in AWS's shape (lambda/src/lib/summary.mjs's fallbacksOf): `[{ instance, from, to }]`,
+// `from` its own type, `to` the one it runs on, from the run's `instanceTypes` (AWS's field: `{ <vm>: { from, to } }`, a map here).
+const fallbacksOf = (run) => Object.entries(run?.instanceTypes ?? {}).map(([instance, { from, to }]) => ({ instance, from, to }));
+
 function failureOf(run) {
   if (!run?.failure) return null;
   try {
@@ -218,10 +222,11 @@ function failureOf(run) {
 // when, until a nap commits. `beatAt`: the running wake's or nap's last heartbeat (heartbeat.mjs), WAKING or NAPPING only. `idleReads`:
 // what the idle check read at the last check that read log entries or counted a request, `request logs` or `request count`
 // (controller-core.mjs). With the router level (`router`): each setting resolved (`settings`), where it comes from, the type and the
-// rules of every level, as AWS's status gives them, and its hibernation; its fallback machine types, and `instanceTypes` while a VM
-// runs on one.
+// rules of every level, as AWS's status gives them, and its hibernation; its fallback machine types, and `fallbacks`, as AWS's, while a
+// VM runs on one.
 function workloadOf(cfg, run, paused, router) {
   const failure = failureOf(run);
+  const fallbacks = fallbacksOf(run);
   const beatAt = run ? beatOf(run) : undefined;
   const effective = effectiveOf(cfg, { run, router });
   const { settings, settingsFrom, type } = resolvedSettings(effective);
@@ -240,7 +245,7 @@ function workloadOf(cfg, run, paused, router) {
     hibernation: hibernationOf(cfg, router),
     backends: cfg.backends,
     ...(Array.isArray(cfg.fallbackInstanceTypes) && cfg.fallbackInstanceTypes.length ? { fallbackInstanceTypes: cfg.fallbackInstanceTypes } : {}),
-    ...(run?.instanceTypes && Object.keys(run.instanceTypes).length ? { instanceTypes: run.instanceTypes } : {}),
+    ...(fallbacks.length ? { fallbacks } : {}),
     ...(cfg.requestLogs ? { requestLogs: cfg.requestLogs } : {}),
     ...(run?.state === STATES.AWAKE && run.awakeSince !== undefined ? { awakeSince: isoOf(run.awakeSince) } : {}),
     ...(run?.lastWake ? { lastWake: run.lastWake } : {}),
@@ -760,10 +765,12 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   // The router level (`router/settings`), null when unset. A read that fails fails the request, as any other read of it.
   const routerLevel = async () => (await store.getRouterSettings()) ?? null;
 
-  // The VMs a wake left on a fallback machine type (`instanceTypes`, the run's: `{ <vm>: { from, to } }`, `from` its own type, `to` the one
-  // it runs on), named in the offboarding's answer: no stop of the router's gives them their own back once it is offboarded (vision
-  // docs/specs/2026-11-08-google-cloud-router-features-design.md, section 6).
-  const onFallback = (run) => (run?.instanceTypes && Object.keys(run.instanceTypes).length ? { instanceTypes: run.instanceTypes } : {});
+  // The VMs a wake left on a fallback machine type (`fallbacks`, fallbacksOf's), named in the offboarding's answer: no stop of the router's
+  // gives them their own back once it is offboarded (vision docs/specs/2026-11-08-google-cloud-router-features-design.md, section 6).
+  const onFallback = (run) => {
+    const fallbacks = fallbacksOf(run);
+    return fallbacks.length ? { fallbacks } : {};
+  };
 
   // Back awake in this request, up to the wake's timeout: the VMs must be up once the policy goes and the CLI unbinds the tag.
   async function awaken(id, run) {
@@ -791,7 +798,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   // A workload that cannot wake, or whose state is stuck: no wake, and all of Dormeto's goes. The backends stay as they are,
   // and those not up are named. A nap in flight finds its waker backend service gone before it would stop anything, unless
   // it is already stopping them. What it cannot give back is named too, `notGivenBack`, in the operator's words: none, no field, and
-  // the router will not try again; and the VMs on a fallback machine type, `instanceTypes`. `left` stays what it was for a CLI below
+  // the router will not try again; and the VMs on a fallback machine type, `fallbacks`. `left` stays what it was for a CLI below
   // this version.
   async function forceOff(cfg, run) {
     const { workloadId } = cfg;

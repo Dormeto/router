@@ -49,6 +49,8 @@ test('GET /v1/workloads: none, then each as a Workload the CLI can read', async 
   assert.equal(res.status, 200);
   assert.deepEqual(res.body, [{
     id: 'demo',
+    name: 'demo',
+    tags: {},
     state: STATES.AWAKE,
     urlMap: 'lb',
     backendService: 'app',

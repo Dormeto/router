@@ -26,12 +26,14 @@
 // pageViewOf); custom pages need the install's switch (pages.mjs).
 import { createHash } from 'node:crypto';
 import { resolveHibernation, settingsProblems, workloadSettingsProblems } from '../../lambda/src/lib/hibernation.mjs';
+import { checkName } from '../../lambda/src/lib/names.mjs';
 import { joinLevels } from '../../lambda/src/lib/manager-settings.mjs';
 import { pageViewOf, validatePage } from '../../lambda/src/lib/page-settings.mjs';
 import { nextEvents, normalizeSchedule, resolveJoin, scheduleProblems } from '../../lambda/src/lib/schedule.mjs';
 import { describedRules, SCALAR_KEYS } from '../../lambda/src/lib/settings-levels.mjs';
 import { mergedRouterSettings, resolvedSettings, routerSettingsView, withSettings, writtenRouterView } from '../../lambda/src/lib/settings-writes.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
+import { tagsProblem } from '../../lambda/src/lib/tags.mjs';
 import { companionRead, INSTANCE_NAME, isCompanion, statusOf } from './cloudsql.mjs';
 import { groupOf, PauseRefused } from './controller-core.mjs';
 import {
@@ -232,6 +234,8 @@ function workloadOf(cfg, run, paused, router) {
   const { settings, settingsFrom, type } = resolvedSettings(effective);
   return {
     id: cfg.workloadId,
+    name: cfg.name ?? cfg.workloadId,
+    tags: cfg.tags ?? {},
     state: run?.state ?? 'UNKNOWN',
     urlMap: cfg.urlMap,
     backendService: cfg.backendService,
@@ -280,7 +284,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   const insertService = (body, lb) => (isRegionalLb(lb) ? compute.insertRegionBackendService(lb.region, body) : compute.insertBackendService(body));
 
   // The request's fields, or a 400. Without an ID, the backend service's name, when it is one. `needsAll`: an onboarding's `gke` names all, a dry run's the cluster alone.
-  function requested({ urlMap, backendService, id, settings = {}, loadBalancer, cloudSql = [], gke: gkeAsked, requestLogs, fallbackInstanceTypes }, { needsAll = false } = {}) {
+  function requested({ urlMap, backendService, id, name, tags, source = 'cli', settings = {}, loadBalancer, cloudSql = [], gke: gkeAsked, requestLogs, fallbackInstanceTypes }, { needsAll = false } = {}) {
     if (!urlMap || !backendService) throw bad('urlMap and backendService are needed');
     for (const [key, value] of Object.entries({ urlMap, backendService })) {
       if (typeof value !== 'string' || !NAME.test(value)) throw bad(`${key}: ${JSON.stringify(value)} is not a Compute Engine name`);
@@ -289,9 +293,15 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     const workloadId = checkedId(id || backendService);
     const waker = wakerName(workloadId);
     if (waker.length > NAME_MAX) throw bad(`workload ID ${workloadId} would name the waker backend service ${waker}, longer than the ${NAME_MAX} characters of a Compute Engine name: use a shorter one`);
+    // The name people see and the labels, as AWS's rename and tag take them (`source`: who onboarded it, the CLI or the manager's action).
+    const checkedName = checkName(name);
+    if (name !== undefined && checkedName.problem) throw bad(checkedName.problem);
+    const tagged = tags === undefined ? null : tagsProblem(tags);
+    if (tagged) throw bad(tagged);
+    if (source !== 'cli' && source !== 'manager') throw bad('source: cli or manager');
     const problems = [...onboardSettingsProblems(settings), ...cloudSqlProblems(cloudSql), ...(requestLogs === undefined ? [] : requestLogsProblems(requestLogs)), ...(fallbackInstanceTypes === undefined ? [] : fallbackTypesProblems(fallbackInstanceTypes)), ...(gkeAsked === undefined ? [] : gkeProblems(gkeAsked, { needsAll }))];
     if (problems.length) throw bad(problems.join('; '));
-    return { id: workloadId, urlMap, backendService, settings, loadBalancer, cloudSql, gkeAsked, requestLogs, fallbackTypes: fallbackInstanceTypes ?? [] };
+    return { id: workloadId, name: checkedName.name || undefined, tags, source, urlMap, backendService, settings, loadBalancer, cloudSql, gkeAsked, requestLogs, fallbackTypes: fallbackInstanceTypes ?? [] };
   }
 
   // The URL map, `{ map, regional }`, or why it is not one: `{ reason }`. A regional one elsewhere than the router's region reads as none.
@@ -668,7 +678,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   }
 
   async function onboard(input) {
-    const { id, urlMap, backendService, settings, loadBalancer, cloudSql, gkeAsked, requestLogs, fallbackTypes } = requested(input, { needsAll: true });
+    const { id, name: personName, tags, source, urlMap, backendService, settings, loadBalancer, cloudSql, gkeAsked, requestLogs, fallbackTypes } = requested(input, { needsAll: true });
     if (await store.getConfig(id)) throw new Refusal(409, 'exists', `workload ${id} is onboarded already`);
     const { reasons, vms, groups, negs, memberOf, serviceBackends, podNegs, databases, hosts, wakerExists, lb } = await inspect({ id, urlMap, backendService, loadBalancer, settings, cloudSql, gkeAsked, fallbackTypes });
     if (reasons.length) throw new Refusal(400, 'not-eligible', `cannot onboard ${id}: ${reasons.join('; ')}`);
@@ -693,6 +703,8 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     const levels = Object.fromEntries(Object.entries(asked).filter(([, value]) => value !== null));
     const written = {
       workloadId: id,
+      ...(personName ? { name: personName } : {}),
+      ...(tags ? { tags } : {}),
       urlMap,
       backendService,
       wakerBackendService: name,
@@ -723,7 +735,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
       ...(typeof hibernate === 'boolean' ? { hibernate } : {}),
       // What the onboarding is not given follows the levels (design section 4.1), G1's computed wake timeout included.
       inherits: SCALAR_KEYS.filter((key) => !Object.hasOwn(levels, key)),
-      source: 'cli',
+      source,
       onboardedAt: isoOf(now()),
     };
     const builtIn = builtInsOf(written);
@@ -847,6 +859,28 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   async function current(cfg, { router } = {}) {
     const [run, [paused], level] = await Promise.all([store.getRun(cfg.workloadId), core.pausesFor(cfg.workloadId), router === undefined ? routerLevel() : router]);
     return workloadOf(cfg, run, paused, level);
+  }
+
+  // The name people see, for a workload onboarded here (AWS's rename answer). A write racing an offboarding puts nothing back.
+  async function setName(id, name, by) {
+    const cfg = await find(id);
+    const checked = checkName(name);
+    if (!checked.name) throw bad('name: required');
+    if (checked.problem) throw bad(checked.problem);
+    if (!(await store.putConfig(cfg.workloadId, { ...cfg, name: checked.name }, { mustExist: true }))) throw notFound(id);
+    log.info('Renamed', { workloadId: cfg.workloadId, name: checked.name, by });
+    return { workloadId: cfg.workloadId, name: checked.name };
+  }
+
+  // The workload's tags, replaced whole (AWS's tag answer). This instance's events carry them from now on; the others' at their next check.
+  async function setTags(id, tags, by) {
+    const cfg = await find(id);
+    const problem = tagsProblem(tags);
+    if (problem) throw bad(problem);
+    if (!(await store.putConfig(cfg.workloadId, { ...cfg, tags }, { mustExist: true }))) throw notFound(id);
+    core.noteTags(cfg.workloadId, tags);
+    log.info('Tagged', { workloadId: cfg.workloadId, tags, by });
+    return { workloadId: cfg.workloadId, tags };
   }
 
   const show = async (id) => current(await find(id));
@@ -1007,7 +1041,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   }
 
   return {
-    dryRun, onboard, offboard, find, show, list, nap, wake, showSchedule, setSchedule, clearSchedule, pause, resume, setSettings, routerSettings, setRouterSettings,
+    dryRun, onboard, offboard, find, setName, setTags, show, list, nap, wake, showSchedule, setSchedule, clearSchedule, pause, resume, setSettings, routerSettings, setRouterSettings,
     waitingPage,
   };
 }

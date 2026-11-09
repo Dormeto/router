@@ -235,6 +235,9 @@ export function createController({
     return next;
   }
 
+  // A rename of the tags (the onboarding's setTags): the events this instance writes from now on carry them.
+  const noteTags = (workloadId, tags) => tagsOf.set(workloadId, tags);
+
   async function getConfig(workloadId) {
     const cfg = await store.getConfig(workloadId);
     if (cfg) tagsOf.set(workloadId, cfg.tags ?? {});
@@ -1592,5 +1595,5 @@ export function createController({
     }
   }
 
-  return { refreshLists, wake, beginWake, wakeNow, nap, napNow, release, check, pause, resume, pausesFor };
+  return { noteTags, refreshLists, wake, beginWake, wakeNow, nap, napNow, release, check, pause, resume, pausesFor };
 }

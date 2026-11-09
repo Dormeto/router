@@ -391,6 +391,8 @@ test('onboard: the service, then the route, then the configuration and AWAKE; no
   assert.ok(!('admin' in config), 'cfg.admin.enabled would turn /_dormeto/wake into a 404');
   assert.deepEqual(workload, {
     id: 'demo',
+    name: 'demo',
+    tags: {},
     state: STATES.AWAKE,
     urlMap: 'lb',
     backendService: 'app',
@@ -2794,4 +2796,107 @@ test('fallback machine types: a GKE workload\'s pods are refused, as a managed g
     refused(400, 'not-eligible', /fallback machine types are for VMs of unmanaged instance groups: the pods of a GKE cluster have no machine type of their own/),
   );
   assert.deepEqual(w.changes, []);
+});
+
+// --- Names and tags (the manager's rows, G2 plan 1) -----------------------------------------------------------------------
+
+test('onboard: the name and the tags are kept in the configuration and shown; without them the name is the ID and the tags none; the source is cli', async () => {
+  const { store, onboarding } = setup();
+  const shown = await onboarding.onboard({ ...INPUT, name: ' The demo ', tags: { team: 'a' } });
+  assert.deepEqual([shown.name, shown.tags], ['The demo', { team: 'a' }]);
+  const cfg = await store.getConfig('demo');
+  assert.deepEqual([cfg.name, cfg.tags, cfg.source], ['The demo', { team: 'a' }, 'cli']);
+});
+
+test('onboard: nothing named, nothing tagged: the ID is the name and the tags are none', async () => {
+  const { store, onboarding } = setup();
+  const shown = await onboarding.onboard(INPUT);
+  assert.deepEqual([shown.name, shown.tags], ['demo', {}]);
+  assert.equal('name' in (await store.getConfig('demo')), false);
+});
+
+test('onboard: from the manager, the source is manager', async () => {
+  const { store, onboarding } = setup();
+  await onboarding.onboard({ ...INPUT, source: 'manager' });
+  assert.equal((await store.getConfig('demo')).source, 'manager');
+});
+
+test('onboard: a source that is neither cli nor manager, a bad tag key or a bad name is a 400 naming it, with nothing changed', async () => {
+  for (const [fields, message] of [
+    [{ source: 'terraform' }, /^source: cli or manager$/],
+    [{ tags: { 'dormeto:x': 'v' } }, /^tag "dormeto:x": the dormeto: prefix is reserved$/],
+    [{ tags: { 'a#b': 'v' } }, /^tag "a#b": key characters: letters, digits, spaces and _ \. : \/ = \+ - @$/],
+    [{ tags: ['x'] }, /^tags: an object of key and value strings$/],
+    [{ name: 'x'.repeat(65) }, /^name: at most 64 characters$/],
+  ]) {
+    const { w, store, onboarding } = setup();
+    await assert.rejects(onboarding.onboard({ ...INPUT, ...fields }), refused(400, 'bad-request', message));
+    assert.deepEqual(w.changes, []);
+    assert.equal(store.configs.size, 0);
+  }
+});
+
+test('dry run: a bad tag is refused as an onboarding would', async () => {
+  const { onboarding } = setup();
+  await assert.rejects(onboarding.dryRun({ ...INPUT, tags: { 'dormeto:x': 'v' } }), refused(400, 'bad-request', /dormeto: prefix is reserved/));
+});
+
+test('setName and setTags: written to the configuration, answered as AWS answers, and shown by show', async () => {
+  const { store, onboarding } = setup();
+  await onboarding.onboard({ ...INPUT, tags: { team: 'a' } });
+  assert.deepEqual(await onboarding.setName('demo', ' Renamed ', 'ada'), { workloadId: 'demo', name: 'Renamed' });
+  assert.deepEqual(await onboarding.setTags('demo', { team: 'b', env: 'dev' }, 'ada'), { workloadId: 'demo', tags: { team: 'b', env: 'dev' } });
+  const cfg = await store.getConfig('demo');
+  assert.deepEqual([cfg.name, cfg.tags], ['Renamed', { team: 'b', env: 'dev' }]);
+  assert.deepEqual([(await onboarding.show('demo')).name, (await onboarding.show('demo')).tags], ['Renamed', { team: 'b', env: 'dev' }]);
+});
+
+test('setName and setTags: a bad name or tag is a 400, an empty name too, and nothing is written', async () => {
+  const { store, onboarding } = setup();
+  await onboarding.onboard({ ...INPUT, name: 'Demo', tags: { team: 'a' } });
+  await assert.rejects(onboarding.setName('demo', '  ', 'ada'), refused(400, 'bad-request', /^name: required$/));
+  await assert.rejects(onboarding.setName('demo', 'x'.repeat(65), 'ada'), refused(400, 'bad-request', /^name: at most 64 characters$/));
+  await assert.rejects(onboarding.setTags('demo', { 'dormeto:x': 'v' }, 'ada'), refused(400, 'bad-request', /^tag "dormeto:x": the dormeto: prefix is reserved$/));
+  const cfg = await store.getConfig('demo');
+  assert.deepEqual([cfg.name, cfg.tags], ['Demo', { team: 'a' }]);
+});
+
+test('setName and setTags: a workload that is not onboarded, or offboarded while the write was made, is a 404 and nothing is written', async () => {
+  const { store, onboarding } = setup();
+  await assert.rejects(onboarding.setName('demo', 'x', 'ada'), refused(404, 'not-found'));
+  await assert.rejects(onboarding.setTags('demo', {}, 'ada'), refused(404, 'not-found'));
+  await onboarding.onboard(INPUT);
+  // Offboarded between the read and the write: the conditional write puts nothing back.
+  const { getConfig } = store;
+  store.getConfig = async (id) => {
+    const cfg = await getConfig(id);
+    store.configs.delete(id);
+    return cfg;
+  };
+  await assert.rejects(onboarding.setName('demo', 'x', 'ada'), refused(404, 'not-found'));
+  await assert.rejects(onboarding.setTags('demo', { a: 'b' }, 'ada'), refused(404, 'not-found'));
+  assert.equal(store.configs.size, 0);
+});
+
+test('setTags: the next state change of this instance carries the new tags, though the configuration was read before', async () => {
+  const { store, core, onboarding } = setup();
+  await onboarding.onboard({ ...INPUT, tags: { team: 'a' } });
+  const asked = [];
+  const { transition, getRun } = store;
+  store.transition = (id, change) => {
+    if (change.set?.state) asked.push(change.event);
+    return transition.call(store, id, change);
+  };
+  // The nap has read the configuration (and its tags) when the tags change.
+  let changed = false;
+  store.getRun = async (id) => {
+    if (!changed) {
+      changed = true;
+      await onboarding.setTags('demo', { team: 'b' }, 'ada');
+    }
+    return getRun.call(store, id);
+  };
+  await core.nap('demo');
+  assert.ok(asked.length > 0);
+  assert.deepEqual(asked.map((event) => event.tags), asked.map(() => ({ team: 'b' })));
 });

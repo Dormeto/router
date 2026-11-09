@@ -1343,14 +1343,15 @@ export function createController({
     }
   }
 
-  // Every active pause, null when they cannot be read; the expired ones are deleted (unless a newer pause replaced them).
+  // Every active pause, `{ pauses }`; when they cannot be read, `{ pauses: null, error }` (the read's). The expired ones are deleted
+  // (unless a newer pause replaced them).
   async function activePauses() {
     let pauses;
     try {
       pauses = await store.listPauses();
     } catch (err) {
       log.warn('PausesUnreadable', { error: err.message });
-      return null;
+      return { pauses: null, error: err.message };
     }
     for (const p of pauses.filter(expired)) {
       const deleted = await store.removePauses(p.workloadId, { at: p.at }).catch((err) => {
@@ -1359,7 +1360,7 @@ export function createController({
       });
       if (deleted) log.info('PauseExpired', { workloadId: p.workloadId, by: p.by, reason: p.reason });
     }
-    return pauses.filter((p) => !expired(p));
+    return { pauses: pauses.filter((p) => !expired(p)) };
   }
 
   // The record as stored. No `until` when none is asked for: the store would make `undefined` a null, read as expired.
@@ -1604,7 +1605,7 @@ export function createController({
   async function check({ scheduled = false } = {}) {
     const started = now();
     const deadline = started + CHECK_BUDGET_MS;
-    const pauses = await activePauses();
+    const { pauses, error: pausesError } = await activePauses();
     const paused = (workloadId) => pauses === null || pauses.some((p) => p.workloadId === null || p.workloadId === workloadId);
     const keptAsleep = (workloadId) => pauses === null || pauses.some((p) => p.keepAsleep && (p.workloadId === null || p.workloadId === workloadId));
     const [{ configs, schedules }, levels] = await Promise.all([store.listWorkloads(), routerLevel()]);
@@ -1643,7 +1644,7 @@ export function createController({
     const reached = new Set(results.map((r) => r.workloadId));
     for (const workloadId of applied.keys()) if (!reached.has(workloadId)) results.push({ workloadId, ...passed(workloadId) });
     await sweepStats();
-    await recordCheck({ started, scheduled, order, results, pauses: (pauses ?? []).filter((p) => p.workloadId === null), pausesError: pauses === null ? 'see the controller\'s log' : undefined, managerState: levels.managerState });
+    await recordCheck({ started, scheduled, order, results, pauses: (pauses ?? []).filter((p) => p.workloadId === null), pausesError, managerState: levels.managerState });
     return results;
   }
 
@@ -1682,9 +1683,13 @@ export function createController({
   }
 
   // The router's health through the shared healthOf: the check late, the failed workloads, the manager's settings, the IP lists. No
-  // Lambda, queue or concurrency figure (AWS's), and no Cloud Run request error (the router holds no role to read them).
+  // Lambda, queue or concurrency figure (AWS's), and no Cloud Run request error (the router holds no role to read them). IP lists whose
+  // records cannot be read are each a problem with the read's error, as a failed read is in the status action, and the summary is
+  // still written.
   async function healthSummary({ t, byState, lastScheduledCheckAt, pausesError, managerState }) {
-    const ipLists = lists.length ? await describeStoredLists(store, lists) : [];
+    const ipLists = lists.length
+      ? await describeStoredLists(store, lists).catch((err) => lists.map(({ name, action, url }) => ({ name, action, url, error: err.message })))
+      : [];
     const manager = await managerLevel(managerState);
     const health = healthOf({
       checkSchedule: CHECK_SCHEDULE, lastScheduledCheckAt, now: t, failed: byState[STATES.FAILED] ?? 0, ipLists, managerSettingsError: manager.error,

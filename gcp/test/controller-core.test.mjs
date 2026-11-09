@@ -5846,6 +5846,27 @@ test('a check whose summary cannot be written is not failed: it says so', async 
   assert.equal(t.logged('CheckNotRecorded').length, 1);
 });
 
+test('a check whose pauses cannot be read says so in its summary with the read\'s error, as routerInfo and AWS\'s health say it', async () => {
+  const t = setup({ run: AWAKE_LONG, vms: RUNNING_VM });
+  t.store.listPauses = async () => { throw unreadable(); };
+  await t.controller.check({ scheduled: true });
+  const problem = { level: 'warning', code: 'pauses-unreadable', text: `pauses unreadable: ${unreadable().message}` };
+  assert.deepEqual(t.store.state.check.health, { status: 'warning', problems: [problem] });
+  assert.deepEqual((await t.controller.routerInfo()).health.problems, [problem]);
+});
+
+test('a check whose IP lists\' records cannot be read writes its summary all the same, each list\'s problem in its health; routerInfo answers too', async () => {
+  const t = setup({ run: AWAKE_LONG, vms: RUNNING_VM, lists: LISTS });
+  t.store.getListMeta = () => { throw unreadable(); };
+  await t.controller.check({ scheduled: true });
+  assert.equal(t.logged('CheckNotRecorded').length, 0);
+  const problem = { level: 'warning', code: 'ip-list:scanners', text: `IP list scanners: ${unreadable().message}` };
+  assert.deepEqual(t.store.state.check.health, { status: 'warning', problems: [problem] });
+  const info = await t.controller.routerInfo();
+  assert.deepEqual(info.health.problems, [problem]);
+  assert.deepEqual(info.health.ipLists.map((l) => [l.name, l.error, l.source]), [['scanners', unreadable().message, 'cli']]);
+});
+
 test('the counts of router/check are the workloads\' states, a workload with no run counting UNKNOWN', async () => {
   const t = setup({ run: FAILED_RUN(START - MINUTE), vms: RUNNING_VM, map: asleepMap(), unhealthyPolls: Infinity });
   await t.controller.check({ scheduled: true });

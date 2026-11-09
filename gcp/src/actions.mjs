@@ -11,8 +11,10 @@
 // The manager's wake, nap and pause say who asked (`by`) and, as AWS's, the cause `manager`, in their events. What AWS's status reads
 // live and the Google Cloud router does not (CloudWatch's last request, the load balancer's rules and targets, the backends' status,
 // the instances' hibernation) keeps its key, empty, as routerInfo keeps the Lambda figures. AWS's onboarder's three (`preview`,
-// `onboard`, `offboard`) answer the REST dry run's, onboarding's and offboarding's: AWS's name target groups and rules. Two actions
-// are Google Cloud's, the manager's poll: `events`, the journal (§5.3), and `manager-settings`, the organization's level (§5.5).
+// `onboard`, `offboard`) answer in its shapes (lambda/src/lib/onboarding.mjs), the Google Cloud resources for its target groups and
+// steps for what the Google Cloud onboarding changed, the REST answers' fields beside them; the REST routes keep their own answers for
+// the CLI. Two actions are Google Cloud's, the manager's poll: `events`, the journal (§5.3), and `manager-settings`, the organization's
+// level (§5.5).
 import { k8sId } from '../../lambda/src/lib/kubernetes.mjs';
 import { describeStoredLists } from '../../lambda/src/lib/list-cache.mjs';
 import { maintenanceDue } from '../../lambda/src/lib/schedule.mjs';
@@ -82,6 +84,22 @@ const checkOf = (check) => check && { ...check, checkedAt: iso(check.checkedAt),
 // it names, onboarded by the manager. GKE access and request logs stay with the CLI (§8): not taken here.
 const onboardingOf = ({ workloadId, name, tags, settings, urlMap, backendService, loadBalancer, databases, fallbackInstanceTypes }) => ({
   urlMap, backendService, id: workloadId, name, tags, settings, loadBalancer, cloudSql: databases, fallbackInstanceTypes, source: 'manager',
+});
+
+// AWS's preview (lambda/src/lib/onboarding.mjs's preview, :392 and :451): the workload's id, name and tags; instead of the target
+// groups and the load balancer, the Google Cloud resources (the URL map, the backend service, the waker's, `lb`); its backends and
+// databases in AWS's entries (:442, :449), `tagged` unknown: the router cannot see the tags the CLI binds; `ok` and `problems`. The REST
+// dry run's fields beside them. A dry run reads no route the onboarding adds: no `rules`.
+const previewOf = ({ request, answer }) => ({
+  ...request,
+  ...answer,
+  backends: [
+    ...answer.vms.map((vm) => ({ kind: 'instance', id: vm.name, tagged: null, location: vm.zone })),
+    ...answer.groups.map((group) => ({ kind: 'asg', id: group.name, tagged: null, location: group.location })),
+  ],
+  databases: answer.databases.map((database) => ({ kind: 'cloudsql-instance', id: database.name, tagged: null, ...database })),
+  ok: answer.eligible,
+  problems: answer.reasons,
 });
 
 // AWS answers a refused body's problems as `{ problems }`, an answer and not a refusal.
@@ -302,9 +320,17 @@ export function createActions({ controller, onboarding, store, router, lists = [
     'waiting-page': waitingPage,
     schedule: setSchedule,
     'clear-schedule': ({ workloadId, by }) => onboarding.deleteSchedule(workloadId, { by }),
-    preview: (payload) => onboarding.dryRun(onboardingOf(payload)),
-    onboard: (payload) => onboarding.onboard(onboardingOf(payload)),
-    offboard: ({ workloadId, force }) => onboarding.offboard(workloadId, { force: force === true }),
+    preview: async (payload) => previewOf(await onboarding.dryRunOf(onboardingOf(payload))),
+    // AWS's onboard (:552): its steps, and the workload with the REST Workload's fields; the waker backend service for its target group.
+    onboard: async (payload) => {
+      const { workload, steps } = await onboarding.onboardWithSteps(onboardingOf(payload));
+      return { steps, workload: { workloadId: workload.id, ...workload } };
+    },
+    // AWS's offboard (:793): its steps, with the REST answer's fields (the VMs left on a fallback type, and a forced one's backends left).
+    offboard: async ({ workloadId, force }) => {
+      const { answer, steps } = await onboarding.offboardWithSteps(workloadId, { force: force === true });
+      return { steps, ...answer };
+    },
     events,
     'manager-settings': pushManagerSettings,
   };

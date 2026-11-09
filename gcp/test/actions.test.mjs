@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { createActions } from '../src/actions.mjs';
 import { createControllerApi } from '../src/controller.mjs';
-import { INPUT, REGION, ZONE, setup } from './world.mjs';
+import { INPUT, REGION, WAKER, ZONE, setup } from './world.mjs';
 
 const iso = (ms) => new Date(ms).toISOString();
 const DAY = 86_400_000;
@@ -299,6 +299,36 @@ test('waiting-page: a custom page, with the switch on, stored as the REST route 
   assert.deepEqual(store.pages.get('pages/demo').page, { mode: 'custom', html: PAGE_HTML });
 });
 
+test('waiting-page: the organization\'s page (router/manager) inherited and effective at the router and workload levels, as AWS\'s view gives it', async () => {
+  const { call, act } = world();
+  await call('POST', '/v1/workloads', INPUT);
+  await act({ action: 'manager-settings', settings: { waitingPage: { mode: 'template', title: 'Acme Org', description: 'Back soon.' } }, etag: '"e1"' });
+  const routerLevel = (await act({ action: 'waiting-page', op: 'get', refusals: true })).body;
+  assert.deepEqual([routerLevel.own, routerLevel.inherited.title, routerLevel.effective.title, routerLevel.from.title], [null, 'Acme Org', 'Acme Org', 'organization']);
+  await act({ action: 'waiting-page', op: 'put', workloadId: 'demo', page: { mode: 'template', title: 'Shop' }, by: 'ann' });
+  const workload = (await act({ action: 'waiting-page', op: 'get', workloadId: 'demo' })).body;
+  assert.deepEqual([workload.inherited.title, workload.effective.title, workload.effective.description, workload.from.title, workload.from.description], ['Acme Org', 'Shop', 'Back soon.', 'workload', 'organization']);
+  assert.deepEqual((await call('GET', '/v1/workloads/demo/waiting-page')).body, workload);
+});
+
+test('waiting-page: the organization\'s custom page is not effective with the install\'s switch off, as the waker does not serve it; with it on, it is', async () => {
+  for (const customPages of [false, true]) {
+    const { act } = world((w) => { w.customPages = customPages; });
+    await act({ action: 'manager-settings', settings: { waitingPage: { mode: 'custom', html: PAGE_HTML } }, etag: '"e1"' });
+    const { body } = await act({ action: 'waiting-page', op: 'get' });
+    const [mode, from] = customPages ? ['custom', 'organization'] : ['template', 'default'];
+    assert.deepEqual([body.effective.mode, body.effective.from.mode, body.inherited.mode], [mode, from, mode], String(customPages));
+  }
+});
+
+test('waiting-page: an organization\'s settings that cannot be read leave its page out, said, and the view answers', async () => {
+  const { act, store, w } = world();
+  store.getManagerSettings = async () => { throw new Error('Google: 503 firestore'); };
+  const { status, body } = await act({ action: 'waiting-page', op: 'get' });
+  assert.deepEqual([status, body.effective.from.mode], [200, 'default']);
+  assert.deepEqual(pick(w.logs.find((l) => l.event === 'WaitingPageUnread'), ['level', 'error']), { level: 'organization', error: 'Google: 503 firestore' });
+});
+
 test('schedule and clear-schedule: AWS\'s answers with the REST schedule\'s data, `next` and the maintenance wake; problems answered as AWS\'s', async () => {
   const { call, act, store, clock } = world();
   await call('POST', '/v1/workloads', INPUT);
@@ -322,34 +352,130 @@ test('schedule and clear-schedule: AWS\'s answers with the REST schedule\'s data
   assert.equal((await act({ action: 'clear-schedule', workloadId: 'nope', refusals: true })).body.refused.code, 'not_found');
 });
 
-test('preview, onboard and offboard: the REST dry run\'s, onboarding\'s and offboarding\'s answers, with AWS\'s workloadId and databases; onboarded by the manager', async () => {
+// AWS's onboarder's answers (lambda/src/lib/onboarding.mjs): the preview's keys (:392, :451), its backends' and databases' (:442, :449),
+// the onboarding's (:552) and the offboarding's (:793), each step's (:477, :671-673).
+const AWS_PREVIEW = ['workloadId', 'name', 'tags', 'targetGroupArn', 'wakerTargetGroupName', 'loadBalancerArn', 'rules', 'backends', 'databases', 'ok', 'problems'];
+const AWS_BACKEND = ['kind', 'id', 'tagged'];
+const AWS_ONBOARD = ['steps', 'workload'];
+const AWS_ONBOARDED = ['workloadId', 'name', 'wakerTargetGroupArn'];
+const AWS_OFFBOARD = ['steps'];
+const AWS_STEP = ['name', 'status', 'detail'];
+// Instead of the target groups and the load balancer, the Google Cloud resources (G2 §5.2). A dry run reads no route the onboarding
+// would add, so the rules have no Google Cloud reading here.
+const GOOGLE_PREVIEW = { targetGroupArn: ['backendService', 'urlMap'], wakerTargetGroupName: ['wakerBackendService'], loadBalancerArn: ['urlMap', 'lb'], rules: [] };
+const PREVIEW = [...new Set(AWS_PREVIEW.flatMap((key) => GOOGLE_PREVIEW[key] ?? [key]))];
+const ONBOARDED = AWS_ONBOARDED.map((key) => (key === 'wakerTargetGroupArn' ? 'wakerBackendService' : key));
+const STEP_KEYS = (steps) => steps.every((step) => Object.keys(step).every((key) => AWS_STEP.includes(key)) && ['done', 'skipped', 'failed'].includes(step.status));
+
+test('preview: AWS\'s preview keys, the Google Cloud resources instead of the target groups, beside the REST dry run\'s fields', async () => {
+  const { call, act } = world((w) => { w.sql.db = {}; });
+  const asked = { urlMap: 'lb', backendService: 'app', workloadId: 'demo', name: 'Shop', tags: { team: 'a' }, settings: { idleMinutes: 30 } };
+  const preview = await act({ action: 'preview', ...asked, databases: ['db'], refusals: true });
+  assert.equal(preview.status, 200);
+  for (const key of PREVIEW) assert.ok(Object.hasOwn(preview.body, key), key);
+  assert.deepEqual([preview.body.targetGroupArn, preview.body.loadBalancerArn, preview.body.rules], [undefined, undefined, undefined]);
+  assert.deepEqual(pick(preview.body, ['workloadId', 'name', 'tags', 'urlMap', 'backendService', 'wakerBackendService', 'lb', 'ok', 'problems']), {
+    workloadId: 'demo', name: 'Shop', tags: { team: 'a' }, urlMap: 'lb', backendService: 'app', wakerBackendService: WAKER, lb: { kind: 'global' }, ok: true, problems: [],
+  });
+  // AWS's backends and databases, `tagged` unknown: the router cannot see Google's tags, which the CLI binds.
+  assert.deepEqual(preview.body.backends, [{ kind: 'instance', id: 'vm-a', tagged: null, location: ZONE }]);
+  for (const entry of [...preview.body.backends, ...preview.body.databases]) for (const key of AWS_BACKEND) assert.ok(Object.hasOwn(entry, key), key);
+  const rest = (await call('POST', '/v1/workloads?dryRun=true', { ...INPUT, name: 'Shop', tags: { team: 'a' }, settings: { idleMinutes: 30 }, cloudSql: ['db'] })).body;
+  assert.deepEqual(preview.body.databases, rest.databases.map((d) => ({ kind: 'cloudsql-instance', id: d.name, tagged: null, ...d })));
+  for (const key of Object.keys(rest).filter((k) => k !== 'databases')) assert.deepEqual(preview.body[key], rest[key], key);
+  // Not eligible: ok false and the reasons as AWS's problems.
+  const refused = await act({ action: 'preview', ...asked, databases: ['orders'] });
+  assert.deepEqual([refused.body.ok, refused.body.problems, refused.body.eligible], [false, refused.body.reasons, false]);
+  assert.match(refused.body.problems.join('; '), /Cloud SQL instance orders/);
+  // No name: the workload's id, the Workload's own default.
+  assert.deepEqual(pick((await act({ action: 'preview', urlMap: 'lb', backendService: 'app' })).body, ['workloadId', 'name', 'tags']), { workloadId: 'app', name: 'app', tags: {} });
+});
+
+test('onboard: AWS\'s answer, the steps of what the onboarding changed and the workload, with the REST Workload in it; onboarded by the manager', async () => {
   const { call, act, store } = world();
   const asked = { urlMap: 'lb', backendService: 'app', workloadId: 'demo', name: 'Shop', tags: { team: 'a' }, settings: { idleMinutes: 30 } };
-  const preview = await act({ action: 'preview', ...asked, refusals: true });
-  assert.deepEqual(preview, await call('POST', '/v1/workloads?dryRun=true', { ...INPUT, name: 'Shop', tags: { team: 'a' }, settings: { idleMinutes: 30 } }));
-  assert.equal(preview.body.eligible, true);
-  const databases = await act({ action: 'preview', ...asked, databases: ['orders'] });
-  assert.match(databases.body.reasons.join('; '), /Cloud SQL instance orders/);
   const onboarded = await act({ action: 'onboard', ...asked, by: 'ann', refusals: true });
   assert.equal(onboarded.status, 200);
-  assert.deepEqual(onboarded.body, (await call('GET', '/v1/workloads/demo')).body);
-  assert.deepEqual([onboarded.body.name, onboarded.body.tags, onboarded.body.settings.idleMinutes], ['Shop', { team: 'a' }, 30]);
+  assert.deepEqual(Object.keys(onboarded.body), AWS_ONBOARD);
+  assert.ok(STEP_KEYS(onboarded.body.steps));
+  assert.deepEqual(onboarded.body.steps, [
+    { name: 'waker backend service', status: 'done', detail: WAKER },
+    { name: 'instrument URL map', status: 'done', detail: 'URL map lb' },
+    { name: 'workload configuration', status: 'done' },
+  ]);
+  for (const key of ONBOARDED) assert.ok(Object.hasOwn(onboarded.body.workload, key), key);
+  assert.deepEqual(onboarded.body.workload, { workloadId: 'demo', ...(await call('GET', '/v1/workloads/demo')).body });
+  assert.deepEqual([onboarded.body.workload.name, onboarded.body.workload.tags, onboarded.body.workload.settings.idleMinutes], ['Shop', { team: 'a' }, 30]);
   assert.equal(store.configs.get('demo').source, 'manager');
   assert.equal((await act({ action: 'list' })).body.workloads[0].source, 'manager');
   assert.deepEqual((await act({ action: 'onboard', ...asked, refusals: true })).body, { refused: { code: 'conflict', message: 'workload demo is onboarded already' } });
-  const offboarded = await act({ action: 'offboard', workloadId: 'demo', by: 'ann', refusals: true });
-  assert.deepEqual(offboarded, { status: 200, body: {} });
-  assert.equal(store.configs.size, 0);
-  assert.equal((await act({ action: 'offboard', workloadId: 'demo', refusals: true })).body.refused.code, 'not_found');
 });
 
-test('offboard with force: the REST forced offboarding\'s answer', async () => {
-  const { call, act, store, w } = world();
+test('onboard: a waker backend service of the workload\'s already there is a step skipped, as AWS\'s waker target group', async () => {
+  const { act } = world((w) => {
+    w.services[WAKER] = { name: WAKER, loadBalancingScheme: 'EXTERNAL_MANAGED', customRequestHeaders: ['x-dormeto-workload: demo'], backends: [] };
+  });
+  const { body } = await act({ action: 'onboard', urlMap: 'lb', backendService: 'app', workloadId: 'demo' });
+  assert.deepEqual(body.steps[0], { name: 'waker backend service', status: 'skipped', detail: WAKER });
+});
+
+test('offboard: AWS\'s answer, the steps of what the offboarding undid; the REST route keeps its own answer', async () => {
+  const { call, act, store } = world();
   await call('POST', '/v1/workloads', INPUT);
-  store.runs.get('demo').state = STATES.ASLEEP;
+  const offboarded = await act({ action: 'offboard', workloadId: 'demo', by: 'ann', refusals: true });
+  assert.equal(offboarded.status, 200);
+  assert.deepEqual(Object.keys(offboarded.body), AWS_OFFBOARD);
+  assert.ok(STEP_KEYS(offboarded.body.steps));
+  assert.deepEqual(offboarded.body.steps, [
+    { name: 'wake', status: 'skipped' },
+    { name: 'restore autoscalers', status: 'skipped' },
+    { name: 'restore URL map', status: 'done', detail: 'URL map lb' },
+    { name: 'waker backend service', status: 'done', detail: WAKER },
+    { name: 'workload configuration', status: 'done' },
+  ]);
+  assert.equal(store.configs.size, 0);
+  assert.equal((await act({ action: 'offboard', workloadId: 'demo', refusals: true })).body.refused.code, 'not_found');
+  await call('POST', '/v1/workloads', INPUT);
+  assert.deepEqual((await call('DELETE', '/v1/workloads/demo')).body, {});
+});
+
+test('offboard: an asleep workload woken first, a step done, the wake giving its autoscaler back; one left on an awake run given back, a step done', async () => {
+  const autoscaler = { kind: 'zonal', location: ZONE, name: 'scaler', mode: 'ON' };
+  const asleep = world((w) => { w.autoscalers.scaler = 'OFF'; });
+  await asleep.call('POST', '/v1/workloads', INPUT);
+  asleep.w.vms['vm-a'].status = 'TERMINATED';
+  Object.assign(asleep.store.runs.get('demo'), { state: STATES.ASLEEP, autoscalers: [autoscaler] });
+  const woken = await asleep.act({ action: 'offboard', workloadId: 'demo', by: 'ann' });
+  assert.deepEqual(woken.body.steps.slice(0, 2), [{ name: 'wake', status: 'done', detail: `from ${STATES.ASLEEP}` }, { name: 'restore autoscalers', status: 'skipped' }]);
+  assert.deepEqual([asleep.w.autoscalers.scaler, asleep.w.vms['vm-a'].status, asleep.store.configs.size], ['ON', 'RUNNING', 0]);
+  const awake = world((w) => { w.autoscalers.scaler = 'OFF'; });
+  await awake.call('POST', '/v1/workloads', INPUT);
+  awake.store.runs.get('demo').autoscalers = [autoscaler];
+  const restored = await awake.act({ action: 'offboard', workloadId: 'demo', by: 'ann' });
+  assert.deepEqual(restored.body.steps.slice(0, 2), [{ name: 'wake', status: 'skipped' }, { name: 'restore autoscalers', status: 'done', detail: `autoscaler scaler (${ZONE}): ON` }]);
+  assert.equal(awake.w.autoscalers.scaler, 'ON');
+});
+
+test('offboard with force: AWS\'s steps beside the REST forced offboarding\'s answer; an autoscaler not given back a step failed', async () => {
+  const { call, act, store, w } = world((world) => { world.autoscalers.scaler = 'OFF'; });
+  await call('POST', '/v1/workloads', INPUT);
   w.vms['vm-a'].status = 'TERMINATED';
-  const res = await act({ action: 'offboard', workloadId: 'demo', force: true, by: 'ann' });
-  assert.deepEqual(res.body, { id: 'demo', left: [{ kind: 'vm', location: ZONE, name: 'vm-a', id: '1001' }] });
+  Object.assign(store.runs.get('demo'), { state: STATES.ASLEEP, autoscalers: [{ kind: 'zonal', location: ZONE, name: 'scaler', mode: 'ON' }] });
+  w.fail[`PATCH zones/${ZONE}/autoscalers?autoscaler=scaler`] = new Error('Google: refused');
+  const { body } = await act({ action: 'offboard', workloadId: 'demo', force: true, by: 'ann' });
+  const notGivenBack = [`autoscaler scaler (${ZONE}) is still off: set its mode back to ON`];
+  assert.deepEqual(body, {
+    steps: [
+      { name: 'restore autoscalers', status: 'failed', detail: notGivenBack[0] },
+      { name: 'restore URL map', status: 'done', detail: 'URL map lb' },
+      { name: 'waker backend service', status: 'done', detail: WAKER },
+      { name: 'workload configuration', status: 'done' },
+    ],
+    id: 'demo',
+    left: [{ kind: 'vm', location: ZONE, name: 'vm-a', id: '1001' }],
+    notGivenBack,
+  });
+  assert.ok(STEP_KEYS(body.steps));
   assert.equal(store.configs.size, 0);
 });
 

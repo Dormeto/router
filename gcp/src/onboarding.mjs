@@ -108,6 +108,9 @@ const zoneOf = (url) => /\/zones\/([^/]+)\//.exec(url)?.[1];
 const fromProjects = (url) => url.slice(Math.max(url.indexOf('projects/'), 0));
 const isoOf = (ms) => new Date(ms).toISOString();
 const isSwapped = (lb) => Object.hasOwn(SWAP_WAIT_MS, lb.kind);
+// A step of an onboarding or an offboarding in AWS's onboarder's shape (lambda/src/lib/onboarding.mjs): done or skipped, and what.
+const stepOf = (name, done, detail) => ({ name, status: done ? 'done' : 'skipped', ...(detail ? { detail } : {}) });
+const autoscalerText = (a) => `autoscaler ${a.name} (${a.location}): ${a.mode}`;
 // The CLI sends `requestLogs` when it turned the backend service's logging on: what the logging was before, kept for the offboarding.
 function requestLogsProblems(asked) {
   if (typeof asked !== 'object' || asked === null || Array.isArray(asked)) return ['requestLogs: must be an object'];
@@ -626,10 +629,21 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     };
   }
 
+  // The dry run with the request as read: AWS's preview answers both (`request`: the workload's id, name and tags, and the Google
+  // Cloud resources it names). `dryRun` is the REST route's.
+  async function dryRunOf(input) {
+    const asked = requested(input);
+    const request = {
+      workloadId: asked.id, name: asked.name ?? asked.id, tags: asked.tags ?? {}, urlMap: asked.urlMap, backendService: asked.backendService, wakerBackendService: wakerName(asked.id),
+    };
+    return { request, answer: await dryRunAnswer(asked) };
+  }
+  const dryRun = async (input) => (await dryRunOf(input)).answer;
+
   // `warnings`: what does not refuse it, but its operator should know: spec section 8's limit of a Standard cluster, and a database's
   // replicas, which Google leaves running (M8).
-  async function dryRun(input) {
-    const { reasons, vms, groups, databases, lb, gke: pods } = await inspect(requested(input));
+  async function dryRunAnswer(asked) {
+    const { reasons, vms, groups, databases, lb, gke: pods } = await inspect(asked);
     const warnings = [
       ...(pods && !pods.autopilot ? [`GKE cluster ${pods.cluster.location}/${pods.cluster.name} is a Standard cluster: scaling pods saves money only on Autopilot, or with the node autoscaler freeing a node; its fixed nodes are paid all the same`] : []),
       ...databases.filter((d) => d.replicas).map((d) => `Cloud SQL instance ${d.name} has read replicas (${d.replicas.join(', ')}): Google stops only the primary, its replicas keep running, and billing, while the workload sleeps`),
@@ -649,21 +663,27 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   // In one update, then the waker backend service: the route and the policy; under a swap, the application back wherever the map
   // is still swapped, the hold route and the route. What is gone already is no failure.
   // A delete refused as in use means a check wrote the route back between the update and the delete (it read the workload
-  // before the offboarding began): the route goes again, and the delete is tried once more.
+  // before the offboarding began): the route goes again, and the delete is tried once more. Answers what it changed, as steps.
   async function removeFromGoogle({ urlMap, backendService, wakerBackendService: name, lb = GLOBAL_LB }) {
     const waker = wakerUrl(name, lb);
-    const removeRoute = () => mapsOf(lb).modify(urlMap, (map) => {
-      const steps = isSwapped(lb)
-        ? [(m) => withoutSwap(m, backendService, waker), (m) => withoutHoldRoute(m, backendService, waker), (m) => withoutWakerRoute(m, waker)]
-        : [(m) => withoutErrorPolicy(m, waker), (m) => withoutWakerRoute(m, waker)];
-      return inOneUpdate(map, steps);
-    }).catch(absent);
+    let routeChanged = false;
+    const removeRoute = async () => {
+      const removed = await mapsOf(lb).modify(urlMap, (map) => {
+        const steps = isSwapped(lb)
+          ? [(m) => withoutSwap(m, backendService, waker), (m) => withoutHoldRoute(m, backendService, waker), (m) => withoutWakerRoute(m, waker)]
+          : [(m) => withoutErrorPolicy(m, waker), (m) => withoutWakerRoute(m, waker)];
+        return inOneUpdate(map, steps);
+      }).catch(absent);
+      routeChanged ||= Boolean(removed?.paths.length);
+    };
     await removeRoute();
-    await deleteService(name, lb).catch(async (err) => {
-      if (err?.code !== 400 || err.reason !== 'resourceInUseByAnotherResource') return absent(err);
+    const deleted = () => deleteService(name, lb).then(() => true);
+    const wakerGone = await deleted().catch(async (err) => {
+      if (err?.code !== 400 || err.reason !== 'resourceInUseByAnotherResource') return absent(err) ?? false;
       await removeRoute();
-      await deleteService(name, lb).catch(absent);
+      return deleted().catch((again) => absent(again) ?? false);
     });
+    return [stepOf('restore URL map', routeChanged, `URL map ${urlMap}`), stepOf('waker backend service', wakerGone, name)];
   }
 
   // Nothing of a failed onboarding stays: a waker backend service left would keep the NEG from being uninstalled.
@@ -678,7 +698,10 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     }
   }
 
-  async function onboard(input) {
+  // The REST route's answer, the Workload; `onboardWithSteps` adds what it changed, as AWS's onboarder's steps.
+  const onboard = async (input) => (await onboardWithSteps(input)).workload;
+
+  async function onboardWithSteps(input) {
     const { id, name: personName, tags, source, urlMap, backendService, settings, loadBalancer, cloudSql, gkeAsked, requestLogs, fallbackTypes } = requested(input, { needsAll: true });
     if (await store.getConfig(id)) throw new Refusal(409, 'exists', `workload ${id} is onboarded already`);
     const { reasons, vms, groups, negs, memberOf, serviceBackends, podNegs, databases, hosts, wakerExists, lb } = await inspect({ id, urlMap, backendService, loadBalancer, settings, cloudSql, gkeAsked, fallbackTypes });
@@ -741,6 +764,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     };
     const builtIn = builtInsOf(written);
     const cfg = { ...written, ...Object.fromEntries(written.inherits.map((key) => [key, builtIn[key]])) };
+    const steps = [];
     try {
       if (!wakerExists) {
         // M4 (the coverage design's section 10): Google takes a classic backend service with EXTERNAL and its two custom request
@@ -756,18 +780,21 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
           ...(headersInMap(lb) ? {} : { customRequestHeaders: wakerHeaders(id, lb) }),
         }, lb).catch(refusedByGoogle(id, `its waker backend service ${name}`));
       }
-      await mapsOf(lb).modify(urlMap, (map) => inOneUpdate(map, isSwapped(lb)
+      steps.push(stepOf('waker backend service', !wakerExists, name));
+      const { paths } = await mapsOf(lb).modify(urlMap, (map) => inOneUpdate(map, isSwapped(lb)
         ? [(m) => withWakerRoute(m, backendService, waker, mapHeaders(id, lb)), (m) => withHoldRoute(m, backendService, waker)]
         : [(m) => withWakerRoute(m, backendService, waker)])).catch(refusedByGoogle(id, `the update of URL map ${urlMap}`));
+      steps.push(stepOf('instrument URL map', paths.length > 0, `URL map ${urlMap}`));
       await store.putConfig(id, cfg);
       await store.initRun(id, now());
+      steps.push(stepOf('workload configuration', true));
     } catch (err) {
       await undo(cfg, err);
       if (err instanceof UrlMapRefused) throw new Refusal(400, 'not-eligible', `cannot onboard ${id}: ${err.message}`);
       throw err;
     }
     log.info('Onboarded', { workloadId: id, urlMap, backendService });
-    return workloadOf(cfg, await store.getRun(id), undefined, above);
+    return { workload: workloadOf(cfg, await store.getRun(id), undefined, above), steps };
   }
 
   // The configuration, or a 400 or a 404.
@@ -835,40 +862,55 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     const up = await Promise.all(cfg.backends.map((backend) => isUp(backend, workloadId)));
     const left = cfg.backends.filter((_, i) => !up[i]);
     const notGivenBack = [];
-    await Promise.all((run?.autoscalers ?? []).map((a) => compute.setAutoscalerMode(a, a.mode).catch((err) => {
+    const givenBack = [];
+    await Promise.all((run?.autoscalers ?? []).map((a) => compute.setAutoscalerMode(a, a.mode).then(() => givenBack.push(autoscalerText(a)), (err) => {
       log.warn('AutoscalerNotGivenBack', { workloadId, autoscaler: a.name, mode: a.mode, error: err.message });
       notGivenBack.push(`autoscaler ${a.name} (${a.location}) is still off: set its mode back to ${a.mode}`);
     })));
     // A give-back's failure needs a ScaledObject to give back.
-    await Promise.all((run?.owners ?? []).map((record) => giveBackOwner(clients, record).catch((err) => {
+    await Promise.all((run?.owners ?? []).map((record) => giveBackOwner(clients, record).then(() => givenBack.push(ownerText(record)), (err) => {
       log.warn('AutoscalerNotGivenBack', { workloadId, autoscaler: record.keda?.name, error: err.message });
       notGivenBack.push(pauseLeft(record));
     })));
-    await removeFromGoogle(cfg);
+    const restored = notGivenBack.length ? { name: 'restore autoscalers', status: 'failed', detail: notGivenBack.join('; ') } : stepOf('restore autoscalers', givenBack.length > 0, givenBack.join(', '));
+    const google = await removeFromGoogle(cfg);
     await store.deleteWorkload(workloadId);
     // An owner left at 0: what it ran goes with the run, its record.
     const replicasBefore = (run?.owners ?? []).map((record) => ({ owner: ownerText(record), replicas: record.replicas }));
     log.warn('Offboarded', { workloadId, force: true, left: left.map(backendText), ...(replicasBefore.length ? { replicasBefore } : {}) });
-    return { id: workloadId, left, ...(notGivenBack.length ? { notGivenBack } : {}), ...onFallback(run) };
+    return {
+      answer: { id: workloadId, left, ...(notGivenBack.length ? { notGivenBack } : {}), ...onFallback(run) },
+      steps: [restored, ...google, stepOf('workload configuration', true)],
+    };
   }
 
   // An offboarding that stops keeps the documents: they name what is left to remove when it runs again. Its answer names the VMs left on
-  // a fallback machine type.
-  async function offboard(id, { force = false } = {}) {
+  // a fallback machine type. The REST route's answer; `offboardWithSteps` adds what it undid, as AWS's onboarder's steps.
+  const offboard = async (id, options) => (await offboardWithSteps(id, options)).answer;
+
+  async function offboardWithSteps(id, { force = false } = {}) {
     const cfg = await find(id);
     let run = await store.getRun(id);
     if (force) return forceOff(cfg, run);
     if ([STATES.WAKING, STATES.NAPPING].includes(run?.state)) throw new Refusal(409, 'busy', `cannot offboard ${id}: it is ${run.state}, try again once it is done`);
-    if (run && run.state !== STATES.AWAKE) {
+    const asleep = run && run.state !== STATES.AWAKE ? run.state : null;
+    if (asleep) {
       await awaken(id, run);
       run = await store.getRun(id);
     }
     // A mode the checks could not give back yet: its record goes with the run.
     await Promise.all([...(run?.autoscalers ?? []).map((a) => compute.setAutoscalerMode(a, a.mode)), ...(run?.owners ?? []).map((record) => giveBackOwner(clients, record))]);
-    await removeFromGoogle(cfg);
+    const givenBack = [...(run?.autoscalers ?? []).map(autoscalerText), ...(run?.owners ?? []).map(ownerText)];
+    const google = await removeFromGoogle(cfg);
     await store.deleteWorkload(id);
     log.info('Offboarded', { workloadId: id });
-    return onFallback(run);
+    return {
+      answer: onFallback(run),
+      steps: [
+        stepOf('wake', Boolean(asleep), asleep && `from ${asleep}`), stepOf('restore autoscalers', givenBack.length > 0, givenBack.join(', ')), ...google,
+        stepOf('workload configuration', true),
+      ],
+    };
   }
 
   // The Workload as it is now. `levels`: the router's and the organization's, already read.
@@ -1037,13 +1079,21 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     return { level: 'router', settings: writtenRouterView(record) };
   }
 
-  // A level's page as AWS's action answers it. Every workload here is the CLI's: none is Terraform's. A custom page the switch keeps
-  // from visitors is its level's own still, said not served, and what the page shows is resolved without it.
+  // The organization's page, the waitingPage of the manager's settings.json in router/manager (organizationOf's), as AWS's view reads
+  // it (lambda/src/lib/controller-core.mjs's pageView): one that cannot be read is none, and said.
+  const organizationPage = () => Promise.resolve().then(() => store.getManagerSettings?.()).then((stored) => organizationOf(stored ?? null).page).catch((err) => {
+    log.warn('WaitingPageUnread', { level: 'organization', error: String(err?.message ?? err).slice(0, 200) });
+    return null;
+  });
+
+  // A level's page as AWS's action answers it, the organization's level above the router's. No workload here is Terraform's. A custom
+  // page the switch keeps from visitors, at any level, is resolved without, as the waker does not serve it; the level's own is still
+  // shown, said not served.
   async function pageView(level) {
     const workloadId = level === 'router' ? null : level.workloadId;
-    const [router, favicon] = await Promise.all([store.getWaitingPage('router'), workloadId ? store.getFavicon(workloadId) : null]);
+    const [organization, router, favicon] = await Promise.all([organizationPage(), store.getWaitingPage('router'), workloadId ? store.getFavicon(workloadId) : null]);
     const own = workloadId ? await store.getWaitingPage(level) : router;
-    const view = pageViewOf({ router, own, favicon, workload: Boolean(workloadId), served: servedPage(customPages) });
+    const view = pageViewOf({ organization, router, own, favicon, workload: Boolean(workloadId), served: servedPage(customPages) });
     return notServed(customPages, own?.page) ? { ...view, warnings: [CUSTOM_PAGE_NOT_SERVED, ...view.warnings] } : view;
   }
 
@@ -1077,7 +1127,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   }
 
   return {
-    dryRun, onboard, offboard, find, setName, setTags, show, list, nap, wake, showSchedule, setSchedule, clearSchedule, deleteSchedule, pause, resume, pauseRouter, resumeRouter, setSettings,
+    dryRun, dryRunOf, onboard, onboardWithSteps, offboard, offboardWithSteps, find, setName, setTags, show, list, nap, wake, showSchedule, setSchedule, clearSchedule, deleteSchedule, pause, resume, pauseRouter, resumeRouter, setSettings,
     routerSettings, setRouterSettings, waitingPage,
   };
 }

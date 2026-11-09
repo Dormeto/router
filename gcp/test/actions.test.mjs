@@ -482,6 +482,23 @@ test('onboard: a waker backend service of the workload\'s already there is a ste
   assert.deepEqual(body.steps[0], { name: 'waker backend service', status: 'skipped', detail: WAKER });
 });
 
+test('onboard and offboard: who asked is kept in the configuration as AWS\'s onboardedBy, unknown when the manager names none, and said in Onboarded and Offboarded', async () => {
+  const { act, call, store, w } = world();
+  const asked = { action: 'onboard', urlMap: 'lb', backendService: 'app', workloadId: 'demo' };
+  await act({ ...asked, by: 'ann' });
+  assert.equal(store.configs.get('demo').onboardedBy, 'ann');
+  await act({ action: 'offboard', workloadId: 'demo', by: 'bob' });
+  await act(asked);
+  assert.equal(store.configs.get('demo').onboardedBy, 'unknown');
+  await act({ action: 'offboard', workloadId: 'demo', force: true, by: 'bob' });
+  // The CLI's names no one: nothing kept, its lines say unknown.
+  await call('POST', '/v1/workloads', INPUT);
+  assert.equal(Object.hasOwn(store.configs.get('demo'), 'onboardedBy'), false);
+  await call('DELETE', '/v1/workloads/demo');
+  assert.deepEqual(w.logs.filter((l) => l.event === 'Onboarded').map((l) => l.by), ['ann', 'unknown', 'unknown']);
+  assert.deepEqual(w.logs.filter((l) => l.event === 'Offboarded').map((l) => [l.by, l.force === true]), [['bob', false], ['bob', true], ['unknown', false]]);
+});
+
 test('offboard: AWS\'s answer, the steps of what the offboarding undid; the REST route keeps its own answer', async () => {
   const { call, act, store } = world();
   await call('POST', '/v1/workloads', INPUT);

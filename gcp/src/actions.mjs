@@ -83,9 +83,10 @@ function scheduleAnswer({ schedule, nextEvents, joinMinutes, joinFrom, joinInher
 const checkOf = (check) => check && { ...check, checkedAt: iso(check.checkedAt), lastScheduledCheckAt: isoOrNull(check.lastScheduledCheckAt) };
 
 // An onboarding in AWS's onboarder's words (`workloadId`, `databases`: here the Cloud SQL instances), with the Google Cloud resources
-// it names, onboarded by the manager. GKE access and request logs stay with the CLI (§8): not taken here.
-const onboardingOf = ({ workloadId, name, tags, settings, urlMap, backendService, loadBalancer, databases, fallbackInstanceTypes }) => ({
-  urlMap, backendService, id: workloadId, name, tags, settings, loadBalancer, cloudSql: databases, fallbackInstanceTypes, source: 'manager',
+// it names, onboarded by the manager, by who asked (`unknown` when the payload names no one, as AWS's onboardedBy). GKE access and
+// request logs stay with the CLI (§8): not taken here.
+const onboardingOf = ({ workloadId, name, tags, settings, urlMap, backendService, loadBalancer, databases, fallbackInstanceTypes, by }) => ({
+  urlMap, backendService, id: workloadId, name, tags, settings, loadBalancer, cloudSql: databases, fallbackInstanceTypes, source: 'manager', by: by ?? 'unknown',
 });
 
 // AWS's preview (lambda/src/lib/onboarding.mjs's preview, :392 and :451): the workload's id, name and tags; instead of the target
@@ -303,7 +304,7 @@ export function createActions({ controller, onboarding, store, router, lists = [
   // What only the CLI undoes is refused with its command (design §8): the request logs the onboarding turned on (setting them back
   // needs compute.backendServices.update, which the manager's accounts don't hold) and a GKE workload's Kubernetes access (its RBAC
   // objects are the operator's). The REST route, the CLI's, offboards both.
-  async function offboard({ workloadId, force }) {
+  async function offboard({ workloadId, force, by }) {
     const cfg = await onboarding.find(workloadId);
     const why = cfg.backends.some(isPods) ? 'a GKE workload\'s Kubernetes access is the CLI\'s to remove'
       : cfg.requestLogs?.before ? 'its onboarding turned its backend service\'s request logs on, which the CLI sets back' : null;
@@ -311,7 +312,7 @@ export function createActions({ controller, onboarding, store, router, lists = [
       const command = `dormeto gcp workloads offboard ${cfg.workloadId} --project ${router.project} --region ${router.region}`;
       throw new Refusal(409, 'cli-only', `cannot offboard ${cfg.workloadId} through the manager: ${why}: ${command}`);
     }
-    const { answer, steps } = await onboarding.offboardWithSteps(cfg.workloadId, { force: force === true });
+    const { answer, steps } = await onboarding.offboardWithSteps(cfg.workloadId, { force: force === true, by });
     return { steps, ...answer };
   }
 

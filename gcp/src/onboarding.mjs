@@ -288,7 +288,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   const insertService = (body, lb) => (isRegionalLb(lb) ? compute.insertRegionBackendService(lb.region, body) : compute.insertBackendService(body));
 
   // The request's fields, or a 400. Without an ID, the backend service's name, when it is one. `needsAll`: an onboarding's `gke` names all, a dry run's the cluster alone.
-  function requested({ urlMap, backendService, id, name, tags, source = 'cli', settings = {}, loadBalancer, cloudSql = [], gke: gkeAsked, requestLogs, fallbackInstanceTypes }, { needsAll = false } = {}) {
+  function requested({ urlMap, backendService, id, name, tags, source = 'cli', settings = {}, loadBalancer, cloudSql = [], gke: gkeAsked, requestLogs, fallbackInstanceTypes, by }, { needsAll = false } = {}) {
     if (!urlMap || !backendService) throw bad('urlMap and backendService are needed');
     for (const [key, value] of Object.entries({ urlMap, backendService })) {
       if (typeof value !== 'string' || !NAME.test(value)) throw bad(`${key}: ${JSON.stringify(value)} is not a Compute Engine name`);
@@ -305,7 +305,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     if (source !== 'cli' && source !== 'manager') throw bad('source: cli or manager');
     const problems = [...onboardSettingsProblems(settings), ...cloudSqlProblems(cloudSql), ...(requestLogs === undefined ? [] : requestLogsProblems(requestLogs)), ...(fallbackInstanceTypes === undefined ? [] : fallbackTypesProblems(fallbackInstanceTypes)), ...(gkeAsked === undefined ? [] : gkeProblems(gkeAsked, { needsAll }))];
     if (problems.length) throw bad(problems.join('; '));
-    return { id: workloadId, name: checkedName.name || undefined, tags, source, urlMap, backendService, settings, loadBalancer, cloudSql, gkeAsked, requestLogs, fallbackTypes: fallbackInstanceTypes ?? [] };
+    return { id: workloadId, name: checkedName.name || undefined, tags, source, urlMap, backendService, settings, loadBalancer, cloudSql, gkeAsked, requestLogs, fallbackTypes: fallbackInstanceTypes ?? [], by: by ? String(by) : undefined };
   }
 
   // The URL map, `{ map, regional }`, or why it is not one: `{ reason }`. A regional one elsewhere than the router's region reads as none.
@@ -702,7 +702,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   const onboard = async (input) => (await onboardWithSteps(input)).workload;
 
   async function onboardWithSteps(input) {
-    const { id, name: personName, tags, source, urlMap, backendService, settings, loadBalancer, cloudSql, gkeAsked, requestLogs, fallbackTypes } = requested(input, { needsAll: true });
+    const { id, name: personName, tags, source, urlMap, backendService, settings, loadBalancer, cloudSql, gkeAsked, requestLogs, fallbackTypes, by } = requested(input, { needsAll: true });
     if (await store.getConfig(id)) throw new Refusal(409, 'exists', `workload ${id} is onboarded already`);
     const { reasons, vms, groups, negs, memberOf, serviceBackends, podNegs, databases, hosts, wakerExists, lb } = await inspect({ id, urlMap, backendService, loadBalancer, settings, cloudSql, gkeAsked, fallbackTypes });
     if (reasons.length) throw new Refusal(400, 'not-eligible', `cannot onboard ${id}: ${reasons.join('; ')}`);
@@ -760,6 +760,8 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
       // What the onboarding is not given follows the levels (design section 4.1), G1's computed wake timeout included.
       inherits: SCALAR_KEYS.filter((key) => !Object.hasOwn(levels, key)),
       source,
+      // Who asked, as AWS's: the manager's action names them; the CLI names no one.
+      ...(by ? { onboardedBy: by } : {}),
       onboardedAt: isoOf(now()),
     };
     const builtIn = builtInsOf(written);
@@ -793,7 +795,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
       if (err instanceof UrlMapRefused) throw new Refusal(400, 'not-eligible', `cannot onboard ${id}: ${err.message}`);
       throw err;
     }
-    log.info('Onboarded', { workloadId: id, urlMap, backendService });
+    log.info('Onboarded', { workloadId: id, urlMap, backendService, by: by ?? 'unknown' });
     return { workload: workloadOf(cfg, await store.getRun(id), undefined, above), steps };
   }
 
@@ -857,7 +859,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   // it is already stopping them. What it cannot give back is named too, `notGivenBack`, in the operator's words: none, no field, and
   // the router will not try again; and the VMs on a fallback machine type, `fallbacks`. `left` stays what it was for a CLI below
   // this version.
-  async function forceOff(cfg, run) {
+  async function forceOff(cfg, run, by) {
     const { workloadId } = cfg;
     const up = await Promise.all(cfg.backends.map((backend) => isUp(backend, workloadId)));
     const left = cfg.backends.filter((_, i) => !up[i]);
@@ -877,7 +879,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     await store.deleteWorkload(workloadId);
     // An owner left at 0: what it ran goes with the run, its record.
     const replicasBefore = (run?.owners ?? []).map((record) => ({ owner: ownerText(record), replicas: record.replicas }));
-    log.warn('Offboarded', { workloadId, force: true, left: left.map(backendText), ...(replicasBefore.length ? { replicasBefore } : {}) });
+    log.warn('Offboarded', { workloadId, by: by ?? 'unknown', force: true, left: left.map(backendText), ...(replicasBefore.length ? { replicasBefore } : {}) });
     return {
       answer: { id: workloadId, left, ...(notGivenBack.length ? { notGivenBack } : {}), ...onFallback(run) },
       steps: [restored, ...google, stepOf('workload configuration', true)],
@@ -888,10 +890,10 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   // a fallback machine type. The REST route's answer; `offboardWithSteps` adds what it undid, as AWS's onboarder's steps.
   const offboard = async (id, options) => (await offboardWithSteps(id, options)).answer;
 
-  async function offboardWithSteps(id, { force = false } = {}) {
+  async function offboardWithSteps(id, { force = false, by } = {}) {
     const cfg = await find(id);
     let run = await store.getRun(id);
-    if (force) return forceOff(cfg, run);
+    if (force) return forceOff(cfg, run, by);
     if ([STATES.WAKING, STATES.NAPPING].includes(run?.state)) throw new Refusal(409, 'busy', `cannot offboard ${id}: it is ${run.state}, try again once it is done`);
     const asleep = run && run.state !== STATES.AWAKE ? run.state : null;
     if (asleep) {
@@ -903,7 +905,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     const givenBack = [...(run?.autoscalers ?? []).map(autoscalerText), ...(run?.owners ?? []).map(ownerText)];
     const google = await removeFromGoogle(cfg);
     await store.deleteWorkload(id);
-    log.info('Offboarded', { workloadId: id });
+    log.info('Offboarded', { workloadId: id, by: by ?? 'unknown' });
     return {
       answer: onFallback(run),
       steps: [

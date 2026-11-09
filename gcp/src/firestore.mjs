@@ -212,6 +212,21 @@ export function createFirestoreStore({ google, project, database, region = datab
       await commit([{ update: { name: named(`schedules/${workloadId}`), fields: toFields({ schedule }) } }]);
     },
 
+    // Replace the schedule as read (`from`) by `next`, or remove it when `next` is null: false when it changed since (a save kept).
+    async replaceSchedule(workloadId, from, next) {
+      const path = `schedules/${workloadId}`;
+      const doc = await read(path);
+      if (!doc || JSON.stringify(doc.value.schedule) !== JSON.stringify(from)) return false;
+      const precondition = { currentDocument: { updateTime: doc.updateTime } };
+      try {
+        await commit([next ? { update: { name: named(path), fields: toFields({ schedule: next }) }, ...precondition } : { delete: named(path), ...precondition }]);
+      } catch (err) {
+        if (lostPrecondition(err)) return false;
+        throw err;
+      }
+      return true;
+    },
+
     // True when there was one.
     async deleteSchedule(workloadId) {
       if (!(await read(`schedules/${workloadId}`))) return false;

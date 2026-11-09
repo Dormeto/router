@@ -600,6 +600,12 @@ export function setup(change = () => {}, { clock = fakeClock() } = {}) {
       schedules.set(id, structuredClone(schedule));
     },
     deleteSchedule: async (id) => schedules.delete(id),
+    replaceSchedule: async (id, from, next) => {
+      if (JSON.stringify(schedules.get(id) ?? null) !== JSON.stringify(from)) return false;
+      if (next) schedules.set(id, structuredClone(next));
+      else schedules.delete(id);
+      return true;
+    },
     getPauses: async (id) => (pauses.has(id) ? [{ workloadId: id, ...structuredClone(pauses.get(id)) }] : []),
     getRouterPause: async () => structuredClone(pauses.get(null) ?? null),
     listPauses: async () => [...pauses].map(([workloadId, pause]) => ({ workloadId, ...structuredClone(pause) })),

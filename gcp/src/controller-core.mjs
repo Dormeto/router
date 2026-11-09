@@ -59,7 +59,7 @@ import { cacheFavicon, FAVICON_BUDGET_MS, hostOfRules } from '../../lambda/src/l
 import { healthOf } from '../../lambda/src/lib/health.mjs';
 import { resolveHibernation } from '../../lambda/src/lib/hibernation.mjs';
 import { createListCache, describeStoredLists } from '../../lambda/src/lib/list-cache.mjs';
-import { awakeStartWithin, CLOSE_START_MS, maintenanceDue, occurrenceAt, resolveJoin } from '../../lambda/src/lib/schedule.mjs';
+import { awakeStartWithin, CLOSE_START_MS, ENDED_DAYS_DEFAULT, maintenanceDue, occurrenceAt, resolveJoin, withoutEnded } from '../../lambda/src/lib/schedule.mjs';
 import { DAY_MS, STATES, utcDay } from '../../lambda/src/lib/state.mjs';
 import { createListRefresher } from '../../lambda/src/lib/list-refresh.mjs';
 import { routerSettingsView } from '../../lambda/src/lib/settings-writes.mjs';
@@ -1203,7 +1203,7 @@ export function createController({
   // called but the tasks it enqueues. holdOf(workloadId): { paused, keepAsleep }. `flight`: the naps in flight, which its naps
   // add to. `joins`: the levels' joinMinutes. Answers each workload's outcome (what it did, or what held it) and the schedules the
   // router can read: one it cannot (a time zone Intl refuses) is logged and the workload behaves as if it had none.
-  async function applySchedules(configs, schedules, holdOf, t, deadline, flight, joins) {
+  async function applySchedules(configs, schedules, holdOf, t, deadline, flight, joins, endedDays = null) {
     const due = [];
     const readable = new Map();
     for (const { workloadId } of configs) {
@@ -1236,8 +1236,32 @@ export function createController({
       }
     }));
     await askScheduledNaps(naps, applied, t, deadline, flight);
+    if (endedDays) await removeEnded(due, t, endedDays);
     return { applied, readable };
   }
+
+  // Windows that ended more than `days` days ago leave their schedule, and so do the dates without a window as old; a schedule left
+  // with nothing is removed (AWS's rule, schedule.mjs's withoutEnded). Only between occurrences: an occurrence's id holds its window's
+  // index, which a removal shifts. Written only over the schedule as read, so a save since is kept.
+  async function removeEnded(due, t, days) {
+    for (const { workloadId, schedule, occurrence } of due) {
+      if (occurrence) continue;
+      const ended = withoutEnded(schedule, t, days);
+      if (!ended) continue;
+      try {
+        if (await store.replaceSchedule(workloadId, schedule, ended.schedule)) log.info('EndedWindowsRemoved', { workloadId, windows: ended.windows, dates: ended.dates, days });
+      } catch (err) {
+        log.warn('EndedWindowsKept', { workloadId, error: err.message });
+      }
+    }
+  }
+
+  // The days before an ended window leaves its schedule: the organization's endedWindowDays (0 keeps them), a year when it sets none.
+  // Null, nothing leaves, when the organization's settings cannot be read or are not a settings.json: an organization's 0 may be there.
+  const endedDaysOf = ({ unreadable, managerState }) => {
+    if (unreadable || (managerState?.error && !managerState.level)) return null;
+    return managerState?.level?.endedWindowDays ?? ENDED_DAYS_DEFAULT;
+  };
 
   // The occurrence active now, applied once: the run records the last applied one, so a late check, a deploy inside a window
   // or two checks in it apply it once. Then the maintenance wake of a workload asleep longer than maxNapDays. A pause holds
@@ -1581,7 +1605,7 @@ export function createController({
     const flight = { naps: order.length > NAPS_MAX ? await napsInFlight(order) : 0, deferred: 0 };
     // The router level's joinMinutes, read with the levels: one never read is unset, as AWS's join levels count a level they cannot read.
     const joins = { router: levels.router?.joinMinutes ?? null, manager: levels.organization?.joinMinutes ?? null };
-    const { applied, readable } = await applySchedules(order, schedules, (id) => ({ paused: paused(id), keepAsleep: keptAsleep(id) }), now(), deadline, flight, joins);
+    const { applied, readable } = await applySchedules(order, schedules, (id) => ({ paused: paused(id), keepAsleep: keptAsleep(id) }), now(), deadline, flight, joins, schedules.size ? endedDaysOf(levels) : null);
     await requestListRefresh();
     const ctx = { schedules: readable, applied, flight, levels, joins };
     const passed = (workloadId) => (applied.has(workloadId) ? { schedule: applied.get(workloadId) } : {});

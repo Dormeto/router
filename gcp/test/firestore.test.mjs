@@ -484,6 +484,20 @@ test('schedules: a round trip, listWorkloads returns the map, deleteSchedule say
   assert.equal((await store.listWorkloads()).schedules.size, 0);
 });
 
+test('replaceSchedule: replaces the schedule as read, removes it for null; one saved since, or none, is kept and says false', async () => {
+  const { store } = setup();
+  await store.putConfig('app', { workloadId: 'app' });
+  assert.equal(await store.replaceSchedule('app', SCHEDULE, null), false);
+  await store.putSchedule('app', SCHEDULE);
+  const next = { ...SCHEDULE, timezone: 'UTC' };
+  assert.equal(await store.replaceSchedule('app', { ...SCHEDULE, by: 'someone else' }, next), false);
+  assert.deepEqual(await store.getSchedule('app'), SCHEDULE);
+  assert.equal(await store.replaceSchedule('app', SCHEDULE, next), true);
+  assert.deepEqual(await store.getSchedule('app'), next);
+  assert.equal(await store.replaceSchedule('app', next, null), true);
+  assert.equal(await store.getSchedule('app'), null);
+});
+
 test('pauses: two workloads paused, one expired; the store gives both, the expired one with its until', async () => {
   const { store } = setup();
   const live = { by: 'ops', at: 1000, reason: 'release', until: Date.parse('2026-03-11T00:00:00Z'), keepAsleep: false };

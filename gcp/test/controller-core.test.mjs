@@ -5929,3 +5929,55 @@ test('routerInfo: the router level\'s record and the active router pauses are sh
   t.store.listPauses = async () => { throw unreadable(); };
   assert.deepEqual((await t.controller.routerInfo()).health.problems.map((p) => p.code), ['pauses-unreadable']);
 });
+
+// --- Windows that ended long ago leave the schedule: the organization's endedWindowDays, a year by default (AWS's rule) ---------------
+
+const OFFICE = { kind: 'awake', days: ['sat'], start: '10:00', end: '11:00' };
+const endedOn = (day, until) => ({ kind: 'awake', days: [day], start: '10:00', end: '11:00', until });
+const withEnded = (windows, settings) => {
+  const t = scheduled(scheduleOf(...windows), { run: { state: STATES.ASLEEP } });
+  if (settings !== undefined) t.store.state.managerSettings = { settings, etag: 'e', at: START - MINUTE };
+  return t;
+};
+const kept = (t) => t.store.state.schedules.demo.windows;
+
+test('a window that ended 400 days ago and no organization value: removed, the other kept, logged with the year', async () => {
+  const t = withEnded([OFFICE, endedOn('sat', '2022-10-08')]);
+  await t.controller.check();
+  assert.deepEqual(kept(t), [OFFICE]);
+  assert.deepEqual(t.logged('EndedWindowsRemoved').map(({ workloadId, windows, dates, days }) => ({ workloadId, windows, dates, days })), [{ workloadId: 'demo', windows: 1, dates: 0, days: 365 }]);
+  assert.equal(t.store.state.schedules.demo.by, 'ops', 'who set the schedule is kept');
+});
+
+test('the organization\'s endedWindowDays 0 keeps them; 30 removes one ended 31 days ago and keeps one ended 29 days ago', async () => {
+  const old = endedOn('sat', '2022-10-08');
+  const keep = withEnded([OFFICE, old], { workloads: { endedWindowDays: 0 } });
+  await keep.controller.check();
+  assert.equal(kept(keep).length, 2);
+  const month = withEnded([OFFICE, endedOn('sat', '2023-10-14'), endedOn('mon', '2023-10-16')], { workloads: { endedWindowDays: 30 } });
+  await month.controller.check();
+  assert.deepEqual(kept(month), [OFFICE, endedOn('mon', '2023-10-16')]);
+  assert.deepEqual(month.logged('EndedWindowsRemoved').map((l) => l.days), [30]);
+});
+
+test('the organization\'s value unreadable, or its document not an object: nothing leaves; a document without the key uses the year', async () => {
+  const bad = withEnded([OFFICE, endedOn('sat', '2022-10-08')], 'oops');
+  await bad.controller.check();
+  assert.equal(kept(bad).length, 2);
+  const unread = withEnded([OFFICE, endedOn('sat', '2022-10-08')]);
+  unread.store.getManagerSettings = async () => { throw unreadable(); };
+  await unread.controller.check();
+  assert.equal(kept(unread).length, 2);
+  const unset = withEnded([OFFICE, endedOn('sat', '2022-10-08')], { workloads: { hibernate: true } });
+  await unset.controller.check();
+  assert.deepEqual(kept(unset), [OFFICE]);
+});
+
+test('not while a window is active, and a workload with no schedule never touches the schedules', async () => {
+  const active = withEnded([NAP, endedOn('sat', '2022-10-08')]);
+  await active.controller.check();
+  assert.equal(kept(active).length, 2, 'an occurrence\'s id holds its window\'s index');
+  const none = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
+  none.store.replaceSchedule = async () => assert.fail('no schedule, nothing to replace');
+  await none.controller.check();
+});

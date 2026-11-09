@@ -669,7 +669,7 @@
         "dmt-{env}-manager-api",
         "dmt-{env}-manager-fleet"
       ],
-      "note": "Granted on each service account to the principal set of each of its roles, and to no other. Whether roles/iam.workloadIdentityUser alone lets a principal set mint the ID token is measured live (M1); if not, roles/iam.serviceAccountOpenIdTokenCreator is added on the command account."
+      "note": "Granted on each service account to the principal set of each of its roles, and to no other. roles/iam.workloadIdentityUser alone lets a principal set mint the ID token: measured live (M1), the role holds iam.serviceAccounts.get, getAccessToken, getOpenIdToken and list, and the manager minted the ID token and called the controller. No roles/iam.serviceAccountOpenIdTokenCreator is needed."
     }
   }
 }

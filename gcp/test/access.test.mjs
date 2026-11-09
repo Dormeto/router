@@ -427,7 +427,8 @@ test('manager: the impersonation, workloadIdentityUser per account for its roles
   assert.equal(i.principalSet, 'principalSet://iam.googleapis.com/projects/{hostNumber}/locations/global/workloadIdentityPools/dmt-{env}/attribute.aws_role/{awsRole}');
   assert.deepEqual(i.discovery, ['dmt-{env}-manager-discovery', 'dmt-{env}-manager-api', 'dmt-{env}-manager-savings']);
   assert.deepEqual(i.command, ['dmt-{env}-manager-operations', 'dmt-{env}-manager-api', 'dmt-{env}-manager-fleet']);
-  assert.match(i.note, /iam\.serviceAccountOpenIdTokenCreator/);
+  assert.match(i.note, /measured live \(M1\).*getOpenIdToken/);
+  assert.match(i.note, /No roles\/iam\.serviceAccountOpenIdTokenCreator is needed/);
   assert.doesNotMatch(JSON.stringify(manager.grants), /serviceAccountOpenIdTokenCreator/);
 });
 

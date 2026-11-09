@@ -58,7 +58,7 @@ import { classify, failedSpec, failureError } from '../../lambda/src/lib/failure
 import { cacheFavicon, FAVICON_BUDGET_MS, hostOfRules } from '../../lambda/src/lib/favicon.mjs';
 import { resolveHibernation } from '../../lambda/src/lib/hibernation.mjs';
 import { createListCache } from '../../lambda/src/lib/list-cache.mjs';
-import { awakeStartWithin, CLOSE_START_MS, maintenanceDue, occurrenceAt } from '../../lambda/src/lib/schedule.mjs';
+import { awakeStartWithin, CLOSE_START_MS, maintenanceDue, occurrenceAt, resolveJoin } from '../../lambda/src/lib/schedule.mjs';
 import { DAY_MS, STATES, utcDay } from '../../lambda/src/lib/state.mjs';
 import { createListRefresher } from '../../lambda/src/lib/list-refresh.mjs';
 import { withWake } from '../../lambda/src/lib/page-settings.mjs';
@@ -1161,18 +1161,22 @@ export function createController({
     if (deferred.length) log.info('ScheduledNapsDeferred', { workloads: deferred });
   }
 
+  // How far a schedule's windows join (AWS's joinOf): its own joinMinutes, else the levels' above it, `joins` (`{ router }`, the
+  // router level's value or null: no organization level here), else the default.
+  const joinOf = (schedule, joins) => ({ joinMinutes: resolveJoin({ workload: schedule?.joinMinutes, ...joins }).joinMinutes });
+
   // Before the check's loop, every scheduled workload whatever the loop's budget: 8 at a time, one run read each, nothing
   // called but the tasks it enqueues. holdOf(workloadId): { paused, keepAsleep }. `flight`: the naps in flight, which its naps
-  // add to. Answers each workload's outcome (what it did, or what held it) and the schedules the router can read: one it cannot
-  // (a time zone Intl refuses) is logged and the workload behaves as if it had none.
-  async function applySchedules(configs, schedules, holdOf, t, deadline, flight) {
+  // add to. `joins`: the levels' joinMinutes. Answers each workload's outcome (what it did, or what held it) and the schedules the
+  // router can read: one it cannot (a time zone Intl refuses) is logged and the workload behaves as if it had none.
+  async function applySchedules(configs, schedules, holdOf, t, deadline, flight, joins) {
     const due = [];
     const readable = new Map();
     for (const { workloadId } of configs) {
       const schedule = schedules.get(workloadId);
       if (!schedule) continue;
       try {
-        const occurrence = occurrenceAt(schedule, t);
+        const occurrence = occurrenceAt(schedule, t, joinOf(schedule, joins));
         // A nap window's occurrence is skipped when an awake window starts within 30 minutes of its start, or of now (an
         // occurrence first applied late).
         const closeStart = occurrence?.kind === 'nap'
@@ -1244,7 +1248,7 @@ export function createController({
     const schedule = ctx.schedules.get(workloadId);
     if (!schedule) return null;
     if (ctx.applied.get(workloadId)?.startsWith('nap')) return {};
-    if (occurrenceAt(schedule, t)?.kind === 'awake') return { kept: 'awake window' };
+    if (occurrenceAt(schedule, t, joinOf(schedule, ctx.joins))?.kind === 'awake') return { kept: 'awake window' };
     if (awakeStartWithin(schedule, t, CLOSE_START_MS)) return { kept: 'awake window within 30 minutes' };
     return null;
   }
@@ -1519,9 +1523,11 @@ export function createController({
     const order = [...configs].sort((a, b) => a.workloadId.localeCompare(b.workloadId));
     // A workload holds one nap in flight at most: with no more workloads than NAPS_MAX, their runs are not read for it.
     const flight = { naps: order.length > NAPS_MAX ? await napsInFlight(order) : 0, deferred: 0 };
-    const { applied, readable } = await applySchedules(order, schedules, (id) => ({ paused: paused(id), keepAsleep: keptAsleep(id) }), now(), deadline, flight);
+    // The router level's joinMinutes, read with the levels: one never read is unset, as AWS's join levels count a level they cannot read.
+    const joins = { router: levels.router?.joinMinutes ?? null };
+    const { applied, readable } = await applySchedules(order, schedules, (id) => ({ paused: paused(id), keepAsleep: keptAsleep(id) }), now(), deadline, flight, joins);
     await requestListRefresh();
-    const ctx = { schedules: readable, applied, flight, levels };
+    const ctx = { schedules: readable, applied, flight, levels, joins };
     const passed = (workloadId) => (applied.has(workloadId) ? { schedule: applied.get(workloadId) } : {});
     const results = [];
     let next = 0;

@@ -3018,6 +3018,35 @@ test('napping or waking at a nap window: left for the next check, which naps it 
   assert.equal(t.run().scheduleApplied, NAP_ID);
 });
 
+// The router level's joinMinutes (router/settings), as AWS's check reads it: the schedule's own value, then the router's, then 15.
+test('the router\'s joinMinutes 0 on a schedule with none of its own: two nap windows 10 minutes apart stay apart, the nap ends with the first; the schedule\'s own wins', async () => {
+  const windows = scheduleOf(NAP, { ...NAP, start: '23:10', end: '23:50' });
+  const JOINED_END = Date.parse('2023-11-14T23:50:00Z');
+  const untilOf = async (t) => {
+    await check(t);
+    return t.world.tasks.map((task) => task.body.until);
+  };
+  assert.deepEqual(await untilOf(scheduled(windows)), [JOINED_END]);
+  const router = scheduled(windows);
+  router.store.state.routerSettings = { joinMinutes: 0 };
+  assert.deepEqual(await untilOf(router), [NAP_END]);
+  const own = scheduled({ ...windows, joinMinutes: 15 });
+  own.store.state.routerSettings = { joinMinutes: 0 };
+  assert.deepEqual(await untilOf(own), [JOINED_END]);
+});
+
+test('the router\'s joinMinutes 60 joins two awake windows 45 minutes apart: in their gap, the idle nap kept off by the awake window', async () => {
+  // 22:13 on the fake clock: 32 minutes before the second starts, past the 30 that keep a workload awake before a start.
+  const windows = scheduleOf({ ...AWAKE_WINDOW, start: '21:00', end: '22:00' }, { ...AWAKE_WINDOW, start: '22:45', end: '23:30' });
+  const apart = scheduled(windows, { run: AWAKE_LONG, requests: 0 });
+  assert.equal((await check(apart)).nap, 'requested');
+  const joined = scheduled(windows, { run: AWAKE_LONG, requests: 0 });
+  joined.store.state.routerSettings = { joinMinutes: 60 };
+  const out = await check(joined);
+  assert.equal(out.kept, 'awake window');
+  assert.deepEqual(joined.world.tasks, []);
+});
+
 test('a schedule the router cannot read: logged, the workload as with none', async () => {
   const t = scheduled({ timeZone: 'Nowhere/Land', windows: [NAP], at: START }, { requests: 0 });
   const out = await check(t);

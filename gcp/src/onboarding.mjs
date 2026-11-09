@@ -26,6 +26,7 @@
 // pageViewOf); custom pages need the install's switch (pages.mjs).
 import { createHash } from 'node:crypto';
 import { resolveHibernation, settingsProblems, workloadSettingsProblems } from '../../lambda/src/lib/hibernation.mjs';
+import { joinLevels } from '../../lambda/src/lib/manager-settings.mjs';
 import { pageViewOf, validatePage } from '../../lambda/src/lib/page-settings.mjs';
 import { nextEvents, normalizeSchedule, resolveJoin, scheduleProblems } from '../../lambda/src/lib/schedule.mjs';
 import { describedRules, SCALAR_KEYS } from '../../lambda/src/lib/settings-levels.mjs';
@@ -858,15 +859,17 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   const nap = (id) => move(id, { acts: [STATES.AWAKE], there: STATES.ASLEEP, act: napUnlessPaused });
   const wake = (id) => move(id, { acts: [STATES.ASLEEP, STATES.FAILED, STATES.NAPPING], there: STATES.AWAKE, act: (workloadId) => core.wakeNow(workloadId) });
 
-  // A schedule's answer. One the router cannot read (a time zone Intl refuses) is shown, with no next event.
-  function scheduleView(id, schedule) {
+  // A schedule's answer. One the router cannot read (a time zone Intl refuses) is shown, with no next event. Its joinMinutes as AWS's
+  // answer resolves it: the schedule's own value, then the router level's (`router/settings`), then the default, with no manager here
+  // (design, section 11); a router level that cannot be read counts as unset, said in `JoinLevelUnreadable`, as AWS's join levels.
+  async function scheduleView(id, schedule) {
     const shown = schedule && { ...schedule, at: isoOf(schedule.at) };
-    // No manager here: the workload's value, then the default (design, section 11).
-    const { joinMinutes, from } = resolveJoin({ workload: schedule?.joinMinutes });
-    const inherited = resolveJoin();
+    const joins = await joinLevels({ router: () => store.getRouterSettings(), manager: null, log, fields: { workloadId: id } });
+    const { joinMinutes, from } = resolveJoin({ workload: schedule?.joinMinutes, ...joins });
+    const inherited = resolveJoin(joins);
     const join = { joinMinutes, joinFrom: from, joinInherited: { joinMinutes: inherited.joinMinutes, joinFrom: inherited.from } };
     try {
-      return { schedule: shown, nextEvents: nextEvents(schedule, now()), ...join };
+      return { schedule: shown, nextEvents: nextEvents(schedule, now(), { joinMinutes }), ...join };
     } catch (err) {
       log.warn('ScheduleSkipped', { workloadId: id, error: err.message });
       return { schedule: shown, nextEvents: [], ...join };

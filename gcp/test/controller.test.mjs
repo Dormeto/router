@@ -6,9 +6,10 @@ import { silentLog } from '../../lambda/test/fakes.mjs';
 import { createControllerApi, fromEnvironment } from '../src/controller.mjs';
 import { toFields } from '../src/firestore.mjs';
 import { GoogleError } from '../src/google.mjs';
+import { createCloudRunWaker } from '../src/waker.mjs';
 import { fakeFirestore } from './firestore-fake.mjs';
 import {
-  DEFAULT_FROM, DEFAULT_SETTINGS, INPUT, REGION, V1, WAKER, ZONE, regional, serviceUrl, setup, unmanagedUrl,
+  CONTROLLER, DEFAULT_FROM, DEFAULT_SETTINGS, INPUT, REGION, V1, WAKER, ZONE, regional, serviceUrl, setup, unmanagedUrl,
 } from './world.mjs';
 
 const PACKAGE = JSON.parse(await readFile(new URL('../../package.json', import.meta.url), 'utf8'));
@@ -346,6 +347,50 @@ test('schedule: no manager, so the workload\'s joinMinutes then the default; the
   const bad = await call('PUT', '/v1/workloads/demo/schedule', { timeZone: 'UTC', windows, joinMinutes: 7 });
   assert.equal(bad.status, 400);
   assert.equal(bad.body.error, 'joinMinutes: a whole number from 0 to 120, a multiple of 5');
+});
+
+// The router level's joinMinutes (PUT /v1/settings), as AWS's: the check, the waker and the schedule's answer resolve it through the
+// same levels (lambda/src/lib/schedule.mjs's resolveJoin), so that they agree on where a nap window ends.
+test('a router joinMinutes 0, a schedule with none of its own: the check\'s nap, the waker\'s page and its probe end with the first of two nap windows 10 minutes apart; the answer names the router', async () => {
+  const { call, store, clock, w } = api();
+  await call('POST', '/v1/workloads', INPUT);
+  // On the fake clock, Tuesday 22:13 UTC, in the first window: by default (15 minutes) the two join, until 23:50.
+  const windows = [{ kind: 'nap', days: ['tue'], start: '22:00', end: '23:00' }, { kind: 'nap', days: ['tue'], start: '23:10', end: '23:50' }];
+  const joined = await call('PUT', '/v1/workloads/demo/schedule', { timeZone: 'UTC', windows });
+  assert.deepEqual([joined.body.joinMinutes, joined.body.joinFrom], [15, 'default']);
+  assert.equal((await call('PUT', '/v1/settings', { joinMinutes: 0, by: 'ops' })).status, 200);
+  const answer = (await call('GET', '/v1/workloads/demo/schedule')).body;
+  assert.deepEqual([answer.joinMinutes, answer.joinFrom, answer.joinInherited], [0, 'router', { joinMinutes: 0, joinFrom: 'router' }]);
+  const END = '2023-11-14T23:00:00.000Z';
+  assert.deepEqual(answer.nextEvents[0], { at: END, kind: 'nap-end', window: 0 });
+  // The check's nap.
+  await call('POST', '/v1/check');
+  assert.deepEqual(w.tasks.map(({ body }) => [body.action, body.cause, body.until]), [['nap', 'schedule', Date.parse(END)]]);
+  // The waker on the same store, once the nap is done: its page and its probe say the same end.
+  store.runs.get('demo').state = STATES.ASLEEP;
+  const waker = createCloudRunWaker({ store, tasks: { enqueue: async () => assert.fail('a nap window wakes nothing') }, controllerUrl: CONTROLLER, now: clock.now, log: silentLog });
+  const headers = { 'x-dormeto-workload': 'demo', 'x-forwarded-for': '1.2.3.4, 35.1.1.1', 'user-agent': 'Mozilla/5.0' };
+  const page = await waker({ method: 'GET', url: '/_dormeto/waiting', headers });
+  assert.equal(page.multiValueHeaders['x-dormeto-nap-until'][0], END);
+  assert.match(page.body, /Napping on schedule until Tue 23:00 \(UTC\)/);
+  const probed = await waker({ method: 'GET', url: '/_dormeto/wake', headers: { ...headers, accept: '*/*', 'x-dormeto-probe': '1' } });
+  assert.equal(probed.multiValueHeaders['x-dormeto-nap-until'][0], END);
+  // The schedule's own value wins over the router's, everywhere.
+  await call('PUT', '/v1/workloads/demo/schedule', { timeZone: 'UTC', windows, joinMinutes: 15 });
+  const own = (await call('GET', '/v1/workloads/demo/schedule')).body;
+  assert.deepEqual([own.joinMinutes, own.joinFrom, own.joinInherited], [15, 'workload', { joinMinutes: 0, joinFrom: 'router' }]);
+  const later = await waker({ method: 'GET', url: '/_dormeto/waiting', headers });
+  assert.equal(later.multiValueHeaders['x-dormeto-nap-until'][0], '2023-11-14T23:50:00.000Z');
+});
+
+test('a router level that cannot be read: the schedule\'s answer as with none, said in JoinLevelUnreadable, as AWS\'s', async () => {
+  const { call, store, w } = api();
+  await call('POST', '/v1/workloads', INPUT);
+  store.getRouterSettings = async () => { throw new Error('Google: 503 firestore'); };
+  const res = await call('GET', '/v1/workloads/demo/schedule');
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body, NO_SCHEDULE);
+  assert.deepEqual(w.logs.filter((l) => l.event === 'JoinLevelUnreadable').map(({ level, error }) => ({ level, error })), [{ level: 'router', error: 'Google: 503 firestore' }]);
 });
 
 test('PUT /v1/workloads/:id/schedule: a bad schedule → 400 with scheduleProblems\' words, nothing stored', async () => {

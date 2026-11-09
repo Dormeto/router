@@ -40,7 +40,7 @@ import { logger } from '../../lambda/src/lib/log.mjs';
 import { createJoinLevelsCache } from '../../lambda/src/lib/manager-settings.mjs';
 import { PAGE_CSP, languageOf, renderPage } from '../../lambda/src/lib/page.mjs';
 import { wakeHeaders, wakeProgress } from '../../lambda/src/lib/page-settings.mjs';
-import { napEndHeader, napEndOf, occurrenceAt } from '../../lambda/src/lib/schedule.mjs';
+import { isJoinMinutes, napEndHeader, napEndOf, occurrenceAt, resolveJoin } from '../../lambda/src/lib/schedule.mjs';
 import { effectiveConfig } from '../../lambda/src/lib/settings-levels.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { createWaitingPages } from '../../lambda/src/lib/waiting-pages.mjs';
@@ -159,13 +159,16 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], c
   });
 
   // The end of the nap window active now, as the page says it, or null. A schedule that cannot be read counts as none: the
-  // page is served all the same.
+  // page is served all the same. Its windows join as the shared core's (napWindow) join them: the schedule's own joinMinutes, else the
+  // levels' above it, from the record of them this request read.
   async function napUntilOf(workloadId, state) {
     if (!KEPT_BY_NAP.includes(state)) return null;
     try {
       const schedule = await getSchedule(workloadId);
+      if (!schedule) return null;
+      const joins = isJoinMinutes(schedule.joinMinutes) ? {} : await levelsCache.levels({ workloadId });
       const t = now();
-      const occurrence = occurrenceAt(schedule, t);
+      const occurrence = occurrenceAt(schedule, t, { joinMinutes: resolveJoin({ workload: schedule.joinMinutes, ...joins }).joinMinutes });
       if (occurrence?.kind !== 'nap') return null;
       return napEndOf(occurrence, schedule.timeZone, t);
     } catch (err) {

@@ -110,6 +110,8 @@ export function createControllerApi({ core, onboarding, config }) {
     if (path === '/v1/tasks' && method === 'POST') return task(await bodyOf(request));
     if (path === SETTINGS && method === 'GET') return onboarding.routerSettings();
     if (path === SETTINGS && method === 'PUT') return onboarding.setRouterSettings(await bodyOf(request));
+    if (path === '/v1/pause' && method === 'POST') return onboarding.pauseRouter(await bodyOf(request));
+    if (path === '/v1/resume' && method === 'POST') return onboarding.resumeRouter(await bodyOf(request));
     if (path === WAITING_PAGE) return waitingPage('router', request);
     if (path === WORKLOADS && method === 'GET') return onboarding.list();
     if (path === WORKLOADS && method === 'POST') {

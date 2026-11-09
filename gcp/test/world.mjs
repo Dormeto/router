@@ -601,6 +601,7 @@ export function setup(change = () => {}, { clock = fakeClock() } = {}) {
     },
     deleteSchedule: async (id) => schedules.delete(id),
     getPauses: async (id) => (pauses.has(id) ? [{ workloadId: id, ...structuredClone(pauses.get(id)) }] : []),
+    getRouterPause: async () => structuredClone(pauses.get(null) ?? null),
     listPauses: async () => [...pauses].map(([workloadId, pause]) => ({ workloadId, ...structuredClone(pause) })),
     addPause: async (id, pause) => {
       pauses.set(id, structuredClone(pause));

@@ -964,6 +964,19 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     return current(cfg);
   }
 
+  // The router-wide pause (`router/pause`), for `POST /v1/pause` and `/v1/resume` without a workload: AWS's `pause` and `resume` actions'
+  // answers, `{ pause, woken }` and `{ resumed }`.
+  async function pauseRouter(input) {
+    return core.pause(null, input ?? {}).catch((err) => {
+      if (err instanceof PauseRefused) throw bad(err.message);
+      throw err;
+    });
+  }
+
+  async function resumeRouter({ by } = {}) {
+    return core.resume(null, by ?? 'unknown');
+  }
+
   // AWS's settings action for a workload, its write shared (settings-writes.mjs): `hibernate` (null removes it), the settings of the
   // levels (null gives the key back to the levels, its value without any level written for a router before G5), the rules (null: none)
   // and the type (null: inherited). Every workload here is the CLI's: no Terraform writes one, so none is refused as on AWS. `by` says
@@ -1041,7 +1054,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   }
 
   return {
-    dryRun, onboard, offboard, find, setName, setTags, show, list, nap, wake, showSchedule, setSchedule, clearSchedule, pause, resume, setSettings, routerSettings, setRouterSettings,
+    dryRun, onboard, offboard, find, setName, setTags, show, list, nap, wake, showSchedule, setSchedule, clearSchedule, pause, resume, pauseRouter, resumeRouter, setSettings, routerSettings, setRouterSettings,
     waitingPage,
   };
 }

@@ -1277,11 +1277,15 @@ export function createController({
 
   const expired = (p) => p.until !== undefined && p.until <= now();
 
-  // A workload's active pause, as people read it (at most one).
+  // A pause as people read it; the router's says so (`scope: 'router'`), a workload's is the one it was.
+  const shown = ({ workloadId, by, at, reason, until, keepAsleep }) => ({
+    ...(workloadId === null ? { scope: 'router' } : {}), by, at: iso(at), reason, until: until === undefined ? null : iso(until), keepAsleep: keepAsleep === true,
+  });
+
+  // A workload's active pauses, as people read them: its own (at most one), then its router's.
   async function pausesFor(workloadId) {
-    return (await store.getPauses(workloadId)).filter((p) => !expired(p)).map(({ by, at, reason, until, keepAsleep }) => ({
-      by, at: iso(at), reason, until: until === undefined ? null : iso(until), keepAsleep: keepAsleep === true,
-    }));
+    const [own, router] = await Promise.all([store.getPauses(workloadId), store.getRouterPause()]);
+    return [...own, ...(router ? [{ workloadId: null, ...router }] : [])].filter((p) => !expired(p)).map(shown);
   }
 
   // A nap needs to know: pauses that cannot be read count as a pause.
@@ -1326,18 +1330,34 @@ export function createController({
     return { by: by ?? 'unknown', at: now(), reason: text, ...(untilMs === undefined ? {} : { until: untilMs }), keepAsleep: keepAsleep === true };
   }
 
-  // Unless keepAsleep, an asleep or failed workload is woken and a napping one gets a pending wake. keepAsleep holds the
-  // scheduled and maintenance wakes only: a visitor still wakes it (the waker knows nothing of pauses).
+  // Pauses the workload, or the router when `workloadId` is null. Unless keepAsleep, an asleep or failed workload (each one of a
+  // paused router) is woken and a napping one gets a pending wake. keepAsleep holds the scheduled and maintenance wakes only: a
+  // visitor still wakes it (the waker knows nothing of pauses). Answers the pause as shown and the workloads woken, as AWS's action.
   async function pause(workloadId, input) {
     const record = pauseRecord(input);
     await store.addPause(workloadId, record);
     log.info('Paused', { workloadId, ...record });
-    if (record.keepAsleep) return;
-    await wakeNow(workloadId, 'pause').catch((err) => log.error('PauseWakeFailed', { workloadId, error: err.message }));
+    const woken = [];
+    if (!record.keepAsleep) {
+      const ids = workloadId ? [workloadId] : (await store.listConfigs()).map((c) => c.workloadId);
+      for (const id of ids) {
+        try {
+          const state = (await store.getRun(id))?.state;
+          await wakeNow(id, 'pause');
+          if ([STATES.ASLEEP, STATES.FAILED, STATES.NAPPING].includes(state)) woken.push(id);
+        } catch (err) {
+          log.error('PauseWakeFailed', { workloadId: id, error: err.message });
+        }
+      }
+    }
+    return { pause: shown({ workloadId, ...record }), woken };
   }
 
+  // Removes the workload's pause, or the router's when `workloadId` is null: only that one. Answers whether there was one.
   async function resume(workloadId, by) {
-    if (await store.removePauses(workloadId)) log.info('Resumed', { workloadId, by });
+    const resumed = Boolean(await store.removePauses(workloadId));
+    if (resumed) log.info('Resumed', { workloadId, by });
+    return { resumed };
   }
 
   // --- The check -----------------------------------------------------------------------------------------------------
@@ -1538,8 +1558,8 @@ export function createController({
     const started = now();
     const deadline = started + CHECK_BUDGET_MS;
     const pauses = await activePauses();
-    const paused = (workloadId) => pauses === null || pauses.some((p) => p.workloadId === workloadId);
-    const keptAsleep = (workloadId) => pauses === null || pauses.some((p) => p.keepAsleep && p.workloadId === workloadId);
+    const paused = (workloadId) => pauses === null || pauses.some((p) => p.workloadId === null || p.workloadId === workloadId);
+    const keptAsleep = (workloadId) => pauses === null || pauses.some((p) => p.keepAsleep && (p.workloadId === null || p.workloadId === workloadId));
     const [{ configs, schedules }, levels] = await Promise.all([store.listWorkloads(), routerLevel()]);
     for (const cfg of configs) tagsOf.set(cfg.workloadId, cfg.tags ?? {});
     const order = [...configs].sort((a, b) => a.workloadId.localeCompare(b.workloadId));
@@ -1576,7 +1596,7 @@ export function createController({
     const reached = new Set(results.map((r) => r.workloadId));
     for (const workloadId of applied.keys()) if (!reached.has(workloadId)) results.push({ workloadId, ...passed(workloadId) });
     await sweepStats();
-    await recordCheck({ started, scheduled, order, results, pausesError: pauses === null ? 'see the controller\'s log' : undefined });
+    await recordCheck({ started, scheduled, order, results, pauses: (pauses ?? []).filter((p) => p.workloadId === null), pausesError: pauses === null ? 'see the controller\'s log' : undefined });
     return results;
   }
 
@@ -1638,7 +1658,7 @@ export function createController({
 
   // router/check: written at the end of each check, the date of the last one the schedule started kept by the others. A summary that
   // cannot be written fails nothing: the check's work is done.
-  async function recordCheck({ started, scheduled, order, results, pausesError }) {
+  async function recordCheck({ started, scheduled, order, results, pauses, pausesError }) {
     if (!store.putCheck) return;
     try {
       const t = now();
@@ -1646,8 +1666,7 @@ export function createController({
       const known = new Map(results.filter((r) => ANY_STATE.includes(r.state)).map((r) => [r.workloadId, r.state]));
       const { byState } = await stateCounts(order, known);
       const { health } = await healthSummary({ t, byState, lastScheduledCheckAt, pausesError });
-      // Router-wide pauses are the manager's (G2 §5.6): none yet.
-      await store.putCheck({ checkedAt: started, durationMs: t - started, checkSchedule: CHECK_SCHEDULE, lastScheduledCheckAt, health, pauses: [], counts: byState });
+      await store.putCheck({ checkedAt: started, durationMs: t - started, checkSchedule: CHECK_SCHEDULE, lastScheduledCheckAt, health, pauses: pauses.map(shown), counts: byState });
     } catch (err) {
       log.warn('CheckNotRecorded', { error: err.message });
     }
@@ -1680,11 +1699,11 @@ export function createController({
         noWakeRules: { value: [], source: CLI },
         metrics: { value: null, source: CLI },
       },
-      pauses: [],
+      pauses: pauses.filter((p) => p.workloadId === null).map(shown),
       workloads: {
         total: configs.length,
         byState,
-        paused: configs.filter((cfg) => pauses.some((p) => p.workloadId === cfg.workloadId)).length,
+        paused: pauses.some((p) => p.workloadId === null) ? configs.length : configs.filter((cfg) => pauses.some((p) => p.workloadId === cfg.workloadId)).length,
         lastActivityAt: lastActivity ? iso(lastActivity) : null,
       },
       health: {

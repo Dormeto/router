@@ -504,6 +504,25 @@ test('pauses: two workloads paused, one expired; the store gives both, the expir
   assert.deepEqual(await store.listPauses(), []);
 });
 
+test('the router pause (router/pause): put, read with no workload, listed among the pauses, removed once; a newer one is kept', async () => {
+  const { store } = setup();
+  assert.equal(await store.getRouterPause(), null);
+  assert.deepEqual(await store.getPauses(null), []);
+  const pause = { by: 'ops', at: 1000, reason: 'maintenance', until: Date.parse('2026-03-11T00:00:00Z'), keepAsleep: true };
+  await store.putRouterPause(pause);
+  await store.addPause('a', { by: 'ops', at: 900, reason: 'x', keepAsleep: false });
+  assert.deepEqual(await store.getRouterPause(), pause);
+  assert.deepEqual(await store.getPauses(null), [{ workloadId: null, ...pause }]);
+  assert.deepEqual((await store.listPauses()).map((p) => p.workloadId), [null, 'a']);
+  assert.equal(await store.removePauses(null, { at: 999 }), false);
+  assert.equal(await store.removePauses(null, { at: 1000 }), true);
+  assert.equal(await store.deleteRouterPause(), false);
+  await store.putRouterPause(pause);
+  assert.equal(await store.removePauses(null), true);
+  assert.equal(await store.getRouterPause(), null);
+  assert.deepEqual((await store.listPauses()).map((p) => p.workloadId), ['a']);
+});
+
 test('transition: a state change sets stateAt to now, no state change leaves it; an explicit stateAt is kept', async () => {
   let t = Date.parse('2026-03-10T12:00:00Z');
   const { store } = setup({ now: () => t });

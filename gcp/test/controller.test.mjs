@@ -488,6 +488,31 @@ test('POST /v1/workloads/:id/resume: the Workload without its pause, with or wit
   }
 });
 
+test('POST /v1/pause and /v1/resume: the router\'s pause and its resume; a bad body: 400', async () => {
+  const { call, store, clock, w } = api();
+  await call('POST', '/v1/workloads', INPUT);
+  store.runs.get('demo').state = STATES.ASLEEP;
+  const until = new Date(clock.now() + 3_600_000).toISOString();
+  const res = await call('POST', '/v1/pause', { reason: 'maintenance', by: 'ops', until });
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body, { pause: { scope: 'router', by: 'ops', at: new Date(clock.now()).toISOString(), reason: 'maintenance', until, keepAsleep: false }, woken: ['demo'] });
+  assert.equal(store.runs.get('demo').state, STATES.WAKING);
+  assert.deepEqual(w.tasks.at(-1).body, { action: 'wake', workloadId: 'demo', wakeId: 'wake-1' });
+  assert.equal((await call('GET', '/v1/workloads/demo')).body.paused.scope, 'router');
+  for (const [body, words] of [[{}, /reason required/], [{ reason: 'r', until: 'soon' }, /until must be/], [{ reason: 'r', keepAsleep: 'yes' }, /keepAsleep must be/]]) {
+    const refused = await call('POST', '/v1/pause', body);
+    assert.equal(refused.status, 400, JSON.stringify(body));
+    assert.equal(refused.body.reason, 'bad-request');
+    assert.match(refused.body.error, words);
+  }
+  for (const body of [{ by: 'ops' }, undefined]) {
+    const resumed = await call('POST', '/v1/resume', body);
+    assert.equal(resumed.status, 200);
+    assert.deepEqual(resumed.body, { resumed: body !== undefined });
+  }
+  assert.equal(store.pauses.size, 0);
+});
+
 test('GET /v1/workloads and /:id show the pause, not an expired one', async () => {
   const { call, clock } = api();
   await call('POST', '/v1/workloads', INPUT);

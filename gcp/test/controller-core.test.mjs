@@ -96,6 +96,7 @@ function setup({
     store.state.check = fromFields(toFields(summary));
   };
   store.getManagerSettings = async () => structuredClone(store.state.managerSettings ?? null);
+  store.getRouterPause = async () => structuredClone(store.state.pauses.find((p) => p.workloadId === null) ?? null);
   store.addPause = (id, pause) => store.putPause(id, fromFields(toFields(pause)));
   store.removePauses = async (id, { at } = {}) => {
     const found = store.state.pauses.find((p) => p.workloadId === id && (at === undefined || p.at === at));
@@ -3608,6 +3609,83 @@ test('resume removes the pause, once; the wake it made stays', async () => {
   assert.deepEqual(t.logged('Resumed').map((l) => l.by), ['ops']);
   await t.controller.resume('demo', 'ops');
   assert.equal(t.logged('Resumed').length, 1);
+});
+
+// --- The router-wide pause (G2 §5.6) ---------------------------------------------------------------------------------
+
+const routerPauseFor = (t, pause = {}) => pauseFor(t, { workloadId: null, ...pause });
+
+test('a router pause keeps every workload from its idle nap and shows in its pauses', async () => {
+  const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
+  routerPauseFor(t);
+  assert.deepEqual(await check(t), { workloadId: 'demo', state: STATES.AWAKE, paused: true });
+  assert.deepEqual(t.world.tasks, []);
+  assert.deepEqual(t.world.metricReads, []);
+  assert.deepEqual(await t.controller.pausesFor('demo'), [
+    { scope: 'router', by: 'ops', at: new Date(START - 1000).toISOString(), reason: 'load test', until: null, keepAsleep: false },
+  ]);
+});
+
+test('a router pause past its until no longer holds, and the check deletes it', async () => {
+  const t = scheduled(scheduleOf(NAP));
+  routerPauseFor(t, { until: START });
+  assert.equal((await check(t)).schedule, 'nap');
+  assert.deepEqual(t.store.state.pauses, []);
+  assert.deepEqual(t.logged('PauseExpired').map((l) => [l.workloadId, l.by, l.reason]), [[null, 'ops', 'load test']]);
+});
+
+test('a router pause with keepAsleep holds the wakes of an asleep workload; a plain one holds the window\'s nap', async () => {
+  const kept = scheduled(scheduleOf(AWAKE_WINDOW), { run: { state: STATES.ASLEEP, stateAt: START - DAY }, vms: { 'vm-a': { status: 'TERMINATED' } }, map: asleepMap() });
+  routerPauseFor(kept, { keepAsleep: true });
+  assert.equal((await check(kept)).schedule, 'held by a keepAsleep pause');
+  assert.equal(kept.run().state, STATES.ASLEEP);
+  const plain = scheduled(scheduleOf(NAP));
+  routerPauseFor(plain);
+  assert.equal((await check(plain)).schedule, 'held by a pause');
+});
+
+test('pausing the router writes its pause without a workload and wakes a sleeper; keepAsleep leaves it asleep', async () => {
+  const t = setup({ run: { state: STATES.ASLEEP }, vms: { 'vm-a': { status: 'TERMINATED' } }, map: asleepMap() });
+  const done = await t.controller.pause(null, { reason: ' maintenance ', by: 'ops' });
+  assert.deepEqual(t.store.state.pauses, [{ workloadId: null, by: 'ops', at: START, reason: 'maintenance', keepAsleep: false }]);
+  assert.equal(t.run().state, STATES.WAKING);
+  assert.deepEqual(done, { pause: { scope: 'router', by: 'ops', at: new Date(START).toISOString(), reason: 'maintenance', until: null, keepAsleep: false }, woken: ['demo'] });
+  assert.equal(t.store.state.stats['wake:pause'], 1);
+
+  const asleep = setup({ run: { state: STATES.ASLEEP }, vms: { 'vm-a': { status: 'TERMINATED' } }, map: asleepMap() });
+  const kept = await asleep.controller.pause(null, { reason: 'freeze', keepAsleep: true });
+  assert.equal(asleep.run().state, STATES.ASLEEP);
+  assert.deepEqual(kept.woken, []);
+  assert.deepEqual(asleep.world.tasks, []);
+  await assert.rejects(() => asleep.controller.pause(null, {}), /reason required/);
+});
+
+test('a router pause is refused as a workload\'s is: no reason, an until in the past', async () => {
+  const t = setup();
+  await assert.rejects(() => t.controller.pause(null, { reason: 'r', until: START }), /until must be/);
+  assert.deepEqual(t.store.state.pauses, []);
+});
+
+test('resuming the router removes its pause only, once; the workload\'s own stays', async () => {
+  const t = setup();
+  await t.controller.pause('demo', { reason: 'mine', by: 'ops' });
+  await t.controller.pause(null, { reason: 'all', by: 'ops' });
+  assert.deepEqual(await t.controller.resume(null, 'ops'), { resumed: true });
+  assert.deepEqual(t.store.state.pauses.map((p) => p.workloadId), ['demo']);
+  assert.deepEqual(t.logged('Resumed').map((l) => [l.workloadId ?? null, l.by]), [[null, 'ops']]);
+  assert.deepEqual(await t.controller.resume(null, 'ops'), { resumed: false });
+  assert.equal(t.logged('Resumed').length, 1);
+});
+
+test('routerInfo and the check\'s summary show the router pause as AWS\'s answer does, and count every workload as paused', async () => {
+  const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
+  routerPauseFor(t, { until: START + MINUTE, keepAsleep: true });
+  const shown = { scope: 'router', by: 'ops', at: new Date(START - 1000).toISOString(), reason: 'load test', until: new Date(START + MINUTE).toISOString(), keepAsleep: true };
+  const info = await t.controller.routerInfo();
+  assert.deepEqual(info.pauses, [shown]);
+  assert.equal(info.workloads.paused, 1);
+  await t.controller.check();
+  assert.deepEqual(t.store.state.check.pauses, [shown]);
 });
 
 // --- IP lists --------------------------------------------------------------------------------------------------------

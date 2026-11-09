@@ -1,6 +1,6 @@
 // The router's state on Google Cloud: the DynamoDB store's methods over Firestore's REST API (Native mode, one database
 // per router). One document per workload and kind: `workloads/<id>` (the configuration), `runs/<id>` (the state
-// machine), `schedules/<id>`, `pauses/<id>` (a workload's pause), `stats/<id>-<day>` (the day's counters, committed in
+// machine), `schedules/<id>`, `pauses/<id>` (a workload's pause), `router/pause` (the router's), `stats/<id>-<day>` (the day's counters, committed in
 // batches, kept 35 days), `router/sweep` (the day of the last sweep of the old counters), `router/settings` (the router level of the settings:
 // hibernate, joinMinutes, defaults, by, at), `router/check` (the last check's summary), `router/manager` (the organization's settings,
 // pushed by the manager), `router/page` (the router's waiting page) and, per workload, `pages/<id>` (its
@@ -133,6 +133,21 @@ export function createFirestoreStore({ google, project, database, region = datab
   }
 
   const pauseOf = (workloadId, doc) => ({ workloadId, ...doc.value.pause });
+  const ROUTER_PAUSE = 'router/pause';
+
+  // Deletes a pause's document, with its time as precondition; false when `at` is given and differs, or when there is none.
+  async function removeDoc(path, at) {
+    for (let attempt = 1; ; attempt += 1) {
+      const doc = await read(path);
+      if (!doc || (at !== undefined && doc.value.at !== at)) return false;
+      try {
+        await commit([{ delete: named(path), currentDocument: { updateTime: doc.updateTime } }]);
+        return true;
+      } catch (err) {
+        if (!lostPrecondition(err) || attempt >= ATTEMPTS) throw err;
+      }
+    }
+  }
 
   // The document, or null: { fields (as objects), updateTime }.
   async function read(path) {
@@ -204,35 +219,43 @@ export function createFirestoreStore({ google, project, database, region = datab
       return true;
     },
 
-    // A workload's pause (one per workload): [{ workloadId, by, at, reason, until?, keepAsleep }], expired ones included
-    // (the controller filters them). A router-wide pause waits for the manager: none here.
+    // A workload's pause (one per workload) and the router's (`router/pause`, workloadId null): [{ workloadId, by, at, reason, until?,
+    // keepAsleep }], expired ones included (the controller filters them).
     async getPauses(workloadId) {
-      if (!workloadId) return [];
-      const doc = await read(`pauses/${workloadId}`);
-      return doc ? [pauseOf(workloadId, doc)] : [];
+      const doc = workloadId ? await read(`pauses/${workloadId}`) : await read(ROUTER_PAUSE);
+      return doc ? [pauseOf(workloadId || null, doc)] : [];
     },
 
+    // Every pause, the router's first when there is one.
     async listPauses() {
-      return (await listAll('pauses')).map((doc) => ({ workloadId: doc.name.slice('pauses/'.length), ...doc.fields.pause }));
+      const router = await read(ROUTER_PAUSE);
+      return [
+        ...(router ? [pauseOf(null, router)] : []),
+        ...(await listAll('pauses')).map((doc) => ({ workloadId: doc.name.slice('pauses/'.length), ...doc.fields.pause })),
+      ];
     },
 
+    // The router-wide pause, as stored: { by, at, reason, until?, keepAsleep }, or null.
+    async getRouterPause() {
+      return (await read(ROUTER_PAUSE))?.value.pause ?? null;
+    },
+    async putRouterPause(pause) {
+      await commit([{ update: { name: named(ROUTER_PAUSE), fields: toFields({ pause, at: pause.at }) } }]);
+    },
+    // false when `at` is given and the pause changed meanwhile (a newer pause is kept), or when there was none.
+    async deleteRouterPause({ at } = {}) {
+      return removeDoc(ROUTER_PAUSE, at);
+    },
+
+    // A workload's pause is written by its id; null is the router's.
     async addPause(workloadId, pause) {
-      if (!workloadId) throw new Error('a pause is a workload\'s');
+      if (!workloadId) return this.putRouterPause(pause);
       await commit([{ update: { name: named(`pauses/${workloadId}`), fields: toFields({ pause, at: pause.at }) } }]);
     },
 
     // false when `at` is given and the pause changed meanwhile (a newer pause is kept), or when there was none.
     async removePauses(workloadId, { at } = {}) {
-      for (let attempt = 1; ; attempt += 1) {
-        const doc = await read(`pauses/${workloadId}`);
-        if (!doc || (at !== undefined && doc.value.at !== at)) return false;
-        try {
-          await commit([{ delete: named(`pauses/${workloadId}`), currentDocument: { updateTime: doc.updateTime } }]);
-          return true;
-        } catch (err) {
-          if (!lostPrecondition(err) || attempt >= ATTEMPTS) throw err;
-        }
-      }
+      return removeDoc(workloadId ? `pauses/${workloadId}` : ROUTER_PAUSE, at);
     },
 
     async getRun(workloadId) {

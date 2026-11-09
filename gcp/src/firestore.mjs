@@ -2,7 +2,8 @@
 // per router). One document per workload and kind: `workloads/<id>` (the configuration), `runs/<id>` (the state
 // machine), `schedules/<id>`, `pauses/<id>` (a workload's pause), `stats/<id>-<day>` (the day's counters, committed in
 // batches, kept 35 days), `router/sweep` (the day of the last sweep of the old counters), `router/settings` (the router level of the settings:
-// hibernate, joinMinutes, defaults, by, at), `router/page` (the router's waiting page) and, per workload, `pages/<id>` (its
+// hibernate, joinMinutes, defaults, by, at), `router/check` (the last check's summary), `router/manager` (the organization's settings,
+// pushed by the manager), `router/page` (the router's waiting page) and, per workload, `pages/<id>` (its
 // waiting page) and `favicons/<id>` (the favicon read while it was awake); `events/<stateAt, 13 digits>-<id>-<to>` (the journal: a
 // state change, committed with the run's, kept 7 days); and the IP lists:
 // `lists/<name>` (the meta) and `listParts/<name>-<version>-<index>` (the packed parts, 350 kB at most). A transition reads the run, checks its condition, and commits
@@ -454,6 +455,24 @@ export function createFirestoreStore({ google, project, database, region = datab
         return;
       }
       await commit([{ update: { name, fields: toFields({ ...record, by: String(by ?? ''), at }) } }]);
+    },
+
+    // The last check's summary (router/check), replaced whole at each check: the health the manager reads, the counts by state, and the
+    // last check the schedule started. None before the first.
+    async getCheck() {
+      return (await read('router/check'))?.value ?? null;
+    },
+    async putCheck(summary) {
+      await commit([{ update: { name: named('router/check'), fields: toFields(summary) } }]);
+    },
+
+    // The organization's settings as the manager pushed them (router/manager {settings, etag, at}), as stored: the reader judges whether
+    // `settings` is an object. None before the manager pushed any.
+    async getManagerSettings() {
+      const doc = await read('router/manager');
+      if (!doc) return null;
+      const { settings, etag, at } = doc.value;
+      return { settings, etag: etag ?? null, at: at ?? 0 };
     },
 
     // The kinds of a workload's backends, written apart from the transitions (no version change).

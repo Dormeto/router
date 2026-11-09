@@ -615,6 +615,11 @@ export function setup(change = () => {}, { clock = fakeClock() } = {}) {
       return true;
     },
     getRouterSettings: async () => structuredClone(router.settings),
+    // router/check, as Firestore's.
+    getCheck: async () => structuredClone(router.check ?? null),
+    putCheck: async (summary) => {
+      router.check = structuredClone(summary);
+    },
     // As Firestore's: the whole record at each write, none of the three set: no record.
     putRouterSettings: async ({ hibernate, joinMinutes, defaults, by, at }) => {
       const record = {

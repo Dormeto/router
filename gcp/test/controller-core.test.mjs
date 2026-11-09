@@ -91,6 +91,11 @@ function setup({
   const { every, timers } = clockTimers(clock);
   Object.assign(store, heartbeatStore(() => store.state.run, clock.now), sweepStore(clock.now), idleReadsStore(() => store.state.run));
   // The Firestore store's names, and what its fields do to a value: an `undefined` comes back null.
+  // The Firestore store's router documents: router/check and router/manager (state.managerSettings, as the store reads it).
+  store.putCheck = async (summary) => {
+    store.state.check = fromFields(toFields(summary));
+  };
+  store.getManagerSettings = async () => structuredClone(store.state.managerSettings ?? null);
   store.addPause = (id, pause) => store.putPause(id, fromFields(toFields(pause)));
   store.removePauses = async (id, { at } = {}) => {
     const found = store.state.pauses.find((p) => p.workloadId === id && (at === undefined || p.at === at));
@@ -212,7 +217,7 @@ function setup({
         world.onTask?.(task);
       },
     },
-    config: { project: 'p', region: 'europe-west1', controllerUrl: CONTROLLER },
+    config: { project: 'p', region: 'europe-west1', controllerUrl: CONTROLLER, version: '0.40.0', build: 'abc123' },
     lists,
     download,
     now: clock.now,
@@ -5671,4 +5676,130 @@ test('a state change reads no configuration of its own: its event carries the ta
   await t.controller.wake('demo', 'w1');
   assert.equal(reads, 1);
   assert.deepEqual(asked.find((c) => c.to === STATES.AWAKE).event.tags, { team: 'a' });
+});
+
+// --- The check's summary and the router's health (G2 plan 1, R3; design §5.4) -------------------------------------------------
+
+const SCHEDULE = '*/5 * * * *';
+const AWS_ROUTER_KEYS = {
+  router: ['name', 'version', 'build'],
+  settings: ['hibernate', 'joinMinutes', 'by', 'at'],
+  managerSettings: ['url', 'hibernate', 'joinMinutes', 'readAt', 'error'],
+  configuration: ['checkSchedule', 'ipLists', 'noWakeRules', 'metrics'],
+  pauses: [],
+  workloads: ['total', 'byState', 'paused', 'lastActivityAt'],
+  health: ['status', 'problems', 'checkSchedule', 'lastScheduledCheckAt', 'lambda', 'queues', 'ipLists', 'concurrency', 'drift24h'],
+};
+
+test('a check writes router/check: when, how long, the schedule, the counts by state, and the health', async () => {
+  const t = setup({ run: AWAKE_LONG, vms: RUNNING_VM });
+  await t.controller.check({ scheduled: true });
+  assert.deepEqual(t.store.state.check, {
+    checkedAt: START, durationMs: 0, checkSchedule: SCHEDULE, lastScheduledCheckAt: START,
+    health: { status: 'ok', problems: [] }, pauses: [], counts: { AWAKE: 1 },
+  });
+});
+
+test('a check an operator asked keeps the last scheduled check\'s date; none ever ran: check-late is in its health', async () => {
+  const t = setup({ run: AWAKE_LONG, vms: RUNNING_VM });
+  await t.controller.check();
+  assert.equal(t.store.state.check.lastScheduledCheckAt, null);
+  assert.deepEqual(t.store.state.check.health.problems.map((p) => p.code), ['check-late']);
+  await t.controller.check({ scheduled: true });
+  t.clock.advance(MINUTE);
+  await t.controller.check();
+  assert.equal(t.store.state.check.lastScheduledCheckAt, START);
+  assert.equal(t.store.state.check.checkedAt, START + MINUTE);
+  assert.equal(t.store.state.check.health.status, 'ok');
+});
+
+test('a check whose summary cannot be written is not failed: it says so', async () => {
+  const t = setup({ run: AWAKE_LONG, vms: RUNNING_VM });
+  t.store.putCheck = async () => { throw unreadable(); };
+  assert.deepEqual(await t.controller.check({ scheduled: true }), [{ workloadId: 'demo', state: STATES.AWAKE, nap: 'requested' }]);
+  assert.equal(t.logged('CheckNotRecorded').length, 1);
+});
+
+test('the counts of router/check are the workloads\' states, a workload with no run counting UNKNOWN', async () => {
+  const t = setup({ run: FAILED_RUN(START - MINUTE), vms: RUNNING_VM, map: asleepMap(), unhealthyPolls: Infinity });
+  await t.controller.check({ scheduled: true });
+  assert.deepEqual(t.store.state.check.counts, { FAILED: 1 });
+  assert.equal(t.store.state.check.health.problems.find((p) => p.code === 'failed-workloads').level, 'warning');
+});
+
+test('routerInfo answers the AWS router action\'s keys, with the Google Cloud router\'s values', async () => {
+  const t = setup({ run: AWAKE_LONG, vms: RUNNING_VM });
+  await t.controller.check({ scheduled: true });
+  const info = await t.controller.routerInfo();
+  assert.deepEqual(Object.keys(info), Object.keys(AWS_ROUTER_KEYS));
+  for (const [key, names] of Object.entries(AWS_ROUTER_KEYS)) for (const name of names) assert.ok(name in info[key], `${key}.${name}`);
+  assert.deepEqual(info.router, { name: 'dmtr-europe-west1', version: '0.40.0', build: 'abc123' });
+  assert.equal(info.configuration.checkSchedule.value, SCHEDULE);
+  assert.deepEqual(info.pauses, []);
+  assert.deepEqual(info.workloads, { total: 1, byState: { AWAKE: 1 }, paused: 0, lastActivityAt: null });
+  assert.deepEqual(info.health, {
+    status: 'ok', problems: [], checkSchedule: SCHEDULE, lastScheduledCheckAt: new Date(START).toISOString(),
+    lambda: {}, queues: {}, ipLists: [], concurrency: null, drift24h: 0,
+  });
+  assert.deepEqual(info.managerSettings, { url: null, hibernate: null, joinMinutes: null, readAt: null, error: null });
+});
+
+test('routerInfo: a router whose last scheduled check is 16 minutes old is check-late, an error; 14 minutes is fine', async () => {
+  const late = setup({ run: AWAKE_LONG, vms: RUNNING_VM });
+  late.store.state.check = { lastScheduledCheckAt: START - 16 * MINUTE };
+  const health = (await late.controller.routerInfo()).health;
+  assert.equal(health.status, 'error');
+  assert.deepEqual(health.problems.map((p) => [p.level, p.code]), [['error', 'check-late']]);
+  const fine = setup({ run: AWAKE_LONG, vms: RUNNING_VM });
+  fine.store.state.check = { lastScheduledCheckAt: START - 14 * MINUTE };
+  assert.equal((await fine.controller.routerInfo()).health.status, 'ok');
+  assert.equal((await setup().controller.routerInfo()).health.problems[0].code, 'check-late', 'none ever recorded');
+});
+
+test('routerInfo: a failed workload is the warning failed-workloads', async () => {
+  const t = setup({ run: FAILED_RUN(START - MINUTE) });
+  t.store.state.check = { lastScheduledCheckAt: START };
+  const info = await t.controller.routerInfo();
+  assert.deepEqual(info.health.problems.map((p) => [p.level, p.code]), [['warning', 'failed-workloads']]);
+  assert.deepEqual(info.workloads.byState, { FAILED: 1 });
+});
+
+test('routerInfo: the organization\'s settings that are not a JSON object are manager-settings-unreadable; absent, no problem', async () => {
+  for (const settings of ['oops', null, ['a'], 3]) {
+    const t = setup();
+    t.store.state.check = { lastScheduledCheckAt: START };
+    t.store.state.managerSettings = { settings, etag: 'e', at: START - MINUTE };
+    const info = await t.controller.routerInfo();
+    assert.deepEqual(info.health.problems.map((p) => p.code), ['manager-settings-unreadable'], JSON.stringify(settings));
+    assert.equal(info.managerSettings.error, 'settings.json is invalid: settings.json must be an object');
+  }
+  const absent = setup();
+  absent.store.state.check = { lastScheduledCheckAt: START };
+  assert.deepEqual((await absent.controller.routerInfo()).health.problems, []);
+  const unread = setup();
+  unread.store.state.check = { lastScheduledCheckAt: START };
+  unread.store.getManagerSettings = async () => { throw unreadable(); };
+  assert.deepEqual((await unread.controller.routerInfo()).health.problems.map((p) => p.code), ['manager-settings-unreadable']);
+});
+
+test('routerInfo: the organization\'s settings are shown as the router holds them', async () => {
+  const t = setup();
+  t.store.state.check = { lastScheduledCheckAt: START };
+  t.store.state.managerSettings = { settings: { workloads: { hibernate: false, joinMinutes: 10, defaults: { idleMinutes: 30 } } }, etag: 'e', at: START - MINUTE };
+  const shown = (await t.controller.routerInfo()).managerSettings;
+  assert.equal(shown.hibernate, false);
+  assert.equal(shown.joinMinutes, 10);
+  assert.deepEqual(shown.defaults, { idleMinutes: 30 });
+  assert.equal('types' in shown, false);
+  assert.equal(shown.error, null);
+  assert.equal(shown.readAt, new Date(START - MINUTE).toISOString());
+});
+
+test('routerInfo: the router level\'s record and the active router pauses are shown; a router whose pauses cannot be read says so', async () => {
+  const t = leveled({ hibernate: true, joinMinutes: 3, by: 'ops', at: START - MINUTE }, {});
+  t.store.state.check = { lastScheduledCheckAt: START };
+  const info = await t.controller.routerInfo();
+  assert.deepEqual(info.settings, { hibernate: true, joinMinutes: 3, by: 'ops', at: new Date(START - MINUTE).toISOString() });
+  t.store.listPauses = async () => { throw unreadable(); };
+  assert.deepEqual((await t.controller.routerInfo()).health.problems.map((p) => p.code), ['pauses-unreadable']);
 });

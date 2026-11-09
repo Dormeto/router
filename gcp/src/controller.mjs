@@ -30,6 +30,8 @@ const PAGE_VERB = 'waiting-page';
 const PAGE_OPS = { GET: 'get', PUT: 'put', DELETE: 'delete' };
 const WORKLOAD = /^\/v1\/workloads\/([^/]+)(?:\/([^/]+))?$/;
 const MAX_BODY_BYTES = 1024 * 1024;
+// The User-Agent Cloud Scheduler sends to an HTTP target.
+const SCHEDULER = /^Google-Cloud-Scheduler/;
 
 const bad = (message) => new Refusal(400, 'bad-request', message);
 const json = (statusCode, body) => response(statusCode, { 'cache-control': 'no-store', 'content-type': 'application/json' }, JSON.stringify(body));
@@ -103,7 +105,8 @@ export function createControllerApi({ core, onboarding, config }) {
   async function route(request, path, query) {
     const { method } = request;
     if (path === '/v1/health' && method === 'GET') return { version: PACKAGE.version, project: config.project, region: config.region };
-    if (path === '/v1/check' && method === 'POST') return { results: await core.check() };
+    // Cloud Scheduler's call (its job, the CLI's install) is the scheduled check, whose date the health reads; an operator's is not.
+    if (path === '/v1/check' && method === 'POST') return { results: await core.check({ scheduled: SCHEDULER.test(request.headers?.['user-agent'] ?? '') }) };
     if (path === '/v1/tasks' && method === 'POST') return task(await bodyOf(request));
     if (path === SETTINGS && method === 'GET') return onboarding.routerSettings();
     if (path === SETTINGS && method === 'PUT') return onboarding.setRouterSettings(await bodyOf(request));
@@ -149,7 +152,9 @@ export function fromEnvironment(env = process.env, { fetch, log = logger } = {})
   const google = createGoogle({ fetch });
   const project = env.DMT_PROJECT;
   const customPages = customPagesOf(env);
-  const config = { project, region: env.DMT_REGION, wakerNeg: env.DMT_WAKER_NEG, controllerUrl: env.DMT_CONTROLLER_URL };
+  const config = {
+    project, region: env.DMT_REGION, wakerNeg: env.DMT_WAKER_NEG, controllerUrl: env.DMT_CONTROLLER_URL, version: PACKAGE.version, build: env.DMT_BUILD ?? null,
+  };
   const store = createFirestoreStore({ google, project, database: env.DMT_DATABASE, region: env.DMT_REGION, log });
   const compute = createCompute({ google, project });
   const cloudsql = createCloudSql({ google, project });

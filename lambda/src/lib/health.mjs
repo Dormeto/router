@@ -46,7 +46,9 @@ export function checkLate(schedule, lastScheduledCheckAt, now) {
   if (!lastScheduledCheckAt) return true;
   const rate = /rate\((\d+) (minute|minutes|hour|hours)\)/.exec(schedule ?? '');
   const cron = /^cron\(0\/(\d+) \* \* \* \? \*\)$/.exec(schedule ?? '');
-  const periodMs = rate ? Number(rate[1]) * (rate[2].startsWith('hour') ? HOUR_MS : 60_000) : cron ? Number(cron[1]) * 60_000 : 5 * 60_000;
+  // Cloud Scheduler's five fields (the Google Cloud router): every N minutes.
+  const fiveField = /^\*\/(\d+) \* \* \* \*$/.exec(schedule ?? '');
+  const periodMs = rate ? Number(rate[1]) * (rate[2].startsWith('hour') ? HOUR_MS : 60_000) : cron ? Number(cron[1]) * 60_000 : fiveField ? Number(fiveField[1]) * 60_000 : 5 * 60_000;
   return now - lastScheduledCheckAt > 3 * periodMs;
 }
 

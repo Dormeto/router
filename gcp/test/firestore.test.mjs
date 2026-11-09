@@ -861,3 +861,26 @@ test('an event takes the tags the caller gives with no read of the configuration
   assert.deepEqual(eventOfDoc(docs, `events/${T0 + 1}-app-ASLEEP`).tags, {});
   assert.deepEqual(warned.map((w) => [w.event, w.workloadId]), [['EventTagsUnreadable', 'app']]);
 });
+
+test('router/check: the check\'s summary round trips whole, replaced at each check; none before the first', async () => {
+  const { store, docs } = setup();
+  assert.equal(await store.getCheck(), null);
+  const summary = {
+    checkedAt: 5, durationMs: 120, checkSchedule: '*/5 * * * *', lastScheduledCheckAt: 5,
+    health: { status: 'warning', problems: [{ level: 'warning', code: 'failed-workloads', text: '1 failed workload' }] }, pauses: [], counts: { AWAKE: 2, FAILED: 1 },
+  };
+  await store.putCheck(summary);
+  assert.deepEqual(await store.getCheck(), summary);
+  await store.putCheck({ ...summary, checkedAt: 6, counts: { AWAKE: 3 } });
+  assert.deepEqual((await store.getCheck()).counts, { AWAKE: 3 });
+  assert.deepEqual([...docs.keys()], ['router/check']);
+});
+
+test('router/manager: the organization\'s settings as the manager pushed them; none before; what is stored is returned as it is', async () => {
+  const { store, docs } = setup();
+  assert.equal(await store.getManagerSettings(), null);
+  docs.set('router/manager', { fields: toFields({ settings: { hibernate: false }, etag: 'e1', at: 7 }), updateTime: 't' });
+  assert.deepEqual(await store.getManagerSettings(), { settings: { hibernate: false }, etag: 'e1', at: 7 });
+  docs.set('router/manager', { fields: toFields({ settings: 'oops', etag: 'e2', at: 8 }), updateTime: 't' });
+  assert.deepEqual(await store.getManagerSettings(), { settings: 'oops', etag: 'e2', at: 8 });
+});

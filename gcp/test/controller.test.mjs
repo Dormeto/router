@@ -16,9 +16,9 @@ const PACKAGE = JSON.parse(await readFile(new URL('../../package.json', import.m
 const PATTERN = '^[a-z]([a-z0-9-]{0,38}[a-z0-9])?$';
 
 // A `node:http` request as `serve` hands it to the role.
-const request = (method, url, body = '') => {
+const request = (method, url, body = '', headers = {}) => {
   const stream = (async function* chunks() { if (body) yield Buffer.from(body); }());
-  return Object.assign(stream, { method, url, headers: {} });
+  return Object.assign(stream, { method, url, headers });
 };
 
 // The API over the world, as the CLI and Cloud Tasks call it.
@@ -266,6 +266,18 @@ test('POST /v1/check: what the check found, workload by workload', async () => {
   const res = await call('POST', '/v1/check');
   assert.equal(res.status, 200);
   assert.deepEqual(res.body, { results: [{ workloadId: 'demo', state: STATES.AWAKE }] });
+});
+
+test('POST /v1/check: Cloud Scheduler\'s call (its user agent) is the scheduled check; an operator\'s is not', async () => {
+  const { handler, clock, store } = api();
+  const post = (headers) => handler(request('POST', '/v1/check', '', headers));
+  await post({ 'user-agent': 'curl/8.7.1' });
+  assert.equal((await store.getCheck()).lastScheduledCheckAt, null);
+  await post({ 'user-agent': 'Google-Cloud-Scheduler' });
+  assert.equal((await store.getCheck()).lastScheduledCheckAt, clock.now());
+  clock.advance(60_000);
+  await post({});
+  assert.equal((await store.getCheck()).lastScheduledCheckAt, clock.now() - 60_000);
 });
 
 test('POST /v1/tasks: a nap task passes on what the check asked it with', async () => {

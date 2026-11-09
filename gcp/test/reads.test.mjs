@@ -153,8 +153,9 @@ test('a nap window: the probe reads it once, and says it', async () => {
 });
 
 // The controller's Cloud Scheduler call: the pauses, the configurations and the schedules listed, the router level (router/settings),
-// once for every workload, then the workload's run.
-test('Firestore reads: a check, one AWAKE workload, 5; the first of the day 3 more, the router\'s sweep claimed, the counters and the events listed', async () => {
+// once for every workload, then the workload's run; then the summary's: the organization's settings (router/manager), and, for a check
+// the schedule did not start, the last scheduled check's date (router/check). The runs it counts are those the check read.
+test('Firestore reads: a check, one AWAKE workload, 7; the first of the day 3 more, the router\'s sweep claimed, the counters and the events listed', async () => {
   const clock = fakeClock();
   const { reads, store } = firestoreWith({ state: STATES.AWAKE, version: 0, awakeSince: clock.now(), holders: 0, wakeCount: 0 });
   await store.putConfig('demo', {
@@ -166,13 +167,13 @@ test('Firestore reads: a check, one AWAKE workload, 5; the first of the day 3 mo
   });
   const out = await core.check();
   assert.deepEqual(out.map((r) => [r.workloadId, r.state]), [['demo', STATES.AWAKE]]);
-  assert.equal(reads(), 8);
+  assert.equal(reads(), 10);
   await core.check();
-  assert.equal(reads(), 13);
+  assert.equal(reads(), 17);
 });
 
 // Past 20 workloads, the naps in flight can pass their cap (F8): each run is read once more as the check starts, for the NAPPING ones.
-test('Firestore reads: a check of 21 AWAKE workloads reads each run twice, the lists and the router level once, 46; of 20, each run once, 24', async () => {
+test('Firestore reads: a check of 21 AWAKE workloads reads each run twice, the lists and the router level once, 48; of 20, each run once, 26', async () => {
   const clock = fakeClock();
   const awake = { state: STATES.AWAKE, version: 0, awakeSince: clock.now(), holders: 0, wakeCount: 0 };
   const { firestore, reads, store } = firestoreWith(awake);
@@ -191,9 +192,9 @@ test('Firestore reads: a check of 21 AWAKE workloads reads each run twice, the l
   await core.check();
   let before = reads();
   await core.check();
-  assert.equal(reads() - before, 4 + 2 * 21);
+  assert.equal(reads() - before, 6 + 2 * 21);
   firestore.docs.delete('workloads/w20');
   before = reads();
   await core.check();
-  assert.equal(reads() - before, 4 + 20);
+  assert.equal(reads() - before, 6 + 20);
 });

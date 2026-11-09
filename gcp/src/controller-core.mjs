@@ -56,11 +56,13 @@ import { randomUUID } from 'node:crypto';
 import { retryCapacity } from '../../lambda/src/lib/capacity.mjs';
 import { classify, failedSpec, failureError } from '../../lambda/src/lib/failures.mjs';
 import { cacheFavicon, FAVICON_BUDGET_MS, hostOfRules } from '../../lambda/src/lib/favicon.mjs';
-import { resolveHibernation } from '../../lambda/src/lib/hibernation.mjs';
-import { createListCache } from '../../lambda/src/lib/list-cache.mjs';
+import { healthOf } from '../../lambda/src/lib/health.mjs';
+import { parseManagerSettings, resolveHibernation } from '../../lambda/src/lib/hibernation.mjs';
+import { createListCache, describeStoredLists } from '../../lambda/src/lib/list-cache.mjs';
 import { awakeStartWithin, CLOSE_START_MS, maintenanceDue, occurrenceAt, resolveJoin } from '../../lambda/src/lib/schedule.mjs';
 import { DAY_MS, STATES, utcDay } from '../../lambda/src/lib/state.mjs';
 import { createListRefresher } from '../../lambda/src/lib/list-refresh.mjs';
+import { routerSettingsView } from '../../lambda/src/lib/settings-writes.mjs';
 import { withWake } from '../../lambda/src/lib/page-settings.mjs';
 import { createWakeWatch } from '../../lambda/src/lib/wake-watch.mjs';
 import { activityOf, createNoWakeRules } from './activity.mjs';
@@ -117,6 +119,10 @@ const NAPPING_STUCK_MS = 35 * 60_000;
 const NAPPING_SWAP_STUCK_MS = 22 * 60_000;
 const CHECK_BUDGET_MS = 240_000;
 const CHECK_CONCURRENCY = 8;
+// The Cloud Scheduler job's schedule (the CLI's install); the check late after three of its periods.
+const CHECK_SCHEDULE = '*/5 * * * *';
+// Where a configuration value comes from, as AWS's `terraform`: the CLI's install.
+const CLI = 'cli';
 const SUSPEND_MAX_MEMORY_MB = 208 * 1024;
 // A nap holds a request of the controller for minutes: a nap window on many workloads is spread over the checks.
 const SCHEDULED_NAPS_MAX = 10;
@@ -1528,8 +1534,9 @@ export function createController({
   // first, whatever the budget. Pauses that cannot be read hold every nap and scheduled wake of this check; the reconcile
   // still runs. At most NAPS_MAX naps in flight: the idle naps past it are said once (`NapDeferred`, with their count), and asked
   // at a later check. Wakes are never held back.
-  async function check() {
-    const deadline = now() + CHECK_BUDGET_MS;
+  async function check({ scheduled = false } = {}) {
+    const started = now();
+    const deadline = started + CHECK_BUDGET_MS;
     const pauses = await activePauses();
     const paused = (workloadId) => pauses === null || pauses.some((p) => p.workloadId === workloadId);
     const keptAsleep = (workloadId) => pauses === null || pauses.some((p) => p.keepAsleep && p.workloadId === workloadId);
@@ -1569,7 +1576,128 @@ export function createController({
     const reached = new Set(results.map((r) => r.workloadId));
     for (const workloadId of applied.keys()) if (!reached.has(workloadId)) results.push({ workloadId, ...passed(workloadId) });
     await sweepStats();
+    await recordCheck({ started, scheduled, order, results, pausesError: pauses === null ? 'see the controller\'s log' : undefined });
     return results;
+  }
+
+  // --- The check's summary and the router's health (design §5.4) -------------------------------------------------------------
+
+  // The states of the workloads' runs, counted (a run that cannot be read or is missing: UNKNOWN), 8 reads at a time, with the date of
+  // the newest run update. `known`: the states the check just saw (the run it read), which are not read again.
+  async function stateCounts(configs, known = new Map()) {
+    const byState = {};
+    let lastActivity = 0;
+    let next = 0;
+    await Promise.all(Array.from({ length: Math.min(CHECK_CONCURRENCY, configs.length) }, async () => {
+      while (next < configs.length) {
+        const { workloadId } = configs[next++];
+        const run = known.has(workloadId) ? { state: known.get(workloadId) } : await store.getRun(workloadId).catch(() => null);
+        byState[run?.state ?? 'UNKNOWN'] = (byState[run?.state ?? 'UNKNOWN'] ?? 0) + 1;
+        lastActivity = Math.max(lastActivity, run?.updatedAt ?? 0);
+      }
+    }));
+    return { byState: Object.fromEntries(Object.entries(byState).sort(([a], [b]) => a.localeCompare(b))), lastActivity };
+  }
+
+  // The organization's level as the router holds it (router/manager, pushed by the manager): what AWS's manager settings answer. None
+  // pushed: unset, no problem. Not a JSON object (or invalid): the error the health warns of; the manager gives it its meaning (G2 §5.5).
+  async function managerLevel() {
+    let stored;
+    try {
+      stored = await store.getManagerSettings?.();
+    } catch (err) {
+      return { hibernate: null, readAt: null, error: err.message };
+    }
+    if (!stored) return { hibernate: null, readAt: null, error: null };
+    const readAt = stored.at ? stored.at : null;
+    try {
+      const { problems, defaults = {}, types = [], ...values } = parseManagerSettings(JSON.stringify(stored.settings));
+      return {
+        ...values, ...(Object.keys(defaults).length ? { defaults } : {}), ...(types.length ? { types } : {}), readAt,
+        error: problems ? `settings.json: ${problems[0]}` : null,
+      };
+    } catch (err) {
+      return { hibernate: null, readAt, error: `settings.json is invalid: ${err.message}` };
+    }
+  }
+
+  // The router's health through the shared healthOf: the check late, the failed workloads, the manager's settings, the IP lists. No
+  // Lambda, queue or concurrency figure (AWS's), and no Cloud Run request error (the router holds no role to read them).
+  async function healthSummary({ t, byState, lastScheduledCheckAt, pausesError }) {
+    const ipLists = lists.length ? await describeStoredLists(store, lists) : [];
+    const manager = await managerLevel();
+    const health = healthOf({
+      checkSchedule: CHECK_SCHEDULE, lastScheduledCheckAt, now: t, failed: byState[STATES.FAILED] ?? 0, ipLists, managerSettingsError: manager.error,
+    });
+    if (pausesError) {
+      health.problems.push({ level: 'warning', code: 'pauses-unreadable', text: `pauses unreadable: ${pausesError}` });
+      if (health.status === 'ok') health.status = 'warning';
+    }
+    return { health, ipLists, manager };
+  }
+
+  // router/check: written at the end of each check, the date of the last one the schedule started kept by the others. A summary that
+  // cannot be written fails nothing: the check's work is done.
+  async function recordCheck({ started, scheduled, order, results, pausesError }) {
+    if (!store.putCheck) return;
+    try {
+      const t = now();
+      const lastScheduledCheckAt = scheduled ? started : (await store.getCheck?.().catch(() => null))?.lastScheduledCheckAt ?? null;
+      const known = new Map(results.filter((r) => ANY_STATE.includes(r.state)).map((r) => [r.workloadId, r.state]));
+      const { byState } = await stateCounts(order, known);
+      const { health } = await healthSummary({ t, byState, lastScheduledCheckAt, pausesError });
+      // Router-wide pauses are the manager's (G2 §5.6): none yet.
+      await store.putCheck({ checkedAt: started, durationMs: t - started, checkSchedule: CHECK_SCHEDULE, lastScheduledCheckAt, health, pauses: [], counts: byState });
+    } catch (err) {
+      log.warn('CheckNotRecorded', { error: err.message });
+    }
+  }
+
+  // What the AWS `router` action answers (lambda/src/lib/controller-core.mjs), for this router. What has no Google Cloud meaning keeps
+  // its key: the Lambda and queue figures are empty, the concurrency null, the drift repairs 0 (a Google Cloud router repairs none), the
+  // manager's settings have no URL.
+  async function routerInfo() {
+    const t = now();
+    const { configs } = await store.listWorkloads();
+    const [{ byState, lastActivity }, checked, level] = await Promise.all([stateCounts(configs), store.getCheck?.().catch(() => null), routerLevel()]);
+    let pausesError;
+    const pauses = await store.listPauses().then((all) => all.filter((p) => !expired(p))).catch((err) => {
+      pausesError = err.message;
+      return [];
+    });
+    const { health, ipLists, manager } = await healthSummary({ t, byState, lastScheduledCheckAt: checked?.lastScheduledCheckAt ?? null, pausesError });
+    return {
+      router: { name: `dmtr-${config.region}`, version: config.version ?? null, build: config.build ?? null },
+      settings: routerSettingsView(level.router),
+      managerSettings: {
+        url: null, hibernate: manager.hibernate ?? null, joinMinutes: manager.joinMinutes ?? null,
+        ...(manager.defaults ? { defaults: manager.defaults } : {}), ...(manager.types ? { types: manager.types } : {}),
+        readAt: manager.readAt ? iso(manager.readAt) : null, error: manager.error ?? null,
+      },
+      configuration: {
+        checkSchedule: { value: CHECK_SCHEDULE, source: CLI },
+        ipLists: { value: lists.map(({ name, url, action, refreshHours }) => ({ name, url, action, refreshHours })), source: CLI },
+        noWakeRules: { value: [], source: CLI },
+        metrics: { value: null, source: CLI },
+      },
+      pauses: [],
+      workloads: {
+        total: configs.length,
+        byState,
+        paused: configs.filter((cfg) => pauses.some((p) => p.workloadId === cfg.workloadId)).length,
+        lastActivityAt: lastActivity ? iso(lastActivity) : null,
+      },
+      health: {
+        ...health,
+        checkSchedule: CHECK_SCHEDULE,
+        lastScheduledCheckAt: checked?.lastScheduledCheckAt ? iso(checked.lastScheduledCheckAt) : null,
+        lambda: {},
+        queues: {},
+        ipLists: ipLists.map((l) => ({ ...l, source: CLI, refreshHours: lists.find((c) => c.name === l.name)?.refreshHours })),
+        concurrency: null,
+        drift24h: 0,
+      },
+    };
   }
 
   // The counters older than 35 days, once a UTC day: the first check of the day sweeps, the others find the day claimed. An
@@ -1595,5 +1723,5 @@ export function createController({
     }
   }
 
-  return { noteTags, refreshLists, wake, beginWake, wakeNow, nap, napNow, release, check, pause, resume, pausesFor };
+  return { noteTags, refreshLists, routerInfo, wake, beginWake, wakeNow, nap, napNow, release, check, pause, resume, pausesFor };
 }

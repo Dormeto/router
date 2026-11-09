@@ -118,7 +118,8 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], c
 
   // The levels above the workload's, kept 60 s by the instance in the cache the shared core reads too: a request reads one record
   // of them, so that the values Google Cloud fixes below and the core's resolution agree. Never throws.
-  const levels = createJoinLevelsCache({ router: () => store.getRouterSettings?.(), manager: () => store.getManagerSettings?.(), now, log });
+  // The organization's level is not read here yet: the router holds it (router/manager) for its health only, until it gives it meaning (G2 §5.5).
+  const levels = createJoinLevelsCache({ router: () => store.getRouterSettings?.(), manager: undefined, now, log });
   const levelsCache = { ...levels, records: (fields) => (thisRequest.getStore().levels ??= levels.records(fields)) };
 
   // Whatever the levels say, what Google Cloud fixes: no request is held, and the wake mode is browser behind the policy and on its

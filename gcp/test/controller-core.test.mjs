@@ -1690,7 +1690,7 @@ test('the nap writes the policy, waits 300 s, then stops; ASLEEP with what it st
   assert.equal(t.run().stopping, undefined);
   assert.equal(t.logged('NapCompleted').length, 1);
   assert.deepEqual(t.world.map.pathMatchers[0].defaultCustomErrorResponsePolicy.errorService, WAKER_URL);
-  assert.equal(t.logged('StateChanged').find((l) => l.to === STATES.ASLEEP).stopped[0], 'vm-a');
+  assert.equal(t.logged('StateChanged').find((l) => l.to === STATES.ASLEEP).stopped[0].machineType, 'e2-small');
 });
 
 test('the nap of a workload not awake does nothing', async () => {
@@ -5831,6 +5831,29 @@ test('a nap to ASLEEP hands the store the VMs it suspended, which the event list
   const change = asked.find((c) => c.to === STATES.ASLEEP);
   assert.deepEqual(change.event.suspended, ['vm-a']);
   assert.deepEqual(eventOf({ workloadId: 'demo', from: 'NAPPING', to: 'ASLEEP', stateAt: START, event: change.event, router: { name: 'dmtr-europe-west1', region: 'europe-west1', project: 'p' } }).hibernated, ['vm-a']);
+});
+
+test('a nap to ASLEEP names what it stopped as priced items in its event; the run keeps the names the wake reads', async () => {
+  const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
+  const asked = changesOf(t);
+  await t.controller.nap('demo');
+  const { event } = asked.find((c) => c.to === STATES.ASLEEP);
+  assert.deepEqual(event.suspended, ['vm-a']);
+  assert.deepEqual(event.items, [{ kind: 'gce', machineType: 'e2-small', family: 'e2', vcpus: 0.5, memoryGb: 2, count: 1, os: 'linux', suspended: true, zone: ZONE }]);
+  assert.deepEqual(t.run().suspended, ['vm-a']);
+  assert.deepEqual(t.run().stopped, []);
+  assert.deepEqual(t.run().items, undefined);
+  assert.deepEqual(t.logged('StateChanged').find((l) => l.to === STATES.ASLEEP).stopped, event.items);
+});
+
+test('a nap whose reads all fail still reaches ASLEEP: the items are unknown, with the reason', async () => {
+  const t = setup({ cfg: { hibernate: false }, vms: { 'vm-a': { status: 'RUNNING' } } });
+  t.world.machineTypes = {};
+  const asked = changesOf(t);
+  assert.equal((await t.controller.nap('demo')).state, STATES.ASLEEP);
+  const { event } = asked.find((c) => c.to === STATES.ASLEEP);
+  assert.deepEqual(event.items, [{ kind: 'unknown', backend: 'instance:vm-a', reason: 'no machine type' }]);
+  assert.deepEqual(t.run().stopped, ['vm-a']);
 });
 
 test('a state change reads no configuration of its own: its event carries the tags the wake read', async () => {

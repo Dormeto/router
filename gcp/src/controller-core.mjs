@@ -73,6 +73,8 @@ import {
 import { OPERATION_NOT_DONE } from './google.mjs';
 import { resendStale, startHeartbeat, staleness } from './heartbeat.mjs';
 import { organizationOf } from './organization.mjs';
+import { KIND_OF } from './rows.mjs';
+import { describeStopped } from './stopped.mjs';
 import { effectiveOf, SWAP_WAKE_ROOM_SECONDS, WAKE_TIMEOUT_MAX } from './levels.mjs';
 import { faviconReachable, servedPage } from './pages.mjs';
 import { inOneUpdate, isRegionalLb, switchOf } from './switch.mjs';
@@ -173,6 +175,9 @@ const repeat = (ms, fn) => {
 const nameOf = (url) => url.slice(url.lastIndexOf('/') + 1);
 const zoneOf = (url) => /\/zones\/([^/]+)\//.exec(url)?.[1];
 const names = (vms) => vms.map((vm) => vm.name);
+// A nap's answer: the names the run keeps (the wake reads them), and what its event says (the suspended VMs, the priced items).
+const runOf = ({ stopped, suspended }) => ({ stopped, suspended });
+const eventOfSlept = ({ suspended, items }) => ({ suspended, items });
 const primariesOf = (cfg) => cfg.backends.filter((b) => !isCompanion(b));
 const companionsOf = (cfg) => cfg.backends.filter(isCompanion);
 // A zone ends in its letter, a region in its number.
@@ -241,9 +246,11 @@ export function createController({
     const next = await store.transition(workloadId, tags ? { ...change, event: { ...change.event, tags } } : change);
     if (next && change.set?.state) {
       const { cond, set, cause, by, event } = change;
+      // The nap's items are the event's `stopped` (rows.mjs's eventOf); the line says the same.
+      const { items, ...said } = event ?? {};
       // The journal's event is the store's (committed with the run); the line says the same: when, which router, and who asked.
       log.info('StateChanged', {
-        workloadId, from: cond.state, to: set.state, ...(cause ? { cause } : {}), ...(by ? { by } : {}), ...event,
+        workloadId, from: cond.state, to: set.state, ...(cause ? { cause } : {}), ...(by ? { by } : {}), ...said, ...(items ? { stopped: items } : {}),
         at: new Date(next.stateAt ?? now()).toISOString(), router: `dmtr-${config.region}`, region: config.region, project: config.project,
       });
     }
@@ -608,7 +615,7 @@ export function createController({
   async function sleepBackend(backend, hibernate, deadline, owners, onFallback) {
     if (isPods(backend)) {
       await sleepOwner(clients, backend, recordOf(owners, backend), { now, sleep, deadline });
-      return { stopped: [ownerText(backend)], suspended: [] };
+      return { stopped: [ownerText(backend)], suspended: [], vms: [], pods: [backend] };
     }
     // Only what runs: Google refuses a request naming a VM being created or started, and the whole nap with it.
     const vms = (await vmsOf(backend)).filter((vm) => vm.status === 'RUNNING');
@@ -623,7 +630,10 @@ export function createController({
       stopped = vms;
     }
     await act(backend, 'stop', stopped);
-    return { stopped: names(stopped), suspended: names(suspended) };
+    // What the nap acted on, for its priced items: each VM with the status backend it belongs to.
+    const text = `${KIND_OF[backend.kind]}:${backend.name}`;
+    const acted = (list, isSuspended) => list.map((vm) => ({ name: vm.name, zone: vm.zone, backend: text, suspended: isSuspended }));
+    return { stopped: names(stopped), suspended: names(suspended), vms: [...acted(stopped, false), ...acted(suspended, true)], pods: [] };
   }
 
   // The autoscalers on: what the wake gives back. Those a nap that failed already turned off keep their recorded mode.
@@ -668,7 +678,14 @@ export function createController({
     await each(companionsOf(cfg), async ({ name }) => {
       if ((await stopDatabase(cloudsql, name, latest, stillGoing)) === COMPANION_GONE) log.warn('CompanionGone', { workloadId: cfg.workloadId, instance: name });
     });
-    return { stopped: done.flatMap((d) => d.stopped), suspended: done.flatMap((d) => d.suspended) };
+    // Described after the acts (a stopping VM reads the same machine type and licenses); never a reason to fail the nap.
+    const items = await describeStopped({ compute, cloudsql, log }, {
+      vms: done.flatMap((d) => d.vms), pods: done.flatMap((d) => d.pods), companions: companionsOf(cfg).map(({ name }) => name),
+    }).catch((err) => {
+      log.warn('StoppedUndescribed', { workloadId: cfg.workloadId, error: err.message });
+      return [];
+    });
+    return { stopped: done.flatMap((d) => d.stopped), suspended: done.flatMap((d) => d.suspended), items };
   }
 
   // The companions found gone, said each time and kept on the run while they are, for whoever reads the workload. `cond`: the run as read.
@@ -1101,9 +1118,9 @@ export function createController({
     }
     const asleep = await transition(workloadId, {
       cond: { state: STATES.NAPPING, pendingWake: false },
-      set: { state: STATES.ASLEEP, ...slept, ...types.set },
+      set: { state: STATES.ASLEEP, ...runOf(slept), ...types.set },
       remove: ['stopping', ...types.remove],
-      event: slept,
+      event: eventOfSlept(slept),
     });
     if (asleep) {
       log.info('NapCompleted', { workloadId });
@@ -1159,10 +1176,10 @@ export function createController({
       const slept = await putToSleep(cfg, { autoscalers, owners, router, organization, instanceTypes: run.instanceTypes }, latest, async () => (await store.getRun(workloadId))?.state === STATES.FAILED);
       const types = await revertTypes(cfg, run.instanceTypes);
       const asleep = await transition(workloadId, {
-        cond: { state: STATES.FAILED }, set: { state: STATES.ASLEEP, ...slept, ...types.set }, remove: types.remove, cause: 'failed-released', event: slept,
+        cond: { state: STATES.FAILED }, set: { state: STATES.ASLEEP, ...runOf(slept), ...types.set }, remove: types.remove, cause: 'failed-released', event: eventOfSlept(slept),
       });
       if (!asleep) return { state: 'SUPERSEDED' };
-      log.warn('FailedReleased', { workloadId, ...slept });
+      log.warn('FailedReleased', { workloadId, ...runOf(slept) });
       return { state: STATES.ASLEEP };
     } catch (err) {
       log.error('ReleaseFailed', { workloadId, error: err.message });

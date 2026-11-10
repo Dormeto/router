@@ -24,6 +24,12 @@ test('eventOf: a failure stored in ms comes out ISO; the items a nap stopped and
   assert.equal('hibernated' in eventOf({ workloadId: 'a', from: 'NAPPING', to: 'ASLEEP', stateAt: AT, router, event: { suspended: [] } }), false);
 });
 
+test('eventOf: the items a nap stopped are the event\'s stopped, none given none written', () => {
+  const items = [{ kind: 'gce', machineType: 'e2-small', family: 'e2', vcpus: 0.5, memoryGb: 2, count: 1, os: 'linux', zone: 'z' }];
+  assert.deepEqual(eventOf({ workloadId: 'a', from: 'NAPPING', to: 'ASLEEP', stateAt: AT, router, event: { items, suspended: [] } }).stopped, items);
+  assert.equal('stopped' in eventOf({ workloadId: 'a', from: 'NAPPING', to: 'ASLEEP', stateAt: AT, router, event: { stopped: ['a'] } }), false);
+});
+
 // --- rowOf: the AWS row ------------------------------------------------------------------------------------------------
 
 const cfg = {

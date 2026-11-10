@@ -13,10 +13,10 @@ const iso = (ms) => new Date(ms).toISOString();
 const failureOf = (failure) => (typeof failure?.at === 'number' ? { ...failure, at: iso(failure.at) } : failure);
 
 // The `Workload state changed` detail of a transition. `event` is what the transition's caller says of it (the wake id and its duration,
-// the failure, the VMs a nap suspended, the fallbacks, who asked); the rest of it (the items a nap stopped, the autoscalers) stays in the
-// run. `stateAt` is the instant of the change (ms).
+// the failure, the VMs a nap suspended and the items it stopped, the fallbacks, who asked); the rest of it (the names it stopped, the
+// autoscalers) stays in the run. `stateAt` is the instant of the change (ms).
 export function eventOf({ workloadId, from, to, stateAt, cause, event = {}, router, tags = {} }) {
-  const { wakeId, durationMs, failure, fallbacks, by, suspended } = event;
+  const { wakeId, durationMs, failure, fallbacks, by, suspended, items } = event;
   return {
     workloadId,
     from,
@@ -32,6 +32,7 @@ export function eventOf({ workloadId, from, to, stateAt, cause, event = {}, rout
     ...(by ? { by } : {}),
     ...(fallbacks ? { fallbacks } : {}),
     ...(suspended?.length ? { hibernated: suspended } : {}),
+    ...(items ? { stopped: items } : {}),
     tags,
   };
 }
@@ -52,7 +53,7 @@ function lastFailure(run) {
 const fallbacksOf = (run) => Object.entries(run?.instanceTypes ?? {}).map(([instance, { from, to }]) => ({ instance, from, to }));
 
 // The AWS kind names of the backends (G5's type names map the same way), in AWS's order; the Cloud SQL twin of `rds-instance`.
-const KIND_OF = { vm: 'instance', mig: 'asg', k8s: 'k8s', cloudsql: 'cloudsql-instance' };
+export const KIND_OF = { vm: 'instance', mig: 'asg', k8s: 'k8s', cloudsql: 'cloudsql-instance' };
 const KINDS = Object.values(KIND_OF);
 
 // The AWS `list` row (lambda/src/lib/summary.mjs's workloadSummary) of a workload, from its configuration and run. `stats7d`: the

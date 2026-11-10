@@ -2620,7 +2620,7 @@ test('PUT the router level: what it refuses is a 400 with the problems, nothing 
 
 // --- The waiting page (vision docs/specs/2026-11-08-google-cloud-router-features-design.md, section 5) ------------------------------
 
-const CUSTOM_REFUSED = 'custom pages are off on this router: an administrator turns them on with dormeto gcp install --custom-pages';
+const CUSTOM_REFUSED = 'custom pages are off on this router: an administrator turns them on with dormeto gcp routers install --custom-pages';
 const NOT_SERVED = 'custom pages are off on this router: this page is not served';
 const PAGE_HTML = '<!doctype html><p data-dormeto="status"></p>';
 const DEFAULT_PAGE = { mode: 'template', icon: 'auto', from: { mode: 'default', icon: 'default' } };

@@ -161,7 +161,7 @@ const KIND_OF_REASON = [
 ];
 const kindOfReason = (reason) => KIND_OF_REASON.find(([pattern]) => pattern.test(reason ?? ''))?.[1];
 // A machine type's change refused for the permission: a router installed before it was in its role.
-const SET_TYPE_REFUSED = 'the router\'s role lacks compute.instances.setMachineType: run dormeto gcp install again';
+const SET_TYPE_REFUSED = 'the router\'s role lacks compute.instances.setMachineType: run dormeto gcp routers install again';
 // Google refused the change itself, its operation's error included: nothing changed.
 const nothingChanged = (err) => err?.code >= 400 && err.code < 500;
 // A machine type's change refused, in the words that say what to do.

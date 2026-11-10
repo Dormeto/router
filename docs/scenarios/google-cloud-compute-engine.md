@@ -543,7 +543,7 @@ characters, a description of 500, HTML of 256 KiB.
 - **Custom pages are off unless the install turns them on.** Custom HTML runs on the application's address. On AWS only an
   administrator may set it; on Google Cloud anyone who can invoke the controller is an operator. So `dormeto gcp routers install
   --custom-pages` sets `DMT_CUSTOM_PAGES=1` on the controller and the waker, and `customPages` in the install record. Without it, a
-  custom page is refused, `custom pages are off on this router: an administrator turns them on with dormeto gcp install
+  custom page is refused, `custom pages are off on this router: an administrator turns them on with dormeto gcp routers install
   --custom-pages`, and a custom page already stored is read as absent: the template levels or the default page show. It stays stored,
   listed as `off`, until it is cleared or the switch comes back, so turning the switch off stops customer HTML at once.
 - **The waker renders** through a cache of 60 s, 1 s per read, which keeps the last value when a read fails, with the language from
@@ -589,7 +589,7 @@ network endpoint groups, gives a VM other machine types to run on:
   type and its own, in its answer's `fallbacks`: it keeps that type until you change it by hand.
 - **The permission** is `compute.instances.setMachineType`, in `dormetoRouterBackends` under its `dormeto=managed` condition, in
   `gcp/access.json`. `dormeto gcp routers install` adds it to an installed router. Without it, a wake that needs a fallback fails with `the router's
-  role lacks compute.instances.setMachineType: run dormeto gcp install again`.
+  role lacks compute.instances.setMachineType: run dormeto gcp routers install again`.
 - **Not covered:** Cloud SQL tiers (Google documents no change on a stopped instance), managed groups, other zones, accelerators.
 
 ## Internal load balancers

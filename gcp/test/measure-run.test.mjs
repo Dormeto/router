@@ -660,7 +660,7 @@ test('tag unbind: none bound says so and exits 0', async () => {
 test('tag: no such tag says what makes it: the install, not this tool', async () => {
   for (const code of [403, 404]) {
     const world = tagWorld({ refuse: { [`GET ${TAG_VALUE}`]: new GoogleError(code, 'GET: not there', code === 403 ? 'PERMISSION_DENIED' : 'NOT_FOUND') } });
-    await assert.rejects(tagRun(world, 'bind').code, /no tag dormeto-dev\/dormeto\/managed: dormeto gcp install makes it/);
+    await assert.rejects(tagRun(world, 'bind').code, /no tag dormeto-dev\/dormeto\/managed: dormeto gcp routers install makes it/);
     assert.deepEqual(world.changes, []);
   }
 });

@@ -610,7 +610,7 @@ test('GET /v1/settings: the router level, none as AWS\'s empty answer; PUT: stor
 
 // --- The waiting page (vision docs/specs/2026-11-08-google-cloud-router-features-design.md, section 5.2) ---------------------------
 
-const CUSTOM_REFUSED = 'custom pages are off on this router: an administrator turns them on with dormeto gcp install --custom-pages';
+const CUSTOM_REFUSED = 'custom pages are off on this router: an administrator turns them on with dormeto gcp routers install --custom-pages';
 const PAGE_HTML = '<!doctype html><p data-dormeto="status"></p>';
 
 test('GET|PUT|DELETE /v1/waiting-page and /v1/workloads/:id/waiting-page: AWS\'s answer; the page\'s refusal: 400 with the problems; unknown: 404', async () => {

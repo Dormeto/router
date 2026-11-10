@@ -325,7 +325,7 @@ test('a managed group\'s location says zonal or regional', async () => {
 // fallback machine types, given back after the next stop.
 const stockout = () => new GoogleError("Google: operation compute.instances.start: ZONE_RESOURCE_POOL_EXHAUSTED: The zone 'europe-west1-b' does not have enough resources", { reason: 'ZONE_RESOURCE_POOL_EXHAUSTED' });
 const forbidden = () => new GoogleError("Google: POST setMachineType: 403 Required 'compute.instances.setMachineType' permission for 'projects/p/zones/europe-west1-b/instances/vm-a'", { code: 403 });
-const SET_TYPE_REFUSED = 'the router\'s role lacks compute.instances.setMachineType: run dormeto gcp install again';
+const SET_TYPE_REFUSED = 'the router\'s role lacks compute.instances.setMachineType: run dormeto gcp routers install again';
 // The next `times` asks of `line` refused, for capacity unless said.
 const refusedFor = (t, line, times, error = stockout) => {
   let left = times;

@@ -14,7 +14,7 @@ import { GKE_INPUT, INPUT, REGION, WAKER, ZONE, onGke, setup, virtualClock } fro
 const iso = (ms) => new Date(ms).toISOString();
 const DAY = 86_400_000;
 const SCHEDULE = { timeZone: 'europe/paris', windows: [{ kind: 'nap', days: ['sat', 'sun'], start: '20:00', end: '08:00' }], maxNapDays: 7 };
-const CUSTOM_REFUSED = 'custom pages are off on this router: an administrator turns them on with dormeto gcp install --custom-pages';
+const CUSTOM_REFUSED = 'custom pages are off on this router: an administrator turns them on with dormeto gcp routers install --custom-pages';
 const PAGE_HTML = '<!doctype html><p data-dormeto="status"></p>';
 const NO_COUNTS = () => ({ ignored: {}, deferred: {}, wakes: {} });
 

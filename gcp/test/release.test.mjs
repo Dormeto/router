@@ -485,7 +485,7 @@ test('the Compute Engine page: the waiting page, its storage and its custom-page
   }
   assert.match(page, /The answers have AWS's shape: own, inherited, effective, from, favicon, warnings, terraform, by and at/);
   assert.match(page, /icon of 64 KiB at most, a title of 80 characters, a description of 500, HTML of 256 KiB/);
-  assert.match(page, /custom pages are off on this router: an administrator turns them on with dormeto gcp install --custom-pages/);
+  assert.match(page, /custom pages are off on this router: an administrator turns them on with dormeto gcp routers install --custom-pages/);
   assert.match(page, /DMT_CUSTOM_PAGES=1 on the controller and the waker/);
   assert.match(page, /a custom page already stored is read as absent: the template levels or the default page show/);
   assert.match(page, /WaitingPageSet records the size and the SHA-256 of a page, never its content/);
@@ -527,7 +527,7 @@ test('the Compute Engine page: the capacity retry and the fallback machine types
   assert.match(page, /InstanceTypeNotReverted/);
   assert.match(page, /The nap, after the VMs stop, and the release give each VM its own type back/);
   assert.match(page, /compute\.instances\.setMachineType, in dormetoRouterBackends under its dormeto=managed condition/);
-  assert.match(page, /the router's role lacks compute\.instances\.setMachineType: run dormeto gcp install again/);
+  assert.match(page, /the router's role lacks compute\.instances\.setMachineType: run dormeto gcp routers install again/);
 });
 
 test('the Compute Engine page: the internal Application Load Balancers', () => {
@@ -899,19 +899,14 @@ test('every "Not released yet: router X" sentence names a version above the pack
 });
 
 // The CLI's move of the router commands under `dormeto gcp routers`: the docs name the new ones, and the old names only in one sentence
-// of the README (plus the two refusals the router itself words, which are quoted as they are).
+// of the README.
 const OLD_NAMES_SENTENCE = 'The old names dormeto gcp install, dormeto gcp uninstall and dormeto gcp status work for one release, with a notice on stderr (Not released yet: CLI 0.14.0).';
-const QUOTED_REFUSALS = [
-  'custom pages are off on this router: an administrator turns them on with dormeto gcp install --custom-pages',
-  'the router\'s role lacks compute.instances.setMachineType: run dormeto gcp install again',
-];
 test('the docs name dormeto gcp routers install, uninstall and show, and the old names only in one sentence', () => {
   const files = ['README.md', 'terraform/gcp-dev/README.md', 'terraform/gcp-releases/README.md', 'docs/scenarios/README.md', MANAGER, CE, SQL, GKE];
   let sentences = 0;
   for (const file of files) {
     let text = flat(read(file));
     if (text.includes(OLD_NAMES_SENTENCE)) { sentences += 1; text = text.replace(OLD_NAMES_SENTENCE, ''); }
-    for (const refusal of QUOTED_REFUSALS) text = text.replaceAll(refusal, '');
     assert.doesNotMatch(text, /dormeto gcp (install|uninstall|status)\b/, file);
   }
   assert.equal(sentences, 1, 'the one sentence, in the README');

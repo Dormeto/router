@@ -7,7 +7,7 @@
 // levels or the default page show. It stays stored, and its level's answer says it is not served, until it is cleared or the switch
 // comes back: turning the switch off stops customer HTML at once.
 
-export const CUSTOM_PAGES_REFUSED = 'custom pages are off on this router: an administrator turns them on with dormeto gcp install --custom-pages';
+export const CUSTOM_PAGES_REFUSED = 'custom pages are off on this router: an administrator turns them on with dormeto gcp routers install --custom-pages';
 export const CUSTOM_PAGE_NOT_SERVED = 'custom pages are off on this router: this page is not served';
 
 // The install's switch, from a service's environment.

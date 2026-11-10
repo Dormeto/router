@@ -598,7 +598,7 @@ export async function runTag(ctx) {
     ({ name: tagValue } = await request('GET', `${RESOURCE_MANAGER}/tagValues/namespaced?name=${encodeURIComponent(namespaced)}`));
   } catch (e) {
     // Resource Manager answers 403 for a tag that does not exist.
-    if (e.status === 403 || e.status === 404) throw new CheckError(`no tag ${namespaced}: dormeto gcp install makes it (${e.message})`);
+    if (e.status === 403 || e.status === 404) throw new CheckError(`no tag ${namespaced}: dormeto gcp routers install makes it (${e.message})`);
     throw e;
   }
   log('tag value', `${namespaced} ${tagValue}`);

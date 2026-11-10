@@ -45,7 +45,7 @@ flowchart LR
 
 ## Services
 
-- **Google Kubernetes Engine** (`container.googleapis.com`), turned on by `dormeto gcp install --with gke`, with the
+- **Google Kubernetes Engine** (`container.googleapis.com`), turned on by `dormeto gcp routers install --with gke`, with the
   router's custom role `dormetoRouterKubernetes`: exactly `container.clusters.get` (the cluster's DNS endpoint, and
   whether it is Autopilot) and `container.clusters.connect` (each call through the DNS endpoint). They grant nothing
   inside the cluster.
@@ -207,6 +207,6 @@ label is refused at the onboarding and left alone.
 
 ## Setup
 
-`dormeto gcp install --with gke` (with `--image` for the router), then `dormeto gcp workloads onboard … --gke-cluster
+`dormeto gcp routers install --with gke` (with `--image` for the router), then `dormeto gcp workloads onboard … --gke-cluster
 <location>/<name>`; an onboarding with `--gke-cluster` on a router installed without the feature is refused, with the
 command that adds it. A GKE-only workload binds no tag. The CLI's README has the commands.

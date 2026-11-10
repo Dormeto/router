@@ -11,4 +11,4 @@ release.
   `google_project_service`, as in `gcp-dev`), once:
   `gcloud services enable artifactregistry.googleapis.com --project dormeto-releases --configuration dormeto-releases`.
 - The `allUsers` `roles/artifactregistry.reader` binding on each repository makes the image public. It is the one IAM
-  change of the router's Terraform outside `dormeto gcp install`; `terraform/gcp-dev` still holds none.
+  change of the router's Terraform outside `dormeto gcp routers install`; `terraform/gcp-dev` still holds none.

@@ -31,7 +31,7 @@ flowchart LR
 
 ## Services
 
-- **Cloud SQL Admin API** (`sqladmin.googleapis.com`), turned on by `dormeto gcp install --with cloud-sql` (a later run
+- **Cloud SQL Admin API** (`sqladmin.googleapis.com`), turned on by `dormeto gcp routers install --with cloud-sql` (a later run
   with more features adds them; a run without `--with` keeps what is there). It adds two custom roles to the router's
   service account:
   - `dormetoRouterDatabasesRead`: `cloudsql.instances.get` and `cloudsql.instances.list`, on the project: reading an
@@ -137,6 +137,6 @@ acceptance's took 14 min 44 s, and left the VM and the database running, untagge
 
 ## Setup
 
-`dormeto gcp install --with cloud-sql` (with `--image` for the router), then `dormeto gcp workloads onboard … --cloud-sql
+`dormeto gcp routers install --with cloud-sql` (with `--image` for the router), then `dormeto gcp workloads onboard … --cloud-sql
 <instance>` for each instance; an onboarding with `--cloud-sql` on a router installed without the feature is refused,
 with the command that adds it. The CLI's README has the commands.

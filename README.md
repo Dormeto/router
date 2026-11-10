@@ -599,7 +599,7 @@ aws dynamodb get-item --table-name dmt-dev-router --key '{"pk":{"S":"WL#demo"},"
 ## Google Cloud
 
 Since 0.34.0 the router also runs on Google Cloud: `gcp/src` holds the two Cloud Run roles, one container image,
-`DMT_ROLE` (`waker` or `controller`) picks the role. `dormeto gcp install` (the CLI) creates the services, from Dormeto's public image by
+`DMT_ROLE` (`waker` or `controller`) picks the role. `dormeto gcp routers install` (the CLI) creates the services, from Dormeto's public image by
 default (Not released yet: router 0.40.0 and CLI 0.14.0) or from your own with `--image`. Its scenarios, each with its limits:
 
 - [Compute Engine VMs](docs/scenarios/google-cloud-compute-engine.md): instance groups behind a global external
@@ -613,8 +613,8 @@ default (Not released yet: router 0.40.0 and CLI 0.14.0) or from your own with `
   /v1/actions`, through which the Dormeto manager reads and acts on a Google Cloud router. Not released yet: router 0.40.0.
 
 Router 0.37.0 adds zonal network endpoint groups, the regional and classic load balancers, schedules, pauses, IP lists
-(`dormeto gcp install --ip-list`), Cloud SQL companions and GKE pods, the last two with the access that
-`dormeto gcp install --with cloud-sql,gke` adds (their APIs, the roles `dormetoRouterDatabasesRead`,
+(`dormeto gcp routers install --ip-list`), Cloud SQL companions and GKE pods, the last two with the access that
+`dormeto gcp routers install --with cloud-sql,gke` adds (their APIs, the roles `dormetoRouterDatabasesRead`,
 `dormetoRouterDatabases` and `dormetoRouterKubernetes`, and a Kubernetes Role per GKE workload, which the CLI applies).
 They were accepted on 2026-11-04 in `dormeto-dev` with CLI 0.11.0: each page says what was accepted and measured.
 
@@ -646,8 +646,9 @@ podman run --rm -p 8080:8080 -e DMT_ROLE=controller -e DMT_PROJECT=p -e DMT_REGI
 ```
 
 Dormeto publishes the image, public, at `<europe|us|asia>-docker.pkg.dev/dormeto-releases/router/router:<version>` from
-router 0.40.0 (`terraform/gcp-releases` creates the three repositories), and `dormeto gcp install` uses it by default. Not
+router 0.40.0 (`terraform/gcp-releases` creates the three repositories), and `dormeto gcp routers install` uses it by default. Not
 released yet: router 0.40.0 and CLI 0.14.0.
+The old names `dormeto gcp install`, `dormeto gcp uninstall` and `dormeto gcp status` work for one release, with a notice on stderr (Not released yet: CLI 0.14.0).
 Building your own is for `--image`, for example inside a VPC Service Controls perimeter, which keeps the public
 repository out. An image in another project needs Artifact Registry Reader for the project's Cloud Run service agent,
 which the customer gives.

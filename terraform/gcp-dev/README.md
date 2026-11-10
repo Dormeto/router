@@ -36,10 +36,10 @@ backend service out of service.
   matchers too, and so do the optional maps. The autoscaler ignores its mode, which a managed
   group's stop turns off.
 - **Optional parts** (`classic.tf`, `neg.tf`, `sql.tf`, `gke.tf`, `gke-demo.yaml`), off by default: see Optional parts below.
-- **No IAM, no API**: every IAM change and every API turned on in the project go through `dormeto gcp install` or
+- **No IAM, no API**: every IAM change and every API turned on in the project go through `dormeto gcp routers install` or
   `uninstall`. This root holds no `google_*_iam_*` resource, no service account and no `google_project_service`, and its
   VMs and template run without a service account (attaching one is an IAM grant); `gcp/test/gcp-dev.test.mjs` checks
-  it. It needs the `compute` and `monitoring` APIs, which `dormeto gcp install --project dormeto-dev --region
+  it. It needs the `compute` and `monitoring` APIs, which `dormeto gcp routers install --project dormeto-dev --region
   europe-west1` turns on.
 - **Cost** while it exists, at list prices: about $0.11 an hour, $80 a month: the three `e2-small` VMs about $40 a
   month while running, their 10 GB balanced disks $3 (also while stopped; a suspended VM also pays for its memory's
@@ -67,7 +67,7 @@ binding for a resource it makes (a service agent's).
 | `enable_internal` | `internal.tf` (G5): internal Application Load Balancers, each over HTTP in front of a VM of its own in an unmanaged group (not the demo VM, which Dormeto naps): a regional one (`dmt-dev-internal-regional`: backend service `dmt-demo-internal-regional`, regional URL map, proxy and `INTERNAL_MANAGED` forwarding rule on port 80) and a cross-region one (`dmt-dev-internal-global`: global map, global forwarding rule in the subnet); the proxy-only subnet `dmt-dev-proxy-global` (`GLOBAL_MANAGED_PROXY`, `10.10.3.0/24`; `10.10.2.0/24` is the GKE subnet's; the regional one is `dmt-dev-proxy`, already there); a firewall rule for the health checkers and both proxy subnets to the VMs' port 80; and a firewall rule for the health checkers and the proxy subnets to the VMs' port 80. `internal_region` (default `null`: `var.region`) puts the regional kind elsewhere: its URL map, backend service, proxy, forwarding rule, VM (zone `-b` of that region) and group, in the subnet `dmt-dev-<internal_region>` (`10.10.4.0/24`) with its own proxy-only subnet `dmt-dev-proxy-<internal_region>` (`REGIONAL_MANAGED_PROXY`, `10.10.5.0/24`) and a regional health check `dmt-demo-internal`; the cross-region kind stays in `var.region`; unset or equal to `var.region`, nothing changes. There is no client VM: the measures reach both load balancers from a Cloud Run job with Direct VPC egress, in the regional load balancer's region: `gcloud run jobs create <job> --image <the router image> --region <region> --network dmt-dev --subnet <that region's subnet: dmt-dev, or dmt-dev-<internal_region>> --vpc-egress all-traffic --command /nodejs/bin/node --args <script and arguments>`, then `gcloud run jobs execute <job> --wait`. The output `internal` (null unless on) gives each URL map and address, and the regional one's region | $78: two VMs $26, their disks $2, two forwarding rules $36 (a second region adds a health check and no more VM) |
 
 **Needs first.** `enable_sql` and `enable_gke` need the `sqladmin` and `container` APIs, which this root does not turn on
-(no `google_project_service`, by design): `dormeto gcp install --with cloud-sql,gke` does, and **not in `europe-west1`
+(no `google_project_service`, by design): `dormeto gcp routers install --with cloud-sql,gke` does, and **not in `europe-west1`
 before 2026-11-02**. The probe's Cloud Run job (below) needs a router image holding `probe.mjs`: one built and pushed
 for the measures (`scripts/gcp-image.sh <version> --push --configuration dormeto-dev --repository <host>/<project>/<repo>`, which pushes `<repository>/router:<version>`).
 
@@ -175,7 +175,7 @@ node gcp/tools/measure.mjs tag bind   --instance dmt-demo-sql
 node gcp/tools/measure.mjs tag unbind --instance dmt-demo-sql
 ```
 
-**Unbound before any uninstall**: `dormeto gcp uninstall` can't delete a tag that is still bound, and the tag strands; the
+**Unbound before any uninstall**: `dormeto gcp routers uninstall` can't delete a tag that is still bound, and the tag strands; the
 tool's `unbind` clears it. The parent is `//sqladmin.googleapis.com/projects/<project ID>/instances/<name>`, at the regional
 endpoint `<region>-cloudresourcemanager.googleapis.com`: both confirmed live.
 
@@ -185,7 +185,7 @@ The owner would bypass a condition or an RBAC rule, so these two calls are made 
 `gcp/tools/probe.mjs` is in the router's image and makes one call with the account's token from the metadata server,
 printing the status and the body. It runs as a Cloud Run job with `--service-account dmtr-<region>@dormeto-dev.iam.gserviceaccount.com`
 (the owner can act as that account: no IAM change, nothing granted; if Google refuses, the measure waits for the
-code of S5 or S6 on a workload). What the router holds comes from `dormeto gcp install --with cloud-sql,gke` and its RBAC
+code of S5 or S6 on a workload). What the router holds comes from `dormeto gcp routers install --with cloud-sql,gke` and its RBAC
 from the CLI's onboarding step; nothing is applied by hand.
 
 ```
@@ -351,5 +351,5 @@ GOOGLE_OAUTH_ACCESS_TOKEN="$(gcloud config config-helper --min-expiry=30m --form
 ```
 
 Stopped, suspended or switched (plainly or with weights), everything goes: the URL maps depend on all their backend
-services, so the destroy deletes them first, whichever service they name. What `dormeto gcp install` made (the APIs,
-the roles, the service account, the tag) stays until `dormeto gcp uninstall`.
+services, so the destroy deletes them first, whichever service they name. What `dormeto gcp routers install` made (the APIs,
+the roles, the service account, the tag) stays until `dormeto gcp routers uninstall`.

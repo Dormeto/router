@@ -834,7 +834,7 @@ test('the pages do not call 0.38.0 or 0.39.0 a release, say Not released yet: ro
     assert.doesNotMatch(read(file), /(?<![\d.])0\.3[89]\.0(?![-\d])/, file);
   }
   assert.ok(flat(read('README.md')).includes('(Not released yet: router 0.40.0 and CLI 0.14.0) or from your own'));
-  assert.match(flat(read('README.md')), /router 0\.40\.0 \(terraform\/gcp-releases creates the three repositories\), and dormeto gcp install uses it by default\. Not released yet: router 0\.40\.0 and CLI 0\.14\.0\./);
+  assert.match(flat(read('README.md')), /router 0\.40\.0 \(terraform\/gcp-releases creates the three repositories\), and dormeto gcp routers install uses it by default\. Not released yet: router 0\.40\.0 and CLI 0\.14\.0\./);
   assert.match(flat(read(MANAGER)), /^# Google Cloud: the router and the manager Not released yet: router 0\.40\.0\./);
 });
 
@@ -896,4 +896,26 @@ test('every "Not released yet: router X" sentence names a version above the pack
   assert.ok(found.length >= 6, 'the docs say it where they describe 0.40.0');
   const reached = found.filter(([, version]) => compareVersions(PACKAGE.version, version) >= 0);
   assert.deepEqual(reached, [], `the package is at ${PACKAGE.version}: these sentences are released, rewrite them`);
+});
+
+// The CLI's move of the router commands under `dormeto gcp routers`: the docs name the new ones, and the old names only in one sentence
+// of the README (plus the two refusals the router itself words, which are quoted as they are).
+const OLD_NAMES_SENTENCE = 'The old names dormeto gcp install, dormeto gcp uninstall and dormeto gcp status work for one release, with a notice on stderr (Not released yet: CLI 0.14.0).';
+const QUOTED_REFUSALS = [
+  'custom pages are off on this router: an administrator turns them on with dormeto gcp install --custom-pages',
+  'the router\'s role lacks compute.instances.setMachineType: run dormeto gcp install again',
+];
+test('the docs name dormeto gcp routers install, uninstall and show, and the old names only in one sentence', () => {
+  const files = ['README.md', 'terraform/gcp-dev/README.md', 'terraform/gcp-releases/README.md', 'docs/scenarios/README.md', MANAGER, CE, SQL, GKE];
+  let sentences = 0;
+  for (const file of files) {
+    let text = flat(read(file));
+    if (text.includes(OLD_NAMES_SENTENCE)) { sentences += 1; text = text.replace(OLD_NAMES_SENTENCE, ''); }
+    for (const refusal of QUOTED_REFUSALS) text = text.replaceAll(refusal, '');
+    assert.doesNotMatch(text, /dormeto gcp (install|uninstall|status)\b/, file);
+  }
+  assert.equal(sentences, 1, 'the one sentence, in the README');
+  assert.ok(flat(read('README.md')).includes(OLD_NAMES_SENTENCE));
+  assert.match(flat(read('README.md')), /dormeto gcp routers install/);
+  assert.match(flat(read('terraform/gcp-dev/README.md')), /dormeto gcp routers uninstall/);
 });

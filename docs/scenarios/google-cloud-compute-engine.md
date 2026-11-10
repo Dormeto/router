@@ -3,7 +3,7 @@
 Compute Engine VMs in unmanaged instance groups, managed instance groups (zonal or regional) or zonal network endpoint
 groups, behind a backend service of an **Application Load Balancer**: external global (`EXTERNAL_MANAGED`), regional
 (`EXTERNAL_MANAGED`, in the router's region) or classic (`EXTERNAL`), or [internal](#internal-load-balancers) (`INTERNAL_MANAGED`). The nap suspends or stops them, the wake starts or
-resumes the ones it napped. The router runs in your project as two Cloud Run services, and `dormeto gcp install` puts it
+resumes the ones it napped. The router runs in your project as two Cloud Run services, and `dormeto gcp routers install` puts it
 there: router 0.34.0 for groups behind the global load balancer; from router 0.37.0, [zonal network endpoint
 groups](#zonal-network-endpoint-groups), [the regional and classic load balancers](#regional-and-classic-load-balancers-the-swap),
 [schedules and pauses](#schedules-and-pauses) and [IP lists](#ip-lists). The router also has AWS's [settings by
@@ -192,7 +192,7 @@ The counts are kept 35 days and swept once a day, and an offboarding deletes its
 - **Scanners that send a browser's user agent to the application's own paths count as activity** (`/`,
   `/favicon.ico`, `/geoserver/web/`, seen within minutes on a bare address): the waker's filters cannot tell them from
   visitors, and they keep the workload awake. IP lists catch known scanner networks ([IP lists](#ip-lists)).
-- **How it gets there.** `dormeto gcp install` creates the log view `dmtr-<region>-lb` on the project's `_Default`
+- **How it gets there.** `dormeto gcp routers install` creates the log view `dmtr-<region>-lb` on the project's `_Default`
   bucket, filtered to the load balancers' request logs, and gives the router `roles/logging.viewAccessor` on that view
   alone, by an IAM condition: never the project's other logs. `dormeto gcp workloads onboard --request-logs` turns the
   backend service's logging on at sample rate 1.0, as the operator; the offboarding sets it back. Without the flag, the
@@ -541,7 +541,7 @@ characters, a description of 500, HTML of 256 KiB.
   shape: `own`, `inherited`, `effective`, `from`, `favicon`, `warnings`, `terraform`, `by` and `at`, or a 400 with `problems`. A put needs `by`, who sets the page.
   `WaitingPageSet` records the size and the SHA-256 of a page, never its content.
 - **Custom pages are off unless the install turns them on.** Custom HTML runs on the application's address. On AWS only an
-  administrator may set it; on Google Cloud anyone who can invoke the controller is an operator. So `dormeto gcp install
+  administrator may set it; on Google Cloud anyone who can invoke the controller is an operator. So `dormeto gcp routers install
   --custom-pages` sets `DMT_CUSTOM_PAGES=1` on the controller and the waker, and `customPages` in the install record. Without it, a
   custom page is refused, `custom pages are off on this router: an administrator turns them on with dormeto gcp install
   --custom-pages`, and a custom page already stored is read as absent: the template levels or the default page show. It stays stored,
@@ -588,7 +588,7 @@ network endpoint groups, gives a VM other machine types to run on:
   `InstanceTypeNotReverted`, and the run keeps the type for the next try. An offboarding while a VM runs on a fallback type names the VM, its
   type and its own, in its answer's `fallbacks`: it keeps that type until you change it by hand.
 - **The permission** is `compute.instances.setMachineType`, in `dormetoRouterBackends` under its `dormeto=managed` condition, in
-  `gcp/access.json`. `dormeto gcp install` adds it to an installed router. Without it, a wake that needs a fallback fails with `the router's
+  `gcp/access.json`. `dormeto gcp routers install` adds it to an installed router. Without it, a wake that needs a fallback fails with `the router's
   role lacks compute.instances.setMachineType: run dormeto gcp install again`.
 - **Not covered:** Cloud SQL tiers (Google documents no change on a stopped instance), managed groups, other zones, accelerators.
 
@@ -612,7 +612,7 @@ Two kinds join the external ones, told from Google by the forwarding rules' sche
   5 to 7 s); cross-region internal, 28 to 120 s (nine writes, each about 40 s). The waits are ten times and one and a quarter times the
   worst. A wake timeout of 90 s or less on an internal load balancer, or 210 s or less on a cross-region one, is refused.
 - **The idle check** reads `loadbalancing.googleapis.com/https/internal/request_count`, and the request logs of the resource
-  `internal_http_lb_rule`, which `dormeto gcp install` adds to the log view's filter. A regional internal map's service is read with its region, a
+  `internal_http_lb_rule`, which `dormeto gcp routers install` adds to the log view's filter. A regional internal map's service is read with its region, a
   cross-region one's without.
 - **The network.** Nothing is added: your internal load balancer has its proxy-only subnet, and the waker's ingress admits both
   internal kinds (measured 2026-11-08). The page's probe goes through the same load balancer.
@@ -680,7 +680,7 @@ workload slept on (`WakeIgnored`), the same probe from another address woke it, 
 `POST /_dormeto/wake` woke it.
 
 The router ignores the addresses of the IP lists named at its install, for every workload:
-`dormeto gcp install --ip-list name=<n>,url=<u>[,refresh=<hours>]`, repeatable. A run with `--ip-list` replaces the set,
+`dormeto gcp routers install --ip-list name=<n>,url=<u>[,refresh=<hours>]`, repeatable. A run with `--ip-list` replaces the set,
 `--no-ip-lists` clears it, and a run with neither keeps it, a later `--image` included. Either flag changes the two Cloud
 Run services (`DMT_IP_LISTS`), so it needs the router installed: without `--image`, the recorded image is reused. A
 list's URL starts with `http://` or `https://` (no `s3://`, no credentials; its query string is printed and stored). The
@@ -780,10 +780,10 @@ wakes the workload, from any address.
 
 ## Setup
 
-`dormeto gcp check`, then `dormeto gcp install` onboard a project and region (the access, the router; `--ip-list` for
+`dormeto gcp check`, then `dormeto gcp routers install` onboard a project and region (the access, the router; `--ip-list` for
 IP lists, `--with cloud-sql,gke` for the features of the Cloud SQL and GKE pages), and `dormeto gcp workloads onboard`
 onboards a workload (`--load-balancer` when its URL map's name is both global and regional, or for an internal kind,
 `--wake-timeout-seconds`, `--wake-mode`, `--fallback-type`); `dormeto gcp workloads settings` and `dormeto gcp routers settings` set the
-levels, `waiting-page` the page, and `dormeto gcp install --custom-pages` turns custom pages on. The README
+levels, `waiting-page` the page, and `dormeto gcp routers install --custom-pages` turns custom pages on. The README
 of the CLI has the commands; the router's image is built with `scripts/gcp-image.sh` (see the
 [README](../../README.md)).

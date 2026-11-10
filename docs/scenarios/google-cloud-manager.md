@@ -152,7 +152,7 @@ logged, `EndedWindowsRemoved`.
 - **The manager polls, the router does not push.** It asks every minute and reads the journal again from 5 minutes
   before the newest event it has, so an event is read twice and kept once.
 - **A router older than 0.40.0 (Not released yet: router 0.40.0) has no `/v1/actions`**: the manager lists it with its version, does not poll it and
-  says which `dormeto gcp install` command upgrades it.
+  says which `dormeto gcp routers install` command upgrades it.
 - **The journal is 7 days.** A manager that cannot read the router for longer loses the changes in between; its history
   is inferred from the next check's states.
 - **The IP lists stay the router's:** the manager's catalog is in S3, which a Google Cloud router cannot read.

@@ -477,7 +477,20 @@ test('POST /v1/workloads/:id/pause with keepAsleep: the sleeper stays asleep', a
   const res = await call('POST', '/v1/workloads/demo/pause', { reason: 'load test', keepAsleep: true });
   assert.equal(res.body.state, STATES.ASLEEP);
   assert.equal(res.body.paused.keepAsleep, true);
+  assert.deepEqual(res.body.woken, []);
   assert.deepEqual(w.tasks, []);
+});
+
+test('POST /v1/workloads/:id/pause: the Workload answers the workloads the pause woke, as the pause action does', async () => {
+  const { call, store } = api();
+  await call('POST', '/v1/workloads', INPUT);
+  assert.deepEqual((await call('POST', '/v1/workloads/demo/pause', { reason: 'load test' })).body.woken, []);
+  await call('POST', '/v1/workloads/demo/resume');
+  store.runs.get('demo').state = STATES.ASLEEP;
+  const res = await call('POST', '/v1/workloads/demo/pause', { reason: 'load test', by: 'ops' });
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.woken, ['demo']);
+  assert.equal(res.body.state, STATES.WAKING);
 });
 
 test('POST /v1/workloads/:id/resume: the Workload without its pause, with or without one; unknown: 404', async () => {

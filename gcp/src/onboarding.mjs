@@ -1062,13 +1062,14 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     return scheduleView(id, null);
   }
 
+  // The Workload with its pause, and the workloads the pause woke, `woken`, as the pause action answers them.
   async function pause(id, input) {
     const cfg = await find(id);
-    await core.pause(id, input).catch((err) => {
+    const { woken } = await core.pause(id, input).catch((err) => {
       if (err instanceof PauseRefused) throw bad(err.message);
       throw err;
     });
-    return current(cfg);
+    return { ...(await current(cfg)), woken };
   }
 
   async function resume(id, { by } = {}) {

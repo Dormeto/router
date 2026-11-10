@@ -64,9 +64,9 @@ workload sleeps and stops it again (`DatabaseRestopped` in the controller's logs
 
 ## Limits
 
-- **Set the wake timeout.** The manager's onboarding gives a workload with databases a wake timeout of 1800 s. A workload
-  written with the Terraform `workload` module keeps 600 s, too short for most database starts: set
-  `wake_timeout_seconds = 1800`.
+- **The wake timeout is 1800 s.** A workload with databases has the built-in 1800 s of the `databases` type, which the manager's
+  onboarding leaves to the levels. A workload written with the Terraform `workload` module has it too: its
+  `wake_timeout_seconds` is null, so the levels decide. Set `wake_timeout_seconds` only to choose another value.
 - **Only for databases this workload uses alone.** The router stops a tagged database with its workload, whoever else
   uses it, and the tag holds one workload id.
 - **Ignored:** read replicas and Aurora Serverless v1 clusters, which AWS cannot stop. They are shown in the status.
@@ -79,7 +79,7 @@ workload sleeps and stops it again (`DatabaseRestopped` in the controller's logs
 ## Setup
 
 Tag the database `dormeto:workload = <workload id>`, with the same id as the application's backends. The manager's
-onboarding of the target group tags the databases it is given and sets the 1800 s wake timeout.
+onboarding of the target group tags the databases it is given; the wake timeout is the levels' 1800 s.
 
 If Terraform writes the database, a workload onboarded from the manager needs the AWS provider's `ignore_tags` for
 `dormeto:` (see [A customer's Terraform](../../README.md)).

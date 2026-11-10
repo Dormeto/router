@@ -80,7 +80,7 @@ action names any right that is missing, and the onboarding refuses a workload un
 The test pods request 100m CPU and 128 MiB, and their health checks use the AWS Load Balancer Controller's defaults
 (every 15 s, 2 healthy checks). Fargate provisions a node for each pod, hence the longer time. When no node has room for
 the pods, Karpenter or the Cluster Autoscaler must launch one first, which adds the node's launch and join time. The
-wake timeout's 300 s default leaves room for it.
+wake timeout's 600 s default leaves room for it.
 
 ## Behavior
 
@@ -138,4 +138,4 @@ annotation and the patched paths' backends. The onboarding dialog gives the snip
 - **Group-wide annotations are not copied** (certificates, scheme, SSL redirect): they already apply to the whole
   IngressGroup.
 - **Only requests through the load balancer wake the workload.** Calls from inside the cluster to the Service do not.
-- **Wake timeout.** 300 s by default, 1800 s with a database companion.
+- **Wake timeout.** 600 s by default (the levels' built-in; the manager's onboarding leaves it to them), 1800 s with a database companion.

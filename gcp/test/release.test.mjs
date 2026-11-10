@@ -406,7 +406,7 @@ test('the README\'s Google Cloud section names the three pages and what router 0
   assert.match(flat(section), /--with cloud-sql,gke/);
   assert.doesNotMatch(flat(section), /not accepted yet/);
   assert.match(flat(section), /accepted on 2026-11-04 in dormeto-dev with CLI 0\.11\.0: each page says what was accepted and measured/);
-  assert.match(flat(section), /Router 0\.38\.0 is not released yet\. Its acceptance passed on 2026-11-08 in dormeto-dev, with the image 0\.38\.0-dev\.2 and the CLI built from main/);
+  assert.match(flat(section), /Not released yet: router 0\.40\.0, which holds the fixes of 0\.38\.0\. Their acceptance passed on 2026-11-08 in dormeto-dev, with the image 0\.38\.0-dev\.2 and the CLI built from main/);
   assert.doesNotMatch(flat(section), /which was not run/);
   // M1 and M2 (2026-11-08).
   assert.doesNotMatch(flat(section), /unmeasured/);
@@ -613,7 +613,7 @@ test('the Compute Engine page: the idle check leaves out what a no-wake rule mat
 // G5's last docs pass: the acceptance of 2026-11-09 and the measures it settled.
 test('the Compute Engine page: G5 was accepted in dormeto-dev on 2026-11-08 and 2026-11-09 and is not released, the wake header is measured, the waker holds no request', () => {
   const page = flat(read(CE));
-  assert.match(page, /These were accepted in dormeto-dev on 2026-11-08 and 2026-11-09, on dev builds of main \(router 0\.39\.0-dev\.2, then 0\.39\.0-dev\.3 with the final review's fixes\): the settings by level, the wake mode and rules, the waiting page, the fallback's machine type change through the router's own role, both internal kinds \(measured, napped by the idle check, woken by the page's probe\) and GKE's refusal\. They are not released\./);
+  assert.match(page, /These were accepted in dormeto-dev on 2026-11-08 and 2026-11-09, on dev builds of main \(router 0\.39\.0-dev\.2, then 0\.39\.0-dev\.3 with the final review's fixes\): the settings by level, the wake mode and rules, the waiting page, the fallback's machine type change through the router's own role, both internal kinds \(measured, napped by the idle check, woken by the page's probe\) and GKE's refusal\. Not released yet: router 0\.40\.0, which holds them\./);
   assert.doesNotMatch(page, /the switch back takes longer than any hold/);
   assert.doesNotMatch(page, /was not measured: the headers/);
 });
@@ -735,7 +735,7 @@ test('the manager page says what preview and onboard take, and what status keeps
   assert.match(read('gcp/src/onboarding.mjs'), /\.\.\.\(by \? \{ onboardedBy: by \} : \{\}\),/);
   assert.match(page, /An onboarding from the manager records onboardedBy, who asked \(unknown when the payload names no one\), which the workload's status and the REST Workload carry, not the rows of list; one from the CLI records no one/);
   assert.match(ACTIONS_SRC, /\{ resourceId: String\(id\) \}/);
-  assert.match(page, /status's instance and asg backends carry resourceId, the numeric id the onboarding stored \(the manager removes the dormeto\/managed binding on that id at an offboarding, whoever bound it, the CLI too\), and their location; a backend stored without its id has none/);
+  assert.match(page, /status's instance and asg backends carry resourceId, the numeric id the onboarding stored \(the manager removes the dormeto=managed binding on that id at an offboarding, whoever bound it, the CLI too\), and their location; a backend stored without its id has none/);
   assert.match(page, /status also keeps the workload's requestLogs/);
 });
 
@@ -770,4 +770,62 @@ test('the manager page says what a nap\'s event names, as stopped.mjs builds it'
   assert.match(page, /\{ kind, backend, reason \}, with the backend as status names it \(instance:<vm>, asg:<group>, k8s:<id>, cloudsql-instance:<name>\) and the reason, cut to 200 characters/);
   assert.match(page, /Each GKE backend is one, with the reason "GKE pods are not priced"/);
   assert.match(page, /Describing never stops a nap: the nap reaches ASLEEP whatever these reads answer/);
+});
+
+// R15 of the AWS and Google Cloud review (vision docs/plans/2026-11-10-aws-google-cloud-review-apis.md): the pages say what the code does,
+// and mark what the next router adds with the one phrase the release tool lets through.
+const NOT_YET = 'Not released yet: router 0.40.0';
+
+test('the manager page: the AWS actions Google Cloud answers unsupported, and the refused body', () => {
+  const page = flat(read(MANAGER));
+  assert.match(page, /AWS's wake, nap, release, check, ensure-awake, refresh-lists, report and clusterCheck, which AWS receives as invocations, and any other name, are answered as AWS's controller does/);
+  assert.match(page, /with "refusals": true, a refusal unsupported \(unknown action: <name>\); without it, a 400 \{ "error": "unknown action: <name>", "reason": "unknown-action" \}/);
+  assert.doesNotMatch(page, /the wake, nap, release, check and list refresh that AWS receives/);
+  const actions = read('gcp/src/actions.mjs');
+  assert.match(actions, /code: 'unsupported', message \} \} \}/);
+  assert.match(actions, /body: \{ error: message, reason: UNKNOWN_ACTION \}/);
+  for (const name of ['wake', 'nap', 'release', 'check', 'ensure-awake', 'refresh-lists', 'report', 'clusterCheck']) {
+    assert.doesNotMatch(actions, new RegExp(`^    '?${name}'?: `, 'm'), `${name} is not an action here`);
+  }
+});
+
+test('the manager page: the REST names, the status\'s settings and what a refusal says', () => {
+  const page = flat(read(MANAGER));
+  assert.match(page, /The REST Workload carries workloadId beside id and pauses \(a list, as the rows' are\) beside paused \(the first of them\)/);
+  assert.match(page, /The onboarding takes databases or cloudSql, settings\.fallbackInstanceTypes or the top-level fallbackInstanceTypes/);
+  assert.match(page, /status's settings hold AWS's six keys \(idleMinutes, waitSeconds, drainSeconds, wakeTimeoutSeconds, maxHolders, failedRetrySeconds\), and wakeMode is beside them, at the top of the status/);
+  assert.match(page, /A pause's keepAsleep that is not true or false is refused/);
+  assert.match(page, /A put of a waiting page needs by/);
+  assert.match(page, /The waker answers a request with no workload header a 400 \{ "error": "x-dormeto-workload names no workload", "reason": "bad-request" \}/);
+});
+
+test('the tag is spelled dormeto=managed on every page', () => {
+  for (const file of ['README.md', 'docs/scenarios/README.md', MANAGER, CE, SQL, GKE]) {
+    assert.doesNotMatch(read(file), /dormeto\/managed/, file);
+  }
+  assert.match(flat(read(MANAGER)), /removes the dormeto=managed binding on that id at an offboarding/);
+});
+
+test('the Compute Engine page: the waiting page\'s headers and the settings problem text', () => {
+  const page = flat(read(CE));
+  assert.match(page, /A failed workload's page, and a backoff's \(asleep with its failure\), carry x-dormeto-failure, why it failed, and x-dormeto-retry-at, the next attempt as an ISO date, as AWS's do/);
+  assert.match(page, /a value that is not a whole number in its range is the problem <key>: must be a whole number from <min> to <max> \(an onboarding's problem starts with settings: \), as AWS's/);
+  assert.match(page, /The page's probe goes to \/_dormeto\/wake and sends the visitor's path in x-dormeto-path; a workload that sleeps or wakes answers a 202 there, where AWS's page answers a 503 to the probe of its own address/);
+  assert.match(page, /A put needs by, who sets the page/);
+  assert.match(page, /Not released yet: router 0\.40\.0/);
+  assert.doesNotMatch(page, /They are not released\./);
+});
+
+test('the scenarios index and the README do not say 0.37.0 of what 0.38.0 to 0.40.0 add', () => {
+  const index = flat(read('docs/scenarios/README.md'));
+  assert.match(index, /What the router naps and wakes, as of router 0\.37\.0\. Not released yet: router 0\.40\.0 adds what the Google Cloud pages say of 0\.38\.0 to 0\.40\.0 and the manager page/);
+  assert.match(index, /accepted on 2026-11-04, and say what was not run; what they add of 0\.38\.0 to 0\.40\.0 is marked Not released yet: router 0\.40\.0/);
+  const readme = read('README.md');
+  const section = flat(readme.slice(readme.indexOf('\n## Google Cloud\n'), readme.indexOf('\n## Version\n')));
+  assert.ok(section.includes('(docs/scenarios/google-cloud-manager.md)'), 'the manager page is in the list');
+  assert.ok(section.includes(NOT_YET));
+  assert.doesNotMatch(section, /Router 0\.38\.0 is not released yet/);
+  for (const file of ['README.md', 'docs/scenarios/README.md', MANAGER, CE, SQL, GKE]) {
+    assert.doesNotMatch(read(file), /unreleased/i, file);
+  }
 });

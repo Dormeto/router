@@ -11,7 +11,7 @@ level](#settings-and-their-levels), the wake mode and the rules, [the branded wa
 retry with fallback machine types](#capacity-and-fallback-machine-types) and [the internal load
 balancers](#internal-load-balancers). These were accepted in `dormeto-dev` on 2026-11-08 and 2026-11-09, on dev builds of `main` (router 0.39.0-dev.2, then 0.39.0-dev.3 with the final review's fixes): the settings by level, the wake mode and rules, the waiting page, the fallback's machine type change
 through the router's own role, both internal kinds (measured, napped by the idle check, woken by the page's probe) and GKE's
-refusal. They are not released.
+refusal. Not released yet: router 0.40.0, which holds them.
 
 The global load balancer keeps the application's backend service in its URL map and serves the waiting page through a
 custom error response (the diagram, and [Behavior](#behavior)). The regional and classic ones have no custom error
@@ -444,7 +444,8 @@ A workload's settings come from AWS's levels: the workload, its type, the router
 value. The names, the values and the answers are AWS's (`idleMinutes`, `settingsFrom`, `type`, `noWakeRules`, `inherits`),
 so one model describes both clouds. The CLI sets them with `dormeto gcp workloads settings` and `dormeto gcp routers settings` (the README has the
 flags); the controller's routes are `PUT /v1/workloads/{id}/settings`, and `GET` and `PUT /v1/settings` for the router's level, with
-AWS's bodies, answers and checks.
+AWS's bodies, answers and checks: a value that is not a whole number in its range is the problem `<key>: must be a whole number from
+<min> to <max>` (an onboarding's problem starts with `settings: `), as AWS's, and the status's `settings` hold AWS's six keys, `wakeMode` beside them at the top.
 
 - **The levels.** The workload's own values are in its configuration, which lists in `inherits` the keys that follow the levels;
   the router's are in the Firestore document `router/settings` (`hibernate`, `joinMinutes`, `defaults`, `by`, `at`). The
@@ -537,7 +538,7 @@ characters, a description of 500, HTML of 256 KiB.
   `favicons/<id>`, with `icon`, `fetchedAt` and `error`; and the run's `recentWakes`, the durations of the last 10 wakes, written at
   each transition to `AWAKE`. An offboarding deletes `pages/<id>` and `favicons/<id>`.
 - **The routes** are `GET`, `PUT` and `DELETE /v1/workloads/{id}/waiting-page` and `GET`, `PUT` and `DELETE /v1/waiting-page`. The answers have AWS's
-  shape: `own`, `inherited`, `effective`, `from`, `favicon`, `warnings`, `terraform`, `by` and `at`, or a 400 with `problems`.
+  shape: `own`, `inherited`, `effective`, `from`, `favicon`, `warnings`, `terraform`, `by` and `at`, or a 400 with `problems`. A put needs `by`, who sets the page.
   `WaitingPageSet` records the size and the SHA-256 of a page, never its content.
 - **Custom pages are off unless the install turns them on.** Custom HTML runs on the application's address. On AWS only an
   administrator may set it; on Google Cloud anyone who can invoke the controller is an operator. So `dormeto gcp install
@@ -548,7 +549,10 @@ characters, a description of 500, HTML of 256 KiB.
 - **The waker renders** through a cache of 60 s, 1 s per read, which keeps the last value when a read fails, with the language from
   `Accept-Language`, English or French, with `vary: accept-language`, and our `Content-Security-Policy` on a template page, never on a
   custom one. While the workload wakes, the page and `/_dormeto/wake` carry the headers `x-dormeto-wake-elapsed` and
-  `x-dormeto-wake-typical`, and the progress bar is filled from the median of the last 10 wakes.
+  `x-dormeto-wake-typical`, and the progress bar is filled from the median of the last 10 wakes. A failed workload's page, and a
+  backoff's (asleep with its failure), carry `x-dormeto-failure`, why it failed, and `x-dormeto-retry-at`, the next attempt as an ISO
+  date, as AWS's do. The page's probe goes to `/_dormeto/wake` and sends the visitor's path in `x-dormeto-path`; a workload that sleeps
+  or wakes answers a `202` there, where AWS's page answers a `503` to the probe of its own address.
 - **The favicon.** The favicon is read at a nap, at most once a day, in 3 s, when the icon is `auto` and the workload awake. It
   is read from the first host rule whose path matcher sends the whole of `/` to the workload's backend
   service by the path alone. A host whose `/` goes elsewhere or depends on more than the path (a regex or a path template match, a

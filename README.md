@@ -15,7 +15,8 @@ sleep and wakes them just-in-time on the next request.
 databases, Kubernetes on EKS, and on Google Cloud Compute Engine VMs, Cloud SQL databases and Kubernetes on GKE, each with
 its diagram, services, measured wake time, behavior and limits.
 
-This MVP manages one EC2 instance behind an ALB:
+On AWS the router is two Lambda functions for the workloads behind an Application Load Balancer (on Google Cloud, [two Cloud
+Run services](#google-cloud) of the same two roles):
 
 - `waker` Lambda: ALB target used only while the workload naps. It wakes the workload once, holds the request up to
   `waitSeconds`, then answers a `307` or a self-reloading waiter page.
@@ -30,8 +31,6 @@ forward to the application target group (weight 1) and to the workload's waker t
 Terraform. A rule forwarding to the target group without being instrumented (no waker target group, missing tag, other
 target groups, or a listener default rule) is an **issue**: the router never naps the workload while it exists, wakes it
 if it appears while the workload sleeps (that rule would reach the stopped backend), and shows it in the status.
-Upgrading from 0.14 or earlier: an asleep workload with such a rule (for example an HTTP rule forwarding to the target
-group) is woken at the first idle check and stays awake until the rule is instrumented or removed.
 
 Instances are **discovered** from the application target group: every instance target tagged
 `dormeto:workload=<workload id>` is managed; other targets are ignored (and shown on the admin dashboard). The nap records
@@ -52,8 +51,8 @@ wake restores both.
 **Databases** (RDS DB instances and Aurora DB clusters) tagged `dormeto:workload=<workload id>` are **companions**: the
 nap stops them after the application (without waiting), the wake starts them and waits until they are available before
 starting the application. A wake that outlasts one Lambda invocation continues in a new one (same wake id) until
-`wake_timeout_seconds` (1800 s for workloads with a database onboarded by the manager; the `workload` module's default
-stays 600 s, set it there). While a workload sleeps, a database restarted by AWS after
+`wake_timeout_seconds` (1800 s for a workload with a database, 600 s otherwise: the built-in values of the levels, below, whoever
+wrote the workload). While a workload sleeps, a database restarted by AWS after
 7 days is stopped again. Read replicas and Aurora Serverless v1 are ignored.
 
 **No-wake requests** get the waiter page without waking the workload: `HEAD`, bot and scanner user agents, well-known
@@ -76,7 +75,9 @@ no_wake_rules = [
 **wake rule** (`wake_rules`, same format as the no-wake rules, for example `path_prefixes = ["/api/"]`). Other requests
 get the waiter page at once (or JSON naming the wake header), so scanners that do not run JavaScript never wake the
 workload; a request arriving during a wake is held as usual. The filters (no-wake rules, `HEAD`, bots, scanner paths)
-apply to the probe too.
+apply to the probe too. On Google Cloud the waiter page's probe goes to `/_dormeto/wake` with the visitor's path in
+`x-dormeto-path`, and a workload that sleeps or wakes answers a `202` there, not a `503`: see [the Compute Engine
+page](docs/scenarios/google-cloud-compute-engine.md#the-waiting-page).
 
 **Settings and their levels (router 0.37.0):** a workload's idle window, waits, wake timeout, held requests, retry
 after a failed wake and wake mode each come from the first level that sets them: the workload, its type, its router,
@@ -173,7 +174,8 @@ cluster, beside `eks-access` (its README says to destroy it before the cluster's
 limited to some addresses with private access off is not reachable: turn private access on. The configuration's
 `kubernetes` (written by the onboarding) names the cluster, namespace, owner, the switching mode and, for an Ingress,
 its name and the Service it routes to; Kubernetes workloads come from the manager's onboarding (the `workload` module
-has no Kubernetes setting). Their wake timeout defaults to 300 s (pods may wait for a node).
+has no Kubernetes setting). Their wake timeout is the built-in 600 s, which leaves room for a node to launch (the onboarding lists it in `inherits`, so the
+levels decide; 1800 s with a database companion).
 
 The controller deletes the listener rules it does not own, so the switch lives in the objects it reads:
 
@@ -606,6 +608,8 @@ default (from 0.38.0) or from your own with `--image`. Its scenarios, each with 
   application and started before it, from 0.37.0.
 - [Kubernetes on GKE](docs/scenarios/google-kubernetes-engine.md): a Deployment or StatefulSet behind standalone network
   endpoint groups, scaled to 0 and back, from 0.37.0.
+- [The router and the manager](docs/scenarios/google-cloud-manager.md): the journal, the check summary and `POST
+  /v1/actions`, through which the Dormeto manager reads and acts on a Google Cloud router. Not released yet: router 0.40.0.
 
 Router 0.37.0 adds zonal network endpoint groups, the regional and classic load balancers, schedules, pauses, IP lists
 (`dormeto gcp install --ip-list`), Cloud SQL companions and GKE pods, the last two with the access that
@@ -625,7 +629,7 @@ a nap up instead of failing it; at most 20 naps are in flight per router; an idl
 stops anything; a nap checks an unmanaged group's VMs and the backend service's backends; and a classic load balancer on
 the Standard tier is found, and Google accepts it for the swap (measured). With `--request-logs` the idle check reads
 the load balancer's request logs and ignores what the waker ignores: the logs decide alone, as Monitoring's count is
-sampled, but an empty log leaves the count to decide. GKE refuses a KEDA `minReplicaCount: 0`. Router 0.38.0 is not released yet. Its acceptance passed on 2026-11-08 in
+sampled, but an empty log leaves the count to decide. GKE refuses a KEDA `minReplicaCount: 0`. Not released yet: router 0.40.0, which holds the fixes of 0.38.0. Their acceptance passed on 2026-11-08 in
 `dormeto-dev`, with the image 0.38.0-dev.2 and the CLI built from `main`.
 
 ```bash

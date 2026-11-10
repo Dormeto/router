@@ -1,6 +1,7 @@
 # Supported scenarios
 
-What the router naps and wakes, as of router 0.37.0. A **workload** is an Application Load Balancer target group and
+What the router naps and wakes, as of router 0.37.0. Not released yet: router 0.40.0 adds what the Google Cloud pages say of
+0.38.0 to 0.40.0 and the manager page. A **workload** is an Application Load Balancer target group and
 the backends behind it: the router naps them together once the target group has had no request for the idle window, and
 wakes them on the next request. Each page below gives the scenario's diagram, the services it uses, its measured wake
 time, its behavior and its limits.
@@ -10,8 +11,8 @@ time, its behavior and its limits.
 | [EC2 instances](ec2-instances.md) | Instances stopped, then started | 35–45 s | 600 s |
 | [Auto Scaling groups](auto-scaling-groups.md) | Group scaled to 0, then given back its size | 35–44 s with a stopped warm pool, 41–51 s without | 600 s |
 | [ECS services](ecs-services.md) | Desired count 0, Application Auto Scaling suspended | 25–57 s on Fargate | 600 s |
-| [RDS and Aurora databases](databases.md) | Stopped after the application, started before it | 6–15 min with PostgreSQL | 1800 s (manager onboarding) |
-| [Kubernetes on EKS](kubernetes.md) | Deployment or StatefulSet scaled to 0 | 22–26 s on EC2 nodes, 62–74 s on Fargate | 300 s (manager onboarding) |
+| [RDS and Aurora databases](databases.md) | Stopped after the application, started before it | 6–15 min with PostgreSQL | 1800 s |
+| [Kubernetes on EKS](kubernetes.md) | Deployment or StatefulSet scaled to 0 | 22–26 s on EC2 nodes, 62–74 s on Fargate | 600 s |
 | [Google Cloud: Compute Engine VMs](google-cloud-compute-engine.md) | VMs of groups or zonal NEGs suspended or stopped, then resumed or started, behind a global, regional, classic or internal load balancer | 13–25 s after a resume, 37–41 s after a start (Compute Engine's part); through a regional load balancer 62 s from `POST /_dormeto/wake`, a classic one 2 min 16 s (a resume) | 600 s |
 | [Google Cloud: Cloud SQL databases](google-cloud-sql.md) | Activation policy `NEVER` after the application, `ALWAYS` before it | 9.2 min through the router with a `db-f1-micro` companion, 9.4 min for its start alone (one run each) | 1700 s |
 | [Google Cloud: Kubernetes on GKE](google-kubernetes-engine.md) | Deployment or StatefulSet behind standalone NEGs scaled to 0 | 13 s through the router on a Standard cluster, 9 s from the scale (one run each) | 600 s |
@@ -22,7 +23,7 @@ The Dormeto manager reads and acts on a Google Cloud router through the journal,
 A workload may combine backends: Auto Scaling groups and loose instances, an ECS service and its database, pods and
 their database. Databases are always companions of an application's backends. On Google Cloud a workload is a backend
 service of an Application Load Balancer, external or internal; its three pages are from router 0.37.0 but for the Compute Engine
-page's global load balancer, accepted on 2026-11-04, and say what was not run.
+page's global load balancer, accepted on 2026-11-04, and say what was not run; what they add of 0.38.0 to 0.40.0 is marked Not released yet: router 0.40.0.
 
 ## The cycle
 
@@ -153,5 +154,6 @@ the AWS Load Balancer Controller's defaults (15 s, 2 checks).
   or rarely used accounts may have a limit of 10.
 - **One router per account and region**, whose name has at most 15 characters.
 - **Timing.** Naps start on the 5-minute check. A wake waits for the first healthy target, not for full capacity.
-- **Wake timeout.** The manager's onboarding sets 600 s, 1800 s with a database and 300 s for Kubernetes. A workload
-  written with the Terraform `workload` module keeps 600 s unless `wake_timeout_seconds` is set.
+- **Wake timeout.** The built-in wake timeout is 600 s, Kubernetes included, and 1800 s for a workload with a database. The
+  manager's onboarding and the Terraform `workload` module leave it to the levels (a type, the router or the organization may
+  set another); `wake_timeout_seconds` on the module, or the onboarding's settings, set the workload's own.

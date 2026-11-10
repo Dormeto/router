@@ -1290,6 +1290,7 @@ export function createController({
   function pauseRecord({ by, reason, until, keepAsleep, exclusionId }) {
     const text = typeof reason === 'string' ? reason.trim() : '';
     if (!text || text.length > REASON_MAX) throw new Refusal('invalid', `reason required (1 to ${REASON_MAX} characters)`);
+    if (keepAsleep !== undefined && typeof keepAsleep !== 'boolean') throw new Refusal('invalid', 'keepAsleep must be true or false');
     let untilMs;
     if (until !== undefined && until !== null) {
       untilMs = typeof until === 'number' ? until : Date.parse(until);

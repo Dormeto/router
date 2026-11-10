@@ -189,6 +189,9 @@ export function createActions({ controller, onboarding, store, router, lists = [
     };
   }
 
+  // AWS's six keys (status.mjs): the wake mode is the status's own field, at the top.
+  const statusSettings = ({ wakeMode, ...six }) => six;
+
   // AWS's status (status.mjs, then the schedule's view): the REST Workload's fields, the row's, and AWS's status keys.
   async function status({ workloadId }) {
     const cfg = await onboarding.find(workloadId);
@@ -222,7 +225,7 @@ export function createActions({ controller, onboarding, store, router, lists = [
       ignoredTargets: [],
       recommendations: [],
       targets: [],
-      settings: shown.settings,
+      settings: statusSettings(shown.settings),
       settingsFrom: shown.settingsFrom,
       type: shown.type,
       stats,

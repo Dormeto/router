@@ -172,7 +172,7 @@ test('levelProblems names a key of Object\'s prototype an unknown setting, as an
     assert.deepEqual(levelProblems(settings, { level: 'router' }), [`unknown setting ${Object.keys(settings)[0]}`]);
     assert.deepEqual(levelProblems(settings, { level: 'workload', cfg: regional }), [`unknown setting ${Object.keys(settings)[0]}`]);
   }
-  assert.deepEqual(levelProblems({ constructor: 1, idleMinutes: 4 }, { level: 'router' }), ['unknown setting constructor', 'idleMinutes must be a whole number from 5 to 1440']);
+  assert.deepEqual(levelProblems({ constructor: 1, idleMinutes: 4 }, { level: 'router' }), ['unknown setting constructor', 'idleMinutes: must be a whole number from 5 to 1440']);
 });
 
 // --- The organization level (G2 §5.5): the manager's settings.json as the router holds it -------------------------------------------

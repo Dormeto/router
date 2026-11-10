@@ -565,6 +565,22 @@ test('a failed workload\'s next attempt on the page comes from its settings reso
   assert.match(res.body, /the start is retried, next attempt in 10 minutes\./);
 });
 
+test('the waiting page of a failed workload, and of a backoff (asleep with its failure), carries the failure and the next attempt in headers, as AWS\'s', async () => {
+  const clock = fakeClock();
+  const failure = JSON.stringify({ kind: 'capacity' });
+  for (const run of [{ state: STATES.FAILED, failedAt: clock.now(), consecutiveFailures: 1, failure }, { state: STATES.ASLEEP, failedAt: clock.now(), consecutiveFailures: 1, failure }]) {
+    const { handler } = setup({ run });
+    for (const res of [await handler(request()), await handler(request({ method: 'HEAD' }))]) {
+      assert.equal(headerOf(res, 'x-dormeto-failure'), 'capacity', run.state);
+      assert.equal(headerOf(res, 'x-dormeto-retry-at'), new Date(clock.now() + 60_000).toISOString(), run.state);
+    }
+  }
+  const { handler } = setup({ run: { state: STATES.AWAKE } });
+  const awake = await handler(request());
+  assert.equal(headerOf(awake, 'x-dormeto-failure'), undefined);
+  assert.equal(headerOf(awake, 'x-dormeto-retry-at'), undefined);
+});
+
 test('the pages of a workload not configured: the router\'s; Firestore unreadable: the built-in page, its levels not waited for', async () => {
   const { handler, store } = setup();
   pages(store, { router: { mode: 'template', title: 'Acme' } });

@@ -125,7 +125,7 @@ export function defaultsProblems(defaults, { workload = false } = {}) {
     if (value === null && (SCALAR_KEYS.includes(key) || RULE_KEYS.includes(key) || (workload && key === 'type'))) continue;
     if (SETTING_RANGES[key]) {
       const [min, max] = SETTING_RANGES[key];
-      if (!Number.isInteger(value) || value < min || value > max) problems.push(`${key} must be a whole number from ${min} to ${max}`);
+      if (!Number.isInteger(value) || value < min || value > max) problems.push(`${key}: must be a whole number from ${min} to ${max}`);
     } else if (key === 'wakeMode') {
       if (!WAKE_MODES.includes(value)) problems.push('wakeMode must be any or browser');
     } else if (RULE_KEYS.includes(key)) {

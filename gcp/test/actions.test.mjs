@@ -146,7 +146,10 @@ test('status: AWS\'s status keys, the Google Cloud resources instead of the targ
   assert.deepEqual([body.targetGroupArn, body.servingTargetGroupArn], [undefined, undefined]);
   // The REST Workload's fields, the same; the backends and the hibernation in AWS's shape.
   const rest = (await call('GET', '/v1/workloads/demo')).body;
-  for (const key of Object.keys(rest).filter((k) => k !== 'backends' && k !== 'hibernation')) assert.deepEqual(body[key], rest[key], key);
+  for (const key of Object.keys(rest).filter((k) => !['backends', 'hibernation', 'settings'].includes(k))) assert.deepEqual(body[key], rest[key], key);
+  // The status's settings are AWS's six: the wake mode is at the top.
+  const { wakeMode: _, ...six } = rest.settings;
+  assert.deepEqual(body.settings, six);
   assert.deepEqual(body.hibernation, { ...rest.hibernation, manager: { hibernate: false, readAt: iso(clock.now() - 1000), error: null }, instances: null, freshBoot: false });
   assert.deepEqual(body.backends, [{ kind: 'instance', id: 'vm-a', status: null, location: ZONE, resourceId: '1001' }]);
   assert.deepEqual([body.wakeMode, body.wakeRules, body.noWakeRules], [rest.settings.wakeMode, rest.wakeRules, rest.noWakeRules]);
@@ -185,6 +188,14 @@ test('status: each backend in AWS\'s kinds, a database a companion', async () =>
     { kind: 'k8s', id: `${ZONE}/shop/shop/Deployment/web`, status: null, cluster: `${ZONE}/shop`, namespace: 'shop', owner: { kind: 'Deployment', name: 'web' } },
     { kind: 'cloudsql-instance', id: 'db', status: null, companion: true },
   ]);
+});
+
+test('status: settings holds AWS\'s six keys, and wakeMode is at the top only', async () => {
+  const { call, act } = world();
+  await call('POST', '/v1/workloads', INPUT);
+  const { body } = await act({ action: 'status', workloadId: 'demo' });
+  assert.deepEqual(Object.keys(body.settings).sort(), ['drainSeconds', 'failedRetrySeconds', 'idleMinutes', 'maxHolders', 'waitSeconds', 'wakeTimeoutSeconds']);
+  assert.equal(typeof body.wakeMode, 'string');
 });
 
 test('status: an unknown workload is refused as not found, and without refusals answers the REST route\'s 404', async () => {

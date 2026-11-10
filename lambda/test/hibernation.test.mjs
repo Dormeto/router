@@ -97,7 +97,7 @@ test('parseManagerSettings reads the organization\'s defaults and types, drops w
   } }));
   assert.deepEqual([parsed.hibernate, parsed.joinMinutes, parsed.defaults, parsed.types], [false, 30, { waitSeconds: 20, wakeMode: 'browser' }, [api, { name: 'databases', settings: { idleMinutes: 45 } }]]);
   assert.deepEqual(parsed.problems, [
-    'workloads.defaults: idleMinutes must be a whole number from 5 to 1440',
+    'workloads.defaults: idleMinutes: must be a whole number from 5 to 1440',
     'workloads.types: type Bad: a name is lower-case letters, digits and hyphens, starting with a letter (at most 32)',
     'workloads.types: type Bad: tags must select at least one tag (key and value)',
   ]);
@@ -113,7 +113,7 @@ test('parseManagerSettings reads the organization\'s defaults and types, drops w
 
 test('settingsProblems: a router\'s defaults are checked as a level\'s', () => {
   assert.deepEqual(settingsProblems({ defaults: { idleMinutes: 30, noWakeRules: [{ name: 'h', pathPrefixes: ['/health'] }], waitSeconds: null } }), []);
-  assert.deepEqual(settingsProblems({ defaults: { idleMinutes: 1 } }), ['settings: defaults: idleMinutes must be a whole number from 5 to 1440']);
+  assert.deepEqual(settingsProblems({ defaults: { idleMinutes: 1 } }), ['settings: defaults: idleMinutes: must be a whole number from 5 to 1440']);
   assert.deepEqual(settingsProblems({ defaults: [] }), ['settings: defaults: settings must be an object']);
   assert.deepEqual(settingsProblems({ defaults: { type: 'api' } }), ['settings: defaults: unknown setting type']);
 });

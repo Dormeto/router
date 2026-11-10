@@ -273,6 +273,9 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], c
     const headers = {
       ...(napUntil ? { [NAP_UNTIL_HEADER]: napEndHeader(napUntil) } : {}),
       'cache-control': 'no-store', 'retry-after': String(pollSeconds), 'x-dormeto-state': state, 'content-type': 'text/html; charset=utf-8',
+      // As AWS's page: why the workload failed and when the next attempt is.
+      ...(failed.failure ? { 'x-dormeto-failure': failed.failure } : {}),
+      ...(retryAt !== null ? { 'x-dormeto-retry-at': new Date(retryAt).toISOString() } : {}),
       ...wakeHeaders(progress),
     };
     if (event.httpMethod === 'HEAD') return response(statusCode, headers);

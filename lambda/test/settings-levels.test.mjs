@@ -82,8 +82,8 @@ test('the effective configuration: resolved values in place, their sources, the 
 
 test('defaults are checked: ranges, wake mode, rules; null unsets; type only for a workload', () => {
   assert.deepEqual(defaultsProblems({ idleMinutes: 30, wakeMode: 'browser', noWakeRules: [rule('a')], waitSeconds: null }), []);
-  assert.match(defaultsProblems({ idleMinutes: 4 })[0], /idleMinutes must be a whole number from 5 to 1440/);
-  assert.match(defaultsProblems({ drainSeconds: 1.5 })[0], /drainSeconds must be a whole number from 0 to 300/);
+  assert.match(defaultsProblems({ idleMinutes: 4 })[0], /idleMinutes: must be a whole number from 5 to 1440/);
+  assert.match(defaultsProblems({ drainSeconds: 1.5 })[0], /drainSeconds: must be a whole number from 0 to 300/);
   assert.match(defaultsProblems({ wakeMode: 'never' })[0], /wakeMode must be any or browser/);
   assert.match(defaultsProblems({ noWakeRules: Array.from({ length: 21 }, (_, i) => rule(`r${i}`)) })[0], /noWakeRules: at most 20 rules/);
   assert.match(defaultsProblems({ wakeRules: [{ name: 'empty' }] })[0], /wakeRules: rule empty: no condition/);
@@ -103,7 +103,7 @@ test('types are checked: names, selectors, built-in names, their number', () => 
   assert.match(typesProblems([custom('api'), custom('api')])[0], /type api: named twice/);
   assert.match(typesProblems([custom('Bad_Name')])[0], /type Bad_Name: a name is lower-case letters, digits and hyphens/);
   assert.match(typesProblems([custom('api', {})])[0], /type api: tags must select at least one tag/);
-  assert.match(typesProblems([{ name: 'api', tags: { kind: 'x' }, settings: { idleMinutes: 1 } }])[0], /type api: settings: idleMinutes must be/);
+  assert.match(typesProblems([{ name: 'api', tags: { kind: 'x' }, settings: { idleMinutes: 1 } }])[0], /type api: settings: idleMinutes: must be/);
   assert.match(typesProblems(Array.from({ length: 21 }, (_, i) => custom(`t${i}`)))[0], /at most 20 custom types/);
   assert.match(typesProblems({})[0], /types must be a list/);
 });

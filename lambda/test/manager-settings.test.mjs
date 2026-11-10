@@ -251,7 +251,7 @@ test('the organization\'s defaults and types: mirrored, answered by current(); a
   s.s3.put('settings.json', { workloads: { hibernate: false, defaults: { idleMinutes: 20, waitSeconds: 1 } } });
   await s.settings.refresh();
   const current = await s.settings.current();
-  assert.deepEqual([current.defaults, current.types, current.error], [{ idleMinutes: 20 }, undefined, 'settings.json: workloads.defaults: waitSeconds must be a whole number from 5 to 120']);
+  assert.deepEqual([current.defaults, current.types, current.error], [{ idleMinutes: 20 }, undefined, 'settings.json: workloads.defaults: waitSeconds: must be a whole number from 5 to 120']);
 });
 
 test('a copy from before the defaults is read again in full: its ETag would hide them', async () => {

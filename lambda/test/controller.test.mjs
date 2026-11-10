@@ -2637,6 +2637,8 @@ test('refusals: a caller that understands them gets each one as an answer with i
   assert.deepEqual(await ask(manager, { action: 'tag', workloadId: 'demo', tags: { 'dormeto:x': '1' }, by: 'ops' }), refused('invalid', 'tag "dormeto:x": the dormeto: prefix is reserved'));
   assert.deepEqual(await ask(manager, { action: 'pause', workloadId: 'demo', by: 'ops', reason: ' ' }), refused('invalid', 'reason required (1 to 256 characters)'));
   assert.deepEqual(await ask(manager, { action: 'pause', workloadId: 'demo', by: 'ops', reason: 'x', until: 1 }), refused('invalid', 'until must be in the future, within 366 days'));
+  assert.deepEqual(await ask(manager, { action: 'pause', workloadId: 'demo', by: 'ops', reason: 'x', keepAsleep: 'yes' }), refused('invalid', 'keepAsleep must be true or false'));
+  assert.deepEqual(await ask(manager, { action: 'pause', by: 'ops', reason: 'x', keepAsleep: 1 }), refused('invalid', 'keepAsleep must be true or false'));
   assert.deepEqual(await ask(manager, { action: 'pause', workloadId: 'demo', by: 'ops', reason: 'x', targetGroupArn: 'arn:other' }), refused('not_found', 'workload not configured: demo (its target group is not arn:other)'));
   assert.deepEqual(await ask(manager, { action: 'waiting-page', op: 'move', workloadId: 'demo', by: 'ops' }), refused('invalid', 'unknown waiting-page op: move'));
   assert.deepEqual(await ask(manager, { action: 'waiting-page', op: 'put', workloadId: 'demo' }), refused('invalid', 'a put needs by: who sets the page'));
@@ -2649,7 +2651,7 @@ test('refusals: a caller that understands them gets each one as an answer with i
   manager.store.putConfig = async () => false;
   assert.deepEqual(await ask(manager, { action: 'rename', workloadId: 'demo', name: 'Shop', by: 'ops' }), refused('not_found', 'workload not configured: demo'));
   const said = logged.filter(([event]) => event === 'Refused');
-  assert.equal(said.length, 15);
+  assert.equal(said.length, 17);
   assert.deepEqual(said[0][1], { action: 'status', workloadId: 'nope', code: 'not_found', message: 'workload not configured: nope' });
   assert.deepEqual(said.at(-6)[1], { action: 'dance', workloadId: null, code: 'unsupported', message: 'unknown action: dance' });
 });
@@ -2747,7 +2749,7 @@ test('settings at scale: the router\'s defaults from the manager, merged with wh
   // Hibernate and the join leave the defaults as they are, and the other way round.
   await s.handler({ action: 'settings', settings: { hibernate: false }, by: 'ana' });
   assert.deepEqual(await s.store.getRouterSettings(), { hibernate: false, defaults: { wakeMode: 'browser', waitSeconds: 20 }, by: 'ana', at: s.clock.now() });
-  assert.deepEqual(await s.handler({ action: 'settings', settings: { defaults: { idleMinutes: 1 } }, by: 'ana' }), { problems: ['settings: defaults: idleMinutes must be a whole number from 5 to 1440'] });
+  assert.deepEqual(await s.handler({ action: 'settings', settings: { defaults: { idleMinutes: 1 } }, by: 'ana' }), { problems: ['settings: defaults: idleMinutes: must be a whole number from 5 to 1440'] });
   const cleared = await s.handler({ action: 'settings', settings: { defaults: null }, by: 'ana' });
   assert.equal('defaults' in cleared.settings, false);
   assert.deepEqual(await s.store.getRouterSettings(), { hibernate: false, by: 'ana', at: s.clock.now() });
@@ -2780,7 +2782,7 @@ test('settings at scale: a manager workload\'s own settings and type; null gives
   assert.deepEqual([stored.idleMinutes, stored.inherits.sort(), 'type' in stored, stored.noWakeRules], [15, ['idleMinutes', 'wakeMode'], false, []]);
   assert.equal('hibernate' in stored, false, 'hibernate untouched when not sent');
   assert.deepEqual(await s.handler({ action: 'settings', workloadId: 'demo', settings: { idleMinutes: 4, type: 'Bad' }, by: 'ops' }), { problems: [
-    'settings: idleMinutes must be a whole number from 5 to 1440', 'settings: type must be a type\'s name (lower-case letters, digits and hyphens) or null',
+    'settings: idleMinutes: must be a whole number from 5 to 1440', 'settings: type must be a type\'s name (lower-case letters, digits and hyphens) or null',
   ] });
   assert.deepEqual(await s.handler({ action: 'settings', workloadId: 'demo', settings: { defaults: {} }, by: 'ops' }), { problems: ['settings: unknown setting defaults'] });
 });

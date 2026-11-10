@@ -11,6 +11,10 @@
 //   workloads.go:905-927: an offboarding that cannot wake the workload is the reason `wake-failed` (a 409, its `error` shown whole), and
 //     with `?force=true` answers `left` (backends) and `notGivenBack`; workloads.go:1069-1072: a workload the router does not hold is a
 //     404 with the reason `not-found` (any other 404 is not the controller's).
+//   workloads.go:143-144 (lbRef): `lb.kind` and, of a regional workload, `lb.region`.
+//   workloads_schedule.go:55-75 and :153-154: the schedule's answer, `schedule` (`timeZone`, `windows`, `exceptions`, `maxNapDays`, `by`, `at`)
+//     and `nextEvents` (`at`, `kind`, `window`); internal/schedule/window.go:23-32 the windows' `kind`, `days`, `start`, `end`, and :239-242
+//     the answer's `joinMinutes`, `joinFrom`, `joinInherited` (schedule.Join, embedded).
 //   workloads_schedule.go:218-224: `paused` is `by`, `at`, `reason`, `until` (a string or null), `keepAsleep`.
 //   workloads.go:350-356 and uninstall.go:40-41: the list's rows are Workloads (`id`, `state`, `backendService`, `paused`).
 //   router.go:636-641: GET /v1/health answers `version`.
@@ -19,7 +23,7 @@ import assert from 'node:assert/strict';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { createActions } from '../src/actions.mjs';
 import { createControllerApi } from '../src/controller.mjs';
-import { CLUSTER, GKE_INPUT, INPUT, K8S_BACKEND, V1, ZONE, onGke, setup } from './world.mjs';
+import { CLUSTER, GKE_INPUT, INPUT, K8S_BACKEND, REGION, V1, ZONE, onGke, regional, setup } from './world.mjs';
 
 const request = (method, url, body = '') => {
   const stream = (async function* chunks() { if (body) yield Buffer.from(body); }());
@@ -156,4 +160,38 @@ test('CLI 0.11.0: /v1/health answers the version, and a bad request is { error, 
   assert.equal(typeof (await call('GET', '/v1/health')).body.version, 'string');
   const bad = await call('POST', '/v1/workloads', { ...INPUT, id: 'Bad_ID' });
   assert.deepEqual([bad.status, bad.body.reason, typeof bad.body.error], [400, 'bad-request', 'string']);
+});
+
+test('CLI 0.11.0: a regional workload names its region beside the kind of its load balancer', async () => {
+  const { call } = api(regional);
+  const dry = (await call('POST', '/v1/workloads?dryRun=true', { ...INPUT, loadBalancer: 'regional' })).body;
+  assert.deepEqual(dry.lb, { kind: 'regional', region: REGION });
+  const onboarded = await call('POST', '/v1/workloads', { ...INPUT, loadBalancer: 'regional' });
+  assert.equal(onboarded.status, 200, JSON.stringify(onboarded.body));
+  assert.deepEqual(onboarded.body.lb, { kind: 'regional', region: REGION });
+  assert.deepEqual((await call('GET', '/v1/workloads/demo')).body.lb, { kind: 'regional', region: REGION });
+});
+
+test('CLI 0.11.0: the schedule put and get: schedule (timeZone, windows, exceptions, maxNapDays, by, at), nextEvents (at, kind, window) and the join fields', async () => {
+  const { call } = api();
+  await call('POST', '/v1/workloads', INPUT);
+  const windows = [{ kind: 'nap', days: ['sat', 'sun'], start: '20:00', end: '08:00' }];
+  const put = await call('PUT', '/v1/workloads/demo/schedule', { timeZone: 'Europe/Paris', windows, maxNapDays: 7, by: 'ann' });
+  assert.equal(put.status, 200, JSON.stringify(put.body));
+  for (const answer of [put.body, (await call('GET', '/v1/workloads/demo/schedule')).body]) {
+    const { schedule, nextEvents } = answer;
+    assert.deepEqual([schedule.timeZone, schedule.maxNapDays, schedule.by], ['Europe/Paris', 7, 'ann']);
+    assert.equal(typeof schedule.at, 'string');
+    assert.deepEqual(schedule.windows.map(({ kind, days, start, end }) => ({ kind, days, start, end })), windows);
+    assert.ok(schedule.exceptions === undefined || schedule.exceptions === null || Array.isArray(schedule.exceptions));
+    assert.ok(nextEvents.length > 0);
+    for (const event of nextEvents) {
+      assert.equal(typeof event.at, 'string');
+      assert.ok(['nap-start', 'nap-end', 'awake-start', 'awake-end'].includes(event.kind), event.kind);
+      assert.equal(Number.isInteger(event.window), true);
+    }
+    assert.ok(Object.hasOwn(answer, 'joinMinutes'), 'joinMinutes');
+  }
+  assert.equal((await call('DELETE', '/v1/workloads/demo/schedule')).status, 200);
+  assert.equal((await call('GET', '/v1/workloads/demo/schedule')).body.schedule, null);
 });

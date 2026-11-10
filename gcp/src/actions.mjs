@@ -336,7 +336,6 @@ export function createActions({ controller, onboarding, store, router, lists = [
   // answers 409 with these words); the page's other problems, AWS's answer.
   async function waitingPage({ op, workloadId = null, page, by }) {
     if (workloadId !== null && (typeof workloadId !== 'string' || !workloadId)) throw invalid('workloadId must be the id of a workload');
-    if (op === 'put' && (typeof by !== 'string' || !by)) throw invalid('a put needs by: who sets the page');
     const answer = await problemsAnswered(() => onboarding.waitingPage(workloadId === null ? 'router' : { workloadId }, { op, page, by }));
     if (answer.problems?.includes(CUSTOM_PAGES_REFUSED)) throw new Refusal(409, 'custom-pages-off', CUSTOM_PAGES_REFUSED);
     return answer;

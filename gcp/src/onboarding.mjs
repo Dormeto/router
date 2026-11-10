@@ -177,20 +177,22 @@ function routerProblems(settings) {
   ];
 }
 
-function fallbackTypesProblems(types) {
-  if (!Array.isArray(types)) return ['fallbackInstanceTypes: must be a list of machine type names'];
+// `field` is what the caller sent: `fallbackInstanceTypes`, or AWS's `settings: fallbackInstanceTypes`. One text for a list that is not
+// one or is too long, as AWS's onboarder's, with the hint.
+function fallbackTypesProblems(types, field = 'fallbackInstanceTypes') {
+  if (!Array.isArray(types) || types.length > FALLBACK_TYPES_MAX) return [`${field}: must be a list of at most ${FALLBACK_TYPES_MAX} machine types, such as e2-medium`];
   return [
-    ...(types.length > FALLBACK_TYPES_MAX ? [`fallbackInstanceTypes: must be at most ${FALLBACK_TYPES_MAX} machine types`] : []),
-    ...types.filter((t) => typeof t !== 'string' || !MACHINE_TYPE.test(t)).map((t) => `fallbackInstanceTypes: ${JSON.stringify(t)} is not a machine type name`),
-    ...[...new Set(types.filter((t, i) => types.indexOf(t) !== i))].map((t) => `fallbackInstanceTypes: ${t} is named twice`),
+    ...types.filter((t) => typeof t !== 'string' || !MACHINE_TYPE.test(t)).map((t) => `${field}: ${JSON.stringify(t)} is not a machine type name`),
+    ...[...new Set(types.filter((t, i) => types.indexOf(t) !== i))].map((t) => `${field}: ${t} is named twice`),
   ];
 }
 
-function cloudSqlProblems(cloudSql) {
-  if (!Array.isArray(cloudSql)) return ['cloudSql: must be a list of Cloud SQL instance names'];
+// `field` is `cloudSql` (the CLI's) or `databases` (AWS's), whichever the caller sent.
+function cloudSqlProblems(cloudSql, field = 'cloudSql') {
+  if (!Array.isArray(cloudSql)) return [`${field}: must be a list of Cloud SQL instance names`];
   return [
-    ...cloudSql.filter((name) => typeof name !== 'string' || !INSTANCE_NAME.test(name)).map((name) => `cloudSql: ${JSON.stringify(name)} is not a Cloud SQL instance name`),
-    ...[...new Set(cloudSql.filter((name, i) => cloudSql.indexOf(name) !== i))].map((name) => `cloudSql: ${name} is named twice`),
+    ...cloudSql.filter((name) => typeof name !== 'string' || !INSTANCE_NAME.test(name)).map((name) => `${field}: ${JSON.stringify(name)} is not a Cloud SQL instance name`),
+    ...[...new Set(cloudSql.filter((name, i) => cloudSql.indexOf(name) !== i))].map((name) => `${field}: ${name} is named twice`),
   ];
 }
 
@@ -245,6 +247,10 @@ function oneOf(first, second, firstName, secondName) {
   return first;
 }
 
+// A pause as the controller shows it (controller-core.mjs's `shown`, which names the router's scope only), with AWS's `scope` on every one: the
+// workload's or the router's. The API's Workload and the manager's rows and status read the same pause through this.
+export const scoped = (pause) => ({ scope: pause.scope ?? 'workload', ...pause });
+
 // The API's Workload. `awakeSince` is a time the CLI prints, and left on the run by a nap. `workloadId` beside `id` (AWS's name beside the CLI's); `pauses`: its active pauses, as AWS's rows list them, and `paused` the first (the CLI's). `companionsGone`:
 // the Cloud SQL instances named at its onboarding that no longer exist, as last read. `napAborted`: why the last nap was given up and
 // when, until a nap commits. `beatAt`: the running wake's or nap's last heartbeat (heartbeat.mjs), WAKING or NAPPING only. `idleReads`:
@@ -258,7 +264,8 @@ function workloadOf(cfg, pauses, run, { router = null, organization = null } = {
   const beatAt = run ? beatOf(run) : undefined;
   const effective = effectiveOf(cfg, { run, router, organization });
   const { settings, settingsFrom, type } = resolvedSettings(effective);
-  const [paused] = pauses;
+  const shownPauses = pauses.map(scoped);
+  const [paused] = shownPauses;
   return {
     workloadId: cfg.workloadId,
     id: cfg.workloadId,
@@ -283,7 +290,7 @@ function workloadOf(cfg, pauses, run, { router = null, organization = null } = {
     ...(run?.state === STATES.AWAKE && run.awakeSince !== undefined ? { awakeSince: isoOf(run.awakeSince) } : {}),
     ...(run?.lastWake ? { lastWake: run.lastWake } : {}),
     ...(failure ? { failure } : {}),
-    pauses,
+    pauses: shownPauses,
     ...(paused ? { paused } : {}),
     ...(run?.companionsGone?.length ? { companionsGone: run.companionsGone } : {}),
     ...(run?.napAborted ? { napAborted: { reason: run.napAborted.reason, at: isoOf(run.napAborted.at) } } : {}),
@@ -318,7 +325,11 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     const { fallbackInstanceTypes: inSettings, ...ownSettings } = isObject(settings) ? settings : {};
     if (isObject(settings)) settings = ownSettings;
     const fallbackInstanceTypes = oneOf(inSettings, topFallbackTypes, 'settings.fallbackInstanceTypes', 'fallbackInstanceTypes');
-    const cloudSql = oneOf(databaseNames(databases), cloudSqlAsked, 'databases', 'cloudSql') ?? [];
+    const fallbackField = inSettings !== undefined ? 'settings: fallbackInstanceTypes' : 'fallbackInstanceTypes';
+    // A null is not none: it is refused, as it was before the two names.
+    const databasesAsked = oneOf(databaseNames(databases), cloudSqlAsked, 'databases', 'cloudSql');
+    const databasesField = databases !== undefined ? 'databases' : 'cloudSql';
+    const cloudSql = databasesAsked === undefined ? [] : databasesAsked;
     if (!urlMap || !backendService) throw bad('urlMap and backendService are needed');
     for (const [key, value] of Object.entries({ urlMap, backendService })) {
       if (typeof value !== 'string' || !NAME.test(value)) throw bad(`${key}: ${JSON.stringify(value)} is not a Compute Engine name`);
@@ -333,7 +344,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     const tagged = tags === undefined ? null : tagsProblem(tags);
     if (tagged) throw bad(tagged);
     if (source !== 'cli' && source !== 'manager') throw bad('source: cli or manager');
-    const problems = [...onboardSettingsProblems(settings), ...cloudSqlProblems(cloudSql), ...(requestLogs === undefined ? [] : requestLogsProblems(requestLogs)), ...(fallbackInstanceTypes === undefined ? [] : fallbackTypesProblems(fallbackInstanceTypes)), ...(gkeAsked === undefined ? [] : gkeProblems(gkeAsked, { needsAll }))];
+    const problems = [...onboardSettingsProblems(settings), ...(databasesAsked === undefined ? [] : cloudSqlProblems(cloudSql, databasesField)), ...(requestLogs === undefined ? [] : requestLogsProblems(requestLogs)), ...(fallbackInstanceTypes === undefined ? [] : fallbackTypesProblems(fallbackInstanceTypes, fallbackField)), ...(gkeAsked === undefined ? [] : gkeProblems(gkeAsked, { needsAll }))];
     if (problems.length) throw bad(problems.join('; '));
     return { id: workloadId, name: checkedName.name || undefined, tags, source, urlMap, backendService, settings, loadBalancer, cloudSql, gkeAsked, requestLogs, fallbackTypes: fallbackInstanceTypes ?? [], by: by ? String(by) : undefined };
   }
@@ -826,7 +837,12 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
       throw err;
     }
     log.info('Onboarded', { workloadId: id, urlMap, backendService, by: by ?? 'unknown' });
-    return { workload: workloadOf(cfg, [], await store.getRun(id), above), steps };
+    // The router's pause is shown; one that cannot be read leaves the answer of an onboarding that is done, as a list's rows do.
+    const pauses = await core.pausesFor(id).catch((err) => {
+      log.warn('PausesUnreadable', { workloadId: id, error: err.message });
+      return [];
+    });
+    return { workload: workloadOf(cfg, pauses, await store.getRun(id), above), steps };
   }
 
   // The configuration, or a 400 or a 404.
@@ -1134,13 +1150,14 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   // and the SHA-256 of a custom page, never the page.
   async function waitingPage(level, { op, page, by } = {}) {
     const workloadId = level === 'router' ? null : level.workloadId;
+    // As AWS's: who sets the page is asked before the workload is looked up.
+    if (op === 'put' && (typeof by !== 'string' || !by)) throw bad('a put needs by: who sets the page');
     if (workloadId !== null) await find(workloadId);
     const fields = { level: workloadId ? 'workload' : 'router', workloadId, by: by ?? 'unknown' };
     switch (op) {
       case 'get':
         break;
       case 'put': {
-        if (typeof by !== 'string' || !by) throw bad('a put needs by: who sets the page');
         const problems = [...(page?.mode === 'custom' && !customPages ? [CUSTOM_PAGES_REFUSED] : []), ...validatePage(page)];
         if (problems.length) throw refusedSettings(problems);
         await store.putWaitingPage(level, page, { by: fields.by, at: now() });

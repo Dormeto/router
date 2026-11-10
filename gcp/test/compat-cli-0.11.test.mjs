@@ -7,6 +7,10 @@
 //     a tag binding's parent), and a k8s one's `cluster`, `namespace`, `service`, `owner`.
 //   workloads.go:117-153: the dry run, `eligible`, `reasons`, `vms` (Zone, Name, ID), `groups` (Kind, Location, Name, ID), `lb`, `databases`
 //     (`name`, `replicas`), `gke` (`namespace`, `service`, `autopilot`).
+//   workloads.go:429-446 (moves): nap and wake answer a Workload, read for `id` and `state`.
+//   workloads.go:1164-1175 (backend.target), install.go:45 (regionPattern) and :60-71: a group's `location` is a zone or, of a regional group, a region (the CLI tells
+//     them by shape) with its `id`: the path of the tag binding an offboarding removes.
+//   workloads_schedule.go:314-321 (resumeWorkload): resume answers a Workload, read for `id` and `paused` (absent once resumed).
 //   workloads.go:458-465: the onboarding request: `urlMap`, `backendService`, `id`, `settings`, `loadBalancer`, `cloudSql` (a list of names).
 //   workloads.go:905-927: an offboarding that cannot wake the workload is the reason `wake-failed` (a 409, its `error` shown whole), and
 //     with `?force=true` answers `left` (backends) and `notGivenBack`; workloads.go:1069-1072: a workload the router does not hold is a
@@ -46,6 +50,11 @@ const withMig = (w) => {
   w.managed.mig = { kind: 'zonal', location: ZONE, id: '2001', members: ['mig-1'] };
   w.vms['mig-1'] = { id: '3001', status: 'RUNNING' };
   w.services.app.backends = [{ group: `${V1}/zones/${ZONE}/instanceGroups/mig` }];
+};
+const withRegionalMig = (w) => {
+  w.managed.mig = { kind: 'regional', location: REGION, id: '2002', members: ['mig-1'], updatePolicy: { instanceRedistributionType: 'NONE' } };
+  w.vms['mig-1'] = { id: '3001', status: 'RUNNING', zone: ZONE };
+  w.services.app.backends = [{ group: `${V1}/regions/${REGION}/instanceGroups/mig` }];
 };
 const withDatabase = (w) => { w.sql.db1 = {}; };
 
@@ -194,4 +203,45 @@ test('CLI 0.11.0: the schedule put and get: schedule (timeZone, windows, excepti
   }
   assert.equal((await call('DELETE', '/v1/workloads/demo/schedule')).status, 200);
   assert.equal((await call('GET', '/v1/workloads/demo/schedule')).body.schedule, null);
+});
+
+test('CLI 0.11.0: nap and wake answer a Workload with its id and its state', async () => {
+  const { call, store } = api();
+  await call('POST', '/v1/workloads', INPUT);
+  const nap = await call('POST', '/v1/workloads/demo/nap');
+  assert.equal(nap.status, 200);
+  assertWorkload(nap.body, 'demo');
+  assert.equal(typeof nap.body.state, 'string');
+  store.runs.get('demo').state = STATES.ASLEEP;
+  const wake = await call('POST', '/v1/workloads/demo/wake');
+  assert.equal(wake.status, 200);
+  assertWorkload(wake.body, 'demo');
+  assert.equal(wake.body.state, STATES.WAKING);
+});
+
+test('CLI 0.11.0: resume answers a Workload with its id, and paused only while a pause holds', async () => {
+  const { call } = api();
+  await call('POST', '/v1/workloads', INPUT);
+  await call('POST', '/v1/workloads/demo/pause', { reason: 'load test', by: 'ops' });
+  const resumed = await call('POST', '/v1/workloads/demo/resume', { by: 'ops' });
+  assert.equal(resumed.status, 200);
+  assertWorkload(resumed.body, 'demo');
+  assert.equal(resumed.body.paused, undefined);
+  // The router's pause is still one: the CLI says the workload is still paused.
+  await call('POST', '/v1/pause', { reason: 'maintenance', by: 'adm' });
+  const held = await call('POST', '/v1/workloads/demo/resume', { by: 'ops' });
+  assertWorkload(held.body, 'demo');
+  assert.equal(typeof held.body.paused.by, 'string');
+});
+
+test('CLI 0.11.0: a regional group\'s backend names its region as its location, with its id, for the tag binding\'s path', async () => {
+  const { call } = api(withRegionalMig);
+  const group = (await call('POST', '/v1/workloads?dryRun=true', INPUT)).body.groups;
+  assert.deepEqual(group.map((g) => [g.kind, g.location, g.name, g.id]), [['regional', REGION, 'mig', '2002']]);
+  const workload = (await call('POST', '/v1/workloads', INPUT)).body;
+  assertWorkload(workload, 'demo');
+  assert.deepEqual(workload.backends, [{ kind: 'mig', location: REGION, name: 'mig', id: '2002' }]);
+  // The CLI tells a region from a zone by its shape: a zone ends with a letter after the region's name.
+  assert.match(workload.backends[0].location, /^[a-z]+-[a-z]+\d+$/);
+  assert.deepEqual((await call('GET', '/v1/workloads/demo')).body.backends, workload.backends);
 });

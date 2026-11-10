@@ -312,13 +312,13 @@ test('bad input is a 400 before any read', async () => {
     [{ ...INPUT, settings: { waitSeconds: 0 } }, /settings: waitSeconds is 0 on Google Cloud/],
     [{ ...INPUT, settings: { maxHolders: 0 } }, /settings: maxHolders is 0 on Google Cloud: no request is held/],
     [{ ...INPUT, settings: { drainSeconds: 30 } }, /settings: drainSeconds is 0 on Google Cloud/],
-    [{ ...INPUT, settings: { wakeTimeoutSeconds: 59 } }, /settings: wakeTimeoutSeconds: must be a whole number from 60 to 3600/],
-    [{ ...INPUT, settings: { wakeTimeoutSeconds: 1701 } }, /settings: wakeTimeoutSeconds must be at most 1700: one controller request lasts at most 1800 s/],
+    [{ ...INPUT, settings: { wakeTimeoutSeconds: 59 } }, /settings: wakeTimeoutSeconds: must be a whole number from 60 to 1700/],
+    [{ ...INPUT, settings: { wakeTimeoutSeconds: 1701 } }, /settings: wakeTimeoutSeconds: must be a whole number from 60 to 1700/],
     [{ ...INPUT, settings: { failedRetrySeconds: 5 } }, /settings: failedRetrySeconds: must be a whole number from 10 to 600/],
-    [{ ...INPUT, settings: { wakeMode: 'sometimes' } }, /settings: wakeMode must be any or browser/],
+    [{ ...INPUT, settings: { wakeMode: 'sometimes' } }, /settings: wakeMode: must be any or browser/],
     [{ ...INPUT, settings: { noWakeRules: Array.from({ length: 21 }, (_, i) => ({ name: `r${i}`, pathPrefixes: ['/x'] })) } }, /settings: noWakeRules: at most 20 rules/],
     [{ ...INPUT, settings: { wakeRules: [{ name: 'bad', pathPattern: '(' }] } }, /settings: wakeRules: rule bad: /],
-    [{ ...INPUT, settings: { type: 'Not A Type' } }, /settings: type must be a type's name/],
+    [{ ...INPUT, settings: { type: 'Not A Type' } }, /settings: type: must be a type's name/],
     // The fallback types are a top-level field of the body or, as AWS's, in the settings (R13): not a setting of the levels.
     [{ ...INPUT, settings: { joinMinutes: 15 } }, /settings: unknown setting joinMinutes/],
     [{ ...INPUT, loadBalancer: 'internal-self-managed' }, /loadBalancer: "internal-self-managed" is not global, regional, classic, internal or cross-region-internal/],
@@ -1731,15 +1731,21 @@ test('an instance another workload holds is refused, naming it', async () => {
   assert.match(reasons.join('; '), /Cloud SQL instance db belongs to workload first/);
 });
 
-for (const [title, cloudSql, words] of [
-  ['a name asked twice', ['db', 'db'], /cloudSql: db is named twice/],
-  ['not a list', 'db', /cloudSql: must be a list of Cloud SQL instance names/],
-  ['a name that is not one', ['Bad_Name'], /cloudSql: "Bad_Name" is not a Cloud SQL instance name/],
-  ['a name that is no string', [1], /cloudSql: 1 is not a Cloud SQL instance name/],
+// The problem names the field the caller sent: `cloudSql` (the CLI's) or `databases` (AWS's), and a null is refused, not read as none.
+for (const [title, key, value, words] of [
+  ['a name asked twice', 'cloudSql', ['db', 'db'], /^cloudSql: db is named twice$/],
+  ['not a list', 'cloudSql', 'db', /^cloudSql: must be a list of Cloud SQL instance names$/],
+  ['a null', 'cloudSql', null, /^cloudSql: must be a list of Cloud SQL instance names$/],
+  ['a name that is not one', 'cloudSql', ['Bad_Name'], /^cloudSql: "Bad_Name" is not a Cloud SQL instance name$/],
+  ['a name that is no string', 'cloudSql', [1], /^cloudSql: 1 is not a Cloud SQL instance name$/],
+  ['a name asked twice, as databases', 'databases', ['db', 'db'], /^databases: db is named twice$/],
+  ['not a list, as databases', 'databases', 'db1', /^databases: must be a list of Cloud SQL instance names$/],
+  ['a null, as databases', 'databases', null, /^databases: must be a list of Cloud SQL instance names$/],
+  ['a name that is not one, as databases', 'databases', ['Bad_Name'], /^databases: "Bad_Name" is not a Cloud SQL instance name$/],
 ]) {
-  test(`cloudSql: ${title} is a 400 before any read`, async () => {
+  test(`${key}: ${title} is a 400 before any read, naming ${key}`, async () => {
     const { w, onboarding } = setup(withSql());
-    for (const call of [onboarding.dryRun, onboarding.onboard]) await assert.rejects(call({ ...INPUT, cloudSql }), refused(400, 'bad-request', words));
+    for (const call of [onboarding.dryRun, onboarding.onboard]) await assert.rejects(call({ ...INPUT, [key]: value }), refused(400, 'bad-request', words));
     assert.equal(w.used.size, 0);
   });
 }
@@ -2472,7 +2478,7 @@ test('PUT settings: what a level refuses is a 400 with the problems, nothing wri
     [setup, { wakeMode: 'any' }, [`settings: ${BROWSER_ONLY}`]],
     [() => setup(regional), { wakeTimeoutSeconds: 120 }, ['settings: wakeTimeoutSeconds 120 is too short for a regional load balancer: its wake includes the URL map\'s change, 100 s: use more than 160']],
     [() => setup(internal), { wakeTimeoutSeconds: 90 }, ['settings: wakeTimeoutSeconds 90 is too short for an internal load balancer: its wake includes the URL map\'s change, 30 s: use more than 90']],
-    [setup, { wakeTimeoutSeconds: 1800 }, ['settings: wakeTimeoutSeconds must be at most 1700: one controller request lasts at most 1800 s']],
+    [setup, { wakeTimeoutSeconds: 1800 }, ['settings: wakeTimeoutSeconds: must be a whole number from 60 to 1700']],
     [setup, { joinMinutes: 10 }, ['settings: a workload\'s joinMinutes is on its schedule']],
     [setup, { hibernate: 'yes' }, ['settings: hibernate must be true, false or null']],
     [setup, { fallbackInstanceTypes: ['e2-medium'] }, ['settings: unknown setting fallbackInstanceTypes']],
@@ -2599,10 +2605,10 @@ test('PUT the router level: what it refuses is a 400 with the problems, nothing 
   const { store, onboarding } = setup();
   const cases = [
     [{ defaults: { waitSeconds: 30 } }, [`settings: defaults: ${WAIT_FIXED}`]],
-    [{ defaults: { wakeTimeoutSeconds: 1800 } }, ['settings: defaults: wakeTimeoutSeconds must be at most 1700: one controller request lasts at most 1800 s']],
+    [{ defaults: { wakeTimeoutSeconds: 1800 } }, ['settings: defaults: wakeTimeoutSeconds: must be a whole number from 60 to 1700']],
     [{ defaults: { type: 'asg' } }, ['settings: defaults: unknown setting type']],
     [{ hibernate: 'yes' }, ['settings: hibernate must be true, false or null']],
-    [{ joinMinutes: 7 }, ['settings: joinMinutes must be a whole number from 0 to 120, a multiple of 5, or null']],
+    [{ joinMinutes: 7 }, ['settings: joinMinutes: must be a whole number from 0 to 120, a multiple of 5, or null']],
     [{ idleMinutes: 30 }, ['settings: unknown setting idleMinutes']],
   ];
   for (const [body, problems] of cases) {
@@ -2655,6 +2661,12 @@ test('waiting page: a put says who sets it, and without by is refused; the log h
   ]);
   assert.equal(JSON.stringify(w.logs).includes('data-dormeto'), false);
   await assert.rejects(onboarding.waitingPage('router', { op: 'put', page: { mode: 'template', title: 'Acme' } }), refused(400, 'bad-request', /a put needs by/));
+});
+
+test('waiting page: a put without by is refused before the workload is looked up, as AWS\'s: the same answer for an unknown workload', async () => {
+  const { onboarding } = setup();
+  await assert.rejects(onboarding.waitingPage({ workloadId: 'nobody' }, { op: 'put', page: { mode: 'template', title: 'Acme' } }), refused(400, 'bad-request', /^a put needs by: who sets the page$/));
+  await assert.rejects(onboarding.waitingPage({ workloadId: 'nobody' }, { op: 'put', page: { mode: 'template', title: 'Acme' }, by: 'ops' }), refused(404, 'not-found', /nobody/));
 });
 
 test('waiting page: a custom put without the switch is a 400 with the verbatim text, nothing written; with it, stored and shown', async () => {
@@ -2772,12 +2784,12 @@ test('dry run: a VM of a series outside the list refuses a type of another serie
 });
 
 const FALLBACK_REFUSALS = [
-  ['more than 5 types', ['e2-medium', 'e2-standard-2', 'e2-standard-4', 'e2-standard-8', 'e2-standard-16', 'e2-highmem-2'], /fallbackInstanceTypes: must be at most 5 machine types/],
+  ['more than 5 types', ['e2-medium', 'e2-standard-2', 'e2-standard-4', 'e2-standard-8', 'e2-standard-16', 'e2-highmem-2'], /^fallbackInstanceTypes: must be a list of at most 5 machine types, such as e2-medium$/],
   ['a type named twice', ['e2-medium', 'e2-medium'], /fallbackInstanceTypes: e2-medium is named twice/],
   ['the VM\'s own type', ['e2-small'], /fallbackInstanceTypes: e2-small is the type of VM vm-a/],
   ['a type that is not in the zone', ['e2-nothere'], /fallback machine type e2-nothere does not exist in zone/],
   ['a name that is no machine type', ['E2 Medium'], /fallbackInstanceTypes: "E2 Medium" is not a machine type name/],
-  ['not a list', 'e2-medium', /fallbackInstanceTypes: must be a list of machine type names/],
+  ['not a list', 'e2-medium', /^fallbackInstanceTypes: must be a list of at most 5 machine types, such as e2-medium$/],
 ];
 for (const [name, list, message] of FALLBACK_REFUSALS) {
   const reason = /does not exist|is the type of/.test(message.source) ? 'not-eligible' : 'bad-request';
@@ -2787,6 +2799,18 @@ for (const [name, list, message] of FALLBACK_REFUSALS) {
     assert.deepEqual(w.changes, []);
   });
 }
+
+// The problem starts with the field the caller sent: settings.fallbackInstanceTypes is AWS's, its problems start `settings: `.
+test('fallback machine types: a problem with settings.fallbackInstanceTypes starts with settings: , as AWS\'s onboarder\'s', async () => {
+  const { onboarding } = setup(withTypes('e2-medium'));
+  for (const [list, message] of [
+    ['e2-medium', 'settings: fallbackInstanceTypes: must be a list of at most 5 machine types, such as e2-medium'],
+    [['e2-medium', 'e2-medium'], 'settings: fallbackInstanceTypes: e2-medium is named twice'],
+    [['E2 Medium'], 'settings: fallbackInstanceTypes: "E2 Medium" is not a machine type name'],
+  ]) {
+    await assert.rejects(onboarding.onboard({ ...INPUT, settings: { fallbackInstanceTypes: list } }), refused(400, 'bad-request', new RegExp(`^${message.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`)));
+  }
+});
 
 test('fallback machine types: a type with an accelerator is refused', async () => {
   const { onboarding } = setup((w) => { w.machineTypes['n1-gpu'] = { name: 'n1-gpu', memoryMb: 4096, accelerators: [{ guestAcceleratorCount: 1 }] }; });

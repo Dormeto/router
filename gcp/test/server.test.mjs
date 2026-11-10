@@ -44,7 +44,7 @@ test('serve: a handler that throws → 500, logged, with nothing of the error in
   const url = await serving(t, async () => { throw new Error('Google: secret detail'); }, { ...silentLog, error: (event, fields) => logged.push({ event, ...fields }) });
   const res = await fetch(`${url}/_dormeto/wake?token=abc`);
   assert.equal(res.status, 500);
-  assert.deepEqual(await res.json(), { error: 'internal error', reason: 'see the logs' });
+  assert.deepEqual(await res.json(), { error: 'internal error', reason: 'internal-error' });
   assert.deepEqual(logged, [{ event: 'RequestFailed', method: 'GET', path: '/_dormeto/wake', error: 'Google: secret detail' }]);
 });
 

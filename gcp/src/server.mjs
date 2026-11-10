@@ -19,7 +19,7 @@ export function serve(handler, { port, log }) {
       answer = await handler(request);
     } catch (err) {
       log.error('RequestFailed', { method: request.method, path: request.url.split('?')[0], error: err.message });
-      answer = response(500, { 'cache-control': 'no-store', 'content-type': 'application/json' }, JSON.stringify({ error: 'internal error', reason: 'see the logs' }));
+      answer = response(500, { 'cache-control': 'no-store', 'content-type': 'application/json' }, JSON.stringify({ error: 'internal error', reason: 'internal-error' }));
     }
     request.resume();
     res.writeHead(answer.statusCode, answer.multiValueHeaders);

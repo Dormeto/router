@@ -23,7 +23,7 @@ import { STATES } from '../../lambda/src/lib/state.mjs';
 import { STATS_DAYS } from '../../lambda/src/lib/summary.mjs';
 import { CHECK_SCHEDULE, PauseRefused } from './controller-core.mjs';
 import { isPods } from './gke.mjs';
-import { Refusal } from './onboarding.mjs';
+import { Refusal, scoped } from './onboarding.mjs';
 import { organizationOf } from './organization.mjs';
 import { CUSTOM_PAGES_REFUSED } from './pages.mjs';
 import { rowOf } from './rows.mjs';
@@ -53,8 +53,6 @@ const pauseOf = ({ workloadId, by, at, reason, until, keepAsleep, exclusionId })
   scope: workloadId === null ? 'router' : 'workload', by, at: iso(at), reason, until: until === undefined ? null : iso(until), keepAsleep: keepAsleep === true,
   ...(exclusionId ? { exclusionId } : {}),
 });
-// One as the controller shows it, which names the router's scope only.
-const scoped = (pause) => ({ scope: pause.scope ?? 'workload', ...pause });
 // The exclusions' first, then the workload's own, then the router's; the newest first within each.
 const rankOf = (pause) => (pause.exclusionId ? 0 : pause.scope === 'router' ? 2 : 1);
 const inOrder = (pauses) => pauses.sort((a, b) => rankOf(a) - rankOf(b) || b.at.localeCompare(a.at));
@@ -416,8 +414,12 @@ export function createActions({ controller, onboarding, store, router, lists = [
     if (typeof action !== 'string' || !Object.hasOwn(ACTIONS, action)) {
       const message = `unknown action: ${action}`;
       // AWS's controller's wording and answer (controller-core.mjs): refused as unsupported, or a 400 in the REST routes' shape.
-      log.info('Refused', { action: action ?? null, workloadId: payload?.workloadId ?? null, code: 'unsupported', message });
-      if (payload?.refusals === true) return { status: 200, body: { refused: { code: 'unsupported', message } } };
+      const named = { action: action ?? null, workloadId: payload?.workloadId ?? null };
+      if (payload?.refusals === true) {
+        log.info('Refused', { ...named, code: 'unsupported', message });
+        return { status: 200, body: { refused: { code: 'unsupported', message } } };
+      }
+      log.info('Refused', { ...named, status: 400, reason: UNKNOWN_ACTION, message });
       return { status: 400, body: { error: message, reason: UNKNOWN_ACTION } };
     }
     try {

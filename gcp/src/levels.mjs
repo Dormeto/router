@@ -1,11 +1,13 @@
 // A Google Cloud workload's settings through AWS's levels (design §3): the shared resolution, with what Google imposes
 // applied on top and named `fixed`. Pure: no store, no Google.
-import { defaultsProblems, effectiveConfig, ownSettings, SCALAR_KEYS } from '../../lambda/src/lib/settings-levels.mjs';
+import { defaultsProblems, effectiveConfig, ownSettings, SCALAR_KEYS, SETTING_RANGES } from '../../lambda/src/lib/settings-levels.mjs';
 import { aKind, SWAP_WAIT_MS } from './switch.mjs';
 
 // What Google Cloud fixes whatever the level says; the swap's wait + 60 s is the wake's floor behind a swap.
 const FIXED_ZERO = ['waitSeconds', 'maxHolders', 'drainSeconds'];
 export const WAKE_TIMEOUT_MAX = 1700;
+// One controller request lasts at most 1800 s: the range the wake timeout is checked in, its minimum AWS's.
+const WAKE_TIMEOUT_MIN = SETTING_RANGES.wakeTimeoutSeconds[0];
 // A swap's wake's room beyond the map's wait: in its floor, and before it the end of its capacity retries (controller-core.mjs).
 export const SWAP_WAKE_ROOM_SECONDS = 60;
 // The workload's backends' kinds, by the names AWS gives its types.
@@ -86,14 +88,16 @@ export function levelProblems(settings, { level, cfg } = {}) {
   const fixed = isObject ? FIXED_ZERO.filter((key) => settings[key] !== undefined && settings[key] !== null) : [];
   // A key of Object's prototype (constructor, __proto__) is an unknown setting: the shared check would look it up as a range.
   const prototyped = isObject ? Object.keys(settings).filter((key) => key in Object.prototype) : [];
-  const rest = isObject ? Object.fromEntries(Object.entries(settings).filter(([key]) => !fixed.includes(key) && !prototyped.includes(key))) : settings;
+  // The wake timeout's range is Google Cloud's own, said once below: AWS's would let 2000 through to a second text.
+  const rest = isObject ? Object.fromEntries(Object.entries(settings).filter(([key]) => !fixed.includes(key) && !prototyped.includes(key) && key !== 'wakeTimeoutSeconds')) : settings;
   const problems = [...fixed.map((key) => REASONS[key]), ...prototyped.map((key) => `unknown setting ${key}`), ...defaultsProblems(rest, { workload })];
   if (!isObject) return problems;
   const asked = settings.wakeTimeoutSeconds;
-  if (Number.isInteger(asked)) {
+  if (asked !== undefined && asked !== null && (!Number.isInteger(asked) || asked < WAKE_TIMEOUT_MIN || asked > WAKE_TIMEOUT_MAX)) {
+    problems.push(`wakeTimeoutSeconds: must be a whole number from ${WAKE_TIMEOUT_MIN} to ${WAKE_TIMEOUT_MAX}`);
+  } else if (Number.isInteger(asked)) {
     const floor = workload ? swapFloorOf(cfg?.lb) : null;
-    if (asked > WAKE_TIMEOUT_MAX) problems.push(`wakeTimeoutSeconds must be at most ${WAKE_TIMEOUT_MAX}: one controller request lasts at most 1800 s`);
-    else if (floor && asked < floor) {
+    if (floor && asked < floor) {
       const change = SWAP_WAIT_MS[cfg.lb.kind] / 1000;
       problems.push(`wakeTimeoutSeconds ${asked} is too short for ${aKind(cfg.lb.kind)} load balancer: its wake includes the URL map's change, ${change} s: use more than ${floor - 1}`);
     }

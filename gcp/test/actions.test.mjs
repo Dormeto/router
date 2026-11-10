@@ -105,6 +105,10 @@ test('list: AWS\'s answer, the router and a row per workload in the AWS row\'s k
   for (const key of ['name', 'tags', 'state', 'settingsFrom', ...GOOGLE]) assert.deepEqual(row[key], rest[key], key);
   assert.deepEqual([row.type, row.settings, row.wakeMode], [rest.type.name, pick(rest.settings, ROW_SETTINGS), rest.settings.wakeMode]);
   assert.deepEqual(row.pauses, [{ scope: 'workload', by: 'ops', at: iso(clock.now() - 1000), reason: 'deploy', until: null, keepAsleep: false }, routerPause]);
+  // The REST Workload's pauses are the row's, a workload's pause and the router's both carrying their scope; `paused` is the first.
+  assert.deepEqual(rest.pauses, row.pauses);
+  assert.deepEqual(rest.paused, row.pauses[0]);
+  assert.deepEqual((await call('GET', '/v1/workloads/demo')).body.pauses, row.pauses);
   assert.deepEqual(row.stats7d, { ignored: 2, deferred: 1, wakes: 4 });
   assert.deepEqual([row.scheduled, row.url, row.source, row.backends], [true, 'https://demo.example.com/', 'cli', ['instance']]);
 });
@@ -139,6 +143,9 @@ test('status: AWS\'s status keys, the Google Cloud resources instead of the targ
   store.stats.set('demo', { ignored: { bot: 2 }, deferred: {}, wakes: { normal: 3 } });
   const asleep = clock.now() - 60_000;
   Object.assign(store.runs.get('demo'), { state: STATES.ASLEEP, stateAt: asleep, suspended: ['vm-a'], holders: 2 });
+  // A workload's pause and the router's: the status and the REST Workload list them alike, each with its scope.
+  await act({ action: 'pause', workloadId: 'demo', reason: 'deploy', by: 'ops', keepAsleep: true });
+  await act({ action: 'pause', reason: 'maintenance', by: 'adm', keepAsleep: true });
   const res = await act({ action: 'status', workloadId: 'demo', refusals: true });
   assert.equal(res.status, 200);
   const { body } = res;
@@ -150,6 +157,8 @@ test('status: AWS\'s status keys, the Google Cloud resources instead of the targ
   // The status's settings are AWS's six: the wake mode is at the top.
   const { wakeMode: _, ...six } = rest.settings;
   assert.deepEqual(body.settings, six);
+  assert.deepEqual(body.pauses.map((p) => [p.scope, p.by]), [['workload', 'ops'], ['router', 'adm']]);
+  assert.deepEqual(rest.pauses, body.pauses);
   assert.deepEqual(body.hibernation, { ...rest.hibernation, manager: { hibernate: false, readAt: iso(clock.now() - 1000), error: null }, instances: null, freshBoot: false });
   assert.deepEqual(body.backends, [{ kind: 'instance', id: 'vm-a', status: null, location: ZONE, resourceId: '1001' }]);
   assert.deepEqual([body.wakeMode, body.wakeRules, body.noWakeRules], [rest.settings.wakeMode, rest.wakeRules, rest.noWakeRules]);
@@ -254,7 +263,7 @@ test('pause and resume: a workload\'s or, without workloadId, the router\'s, in 
   assert.deepEqual(own, { status: 200, body: { pause: { scope: 'workload', ...pause }, woken: ['demo'] } });
   const woken = w.logs.find((l) => l.event === 'StateChanged' && l.to === STATES.WAKING);
   assert.deepEqual([woken.cause, woken.by], ['pause', 'ann']);
-  assert.deepEqual((await call('GET', '/v1/workloads/demo')).body.paused, pause);
+  assert.deepEqual((await call('GET', '/v1/workloads/demo')).body.paused, { scope: 'workload', ...pause });
   assert.deepEqual((await act({ action: 'resume', workloadId: 'demo', by: 'ann' })).body, { resumed: true });
   assert.deepEqual((await act({ action: 'resume', workloadId: 'demo', by: 'ann' })).body, { resumed: false });
   const routerPause = await act({ action: 'pause', reason: 'maintenance', keepAsleep: true, by: 'adm' });
@@ -803,6 +812,15 @@ test('an action the router does not serve: as AWS\'s controller answers it, refu
   assert.deepEqual(w.tasks, []);
 });
 
+test('an action the router does not serve: the Refused line says what was answered, unsupported with refusals, the 400 without', async () => {
+  const { act, w } = world();
+  const last = () => w.logs.findLast((l) => l.event === 'Refused');
+  await act({ action: 'ensure-awake', workloadId: 'demo', refusals: true });
+  assert.deepEqual(last(), { level: 'info', event: 'Refused', action: 'ensure-awake', workloadId: 'demo', code: 'unsupported', message: 'unknown action: ensure-awake' });
+  await act({ action: 'ensure-awake', workloadId: 'demo' });
+  assert.deepEqual(last(), { level: 'info', event: 'Refused', action: 'ensure-awake', workloadId: 'demo', status: 400, reason: 'unknown-action', message: 'unknown action: ensure-awake' });
+});
+
 test('a refusal: with refusals, AWS\'s answer { refused: { code, message } } and the Refused line; without, the REST route\'s error and status', async () => {
   const { call, act, w } = world();
   await call('POST', '/v1/workloads', INPUT);
@@ -862,4 +880,17 @@ test('status: a workload the manager onboarded shows who onboarded it, and one o
   await call('POST', '/v1/workloads', { ...INPUT, requestLogs: { before: { enable: false, sampleRate: 1 } } });
   const { body } = await act({ action: 'status', workloadId: 'demo' });
   assert.deepEqual(body.requestLogs, { before: { enable: false, sampleRate: 1 } });
+});
+
+test('onboard: the answer\'s Workload shows the router\'s pause, as the Workload read afterwards does', async () => {
+  const { call, act } = world();
+  await call('POST', '/v1/pause', { reason: 'maintenance', by: 'adm' });
+  const res = await call('POST', '/v1/workloads', INPUT);
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.pauses.map((p) => [p.scope, p.by, p.reason]), [['router', 'adm', 'maintenance']]);
+  assert.deepEqual(res.body.paused.scope, 'router');
+  assert.deepEqual(res.body.pauses, (await call('GET', '/v1/workloads/demo')).body.pauses);
+  await act({ action: 'offboard', workloadId: 'demo', by: 'ops' });
+  const viaAction = await act({ action: 'onboard', ...INPUT, by: 'ops' });
+  assert.deepEqual(viaAction.body.workload.pauses.map((p) => p.scope), ['router']);
 });

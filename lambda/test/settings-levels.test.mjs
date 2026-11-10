@@ -84,7 +84,7 @@ test('defaults are checked: ranges, wake mode, rules; null unsets; type only for
   assert.deepEqual(defaultsProblems({ idleMinutes: 30, wakeMode: 'browser', noWakeRules: [rule('a')], waitSeconds: null }), []);
   assert.match(defaultsProblems({ idleMinutes: 4 })[0], /idleMinutes: must be a whole number from 5 to 1440/);
   assert.match(defaultsProblems({ drainSeconds: 1.5 })[0], /drainSeconds: must be a whole number from 0 to 300/);
-  assert.match(defaultsProblems({ wakeMode: 'never' })[0], /wakeMode must be any or browser/);
+  assert.match(defaultsProblems({ wakeMode: 'never' })[0], /^wakeMode: must be any or browser$/);
   assert.match(defaultsProblems({ noWakeRules: Array.from({ length: 21 }, (_, i) => rule(`r${i}`)) })[0], /noWakeRules: at most 20 rules/);
   assert.match(defaultsProblems({ wakeRules: [{ name: 'empty' }] })[0], /wakeRules: rule empty: no condition/);
   assert.match(defaultsProblems({ wakeRules: [{ pathPrefixes: ['/x'] }] })[0], /wakeRules: each rule needs a name/);
@@ -92,7 +92,7 @@ test('defaults are checked: ranges, wake mode, rules; null unsets; type only for
   assert.match(defaultsProblems({ type: 'api' })[0], /unknown setting type/);
   assert.deepEqual(defaultsProblems({ type: 'api' }, { workload: true }), []);
   assert.deepEqual(defaultsProblems({ type: null }, { workload: true }), []);
-  assert.match(defaultsProblems({ type: 'Bad' }, { workload: true })[0], /type must be a type's name/);
+  assert.match(defaultsProblems({ type: 'Bad' }, { workload: true })[0], /^type: must be a type's name/);
   assert.match(defaultsProblems([])[0], /an object/);
 });
 

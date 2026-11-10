@@ -44,7 +44,7 @@ test('resolveHibernation follows the order workload, fallback types, router, man
   ]) assert.deepEqual(resolveHibernation(input), expected, name);
 });
 
-const JOIN_PROBLEM = 'settings: joinMinutes must be a whole number from 0 to 120, a multiple of 5, or null';
+const JOIN_PROBLEM = 'settings: joinMinutes: must be a whole number from 0 to 120, a multiple of 5, or null';
 
 test('settingsProblems accepts only hibernate as true, false or null and joinMinutes as its minutes or null', () => {
   for (const [settings, expected] of [

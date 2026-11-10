@@ -663,9 +663,15 @@ test('settings: fallback instance types (at most 5 type names) and the failed re
   assert.deepEqual(ok.problems, []);
   const bad = await s.onboarding.preview({ workloadId: 'shop', targetGroupArn: s.tg, settings: { fallbackInstanceTypes: ['t3a.medium', 'not a type', 'a', 'b', 'c', 'd'], failedRetrySeconds: 5 } });
   assert.deepEqual(bad.problems.filter((p) => p.startsWith('settings')), [
-    'settings: fallbackInstanceTypes: must be at most 5 EC2 instance types',
+    'settings: fallbackInstanceTypes: must be a list of at most 5 EC2 instance types, such as t3a.medium',
     'settings: failedRetrySeconds: must be a whole number from 10 to 600',
   ]);
+});
+
+test('settings: a wake mode that is not any or browser is the problem wakeMode: must be any or browser', async () => {
+  const s = setup();
+  const bad = await s.onboarding.preview({ workloadId: 'shop', targetGroupArn: s.tg, settings: { wakeMode: 'never' } });
+  assert.deepEqual(bad.problems.filter((p) => p.startsWith('settings')), ['settings: wakeMode: must be any or browser']);
 });
 
 test('settings: hibernate is a boolean, accepted and written to the configuration (hibernation R6)', async () => {

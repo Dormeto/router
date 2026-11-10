@@ -143,8 +143,15 @@ test('levelProblems refuses what Google Cloud fixes, with the reason', () => {
   assert.deepEqual(levelProblems({ waitSeconds: null, maxHolders: null }, { level: 'router' }), []);
 });
 
+test('levelProblems says one text for a wake timeout out of range: 60 to 1700, whatever the value', () => {
+  for (const value of [59, 1701, 2000, 3600, 3601, 1.5, '600']) {
+    assert.deepEqual(levelProblems({ wakeTimeoutSeconds: value }, { level: 'router' }), ['wakeTimeoutSeconds: must be a whole number from 60 to 1700'], String(value));
+  }
+  for (const value of [60, 600, 1700, null]) assert.deepEqual(levelProblems({ wakeTimeoutSeconds: value }, { level: 'router' }), [], String(value));
+});
+
 test('levelProblems refuses a wake timeout above 1700, or below a swap\'s floor', () => {
-  assert.deepEqual(levelProblems({ wakeTimeoutSeconds: 1800 }, { level: 'router' }), ['wakeTimeoutSeconds must be at most 1700: one controller request lasts at most 1800 s']);
+  assert.deepEqual(levelProblems({ wakeTimeoutSeconds: 1800 }, { level: 'router' }), ['wakeTimeoutSeconds: must be a whole number from 60 to 1700']);
   assert.deepEqual(levelProblems({ wakeTimeoutSeconds: 1800 }, { level: 'workload', cfg: global }).length, 1);
   assert.equal(levelProblems({ wakeTimeoutSeconds: 161 }, { level: 'workload', cfg: regional }).length, 0);
   assert.match(levelProblems({ wakeTimeoutSeconds: 160 }, { level: 'workload', cfg: regional })[0], /too short for a regional load balancer.*100 s.*use more than 160/);

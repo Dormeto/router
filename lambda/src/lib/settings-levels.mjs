@@ -127,11 +127,11 @@ export function defaultsProblems(defaults, { workload = false } = {}) {
       const [min, max] = SETTING_RANGES[key];
       if (!Number.isInteger(value) || value < min || value > max) problems.push(`${key}: must be a whole number from ${min} to ${max}`);
     } else if (key === 'wakeMode') {
-      if (!WAKE_MODES.includes(value)) problems.push('wakeMode must be any or browser');
+      if (!WAKE_MODES.includes(value)) problems.push('wakeMode: must be any or browser');
     } else if (RULE_KEYS.includes(key)) {
       problems.push(...rulesProblems(key, value));
     } else if (key === 'type' && workload) {
-      if (!isTypeName(value)) problems.push('type must be a type\'s name (lower-case letters, digits and hyphens) or null');
+      if (!isTypeName(value)) problems.push('type: must be a type\'s name (lower-case letters, digits and hyphens) or null');
     } else problems.push(`unknown setting ${key}`);
   }
   return problems;

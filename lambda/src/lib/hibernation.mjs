@@ -39,7 +39,7 @@ export function settingsProblems(settings) {
   const problems = [];
   for (const [key, value] of Object.entries(settings)) {
     if (key === 'joinMinutes') {
-      if (value !== null && !isJoinMinutes(value)) problems.push(`settings: joinMinutes must be a whole number from 0 to ${JOIN_MINUTES_MAX}, a multiple of 5, or null`);
+      if (value !== null && !isJoinMinutes(value)) problems.push(`settings: joinMinutes: must be a whole number from 0 to ${JOIN_MINUTES_MAX}, a multiple of 5, or null`);
     } else if (key === 'defaults') {
       if (value !== null) problems.push(...defaultsProblems(value).map((p) => `settings: defaults: ${p}`));
     } else if (key !== 'hibernate') problems.push(`settings: unknown setting ${key}`);

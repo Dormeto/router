@@ -2059,7 +2059,7 @@ test('settings of the router: joinMinutes and hibernate leave each other alone (
   assert.deepEqual(await s.handler({ action: 'settings', settings: { joinMinutes: null, hibernate: null }, by: 'ana' }), { level: 'router', settings: { hibernate: null, joinMinutes: null, by: null, at: null } });
   assert.equal(s.store.state.routerSettings, undefined);
   assert.deepEqual(await s.handler({ action: 'settings', settings: { hibernate: true, joinMinutes: 5 }, by: 'ana' }), { level: 'router', settings: { hibernate: true, joinMinutes: 5, by: 'ana', at } });
-  assert.deepEqual((await s.handler({ action: 'settings', settings: { joinMinutes: 7 }, by: 'ana' })).problems, ['settings: joinMinutes must be a whole number from 0 to 120, a multiple of 5, or null']);
+  assert.deepEqual((await s.handler({ action: 'settings', settings: { joinMinutes: 7 }, by: 'ana' })).problems, ['settings: joinMinutes: must be a whole number from 0 to 120, a multiple of 5, or null']);
   assert.equal(s.store.state.routerSettings.joinMinutes, 5);
 });
 
@@ -2782,7 +2782,7 @@ test('settings at scale: a manager workload\'s own settings and type; null gives
   assert.deepEqual([stored.idleMinutes, stored.inherits.sort(), 'type' in stored, stored.noWakeRules], [15, ['idleMinutes', 'wakeMode'], false, []]);
   assert.equal('hibernate' in stored, false, 'hibernate untouched when not sent');
   assert.deepEqual(await s.handler({ action: 'settings', workloadId: 'demo', settings: { idleMinutes: 4, type: 'Bad' }, by: 'ops' }), { problems: [
-    'settings: idleMinutes: must be a whole number from 5 to 1440', 'settings: type must be a type\'s name (lower-case letters, digits and hyphens) or null',
+    'settings: idleMinutes: must be a whole number from 5 to 1440', 'settings: type: must be a type\'s name (lower-case letters, digits and hyphens) or null',
   ] });
   assert.deepEqual(await s.handler({ action: 'settings', workloadId: 'demo', settings: { defaults: {} }, by: 'ops' }), { problems: ['settings: unknown setting defaults'] });
 });

@@ -460,7 +460,7 @@ test('POST /v1/workloads/:id/pause: the Workload with its pause; a sleeper woken
   const res = await call('POST', '/v1/workloads/demo/pause', { reason: 'load test', by: 'ops', until });
   assert.equal(res.status, 200);
   assert.equal(res.body.state, STATES.WAKING);
-  assert.deepEqual(res.body.paused, { by: 'ops', at: new Date(clock.now()).toISOString(), reason: 'load test', until, keepAsleep: false });
+  assert.deepEqual(res.body.paused, { scope: 'workload', by: 'ops', at: new Date(clock.now()).toISOString(), reason: 'load test', until, keepAsleep: false });
   assert.deepEqual(w.tasks.at(-1).body, { action: 'wake', workloadId: 'demo', wakeId: 'wake-1' });
   for (const [body, words] of [[{}, /reason required/], [{ reason: 'r', until: 'soon' }, /until must be/], [{ reason: 'r', keepAsleep: 'yes' }, /keepAsleep must be/]]) {
     const refused = await call('POST', '/v1/workloads/demo/pause', body);

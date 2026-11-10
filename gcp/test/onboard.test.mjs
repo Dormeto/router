@@ -319,8 +319,7 @@ test('bad input is a 400 before any read', async () => {
     [{ ...INPUT, settings: { noWakeRules: Array.from({ length: 21 }, (_, i) => ({ name: `r${i}`, pathPrefixes: ['/x'] })) } }, /settings: noWakeRules: at most 20 rules/],
     [{ ...INPUT, settings: { wakeRules: [{ name: 'bad', pathPattern: '(' }] } }, /settings: wakeRules: rule bad: /],
     [{ ...INPUT, settings: { type: 'Not A Type' } }, /settings: type must be a type's name/],
-    // A top-level field of the body (ruling 1 of the plan's ledger), not a setting of the levels.
-    [{ ...INPUT, settings: { fallbackInstanceTypes: ['e2-medium'] } }, /settings: unknown setting fallbackInstanceTypes/],
+    // The fallback types are a top-level field of the body or, as AWS's, in the settings (R13): not a setting of the levels.
     [{ ...INPUT, settings: { joinMinutes: 15 } }, /settings: unknown setting joinMinutes/],
     [{ ...INPUT, loadBalancer: 'internal-self-managed' }, /loadBalancer: "internal-self-managed" is not global, regional, classic, internal or cross-region-internal/],
     [{ ...INPUT, settings: { hibernate: 'yes' } }, /settings: hibernate must be true or false/],
@@ -390,7 +389,9 @@ test('onboard: the service, then the route, then the configuration and AWAKE; no
   assert.deepEqual(config.inherits, ['waitSeconds', 'drainSeconds', 'wakeTimeoutSeconds', 'maxHolders', 'failedRetrySeconds', 'wakeMode']);
   assert.ok(!('admin' in config), 'cfg.admin.enabled would turn /_dormeto/wake into a 404');
   assert.deepEqual(workload, {
+    workloadId: 'demo',
     id: 'demo',
+    pauses: [],
     name: 'demo',
     tags: {},
     state: STATES.AWAKE,
@@ -2642,17 +2643,18 @@ test('waiting page: a template put at the router\'s level and a workload\'s, rea
   assert.deepEqual((await onboarding.waitingPage({ workloadId: 'demo' }, { op: 'get' })).favicon, { icon: 'data:image/png;base64,AA==', fetchedAt: new Date(clock.now() - 1000).toISOString(), error: null });
 });
 
-test('waiting page: a put without by is set by unknown, as a schedule; the log holds the mode, and of a custom page its size and SHA-256, never the page', async () => {
+test('waiting page: a put says who sets it, and without by is refused; the log holds the mode, and of a custom page its size and SHA-256, never the page', async () => {
   const { w, onboarding } = setup(withCustomPages);
   await onboarding.onboard(INPUT);
-  assert.equal((await onboarding.waitingPage('router', { op: 'put', page: { mode: 'template', title: 'Acme' } })).by, 'unknown');
+  assert.equal((await onboarding.waitingPage('router', { op: 'put', page: { mode: 'template', title: 'Acme' }, by: 'adm' })).by, 'adm');
   await onboarding.waitingPage({ workloadId: 'demo' }, { op: 'put', page: { mode: 'custom', html: PAGE_HTML }, by: 'ops' });
   const set = w.logs.filter((l) => l.event === 'WaitingPageSet');
   assert.deepEqual(set.map(({ level, workloadId, mode, bytes, sha256, by }) => ({ level, workloadId, mode, bytes, sha256, by })), [
-    { level: 'router', workloadId: null, mode: 'template', bytes: undefined, sha256: undefined, by: 'unknown' },
+    { level: 'router', workloadId: null, mode: 'template', bytes: undefined, sha256: undefined, by: 'adm' },
     { level: 'workload', workloadId: 'demo', mode: 'custom', bytes: 44, sha256: createHash('sha256').update(PAGE_HTML).digest('hex'), by: 'ops' },
   ]);
   assert.equal(JSON.stringify(w.logs).includes('data-dormeto'), false);
+  await assert.rejects(onboarding.waitingPage('router', { op: 'put', page: { mode: 'template', title: 'Acme' } }), refused(400, 'bad-request', /a put needs by/));
 });
 
 test('waiting page: a custom put without the switch is a 400 with the verbatim text, nothing written; with it, stored and shown', async () => {
@@ -2661,7 +2663,7 @@ test('waiting page: a custom put without the switch is a 400 with the verbatim t
   for (const level of ['router', { workloadId: 'demo' }]) {
     await assert.rejects(off.onboarding.waitingPage(level, { op: 'put', page: { mode: 'custom', html: PAGE_HTML }, by: 'ops' }), refusedWith([CUSTOM_REFUSED]));
   }
-  await assert.rejects(off.onboarding.waitingPage('router', { op: 'put', page: { mode: 'custom', html: ' ' } }), refusedWith([CUSTOM_REFUSED, 'html must be a page, not blank']));
+  await assert.rejects(off.onboarding.waitingPage('router', { op: 'put', page: { mode: 'custom', html: ' ' }, by: 'ops' }), refusedWith([CUSTOM_REFUSED, 'html must be a page, not blank']));
   assert.equal(off.store.pages.size, 0);
   const on = setup(withCustomPages);
   await on.onboarding.onboard(INPUT);

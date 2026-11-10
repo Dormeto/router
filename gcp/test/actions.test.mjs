@@ -782,13 +782,12 @@ test('manager-settings over Firestore: a large organization document, 20 custom 
   assert.deepEqual((await post({ action: 'events', after: null, limit: 1 })).body.managerSettings, { etag: 'e1' });
 });
 
-test('an action the router does not serve: 400 unknown-action, with refusals or without', async () => {
+test('an action the router does not serve: as AWS\'s controller answers it, refused unsupported with refusals, else a 400 unknown-action', async () => {
   const { act, w } = world();
   for (const action of ['unknown', 'ensure-awake', 'report', 'clusterCheck', 'check', 'wake', 'nap', 'release', 'refresh-lists', 'constructor', '__proto__', undefined]) {
-    for (const refusals of [true, undefined]) {
-      const res = await act({ action, refusals });
-      assert.deepEqual(res, { status: 400, body: { error: 'unknown-action', message: `unknown action: ${action}` } }, `${action} ${refusals}`);
-    }
+    const message = `unknown action: ${action}`;
+    assert.deepEqual(await act({ action, refusals: true }), { status: 200, body: { refused: { code: 'unsupported', message } } }, `${action} with refusals`);
+    assert.deepEqual(await act({ action }), { status: 400, body: { error: message, reason: 'unknown-action' } }, `${action} without`);
   }
   assert.deepEqual(w.tasks, []);
 });

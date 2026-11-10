@@ -5,8 +5,9 @@
 // `refusals: true` (the manager's synchronous calls) turns a refusal into AWS's answer, `{ refused: { code, message } }` (vision
 // refusals design §1), its status read as AWS's code: 400 invalid, 404 not_found, 409 conflict. Without it, the REST routes' error and
 // status, `{ error, reason, problems? }`. The problems AWS answers as `{ problems }` (settings, the waiting page, a schedule) are answers
-// either way. An action the router does not serve is a 400 `{ error: 'unknown-action' }` either way: the wake, nap, release, check and
-// list refresh of AWS's own invocations among them, as the router's own work goes through /v1/tasks.
+// either way. An action the router does not serve is answered as AWS's controller does (`unsupported` with refusals, else a 400 with
+// reason `unknown-action`): the wake, nap, release, check and list refresh of AWS's own invocations among them, as the router's own work
+// goes through /v1/tasks.
 //
 // The manager's wake, nap and pause say who asked (`by`) and, as AWS's, the cause `manager`, in their events. What AWS's status reads
 // live and the Google Cloud router does not (CloudWatch's last request, the load balancer's rules and targets, the backends' status,
@@ -21,7 +22,6 @@ import { maintenanceDue } from '../../lambda/src/lib/schedule.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { STATS_DAYS } from '../../lambda/src/lib/summary.mjs';
 import { CHECK_SCHEDULE, PauseRefused } from './controller-core.mjs';
-import { INSTANCE_NAME } from './cloudsql.mjs';
 import { isPods } from './gke.mjs';
 import { Refusal } from './onboarding.mjs';
 import { organizationOf } from './organization.mjs';
@@ -92,32 +92,13 @@ function scheduleAnswer({ schedule, nextEvents, joinMinutes, joinFrom, joinInher
 // router/check with its times as the manager reads every router's, ISO.
 const checkOf = (check) => check && { ...check, checkedAt: iso(check.checkedAt), lastScheduledCheckAt: isoOrNull(check.lastScheduledCheckAt) };
 
-// The databases as Cloud SQL instance names: a list of names (the CLI's) or of AWS's entries `{ kind, id }`, not both in one list; an
-// entry of another kind is no Cloud SQL instance. Anything else is left to the onboarding's own check.
-function databaseNames(databases) {
-  if (!Array.isArray(databases)) return databases;
-  const entries = databases.filter(isObject);
-  if (!entries.length) return databases;
-  if (entries.length !== databases.length) throw invalid('databases: a list of names or a list of { kind, id } entries, not both');
-  const other = entries.find((entry) => entry.kind !== 'cloudsql-instance');
-  if (other) throw invalid(`databases: ${JSON.stringify(other.kind)} is not a Cloud SQL instance's kind: the kind is cloudsql-instance`);
-  const unnamed = entries.find((entry) => typeof entry.id !== 'string' || !INSTANCE_NAME.test(entry.id));
-  if (unnamed) throw invalid(unnamed.id === undefined ? 'databases: an entry needs an id: the Cloud SQL instance name' : `databases: ${JSON.stringify(unnamed.id)} is not a Cloud SQL instance name`);
-  return entries.map((entry) => entry.id);
-}
-
 // An onboarding in AWS's onboarder's words (`workloadId`, `databases`: here the Cloud SQL instances), with the Google Cloud resources
-// it names, onboarded by the manager, by who asked (`unknown` when the payload names no one, as AWS's onboardedBy). GKE access and
-// request logs stay with the CLI (§8): not taken here.
-const onboardingOf = ({ workloadId, name, tags, settings, urlMap, backendService, loadBalancer, databases, fallbackInstanceTypes, by }) => {
-  // AWS's onboarder takes the fallback types inside the settings; the REST body's are at the top. Not both.
-  const { fallbackInstanceTypes: inSettings, ...rest } = isObject(settings) ? settings : {};
-  if (inSettings !== undefined && fallbackInstanceTypes !== undefined) throw invalid('fallbackInstanceTypes: given in the settings and at the top level, give one');
-  return {
-    urlMap, backendService, id: workloadId, name, tags, settings: isObject(settings) ? rest : settings, loadBalancer, cloudSql: databaseNames(databases),
-    fallbackInstanceTypes: inSettings ?? fallbackInstanceTypes, source: 'manager', by: by ?? 'unknown',
-  };
-};
+// it names, onboarded by the manager, by who asked (`unknown` when the payload names no one, as AWS's onboardedBy). The REST body's
+// own names (`cloudSql`, the top-level `fallbackInstanceTypes`) are read too (onboarding.mjs's requested). GKE access and request logs
+// stay with the CLI (§8): not taken here.
+const onboardingOf = ({ workloadId, name, tags, settings, urlMap, backendService, loadBalancer, databases, cloudSql, fallbackInstanceTypes, by }) => ({
+  urlMap, backendService, id: workloadId, name, tags, settings, loadBalancer, databases, cloudSql, fallbackInstanceTypes, source: 'manager', by: by ?? 'unknown',
+});
 
 // AWS's preview (lambda/src/lib/onboarding.mjs's preview, :392 and :451): the workload's id, name and tags; instead of the target
 // groups and the load balancer, the Google Cloud resources (the URL map, the backend service, the waker's, `lb`); its backends and
@@ -432,8 +413,10 @@ export function createActions({ controller, onboarding, store, router, lists = [
     const action = payload?.action;
     if (typeof action !== 'string' || !Object.hasOwn(ACTIONS, action)) {
       const message = `unknown action: ${action}`;
-      log.info('Refused', { action: action ?? null, workloadId: payload?.workloadId ?? null, code: UNKNOWN_ACTION, message });
-      return { status: 400, body: { error: UNKNOWN_ACTION, message } };
+      // AWS's controller's wording and answer (controller-core.mjs): refused as unsupported, or a 400 in the REST routes' shape.
+      log.info('Refused', { action: action ?? null, workloadId: payload?.workloadId ?? null, code: 'unsupported', message });
+      if (payload?.refusals === true) return { status: 200, body: { refused: { code: 'unsupported', message } } };
+      return { status: 400, body: { error: message, reason: UNKNOWN_ACTION } };
     }
     try {
       return { status: 200, body: await ACTIONS[action](payload) };

@@ -223,20 +223,44 @@ function failureOf(run) {
   }
 }
 
-// The API's Workload. `awakeSince` is a time the CLI prints, and left on the run by a nap. `paused`: its active pause. `companionsGone`:
+// The databases as Cloud SQL instance names: a list of names (the CLI's) or of AWS's entries `{ kind, id }`, not both in one list; an
+// entry of another kind is no Cloud SQL instance. Anything else is left to the onboarding's own check.
+function databaseNames(databases) {
+  if (!Array.isArray(databases)) return databases;
+  const entries = databases.filter(isObject);
+  if (!entries.length) return databases;
+  if (entries.length !== databases.length) throw bad('databases: a list of names or a list of { kind, id } entries, not both');
+  const other = entries.find((entry) => entry.kind !== 'cloudsql-instance');
+  if (other) throw bad(`databases: ${JSON.stringify(other.kind)} is not a Cloud SQL instance's kind: the kind is cloudsql-instance`);
+  const unnamed = entries.find((entry) => typeof entry.id !== 'string' || !INSTANCE_NAME.test(entry.id));
+  if (unnamed) throw bad(unnamed.id === undefined ? 'databases: an entry needs an id: the Cloud SQL instance name' : `databases: ${JSON.stringify(unnamed.id)} is not a Cloud SQL instance name`);
+  return entries.map((entry) => entry.id);
+}
+
+// The request's two names for what AWS's onboarder and the CLI each call differently: the databases (`databases`, AWS's, or `cloudSql`, the
+// CLI's) and the fallback machine types (`settings.fallbackInstanceTypes`, or the top-level one). Either, or both when they agree.
+function oneOf(first, second, firstName, secondName) {
+  if (first === undefined) return second;
+  if (second !== undefined && JSON.stringify(first) !== JSON.stringify(second)) throw bad(`${firstName} and ${secondName} are given and differ: give one`);
+  return first;
+}
+
+// The API's Workload. `awakeSince` is a time the CLI prints, and left on the run by a nap. `workloadId` beside `id` (AWS's name beside the CLI's); `pauses`: its active pauses, as AWS's rows list them, and `paused` the first (the CLI's). `companionsGone`:
 // the Cloud SQL instances named at its onboarding that no longer exist, as last read. `napAborted`: why the last nap was given up and
 // when, until a nap commits. `beatAt`: the running wake's or nap's last heartbeat (heartbeat.mjs), WAKING or NAPPING only. `idleReads`:
 // what the idle check read at the last check that read log entries or counted a request, `request logs` or `request count`
 // (controller-core.mjs). With the router level (`router`): each setting resolved (`settings`), where it comes from, the type and the
 // rules of every level, as AWS's status gives them, and its hibernation; its fallback machine types, and `fallbacks`, as AWS's, while a
 // VM runs on one.
-function workloadOf(cfg, run, paused, { router = null, organization = null } = {}) {
+function workloadOf(cfg, pauses, run, { router = null, organization = null } = {}) {
   const failure = failureOf(run);
   const fallbacks = fallbacksOf(run);
   const beatAt = run ? beatOf(run) : undefined;
   const effective = effectiveOf(cfg, { run, router, organization });
   const { settings, settingsFrom, type } = resolvedSettings(effective);
+  const [paused] = pauses;
   return {
+    workloadId: cfg.workloadId,
     id: cfg.workloadId,
     name: cfg.name ?? cfg.workloadId,
     tags: cfg.tags ?? {},
@@ -259,6 +283,7 @@ function workloadOf(cfg, run, paused, { router = null, organization = null } = {
     ...(run?.state === STATES.AWAKE && run.awakeSince !== undefined ? { awakeSince: isoOf(run.awakeSince) } : {}),
     ...(run?.lastWake ? { lastWake: run.lastWake } : {}),
     ...(failure ? { failure } : {}),
+    pauses,
     ...(paused ? { paused } : {}),
     ...(run?.companionsGone?.length ? { companionsGone: run.companionsGone } : {}),
     ...(run?.napAborted ? { napAborted: { reason: run.napAborted.reason, at: isoOf(run.napAborted.at) } } : {}),
@@ -289,7 +314,11 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   const insertService = (body, lb) => (isRegionalLb(lb) ? compute.insertRegionBackendService(lb.region, body) : compute.insertBackendService(body));
 
   // The request's fields, or a 400. Without an ID, the backend service's name, when it is one. `needsAll`: an onboarding's `gke` names all, a dry run's the cluster alone.
-  function requested({ urlMap, backendService, id, name, tags, source = 'cli', settings = {}, loadBalancer, cloudSql = [], gke: gkeAsked, requestLogs, fallbackInstanceTypes, by }, { needsAll = false } = {}) {
+  function requested({ urlMap, backendService, id, name, tags, source = 'cli', settings = {}, loadBalancer, cloudSql: cloudSqlAsked, databases, gke: gkeAsked, requestLogs, fallbackInstanceTypes: topFallbackTypes, by }, { needsAll = false } = {}) {
+    const { fallbackInstanceTypes: inSettings, ...ownSettings } = isObject(settings) ? settings : {};
+    if (isObject(settings)) settings = ownSettings;
+    const fallbackInstanceTypes = oneOf(inSettings, topFallbackTypes, 'settings.fallbackInstanceTypes', 'fallbackInstanceTypes');
+    const cloudSql = oneOf(databaseNames(databases), cloudSqlAsked, 'databases', 'cloudSql') ?? [];
     if (!urlMap || !backendService) throw bad('urlMap and backendService are needed');
     for (const [key, value] of Object.entries({ urlMap, backendService })) {
       if (typeof value !== 'string' || !NAME.test(value)) throw bad(`${key}: ${JSON.stringify(value)} is not a Compute Engine name`);
@@ -797,7 +826,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
       throw err;
     }
     log.info('Onboarded', { workloadId: id, urlMap, backendService, by: by ?? 'unknown' });
-    return { workload: workloadOf(cfg, await store.getRun(id), undefined, above), steps };
+    return { workload: workloadOf(cfg, [], await store.getRun(id), above), steps };
   }
 
   // The configuration, or a 400 or a 404.
@@ -918,8 +947,8 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
 
   // The Workload as it is now. `levels`: the router's and the organization's, already read.
   async function current(cfg, { levels } = {}) {
-    const [run, [paused], read] = await Promise.all([store.getRun(cfg.workloadId), core.pausesFor(cfg.workloadId), levels ?? levelsOf()]);
-    return workloadOf(cfg, run, paused, read);
+    const [run, pauses, read] = await Promise.all([store.getRun(cfg.workloadId), core.pausesFor(cfg.workloadId), levels ?? levelsOf()]);
+    return workloadOf(cfg, pauses, run, read);
   }
 
   // The name people see, for a workload onboarded here (AWS's rename answer). A write racing an offboarding puts nothing back.
@@ -1111,6 +1140,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
       case 'get':
         break;
       case 'put': {
+        if (typeof by !== 'string' || !by) throw bad('a put needs by: who sets the page');
         const problems = [...(page?.mode === 'custom' && !customPages ? [CUSTOM_PAGES_REFUSED] : []), ...validatePage(page)];
         if (problems.length) throw refusedSettings(problems);
         await store.putWaitingPage(level, page, { by: fields.by, at: now() });

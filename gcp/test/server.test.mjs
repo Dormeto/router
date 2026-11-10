@@ -73,7 +73,7 @@ test('DMT_ROLE=waker on PORT: answers, and SIGTERM closes it with exit code 0', 
   const url = urlOf(listened);
   const res = await fetch(`${url}/_dormeto/waiting`);
   assert.equal(res.status, 400);
-  assert.equal((await res.json()).reason, 'x-dormeto-workload names no workload');
+  assert.deepEqual(await res.json(), { error: 'x-dormeto-workload names no workload', reason: 'bad-request' });
   child.kill('SIGTERM');
   const { code, signal } = await exited;
   assert.deepEqual({ code, signal }, { code: 0, signal: null });

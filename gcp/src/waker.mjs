@@ -287,7 +287,7 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], c
     const event = eventOf(request);
     const workloadId = workloadIdOf(event);
     if (!workloadId) {
-      return response(400, { 'cache-control': 'no-store', 'content-type': 'application/json' }, JSON.stringify({ error: 'bad request', reason: `${WORKLOAD_HEADER} names no workload` }));
+      return response(400, { 'cache-control': 'no-store', 'content-type': 'application/json' }, JSON.stringify({ error: `${WORKLOAD_HEADER} names no workload`, reason: 'bad-request' }));
     }
     // The policy's fetch carries none of the visitor's path: it is decided with none, in wake mode browser.
     const policyFetch = !underSwap(event) && event.path === WAITING_PATH;

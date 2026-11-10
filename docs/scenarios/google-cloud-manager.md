@@ -36,10 +36,12 @@ service: the manager calls it with an ID token of its command service account, w
   (the last request, the load balancer's rules, the targets) keeps its key, empty. A Google Cloud row names its backend
   service where AWS's names its target group.
 - **The two Google Cloud ones:** `events` and `manager-settings` (below).
-- **Any other action** is a 400, `{ "error": "unknown-action" }`: the wake, nap, release, check and list refresh that AWS
-  receives as invocations are this router's own work, started by its Cloud Scheduler job and its waker.
+- **Any other action** is answered as AWS's controller does: with `"refusals": true`, a refusal `unsupported`
+  (`unknown action: <name>`); without it, a 400 `{ "error": "unknown action: <name>", "reason": "unknown-action" }`. The
+  wake, nap, release, check and list refresh that AWS receives as invocations are this router's own work, started by its
+  Cloud Scheduler job and its waker.
 - **Refusals.** With `"refusals": true`, a refusal is a 200 `{ "refused": { "code", "message" } }` with AWS's codes,
-  `invalid`, `not_found` and `conflict`; without it, the REST routes' status and `{ "error", "reason" }`. The problems
+  `invalid`, `not_found`, `conflict` and `unsupported`; without it, the REST routes' status and `{ "error", "reason" }`. The problems
   AWS answers as `{ "problems": […] }` (a settings write, a waiting page, a schedule) are answers either way.
 - **The manager's own actions say who asked**: a wake or a nap from the manager carries `by`, and its events the cause
   `manager`; a pause carries `by` too: the pause itself writes no event, and the wakes it starts write theirs, with the
@@ -122,7 +124,8 @@ it came from, `source: "cli"` or `"manager"`.
 `preview` and `onboard` take AWS's onboarder payload: `databases` is a list of Cloud SQL instance names (the CLI's) or of
 AWS's entries `{ "kind": "cloudsql-instance", "id": <name> }`, not both in one list, and an entry of another kind is
 refused (`invalid`); the fallback machine types are `settings.fallbackInstanceTypes`, or `fallbackInstanceTypes` at the
-top level, not both. GKE access and request logs are not taken: they stay with the CLI. An onboarding from the manager
+top level, and the REST body's `cloudSql` is accepted beside `databases`: both forms given and different are refused
+(`invalid`). GKE access and request logs are not taken: they stay with the CLI. An onboarding from the manager
 records `onboardedBy`, who asked (`unknown` when the payload names no one), which the workload's `status` and the REST Workload carry, not the rows of `list`;
 one from the CLI records no one. `status`'s `instance` and `asg` backends carry `resourceId`, the numeric id the
 onboarding stored (the manager removes the `dormeto/managed` binding on that id at an offboarding, whoever bound it, the

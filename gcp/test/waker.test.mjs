@@ -77,7 +77,7 @@ test('no x-dormeto-workload, or none that is an ID → 400, nothing read', async
   for (const headers of [{ 'x-dormeto-workload': undefined }, { 'x-dormeto-workload': '' }, { 'x-dormeto-workload': 'demo, ' }, { 'x-dormeto-workload': '../demo' }, { 'x-dormeto-workload': 'Demo' }]) {
     const res = await handler(request({ headers }));
     assert.equal(res.statusCode, 400, JSON.stringify(headers));
-    assert.equal(JSON.parse(res.body).reason, 'x-dormeto-workload names no workload');
+    assert.deepEqual(JSON.parse(res.body), { error: 'x-dormeto-workload names no workload', reason: 'bad-request' });
   }
   assert.equal(created.length, 0);
 });

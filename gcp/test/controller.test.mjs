@@ -51,7 +51,9 @@ test('GET /v1/workloads: none, then each as a Workload the CLI can read', async 
   const res = await call('GET', '/v1/workloads');
   assert.equal(res.status, 200);
   assert.deepEqual(res.body, [{
+    workloadId: 'demo',
     id: 'demo',
+    pauses: [],
     name: 'demo',
     tags: {},
     state: STATES.AWAKE,
@@ -625,9 +627,9 @@ test('GET|PUT|DELETE /v1/waiting-page and /v1/workloads/:id/waiting-page: AWS\'s
   const own = await call('PUT', '/v1/workloads/demo/waiting-page', { page: { mode: 'template', description: 'Back soon.' }, by: 'ops' });
   assert.deepEqual([own.body.effective.title, own.body.effective.description, own.body.from], ['Acme', 'Back soon.', { mode: 'workload', icon: 'default', title: 'router', description: 'workload' }]);
   assert.deepEqual((await call('GET', '/v1/workloads/demo/waiting-page')).body, own.body);
-  const refused = await call('PUT', '/v1/workloads/demo/waiting-page', { page: { mode: 'custom', html: PAGE_HTML } });
+  const refused = await call('PUT', '/v1/workloads/demo/waiting-page', { page: { mode: 'custom', html: PAGE_HTML }, by: 'ops' });
   assert.deepEqual([refused.status, refused.body], [400, { error: CUSTOM_REFUSED, reason: 'bad-request', problems: [CUSTOM_REFUSED] }]);
-  const bad = await call('PUT', '/v1/waiting-page', { page: { mode: 'template', title: '' } });
+  const bad = await call('PUT', '/v1/waiting-page', { page: { mode: 'template', title: '' }, by: 'adm' });
   assert.deepEqual([bad.status, bad.body.problems], [400, ['title must be one line of text']]);
   const cleared = await call('DELETE', '/v1/workloads/demo/waiting-page', { by: 'ops' });
   assert.deepEqual([cleared.status, cleared.body.own, cleared.body.effective.title], [200, null, 'Acme']);
@@ -668,7 +670,7 @@ test('POST /v1/actions: the manager\'s action, its answer; a body that is no JSO
   }
   assert.deepEqual((await call('POST', '/v1/actions', JSON.stringify({ action: 'rename', padding: 'x'.repeat(2_000_000) }))).status, 400);
   const none = await call('POST', '/v1/actions');
-  assert.deepEqual([none.status, none.body], [400, { error: 'unknown-action', message: 'unknown action: undefined' }]);
+  assert.deepEqual([none.status, none.body], [400, { error: 'unknown action: undefined', reason: 'unknown-action' }]);
 });
 
 test('any other route or method: a 404 in the same shape', async () => {
@@ -896,4 +898,64 @@ test('fromEnvironment: POST /v1/actions over the router\'s Firestore: manager-se
   assert.deepEqual([managerSettings.hibernate, managerSettings.joinMinutes, managerSettings.error], [false, 10, null]);
   const listed = await act({ action: 'list' });
   assert.deepEqual([listed.router.name, listed.router.version, listed.router.build, listed.workloads.map((w) => w.workloadId)], [`dmtr-${REGION}`, PACKAGE.version, 'b7', ['demo']]);
+});
+
+// R13: the Workload answers with AWS's name beside the CLI's (the released names stay one minor release).
+test('a Workload answer has workloadId beside id, and pauses (a list) beside paused', async () => {
+  const { call } = api();
+  const created = await call('POST', '/v1/workloads', INPUT);
+  assert.deepEqual([created.body.id, created.body.workloadId, created.body.pauses], ['demo', 'demo', []]);
+  assert.equal(Object.hasOwn(created.body, 'paused'), false);
+  const paused = (await call('POST', '/v1/workloads/demo/pause', { reason: 'load test', by: 'ops' })).body;
+  assert.deepEqual([paused.id, paused.workloadId, paused.pauses, paused.paused.reason], ['demo', 'demo', [paused.paused], 'load test']);
+  const read = (await call('GET', '/v1/workloads/demo')).body;
+  assert.deepEqual([read.workloadId, read.pauses], ['demo', [read.paused]]);
+  assert.deepEqual((await call('GET', '/v1/workloads')).body.map((w) => [w.id, w.workloadId, w.pauses.length]), [['demo', 'demo', 1]]);
+});
+
+test('POST /v1/workloads: databases beside cloudSql, settings.fallbackInstanceTypes beside the top-level one; both given and different: 400 naming both', async () => {
+  const types = (w) => { w.sql.db1 = {}; w.machineTypes['e2-medium'] = { name: 'e2-medium', memoryMb: 4096 }; w.machineTypes['e2-small'] = { name: 'e2-small', memoryMb: 2048 }; };
+  const stored = async (extra, id) => {
+    const { call, store } = api(types);
+    const res = await call('POST', '/v1/workloads', { ...INPUT, ...extra });
+    return { res, cfg: store.configs.get('demo'), id };
+  };
+  const old = await stored({ cloudSql: ['db1'], fallbackInstanceTypes: ['e2-medium'] });
+  assert.equal(old.res.status, 200, JSON.stringify(old.res.body));
+  for (const extra of [{ databases: ['db1'], settings: { fallbackInstanceTypes: ['e2-medium'] } }, { databases: [{ kind: 'cloudsql-instance', id: 'db1' }], settings: { fallbackInstanceTypes: ['e2-medium'] } }]) {
+    const next = await stored(extra);
+    assert.equal(next.res.status, 200, JSON.stringify(next.res.body));
+    assert.deepEqual(next.cfg.backends, old.cfg.backends);
+    assert.deepEqual(next.cfg.fallbackInstanceTypes, ['e2-medium']);
+    assert.equal(Object.hasOwn(next.cfg.settings ?? {}, 'fallbackInstanceTypes'), false);
+  }
+  const same = await stored({ databases: ['db1'], cloudSql: ['db1'], settings: { fallbackInstanceTypes: ['e2-medium'] }, fallbackInstanceTypes: ['e2-medium'] });
+  assert.equal(same.res.status, 200, JSON.stringify(same.res.body));
+  const dry = api(types);
+  assert.equal((await dry.call('POST', '/v1/workloads?dryRun=true', { ...INPUT, databases: ['db1'] })).body.databases.length, 1);
+  for (const [extra, words] of [
+    [{ databases: ['db1'], cloudSql: ['db2'] }, /databases.*cloudSql|cloudSql.*databases/],
+    [{ settings: { fallbackInstanceTypes: ['e2-medium'] }, fallbackInstanceTypes: ['e2-small'] }, /settings\.fallbackInstanceTypes.*fallbackInstanceTypes|fallbackInstanceTypes.*settings/],
+  ]) {
+    const { call, store } = api(types);
+    const res = await call('POST', '/v1/workloads', { ...INPUT, ...extra });
+    assert.equal(res.status, 400, JSON.stringify(extra));
+    assert.equal(res.body.reason, 'bad-request');
+    assert.match(res.body.error, words);
+    assert.equal(store.configs.size, 0);
+  }
+});
+
+test('a waiting page put without by: 400 bad-request, nothing written; a delete or a get needs none', async () => {
+  const { call, store } = api();
+  await call('POST', '/v1/workloads', INPUT);
+  for (const path of ['/v1/waiting-page', '/v1/workloads/demo/waiting-page']) {
+    for (const body of [{ page: { mode: 'template', title: 'Acme' } }, { page: { mode: 'template', title: 'Acme' }, by: '' }]) {
+      const res = await call('PUT', path, body);
+      assert.deepEqual([res.status, res.body.reason, /by/.test(res.body.error)], [400, 'bad-request', true], path);
+    }
+    assert.equal(store.pages.size, 0);
+    assert.equal((await call('GET', path)).status, 200);
+    assert.equal((await call('DELETE', path)).status, 200);
+  }
 });

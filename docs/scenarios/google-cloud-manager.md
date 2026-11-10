@@ -12,7 +12,7 @@ documented in the CLI's README, not here.
   with the id `<stateAt padded to 13 digits>-<workloadId>-<state>`, so the ids sort by time. It is written in the same
   commit as the state change, never apart from it, and holds AWS's `Workload state changed` detail: `workloadId`, `from`,
   `to`, `router`, `region`, `project`, `at`, the `cause`, the `wakeId` and `durationMs` of a wake, a `failure`, `by` (who
-  asked, for a nap, a wake or a pause from the manager), the `fallbacks`, the VMs `hibernated` and the workload's `tags`.
+  asked, for a nap, a wake or a pause from the manager), the `fallbacks`, the VMs `hibernated`, the priced items a nap `stopped` (below) and the workload's `tags`.
   Events are kept 7 days: the daily sweep that removes the old counters removes them too.
 - **The check summary**, `router/check`: replaced whole at each check (every 5 minutes, `checkSchedule` is
   `*/5 * * * *`) with the time of the check and how long it took, the time of the last check the schedule started, the
@@ -62,14 +62,15 @@ settings the router holds (null when it has none), which is what the manager com
 ## What a nap's event names
 
 The `Workload state changed` event of a nap (`to` ASLEEP) names what the nap stopped as priced items, `stopped`, at most 50,
-which is what the manager prices (AWS's event names its own the same way). The run keeps the names of the VMs and the Cloud SQL
-instances it stopped, which the wake uses; the items are only for the event.
+which is what the manager prices (AWS's event names its own the same way). The failed workload's release, which puts a failed
+workload to sleep (cause `failed-released`), names them the same way. The run keeps the names of the VMs (and GKE owners) a nap
+stopped or suspended, which the row's `hibernated` reads; the items are only for the event.
 
 - **A VM** (`gce`): `{ kind, machineType, family, vcpus, memoryGb, count, os, spot?, suspended?, zone }`. `family` is the machine
   type up to its first `-` (`e2-small` is `e2`, `n2d-custom-4-8192` is `n2d`), and a `custom-` type is `n1`. `vcpus` is the
   machine type's `guestCpus`, but the shared cores bill a fraction: `e2-micro` 0.25, `e2-small` 0.5, `e2-medium` 1, `f1-micro` 0.2
-  and `g1-small` 0.5. `memoryGb` is the machine type's `memoryMb` over 1024 (GiB, as Google bills). `os` is `windows` when a boot
-  disk's license is in `/projects/windows-cloud/`, else `linux`. `spot` is set for a Spot or preemptible VM and `suspended` for
+  and `g1-small` 0.5. `memoryGb` is the machine type's `memoryMb` over 1024 (GiB, as Google bills). `os` is `Windows` when a boot
+  disk's license is in `/projects/windows-cloud/`, else `Linux` (spelled as AWS's items spell it). `spot` is set for a Spot or preemptible VM and `suspended` for
   one the nap suspended instead of stopping. VMs of one machine type, zone, system, Spot and suspension are one item, with their
   `count`.
 - **A Cloud SQL instance** (`cloudsql`): `{ kind, tier, engine, edition, ha, region, vcpus?, memoryGb? }`: `engine` is
@@ -78,9 +79,11 @@ instances it stopped, which the wake uses; the items are only for the event.
   vCPUs and 8 GB each (Google's Enterprise Plus N tiers have 8 GB a vCPU); the shared cores and any other tier give neither. An instance
   that no longer exists adds no item.
 - **What cannot be read** is an `unknown` item, `{ kind, backend, reason }`, with the backend as `status` names it
-  (`instance:<vm>`, `asg:<group>`, `k8s:<id>`, `cloudsql-instance:<name>`) and the reason, cut to 200 characters: a VM deleted during
-  the nap, a refused read, a Cloud SQL instance whose engine or tier is unreadable. Each GKE backend is one, with the reason
-  "GKE pods are not priced". Describing never stops a nap: the nap reaches ASLEEP whatever these reads answer.
+  (`instance:<vm>`, `asg:<group>`, `k8s:<id>`, `cloudsql-instance:<name>`) and the reason, cut to 200 characters: a VM deleted since the nap
+  stopped it, a refused read, a Cloud SQL instance whose engine or tier is unreadable. Each GKE backend is one, with the reason
+  "GKE pods are not priced". Describing never stops a nap: the nap reaches ASLEEP whatever these reads answer. A reason starts with Google's status and
+  message (the URL left out). When the whole description fails or takes more than 60 seconds, the event holds one unknown item
+  with the backend `all` (not an empty list, which would read as nothing running), and the router says `StoppedUndescribed`.
 
 ## The organization level
 

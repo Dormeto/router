@@ -290,8 +290,8 @@ export function createFirestoreStore({ google, project, database, region = datab
     },
 
     // A change of state commits its event with the run (`events/…`), so that none is missed whoever transitions it. `cause` (what started
-    // a wake or a nap), `by` (who asked it) and `event` (the wake id and its duration, the failure, the VMs suspended) go in the event
-    // only, never on the run.
+    // a wake or a nap), `by` (who asked it) and `event` (the wake id and its duration, the failure, the VMs suspended, a nap's priced items) go in
+    // the event only, never on the run.
     transition(workloadId, { cond, set = {}, remove = [], increment = [], cause, by, event }) {
       let tags;
       return modifyRun(workloadId, async (run) => {

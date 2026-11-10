@@ -2,10 +2,36 @@
 // lambda/src/lib/stopped.mjs does: each VM by machine type, zone, system and Spot, a Cloud SQL companion by tier, engine and edition. A
 // backend that cannot be described is said (an unknown item), never guessed; describing never stops the nap.
 import { k8sId } from '../../lambda/src/lib/kubernetes.mjs';
+import { GoogleError } from './google.mjs';
+import { companionGone } from './cloudsql.mjs';
 
 const ITEMS_MAX = 50;
 
-const unknown = (backend, err) => ({ kind: 'unknown', backend, reason: String(err?.message ?? err).slice(0, 200) });
+// At most this many VMs are read at once (a large group has one read for each member).
+const READS_AT_ONCE = 10;
+const REASON_MAX = 200;
+
+// Google's own answer first, its URL left out: `403 PERMISSION_DENIED: the message`. Any other error says its message.
+function reasonOf(err) {
+  const text = String(err?.message ?? err);
+  if (!(err instanceof GoogleError)) return text.slice(0, REASON_MAX);
+  const message = /^Google: \S+ \S+: \d+ ([\s\S]*)$/.exec(text)?.[1] ?? text;
+  return `${[err.code || '', err.status].filter(Boolean).join(' ')}: ${message}`.replace(/^: /, '').slice(0, REASON_MAX);
+}
+const unknown = (backend, err) => ({ kind: 'unknown', backend, reason: reasonOf(err) });
+
+// `fn` over `list`, at most `limit` at a time, the answers in order.
+async function limited(list, limit, fn) {
+  const out = new Array(list.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(limit, list.length) }, async () => {
+    while (next < list.length) {
+      const at = next++;
+      out[at] = await fn(list[at]);
+    }
+  }));
+  return out;
+}
 const nameOf = (url) => String(url).split('/').pop();
 
 // The shared cores bill a fraction of a vCPU (the Compute Engine documentation lists them as such).
@@ -26,23 +52,23 @@ async function vmItem(compute, types, vm) {
     if (!Number.isFinite(vcpus) || !Number.isFinite(memoryMb)) throw new Error(`machine type ${type} has no vCPU count or memory`);
     return {
       kind: 'gce', machineType: type, family: familyOf(type), vcpus, memoryGb: memoryMb / 1024, count: 1,
-      os: windowsOf(instance) ? 'windows' : 'linux', ...(spotOf(instance) ? { spot: true } : {}), ...(vm.suspended ? { suspended: true } : {}), zone: vm.zone,
+      os: windowsOf(instance) ? 'Windows' : 'Linux', ...(spotOf(instance) ? { spot: true } : {}), ...(vm.suspended ? { suspended: true } : {}), zone: vm.zone,
     };
   } catch (err) {
     return unknown(vm.backend, err);
   }
 }
 
-// Equal items together, with their count; the order of the first of each.
+// Equal `gce` items together, with their count; the order of the first of each.
 function grouped(items) {
   const groups = new Map();
   for (const item of items) {
-    const key = item.kind === 'gce' ? JSON.stringify({ ...item, count: 0 }) : JSON.stringify(item);
+    const key = JSON.stringify({ ...item, count: 0 });
     const found = groups.get(key);
     if (found) found.count += 1;
     else groups.set(key, { ...item });
   }
-  return [...groups.values()].map((item) => (item.kind === 'gce' ? item : (({ count, ...rest }) => rest)(item)));
+  return [...groups.values()];
 }
 
 // `db-custom-N-M`: N vCPUs and M MB; Enterprise Plus `db-perf-optimized-N-K`: K vCPUs, 8 GB each (Google's Enterprise Plus N tiers). The
@@ -66,23 +92,28 @@ async function databaseItems(cloudsql, name) {
       ha: instance.settings.availabilityType === 'REGIONAL', region: instance.region, ...sizeOf(tier),
     }];
   } catch (err) {
-    return err?.code === 404 ? [] : [unknown(`cloudsql-instance:${name}`, err)];
+    return companionGone(err) ? [] : [unknown(`cloudsql-instance:${name}`, err)];
   }
 }
 
 const podsId = (backend) => `k8s:${k8sId({ cluster: `${backend.cluster.location}/${backend.cluster.name}`, namespace: backend.namespace, owner: backend.owner })}`;
 
 // `vms`: the VMs the nap stopped or suspended, `backend` their status backend (`instance:<vm>`, `asg:<group>`); `pods`: the GKE backends;
-// `companions`: the Cloud SQL instances stopped. At most 50 items.
-export async function describeStopped({ compute, cloudsql }, { vms = [], pods = [], companions = [] }) {
+// `companions`: the Cloud SQL instances stopped. At most 50 items. The VMs and the instances are read together, the VMs 10 at a time; each
+// read that fails is one unknown item and one warn line.
+export async function describeStopped({ compute, cloudsql, log }, { vms = [], pods = [], companions = [] }) {
   const types = new Map();
-  const found = await Promise.all(vms.map((vm) => vmItem(compute, types, vm)));
+  const [found, databases] = await Promise.all([
+    limited(vms, READS_AT_ONCE, (vm) => vmItem(compute, types, vm)),
+    Promise.all(companions.map((name) => databaseItems(cloudsql, name))),
+  ]);
   const unknownVms = [...new Map(found.filter((i) => i.kind === 'unknown').map((i) => [i.backend, i])).values()];
   const items = [
     ...grouped(found.filter((i) => i.kind === 'gce')),
     ...unknownVms,
     ...pods.map((backend) => unknown(podsId(backend), 'GKE pods are not priced')),
-    ...(await Promise.all(companions.map((name) => databaseItems(cloudsql, name)))).flat(),
+    ...databases.flat(),
   ];
+  for (const item of items) if (item.kind === 'unknown' && item.reason !== 'GKE pods are not priced') log?.warn('StoppedItemUnread', { backend: item.backend, reason: item.reason });
   return items.slice(0, ITEMS_MAX);
 }

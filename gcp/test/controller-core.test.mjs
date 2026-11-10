@@ -49,7 +49,7 @@ const notDone = () => new GoogleError('Google: operation op not done in time', {
 // switch (DMT_CUSTOM_PAGES).
 function setup({
   run = { state: STATES.AWAKE, awakeSince: 1 }, cfg = {}, vms = {}, groups = {}, autoscalers = {}, machineTypes = {}, map = mapOf(), requests = 0, unhealthyPolls = 0, lists, download,
-  nodeTimers = false, logs, logConfig, customPages = false,
+  nodeTimers = false, logs, logConfig, customPages = false, describeBudgetMs,
 } = {}) {
   const network = { fetch: async () => { throw new Error('no network in tests'); }, calls: [] };
   const clock = fakeClock();
@@ -118,6 +118,7 @@ function setup({
   const compute = {
     getInstance: async (zone, name) => structuredClone(world.vms[name]),
     getMachineType: async (zone, name) => {
+      if (world.machineTypesHang) await new Promise(() => {});
       if (!world.machineTypes[name]) throw new GoogleError('no machine type', { code: 404 });
       return structuredClone(world.machineTypes[name]);
     },
@@ -231,6 +232,7 @@ function setup({
       return network.fetch(...args);
     },
     customPages,
+    ...(describeBudgetMs === undefined ? {} : { describeBudgetMs }),
   });
   return { controller, store, clock, world, timers, urlmaps, regionalUrlmaps, network, run: () => store.state.run, logged: (event) => world.logs.filter((l) => l.event === event) };
 }
@@ -2473,12 +2475,14 @@ test('failed, its VMs now healthy: awake (recovered), the failure gone', async (
 
 test('the release stops the VMs behind the policy already there, ASLEEP, the failure kept', async () => {
   const t = setup({ run: FAILED_RUN(START - 15 * MINUTE), vms: { 'vm-a': { status: 'RUNNING' } }, map: asleepMap(), cfg: { hibernate: false } });
+  const changes = changesOf(t);
   assert.deepEqual(await t.controller.release('demo'), { state: STATES.ASLEEP });
   assert.deepEqual(t.world.calls, ['stop vm-a']);
   assert.deepEqual(t.world.sleeps, []);
   assert.equal(t.run().state, STATES.ASLEEP);
   assert.equal(JSON.parse(t.run().failure).kind, 'capacity');
   assert.deepEqual(t.run().stopped, ['vm-a']);
+  assert.deepEqual(changes.find((c) => c.to === STATES.ASLEEP).event.items, [{ kind: 'gce', machineType: 'e2-small', family: 'e2', vcpus: 0.5, memoryGb: 2, count: 1, os: 'Linux', zone: ZONE }]);
   assert.equal(t.logged('StateChanged').find((l) => l.to === STATES.ASLEEP).cause, 'failed-released');
   assert.equal(t.logged('FailedReleased').length, 1);
 });
@@ -5833,13 +5837,13 @@ test('a nap to ASLEEP hands the store the VMs it suspended, which the event list
   assert.deepEqual(eventOf({ workloadId: 'demo', from: 'NAPPING', to: 'ASLEEP', stateAt: START, event: change.event, router: { name: 'dmtr-europe-west1', region: 'europe-west1', project: 'p' } }).hibernated, ['vm-a']);
 });
 
-test('a nap to ASLEEP names what it stopped as priced items in its event; the run keeps the names the wake reads', async () => {
+test('a nap to ASLEEP names what it stopped as priced items in its event; the run keeps the names of the VMs it suspended, which the hibernated row reads', async () => {
   const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
   const asked = changesOf(t);
   await t.controller.nap('demo');
   const { event } = asked.find((c) => c.to === STATES.ASLEEP);
   assert.deepEqual(event.suspended, ['vm-a']);
-  assert.deepEqual(event.items, [{ kind: 'gce', machineType: 'e2-small', family: 'e2', vcpus: 0.5, memoryGb: 2, count: 1, os: 'linux', suspended: true, zone: ZONE }]);
+  assert.deepEqual(event.items, [{ kind: 'gce', machineType: 'e2-small', family: 'e2', vcpus: 0.5, memoryGb: 2, count: 1, os: 'Linux', suspended: true, zone: ZONE }]);
   assert.deepEqual(t.run().suspended, ['vm-a']);
   assert.deepEqual(t.run().stopped, []);
   assert.deepEqual(t.run().items, undefined);
@@ -5852,8 +5856,19 @@ test('a nap whose reads all fail still reaches ASLEEP: the items are unknown, wi
   const asked = changesOf(t);
   assert.equal((await t.controller.nap('demo')).state, STATES.ASLEEP);
   const { event } = asked.find((c) => c.to === STATES.ASLEEP);
-  assert.deepEqual(event.items, [{ kind: 'unknown', backend: 'instance:vm-a', reason: 'no machine type' }]);
+  assert.deepEqual(event.items, [{ kind: 'unknown', backend: 'instance:vm-a', reason: '404: no machine type' }]);
   assert.deepEqual(t.run().stopped, ['vm-a']);
+});
+
+test('a nap whose description outlasts its budget reaches ASLEEP: one unknown item for all, StoppedUndescribed said', async () => {
+  const t = setup({ cfg: { hibernate: false }, vms: { 'vm-a': { status: 'RUNNING' } }, describeBudgetMs: 20 });
+  t.world.machineTypesHang = true;
+  const asked = changesOf(t);
+  assert.equal((await t.controller.nap('demo')).state, STATES.ASLEEP);
+  const { event } = asked.find((c) => c.to === STATES.ASLEEP);
+  assert.deepEqual(event.items, [{ kind: 'unknown', backend: 'all', reason: 'the stopped items were not described within 20 ms' }]);
+  assert.deepEqual(t.run().stopped, ['vm-a']);
+  assert.equal(t.logged('StoppedUndescribed').length, 1);
 });
 
 test('a state change reads no configuration of its own: its event carries the tags the wake read', async () => {

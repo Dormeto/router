@@ -83,6 +83,8 @@ import { listenerRulesOf, mapBusy, references, UrlMapRefused } from './urlmaps.m
 const POLL_MS = 2000;
 // Until the VMs are down, from the moment they are asked to go. G0: 106 s, 96 s suspended, 198 s for a managed group's.
 const STOP_TIMEOUT_MS = 300_000;
+// What describing a nap's stopped items may take, as a whole (stopped.mjs).
+const DESCRIBE_BUDGET_MS = 60_000;
 // Within the request's 1800 s: what is left removes the policy after the wake, or records a nap's failure. The nap's fits
 // a lost policy's second wait: two writes (G0: 25 s), twice 300 s and a managed group's stop. A swap's wait comes out of the wake's
 // budget, as it comes before AWAKE.
@@ -174,8 +176,21 @@ const repeat = (ms, fn) => {
 };
 const nameOf = (url) => url.slice(url.lastIndexOf('/') + 1);
 const zoneOf = (url) => /\/zones\/([^/]+)\//.exec(url)?.[1];
+// `fn()` answered, or a rejection when it takes more than `budgetMs`.
+async function describedWithin(budgetMs, fn) {
+  let timer;
+  const late = new Promise((resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`the stopped items were not described within ${budgetMs} ms`)), budgetMs);
+  });
+  try {
+    return await Promise.race([fn(), late]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 const names = (vms) => vms.map((vm) => vm.name);
-// A nap's answer: the names the run keeps (the wake reads them), and what its event says (the suspended VMs, the priced items).
+// A nap's answer: the names of the VMs (and GKE owners) it stopped or suspended, which the run keeps (the row's `hibernated` reads the
+// suspended), and what its event says (the suspended VMs, the priced items).
 const runOf = ({ stopped, suspended }) => ({ stopped, suspended });
 const eventOfSlept = ({ suspended, items }) => ({ suspended, items });
 const primariesOf = (cfg) => cfg.backends.filter((b) => !isCompanion(b));
@@ -224,6 +239,8 @@ export function createController({
   store, compute, cloudsql, gke, urlmaps, regionalUrlmaps, monitoring, logs, tasks, config, lists = [], download, now = Date.now, sleep, every = repeat, newId = randomUUID, log,
   // The favicon read at a nap (favicon.mjs): the network and its time budget, injected for the tests. customPages: the install's switch.
   fetch = globalThis.fetch, faviconBudgetMs = FAVICON_BUDGET_MS, customPages = false,
+  // The time the description of a nap's stopped items has (injected for the tests).
+  describeBudgetMs = DESCRIBE_BUDGET_MS,
 }) {
   const clients = { compute, kubernetesOf: (cluster) => gke.kubernetesOf(cluster) };
   const enqueue = (body) => tasks.enqueue({ url: `${config.controllerUrl}/v1/tasks`, body });
@@ -678,12 +695,13 @@ export function createController({
     await each(companionsOf(cfg), async ({ name }) => {
       if ((await stopDatabase(cloudsql, name, latest, stillGoing)) === COMPANION_GONE) log.warn('CompanionGone', { workloadId: cfg.workloadId, instance: name });
     });
-    // Described after the acts (a stopping VM reads the same machine type and licenses); never a reason to fail the nap.
-    const items = await describeStopped({ compute, cloudsql, log }, {
+    // Described after the acts (a stopping VM reads the same machine type and licenses), within its own budget; never a reason to fail the
+    // nap. What cannot be described at all is one unknown item for `all` (AWS's), which the manager does not price as $0 saved.
+    const items = await describedWithin(describeBudgetMs, () => describeStopped({ compute, cloudsql, log }, {
       vms: done.flatMap((d) => d.vms), pods: done.flatMap((d) => d.pods), companions: companionsOf(cfg).map(({ name }) => name),
-    }).catch((err) => {
+    })).catch((err) => {
       log.warn('StoppedUndescribed', { workloadId: cfg.workloadId, error: err.message });
-      return [];
+      return [{ kind: 'unknown', backend: 'all', reason: String(err?.message ?? err).slice(0, 200) }];
     });
     return { stopped: done.flatMap((d) => d.stopped), suspended: done.flatMap((d) => d.suspended), items };
   }

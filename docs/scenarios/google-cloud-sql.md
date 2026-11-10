@@ -11,6 +11,9 @@ went down after the application and came up before it, a wake after the tag's re
 hand while asleep was stopped by the check, and one stopped while awake was started. A stop and a start were measured on
 Google beforehand (below), and the tag's condition as the router.
 
+Not released yet: router 0.40.0 adds, on this page: the wake timeout 1700 s of a workload with a companion, fixed, which `show` says
+as `fixed`, within the settings by level ([Settings](google-cloud-compute-engine.md#settings-and-their-levels)).
+
 ```mermaid
 flowchart LR
   V(["Visitor"]) --> LB{"Load balancer<br/>global, regional or classic"}

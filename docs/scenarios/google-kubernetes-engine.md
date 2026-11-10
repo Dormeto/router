@@ -15,6 +15,11 @@ router, the RBAC shown by `access show` and removed at the offboarding, a Gatewa
 cluster role or binding of Dormeto's in the cluster. The scale to 0 and back, the DNS endpoint, the Role and GKE's own
 maps were measured on Google beforehand (below).
 
+Not released yet: router 0.40.0 adds, on this page: the refusal of a KEDA ScaledObject whose `minReplicaCount` is 0, a default
+wake timeout of 600 s (300 s in 0.37.0) that behind a swap can't be less than the map's change plus 60 s, the settings by level
+(the type here is `k8s`) with fallback machine types refused for pods, and a wider reading of the load balancers GKE owns
+(Multi Cluster Ingress, an older Ingress, the descriptions GKE writes).
+
 ```mermaid
 flowchart LR
   V(["Visitor"]) --> UM{"URL map of your load balancer<br/>global, regional or classic"}

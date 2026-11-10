@@ -48,7 +48,7 @@ service: the manager calls it with an ID token of its command service account, w
 - **The REST names beside AWS's.** The REST Workload carries `workloadId` beside `id` and `pauses` (a list, as the rows' are)
   beside `paused` (the first of them): the CLI reads the one, the manager the other. The onboarding takes `databases` or
   `cloudSql`, `settings.fallbackInstanceTypes` or the top-level `fallbackInstanceTypes` (below). A put of a waiting page
-  needs `by`, who sets it. The waker answers a request with no workload header a 400
+  needs `by`, who sets it. The waker answers a request with no workload header, or a header that names no valid ID, a 400
   `{ "error": "x-dormeto-workload names no workload", "reason": "bad-request" }`.
 - **`status`'s `settings`** hold AWS's six keys (`idleMinutes`, `waitSeconds`, `drainSeconds`, `wakeTimeoutSeconds`,
   `maxHolders`, `failedRetrySeconds`), and `wakeMode` is beside them, at the top of the status, as on AWS.
@@ -151,7 +151,7 @@ logged, `EndedWindowsRemoved`.
 
 - **The manager polls, the router does not push.** It asks every minute and reads the journal again from 5 minutes
   before the newest event it has, so an event is read twice and kept once.
-- **A router older than 0.40.0 (not released yet) has no `/v1/actions`**: the manager lists it with its version, does not poll it and
+- **A router older than 0.40.0 (Not released yet: router 0.40.0) has no `/v1/actions`**: the manager lists it with its version, does not poll it and
   says which `dormeto gcp install` command upgrades it.
 - **The journal is 7 days.** A manager that cannot read the router for longer loses the changes in between; its history
   is inferred from the next check's states.

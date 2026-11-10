@@ -445,7 +445,7 @@ value. The names, the values and the answers are AWS's (`idleMinutes`, `settings
 so one model describes both clouds. The CLI sets them with `dormeto gcp workloads settings` and `dormeto gcp routers settings` (the README has the
 flags); the controller's routes are `PUT /v1/workloads/{id}/settings`, and `GET` and `PUT /v1/settings` for the router's level, with
 AWS's bodies, answers and checks: a value that is not a whole number in its range is the problem `<key>: must be a whole number from
-<min> to <max>` (an onboarding's problem starts with `settings: `), as AWS's, and the status's `settings` hold AWS's six keys, `wakeMode` beside them at the top.
+<min> to <max>` (an onboarding's problem starts with `settings: `), as AWS's, and the manager's `status` has `settings` of AWS's six keys, `wakeMode` beside them at the top (the REST Workload's `settings` keep seven).
 
 - **The levels.** The workload's own values are in its configuration, which lists in `inherits` the keys that follow the levels;
   the router's are in the Firestore document `router/settings` (`hibernate`, `joinMinutes`, `defaults`, `by`, `at`). The

@@ -20,8 +20,9 @@ Run services](#google-cloud) of the same two roles):
 
 - `waker` Lambda: ALB target used only while the workload naps. It wakes the workload once, holds the request up to
   `waitSeconds`, then answers a `307` or a self-reloading waiter page.
-- `controller` Lambda: switches the ALB rule weights, stops and starts the instance, naps idle workloads (scheduled
-  check of the ALB `RequestCount`), and reconciles external changes.
+- `controller` Lambda: switches the ALB rule weights, naps idle workloads (scheduled check of the ALB `RequestCount`) and
+  wakes them: it stops and starts EC2 instances and databases, scales Auto Scaling groups, ECS services and Kubernetes
+  Deployments to 0 and back, and reconciles external changes.
 
 A workload is identified by its **application target group**. Its **rules** are every listener rule of the target
 group's load balancer that forwards to it, found at each nap, wake and idle check: a nap switches all of them to the waker
@@ -599,7 +600,7 @@ aws dynamodb get-item --table-name dmt-dev-router --key '{"pk":{"S":"WL#demo"},"
 
 Since 0.34.0 the router also runs on Google Cloud: `gcp/src` holds the two Cloud Run roles, one container image,
 `DMT_ROLE` (`waker` or `controller`) picks the role. `dormeto gcp install` (the CLI) creates the services, from Dormeto's public image by
-default (Not released yet: router 0.40.0) or from your own with `--image`. Its scenarios, each with its limits:
+default (Not released yet: router 0.40.0 and CLI 0.14.0) or from your own with `--image`. Its scenarios, each with its limits:
 
 - [Compute Engine VMs](docs/scenarios/google-cloud-compute-engine.md): instance groups behind a global external
   Application Load Balancer since 0.34.0; zonal network endpoint groups, the regional and classic load balancers (the
@@ -617,7 +618,7 @@ Router 0.37.0 adds zonal network endpoint groups, the regional and classic load 
 `dormetoRouterDatabases` and `dormetoRouterKubernetes`, and a Kubernetes Role per GKE workload, which the CLI applies).
 They were accepted on 2026-11-04 in `dormeto-dev` with CLI 0.11.0: each page says what was accepted and measured.
 
-The Google Cloud router has AWS's settings by level, the wake mode and the no-wake and wake rules, the branded waiting page, a
+Not released yet: router 0.40.0 gives the Google Cloud router AWS's settings by level, the wake mode and the no-wake and wake rules, the branded waiting page, a
 capacity retry with fallback machine types, and the internal Application Load Balancers: the [Compute Engine
 page](docs/scenarios/google-cloud-compute-engine.md) says what each does, what Google Cloud fixes and why, and
 [Kubernetes on GKE](docs/scenarios/google-kubernetes-engine.md) says which load balancers GKE owns and are refused.
@@ -646,7 +647,7 @@ podman run --rm -p 8080:8080 -e DMT_ROLE=controller -e DMT_PROJECT=p -e DMT_REGI
 
 Dormeto publishes the image, public, at `<europe|us|asia>-docker.pkg.dev/dormeto-releases/router/router:<version>` from
 router 0.40.0 (`terraform/gcp-releases` creates the three repositories), and `dormeto gcp install` uses it by default. Not
-released yet: router 0.40.0.
+released yet: router 0.40.0 and CLI 0.14.0.
 Building your own is for `--image`, for example inside a VPC Service Controls perimeter, which keeps the public
 repository out. An image in another project needs Artifact Registry Reader for the project's Cloud Run service agent,
 which the customer gives.

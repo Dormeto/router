@@ -578,7 +578,7 @@ test('the GKE page: the exact refusal of GKE\'s own load balancers, and the way'
 
 test('the README and the Cloud SQL page say the G5 features and the 1700 s fixed value', () => {
   const readme = flat(read('README.md'));
-  assert.match(readme, /The Google Cloud router has AWS's settings by level, the wake mode and the no-wake and wake rules, the branded waiting page, a capacity retry with fallback machine types, and the internal Application Load Balancers/);
+  assert.match(readme, /Not released yet: router 0\.40\.0 gives the Google Cloud router AWS's settings by level, the wake mode and the no-wake and wake rules, the branded waiting page, a capacity retry with fallback machine types, and the internal Application Load Balancers/);
   assert.match(readme, /enable_internal/);
   assert.match(flat(read(SQL)), /The wake timeout 1700 s is fixed: the databases type's 1800 s is brought to the most a wake can take/);
 });
@@ -794,9 +794,12 @@ test('the manager page: the REST names, the status\'s settings and what a refusa
   assert.match(page, /The REST Workload carries workloadId beside id and pauses \(a list, as the rows' are\) beside paused \(the first of them\)/);
   assert.match(page, /The onboarding takes databases or cloudSql, settings\.fallbackInstanceTypes or the top-level fallbackInstanceTypes/);
   assert.match(page, /status's settings hold AWS's six keys \(idleMinutes, waitSeconds, drainSeconds, wakeTimeoutSeconds, maxHolders, failedRetrySeconds\), and wakeMode is beside them, at the top of the status/);
+  // The REST Workload's settings keep the seven: the Compute Engine page says which of the two holds six.
+  assert.match(flat(read(CE)), /and the manager's status has settings of AWS's six keys, wakeMode beside them at the top \(the REST Workload's settings keep seven\)/);
+  assert.doesNotMatch(flat(read(CE)), /and the status's settings hold AWS's six keys/);
   assert.match(page, /A pause's keepAsleep that is not true or false is refused/);
   assert.match(page, /A put of a waiting page needs by/);
-  assert.match(page, /The waker answers a request with no workload header a 400 \{ "error": "x-dormeto-workload names no workload", "reason": "bad-request" \}/);
+  assert.match(page, /The waker answers a request with no workload header, or a header that names no valid ID, a 400 \{ "error": "x-dormeto-workload names no workload", "reason": "bad-request" \}/);
 });
 
 test('the tag is spelled dormeto=managed on every page', () => {
@@ -830,7 +833,67 @@ test('the pages do not call 0.38.0 or 0.39.0 a release, say Not released yet: ro
     // G4's 0.38.0 and G5's 0.39.0 never ship alone (the design's 7.2); only their dev builds are named.
     assert.doesNotMatch(read(file), /(?<![\d.])0\.3[89]\.0(?![-\d])/, file);
   }
-  assert.ok(flat(read('README.md')).includes('(Not released yet: router 0.40.0) or from your own'));
-  assert.match(flat(read('README.md')), /router 0\.40\.0 \(terraform\/gcp-releases creates the three repositories\)/);
+  assert.ok(flat(read('README.md')).includes('(Not released yet: router 0.40.0 and CLI 0.14.0) or from your own'));
+  assert.match(flat(read('README.md')), /router 0\.40\.0 \(terraform\/gcp-releases creates the three repositories\), and dormeto gcp install uses it by default\. Not released yet: router 0\.40\.0 and CLI 0\.14\.0\./);
   assert.match(flat(read(MANAGER)), /^# Google Cloud: the router and the manager Not released yet: router 0\.40\.0\./);
+});
+
+// The review's final fix wave: what 0.37.0 did not have is marked on every page that says it, and the index's sentence is true.
+test('the pages that describe what 0.37.0 did not have say Not released yet: router 0.40.0, each naming what it adds', () => {
+  const gke = flat(read(GKE));
+  assert.match(gke, /Not released yet: router 0\.40\.0 adds, on this page: the refusal of a KEDA ScaledObject whose minReplicaCount is 0, a default wake timeout of 600 s \(300 s in 0\.37\.0\) that behind a swap can't be less than the map's change plus 60 s, the settings by level \(the type here is k8s\) with fallback machine types refused for pods, and a wider reading of the load balancers GKE owns/);
+  const sql = flat(read(SQL));
+  assert.match(sql, /Not released yet: router 0\.40\.0 adds, on this page: the wake timeout 1700 s of a workload with a companion, fixed, which show says as fixed, within the settings by level/);
+  // docs/scenarios/README.md says what the Google Cloud pages add beyond 0.37.0 is marked: each of the three has the mark.
+  assert.match(flat(read('docs/scenarios/README.md')), /what they add beyond 0\.37\.0 is marked Not released yet: router 0\.40\.0/);
+  for (const file of [CE, SQL, GKE]) assert.ok(flat(read(file)).includes(NOT_YET), file);
+  const readme = flat(read('README.md'));
+  assert.match(readme, /Not released yet: router 0\.40\.0 gives the Google Cloud router AWS's settings by level, the wake mode and the no-wake and wake rules, the branded waiting page, a capacity retry with fallback machine types, and the internal Application Load Balancers/);
+  assert.doesNotMatch(readme, /The Google Cloud router has AWS's settings by level/);
+});
+
+test('the manager page says Not released yet: router 0.40.0 where it says a router older than that has no /v1/actions', () => {
+  const page = flat(read(MANAGER));
+  assert.match(page, /A router older than 0\.40\.0 \(Not released yet: router 0\.40\.0\) has no \/v1\/actions/);
+  assert.doesNotMatch(page, /not released yet\)/);
+});
+
+test('the README says what the router does for each kind of backend, not that it stops and starts the instance', () => {
+  const readme = flat(read('README.md'));
+  assert.doesNotMatch(readme, /stops and starts the instance/);
+  assert.match(readme, /controller Lambda: switches the ALB rule weights, naps idle workloads \(scheduled check of the ALB RequestCount\) and wakes them: it stops and starts EC2 instances and databases, scales Auto Scaling groups, ECS services and Kubernetes Deployments to 0 and back, and reconciles external changes/);
+});
+
+// A "Not released yet: router X" sentence is true until the package reaches X: the release's npm test lists each one to rewrite.
+const versionParts = (version) => {
+  const [core, pre] = version.split(/-(.*)/s);
+  return { numbers: core.split('.').map(Number), pre: pre ?? null };
+};
+// Negative when `a` is below `b`; 0.40.0-dev.3 is below 0.40.0.
+const compareVersions = (a, b) => {
+  const [x, y] = [versionParts(a), versionParts(b)];
+  for (let i = 0; i < 3; i += 1) if (x.numbers[i] !== y.numbers[i]) return x.numbers[i] - y.numbers[i];
+  if (x.pre === y.pre) return 0;
+  return x.pre === null ? 1 : y.pre === null ? -1 : x.pre < y.pre ? -1 : 1;
+};
+
+test('compareVersions: a dev version is below its release, and a lower minor is below', () => {
+  assert.ok(compareVersions('0.40.0-dev.3', '0.40.0') < 0);
+  assert.ok(compareVersions('0.40.0-rc.1', '0.40.0') < 0);
+  assert.ok(compareVersions('0.37.0', '0.40.0') < 0);
+  assert.ok(compareVersions('0.9.0', '0.40.0') < 0);
+  assert.equal(compareVersions('0.40.0', '0.40.0'), 0);
+  assert.ok(compareVersions('0.40.0', '0.40.0-dev.3') > 0);
+  assert.ok(compareVersions('0.41.0', '0.40.0') > 0);
+});
+
+test('every "Not released yet: router X" sentence names a version above the package\'s: the release rewrites it', () => {
+  const files = ['README.md', 'docs/scenarios/README.md', MANAGER, CE, SQL, GKE, 'docs/scenarios/databases.md', 'docs/scenarios/kubernetes.md'];
+  const found = [];
+  for (const file of files) {
+    for (const [, version] of spaced(read(file)).matchAll(/Not released yet: router (\d+\.\d+\.\d+)/g)) found.push([file, version]);
+  }
+  assert.ok(found.length >= 6, 'the docs say it where they describe 0.40.0');
+  const reached = found.filter(([, version]) => compareVersions(PACKAGE.version, version) >= 0);
+  assert.deepEqual(reached, [], `the package is at ${PACKAGE.version}: these sentences are released, rewrite them`);
 });

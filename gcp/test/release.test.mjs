@@ -737,3 +737,32 @@ test('the manager page says what preview and onboard take, and what status keeps
   assert.match(page, /status's instance and asg backends carry resourceId, the numeric id the onboarding stored \(the manager removes the dormeto\/managed binding on that id at an offboarding, whoever bound it, the CLI too\), and their location; a backend stored without its id has none/);
   assert.match(page, /status also keeps the workload's requestLogs/);
 });
+
+// G2 plan 3 (D3): what a nap's event names, from stopped.mjs.
+test('the manager page says what a nap\'s event names, as stopped.mjs builds it', () => {
+  const page = flat(read(MANAGER));
+  const src = read('gcp/src/stopped.mjs');
+  assert.match(src, /const ITEMS_MAX = 50;/);
+  assert.match(src, /const SHARED_VCPUS = \{ 'e2-micro': 0\.25, 'e2-small': 0\.5, 'e2-medium': 1, 'f1-micro': 0\.2, 'g1-small': 0\.5 \};/);
+  assert.match(src, /type\.startsWith\('custom-'\) \? 'n1' : type\.split\('-'\)\[0\]/);
+  assert.match(src, /memoryGb: memoryMb \/ 1024/);
+  assert.match(src, /\/projects\/windows-cloud\//);
+  assert.match(src, /memoryGb: 8 \* Number\(perf\[1\]\)/);
+  assert.match(src, /'GKE pods are not priced'/);
+  assert.match(src, /\.slice\(0, 200\)/);
+  assert.match(src, /err\?\.code === 404 \? \[\]/);
+  assert.match(page, /names what the nap stopped as priced items, stopped, at most 50/);
+  assert.match(page, /The run keeps the names of the VMs and the Cloud SQL instances it stopped, which the wake uses; the items are only for the event/);
+  assert.match(page, /\{ kind, machineType, family, vcpus, memoryGb, count, os, spot\?, suspended\?, zone \}/);
+  assert.match(page, /family is the machine type up to its first - \(e2-small is e2, n2d-custom-4-8192 is n2d\), and a custom- type is n1/);
+  assert.match(page, /e2-micro 0\.25, e2-small 0\.5, e2-medium 1, f1-micro 0\.2 and g1-small 0\.5/);
+  assert.match(page, /memoryGb is the machine type's memoryMb over 1024 \(GiB, as Google bills\)/);
+  assert.match(page, /os is windows when a boot disk's license is in \/projects\/windows-cloud\/, else linux/);
+  assert.match(page, /VMs of one machine type, zone, system, Spot and suspension are one item, with their count/);
+  assert.match(page, /\{ kind, tier, engine, edition, ha, region, vcpus\?, memoryGb\? \}/);
+  assert.match(page, /db-perf-optimized-N-K gives K vCPUs and 8 GB each \(Google's Enterprise Plus N tiers have 8 GB a vCPU\); the shared cores and any other tier give neither/);
+  assert.match(page, /An instance that no longer exists adds no item/);
+  assert.match(page, /\{ kind, backend, reason \}, with the backend as status names it \(instance:<vm>, asg:<group>, k8s:<id>, cloudsql-instance:<name>\) and the reason, cut to 200 characters/);
+  assert.match(page, /Each GKE backend is one, with the reason "GKE pods are not priced"/);
+  assert.match(page, /Describing never stops a nap: the nap reaches ASLEEP whatever these reads answer/);
+});

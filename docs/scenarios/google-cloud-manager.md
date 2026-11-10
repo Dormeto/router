@@ -59,6 +59,29 @@ settings the router holds (null when it has none), which is what the manager com
 `{ "action": "manager-settings", "settings": <the manager's settings.json>, "etag": <its ETag> }` stores both in
 `router/manager` and answers `{ "etag" }`. The `etag` is a string of 1 to 256 characters; `settings` is needed.
 
+## What a nap's event names
+
+The `Workload state changed` event of a nap (`to` ASLEEP) names what the nap stopped as priced items, `stopped`, at most 50,
+which is what the manager prices (AWS's event names its own the same way). The run keeps the names of the VMs and the Cloud SQL
+instances it stopped, which the wake uses; the items are only for the event.
+
+- **A VM** (`gce`): `{ kind, machineType, family, vcpus, memoryGb, count, os, spot?, suspended?, zone }`. `family` is the machine
+  type up to its first `-` (`e2-small` is `e2`, `n2d-custom-4-8192` is `n2d`), and a `custom-` type is `n1`. `vcpus` is the
+  machine type's `guestCpus`, but the shared cores bill a fraction: `e2-micro` 0.25, `e2-small` 0.5, `e2-medium` 1, `f1-micro` 0.2
+  and `g1-small` 0.5. `memoryGb` is the machine type's `memoryMb` over 1024 (GiB, as Google bills). `os` is `windows` when a boot
+  disk's license is in `/projects/windows-cloud/`, else `linux`. `spot` is set for a Spot or preemptible VM and `suspended` for
+  one the nap suspended instead of stopping. VMs of one machine type, zone, system, Spot and suspension are one item, with their
+  `count`.
+- **A Cloud SQL instance** (`cloudsql`): `{ kind, tier, engine, edition, ha, region, vcpus?, memoryGb? }`: `engine` is
+  `postgres`, `mysql` or `sqlserver` (from the `databaseVersion`), `edition` is `enterprise` or `enterprise-plus`, and `ha`
+  is true for a regional instance. `db-custom-N-M` gives `vcpus` N and `memoryGb` M over 1024, and `db-perf-optimized-N-K` gives K
+  vCPUs and 8 GB each (Google's Enterprise Plus N tiers have 8 GB a vCPU); the shared cores and any other tier give neither. An instance
+  that no longer exists adds no item.
+- **What cannot be read** is an `unknown` item, `{ kind, backend, reason }`, with the backend as `status` names it
+  (`instance:<vm>`, `asg:<group>`, `k8s:<id>`, `cloudsql-instance:<name>`) and the reason, cut to 200 characters: a VM deleted during
+  the nap, a refused read, a Cloud SQL instance whose engine or tier is unreadable. Each GKE backend is one, with the reason
+  "GKE pods are not priced". Describing never stops a nap: the nap reaches ASLEEP whatever these reads answer.
+
 ## The organization level
 
 The router reads `router/manager` through AWS's own parsing, so that both clouds read the same file alike: the hibernation

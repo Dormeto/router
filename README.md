@@ -76,7 +76,7 @@ no_wake_rules = [
 get the waiter page at once (or JSON naming the wake header), so scanners that do not run JavaScript never wake the
 workload; a request arriving during a wake is held as usual. The filters (no-wake rules, `HEAD`, bots, scanner paths)
 apply to the probe too. On Google Cloud the waiter page's probe goes to `/_dormeto/wake` with the visitor's path in
-`x-dormeto-path`, and a workload that sleeps or wakes answers a `202` there, not a `503`: see [the Compute Engine
+`x-dormeto-path`. A workload that sleeps or wakes answers a `202` there, not a `503`: see [the Compute Engine
 page](docs/scenarios/google-cloud-compute-engine.md#the-waiting-page).
 
 **Settings and their levels (router 0.37.0):** a workload's idle window, waits, wake timeout, held requests, retry
@@ -332,7 +332,7 @@ aws lambda invoke --function-name dmt-dev-controller --cli-binary-format raw-in-
     days, 365 by default and without a manager. While the settings were never read, or cannot be, nothing is removed.
   - Only between occurrences, since an occurrence's id holds its window's index; and only over the schedule as the check read
     it (a conditional write), so a save since is kept. Logged `EndedWindowsRemoved` with the counts. Who set the schedule
-    and when stay as they were. On Google Cloud too (router 0.40.0), with the `endedWindowDays` of the settings the
+    and when stay as they were. On Google Cloud too (Not released yet: router 0.40.0), with the `endedWindowDays` of the settings the
     manager pushes to the router: 365 days without them, and 0 keeps them.
 - **The check applies it** on the clock's 5-minute marks: the `check_schedule` of the `router` module is
   `cron(0/5 * * * ? *)` (not `rate(5 minutes)`), so 08:45 is met at the 08:45 check, within its latency. Each occurrence
@@ -599,7 +599,7 @@ aws dynamodb get-item --table-name dmt-dev-router --key '{"pk":{"S":"WL#demo"},"
 
 Since 0.34.0 the router also runs on Google Cloud: `gcp/src` holds the two Cloud Run roles, one container image,
 `DMT_ROLE` (`waker` or `controller`) picks the role. `dormeto gcp install` (the CLI) creates the services, from Dormeto's public image by
-default (from 0.38.0) or from your own with `--image`. Its scenarios, each with its limits:
+default (Not released yet: router 0.40.0) or from your own with `--image`. Its scenarios, each with its limits:
 
 - [Compute Engine VMs](docs/scenarios/google-cloud-compute-engine.md): instance groups behind a global external
   Application Load Balancer since 0.34.0; zonal network endpoint groups, the regional and classic load balancers (the
@@ -622,14 +622,14 @@ capacity retry with fallback machine types, and the internal Application Load Ba
 page](docs/scenarios/google-cloud-compute-engine.md) says what each does, what Google Cloud fixes and why, and
 [Kubernetes on GKE](docs/scenarios/google-kubernetes-engine.md) says which load balancers GKE owns and are refused.
 
-Router 0.38.0 fixes the limits of 0.37.0 on Google Cloud, and each is on the
+Router 0.40.0 fixes the limits of 0.37.0 on Google Cloud, and each is on the
 [Compute Engine page](docs/scenarios/google-cloud-compute-engine.md): a running wake or nap beats every minute, and one
 that stops is sent again or called stuck within minutes; the naps of one URL map share its updates, and a busy map gives
 a nap up instead of failing it; at most 20 naps are in flight per router; an idle nap reads the traffic again before it
 stops anything; a nap checks an unmanaged group's VMs and the backend service's backends; and a classic load balancer on
 the Standard tier is found, and Google accepts it for the swap (measured). With `--request-logs` the idle check reads
 the load balancer's request logs and ignores what the waker ignores: the logs decide alone, as Monitoring's count is
-sampled, but an empty log leaves the count to decide. GKE refuses a KEDA `minReplicaCount: 0`. Not released yet: router 0.40.0, which holds the fixes of 0.38.0. Their acceptance passed on 2026-11-08 in
+sampled, but an empty log leaves the count to decide. GKE refuses a KEDA `minReplicaCount: 0`. Not released yet: router 0.40.0. The fixes' acceptance passed on 2026-11-08 in
 `dormeto-dev`, with the image 0.38.0-dev.2 and the CLI built from `main`.
 
 ```bash
@@ -645,7 +645,8 @@ podman run --rm -p 8080:8080 -e DMT_ROLE=controller -e DMT_PROJECT=p -e DMT_REGI
 ```
 
 Dormeto publishes the image, public, at `<europe|us|asia>-docker.pkg.dev/dormeto-releases/router/router:<version>` from
-router 0.38.0 (`terraform/gcp-releases` creates the three repositories), and `dormeto gcp install` uses it by default.
+router 0.40.0 (`terraform/gcp-releases` creates the three repositories), and `dormeto gcp install` uses it by default. Not
+released yet: router 0.40.0.
 Building your own is for `--image`, for example inside a VPC Service Controls perimeter, which keeps the public
 repository out. An image in another project needs Artifact Registry Reader for the project's Cloud Run service agent,
 which the customer gives.

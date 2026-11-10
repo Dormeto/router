@@ -62,5 +62,5 @@ test('a workload with databases has 1800 s from the levels, written with Terrafo
 test('the AWS wake paragraphs say once where Google Cloud\'s probe goes and what asleep answers there', () => {
   const readme = flat(read('README.md'));
   assert.equal(readme.match(/\/_dormeto\/wake/g)?.length, 1);
-  assert.match(readme, /On Google Cloud the waiter page's probe goes to \/_dormeto\/wake with the visitor's path in x-dormeto-path, and a workload that sleeps or wakes answers a 202 there, not a 503: see \[the Compute Engine page\]\(docs\/scenarios\/google-cloud-compute-engine\.md#the-waiting-page\)/);
+  assert.match(readme, /On Google Cloud the waiter page's probe goes to \/_dormeto\/wake with the visitor's path in x-dormeto-path\. A workload that sleeps or wakes answers a 202 there, not a 503: see \[the Compute Engine page\]\(docs\/scenarios\/google-cloud-compute-engine\.md#the-waiting-page\)/);
 });

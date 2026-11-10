@@ -1,7 +1,7 @@
 # Supported scenarios
 
-What the router naps and wakes, as of router 0.37.0. Not released yet: router 0.40.0 adds what the Google Cloud pages say of
-0.38.0 to 0.40.0 and the manager page. A **workload** is an Application Load Balancer target group and
+What the router naps and wakes, as of router 0.37.0. Not released yet: router 0.40.0 adds what the Google Cloud pages say
+beyond 0.37.0, and the manager page. A **workload** is an Application Load Balancer target group and
 the backends behind it: the router naps them together once the target group has had no request for the idle window, and
 wakes them on the next request. Each page below gives the scenario's diagram, the services it uses, its measured wake
 time, its behavior and its limits.
@@ -23,7 +23,7 @@ The Dormeto manager reads and acts on a Google Cloud router through the journal,
 A workload may combine backends: Auto Scaling groups and loose instances, an ECS service and its database, pods and
 their database. Databases are always companions of an application's backends. On Google Cloud a workload is a backend
 service of an Application Load Balancer, external or internal; its three pages are from router 0.37.0 but for the Compute Engine
-page's global load balancer, accepted on 2026-11-04, and say what was not run; what they add of 0.38.0 to 0.40.0 is marked Not released yet: router 0.40.0.
+page's global load balancer, accepted on 2026-11-04, and say what was not run; what they add beyond 0.37.0 is marked Not released yet: router 0.40.0.
 
 ## The cycle
 

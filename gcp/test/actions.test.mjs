@@ -250,7 +250,7 @@ test('force-wake: AWS\'s answers by state; the wake names the manager and who as
   Object.assign(store.runs.get('demo'), { state: STATES.NAPPING, pendingWake: false });
   assert.deepEqual((await act({ action: 'force-wake', workloadId: 'demo', by: 'ann' })).body, { state: STATES.NAPPING, pendingWake: true });
   assert.equal(store.runs.get('demo').pendingWake, true);
-  assert.deepEqual(pick(w.logs.findLast((l) => l.event === 'PendingWake'), ['reason', 'by']), { reason: 'manager', by: 'ann' });
+  assert.deepEqual(w.logs.findLast((l) => l.event === 'PendingWake').trigger, { kind: 'manager', by: 'ann' });
 });
 
 test('pause and resume: a workload\'s or, without workloadId, the router\'s, in AWS\'s answers, its wake saying who paused; the REST Workload shows the pause', async () => {
@@ -397,7 +397,7 @@ test('pause: the router\'s wakes run 8 at a time, so 40 asleep workloads are wok
   assert.ok(clock.now() - started <= 10_000, `the pause answered after ${clock.now() - started} ms`);
   assert.deepEqual(body.woken, ids);
   assert.deepEqual(w.tasks.map((task) => task.body.workloadId).sort(), ids);
-  assert.equal(w.logs.filter((l) => l.event === 'WakeRequested' && l.reason === 'pause').length, 40);
+  assert.equal(w.logs.filter((l) => l.event === 'WakeRequested' && l.trigger?.kind === 'pause').length, 40);
 });
 
 test('pause: the router\'s woken lists only the wakes it started: one a waker started first is not listed, a napping one\'s pending wake is', async () => {

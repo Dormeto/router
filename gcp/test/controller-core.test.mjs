@@ -3712,11 +3712,23 @@ test('a pause without keepAsleep wakes a sleeper, or a failed one, in a request 
   }
 });
 
+test('WakeRequested and PendingWake name who asked as AWS\'s and the waker\'s lines do, trigger { kind, by } (B6 of the cloud duplication design)', async () => {
+  const asleep = setup({ run: { state: STATES.ASLEEP }, vms: { 'vm-a': { status: 'TERMINATED' } }, map: asleepMap() });
+  await asleep.controller.wakeNow('demo', 'manager', 'ann');
+  const [requested] = asleep.logged('WakeRequested');
+  assert.deepEqual([requested.trigger, 'reason' in requested, 'by' in requested], [{ kind: 'manager', by: 'ann' }, false, false]);
+  const napping = setup({ run: { state: STATES.NAPPING } });
+  await napping.controller.wakeNow('demo', 'pause');
+  const [pending] = napping.logged('PendingWake');
+  // As a log line holds it: no `by` when none asked.
+  assert.deepEqual([JSON.parse(JSON.stringify(pending)).trigger, 'reason' in pending], [{ kind: 'pause' }, false]);
+});
+
 test('a pause without keepAsleep gives a napping workload its pending wake; awake: nothing to wake', async () => {
   const napping = setup({ run: { state: STATES.NAPPING } });
   await napping.controller.pause('demo', { reason: 'load test' });
   assert.equal(napping.run().pendingWake, true);
-  assert.deepEqual(napping.logged('PendingWake').map((l) => l.reason), ['pause']);
+  assert.deepEqual(napping.logged('PendingWake').map((l) => l.trigger.kind), ['pause']);
   assert.equal(napping.store.state.stats['wake:pause'], 1);
   const awake = setup();
   await awake.controller.pause('demo', { reason: 'load test' });

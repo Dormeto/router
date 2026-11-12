@@ -832,15 +832,11 @@ export function createController({
     }
   }
 
-  // How this controller's WakeRequested and PendingWake lines name who asked: `reason` (the kind) and `by`, where AWS's lines and this
-  // router's waker's say `trigger: { kind, by }` (B6 of the cloud duplication design, held: gcp/test/actions.test.mjs reads these
-  // fields).
-  const saidHere = (kind, by) => ({ reason: kind, ...(by ? { by } : {}) });
-
   // The run to WAKING for a wake asked here, not by a request (the waker's; asked-wake.mjs's beginWake). Null when its state changed
-  // meanwhile. `by`: who asked (the manager's actions, a pause), in its event as AWS's.
+  // meanwhile. `by`: who asked (the manager's actions, a pause), in its event as AWS's, and in WakeRequested's `trigger: { kind, by }`
+  // as AWS's and the waker's lines (B6 of the cloud duplication design).
   function beginWake(workloadId, from, cause, by) {
-    return beginAskedWake({ transition, newId, now, log, said: saidHere }, workloadId, from, { kind: cause, by });
+    return beginAskedWake({ transition, newId, now, log }, workloadId, from, { kind: cause, by });
   }
 
   // A daily counter: a failed update changes nothing else.
@@ -849,7 +845,7 @@ export function createController({
   // A napping workload's wake is kept for the nap's end (asked-wake.mjs's). True when this call kept it: one log line and one counted
   // wake.
   function pendingWake(workloadId, kind, by) {
-    return setPendingWake({ store, count, log, said: saidHere }, workloadId, { kind, by });
+    return setPendingWake({ store, count, log }, workloadId, { kind, by });
   }
 
   // The wake of an asleep or failed workload from the run read, in a request of its own. True when its task was accepted;

@@ -246,10 +246,6 @@ function oneOf(first, second, firstName, secondName) {
   return first;
 }
 
-// A pause as the controller shows it (controller-core.mjs's `shown`, which names the router's scope only), with AWS's `scope` on every one: the
-// workload's or the router's. The API's Workload and the manager's rows and status read the same pause through this.
-export const scoped = (pause) => ({ scope: pause.scope ?? 'workload', ...pause });
-
 // The API's Workload. `awakeSince` is a time the CLI prints, and left on the run by a nap. `workloadId` beside `id` (AWS's name beside the CLI's); `pauses`: its active pauses, as AWS's rows list them, and `paused` the first (the CLI's). `companionsGone`:
 // the Cloud SQL instances named at its onboarding that no longer exist, as last read. `napAborted`: why the last nap was given up and
 // when, until a nap commits. `beatAt`: the running wake's or nap's last heartbeat (heartbeat.mjs), WAKING or NAPPING only. `idleReads`:
@@ -263,8 +259,7 @@ function workloadOf(cfg, pauses, run, { router = null, organization = null } = {
   const beatAt = run ? beatOf(run) : undefined;
   const effective = effectiveOf(cfg, { run, router, organization });
   const { settings, settingsFrom, type } = resolvedSettings(effective);
-  const shownPauses = pauses.map(scoped);
-  const [paused] = shownPauses;
+  const [paused] = pauses;
   return {
     workloadId: cfg.workloadId,
     id: cfg.workloadId,
@@ -289,7 +284,7 @@ function workloadOf(cfg, pauses, run, { router = null, organization = null } = {
     ...(run?.state === STATES.AWAKE && run.awakeSince !== undefined ? { awakeSince: isoOf(run.awakeSince) } : {}),
     ...(run?.lastWake ? { lastWake: run.lastWake } : {}),
     ...(failure ? { failure } : {}),
-    pauses: shownPauses,
+    pauses,
     ...(paused ? { paused } : {}),
     ...(run?.companionsGone?.length ? { companionsGone: run.companionsGone } : {}),
     ...(run?.napAborted ? { napAborted: { reason: run.napAborted.reason, at: isoOf(run.napAborted.at) } } : {}),

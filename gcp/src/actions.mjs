@@ -18,12 +18,13 @@
 // level (§5.5).
 import { k8sId } from '../../lambda/src/lib/kubernetes.mjs';
 import { describeStoredLists } from '../../lambda/src/lib/list-cache.mjs';
+import { pauseText } from '../../lambda/src/lib/pauses.mjs';
 import { maintenanceDue } from '../../lambda/src/lib/schedule.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { STATS_DAYS } from '../../lambda/src/lib/summary.mjs';
 import { CHECK_SCHEDULE, PauseRefused } from './controller-core.mjs';
 import { isPods } from './gke.mjs';
-import { Refusal, scoped } from './onboarding.mjs';
+import { Refusal } from './onboarding.mjs';
 import { organizationOf } from './organization.mjs';
 import { CUSTOM_PAGES_REFUSED } from './pages.mjs';
 import { rowOf } from './rows.mjs';
@@ -47,17 +48,6 @@ const iso = (ms) => new Date(ms).toISOString();
 const isoOrNull = (ms) => (typeof ms === 'number' && ms > 0 ? iso(ms) : null);
 const isObject = (value) => !!value && typeof value === 'object' && !Array.isArray(value);
 const invalid = (message) => new Refusal(400, 'bad-request', message);
-
-// A stored pause as AWS shows it (controller-core.mjs's shownPauses), its scope the workload's or the router's.
-const pauseOf = ({ workloadId, by, at, reason, until, keepAsleep, exclusionId }) => ({
-  scope: workloadId === null ? 'router' : 'workload', by, at: iso(at), reason, until: until === undefined ? null : iso(until), keepAsleep: keepAsleep === true,
-  ...(exclusionId ? { exclusionId } : {}),
-});
-// The exclusions' first, then the workload's own, then the router's; the newest first within each.
-const rankOf = (pause) => (pause.exclusionId ? 0 : pause.scope === 'router' ? 2 : 1);
-const inOrder = (pauses) => pauses.sort((a, b) => rankOf(a) - rankOf(b) || b.at.localeCompare(a.at));
-// A pause in AWS's words, as its request-nap answers it (controller-core.mjs's pauseText).
-const pauseText = (p) => `${p.scope === 'router' ? 'router ' : ''}paused by ${p.by}: ${p.reason}`;
 
 // The numeric id the onboarding stored, as a string: the manager removes the tag it bound on that id. An older onboarding stored none.
 const resourceIdOf = ({ id }) => (id === undefined || id === null ? {} : { resourceId: String(id) });
@@ -127,8 +117,6 @@ async function problemsAnswered(write) {
 // `controller`: controller-core.mjs's; `onboarding`: onboarding.mjs's; `router`: `{ name, version, build, project, region }`; `lists`:
 // the router's IP lists (DMT_IP_LISTS). `act(payload)` answers `{ status, body }`.
 export function createActions({ controller, onboarding, store, router, lists = [], now = Date.now, log }) {
-  const expired = (p) => p.until !== undefined && p.until <= now();
-
   // The organization's level (router/manager): what the levels read, and the manager's as AWS's hibernation shows it, null while the
   // manager has pushed none. One that cannot be read counts as unset and is said, as the REST routes count it.
   async function organization() {
@@ -153,8 +141,8 @@ export function createActions({ controller, onboarding, store, router, lists = [
     cfg, run, stats7d: stats, routerName: router.name, router: above.router, organization: above.organization, pauses, scheduled,
   });
 
-  // AWS's list: the router, then a row per workload (rows.mjs), by id. The pauses are read once, as AWS's: unreadable, it is said in
-  // `pausesError` and none is shown.
+  // AWS's list: the router, then a row per workload (rows.mjs), by id. The pauses are read once, as AWS's, and shown as the
+  // controller's (lambda/src/lib/pauses.mjs): unreadable, it is said in `pausesError` and none is shown.
   async function list() {
     let pausesError;
     const [{ configs, schedules }, above, checked, pauses] = await Promise.all([
@@ -167,10 +155,9 @@ export function createActions({ controller, onboarding, store, router, lists = [
         return [];
       }),
     ]);
-    const active = pauses.filter((p) => !expired(p));
     const workloads = await Promise.all(configs.map(async (cfg) => {
       const [run, stats] = await Promise.all([store.getRun(cfg.workloadId), store.getStats(cfg.workloadId, STATS_DAYS).catch(() => null)]);
-      const shown = inOrder(active.filter((p) => p.workloadId === cfg.workloadId || p.workloadId === null).map(pauseOf));
+      const shown = controller.shownPauses(pauses.filter((p) => p.workloadId === cfg.workloadId || p.workloadId === null));
       return rowFor(cfg, { run, stats, pauses: shown, scheduled: schedules.has(cfg.workloadId), above });
     }));
     return {
@@ -180,7 +167,7 @@ export function createActions({ controller, onboarding, store, router, lists = [
         build: router.build ?? null,
         checkSchedule: CHECK_SCHEDULE,
         lastScheduledCheckAt: isoOrNull(checked?.lastScheduledCheckAt),
-        pauses: inOrder(active.filter((p) => p.workloadId === null).map(pauseOf)),
+        pauses: controller.shownPauses(pauses.filter((p) => p.workloadId === null)),
         ...(pausesError ? { pausesError } : {}),
       },
       workloads: workloads.sort((a, b) => a.workloadId.localeCompare(b.workloadId)),
@@ -203,7 +190,7 @@ export function createActions({ controller, onboarding, store, router, lists = [
       onboarding.showSchedule(id),
       lists.length ? describeStoredLists(store, lists).catch((err) => [{ error: err.message }]) : [],
     ]);
-    const row = rowFor(cfg, { run, stats: stats.error ? null : stats, pauses: pauses.map(scoped), scheduled: Boolean(view.schedule), above });
+    const row = rowFor(cfg, { run, stats: stats.error ? null : stats, pauses, scheduled: Boolean(view.schedule), above });
     return {
       ...shown,
       ...row,
@@ -297,11 +284,11 @@ export function createActions({ controller, onboarding, store, router, lists = [
         throw new Refusal(404, 'not-found', `workload not configured: ${workloadId} (its backend service is not ${backendService})`);
       }
     }
-    const answer = workloadId === null ? await onboarding.pauseRouter(payload) : await controller.pause(workloadId, payload, { exclusionId }).catch((err) => {
+    if (workloadId === null) return onboarding.pauseRouter(payload);
+    return controller.pause(workloadId, payload, { exclusionId }).catch((err) => {
       if (err instanceof PauseRefused) throw invalid(err.message);
       throw err;
     });
-    return { ...answer, pause: scoped(answer.pause) };
   }
 
   // AWS's resume: whether there was the pause, the workload's (the exclusion's when `exclusionId` is given) or the router's.

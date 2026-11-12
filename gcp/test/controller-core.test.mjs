@@ -3629,17 +3629,6 @@ test('a pause with no until goes through the store without one, and never expire
   }
 });
 
-test('the pause as written and shown: its author, its reason trimmed, keepAsleep only when true, until to its limit', async () => {
-  const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
-  const until = new Date(START + 366 * DAY).toISOString();
-  await t.controller.pause('demo', { reason: '  load test ', by: 'ops', until, keepAsleep: true });
-  assert.deepEqual(t.store.state.pauses, [{ workloadId: 'demo', by: 'ops', at: START, reason: 'load test', until: START + 366 * DAY, keepAsleep: true }]);
-  assert.deepEqual(await t.controller.pausesFor('demo'), [{ by: 'ops', at: new Date(START).toISOString(), reason: 'load test', until, keepAsleep: true }]);
-  assert.deepEqual(t.logged('Paused').map((l) => [l.workloadId, l.by]), [['demo', 'ops']]);
-  await t.controller.pause('demo', { reason: 'again' });
-  assert.deepEqual(await t.controller.pausesFor('demo'), [{ by: 'unknown', at: new Date(START).toISOString(), reason: 'again', until: null, keepAsleep: false }]);
-});
-
 test('a pause refused: no reason, one too long, an until in the past or too far, a keepAsleep that is not a boolean', async () => {
   const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
   for (const [input, message] of [
@@ -3753,23 +3742,6 @@ test('pausing the router writes its pause without a workload and wakes a sleeper
   assert.deepEqual(kept.woken, []);
   assert.deepEqual(asleep.world.tasks, []);
   await assert.rejects(() => asleep.controller.pause(null, {}), /reason required/);
-});
-
-test('a router pause is refused as a workload\'s is: no reason, an until in the past', async () => {
-  const t = setup();
-  await assert.rejects(() => t.controller.pause(null, { reason: 'r', until: START }), /until must be/);
-  assert.deepEqual(t.store.state.pauses, []);
-});
-
-test('resuming the router removes its pause only, once; the workload\'s own stays', async () => {
-  const t = setup();
-  await t.controller.pause('demo', { reason: 'mine', by: 'ops' });
-  await t.controller.pause(null, { reason: 'all', by: 'ops' });
-  assert.deepEqual(await t.controller.resume(null, 'ops'), { resumed: true });
-  assert.deepEqual(t.store.state.pauses.map((p) => p.workloadId), ['demo']);
-  assert.deepEqual(t.logged('Resumed').map((l) => [l.workloadId ?? null, l.by]), [[null, 'ops']]);
-  assert.deepEqual(await t.controller.resume(null, 'ops'), { resumed: false });
-  assert.equal(t.logged('Resumed').length, 1);
 });
 
 test('routerInfo and the check\'s summary show the router pause as AWS\'s answer does, and count every workload as paused', async () => {

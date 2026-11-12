@@ -232,7 +232,10 @@ through the embedded metric format of the log lines: no API call, about 0.30 USD
 automatic resume (`until`, at most 366 days ahead). A paused workload, or every workload of a paused router, is never
 napped: the idle check skips it and a nap request is refused (`SKIPPED`, reason `paused`, also when the pause arrives
 during the drain); the reconcile still runs and requests still wake. Pausing wakes the asleep and failed workloads (a
-napping one gets a pending wake) unless `keepAsleep`. Pauses live in the state table (`ROUTER / PAUSE`,
+napping one gets a pending wake) unless `keepAsleep`, and its answer's `woken` lists the wakes this pause started or set,
+a router pause's queued wakes among them. Resuming a workload the router does not know is refused (`not_found`:
+`workload not configured: <id>`), and an exclusion's lift of one answers `{ "resumed": false }`. Not released yet:
+router 0.40.0, for `woken` and the refused resume. Pauses live in the state table (`ROUTER / PAUSE`,
 `WL#<id> / PAUSE`, and `WL#<id> / PAUSE#<exclusion>` for a manager exclusion), never in the configuration item that
 Terraform writes; an expired pause no longer counts and the next idle check deletes it (`PauseExpired`). The manager
 pauses and resumes from its Routers and workload views:
@@ -558,7 +561,7 @@ Design: `docs/specs/2026-10-03-mvp-alb-ec2-design.md` in the Dormeto/vision repo
 |---|---|
 | `docs/scenarios` | The supported scenarios: diagrams, services, wake times, behavior, limits |
 | `lambda/src` | Lambda code (Node.js 24, no bundled dependency): the entry points and the AWS clients (`aws/`) |
-| `lambda/src/lib` | Both routers' library: the AWS router's logic, and what the Google Cloud router imports from it (schedules, settings levels, waiting page, waker, rows, events, failures). No cloud SDK: each cloud passes its own store and calls. The Lambda zip and the Cloud Run image both hold it |
+| `lambda/src/lib` | Both routers' library: the AWS router's logic, and what the Google Cloud router imports from it (schedules, settings levels, pauses, waiting page, waker, rows, events, failures). No cloud SDK: each cloud passes its own store and calls. The Lambda zip and the Cloud Run image both hold it |
 | `lambda/test` | Unit tests (`node --test`) |
 | `gcp/src`, `gcp/test` | The Google Cloud router's two Cloud Run roles (waker, controller) on that library, and their unit tests |
 | `terraform/modules/router` | DynamoDB table, Lambdas, IAM, idle check schedule |

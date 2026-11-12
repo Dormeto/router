@@ -60,6 +60,7 @@ import { cacheFavicon, FAVICON_BUDGET_MS, hostOfRules } from '../../lambda/src/l
 import { healthOf } from '../../lambda/src/lib/health.mjs';
 import { resolveHibernation } from '../../lambda/src/lib/hibernation.mjs';
 import { createListCache, describeStoredLists } from '../../lambda/src/lib/list-cache.mjs';
+import { createPauses, pauseHolds, shownPause } from '../../lambda/src/lib/pauses.mjs';
 import { awakeStartWithin, CLOSE_START_MS, ENDED_DAYS_DEFAULT, maintenanceDue, occurrenceAt, resolveJoin, withoutEnded } from '../../lambda/src/lib/schedule.mjs';
 import { DAY_MS, STATES, utcDay } from '../../lambda/src/lib/state.mjs';
 import { createListRefresher } from '../../lambda/src/lib/list-refresh.mjs';
@@ -136,9 +137,6 @@ const SCHEDULED_NAPS_MAX = 10;
 // At most this many naps in flight per router (F8), so that the wakes find room among the controller's 10 instances of 10 requests:
 // the NAPPING runs as the check starts, then each nap it asks, the scheduled ones first. The others nap at a later check.
 const NAPS_MAX = 20;
-// Pauses: automatic resume at most this far ahead, reason length.
-const PAUSE_MAX_MS = 366 * 86_400_000;
-const REASON_MAX = 256;
 const ANY_STATE = Object.values(STATES);
 
 const STOPPED = new Set(['TERMINATED', 'STOPPED']);
@@ -227,6 +225,20 @@ export class PauseRefused extends Error {
     this.name = 'PauseRefused';
   }
 }
+
+// The pauses' store (lambda/src/lib/pauses.mjs) on the Firestore one: its names, and the router's pause, its own document
+// (`router/pause`).
+export const pauseStore = (store) => ({
+  listPauses: () => store.listPauses(),
+  async getPauses(workloadId) {
+    if (workloadId !== null) return store.getPauses(workloadId);
+    const pause = await store.getRouterPause();
+    return pause ? [{ workloadId: null, ...pause }] : [];
+  },
+  putPause: (workloadId, record) => store.addPause(workloadId, record),
+  deletePause: (workloadId, options) => store.removePauses(workloadId, options),
+  listConfigs: () => store.listConfigs(),
+});
 
 // `every(ms, fn)`: the heartbeat's timer, which its answer stops; tests run it on their clock.
 // A day's counters are kept this long, as the DynamoDB store's (lambda/src/lib/state.mjs).
@@ -1359,101 +1371,17 @@ export function createController({
 
   // --- Pauses: a paused workload is never napped -------------------------------------------------------------------------
 
-  const expired = (p) => p.until !== undefined && p.until <= now();
-
-  // A pause as people read it; the router's says so (`scope: 'router'`), a workload's is the one it was, an exclusion's names it.
-  const shown = ({ workloadId, by, at, reason, until, keepAsleep, exclusionId }) => ({
-    ...(workloadId === null ? { scope: 'router' } : {}), by, at: iso(at), reason, until: until === undefined ? null : iso(until), keepAsleep: keepAsleep === true,
-    ...(exclusionId ? { exclusionId } : {}),
+  // Pauses (lambda/src/lib/pauses.mjs) on the Firestore store. A pause without keepAsleep wakes its workload, or each one of a paused
+  // router (wakeNow, its kind `pause`); keepAsleep holds the scheduled and maintenance wakes only: a visitor still wakes it (the
+  // waker knows nothing of pauses). A router's wakes go 8 at a time, as the check's reads (AWS queues them 10 at a time), so that a
+  // router of many sleepers answers within the manager's call. An `exclusionId` is the manager's action's alone (actions.mjs checks
+  // it): the REST routes never pass one.
+  const {
+    expired, shownPauses, pausesFor, isPaused, activePauses, pause, resume,
+  } = createPauses({
+    store: pauseStore(store), wake: (workloadId, { by }) => wakeNow(workloadId, 'pause', by), concurrency: CHECK_CONCURRENCY,
+    refuse: (message) => new PauseRefused(message), now, log,
   });
-
-  // AWS's order (shownPauses): the exclusions first, then the workload's own, then the router's; the newest first within each.
-  const rank = (p) => (p.exclusionId ? 0 : p.workloadId ? 1 : 2);
-
-  // A workload's active pauses, as people read them: its exclusions', its own, then its router's.
-  async function pausesFor(workloadId) {
-    const [own, router] = await Promise.all([store.getPauses(workloadId), store.getRouterPause()]);
-    return [...own, ...(router ? [{ workloadId: null, ...router }] : [])].filter((p) => !expired(p))
-      .sort((a, b) => rank(a) - rank(b) || b.at - a.at).map(shown);
-  }
-
-  // A nap needs to know: pauses that cannot be read count as a pause.
-  async function isPaused(workloadId) {
-    try {
-      return (await pausesFor(workloadId)).length > 0;
-    } catch (err) {
-      log.warn('PausesUnreadable', { workloadId, error: err.message });
-      return true;
-    }
-  }
-
-  // Every active pause, `{ pauses }`; when they cannot be read, `{ pauses: null, error }` (the read's). The expired ones are deleted
-  // (unless a newer pause replaced them).
-  async function activePauses() {
-    let pauses;
-    try {
-      pauses = await store.listPauses();
-    } catch (err) {
-      log.warn('PausesUnreadable', { error: err.message });
-      return { pauses: null, error: err.message };
-    }
-    for (const p of pauses.filter(expired)) {
-      const deleted = await store.removePauses(p.workloadId, { at: p.at, exclusionId: p.exclusionId }).catch((err) => {
-        log.warn('PauseDeleteFailed', { workloadId: p.workloadId, ...(p.exclusionId ? { exclusionId: p.exclusionId } : {}), error: err.message });
-        return false;
-      });
-      if (deleted) log.info('PauseExpired', { workloadId: p.workloadId, by: p.by, reason: p.reason, ...(p.exclusionId ? { exclusionId: p.exclusionId } : {}) });
-    }
-    return { pauses: pauses.filter((p) => !expired(p)) };
-  }
-
-  // The record as stored. No `until` when none is asked for: the store would make `undefined` a null, read as expired.
-  function pauseRecord({ by, reason, until, keepAsleep }, exclusionId) {
-    const text = typeof reason === 'string' ? reason.trim() : '';
-    if (!text || text.length > REASON_MAX) throw new PauseRefused(`reason required (1 to ${REASON_MAX} characters)`);
-    if (keepAsleep !== undefined && typeof keepAsleep !== 'boolean') throw new PauseRefused('keepAsleep must be true or false');
-    let untilMs;
-    if (until !== undefined && until !== null) {
-      untilMs = typeof until === 'number' ? until : Date.parse(until);
-      if (!(untilMs > now() && untilMs <= now() + PAUSE_MAX_MS)) throw new PauseRefused('until must be in the future, within 366 days');
-    }
-    return { by: by ?? 'unknown', at: now(), reason: text, ...(untilMs === undefined ? {} : { until: untilMs }), keepAsleep: keepAsleep === true,
-      ...(exclusionId ? { exclusionId: String(exclusionId) } : {}) };
-  }
-
-  // Pauses the workload, or the router when `workloadId` is null. Unless keepAsleep, an asleep or failed workload (each one of a
-  // paused router) is woken and a napping one gets a pending wake. keepAsleep holds the scheduled and maintenance wakes only: a
-  // visitor still wakes it (the waker knows nothing of pauses). Answers the pause as shown and the workloads woken, as AWS's action:
-  // those whose wake this pause started, in the configurations' order. A router's wakes go 8 at a time, as the check's reads (AWS
-  // queues them 10 at a time), so that a router of many sleepers answers within the manager's call.
-  // `exclusionId` is the manager's action's alone (actions.mjs checks it): the REST routes never pass one.
-  async function pause(workloadId, input, { exclusionId } = {}) {
-    const record = pauseRecord(input, exclusionId);
-    await store.addPause(workloadId, record);
-    log.info('Paused', { workloadId, ...record });
-    const started = new Set();
-    const ids = record.keepAsleep ? [] : workloadId ? [workloadId] : (await store.listConfigs()).map((c) => c.workloadId);
-    let next = 0;
-    await Promise.all(Array.from({ length: Math.min(CHECK_CONCURRENCY, ids.length) }, async () => {
-      while (next < ids.length) {
-        const id = ids[next++];
-        try {
-          if (await wakeNow(id, 'pause', record.by)) started.add(id);
-        } catch (err) {
-          log.error('PauseWakeFailed', { workloadId: id, error: err.message });
-        }
-      }
-    }));
-    return { pause: shown({ workloadId, ...record }), woken: ids.filter((id) => started.has(id)) };
-  }
-
-  // Removes the workload's pause (the exclusion's when `exclusionId` is given, else the operator's), or the router's when `workloadId`
-  // is null: only that one. Answers whether there was one.
-  async function resume(workloadId, by, { exclusionId } = {}) {
-    const resumed = Boolean(await store.removePauses(workloadId, { exclusionId }));
-    if (resumed) log.info('Resumed', { workloadId, by, ...(exclusionId ? { exclusionId } : {}) });
-    return { resumed };
-  }
 
   // --- The check -----------------------------------------------------------------------------------------------------
 
@@ -1653,8 +1581,7 @@ export function createController({
     const started = now();
     const deadline = started + CHECK_BUDGET_MS;
     const { pauses, error: pausesError } = await activePauses();
-    const paused = (workloadId) => pauses === null || pauses.some((p) => p.workloadId === null || p.workloadId === workloadId);
-    const keptAsleep = (workloadId) => pauses === null || pauses.some((p) => p.keepAsleep && (p.workloadId === null || p.workloadId === workloadId));
+    const { paused, keptAsleep } = pauseHolds(pauses);
     const [{ configs, schedules }, levels] = await Promise.all([store.listWorkloads(), routerLevel()]);
     for (const cfg of configs) tagsOf.set(cfg.workloadId, cfg.tags ?? {});
     const order = [...configs].sort((a, b) => a.workloadId.localeCompare(b.workloadId));
@@ -1758,7 +1685,7 @@ export function createController({
       const known = new Map(results.filter((r) => ANY_STATE.includes(r.state)).map((r) => [r.workloadId, r.state]));
       const { byState } = await stateCounts(order, known);
       const { health } = await healthSummary({ t, byState, lastScheduledCheckAt, pausesError, managerState });
-      await store.putCheck({ checkedAt: started, durationMs: t - started, checkSchedule: CHECK_SCHEDULE, lastScheduledCheckAt, health, pauses: pauses.map(shown), counts: byState });
+      await store.putCheck({ checkedAt: started, durationMs: t - started, checkSchedule: CHECK_SCHEDULE, lastScheduledCheckAt, health, pauses: pauses.map(shownPause), counts: byState });
     } catch (err) {
       log.warn('CheckNotRecorded', { error: err.message });
     }
@@ -1791,7 +1718,7 @@ export function createController({
         noWakeRules: { value: [], source: CLI },
         metrics: { value: null, source: CLI },
       },
-      pauses: pauses.filter((p) => p.workloadId === null).map(shown),
+      pauses: pauses.filter((p) => p.workloadId === null).map(shownPause),
       workloads: {
         total: configs.length,
         byState,
@@ -1834,5 +1761,5 @@ export function createController({
     }
   }
 
-  return { noteTags, refreshLists, routerInfo, wake, beginWake, wakeNow, nap, napNow, release, check, pause, resume, pausesFor };
+  return { noteTags, refreshLists, routerInfo, wake, beginWake, wakeNow, nap, napNow, release, check, pause, resume, pausesFor, shownPauses };
 }

@@ -154,6 +154,33 @@ test('resume removes the operator pause only: the router pause and an exclusion 
   assert.deepEqual(s.store.state.pauses, []);
 });
 
+// B4 of the cloud duplication design (vision docs/specs/2026-11-12-cloud-duplication-design.md, §4): as Google Cloud's.
+test('resume refuses a workload the router does not know as not found; an exclusion\'s lift of one has nothing to lift', async () => {
+  const s = setup({ run: { state: STATES.AWAKE } });
+  await assert.rejects(s.handler({ action: 'resume', workloadId: 'nope', by: 'ops' }), (err) => err.code === 'not_found' && err.message === 'workload not configured: nope');
+  assert.deepEqual(await s.handler({ action: 'resume', workloadId: 'nope', by: 'ops', refusals: true }), { refused: { code: 'not_found', message: 'workload not configured: nope' } });
+  assert.deepEqual(await s.handler({ action: 'resume', workloadId: 'nope', exclusionId: 'x1', by: 'mgr' }), { resumed: false });
+  assert.deepEqual(await s.handler({ action: 'resume', by: 'ops' }), { resumed: false });
+  assert.deepEqual(s.logs.filter(([event]) => event === 'Resumed'), []);
+});
+
+// B5 of the cloud duplication design (§4): woken holds the wakes this pause started or set, as Google Cloud's.
+test('a pause lists as woken only the wakes it started or set: not a pending wake set before it, nor a wake another started first', async () => {
+  const napping = setup({ run: { state: STATES.NAPPING, pendingWake: true } });
+  assert.deepEqual((await napping.handler(pauseEvent())).woken, []);
+  assert.equal(napping.store.state.stats['wake:pause'], undefined);
+  // Another wake takes the asleep workload between the pause's read of its run and its own write.
+  const raced = setup({ run: { state: STATES.ASLEEP }, instance: 'stopped', target: 'waker' });
+  const { transition } = raced.store;
+  raced.store.transition = async (id, change) => {
+    if (change.set?.state === STATES.WAKING) raced.store.state.run.state = STATES.WAKING;
+    return transition(id, change);
+  };
+  assert.deepEqual((await raced.handler(pauseEvent())).woken, []);
+  assert.deepEqual(raced.invocations, []);
+  assert.equal(raced.store.state.pauses.length, 1);
+});
+
 test('request-nap: refused with the reason while paused or not awake, else the nap runs in its own invocation', async () => {
   const s = setup({ run: { state: STATES.AWAKE } });
   assert.deepEqual(await s.handler({ action: 'request-nap', workloadId: 'demo', by: 'ops' }), { requested: true });

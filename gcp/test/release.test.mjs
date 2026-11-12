@@ -662,8 +662,9 @@ test('the manager page says what a pause and a request-nap do, from the code, an
   const page = flat(read(MANAGER));
   assert.match(ACTIONS_SRC, /return \{ requested: false, reason: pauseText\(first\) \};/);
   assert.match(page, /is not a refusal: it answers \{ "requested": false, "reason" \} with the pause's words/);
-  // controller-core.mjs's pause: its wakes are the wakes of the cause pause, with who paused.
-  assert.match(CORE_SRC, /if \(await wakeNow\(id, 'pause', record\.by\)\) started\.add\(id\);/);
+  // controller-core.mjs's pause (lambda/src/lib/pauses.mjs): its wakes are the wakes of the cause pause, with who paused.
+  assert.match(CORE_SRC, /wake: \(workloadId, \{ by \}\) => wakeNow\(workloadId, 'pause', by\)/);
+  assert.match(read('lambda/src/lib/pauses.mjs'), /if \(await wake\(id, \{ by: record\.by, router: !workloadId \}\)\) started\.add\(id\);/);
   assert.doesNotMatch(page, /a pause carries by too, and writes no event/);
   assert.match(page, /a pause carries by too: the pause itself writes no event, and the wakes it starts write theirs, with the cause pause and its by/);
   assert.match(page, /plus pauses that cannot be read/);

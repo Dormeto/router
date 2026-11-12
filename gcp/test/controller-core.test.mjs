@@ -6066,6 +6066,25 @@ test('a check an operator asked keeps the last scheduled check\'s date; none eve
   assert.equal(t.store.state.check.health.status, 'ok');
 });
 
+test('a check an operator asked, overlapping a scheduled one, keeps the date that one wrote meanwhile: router/check read again at its end', async () => {
+  const t = setup({ run: AWAKE_LONG, vms: RUNNING_VM });
+  await t.controller.check({ scheduled: true });
+  t.clock.advance(5 * MINUTE);
+  // The scheduled check of the next period writes its summary while this one checks its workload.
+  const { getRun } = t.store;
+  let overlapped = false;
+  t.store.getRun = async (id) => {
+    if (!overlapped) {
+      overlapped = true;
+      t.store.state.check = { ...t.store.state.check, lastScheduledCheckAt: START + 5 * MINUTE };
+    }
+    return getRun.call(t.store, id);
+  };
+  await t.controller.check();
+  assert.equal(overlapped, true);
+  assert.equal(t.store.state.check.lastScheduledCheckAt, START + 5 * MINUTE);
+});
+
 test('a check whose summary cannot be written is not failed: it says so', async () => {
   const t = setup({ run: AWAKE_LONG, vms: RUNNING_VM });
   t.store.putCheck = async () => { throw unreadable(); };

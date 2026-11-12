@@ -1481,7 +1481,7 @@ export function createController({
     // request end, before the summary is written. Written only when it moves.
     if (cursor !== (last?.cursor ?? null)) await store.setCheckCursor?.(cursor).catch((err) => log.warn('CheckCursorNotStored', { error: err.message }));
     await sweepStats();
-    await recordCheck({ started, scheduled, order, results, pauses: (pauses ?? []).filter((p) => p.workloadId === null), pausesError, managerState: levels.managerState, cursor, last });
+    await recordCheck({ started, scheduled, order, results, pauses: (pauses ?? []).filter((p) => p.workloadId === null), pausesError, managerState: levels.managerState, cursor });
     return results;
   }
 
@@ -1535,14 +1535,15 @@ export function createController({
     return { health, ipLists, manager };
   }
 
-  // router/check: written at the end of each check, the date of the last one the schedule started kept by the others (from `last`, the
-  // record the check read as it started; read again when there was none); `cursor`, where the next check starts, when this one stopped
-  // short, as the check stored it after its loop. A summary that cannot be written fails nothing: the check's work is done.
-  async function recordCheck({ started, scheduled, order, results, pauses, pausesError, managerState, cursor = null, last = null }) {
+  // router/check: written at the end of each check, the date of the last one the schedule started kept by the others, read again at
+  // their end (a scheduled check that ran meanwhile wrote a newer one, which the health's check-late reads); `cursor`, where the next
+  // check starts, when this one stopped short, as the check stored it after its loop. A summary that cannot be written fails nothing:
+  // the check's work is done.
+  async function recordCheck({ started, scheduled, order, results, pauses, pausesError, managerState, cursor = null }) {
     if (!store.putCheck) return;
     try {
       const t = now();
-      const lastScheduledCheckAt = scheduled ? started : (last ?? await store.getCheck?.().catch(() => null))?.lastScheduledCheckAt ?? null;
+      const lastScheduledCheckAt = scheduled ? started : (await store.getCheck?.().catch(() => null))?.lastScheduledCheckAt ?? null;
       const known = new Map(results.filter((r) => ANY_STATE.includes(r.state)).map((r) => [r.workloadId, r.state]));
       const { byState } = await stateCounts(order, known);
       const { health } = await healthSummary({ t, byState, lastScheduledCheckAt, pausesError, managerState });

@@ -2607,15 +2607,19 @@ test('a release that fails stays failed, logged, for the next check to ask again
   assert.equal(t.logged('ReleaseFailed').length, 1);
 });
 
-test('the check stops at its 240 s, and one workload\'s failure does not stop the others', async () => {
+// B1 (vision docs/specs/2026-11-12-cloud-duplication-design.md, §4): AWS's rotation, the cursor in the check's summary.
+test('the check stops at its 240 s and the next one starts after the last workload it checked, so every workload is checked in turn; one workload\'s failure does not stop the others', async () => {
   const clock = fakeClock();
   const ids = Array.from({ length: 12 }, (_, i) => `w${String(i).padStart(2, '0')}`);
   const logs = [];
   const log = { info() {}, error: (event, fields) => logs.push({ event, ...fields }), warn: (event, fields) => logs.push({ event, ...fields }) };
+  // Each workload's check takes 100 s, 8 started together: a check of 240 s reaches 8 of the 12.
+  let costMs = 100_000;
   const compute = {
-    getInstance: async () => { clock.advance(100_000); return { status: 'RUNNING' }; },
+    getInstance: async () => { clock.advance(costMs); return { status: 'RUNNING' }; },
     getBackendService: async () => ({ backends: [] }),
   };
+  let summary = null;
   const store = {
     listWorkloads: async () => ({ configs: [...ids].reverse().map((workloadId) => ({ workloadId, urlMap: 'lb', backendService: 'app', wakerBackendService: WAKER, backends: [VM_A], idleMinutes: 15, wakeTimeoutSeconds: 600 })), schedules: new Map() }),
     listPauses: async () => [],
@@ -2624,6 +2628,8 @@ test('the check stops at its 240 s, and one workload\'s failure does not stop th
       if (id === 'w01') throw new Error('unreadable');
       return { state: STATES.AWAKE, awakeSince: clock.now() };
     },
+    getCheck: async () => summary && fromFields(toFields(summary)),
+    putCheck: async (written) => { summary = written; },
   };
   const controller = createController({
     store,
@@ -2636,12 +2642,37 @@ test('the check stops at its 240 s, and one workload\'s failure does not stop th
     sleep: clock.sleep,
     log,
   });
-  const out = await controller.check();
-  const reached = out.map((r) => r.workloadId).sort();
-  assert.deepEqual(reached, ids.slice(0, 8), 'the eight first start together, none after 240 s');
-  assert.match(out.find((r) => r.workloadId === 'w01').error, /unreadable/);
+  const N = 12;
+  const k = 8;
+  const counts = new Map(ids.map((id) => [id, 0]));
+  const checks = [];
+  // Every 5 minutes, as the schedule starts it.
+  const check = async () => {
+    const out = await controller.check();
+    for (const r of out) counts.set(r.workloadId, counts.get(r.workloadId) + 1);
+    checks.push({ reached: out.map((r) => r.workloadId).sort(), cursor: summary?.cursor ?? null });
+    clock.advance(5 * MINUTE);
+    return out;
+  };
+  const first = await check();
+  assert.match(first.find((r) => r.workloadId === 'w01').error, /unreadable/);
   assert.equal(logs.find((l) => l.event === 'CheckFailed').workloadId, 'w01');
-  assert.equal(logs.find((l) => l.event === 'CheckBudgetReached').workloads, 12);
+  while (checks.length < Math.ceil(N / k) + 1 && [...counts.values()].some((n) => n === 0)) await check();
+  assert.ok(checks.length <= Math.ceil(N / k) + 1, `${checks.length} checks`);
+  assert.deepEqual([...counts.keys()].filter((id) => counts.get(id) === 0), [], 'every workload checked');
+  // The eight first start together, none after 240 s; the summary says where the next check starts: after the last one checked.
+  assert.deepEqual(checks[0], { reached: ids.slice(0, 8), cursor: 'w07' });
+  assert.deepEqual(checks[1], { reached: [...ids.slice(0, 4), ...ids.slice(8)], cursor: 'w03' });
+  assert.deepEqual(logs.filter((l) => l.event === 'CheckBudgetReached').map(({ checked, workloads, next }) => [checked, workloads, next]), [[8, 12, 'w08'], [8, 12, 'w04']]);
+  // None starves: the third check takes the 8 after w03, and each workload has been checked twice.
+  await check();
+  assert.deepEqual(checks[2], { reached: ids.slice(4), cursor: 'w11' });
+  assert.deepEqual([...new Set(counts.values())], [2]);
+  // A check that reaches every workload leaves no cursor in its summary.
+  costMs = 0;
+  await check();
+  assert.equal(checks[3].reached.length, 12);
+  assert.equal('cursor' in summary, false);
 });
 
 // --- The waiting page (G5, design §5.2): the wakes' durations, the favicon read at the nap ----------------------------------------
@@ -3099,6 +3130,30 @@ test('within 30 minutes of an awake start, the nap is skipped and recorded, and 
   assert.deepEqual(t.world.tasks, []);
   assert.equal(t.run().scheduleApplied, '0@2023-11-14T21:00:00.000Z');
   assert.deepEqual(t.logged('ScheduleApplied').map((l) => l.action), ['skipped: an awake window starts within 30 minutes']);
+});
+
+// The check reads a schedule twice: in its pass over the schedules, then for the idle decision (lambda/src/lib/check-schedules.mjs's
+// scheduleKeeps). A record that throws only at the second read (a corrupt one) fails that workload's check here; AWS's check says it
+// and decides as without one (lambda/test/controller-check-schedule.test.mjs, the same name).
+test('a schedule that throws only at the idle decision: Google Cloud\'s check fails that workload, CheckFailed, no idle nap', async () => {
+  const t = setup({ run: AWAKE_LONG, vms: RUNNING_VM });
+  const corrupt = { on: false };
+  const schedule = new Proxy(scheduleOf({ ...NAP, days: ['mon'] }), {
+    get(target, key) {
+      if (corrupt.on) throw new Error('a corrupt record');
+      return target[key];
+    },
+  });
+  t.store.listWorkloads = async () => ({ configs: await t.store.listConfigs(), schedules: new Map([['demo', schedule]]) });
+  // Once the schedules' pass is over, the check's first run read corrupts it.
+  const { getRun } = t.store;
+  t.store.getRun = async (workloadId) => {
+    corrupt.on = true;
+    return getRun(workloadId);
+  };
+  assert.deepEqual(await t.controller.check(), [{ workloadId: 'demo', error: 'a corrupt record' }]);
+  assert.deepEqual(t.logged('CheckFailed').map(({ workloadId, error }) => [workloadId, error]), [['demo', 'a corrupt record']]);
+  assert.deepEqual([t.logged('ScheduleSkipped'), t.world.tasks], [[], []]);
 });
 
 test('napping or waking at a nap window: left for the next check, which naps it once awake', async () => {

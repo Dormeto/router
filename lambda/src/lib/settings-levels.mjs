@@ -1,6 +1,6 @@
 // A workload's settings at scale (vision settings at scale design §4–§7): each field from the most specific level that
-// sets it, workload → type → router → organization → built-in; the rules of every level add up. Pure: the levels are
-// read elsewhere (the router's record, its mirror of the manager's settings.json).
+// sets it, workload → type → router → organization → built-in; the rules of every level add up. Pure but for the levels'
+// reader, which each cloud gives its reads (the router's record, its copy of the manager's settings.json).
 import { compileRules, describeRules } from './no-wake.mjs';
 
 export const SETTING_RANGES = {
@@ -101,6 +101,33 @@ export function effectiveConfig(cfg, { run = null, router = null, organization =
     ['organization', organization?.defaults?.[key]], ['router', routerOwn, true], ['router', router?.defaults?.[key]], ['type', typeSettings[key]], ['workload', cfg?.[key]],
   ].filter(([, rules]) => Array.isArray(rules) && rules.length).map(([level, rules, terraform]) => ({ level, rules, ...(terraform ? { terraform: true } : {}) }));
   return { ...cfg, ...values, settingsFrom: from, type, ruleLevels: { noWake: levels('noWakeRules', terraformRules), wake: levels('wakeRules') } };
+}
+
+// The levels above a workload's own settings, both routers' reader (design §6; review, 2026-11-04): each level's record read fresh at
+// each call (a check reads them once for all its workloads). A read that fails is said and keeps the last record this instance read;
+// a level never read makes the levels unreadable: the check then takes no idle nap or failure decision and a wake waits the longest
+// timeout. `readers`: `{ [level]: () => record }`, each cloud's reads, called at each call (nothing answered: the level has none).
+// Answers each level's record or null, `unreadable: true` when a level that failed was never read, and `errors`, each failed read's
+// message, when one failed; the failures said in the levels' order.
+export function createLevelsReader(readers, { log }) {
+  const last = {};
+  return async function readLevels() {
+    const levels = Object.keys(readers);
+    const reads = await Promise.allSettled(levels.map((level) => Promise.resolve().then(() => readers[level]())));
+    const answer = {};
+    const errors = {};
+    let unreadable = false;
+    levels.forEach((level, i) => {
+      if (reads[i].status === 'fulfilled') last[level] = reads[i].value ?? null;
+      else {
+        log.warn('SettingsLevelUnreadable', { level, error: reads[i].reason.message });
+        errors[level] = reads[i].reason.message;
+        if (!(level in last)) unreadable = true;
+      }
+      answer[level] = last[level] ?? null;
+    });
+    return { ...answer, ...(unreadable ? { unreadable: true } : {}), ...(Object.keys(errors).length ? { errors } : {}) };
+  };
 }
 
 function rulesProblems(key, rules) {

@@ -144,7 +144,10 @@ The last 210 s stay unseen even then, as the metric lags. A read that fails give
 the error response policy and the `/_dormeto/*` route (else it repairs them), and that the VMs are still down: a VM
 started by hand makes the workload awake, and VMs all stopped by hand while it is awake make it `ASLEEP` with the cause
 `external-stop`, as on AWS. A wake asked during a nap is kept: during the wait the nap gives up, no VM is stopped and the policy is removed; once the
-VMs are going down, the workload wakes as soon as the nap ends.
+VMs are going down, the workload wakes as soon as the nap ends. A check takes 8 workloads at a time and starts none after
+240 s (`CheckBudgetReached`); the next check starts after the last workload it started (`cursor` in [the check
+summary](google-cloud-manager.md#what-the-router-keeps)), so on a crowded router every workload is checked in turn, as on
+AWS (Not released yet: router 0.40.0).
 
 **A wake or a nap that dies.** A wake or a nap runs in one request of the controller. A running wake or nap beats on its
 run every minute (`beatAt`, in `dormeto gcp workloads show --json`), and a beat that fails is tried again once, 10 s

@@ -18,7 +18,10 @@ documented in the CLI's README, not here.
   `*/5 * * * *`) with the time of the check and how long it took, the time of the last check the schedule started, the
   router's health (the same problems as AWS's health that apply here, such as a manager settings document that cannot be
   read, plus pauses that cannot be read), the router's own pauses (a workload's are in its row) and the count of
-  workloads by state. A summary that cannot be written fails nothing: the check's work is done.
+  workloads by state. After a check that ran out of its 240 s before it reached every workload, it holds `cursor` too, the
+  last workload that check started: the next check starts after it, as an AWS router's does, so every workload is checked
+  in turn. A summary that cannot be written fails nothing: the check's work is done, and the next check starts where the
+  last summary written says.
 - **The organization's level**, `router/manager`: the manager's whole `settings.json` as it pushed it, kept as one JSON
   string (Firestore refuses as a field name some keys a `settings.json` may hold, such as a custom type's tag key
   `__x__`), with its ETag and the time it was stored. Without a push, the organization level reads as unset.

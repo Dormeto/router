@@ -234,6 +234,21 @@ test('check: an error on one workload is reported, not thrown', async () => {
   assert.deepEqual(result, { workloadId: 'demo', error: 'throttled' });
 });
 
+// B2 (vision docs/specs/2026-11-12-cloud-duplication-design.md, §4): as Google Cloud's check does.
+test('check: a workload offboarded while the check ran is skipped, CheckSkipped, no CheckFailed, no error in the results', async () => {
+  const s = setup({ run: { state: STATES.AWAKE, awakeSince: 0 } });
+  const logged = [];
+  s.log.info = (event, fields) => logged.push([event, fields]);
+  s.log.error = (event, fields) => logged.push([event, fields]);
+  // The offboarding deletes the configuration and the instance while the check reads it.
+  s.ec2.describeInstances = async () => {
+    s.store.getConfig = async () => null;
+    throw Object.assign(new Error('The instance ID \'i-0123456789abcdef0\' does not exist'), { name: 'InvalidInstanceID.NotFound' });
+  };
+  assert.deepEqual(await s.handler({ action: 'check' }), [{ workloadId: 'demo', skipped: 'offboarded' }]);
+  assert.deepEqual(logged.filter(([event]) => event.startsWith('Check')), [['CheckSkipped', { workloadId: 'demo', reason: 'offboarded' }]]);
+});
+
 test('ensure-awake switches the route back when the workload is awake and healthy', async () => {
   const s = setup({ run: { state: STATES.AWAKE }, target: 'waker', healthy: 1 });
   const result = await s.handler({ action: 'ensure-awake', workloadId: 'demo' });

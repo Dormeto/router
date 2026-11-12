@@ -62,9 +62,11 @@ import { resolveHibernation } from '../../lambda/src/lib/hibernation.mjs';
 import { createListCache, describeStoredLists } from '../../lambda/src/lib/list-cache.mjs';
 import { createPauses, pauseHolds, shownPause } from '../../lambda/src/lib/pauses.mjs';
 import { createScheduleCheck, scheduleKeeps } from '../../lambda/src/lib/check-schedules.mjs';
+import { runCheck } from '../../lambda/src/lib/check-run.mjs';
 import { ENDED_DAYS_DEFAULT } from '../../lambda/src/lib/schedule.mjs';
 import { DAY_MS, STATES, utcDay } from '../../lambda/src/lib/state.mjs';
 import { createListRefresher } from '../../lambda/src/lib/list-refresh.mjs';
+import { createLevelsReader } from '../../lambda/src/lib/settings-levels.mjs';
 import { routerSettingsView } from '../../lambda/src/lib/settings-writes.mjs';
 import { createCount } from '../../lambda/src/lib/summary.mjs';
 import { withWake } from '../../lambda/src/lib/page-settings.mjs';
@@ -303,28 +305,19 @@ export function createController({
   // organization's (`router/manager`, the manager's settings.json, parsed once by organizationOf: `organization` is what AWS's
   // manager settings answer, `managerState` the whole answer the health and routerInfo read), read once by a check for all its
   // workloads, once by a wake, a nap or a release. A read that fails is said, and keeps the last record this instance read; never
-  // read, the levels are unreadable (AWS's `readLevels`): the built-in values could act against the router's or the
-  // organization's, an idle window shorter than its own, a suspend against its "off", a wake failed before its timeout. Never a
-  // failed check or wake.
-  let lastRouterLevel;
-  let lastManagerState;
+  // read, the levels are unreadable (AWS's reader, lambda/src/lib/settings-levels.mjs): the built-in values could act against the
+  // router's or the organization's, an idle window shorter than its own, a suspend against its "off", a wake failed before its
+  // timeout. Never a failed check or wake.
+  const readLevels = createLevelsReader({
+    router: () => store.getRouterSettings?.(),
+    organization: async () => organizationOf((await store.getManagerSettings?.()) ?? null),
+  }, { log });
   async function routerLevel() {
-    const [routerRead, managerRead] = await Promise.allSettled([store.getRouterSettings?.(), store.getManagerSettings?.()]);
-    let unreadable = false;
-    if (routerRead.status === 'fulfilled') lastRouterLevel = routerRead.value ?? null;
-    else {
-      log.warn('SettingsLevelUnreadable', { level: 'router', error: routerRead.reason.message });
-      unreadable ||= lastRouterLevel === undefined;
-    }
-    if (managerRead.status === 'fulfilled') lastManagerState = organizationOf(managerRead.value ?? null);
-    else {
-      log.warn('SettingsLevelUnreadable', { level: 'organization', error: managerRead.reason.message });
-      unreadable ||= lastManagerState === undefined;
-    }
+    const { router, organization, unreadable, errors } = await readLevels();
     // A read that failed keeps the last level, and the health says it could not be read.
-    const known = lastManagerState ?? { level: null, page: null, error: null, readAt: null };
-    const managerState = managerRead.status === 'rejected' ? { ...known, error: managerRead.reason.message } : known;
-    return { router: lastRouterLevel ?? null, organization: managerState.level, managerState, ...(unreadable ? { unreadable } : {}) };
+    const known = organization ?? { level: null, page: null, error: null, readAt: null };
+    const managerState = errors && 'organization' in errors ? { ...known, error: errors.organization } : known;
+    return { router, organization: managerState.level, managerState, ...(unreadable ? { unreadable } : {}) };
   }
 
   // The configuration a check, a wake, a nap or a release acts on: the stored one resolved through the levels (levels.mjs), marked
@@ -1478,10 +1471,10 @@ export function createController({
     return napping;
   }
 
-  // 8 workloads at a time, none started past the budget; one that fails is logged and stops only itself. The schedules
-  // first, whatever the budget. Pauses that cannot be read hold every nap and scheduled wake of this check; the reconcile
-  // still runs. At most NAPS_MAX naps in flight: the idle naps past it are said once (`NapDeferred`, with their count), and asked
-  // at a later check. Wakes are never held back.
+  // 8 workloads at a time, none started past the budget, from where the last check stopped (lambda/src/lib/check-run.mjs, B1: the
+  // cursor in the check's summary); one that fails is logged and stops only itself. The schedules first, whatever the budget. Pauses
+  // that cannot be read hold every nap and scheduled wake of this check; the reconcile still runs. At most NAPS_MAX naps in flight:
+  // the idle naps past it are said once (`NapDeferred`, with their count), and asked at a later check. Wakes are never held back.
   async function check({ scheduled = false } = {}) {
     const started = now();
     const deadline = started + CHECK_BUDGET_MS;
@@ -1497,33 +1490,17 @@ export function createController({
     const { applied, readable } = await applySchedules(order, schedules, { paused, keptAsleep }, now(), { joins, endedDays: schedules.size ? endedDaysOf(levels) : null, nap: scheduledNaps(deadline, flight) });
     await requestListRefresh();
     const ctx = { schedules: readable, applied, flight, levels, joins };
-    const passed = (workloadId) => (applied.has(workloadId) ? { schedule: applied.get(workloadId) } : {});
-    const results = [];
-    let next = 0;
-    await Promise.all(Array.from({ length: Math.min(CHECK_CONCURRENCY, order.length) }, async () => {
-      while (next < order.length && now() < deadline) {
-        const cfg = order[next++];
-        try {
-          results.push({ workloadId: cfg.workloadId, ...(await checkOne(cfg, deadline, paused(cfg.workloadId), ctx)), ...passed(cfg.workloadId) });
-        } catch (err) {
-          // An offboarding that ran under this check deleted the workload: its writes failing is no failure.
-          if (!(await store.getConfig(cfg.workloadId).catch(() => cfg))) {
-            log.info('CheckSkipped', { workloadId: cfg.workloadId, reason: 'offboarded' });
-            results.push({ workloadId: cfg.workloadId, skipped: 'offboarded' });
-            continue;
-          }
-          log.error('CheckFailed', { workloadId: cfg.workloadId, error: err.message });
-          results.push({ workloadId: cfg.workloadId, error: err.message });
-        }
-      }
-    }));
-    if (flight.deferred) log.info('NapDeferred', { reason: 'cap', count: flight.deferred });
-    if (next < order.length) log.warn('CheckBudgetReached', { checked: next, workloads: order.length, next: order[next].workloadId });
-    // What the schedules did for the workloads the loop did not reach.
-    const reached = new Set(results.map((r) => r.workloadId));
-    for (const workloadId of applied.keys()) if (!reached.has(workloadId)) results.push({ workloadId, ...passed(workloadId) });
+    const { results, cursor } = await runCheck({
+      store, workloads: order, deadline, concurrency: CHECK_CONCURRENCY, now, log,
+      passes: new Map([...applied].map(([workloadId, schedule]) => [workloadId, { schedule }])),
+      checkOne: (cfg) => checkOne(cfg, deadline, paused(cfg.workloadId), ctx),
+      end: () => {
+        if (flight.deferred) log.info('NapDeferred', { reason: 'cap', count: flight.deferred });
+      },
+    });
     await sweepStats();
-    await recordCheck({ started, scheduled, order, results, pauses: (pauses ?? []).filter((p) => p.workloadId === null), pausesError, managerState: levels.managerState });
+    // Where the next check starts, in the check's summary.
+    await recordCheck({ started, scheduled, order, results, pauses: (pauses ?? []).filter((p) => p.workloadId === null), pausesError, managerState: levels.managerState, cursor });
     return results;
   }
 
@@ -1580,9 +1557,10 @@ export function createController({
     return { health, ipLists, manager };
   }
 
-  // router/check: written at the end of each check, the date of the last one the schedule started kept by the others. A summary that
-  // cannot be written fails nothing: the check's work is done.
-  async function recordCheck({ started, scheduled, order, results, pauses, pausesError, managerState }) {
+  // router/check: written at the end of each check, the date of the last one the schedule started kept by the others; `cursor`, where
+  // the next check starts, when this one stopped short (AWS's, on its CHECK item). A summary that cannot be written fails nothing: the
+  // check's work is done, and the next check starts where the last summary written says.
+  async function recordCheck({ started, scheduled, order, results, pauses, pausesError, managerState, cursor = null }) {
     if (!store.putCheck) return;
     try {
       const t = now();
@@ -1590,7 +1568,10 @@ export function createController({
       const known = new Map(results.filter((r) => ANY_STATE.includes(r.state)).map((r) => [r.workloadId, r.state]));
       const { byState } = await stateCounts(order, known);
       const { health } = await healthSummary({ t, byState, lastScheduledCheckAt, pausesError, managerState });
-      await store.putCheck({ checkedAt: started, durationMs: t - started, checkSchedule: CHECK_SCHEDULE, lastScheduledCheckAt, health, pauses: pauses.map(shownPause), counts: byState });
+      await store.putCheck({
+        checkedAt: started, durationMs: t - started, checkSchedule: CHECK_SCHEDULE, lastScheduledCheckAt, health, pauses: pauses.map(shownPause), counts: byState,
+        ...(cursor ? { cursor } : {}),
+      });
     } catch (err) {
       log.warn('CheckNotRecorded', { error: err.message });
     }

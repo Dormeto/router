@@ -100,6 +100,11 @@ export function fakeStore({ config, run, clock }) {
     async count(id, counter) { state.stats[counter] = (state.stats[counter] ?? 0) + 1; },
     async recordScheduledCheck(at) { state.check = { ...(state.check ?? {}), lastScheduledCheckAt: at }; },
     async getCheck() { return structuredClone(state.check ?? null); },
+    // Where a check stopped at its time budget (null: it reached every workload), as state.mjs's.
+    async setCheckCursor(cursor) {
+      if (cursor) state.check = { ...(state.check ?? {}), cursor };
+      else if (state.check) delete state.check.cursor;
+    },
     async getHealth() { return structuredClone(state.health ?? null); },
     async putHealth(health) { state.health = structuredClone(health); },
     async getKubeProxies() { return structuredClone(state.kubeProxies ?? {}); },

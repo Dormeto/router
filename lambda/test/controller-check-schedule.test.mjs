@@ -585,6 +585,30 @@ test('the value reaches the idle nap: a workload in a gap it joins is kept awake
   assert.notEqual((await idleAt(null)).kept, 'awake window');
 });
 
+// The check reads a schedule twice: in its pass over the schedules, then for the idle decision (lib/check-schedules.mjs's
+// scheduleKeeps). A record that throws only at the second read (a corrupt one) is AWS's to say and skip; Google Cloud's check fails
+// that workload instead (gcp/test/controller-core.test.mjs, the same name).
+test('a schedule that throws only at the idle decision: AWS says ScheduleSkipped and decides as without one, its idle nap asked', async () => {
+  const s = setup({ run: { state: STATES.AWAKE, awakeSince: 1 } });
+  const corrupt = { on: false };
+  const schedule = new Proxy(stored({ windows: [NIGHT] }), {
+    get(target, key) {
+      if (corrupt.on) throw new Error('a corrupt record');
+      return target[key];
+    },
+  });
+  s.wrapped.listWorkloads = async () => ({ configs: [testConfig()], schedules: new Map([['demo', schedule]]) });
+  // Once the schedules' pass is over, the first run read (the hibernation's limit) corrupts it.
+  const { getRun } = s.wrapped;
+  s.wrapped.getRun = async (workloadId) => {
+    corrupt.on = true;
+    return getRun(workloadId);
+  };
+  assert.deepEqual(await s.checkAt('19T12:00'), [{ workloadId: 'demo', state: STATES.AWAKE, nap: 'queued' }]);
+  assert.deepEqual(s.logged('ScheduleSkipped'), [{ workloadId: 'demo', error: 'a corrupt record' }]);
+  assert.deepEqual([s.logged('CheckFailed'), s.queued.map((m) => m.action)], [[], ['nap']]);
+});
+
 // --- Windows that ended long ago leave the schedule (the user, 2026-11-02) -----------------------------------------------
 
 const ENDED = { kind: 'awake', days: ['sat'], start: '10:00', end: '11:00', until: '2025-09-27' };

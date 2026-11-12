@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  BUILT_IN, BUILT_IN_TYPES, SCALAR_KEYS, builtInTypeOf, defaultsProblems, effectiveConfig, ownSettings, resolveSettings, typeOf, typesProblems,
+  BUILT_IN, BUILT_IN_TYPES, SCALAR_KEYS, builtInTypeOf, createLevelsReader, defaultsProblems, effectiveConfig, ownSettings, resolveSettings, typeOf, typesProblems,
 } from '../src/lib/settings-levels.mjs';
 
 const rule = (name, path = '/health') => ({ name, pathPrefixes: [path] });
@@ -129,4 +129,46 @@ test('the router\'s Terraform rules are marked in the status (review, 2026-11-04
   const { describedRules } = await import('../src/lib/settings-levels.mjs');
   const effective = effectiveConfig({ workloadId: 'w', noWakeRules: [rule('own')] }, { router: { defaults: { noWakeRules: [rule('manager')] } }, terraformRules: [rule('tf')] });
   assert.deepEqual(describedRules(effective).noWakeRules.map((r) => [r.level, r.name, r.terraform ?? false]), [['router', 'tf', true], ['router', 'manager', false], ['workload', 'own', false]]);
+});
+
+// Both routers' levels reader (research R4; lambda/test/check-run-contract.mjs runs it on both stores).
+test('the levels reader calls each cloud\'s reads at each read, the latest it holds; one that answers nothing is a level with none, not a failure', async () => {
+  const reads = { router: () => ({ joinMinutes: 30 }), organization: () => undefined };
+  const readLevels = createLevelsReader({ router: () => reads.router(), organization: () => reads.organization() }, { log: { warn: () => assert.fail('nothing failed') } });
+  assert.deepEqual(await readLevels(), { router: { joinMinutes: 30 }, organization: null });
+  reads.router = async () => null;
+  reads.organization = async () => ({ hibernate: false });
+  assert.deepEqual(await readLevels(), { router: null, organization: { hibernate: false } });
+});
+
+test('the levels reader: a failed read is said and keeps the last record; a level never read makes them unreadable; both said in the levels\' order, whichever failed first', async () => {
+  const warned = [];
+  const log = { warn: (event, data) => warned.push([event, data]) };
+  let failing = false;
+  let organizationFirst = null;
+  const failure = (message) => async () => {
+    if (!failing) return { from: message };
+    if (message === 'router') await organizationFirst;
+    throw new Error(`${message} unavailable`);
+  };
+  const readLevels = createLevelsReader({ router: failure('router'), organization: failure('organization') }, { log });
+  assert.deepEqual(await readLevels(), { router: { from: 'router' }, organization: { from: 'organization' } });
+  failing = true;
+  organizationFirst = Promise.resolve();
+  assert.deepEqual(await readLevels(), {
+    router: { from: 'router' }, organization: { from: 'organization' }, errors: { router: 'router unavailable', organization: 'organization unavailable' },
+  });
+  assert.deepEqual(warned, [
+    ['SettingsLevelUnreadable', { level: 'router', error: 'router unavailable' }], ['SettingsLevelUnreadable', { level: 'organization', error: 'organization unavailable' }],
+  ]);
+  // Never read on this instance: unreadable, none.
+  const never = createLevelsReader({ router: failure('router'), organization: () => ({ hibernate: true }) }, { log });
+  assert.deepEqual(await never(), { router: null, organization: { hibernate: true }, unreadable: true, errors: { router: 'router unavailable' } });
+});
+
+test('the levels reader: a read that throws at once counts as a failed read, never failing the caller', async () => {
+  const warned = [];
+  const readLevels = createLevelsReader({ router: () => { throw new Error('no table'); } }, { log: { warn: (event, data) => warned.push([event, data]) } });
+  assert.deepEqual(await readLevels(), { router: null, unreadable: true, errors: { router: 'no table' } });
+  assert.deepEqual(warned, [['SettingsLevelUnreadable', { level: 'router', error: 'no table' }]]);
 });

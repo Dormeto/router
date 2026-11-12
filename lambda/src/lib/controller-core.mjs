@@ -20,6 +20,7 @@ import { revertInstanceTypes } from './capacity.mjs';
 import { tagsProblem } from './tags.mjs';
 import { ENDED_DAYS_DEFAULT, maintenanceDue, nextEvents, normalizeSchedule, resolveJoin, scheduleProblems } from './schedule.mjs';
 import { createScheduleCheck, scheduleKeeps as keptBySchedule } from './check-schedules.mjs';
+import { runCheck } from './check-run.mjs';
 import { STATS_DAYS, createCount, totals, workloadSummary } from './summary.mjs';
 import { lastRequestAt } from './metrics.mjs';
 import { checkScope } from './check-scope.mjs';
@@ -27,7 +28,7 @@ import { healthOf, lambdaMetrics, queueDepths } from './health.mjs';
 import { pageViewOf, validatePage, withWake } from './page-settings.mjs';
 import { HIBERNATION_MAX_DAYS, hibernationDue, resolveHibernation, settingsProblems, workloadSettingsProblems } from './hibernation.mjs';
 import { joinLevels } from './manager-settings.mjs';
-import { describedRules, effectiveConfig } from './settings-levels.mjs';
+import { createLevelsReader, describedRules, effectiveConfig } from './settings-levels.mjs';
 import { mergedRouterSettings, resolvedSettings, routerSettingsView, withSettings, writtenRouterView } from './settings-writes.mjs';
 import {
   backendKey, backendStatuses, isCompanion, resolveBackends, resumeBackends, sleepBackends, startCompanions, stopCompanions, toRecord, wakeBackends,
@@ -104,26 +105,14 @@ export function createController({
     return cfg;
   }
 
-  // The levels above a workload (vision settings at scale design §6): the router's record and its copy of the manager's
-  // settings, read fresh (a check reads them once for all its workloads). One that cannot be read counts as none.
-  // A level that cannot be read keeps the last record this instance read; never read, the levels are unreadable: the
-  // check then takes no idle nap or failure decision and a wake waits the longest timeout (review, 2026-11-04).
-  const lastLevels = {};
-  async function readLevels() {
-    let unreadable = false;
-    const read = (level, reader) => (reader ? Promise.resolve().then(() => reader()).then((record) => {
-      lastLevels[level] = record ?? null;
-      return record ?? null;
-    }, (err) => {
-      log.warn('SettingsLevelUnreadable', { level, error: err.message });
-      if (!(level in lastLevels)) unreadable = true;
-      return lastLevels[level] ?? null;
-    }) : null);
-    // The organization as hibernation and the join read it: the manager's settings reader, else the router's copy.
-    const organizationReader = managerSettings ? () => managerSettings.current() : store.getManagerSettings;
-    const [routerLevel, organization] = await Promise.all([read('router', store.getRouterSettings), read('organization', organizationReader)]);
-    return { routerLevel, organization, ...(unreadable ? { unreadable: true } : {}) };
-  }
+  // The levels above a workload (vision settings at scale design §6; lib/settings-levels.mjs's reader): the router's record and
+  // its copy of the manager's settings, read fresh (a check reads them once for all its workloads). A level that cannot be read
+  // keeps the last record this instance read; never read, the levels are unreadable (review, 2026-11-04). The organization as
+  // hibernation and the join read it: the manager's settings reader, else the router's copy.
+  const readLevels = createLevelsReader({
+    router: () => store.getRouterSettings?.(),
+    organization: managerSettings ? () => managerSettings.current() : () => store.getManagerSettings?.(),
+  }, { log });
   // The longest a wake may wait when its levels cannot be read.
   const WAKE_TIMEOUT_MAX_S = 3600;
   const wakeTimeoutS = (cfg) => (cfg.levelsUnreadable ? WAKE_TIMEOUT_MAX_S : cfg.wakeTimeoutSeconds);
@@ -132,7 +121,7 @@ export function createController({
   // from, the type and the rules of every level. The stored one stays what the writes read (config()).
   async function effective(cfg, run, levels) {
     if (cfg.settingsFrom) return cfg;
-    const { routerLevel, organization, unreadable } = levels ?? await readLevels();
+    const { router: routerLevel, organization, unreadable } = levels ?? await readLevels();
     const resolved = effectiveConfig(cfg, { run, router: routerLevel, organization, terraformRules: defaultRules });
     return unreadable ? { ...resolved, levelsUnreadable: true } : resolved;
   }
@@ -1056,62 +1045,38 @@ export function createController({
       // The schedules first, whatever the budget.
       // The levels once for every workload: their settings (settings at scale design §6) and the join of their windows.
       const levels = await readLevels();
-      const joins = listed.schedules.size ? { router: levels.routerLevel?.joinMinutes ?? null, manager: levels.organization?.joinMinutes ?? null } : {};
+      const joins = listed.schedules.size ? { router: levels.router?.joinMinutes ?? null, manager: levels.organization?.joinMinutes ?? null } : {};
       const endedDays = listed.schedules.size ? await endedDaysOf() : null;
       const { applied, readable } = await applySchedules(configs, listed.schedules, { paused, keptAsleep }, now(), { joins, endedDays, nap: scheduledNap });
       // Then the hibernation's 60-day limit, for every workload, held alike.
       const limited = await wakeLongHibernated(configs, applied, keptAsleep, now());
       await pingProxies(configs);
       // What these passes did for a workload, in its result.
-      const passed = (workloadId) => ({
-        ...(applied.has(workloadId) ? { schedule: applied.get(workloadId) } : {}),
-        ...(limited.has(workloadId) ? { hibernation: limited.get(workloadId) } : {}),
-      });
-      // Starting after the workload where the previous check stopped (its time budget), so every workload gets its turn.
-      const cursor = (await store.getCheck?.().catch(() => null))?.cursor;
-      const from = cursor ? configs.findIndex((c) => c.workloadId > cursor) : 0;
-      const order = from > 0 ? [...configs.slice(from), ...configs.slice(0, from)] : configs;
-      // The rules of the workloads, a chunk at a time in the check's order, each load balancer listed once (the listing
-      // cache); backends found by tag once. A chunk is not started when its listing would end past the budget.
+      const passes = new Map([...applied].map(([workloadId, schedule]) => [workloadId, { schedule }]));
+      for (const [workloadId, hibernation] of limited) passes.set(workloadId, { ...passes.get(workloadId), hibernation });
+      // Then the loop (lib/check-run.mjs), from where the previous check stopped. The rules of the workloads, a chunk at a time in
+      // the check's order, each load balancer listed once (the listing cache); backends found by tag once.
       const listing = { balancers: new Map(), listed: new Map(), tags: new Map() };
       const ctx = { rules: new Map(), scope: checkScope(clients), schedules: readable, applied, joins, levels };
-      const deadline = Math.min(started + CHECK_BUDGET_MS, budgetEnd);
-      const results = [];
-      let next = 0;
-      let listingMs = 0;
-      while (next < order.length && now() < deadline && (next === 0 || now() + listingMs < deadline)) {
-        const chunk = order.slice(next, next + CHECK_CHUNK);
-        const listedAt = now();
-        const found = await resolveRules(elbv2, chunk, listing).catch((err) => {
-          log.warn('CheckRulesUnread', { error: err.message });
-          return null;
-        });
-        listingMs = now() - listedAt;
-        if (found) {
-          for (const [id, rules] of found) ctx.rules.set(id, rules);
-          rememberHosts(chunk, found, listedAt);
-        }
-        let i = 0;
-        await Promise.all(Array.from({ length: Math.min(CHECK_CONCURRENCY, chunk.length) }, async () => {
-          while (i < chunk.length && now() < deadline) {
-            const cfg = chunk[i++];
-            next += 1;
-            try {
-              results.push({ workloadId: cfg.workloadId, ...(await checkOne(cfg, paused(cfg.workloadId), ctx)), ...passed(cfg.workloadId) });
-            } catch (err) {
-              log.error('CheckFailed', { workloadId: cfg.workloadId, error: err.message });
-              results.push({ workloadId: cfg.workloadId, error: err.message });
-            }
-          }
-        }));
-      }
-      // What the schedules and the 60-day limit did for the workloads the loop did not reach.
-      const reached = new Set(results.map((r) => r.workloadId));
-      for (const workloadId of new Set([...applied.keys(), ...limited.keys()])) if (!reached.has(workloadId)) results.push({ workloadId, ...passed(workloadId) });
-      // Cut short: the next check starts after the last workload checked (where this one started if it checked none).
-      const stopped = next < order.length ? (next > 0 ? order[next - 1].workloadId : cursor ?? null) : null;
-      if (next < order.length) log.warn('CheckBudgetReached', { checked: next, workloads: order.length, next: order[next].workloadId });
-      await store.setCheckCursor?.(stopped).catch((err) => log.warn('CheckCursorNotStored', { error: err.message }));
+      const { results, cursor } = await runCheck({
+        store, workloads: configs, deadline: Math.min(started + CHECK_BUDGET_MS, budgetEnd), concurrency: CHECK_CONCURRENCY, passes, now, log,
+        chunk: {
+          size: CHECK_CHUNK,
+          async prepare(chunk) {
+            const listedAt = now();
+            const found = await resolveRules(elbv2, chunk, listing).catch((err) => {
+              log.warn('CheckRulesUnread', { error: err.message });
+              return null;
+            });
+            if (!found) return;
+            for (const [id, rules] of found) ctx.rules.set(id, rules);
+            rememberHosts(chunk, found, listedAt);
+          },
+        },
+        checkOne: (cfg) => checkOne(cfg, paused(cfg.workloadId), ctx),
+      });
+      // Where the next check starts, on the CHECK item at once.
+      await store.setCheckCursor?.(cursor).catch((err) => log.warn('CheckCursorNotStored', { error: err.message }));
       await report(started);
       return results;
     } finally {

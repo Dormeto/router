@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { JOIN_DEFAULT_MINUTES } from '../../lambda/src/lib/schedule.mjs';
 import { SWAP_WAKE_ROOM_SECONDS } from '../src/levels.mjs';
 import { SWAP_WAIT_MS } from '../src/switch.mjs';
@@ -406,7 +406,7 @@ test('the README\'s Google Cloud section names the three pages and what router 0
   assert.match(flat(section), /--with cloud-sql,gke/);
   assert.doesNotMatch(flat(section), /not accepted yet/);
   assert.match(flat(section), /accepted on 2026-11-04 in dormeto-dev with CLI 0\.11\.0: each page says what was accepted and measured/);
-  assert.match(flat(section), /Not released yet: router 0\.40\.0\. The fixes' acceptance passed on 2026-11-08 in dormeto-dev, with the image 0\.38\.0-dev\.2 and the CLI built from main/);
+  assert.match(flat(section), /Router 0\.40\.0 fixes the limits of 0\.37\.0 on Google Cloud, .* GKE refuses a KEDA minReplicaCount: 0\. The fixes' acceptance passed on 2026-11-08 in dormeto-dev, with the image 0\.38\.0-dev\.2 and the CLI built from main/);
   assert.doesNotMatch(flat(section), /which was not run/);
   // M1 and M2 (2026-11-08).
   assert.doesNotMatch(flat(section), /unmeasured/);
@@ -578,7 +578,7 @@ test('the GKE page: the exact refusal of GKE\'s own load balancers, and the way'
 
 test('the README and the Cloud SQL page say the G5 features and the 1700 s fixed value', () => {
   const readme = flat(read('README.md'));
-  assert.match(readme, /Not released yet: router 0\.40\.0 gives the Google Cloud router AWS's settings by level, the wake mode and the no-wake and wake rules, the branded waiting page, a capacity retry with fallback machine types, and the internal Application Load Balancers/);
+  assert.match(readme, /what was accepted and measured\. Router 0\.40\.0 gives the Google Cloud router AWS's settings by level, the wake mode and the no-wake and wake rules, the branded waiting page, a capacity retry with fallback machine types, and the internal Application Load Balancers/);
   assert.match(readme, /enable_internal/);
   assert.match(flat(read(SQL)), /The wake timeout 1700 s is fixed: the databases type's 1800 s is brought to the most a wake can take/);
 });
@@ -611,9 +611,9 @@ test('the Compute Engine page: the idle check leaves out what a no-wake rule mat
 });
 
 // G5's last docs pass: the acceptance of 2026-11-09 and the measures it settled.
-test('the Compute Engine page: G5 was accepted in dormeto-dev on 2026-11-08 and 2026-11-09 and is not released, the wake header is measured, the waker holds no request', () => {
+test('the Compute Engine page: G5 was accepted in dormeto-dev on 2026-11-08 and 2026-11-09 and ships in router 0.40.0, the wake header is measured, the waker holds no request', () => {
   const page = flat(read(CE));
-  assert.match(page, /These were accepted in dormeto-dev on 2026-11-08 and 2026-11-09, on dev builds of main \(router 0\.39\.0-dev\.2, then 0\.39\.0-dev\.3 with the final review's fixes\)\. Accepted there: the settings by level, the wake mode and rules, the waiting page, the fallback's machine type change through the router's own role, both internal kinds \(measured, napped by the idle check, woken by the page's probe\) and GKE's refusal\. Not released yet: router 0\.40\.0, which holds them\./);
+  assert.match(page, /These were accepted in dormeto-dev on 2026-11-08 and 2026-11-09, on dev builds of main \(router 0\.39\.0-dev\.2, then 0\.39\.0-dev\.3 with the final review's fixes\)\. Accepted there: the settings by level, the wake mode and rules, the waiting page, the fallback's machine type change through the router's own role, both internal kinds \(measured, napped by the idle check, woken by the page's probe\) and GKE's refusal\. They ship in router 0\.40\.0\. The global load balancer/);
   assert.doesNotMatch(page, /the switch back takes longer than any hold/);
   assert.doesNotMatch(page, /was not measured: the headers/);
 });
@@ -723,7 +723,7 @@ test('the manager and Compute Engine pages say where the next check starts, as t
   assert.match(flat(read(MANAGER)), /A cursor that cannot be written is said in CheckCursorNotStored, and one that cannot be read in CheckCursorUnread: that check starts at the first workload\./);
   assert.match(read('gcp/src/controller-core.mjs'), /log\.warn\('CheckCursorNotStored', \{ error: err\.message \}\)/);
   assert.match(read('lambda/src/lib/check-run.mjs'), /log\.warn\('CheckCursorUnread', \{ error: err\.message \}\);/);
-  assert.match(flat(read(CE)), /A check takes 8 workloads at a time and starts none after 240 s \(CheckBudgetReached\); the next check starts after the last workload it started \(cursor in \[the check summary\]\(google-cloud-manager\.md#what-the-router-keeps\)\), so on a crowded router every workload is checked in turn, as on AWS \(Not released yet: router 0\.40\.0\)\./);
+  assert.match(flat(read(CE)), /A check takes 8 workloads at a time and starts none after 240 s \(CheckBudgetReached\); the next check starts after the last workload it started \(cursor in \[the check summary\]\(google-cloud-manager\.md#what-the-router-keeps\)\), so on a crowded router every workload is checked in turn, as on AWS \(from router 0\.40\.0\)\./);
 });
 
 test('the README and the Compute Engine page give Google Cloud the organization\'s level, its joined windows and its ended windows', () => {
@@ -734,7 +734,7 @@ test('the README and the Compute Engine page give Google Cloud the organization\
   // controller-core.mjs's endedDaysOf: the organization's endedWindowDays, a year by default (ENDED_DAYS_DEFAULT), 0 keeps them.
   assert.match(CORE_SRC, /return managerState\?\.level\?\.endedWindowDays \?\? ENDED_DAYS_DEFAULT;/);
   assert.doesNotMatch(readme, /Not on Google Cloud yet\./);
-  assert.match(readme, /On Google Cloud too \(Not released yet: router 0\.40\.0\), with the endedWindowDays of the settings the manager pushes to the router: 365 days without them, and 0 keeps them\./);
+  assert.match(readme, /and when stay as they were\. On Google Cloud too, from router 0\.40\.0, with the endedWindowDays of the settings the manager pushes to the router: 365 days without them, and 0 keeps them\./);
   for (const [file, stale] of [['gcp/src/controller-core.mjs', /comes with G2|wait for G2/], ['gcp/src/onboarding.mjs', /until G2/]]) assert.doesNotMatch(read(file), stale, file);
 });
 
@@ -792,8 +792,7 @@ test('the manager page says what a nap\'s event names, as stopped.mjs builds it'
 });
 
 // R15 of the AWS and Google Cloud review (vision docs/plans/2026-11-10-aws-google-cloud-review-apis.md): the pages say what the code does,
-// and mark what the next router adds with the one phrase the release tool lets through.
-const NOT_YET = 'Not released yet: router 0.40.0';
+// and what router 0.40.0 adds as router 0.40.0's (its release rewrote the "Not released yet: router 0.40.0" marks).
 
 test('the manager page: the AWS actions Google Cloud answers unsupported, and the refused body', () => {
   const page = flat(read(MANAGER));
@@ -834,46 +833,48 @@ test('the Compute Engine page: the waiting page\'s headers and the settings prob
   assert.match(page, /a value that is not a whole number in its range is the problem <key>: must be a whole number from <min> to <max> \(an onboarding's problem starts with settings: \), as AWS's/);
   assert.match(page, /The page's probe goes to \/_dormeto\/wake and sends the visitor's path in x-dormeto-path; a workload that sleeps or wakes answers a 202 there, where AWS's page answers a 503 to the probe of its own address/);
   assert.match(page, /A put needs by, who sets the page/);
-  assert.match(page, /Not released yet: router 0\.40\.0/);
+  assert.match(page, /and GKE's refusal\. They ship in router 0\.40\.0\./);
   assert.doesNotMatch(page, /They are not released\./);
 });
 
-test('the pages do not call 0.38.0 or 0.39.0 a release, say Not released yet: router 0.40.0, and call nothing unreleased', () => {
+test('the pages do not call 0.38.0 or 0.39.0 a release, say what router 0.40.0 adds, and call nothing unreleased', () => {
   const index = flat(read('docs/scenarios/README.md'));
-  assert.match(index, /What the router naps and wakes, as of router 0\.37\.0\. Not released yet: router 0\.40\.0 adds what the Google Cloud pages say beyond 0\.37\.0, and the manager page/);
-  assert.match(index, /accepted on 2026-11-04, and say what was not run; what they add beyond 0\.37\.0 is marked Not released yet: router 0\.40\.0/);
+  // "as of router <version>" is the package's (the release bumps it); the next sentence names 0.40.0 whatever it is.
+  assert.ok(index.includes(`What the router naps and wakes, as of router ${PACKAGE.version}. Router 0.40.0 adds what the Google Cloud pages say beyond 0.37.0, and the manager page. A workload is`));
+  assert.match(index, /accepted on 2026-11-04, and say what was not run and what router 0\.40\.0 adds beyond 0\.37\.0\. ## The cycle/);
   const readme = read('README.md');
   const section = flat(readme.slice(readme.indexOf('\n## Google Cloud\n'), readme.indexOf('\n## Version\n')));
   assert.ok(section.includes('(docs/scenarios/google-cloud-manager.md)'), 'the manager page is in the list');
-  assert.ok(section.includes(NOT_YET));
+  assert.ok(section.includes('the journal, the check summary and POST /v1/actions, through which the Dormeto manager reads and acts on a Google Cloud router, from 0.40.0. Router 0.37.0 adds'));
   assert.doesNotMatch(section, /Router 0\.38\.0 is not released yet/);
   for (const file of ['README.md', 'docs/scenarios/README.md', MANAGER, CE, SQL, GKE]) {
     assert.doesNotMatch(read(file), /unreleased/i, file);
     // G4's 0.38.0 and G5's 0.39.0 never ship alone (the design's 7.2); only their dev builds are named.
     assert.doesNotMatch(read(file), /(?<![\d.])0\.3[89]\.0(?![-\d])/, file);
   }
-  assert.ok(flat(read('README.md')).includes('(Not released yet: router 0.40.0 and CLI 0.14.0) or from your own'));
-  assert.match(flat(read('README.md')), /router 0\.40\.0 \(terraform\/gcp-releases creates the three repositories\), and dormeto gcp routers install uses it by default\. Not released yet: router 0\.40\.0 and CLI 0\.14\.0\./);
-  assert.match(flat(read(MANAGER)), /^# Google Cloud: the router and the manager Not released yet: router 0\.40\.0\./);
+  assert.ok(flat(read('README.md')).includes('creates the services, from Dormeto\'s public image by default (router 0.40.0 and CLI 0.14.0 or later) or from your own with --image.'));
+  assert.match(flat(read('README.md')), /router 0\.40\.0 \(terraform\/gcp-releases creates the three repositories\), and dormeto gcp routers install uses it by default from CLI 0\.14\.0\. The old names/);
+  assert.match(flat(read(MANAGER)), /^# Google Cloud: the router and the manager From router 0\.40\.0, the Dormeto manager reads a Google Cloud router and acts through it as it does an AWS one\. The router pushes nothing/);
 });
 
-// The review's final fix wave: what 0.37.0 did not have is marked on every page that says it, and the index's sentence is true.
-test('the pages that describe what 0.37.0 did not have say Not released yet: router 0.40.0, each naming what it adds', () => {
+// The review's final fix wave: what 0.37.0 did not have is said on every page that says it, and the index's sentence is true.
+test('the pages that describe what 0.37.0 did not have say what router 0.40.0 adds, each naming it', () => {
   const gke = flat(read(GKE));
-  assert.match(gke, /Not released yet: router 0\.40\.0 adds, on this page: the refusal of a KEDA ScaledObject whose minReplicaCount is 0, a default wake timeout of 600 s \(300 s in 0\.37\.0\) that behind a swap can't be less than the map's change plus 60 s, the settings by level \(the type here is k8s\) with fallback machine types refused for pods, and a wider reading of the load balancers GKE owns/);
+  assert.match(gke, /measured on Google beforehand \(below\)\. Router 0\.40\.0 adds, on this page: the refusal of a KEDA ScaledObject whose minReplicaCount is 0, a default wake timeout of 600 s \(300 s in 0\.37\.0\) that behind a swap can't be less than the map's change plus 60 s, the settings by level \(the type here is k8s\) with fallback machine types refused for pods, and a wider reading of the load balancers GKE owns/);
   const sql = flat(read(SQL));
-  assert.match(sql, /Not released yet: router 0\.40\.0 adds, on this page: the wake timeout 1700 s of a workload with a companion, fixed, which show says as fixed, within the settings by level/);
-  // docs/scenarios/README.md says what the Google Cloud pages add beyond 0.37.0 is marked: each of the three has the mark.
-  assert.match(flat(read('docs/scenarios/README.md')), /what they add beyond 0\.37\.0 is marked Not released yet: router 0\.40\.0/);
-  for (const file of [CE, SQL, GKE]) assert.ok(flat(read(file)).includes(NOT_YET), file);
+  assert.match(sql, /the tag's condition as the router\. Router 0\.40\.0 adds, on this page: the wake timeout 1700 s of a workload with a companion, fixed, which show says as fixed, within the settings by level/);
+  // docs/scenarios/README.md says the Google Cloud pages say what router 0.40.0 adds beyond 0.37.0: each of the three does.
+  assert.match(flat(read('docs/scenarios/README.md')), /and say what was not run and what router 0\.40\.0 adds beyond 0\.37\.0\./);
+  assert.ok(flat(read(CE)).includes('They ship in router 0.40.0.'), CE);
+  for (const file of [SQL, GKE]) assert.ok(flat(read(file)).includes('Router 0.40.0 adds, on this page: '), file);
   const readme = flat(read('README.md'));
-  assert.match(readme, /Not released yet: router 0\.40\.0 gives the Google Cloud router AWS's settings by level, the wake mode and the no-wake and wake rules, the branded waiting page, a capacity retry with fallback machine types, and the internal Application Load Balancers/);
+  assert.match(readme, /what was accepted and measured\. Router 0\.40\.0 gives the Google Cloud router AWS's settings by level, the wake mode and the no-wake and wake rules, the branded waiting page, a capacity retry with fallback machine types, and the internal Application Load Balancers/);
   assert.doesNotMatch(readme, /The Google Cloud router has AWS's settings by level/);
 });
 
-test('the manager page says Not released yet: router 0.40.0 where it says a router older than that has no /v1/actions', () => {
+test('the manager page says a router older than 0.40.0 has no /v1/actions, and names the version once there', () => {
   const page = flat(read(MANAGER));
-  assert.match(page, /A router older than 0\.40\.0 \(Not released yet: router 0\.40\.0\) has no \/v1\/actions/);
+  assert.match(page, /- A router older than 0\.40\.0 has no \/v1\/actions: the manager lists it with its version/);
   assert.doesNotMatch(page, /not released yet\)/);
 });
 
@@ -906,20 +907,27 @@ test('compareVersions: a dev version is below its release, and a lower minor is 
   assert.ok(compareVersions('0.41.0', '0.40.0') > 0);
 });
 
+// The versions a text's "Not released yet: router X" sentences name, a sentence split across lines included.
+const notYet = (text) => [...spaced(text).matchAll(/Not released yet: router (\d+\.\d+\.\d+)/g)].map(([, version]) => version);
+// Every Markdown file of the README, docs/ and terraform/ (not what terraform init downloads).
+const MARKDOWN = ['README.md', ...['docs', 'terraform'].flatMap((dir) => readdirSync(`${ROOT}${dir}`, { recursive: true })
+  .filter((path) => path.endsWith('.md') && !path.split('/').includes('.terraform')).map((path) => `${dir}/${path}`))];
+
+test('notYet finds each "Not released yet: router X" sentence, across a line break too, and nothing else', () => {
+  assert.deepEqual(notYet('Done. Not\nreleased yet: router 0.41.0 and CLI 0.15.0. A (Not released yet: router 1.0.0).'), ['0.41.0', '1.0.0']);
+  assert.deepEqual(notYet('From router 0.40.0, it does. Not released yet: CLI 0.15.0.'), []);
+  assert.ok(MARKDOWN.includes(MANAGER) && MARKDOWN.includes('terraform/gcp-releases/README.md'), MARKDOWN.join());
+});
+
 test('every "Not released yet: router X" sentence names a version above the package\'s: the release rewrites it', () => {
-  const files = ['README.md', 'docs/scenarios/README.md', MANAGER, CE, SQL, GKE, 'docs/scenarios/databases.md', 'docs/scenarios/kubernetes.md'];
-  const found = [];
-  for (const file of files) {
-    for (const [, version] of spaced(read(file)).matchAll(/Not released yet: router (\d+\.\d+\.\d+)/g)) found.push([file, version]);
-  }
-  assert.ok(found.length >= 6, 'the docs say it where they describe 0.40.0');
+  const found = MARKDOWN.flatMap((file) => notYet(read(file)).map((version) => [file, version]));
   const reached = found.filter(([, version]) => compareVersions(PACKAGE.version, version) >= 0);
   assert.deepEqual(reached, [], `the package is at ${PACKAGE.version}: these sentences are released, rewrite them`);
 });
 
 // The CLI's move of the router commands under `dormeto gcp routers`: the docs name the new ones, and the old names only in one sentence
-// of the README.
-const OLD_NAMES_SENTENCE = 'The old names dormeto gcp install, dormeto gcp uninstall and dormeto gcp status work for one release, with a notice on stderr (Not released yet: CLI 0.14.0).';
+// of the README, which says what CLI 0.14.0 does with them (cli cmd/dormeto/gcp_test.go: an unknown command, exit 2, nothing run).
+const OLD_NAMES_SENTENCE = 'The old names dormeto gcp install, dormeto gcp uninstall and dormeto gcp status of CLI 0.11.0 are gone from CLI 0.14.0: unknown commands, with no alias and no notice.';
 test('the docs name dormeto gcp routers install, uninstall and show, and the old names only in one sentence', () => {
   const files = ['README.md', 'terraform/gcp-dev/README.md', 'terraform/gcp-releases/README.md', 'docs/scenarios/README.md', MANAGER, CE, SQL, GKE];
   let sentences = 0;

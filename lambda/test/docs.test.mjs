@@ -65,9 +65,14 @@ test('the AWS wake paragraphs say once where Google Cloud\'s probe goes and what
   assert.match(readme, /On Google Cloud the waiter page's probe goes to \/_dormeto\/wake with the visitor's path in x-dormeto-path\. A workload that sleeps or wakes answers a 202 there, not a 503: see \[the Compute Engine page\]\(docs\/scenarios\/google-cloud-compute-engine\.md#the-waiting-page\)/);
 });
 
+// B5 of the cloud duplication design: a pause's woken and the refused resume, which router 0.40.0 brings.
+test('the README says what a pause answers in woken and which resume is refused, both from router 0.40.0', () => {
+  assert.match(flat(read('README.md')), /\/dev\/stdout A pause's answer lists in woken the wakes this pause started or set, a router pause's queued wakes among them\. Resuming a workload the router does not know is refused \(not_found: workload not configured: <id>\), and an exclusion's lift of one answers \{ "resumed": false \}\. Both are from router 0\.40\.0\. Schedules \(router 0\.31\.0\):/);
+});
+
 // B3 of the cloud duplication design: an unreadable schedule is answered as stored, with no next event, on both routers.
 test('the README says a schedule the router cannot read is answered as stored with no next event, and its maximum nap not due, on both routers', () => {
-  assert.match(flat(read('README.md')), /A schedule the router cannot read \(a time zone the runtime refuses\) is answered as stored, with no next event, and logged ScheduleSkipped; the check leaves it out, so its maxNapDays is not due either\. Not released yet: router 0\.40\.0\./);
+  assert.match(flat(read('README.md')), /The summary carries scheduled: true\. From router 0\.40\.0, a schedule the router cannot read \(a time zone the runtime refuses\) is answered as stored, with no next event, and logged ScheduleSkipped; the check leaves it out, so its maxNapDays is not due either\. json \{/);
   // manager-actions.mjs's scheduleView, and each router's maintenance wake of a schedule it reads only: AWS's, and Google Cloud's in
   // its status (the run given) and its schedule action (a schedule just checked).
   assert.match(read('lambda/src/lib/manager-actions.mjs'), /readable = false;\n {4}log\.warn\('ScheduleSkipped', \{ workloadId, error: err\.message \}\);/);

@@ -11,7 +11,7 @@ level](#settings-and-their-levels), the wake mode and the rules, [the branded wa
 retry with fallback machine types](#capacity-and-fallback-machine-types) and [the internal load
 balancers](#internal-load-balancers). These were accepted in `dormeto-dev` on 2026-11-08 and 2026-11-09, on dev builds of `main` (router 0.39.0-dev.2, then 0.39.0-dev.3 with the final review's fixes). Accepted there: the settings by level, the wake mode and rules, the waiting page, the fallback's machine type change
 through the router's own role, both internal kinds (measured, napped by the idle check, woken by the page's probe) and GKE's
-refusal. Not released yet: router 0.40.0, which holds them.
+refusal. They ship in router 0.40.0.
 
 The global load balancer keeps the application's backend service in its URL map and serves the waiting page through a
 custom error response (the diagram, and [Behavior](#behavior)). The regional and classic ones have no custom error
@@ -147,7 +147,7 @@ started by hand makes the workload awake, and VMs all stopped by hand while it i
 VMs are going down, the workload wakes as soon as the nap ends. A check takes 8 workloads at a time and starts none after
 240 s (`CheckBudgetReached`); the next check starts after the last workload it started (`cursor` in [the check
 summary](google-cloud-manager.md#what-the-router-keeps)), so on a crowded router every workload is checked in turn, as on
-AWS (Not released yet: router 0.40.0).
+AWS (from router 0.40.0).
 
 **A wake or a nap that dies.** A wake or a nap runs in one request of the controller. A running wake or nap beats on its
 run every minute (`beatAt`, in `dormeto gcp workloads show --json`), and a beat that fails is tried again once, 10 s

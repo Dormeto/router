@@ -1,6 +1,6 @@
 # Google Cloud: the router and the manager
 
-Not released yet: router 0.40.0. From it, the Dormeto manager reads a Google Cloud router and acts through it as it does an AWS one. The router
+From router 0.40.0, the Dormeto manager reads a Google Cloud router and acts through it as it does an AWS one. The router
 pushes nothing: it keeps its journal and its check summary in Firestore, and answers one route, `POST /v1/actions`, which
 the manager polls every minute. This page is what the router keeps, what it answers and what is its own. The connection
 (the manager's two service accounts and the grants that reach this router) is made by `dormeto gcp connect`, which is
@@ -156,7 +156,7 @@ logged, `EndedWindowsRemoved`.
 
 - **The manager polls, the router does not push.** It asks every minute and reads the journal again from 5 minutes
   before the newest event it has, so an event is read twice and kept once.
-- **A router older than 0.40.0 (Not released yet: router 0.40.0) has no `/v1/actions`**: the manager lists it with its version, does not poll it and
+- **A router older than 0.40.0 has no `/v1/actions`**: the manager lists it with its version, does not poll it and
   says which `dormeto gcp routers install` command upgrades it.
 - **The journal is 7 days.** A manager that cannot read the router for longer loses the changes in between; its history
   is inferred from the next check's states.

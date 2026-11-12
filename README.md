@@ -244,7 +244,7 @@ aws lambda invoke --function-name dmt-dev-controller --cli-binary-format raw-in-
 
 A pause's answer lists in `woken` the wakes this pause started or set, a router pause's queued wakes among them. Resuming a
 workload the router does not know is refused (`not_found`: `workload not configured: <id>`), and an exclusion's lift of one
-answers `{ "resumed": false }`. Not released yet: router 0.40.0.
+answers `{ "resumed": false }`. Both are from router 0.40.0.
 
 **Schedules (router 0.31.0):** weekly awake and nap windows per workload, and a maximum nap. A schedule is an
 operational record like a pause, stored in the state table (`WL#<id> / SCHEDULE`), set by the manager (dashboard, API,
@@ -253,9 +253,9 @@ controller's `schedule` action validates and writes it (`{problems}` and nothing
 schedule, `next` and `maintenanceDue`), `clear-schedule` removes it, and `status` answers `schedule` (null without),
 `next` (the next 5 events within 8 days, or 400 when a window has a `repeat` or a `from`: `awake-start`, `awake-end`,
 `nap-start`, `nap-end`, with their window) and
-`maintenanceDue` (ISO, when `maxNapDays` applies and the workload is asleep). The summary carries `scheduled: true`. A
-schedule the router cannot read (a time zone the runtime refuses) is answered as stored, with no `next` event, and logged
-`ScheduleSkipped`; the check leaves it out, so its `maxNapDays` is not due either. Not released yet: router 0.40.0.
+`maintenanceDue` (ISO, when `maxNapDays` applies and the workload is asleep). The summary carries `scheduled: true`. From
+router 0.40.0, a schedule the router cannot read (a time zone the runtime refuses) is answered as stored, with no `next`
+event, and logged `ScheduleSkipped`; the check leaves it out, so its `maxNapDays` is not due either.
 
 ```json
 {
@@ -339,7 +339,7 @@ aws lambda invoke --function-name dmt-dev-controller --cli-binary-format raw-in-
     days, 365 by default and without a manager. While the settings were never read, or cannot be, nothing is removed.
   - Only between occurrences, since an occurrence's id holds its window's index; and only over the schedule as the check read
     it (a conditional write), so a save since is kept. Logged `EndedWindowsRemoved` with the counts. Who set the schedule
-    and when stay as they were. On Google Cloud too (Not released yet: router 0.40.0), with the `endedWindowDays` of the settings the
+    and when stay as they were. On Google Cloud too, from router 0.40.0, with the `endedWindowDays` of the settings the
     manager pushes to the router: 365 days without them, and 0 keeps them.
 - **The check applies it** on the clock's 5-minute marks: the `check_schedule` of the `router` module is
   `cron(0/5 * * * ? *)` (not `rate(5 minutes)`), so 08:45 is met at the 08:45 check, within its latency. Each occurrence
@@ -608,7 +608,7 @@ aws dynamodb get-item --table-name dmt-dev-router --key '{"pk":{"S":"WL#demo"},"
 
 Since 0.34.0 the router also runs on Google Cloud: `gcp/src` holds the two Cloud Run roles, one container image,
 `DMT_ROLE` (`waker` or `controller`) picks the role. `dormeto gcp routers install` (the CLI) creates the services, from Dormeto's public image by
-default (Not released yet: router 0.40.0 and CLI 0.14.0) or from your own with `--image`. Its scenarios, each with its limits:
+default (router 0.40.0 and CLI 0.14.0 or later) or from your own with `--image`. Its scenarios, each with its limits:
 
 - [Compute Engine VMs](docs/scenarios/google-cloud-compute-engine.md): instance groups behind a global external
   Application Load Balancer since 0.34.0; zonal network endpoint groups, the regional and classic load balancers (the
@@ -618,7 +618,7 @@ default (Not released yet: router 0.40.0 and CLI 0.14.0) or from your own with `
 - [Kubernetes on GKE](docs/scenarios/google-kubernetes-engine.md): a Deployment or StatefulSet behind standalone network
   endpoint groups, scaled to 0 and back, from 0.37.0.
 - [The router and the manager](docs/scenarios/google-cloud-manager.md): the journal, the check summary and `POST
-  /v1/actions`, through which the Dormeto manager reads and acts on a Google Cloud router. Not released yet: router 0.40.0.
+  /v1/actions`, through which the Dormeto manager reads and acts on a Google Cloud router, from 0.40.0.
 
 Router 0.37.0 adds zonal network endpoint groups, the regional and classic load balancers, schedules, pauses, IP lists
 (`dormeto gcp routers install --ip-list`), Cloud SQL companions and GKE pods, the last two with the access that
@@ -626,7 +626,7 @@ Router 0.37.0 adds zonal network endpoint groups, the regional and classic load 
 `dormetoRouterDatabases` and `dormetoRouterKubernetes`, and a Kubernetes Role per GKE workload, which the CLI applies).
 They were accepted on 2026-11-04 in `dormeto-dev` with CLI 0.11.0: each page says what was accepted and measured.
 
-Not released yet: router 0.40.0 gives the Google Cloud router AWS's settings by level, the wake mode and the no-wake and wake rules, the branded waiting page, a
+Router 0.40.0 gives the Google Cloud router AWS's settings by level, the wake mode and the no-wake and wake rules, the branded waiting page, a
 capacity retry with fallback machine types, and the internal Application Load Balancers: the [Compute Engine
 page](docs/scenarios/google-cloud-compute-engine.md) says what each does, what Google Cloud fixes and why, and
 [Kubernetes on GKE](docs/scenarios/google-kubernetes-engine.md) says which load balancers GKE owns and are refused.
@@ -638,7 +638,7 @@ a nap up instead of failing it; at most 20 naps are in flight per router; an idl
 stops anything; a nap checks an unmanaged group's VMs and the backend service's backends; and a classic load balancer on
 the Standard tier is found, and Google accepts it for the swap (measured). With `--request-logs` the idle check reads
 the load balancer's request logs and ignores what the waker ignores: the logs decide alone, as Monitoring's count is
-sampled, but an empty log leaves the count to decide. GKE refuses a KEDA `minReplicaCount: 0`. Not released yet: router 0.40.0. The fixes' acceptance passed on 2026-11-08 in
+sampled, but an empty log leaves the count to decide. GKE refuses a KEDA `minReplicaCount: 0`. The fixes' acceptance passed on 2026-11-08 in
 `dormeto-dev`, with the image 0.38.0-dev.2 and the CLI built from `main`.
 
 ```bash
@@ -654,9 +654,9 @@ podman run --rm -p 8080:8080 -e DMT_ROLE=controller -e DMT_PROJECT=p -e DMT_REGI
 ```
 
 Dormeto publishes the image, public, at `<europe|us|asia>-docker.pkg.dev/dormeto-releases/router/router:<version>` from
-router 0.40.0 (`terraform/gcp-releases` creates the three repositories), and `dormeto gcp routers install` uses it by default. Not
-released yet: router 0.40.0 and CLI 0.14.0.
-The old names `dormeto gcp install`, `dormeto gcp uninstall` and `dormeto gcp status` work for one release, with a notice on stderr (Not released yet: CLI 0.14.0).
+router 0.40.0 (`terraform/gcp-releases` creates the three repositories), and `dormeto gcp routers install` uses it by default
+from CLI 0.14.0. The old names `dormeto gcp install`, `dormeto gcp uninstall` and `dormeto gcp status` of CLI 0.11.0 are
+gone from CLI 0.14.0: unknown commands, with no alias and no notice.
 Building your own is for `--image`, for example inside a VPC Service Controls perimeter, which keeps the public
 repository out. An image in another project needs Artifact Registry Reader for the project's Cloud Run service agent,
 which the customer gives.

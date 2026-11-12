@@ -19,12 +19,10 @@
 import { k8sId } from '../../lambda/src/lib/kubernetes.mjs';
 import { describeStoredLists } from '../../lambda/src/lib/list-cache.mjs';
 import { listRouter, readPauses, rowPauses } from '../../lambda/src/lib/manager-actions.mjs';
-import { maintenanceDue } from '../../lambda/src/lib/schedule.mjs';
-import { STATES } from '../../lambda/src/lib/state.mjs';
 import { STATS_DAYS } from '../../lambda/src/lib/summary.mjs';
 import { CHECK_SCHEDULE, PauseRefused } from './controller-core.mjs';
 import { isPods } from './gke.mjs';
-import { Refusal } from './onboarding.mjs';
+import { maintenanceDueOf, Refusal } from './onboarding.mjs';
 import { organizationOf } from './organization.mjs';
 import { CUSTOM_PAGES_REFUSED } from './pages.mjs';
 import { rowOf } from './rows.mjs';
@@ -68,13 +66,6 @@ function backendOf(backend) {
 // AWS's hibernation view (controller-core.mjs's hibernationView) from the REST one: the manager's level as AWS's status gives it, and
 // no instance read.
 const hibernationOf = (hibernation, manager) => ({ ...hibernation, manager, instances: null, freshBoot: false });
-
-// A schedule's view (manager-actions.mjs's) with AWS's maintenance wake: the maximum nap's while asleep. No hibernation limit wakes a
-// workload here: Compute Engine itself stops a VM suspended for 60 days.
-function withMaintenance(view, run) {
-  const due = view.schedule && run?.state === STATES.ASLEEP ? maintenanceDue(view.schedule, run.stateAt) : null;
-  return { ...view, maintenanceDue: due === null ? null : iso(due) };
-}
 
 // router/check with its times as the manager reads every router's, ISO; null when its summary was never written (its cursor alone).
 const checkOf = (check) => check && { ...check, checkedAt: isoOrNull(check.checkedAt), lastScheduledCheckAt: isoOrNull(check.lastScheduledCheckAt) };
@@ -161,13 +152,15 @@ export function createActions({ controller, onboarding, store, router, lists = [
   async function status({ workloadId }) {
     const cfg = await onboarding.find(workloadId);
     const id = cfg.workloadId;
+    // One read of the run, for the row and the schedule's maintenance wake.
+    const runRead = store.getRun(id);
     const [shown, run, above, stats, pauses, view, ipLists] = await Promise.all([
       onboarding.show(id),
-      store.getRun(id),
+      runRead,
       levels(),
       store.getStats(id, STATS_DAYS).catch((err) => ({ error: err.message })),
       controller.pausesFor(id),
-      onboarding.workloadSchedule(id),
+      onboarding.workloadSchedule(id, { run: runRead }),
       lists.length ? describeStoredLists(store, lists).catch((err) => [{ error: err.message }]) : [],
     ]);
     const row = rowFor(cfg, { run, stats: stats.error ? null : stats, pauses, scheduled: Boolean(view.schedule), above });
@@ -198,7 +191,7 @@ export function createActions({ controller, onboarding, store, router, lists = [
       wakeMode: shown.settings.wakeMode,
       wakeRules: shown.wakeRules,
       noWakeRules: shown.noWakeRules,
-      ...withMaintenance(view, run),
+      ...view,
     };
   }
 
@@ -290,7 +283,9 @@ export function createActions({ controller, onboarding, store, router, lists = [
   async function setSchedule(payload) {
     const view = await manager.setSchedule(payload);
     if (view.problems) return view;
-    return withMaintenance(view, await store.getRun(payload.workloadId));
+    // A schedule just stored passed scheduleProblems, which reads its time zone and its windows as the view does: one the router reads.
+    const due = maintenanceDueOf(view.schedule, await store.getRun(payload.workloadId), { readable: true });
+    return { ...view, maintenanceDue: due === null ? null : iso(due) };
   }
 
   // AWS's offboard (:793): its steps, with the REST answer's fields (the VMs left on a fallback type, and a forced one's backends left).

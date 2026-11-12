@@ -29,6 +29,7 @@ import { checkName } from '../../lambda/src/lib/names.mjs';
 import { joinLevels } from '../../lambda/src/lib/manager-settings.mjs';
 import { createManagerActions, scheduleView } from '../../lambda/src/lib/manager-actions.mjs';
 import { pageViewOf } from '../../lambda/src/lib/page-settings.mjs';
+import { maintenanceDue } from '../../lambda/src/lib/schedule.mjs';
 import { describedRules, SCALAR_KEYS } from '../../lambda/src/lib/settings-levels.mjs';
 import { resolvedSettings, routerSettingsView, withSettings } from '../../lambda/src/lib/settings-writes.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
@@ -210,6 +211,11 @@ function hibernationOf(cfg, router, organization) {
     manager: typeof organization?.hibernate === 'boolean' ? organization.hibernate : null,
   };
 }
+
+// The maintenance wake of a schedule's view (manager-actions.mjs's `dues`), as AWS's status shows it: the maximum nap of an asleep
+// workload, of a schedule the router reads (its check applies none of another, B3 of the cloud duplication design). No hibernation
+// limit wakes a workload here: Compute Engine itself stops a VM suspended for 60 days.
+export const maintenanceDueOf = (schedule, run, { readable }) => (readable && schedule && run?.state === STATES.ASLEEP ? maintenanceDue(schedule, run.stateAt) : null);
 
 // The REST Workload's failure (what CLI 0.11.0 reads): `at` only when the record has one, unlike the row's (lambda/src/lib/summary.mjs's
 // failureOf). Its `fallbacks` are the row's (summary.mjs's fallbacksOf).
@@ -990,8 +996,10 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   // A schedule's view (manager-actions.mjs's scheduleView): one the router cannot read (a time zone Intl refuses) is shown, with no next
   // event. Its joinMinutes as AWS's answer resolves it: the schedule's own value, then the router level's (`router/settings`), then the
   // organization's (`router/manager`), then the default (design, section 11); a level that cannot be read counts as unset, said in
-  // `JoinLevelUnreadable`, as AWS's join levels. No maintenance wake: the status and schedule actions add theirs (actions.mjs).
-  const scheduleOf = (id, schedule) => scheduleView({ now, log }, id, schedule, {
+  // `JoinLevelUnreadable`, as AWS's join levels. Its maintenance wake (maintenanceDueOf) with the run given, the status action's; none
+  // without, as the REST answer has none.
+  const scheduleOf = (id, schedule, { run } = {}) => scheduleView({ now, log, dues: maintenanceDueOf }, id, schedule, {
+    run,
     joins: () => joinLevels({ router: () => store.getRouterSettings(), manager: async () => organizationOf((await store.getManagerSettings?.()) ?? null).level, log, fields: { workloadId: id } }),
   });
   // The REST routes' answers of the shared actions (what CLI 0.11.0 reads): a schedule's next events as `nextEvents`; problems, a 400
@@ -1002,10 +1010,10 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     return answer;
   };
 
-  // A workload's schedule in AWS's view, as the status action shows it.
-  async function workloadSchedule(id) {
+  // A workload's schedule in AWS's view, as the status action shows it: `run`, the run (or its read under way) for the maintenance wake.
+  async function workloadSchedule(id, { run } = {}) {
     await find(id);
-    return scheduleOf(id, await store.getSchedule(id));
+    return scheduleOf(id, await store.getSchedule(id), { run });
   }
   const showSchedule = async (id) => restSchedule(await workloadSchedule(id));
 

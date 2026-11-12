@@ -450,6 +450,22 @@ test('GET /v1/workloads/:id/schedule: one the router cannot read is shown, with 
   assert.equal(w.logs.filter((l) => l.event === 'ScheduleSkipped').length, 1);
 });
 
+test('the status action: a schedule the router cannot read is shown with no next events and its maximum nap not due, as on AWS (B3); one it reads, due', async () => {
+  const { call, store, clock, w } = api();
+  await call('POST', '/v1/workloads', INPUT);
+  // The status reads the 7 days of counters too, which this world's store does not keep.
+  store.getStats = async (id, days) => ({ days, since: null, today: {}, total: {} });
+  const asleep = clock.now() - 60_000;
+  Object.assign(store.runs.get('demo'), { state: STATES.ASLEEP, stateAt: asleep });
+  store.schedules.set('demo', { ...SCHEDULE, timeZone: 'Nowhere/Land', at: 1 });
+  const unreadable = (await call('POST', '/v1/actions', { action: 'status', workloadId: 'demo' })).body;
+  assert.deepEqual([unreadable.schedule.timeZone, unreadable.next, unreadable.maintenanceDue], ['Nowhere/Land', [], null]);
+  assert.equal(w.logs.filter((l) => l.event === 'ScheduleSkipped').length, 1);
+  // The check applies the maximum nap of a schedule it reads.
+  store.schedules.set('demo', { ...SCHEDULE, timeZone: 'Europe/Paris', at: 1 });
+  assert.equal((await call('POST', '/v1/actions', { action: 'status', workloadId: 'demo' })).body.maintenanceDue, new Date(asleep + 7 * 86_400_000).toISOString());
+});
+
 test('POST /v1/workloads/:id/pause: the Workload with its pause; a sleeper woken; unknown: 404; a bad one: 400', async () => {
   const { call, store, clock, w } = api();
   assert.equal((await call('POST', '/v1/workloads/demo/pause', { reason: 'r' })).status, 404);

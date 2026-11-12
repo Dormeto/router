@@ -66,9 +66,13 @@ test('the AWS wake paragraphs say once where Google Cloud\'s probe goes and what
 });
 
 // B3 of the cloud duplication design: an unreadable schedule is answered as stored, with no next event, on both routers.
-test('the README says a schedule the router cannot read is answered as stored with no next event, and its maximum nap not due', () => {
+test('the README says a schedule the router cannot read is answered as stored with no next event, and its maximum nap not due, on both routers', () => {
   assert.match(flat(read('README.md')), /A schedule the router cannot read \(a time zone the runtime refuses\) is answered as stored, with no next event, and logged ScheduleSkipped; the check leaves it out, so its maxNapDays is not due either\. Not released yet: router 0\.40\.0\./);
-  // manager-actions.mjs's scheduleView, and AWS's maintenance wake of a schedule it reads only.
+  // manager-actions.mjs's scheduleView, and each router's maintenance wake of a schedule it reads only: AWS's, and Google Cloud's in
+  // its status (the run given) and its schedule action (a schedule just checked).
   assert.match(read('lambda/src/lib/manager-actions.mjs'), /readable = false;\n {4}log\.warn\('ScheduleSkipped', \{ workloadId, error: err\.message \}\);/);
   assert.match(read('lambda/src/lib/controller-core.mjs'), /readable && schedule && run\?\.state === STATES\.ASLEEP && run\.stateAt \? maintenanceDue\(schedule, run\.stateAt\) : null,/);
+  assert.match(read('gcp/src/onboarding.mjs'), /export const maintenanceDueOf = \(schedule, run, \{ readable \}\) => \(readable && schedule && run\?\.state === STATES\.ASLEEP \? maintenanceDue\(schedule, run\.stateAt\) : null\);/);
+  assert.match(read('gcp/src/onboarding.mjs'), /scheduleView\(\{ now, log, dues: maintenanceDueOf \}, id, schedule, \{/);
+  assert.match(read('gcp/src/actions.mjs'), /onboarding\.workloadSchedule\(id, \{ run: runRead \}\)/);
 });

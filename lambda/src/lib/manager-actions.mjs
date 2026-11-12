@@ -39,8 +39,9 @@ const isoOrNull = (ms) => (ms ? iso(ms) : null);
 // A schedule as people read it: the schedule (its `at` ISO; null when none), its next events, the maintenance wake due, and its
 // joinMinutes as the levels resolve it, the value in force and its level, and what removing the workload's own would give. A
 // schedule the router cannot read (a time zone the runtime refuses) is shown, with no next event, said in ScheduleSkipped (B3 of the
-// design: AWS said none). `joins()`: the levels' `{ router, manager }`, read once the schedule is shown; `run`: the run read, for
-// `dues(schedule, run, { readable })`, the maintenance wake's time (ms) or null (Google Cloud's REST answer has none).
+// design: AWS said none). `joins()`: the levels' `{ router, manager }`, read once the schedule is shown; `run`: the run read, or its
+// read under way, for `dues(schedule, run, { readable })`, the maintenance wake's time (ms) or null: each cloud's, which shows none
+// for a schedule the router cannot read, as its check applies none (Google Cloud's REST answer has none at all).
 export async function scheduleView({ now, log, dues = () => null }, workloadId, schedule, { run, joins }) {
   const shown = schedule && { ...schedule, at: iso(schedule.at) };
   const levels = await joins();
@@ -54,7 +55,7 @@ export async function scheduleView({ now, log, dues = () => null }, workloadId, 
     readable = false;
     log.warn('ScheduleSkipped', { workloadId, error: err.message });
   }
-  const due = dues(schedule, run, { readable });
+  const due = dues(schedule, await run, { readable });
   return {
     schedule: shown, next, maintenanceDue: due === null ? null : iso(due),
     joinMinutes: join.joinMinutes, joinFrom: join.from, joinInherited: { joinMinutes: inherited.joinMinutes, joinFrom: inherited.from },

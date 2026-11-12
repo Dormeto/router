@@ -18,7 +18,8 @@ import { createWakeWatch, unhealthyError } from './wake-watch.mjs';
 import { describeStopped } from './stopped.mjs';
 import { revertInstanceTypes } from './capacity.mjs';
 import { tagsProblem } from './tags.mjs';
-import { awakeStartWithin, CLOSE_START_MS, ENDED_DAYS_DEFAULT, maintenanceDue, nextEvents, normalizeSchedule, occurrenceAt, resolveJoin, scheduleProblems, withoutEnded } from './schedule.mjs';
+import { ENDED_DAYS_DEFAULT, maintenanceDue, nextEvents, normalizeSchedule, resolveJoin, scheduleProblems } from './schedule.mjs';
+import { createScheduleCheck, scheduleKeeps as keptBySchedule } from './check-schedules.mjs';
 import { STATS_DAYS, createCount, totals, workloadSummary } from './summary.mjs';
 import { lastRequestAt } from './metrics.mjs';
 import { checkScope } from './check-scope.mjs';
@@ -389,7 +390,6 @@ export function createController({
   // The levels of joinMinutes above a workload's: read once for a check or an answer, one that cannot be read logged and
   // unset. A schedule's own value, then these (design, section 11).
   const readJoinLevels = () => joinLevels({ router: () => store.getRouterSettings?.(), manager: () => managerSettings?.current?.(), log });
-  const joinOf = (schedule, levels) => ({ joinMinutes: resolveJoin({ workload: schedule?.joinMinutes, ...levels }).joinMinutes });
   // An unknown manager level, when it is the one that decides (the workload and the router set nothing), is false, said
   // `unknown`: the built-in true could hibernate against an administrator's "off" the router has not read yet (spec §3).
   const resolvedFor = (cfg, { router, manager }) => {
@@ -632,60 +632,22 @@ export function createController({
 
   // --- Schedules applied by the check (R12 design, section 4) --------------------------------------------------------
 
-  // Before the check's per-workload loop, every scheduled workload whatever the loop's budget, so a crowded router still
-  // meets the times: 8 at a time, one run read each, no AWS call but the wakes and naps it asks for. holdOf(workloadId):
-  // { paused, keepAsleep }. Answers each workload's outcome (what it did, or what held it) and the schedules the router
-  // can read: one it cannot (a time zone Intl refuses) is logged and the workload behaves as if it had none.
-  async function applySchedules(configs, schedules, holdOf, t, joins, endedDays = null) {
-    const due = [];
-    const readable = new Map();
-    for (const { workloadId } of configs) {
-      const schedule = schedules.get(workloadId);
-      if (!schedule) continue;
-      try {
-        const occurrence = occurrenceAt(schedule, t, joinOf(schedule, joins));
-        // A nap window's occurrence is skipped when an awake window starts within 30 minutes of its start, or of now (an
-        // occurrence first applied late).
-        const closeStart = occurrence?.kind === 'nap'
-          && (awakeStartWithin(schedule, occurrence.start, CLOSE_START_MS) || awakeStartWithin(schedule, t, CLOSE_START_MS));
-        readable.set(workloadId, schedule);
-        due.push({ workloadId, schedule, occurrence, closeStart });
-      } catch (err) {
-        log.warn('ScheduleSkipped', { workloadId, error: err.message });
-      }
-    }
-    const applied = new Map();
-    let i = 0;
-    await Promise.all(Array.from({ length: Math.min(CHECK_CONCURRENCY, due.length) }, async () => {
-      while (i < due.length) {
-        const item = due[i++];
-        try {
-          const outcome = await applySchedule(item, holdOf(item.workloadId), t);
-          if (outcome) applied.set(item.workloadId, outcome);
-        } catch (err) {
-          log.error('ScheduleFailed', { workloadId: item.workloadId, error: err.message });
-        }
-      }
-    }));
-    if (endedDays) await removeEnded(due, t, endedDays);
-    return { applied, readable };
-  }
-
-  // Windows that ended more than `endedDays` days ago leave their schedule (the user, 2026-11-02), and so do the dates without
-  // a window as old; a schedule left with nothing is removed. Only between occurrences: an occurrence's id holds its window's
-  // index, which a removal shifts. Written only over the schedule as read, so a save since is kept.
-  async function removeEnded(due, t, days) {
-    for (const { workloadId, schedule, occurrence } of due) {
-      if (occurrence) continue;
-      const ended = withoutEnded(schedule, t, days);
-      if (!ended) continue;
-      try {
-        if (await store.replaceSchedule(workloadId, schedule, ended.schedule)) log.info('EndedWindowsRemoved', { workloadId, windows: ended.windows, dates: ended.dates, days });
-      } catch (err) {
-        log.warn('EndedWindowsKept', { workloadId, error: err.message });
-      }
-    }
-  }
+  // Before the check's per-workload loop, every scheduled workload whatever the loop's budget (lib/check-schedules.mjs): 8 at a
+  // time, no AWS call but the wakes and naps it asks for. An awake window's wake as the manager's Wake does, the occurrence recorded
+  // with the wake (one conditional write).
+  const { applySchedules } = createScheduleCheck({
+    store,
+    wake: (workloadId, run, kind, occurrence) => startWake(workloadId, run, undefined, kind, occurrence ? { set: { scheduleApplied: occurrence.id } } : {}),
+    pendingWake: (workloadId, kind) => pendingWake(workloadId, undefined, kind),
+    wakeRecords: true, concurrency: CHECK_CONCURRENCY, log,
+  });
+  // A nap window's nap, asked at once: in the queue, it may wait until the window ends (a crowded nap start, 10 naps at a time).
+  const scheduledNap = {
+    async ask({ workloadId, occurrence, t }) {
+      if (!(await napSoon(workloadId, t, { cause: 'schedule', until: occurrence.end }))) await nap(workloadId, { cause: 'schedule' });
+      return true;
+    },
+  };
 
   // The organization's days before an ended window leaves its schedule, the default without a manager (no settings URL); null
   // when its settings were never read, cannot be, or were read by a router before this field: then nothing leaves, an
@@ -700,48 +662,6 @@ export function createController({
       log.warn('EndedDaysUnreadable', { error: err.message });
       return null;
     }
-  }
-
-  // The occurrence active now, applied once: the run records the last applied one, so a late check, a deploy inside a
-  // window or two checks in it apply it once. Then the maintenance wake of a workload asleep longer than maxNapDays. A
-  // pause holds the window's nap and a keepAsleep pause the wakes: held, the occurrence stays unapplied and applies once
-  // the pause is gone. Every write is conditional on the run read: one that changed since (a request's wake) is left
-  // for the next check. Answers what it did or what held it, else null.
-  async function applySchedule({ workloadId, schedule, occurrence, closeStart }, hold, t) {
-    if (!occurrence && !schedule.maxNapDays) return null;
-    const run = await store.getRun(workloadId);
-    if (!run) return null;
-    const pending = occurrence && run.scheduleApplied !== occurrence.id ? occurrence : null;
-    const applied = (action) => log.info('ScheduleApplied', { workloadId, occurrence: pending.id, kind: pending.kind, action });
-    const record = async (action) => {
-      if (await store.transition(workloadId, { cond: { state: run.state }, set: { scheduleApplied: pending.id } })) applied(action);
-    };
-    const asleep = run.state === STATES.ASLEEP || run.state === STATES.FAILED;
-    if (pending?.kind === 'awake' && (asleep || run.state === STATES.NAPPING)) {
-      if (hold.keepAsleep) return 'held by a keepAsleep pause';
-      // A napping workload gets its pending wake; the occurrence is recorded once the nap settled (a write now would
-      // delay the detection of a stuck nap, which reads updatedAt).
-      if (run.state === STATES.NAPPING) return (await pendingWake(workloadId, undefined, 'schedule')) ? 'pending wake' : null;
-      // Woken as the manager's Wake does, the occurrence recorded with the wake.
-      if (!(await startWake(workloadId, run, undefined, 'schedule', { set: { scheduleApplied: pending.id } }))) return null;
-      applied('wake');
-      return 'wake';
-    }
-    if (pending?.kind === 'nap' && run.state === STATES.AWAKE && !closeStart) {
-      if (hold.paused) return 'held by a pause';
-      // In the queue, it may wait until the window ends (a crowded nap start, 10 naps at a time).
-      if (!(await napSoon(workloadId, t, { cause: 'schedule', until: pending.end }))) await nap(workloadId, { cause: 'schedule' });
-      await record('nap');
-      return 'nap';
-    }
-    // Napping or waking at a nap window: left for the next check, which naps it once awake.
-    if (pending?.kind === 'nap' && (run.state === STATES.NAPPING || run.state === STATES.WAKING)) return null;
-    // Nothing to do (the workload is already as the window wants it, or the nap window comes just before an awake one).
-    if (pending) await record(closeStart ? 'skipped: an awake window starts within 30 minutes' : 'none');
-    const due = run.state === STATES.ASLEEP ? maintenanceDue(schedule, run.stateAt) : null;
-    if (due === null || due > t) return null;
-    if (hold.keepAsleep) return 'held by a keepAsleep pause';
-    return (await startWake(workloadId, run, undefined, 'maintenance')) ? 'maintenance' : null;
   }
 
   // --- The hibernation's 60-day limit (hibernation design §4) ---------------------------------------------------------
@@ -776,19 +696,15 @@ export function createController({
     return outcomes;
   }
 
-  // Why a schedule keeps a workload from its idle nap now, else null: the nap the check's schedule pass just asked for
-  // (not asked twice), an awake window active or starting within 30 minutes. A schedule it cannot read counts as none.
+  // Why a schedule keeps a workload from its idle nap now, else null (lib/check-schedules.mjs). A schedule it cannot read counts as
+  // none, logged.
   function scheduleKeeps(workloadId, ctx, t) {
-    const schedule = ctx?.schedules?.get(workloadId);
-    if (!schedule) return null;
-    if (ctx.applied?.get(workloadId) === 'nap') return {};
     try {
-      if (occurrenceAt(schedule, t, joinOf(schedule, ctx.joins))?.kind === 'awake') return { kept: 'awake window' };
-      if (awakeStartWithin(schedule, t, CLOSE_START_MS)) return { kept: 'awake window within 30 minutes' };
+      return keptBySchedule(workloadId, ctx, t);
     } catch (err) {
       log.warn('ScheduleSkipped', { workloadId, error: err.message });
+      return null;
     }
-    return null;
   }
 
   // --- Manager interface: list, status, force-wake ------------------------------------------------------------------
@@ -1135,7 +1051,7 @@ export function createController({
       const levels = await readLevels();
       const joins = listed.schedules.size ? { router: levels.routerLevel?.joinMinutes ?? null, manager: levels.organization?.joinMinutes ?? null } : {};
       const endedDays = listed.schedules.size ? await endedDaysOf() : null;
-      const { applied, readable } = await applySchedules(configs, listed.schedules, (id) => ({ paused: paused(id), keepAsleep: keptAsleep(id) }), now(), joins, endedDays);
+      const { applied, readable } = await applySchedules(configs, listed.schedules, { paused, keptAsleep }, now(), { joins, endedDays, nap: scheduledNap });
       // Then the hibernation's 60-day limit, for every workload, held alike.
       const limited = await wakeLongHibernated(configs, applied, keptAsleep, now());
       await pingProxies(configs);

@@ -61,7 +61,8 @@ import { healthOf } from '../../lambda/src/lib/health.mjs';
 import { resolveHibernation } from '../../lambda/src/lib/hibernation.mjs';
 import { createListCache, describeStoredLists } from '../../lambda/src/lib/list-cache.mjs';
 import { createPauses, pauseHolds, shownPause } from '../../lambda/src/lib/pauses.mjs';
-import { awakeStartWithin, CLOSE_START_MS, ENDED_DAYS_DEFAULT, maintenanceDue, occurrenceAt, resolveJoin, withoutEnded } from '../../lambda/src/lib/schedule.mjs';
+import { createScheduleCheck, scheduleKeeps } from '../../lambda/src/lib/check-schedules.mjs';
+import { ENDED_DAYS_DEFAULT } from '../../lambda/src/lib/schedule.mjs';
 import { DAY_MS, STATES, utcDay } from '../../lambda/src/lib/state.mjs';
 import { createListRefresher } from '../../lambda/src/lib/list-refresh.mjs';
 import { routerSettingsView } from '../../lambda/src/lib/settings-writes.mjs';
@@ -1215,103 +1216,55 @@ export function createController({
 
   // --- Schedules, applied by the check -----------------------------------------------------------------------------------
 
-  const recordOccurrence = async (workloadId, occurrence, action, state) => {
-    if (await transition(workloadId, { cond: { state }, set: { scheduleApplied: occurrence.id } })) {
-      log.info('ScheduleApplied', { workloadId, occurrence: occurrence.id, kind: occurrence.kind, action });
-    }
-  };
+  // Before the check's loop, every scheduled workload whatever the loop's budget, as AWS's (lambda/src/lib/check-schedules.mjs): 8 at a
+  // time, nothing called but the tasks it enqueues. An awake window's wake in a request of its own, the occurrence recorded once its
+  // task is accepted: refused, the run is FAILED and the next check wakes it. Neither wake has a `by`.
+  const { applySchedules, record: recordOccurrence } = createScheduleCheck({
+    store,
+    wake: (workloadId, run, kind) => startWake(workloadId, run, kind),
+    pendingWake: (workloadId, kind) => pendingWake(workloadId, kind),
+    concurrency: CHECK_CONCURRENCY, log,
+  });
 
-  // The nap windows' naps a check asks for, oldest occurrence first and at most SCHEDULED_NAPS_MAX accepted, within the naps in
-  // flight (`flight`, NAPS_MAX): the next check takes the rest, and those a Cloud Tasks too slow left past the check's budget. Each
-  // occurrence is recorded only once its task is accepted, whatever the state by then: the task may have started. A record lost
-  // asks again at the next check, and the task it adds finds the nap under way. A pause written after that refuses the task, and
-  // the occurrence stays consumed: once the pause is gone only an idle nap comes, not the window's.
-  async function askScheduledNaps(naps, applied, t, deadline, flight) {
-    const deferred = [];
-    const failed = (workloadId) => (err) => log.error('ScheduleFailed', { workloadId, error: err.message });
-    let accepted = 0;
-    naps.sort((a, b) => a.occurrence.start - b.occurrence.start || a.workloadId.localeCompare(b.workloadId));
-    for (const { workloadId, occurrence } of naps) {
-      if (accepted === SCHEDULED_NAPS_MAX || flight.naps >= NAPS_MAX || now() >= deadline) {
-        deferred.push(workloadId);
-        applied.set(workloadId, 'nap deferred');
-        continue;
-      }
-      try {
-        await enqueue({ action: 'nap', workloadId, cause: 'schedule', requestedAt: t, until: occurrence.end });
-      } catch (err) {
-        failed(workloadId)(err);
-        applied.set(workloadId, 'nap refused');
-        continue;
-      }
-      accepted += 1;
-      flight.naps += 1;
-      applied.set(workloadId, 'nap');
-      log.info('NapRequested', { workloadId, cause: 'schedule' });
-      await recordOccurrence(workloadId, occurrence, 'nap', ANY_STATE).catch(failed(workloadId));
-    }
-    if (deferred.length) log.info('ScheduledNapsDeferred', { workloads: deferred });
-  }
-
-  // How far a schedule's windows join (AWS's joinOf): its own joinMinutes, else the levels' above it, `joins` (`{ router, manager }`, the
-  // levels' values or null), else the default.
-  const joinOf = (schedule, joins) => ({ joinMinutes: resolveJoin({ workload: schedule?.joinMinutes, ...joins }).joinMinutes });
-
-  // Before the check's loop, every scheduled workload whatever the loop's budget: 8 at a time, one run read each, nothing
-  // called but the tasks it enqueues. holdOf(workloadId): { paused, keepAsleep }. `flight`: the naps in flight, which its naps
-  // add to. `joins`: the levels' joinMinutes. Answers each workload's outcome (what it did, or what held it) and the schedules the
-  // router can read: one it cannot (a time zone Intl refuses) is logged and the workload behaves as if it had none.
-  async function applySchedules(configs, schedules, holdOf, t, deadline, flight, joins, endedDays = null) {
-    const due = [];
-    const readable = new Map();
-    for (const { workloadId } of configs) {
-      const schedule = schedules.get(workloadId);
-      if (!schedule) continue;
-      try {
-        const occurrence = occurrenceAt(schedule, t, joinOf(schedule, joins));
-        // A nap window's occurrence is skipped when an awake window starts within 30 minutes of its start, or of now (an
-        // occurrence first applied late).
-        const closeStart = occurrence?.kind === 'nap'
-          && (awakeStartWithin(schedule, occurrence.start, CLOSE_START_MS) || awakeStartWithin(schedule, t, CLOSE_START_MS));
-        readable.set(workloadId, schedule);
-        due.push({ workloadId, schedule, occurrence, closeStart });
-      } catch (err) {
-        log.warn('ScheduleSkipped', { workloadId, error: err.message });
-      }
-    }
-    const applied = new Map();
+  // The nap windows' naps a check asks for, after every workload's, oldest occurrence first and at most SCHEDULED_NAPS_MAX accepted,
+  // within the naps in flight (`flight`, NAPS_MAX): the next check takes the rest, and those a Cloud Tasks too slow left past the
+  // check's budget. Each occurrence is recorded only once its task is accepted, whatever the state by then: the task may have started.
+  // A record lost asks again at the next check, and the task it adds finds the nap under way. A pause written after that refuses the
+  // task, and the occurrence stays consumed: once the pause is gone only an idle nap comes, not the window's.
+  function scheduledNaps(deadline, flight) {
     const naps = [];
-    let i = 0;
-    await Promise.all(Array.from({ length: Math.min(CHECK_CONCURRENCY, due.length) }, async () => {
-      while (i < due.length) {
-        const item = due[i++];
-        try {
-          const outcome = await applySchedule(item, holdOf(item.workloadId), t, naps);
-          if (outcome) applied.set(item.workloadId, outcome);
-        } catch (err) {
-          log.error('ScheduleFailed', { workloadId: item.workloadId, error: err.message });
+    return {
+      ask({ workloadId, occurrence }) {
+        naps.push({ workloadId, occurrence });
+        return false;
+      },
+      async end(applied, t) {
+        const deferred = [];
+        const failed = (workloadId) => (err) => log.error('ScheduleFailed', { workloadId, error: err.message });
+        let accepted = 0;
+        naps.sort((a, b) => a.occurrence.start - b.occurrence.start || a.workloadId.localeCompare(b.workloadId));
+        for (const { workloadId, occurrence } of naps) {
+          if (accepted === SCHEDULED_NAPS_MAX || flight.naps >= NAPS_MAX || now() >= deadline) {
+            deferred.push(workloadId);
+            applied.set(workloadId, 'nap deferred');
+            continue;
+          }
+          try {
+            await enqueue({ action: 'nap', workloadId, cause: 'schedule', requestedAt: t, until: occurrence.end });
+          } catch (err) {
+            failed(workloadId)(err);
+            applied.set(workloadId, 'nap refused');
+            continue;
+          }
+          accepted += 1;
+          flight.naps += 1;
+          applied.set(workloadId, 'nap');
+          log.info('NapRequested', { workloadId, cause: 'schedule' });
+          await recordOccurrence(workloadId, occurrence, 'nap', ANY_STATE).catch(failed(workloadId));
         }
-      }
-    }));
-    await askScheduledNaps(naps, applied, t, deadline, flight);
-    if (endedDays) await removeEnded(due, t, endedDays);
-    return { applied, readable };
-  }
-
-  // Windows that ended more than `days` days ago leave their schedule, and so do the dates without a window as old; a schedule left
-  // with nothing is removed (AWS's rule, schedule.mjs's withoutEnded). Only between occurrences: an occurrence's id holds its window's
-  // index, which a removal shifts. Written only over the schedule as read, so a save since is kept.
-  async function removeEnded(due, t, days) {
-    for (const { workloadId, schedule, occurrence } of due) {
-      if (occurrence) continue;
-      const ended = withoutEnded(schedule, t, days);
-      if (!ended) continue;
-      try {
-        if (await store.replaceSchedule(workloadId, schedule, ended.schedule)) log.info('EndedWindowsRemoved', { workloadId, windows: ended.windows, dates: ended.dates, days });
-      } catch (err) {
-        log.warn('EndedWindowsKept', { workloadId, error: err.message });
-      }
-    }
+        if (deferred.length) log.info('ScheduledNapsDeferred', { workloads: deferred });
+      },
+    };
   }
 
   // The days before an ended window leaves its schedule: the organization's endedWindowDays (0 keeps them), a year when it sets none.
@@ -1320,54 +1273,6 @@ export function createController({
     if (unreadable || (managerState?.error && !managerState.level)) return null;
     return managerState?.level?.endedWindowDays ?? ENDED_DAYS_DEFAULT;
   };
-
-  // The occurrence active now, applied once: the run records the last applied one, so a late check, a deploy inside a window
-  // or two checks in it apply it once. Then the maintenance wake of a workload asleep longer than maxNapDays. A pause holds
-  // the window's nap and a keepAsleep pause the wakes: held, the occurrence stays unapplied and applies once the pause is
-  // gone. A nap goes in `naps`, each nap a task, which holds nothing here. Every other write is conditional on the run read:
-  // one that changed since (a request's wake) is left for the next check. Answers what it did or what held it, else null.
-  async function applySchedule({ workloadId, schedule, occurrence, closeStart }, hold, t, naps) {
-    if (!occurrence && !schedule.maxNapDays) return null;
-    const run = await store.getRun(workloadId);
-    if (!run) return null;
-    const pending = occurrence && run.scheduleApplied !== occurrence.id ? occurrence : null;
-    const asleep = run.state === STATES.ASLEEP || run.state === STATES.FAILED;
-    if (pending?.kind === 'awake' && (asleep || run.state === STATES.NAPPING)) {
-      if (hold.keepAsleep) return 'held by a keepAsleep pause';
-      // A napping workload gets its pending wake; the occurrence is recorded once the nap settled (a write now would delay
-      // the detection of a stuck nap, which reads updatedAt).
-      if (run.state === STATES.NAPPING) return (await pendingWake(workloadId, 'schedule')) ? 'pending wake' : null;
-      // Recorded once its task is accepted: refused, the run is FAILED and the next check wakes it.
-      if (!(await startWake(workloadId, run, 'schedule'))) return null;
-      await recordOccurrence(workloadId, pending, 'wake', ANY_STATE);
-      return 'wake';
-    }
-    if (pending?.kind === 'nap' && run.state === STATES.AWAKE && !closeStart) {
-      if (hold.paused) return 'held by a pause';
-      naps.push({ workloadId, occurrence: pending });
-      return null;
-    }
-    // Napping or waking at a nap window: left for the next check, which naps it once awake.
-    if (pending?.kind === 'nap' && (run.state === STATES.NAPPING || run.state === STATES.WAKING)) return null;
-    // Nothing to do (the workload is already as the window wants it, or the nap window comes just before an awake one).
-    if (pending) await recordOccurrence(workloadId, pending, closeStart ? 'skipped: an awake window starts within 30 minutes' : 'none', run.state);
-    const due = run.state === STATES.ASLEEP ? maintenanceDue(schedule, run.stateAt) : null;
-    if (due === null || due > t) return null;
-    if (hold.keepAsleep) return 'held by a keepAsleep pause';
-    return (await startWake(workloadId, run, 'maintenance')) ? 'maintenance' : null;
-  }
-
-  // Why a schedule keeps a workload from its idle nap now, else null: the nap the schedules just decided (asked, put off or
-  // refused, not asked twice and not ahead of the spread), an awake window active or starting within 30 minutes. The
-  // schedules here are those the router can read.
-  function scheduleKeeps(workloadId, ctx, t) {
-    const schedule = ctx.schedules.get(workloadId);
-    if (!schedule) return null;
-    if (ctx.applied.get(workloadId)?.startsWith('nap')) return {};
-    if (occurrenceAt(schedule, t, joinOf(schedule, ctx.joins))?.kind === 'awake') return { kept: 'awake window' };
-    if (awakeStartWithin(schedule, t, CLOSE_START_MS)) return { kept: 'awake window within 30 minutes' };
-    return null;
-  }
 
   // --- Pauses: a paused workload is never napped -------------------------------------------------------------------------
 
@@ -1589,7 +1494,7 @@ export function createController({
     const flight = { naps: order.length > NAPS_MAX ? await napsInFlight(order) : 0, deferred: 0 };
     // The router level's joinMinutes, read with the levels: one never read is unset, as AWS's join levels count a level they cannot read.
     const joins = { router: levels.router?.joinMinutes ?? null, manager: levels.organization?.joinMinutes ?? null };
-    const { applied, readable } = await applySchedules(order, schedules, (id) => ({ paused: paused(id), keepAsleep: keptAsleep(id) }), now(), deadline, flight, joins, schedules.size ? endedDaysOf(levels) : null);
+    const { applied, readable } = await applySchedules(order, schedules, { paused, keptAsleep }, now(), { joins, endedDays: schedules.size ? endedDaysOf(levels) : null, nap: scheduledNaps(deadline, flight) });
     await requestListRefresh();
     const ctx = { schedules: readable, applied, flight, levels, joins };
     const passed = (workloadId) => (applied.has(workloadId) ? { schedule: applied.get(workloadId) } : {});

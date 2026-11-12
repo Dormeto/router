@@ -110,3 +110,12 @@ export function healthOf({ checkSchedule, lastScheduledCheckAt, now, lambda = {}
   const status = problems.some((p) => p.level === 'error') ? 'error' : problems.length ? 'warning' : 'ok';
   return { status, problems };
 }
+
+// A warning a router says after healthOf's (AWS's drift repairs): one more problem, and an ok status a warning.
+export function addWarning(health, code, text) {
+  health.problems.push({ level: 'warning', code, text });
+  if (health.status === 'ok') health.status = 'warning';
+}
+
+// The pauses a router's answer could not read, both routers' warning.
+export const pausesUnreadable = (health, error) => addWarning(health, 'pauses-unreadable', `pauses unreadable: ${error}`);

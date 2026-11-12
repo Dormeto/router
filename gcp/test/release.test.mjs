@@ -660,7 +660,9 @@ test('the manager page\'s numbers are the code\'s: the journal\'s 7 days, 1 to 5
 
 test('the manager page says what a pause and a request-nap do, from the code, and the Compute Engine page says the exclusions pause beside the operator', () => {
   const page = flat(read(MANAGER));
-  assert.match(ACTIONS_SRC, /return \{ requested: false, reason: pauseText\(first\) \};/);
+  // request-nap is both routers' (lambda/src/lib/manager-actions.mjs).
+  assert.match(ACTIONS_SRC, /'request-nap': \(payload\) => manager\.requestNap\(payload\),/);
+  assert.match(read('lambda/src/lib/manager-actions.mjs'), /return \{ requested: false, reason: pauseText\(first\) \};/);
   assert.match(page, /is not a refusal: it answers \{ "requested": false, "reason" \} with the pause's words/);
   // controller-core.mjs's pause (lambda/src/lib/pauses.mjs): its wakes are the wakes of the cause pause, with who paused.
   assert.match(CORE_SRC, /wake: \(workloadId, \{ by \}\) => wakeNow\(workloadId, 'pause', by\)/);

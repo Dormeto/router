@@ -265,3 +265,11 @@ export async function cacheFavicon(workloadId, { store, levels, host, fetch, now
     timers.forEach(clearTimeout);
   }
 }
+
+// cacheFavicon's `levels` for a workload, both routers': the organization's page (`organization({ signal })`; null without one), the
+// router's and the workload's as the store holds them, the last two as the waker serves them (`served`: Google Cloud's custom pages
+// switch, pages.mjs), read at once.
+export const pageLevels = (store, workloadId, { organization = null, served = (page) => page } = {}) => async ({ signal } = {}) => {
+  const [own, router, workload] = await Promise.all([organization ? organization({ signal }) : null, store.getWaitingPage('router'), store.getWaitingPage({ workloadId })]);
+  return [own, served(router?.page), served(workload?.page)];
+};

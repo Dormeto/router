@@ -18,7 +18,7 @@
 // level (§5.5).
 import { k8sId } from '../../lambda/src/lib/kubernetes.mjs';
 import { describeStoredLists } from '../../lambda/src/lib/list-cache.mjs';
-import { pauseText } from '../../lambda/src/lib/pauses.mjs';
+import { listRouter, readPauses, rowPauses } from '../../lambda/src/lib/manager-actions.mjs';
 import { maintenanceDue } from '../../lambda/src/lib/schedule.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { STATS_DAYS } from '../../lambda/src/lib/summary.mjs';
@@ -37,7 +37,6 @@ const UNKNOWN_ACTION = 'unknown-action';
 const EVENTS_MAX = 500;
 const EVENT_ID = /^\d{13}-[a-z0-9-]+-[A-Z]+$/;
 const ETAG_MAX = 256;
-const WAKEABLE = [STATES.ASLEEP, STATES.FAILED, STATES.NAPPING];
 const TARGET_GROUP_REFUSED = 'a Google Cloud router has no targetGroupArn: name the backendService';
 const EXCLUSION_ID_MAX = 64;
 // The manager's are UUIDs; part of a document id, so no character a URL or a path changes.
@@ -70,11 +69,11 @@ function backendOf(backend) {
 // no instance read.
 const hibernationOf = (hibernation, manager) => ({ ...hibernation, manager, instances: null, freshBoot: false });
 
-// AWS's schedule view (controller-core.mjs's scheduleView) from the REST one: `next` for its next events, and the maximum nap's wake
-// while asleep. No hibernation limit wakes a workload here: Compute Engine itself stops a VM suspended for 60 days.
-function scheduleAnswer({ schedule, nextEvents, joinMinutes, joinFrom, joinInherited }, run) {
-  const due = schedule && run?.state === STATES.ASLEEP ? maintenanceDue(schedule, run.stateAt) : null;
-  return { schedule, next: nextEvents, maintenanceDue: due === null ? null : iso(due), joinMinutes, joinFrom, joinInherited };
+// A schedule's view (manager-actions.mjs's) with AWS's maintenance wake: the maximum nap's while asleep. No hibernation limit wakes a
+// workload here: Compute Engine itself stops a VM suspended for 60 days.
+function withMaintenance(view, run) {
+  const due = view.schedule && run?.state === STATES.ASLEEP ? maintenanceDue(view.schedule, run.stateAt) : null;
+  return { ...view, maintenanceDue: due === null ? null : iso(due) };
 }
 
 // router/check with its times as the manager reads every router's, ISO.
@@ -104,19 +103,11 @@ const previewOf = ({ request, answer }) => ({
   problems: answer.reasons,
 });
 
-// AWS answers a refused body's problems as `{ problems }`, an answer and not a refusal.
-async function problemsAnswered(write) {
-  try {
-    return await write();
-  } catch (err) {
-    if (err instanceof Refusal && err.problems) return { problems: err.problems };
-    throw err;
-  }
-}
-
 // `controller`: controller-core.mjs's; `onboarding`: onboarding.mjs's; `router`: `{ name, version, build, project, region }`; `lists`:
 // the router's IP lists (DMT_IP_LISTS). `act(payload)` answers `{ status, body }`.
 export function createActions({ controller, onboarding, store, router, lists = [], now = Date.now, log }) {
+  // The actions both routers share (lambda/src/lib/manager-actions.mjs), on this router's ports (onboarding.mjs's).
+  const manager = onboarding?.manager;
   // The organization's level (router/manager): what the levels read, and the manager's as AWS's hibernation shows it, null while the
   // manager has pushed none. One that cannot be read counts as unset and is said, as the REST routes count it.
   async function organization() {
@@ -144,32 +135,21 @@ export function createActions({ controller, onboarding, store, router, lists = [
   // AWS's list: the router, then a row per workload (rows.mjs), by id. The pauses are read once, as AWS's, and shown as the
   // controller's (lambda/src/lib/pauses.mjs): unreadable, it is said in `pausesError` and none is shown.
   async function list() {
-    let pausesError;
-    const [{ configs, schedules }, above, checked, pauses] = await Promise.all([
+    const [{ configs, schedules }, above, checked, { pauses, pausesError }] = await Promise.all([
       store.listWorkloads(),
       levels(),
       store.getCheck().catch(() => null),
-      store.listPauses().catch((err) => {
-        pausesError = err.message;
-        log.warn('PausesUnreadable', { error: err.message });
-        return [];
-      }),
+      readPauses({ store, log }),
     ]);
     const workloads = await Promise.all(configs.map(async (cfg) => {
       const [run, stats] = await Promise.all([store.getRun(cfg.workloadId), store.getStats(cfg.workloadId, STATS_DAYS).catch(() => null)]);
-      const shown = controller.shownPauses(pauses.filter((p) => p.workloadId === cfg.workloadId || p.workloadId === null));
-      return rowFor(cfg, { run, stats, pauses: shown, scheduled: schedules.has(cfg.workloadId), above });
+      return rowFor(cfg, { run, stats, pauses: controller.shownPauses(rowPauses(pauses, cfg.workloadId)), scheduled: schedules.has(cfg.workloadId), above });
     }));
     return {
-      router: {
-        name: router.name,
-        version: router.version ?? null,
-        build: router.build ?? null,
-        checkSchedule: CHECK_SCHEDULE,
-        lastScheduledCheckAt: isoOrNull(checked?.lastScheduledCheckAt),
-        pauses: controller.shownPauses(pauses.filter((p) => p.workloadId === null)),
-        ...(pausesError ? { pausesError } : {}),
-      },
+      router: listRouter({
+        name: router.name, version: router.version ?? null, build: router.build ?? null, checkSchedule: CHECK_SCHEDULE,
+        lastScheduledCheckAt: isoOrNull(checked?.lastScheduledCheckAt), pauses: controller.shownPauses(pauses.filter((p) => p.workloadId === null)), pausesError,
+      }),
       workloads: workloads.sort((a, b) => a.workloadId.localeCompare(b.workloadId)),
     };
   }
@@ -187,7 +167,7 @@ export function createActions({ controller, onboarding, store, router, lists = [
       levels(),
       store.getStats(id, STATS_DAYS).catch((err) => ({ error: err.message })),
       controller.pausesFor(id),
-      onboarding.showSchedule(id),
+      onboarding.workloadSchedule(id),
       lists.length ? describeStoredLists(store, lists).catch((err) => [{ error: err.message }]) : [],
     ]);
     const row = rowFor(cfg, { run, stats: stats.error ? null : stats, pauses, scheduled: Boolean(view.schedule), above });
@@ -218,30 +198,8 @@ export function createActions({ controller, onboarding, store, router, lists = [
       wakeMode: shown.settings.wakeMode,
       wakeRules: shown.wakeRules,
       noWakeRules: shown.noWakeRules,
-      ...scheduleAnswer(view, run),
+      ...withMaintenance(view, run),
     };
-  }
-
-  // AWS's request-nap: refused at once with the reason when not awake or paused, else the nap's task, the manager's.
-  async function requestNap({ workloadId, by }) {
-    await onboarding.find(workloadId);
-    const run = await store.getRun(workloadId);
-    if (run?.state !== STATES.AWAKE) return { requested: false, reason: `not awake (${run?.state ?? 'UNKNOWN'})` };
-    const [first] = await controller.pausesFor(workloadId);
-    if (first) return { requested: false, reason: pauseText(first) };
-    await controller.napNow(workloadId, { cause: 'manager', by });
-    log.info('NapRequested', { workloadId, trigger: { kind: 'manager', by } });
-    return { requested: true };
-  }
-
-  // AWS's force-wake: an asleep or failed workload's wake, a napping one's pending wake, else its state as it is.
-  async function forceWake({ workloadId, by }) {
-    await onboarding.find(workloadId);
-    const run = await store.getRun(workloadId);
-    if (WAKEABLE.includes(run?.state)) await controller.wakeNow(workloadId, 'manager', by);
-    if (run?.state === STATES.NAPPING) return { state: STATES.NAPPING, pendingWake: true };
-    if (WAKEABLE.includes(run?.state)) return { state: (await store.getRun(workloadId))?.state };
-    return { state: run?.state };
   }
 
   // The manager's exclusions are AWS's workload pauses with an exclusionId, several per workload beside the operator's. The id is a part
@@ -310,30 +268,29 @@ export function createActions({ controller, onboarding, store, router, lists = [
     return controller.resume(workloadId, by ?? 'unknown', { exclusionId });
   }
 
-  // AWS's settings action: without a workload the router's level, with one the workload's, its hibernation in AWS's shape.
+  // AWS's settings action (manager-actions.mjs's): without a workload the router's level, with one the workload's, its hibernation in
+  // AWS's shape. A `by` inside the settings is not one of them: the REST routes read `by` beside them.
   async function setSettings({ workloadId, settings, by }) {
     if (!isObject(settings)) return { problems: ['settings must be an object'] };
-    return problemsAnswered(async () => {
-      if (!workloadId) return onboarding.setRouterSettings({ ...settings, by });
-      const answer = await onboarding.setSettings(workloadId, { ...settings, by });
-      return { ...answer, hibernation: hibernationOf(answer.hibernation, (await organization()).manager) };
-    });
+    const { by: _, ...sent } = settings;
+    if (!workloadId) return manager.setRouterSettings({ settings: sent, by });
+    const answer = await manager.setWorkloadSettings({ workloadId, settings: sent, by });
+    return answer.problems ? answer : { ...answer, hibernation: hibernationOf(answer.hibernation, (await organization()).manager) };
   }
 
   // AWS's waiting-page action, its checks first. A custom page the install's switch keeps off is a conflict (§5.5: the manager
   // answers 409 with these words); the page's other problems, AWS's answer.
-  async function waitingPage({ op, workloadId = null, page, by }) {
-    if (workloadId !== null && (typeof workloadId !== 'string' || !workloadId)) throw invalid('workloadId must be the id of a workload');
-    const answer = await problemsAnswered(() => onboarding.waitingPage(workloadId === null ? 'router' : { workloadId }, { op, page, by }));
+  async function waitingPage(payload) {
+    const answer = await manager.waitingPage(payload);
     if (answer.problems?.includes(CUSTOM_PAGES_REFUSED)) throw new Refusal(409, 'custom-pages-off', CUSTOM_PAGES_REFUSED);
     return answer;
   }
 
   // AWS's schedule action: the schedule stored with who set it, and AWS's view of it.
-  async function setSchedule({ workloadId, schedule, by }) {
-    const view = await problemsAnswered(() => onboarding.setSchedule(workloadId, isObject(schedule) ? { ...schedule, by } : schedule));
+  async function setSchedule(payload) {
+    const view = await manager.setSchedule(payload);
     if (view.problems) return view;
-    return scheduleAnswer(view, await store.getRun(workloadId));
+    return withMaintenance(view, await store.getRun(payload.workloadId));
   }
 
   // AWS's offboard (:793): its steps, with the REST answer's fields (the VMs left on a fallback type, and a forced one's backends left).
@@ -375,16 +332,16 @@ export function createActions({ controller, onboarding, store, router, lists = [
     router: () => controller.routerInfo(),
     list,
     status,
-    'request-nap': requestNap,
-    'force-wake': forceWake,
+    'request-nap': (payload) => manager.requestNap(payload),
+    'force-wake': (payload) => manager.forceWake(payload),
     pause,
     resume,
-    rename: ({ workloadId, name, by }) => onboarding.setName(workloadId, name, by),
-    tag: ({ workloadId, tags, by }) => onboarding.setTags(workloadId, tags, by),
+    rename: (payload) => manager.rename(payload),
+    tag: (payload) => manager.tag(payload),
     settings: setSettings,
     'waiting-page': waitingPage,
     schedule: setSchedule,
-    'clear-schedule': ({ workloadId, by }) => onboarding.deleteSchedule(workloadId, { by }),
+    'clear-schedule': (payload) => manager.clearSchedule(payload),
     preview: async (payload) => previewOf(await onboarding.dryRunOf(onboardingOf(payload))),
     // AWS's onboard (:552): its steps, and the workload with the REST Workload's fields; the waker backend service for its target group.
     onboard: async (payload) => {

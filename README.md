@@ -253,7 +253,9 @@ controller's `schedule` action validates and writes it (`{problems}` and nothing
 schedule, `next` and `maintenanceDue`), `clear-schedule` removes it, and `status` answers `schedule` (null without),
 `next` (the next 5 events within 8 days, or 400 when a window has a `repeat` or a `from`: `awake-start`, `awake-end`,
 `nap-start`, `nap-end`, with their window) and
-`maintenanceDue` (ISO, when `maxNapDays` applies and the workload is asleep). The summary carries `scheduled: true`.
+`maintenanceDue` (ISO, when `maxNapDays` applies and the workload is asleep). The summary carries `scheduled: true`. A
+schedule the router cannot read (a time zone the runtime refuses) is answered as stored, with no `next` event, and logged
+`ScheduleSkipped`; the check leaves it out, so its `maxNapDays` is not due either. Not released yet: router 0.40.0.
 
 ```json
 {
@@ -562,7 +564,7 @@ Design: `docs/specs/2026-10-03-mvp-alb-ec2-design.md` in the Dormeto/vision repo
 |---|---|
 | `docs/scenarios` | The supported scenarios: diagrams, services, wake times, behavior, limits |
 | `lambda/src` | Lambda code (Node.js 24, no bundled dependency): the entry points and the AWS clients (`aws/`) |
-| `lambda/src/lib` | Both routers' library: the AWS router's logic, and what the Google Cloud router imports from it (schedules, settings levels, pauses, waiting page, waker, rows, events, failures). No cloud SDK: each cloud passes its own store and calls. The Lambda zip and the Cloud Run image both hold it |
+| `lambda/src/lib` | Both routers' library: the AWS router's logic, and what the Google Cloud router imports from it (schedules, settings levels, pauses, the check's loop, the manager's actions, waiting page, waker, rows, events, failures). No cloud SDK: each cloud passes its own store and calls. The Lambda zip and the Cloud Run image both hold it |
 | `lambda/test` | Unit tests (`node --test`) |
 | `gcp/src`, `gcp/test` | The Google Cloud router's two Cloud Run roles (waker, controller) on that library, and their unit tests |
 | `terraform/modules/router` | DynamoDB table, Lambdas, IAM, idle check schedule |

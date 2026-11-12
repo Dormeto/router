@@ -64,3 +64,11 @@ test('the AWS wake paragraphs say once where Google Cloud\'s probe goes and what
   assert.equal(readme.match(/\/_dormeto\/wake/g)?.length, 1);
   assert.match(readme, /On Google Cloud the waiter page's probe goes to \/_dormeto\/wake with the visitor's path in x-dormeto-path\. A workload that sleeps or wakes answers a 202 there, not a 503: see \[the Compute Engine page\]\(docs\/scenarios\/google-cloud-compute-engine\.md#the-waiting-page\)/);
 });
+
+// B3 of the cloud duplication design: an unreadable schedule is answered as stored, with no next event, on both routers.
+test('the README says a schedule the router cannot read is answered as stored with no next event, and its maximum nap not due', () => {
+  assert.match(flat(read('README.md')), /A schedule the router cannot read \(a time zone the runtime refuses\) is answered as stored, with no next event, and logged ScheduleSkipped; the check leaves it out, so its maxNapDays is not due either\. Not released yet: router 0\.40\.0\./);
+  // manager-actions.mjs's scheduleView, and AWS's maintenance wake of a schedule it reads only.
+  assert.match(read('lambda/src/lib/manager-actions.mjs'), /readable = false;\n {4}log\.warn\('ScheduleSkipped', \{ workloadId, error: err\.message \}\);/);
+  assert.match(read('lambda/src/lib/controller-core.mjs'), /readable && schedule && run\?\.state === STATES\.ASLEEP && run\.stateAt \? maintenanceDue\(schedule, run\.stateAt\) : null,/);
+});

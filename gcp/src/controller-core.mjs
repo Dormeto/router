@@ -53,11 +53,12 @@
 // absent without DMT_LOG_VIEW); otherwise, and when they cannot be read or are empty, Monitoring's request count. The run says what
 // the last check that read log entries, or counted any request, read (`idleReads`).
 import { randomUUID } from 'node:crypto';
+import { beginWake as beginAskedWake, pendingWake as setPendingWake } from '../../lambda/src/lib/asked-wake.mjs';
 import { retryCapacity } from '../../lambda/src/lib/capacity.mjs';
 import { stateChange } from '../../lambda/src/lib/events.mjs';
 import { classify, failedSpec, failureError } from '../../lambda/src/lib/failures.mjs';
-import { cacheFavicon, FAVICON_BUDGET_MS, hostOfRules } from '../../lambda/src/lib/favicon.mjs';
-import { healthOf } from '../../lambda/src/lib/health.mjs';
+import { cacheFavicon, FAVICON_BUDGET_MS, hostOfRules, pageLevels } from '../../lambda/src/lib/favicon.mjs';
+import { healthOf, pausesUnreadable } from '../../lambda/src/lib/health.mjs';
 import { resolveHibernation } from '../../lambda/src/lib/hibernation.mjs';
 import { createListCache, describeStoredLists } from '../../lambda/src/lib/list-cache.mjs';
 import { createPauses, pauseHolds, shownPause } from '../../lambda/src/lib/pauses.mjs';
@@ -65,9 +66,9 @@ import { createScheduleCheck, scheduleKeeps } from '../../lambda/src/lib/check-s
 import { runCheck } from '../../lambda/src/lib/check-run.mjs';
 import { ENDED_DAYS_DEFAULT } from '../../lambda/src/lib/schedule.mjs';
 import { DAY_MS, STATES, utcDay } from '../../lambda/src/lib/state.mjs';
-import { createListRefresher } from '../../lambda/src/lib/list-refresh.mjs';
+import { routerAnswer } from '../../lambda/src/lib/manager-actions.mjs';
+import { createListRefresher, requestListRefresh as askListRefresh } from '../../lambda/src/lib/list-refresh.mjs';
 import { createLevelsReader } from '../../lambda/src/lib/settings-levels.mjs';
-import { routerSettingsView } from '../../lambda/src/lib/settings-writes.mjs';
 import { createCount } from '../../lambda/src/lib/summary.mjs';
 import { withWake } from '../../lambda/src/lib/page-settings.mjs';
 import { createWakeWatch } from '../../lambda/src/lib/wake-watch.mjs';
@@ -831,32 +832,24 @@ export function createController({
     }
   }
 
-  // The run to WAKING for a wake asked here, not by a request (the waker's). Null when its state changed meanwhile. `by`: who asked
-  // (the manager's actions, a pause), in its event as AWS's.
-  async function beginWake(workloadId, from, cause, by) {
-    const wakeId = newId();
-    const waking = await transition(workloadId, {
-      cond: { state: from },
-      set: { state: STATES.WAKING, wakeId, wakeStartedAt: now() },
-      remove: ['failedAt'],
-      increment: ['wakeCount'],
-      cause,
-      ...(by ? { by } : {}),
-    });
-    if (!waking) return null;
-    log.info('WakeRequested', { workloadId, wakeId, reason: cause, ...(by ? { by } : {}) });
-    return wakeId;
+  // How this controller's WakeRequested and PendingWake lines name who asked: `reason` (the kind) and `by`, where AWS's lines and this
+  // router's waker's say `trigger: { kind, by }` (B6 of the cloud duplication design, held: gcp/test/actions.test.mjs reads these
+  // fields).
+  const saidHere = (kind, by) => ({ reason: kind, ...(by ? { by } : {}) });
+
+  // The run to WAKING for a wake asked here, not by a request (the waker's; asked-wake.mjs's beginWake). Null when its state changed
+  // meanwhile. `by`: who asked (the manager's actions, a pause), in its event as AWS's.
+  function beginWake(workloadId, from, cause, by) {
+    return beginAskedWake({ transition, newId, now, log, said: saidHere }, workloadId, from, { kind: cause, by });
   }
 
   // A daily counter: a failed update changes nothing else.
   const count = createCount({ store, log });
 
-  // A napping workload's wake is kept for the nap's end. True when this call kept it: one log line and one counted wake.
-  async function pendingWake(workloadId, kind, by) {
-    if (!(await store.setPendingWake(workloadId))) return false;
-    log.info('PendingWake', { workloadId, reason: kind, ...(by ? { by } : {}) });
-    await count(workloadId, `wake:${kind}`);
-    return true;
+  // A napping workload's wake is kept for the nap's end (asked-wake.mjs's). True when this call kept it: one log line and one counted
+  // wake.
+  function pendingWake(workloadId, kind, by) {
+    return setPendingWake({ store, count, log, said: saidHere }, workloadId, { kind, by });
   }
 
   // The wake of an asleep or failed workload from the run read, in a request of its own. True when its task was accepted;
@@ -1034,10 +1027,7 @@ export function createController({
     const served = servedPage(customPages);
     return cacheFavicon(workloadId, {
       store, fetch, now, budgetMs: faviconBudgetMs, log,
-      levels: async () => {
-        const [router, workload] = await Promise.all([store.getWaitingPage('router'), store.getWaitingPage({ workloadId })]);
-        return [null, served(router?.page), served(workload?.page)];
-      },
+      levels: pageLevels(store, workloadId, { served }),
       host: async () => hostOfRules(listenerRulesOf(await sw.urlmaps.get(cfg.urlMap), cfg.backendService)),
     });
   }
@@ -1373,14 +1363,7 @@ export function createController({
 
   async function requestListRefresh() {
     if (!refresher) return;
-    try {
-      const names = await refresher.due();
-      if (!names.length) return;
-      await enqueue({ action: 'refreshLists', names });
-      log.info('ListRefreshRequested', { names });
-    } catch (err) {
-      log.error('ListRefreshCheckFailed', { error: err.message });
-    }
+    await askListRefresh({ due: () => refresher.due(), ask: (names) => enqueue({ action: 'refreshLists', names }), log });
   }
 
   async function checkOne(stored, deadline, paused, ctx) {
@@ -1550,10 +1533,7 @@ export function createController({
     const health = healthOf({
       checkSchedule: CHECK_SCHEDULE, lastScheduledCheckAt, now: t, failed: byState[STATES.FAILED] ?? 0, ipLists, managerSettingsError: manager.error,
     });
-    if (pausesError) {
-      health.problems.push({ level: 'warning', code: 'pauses-unreadable', text: `pauses unreadable: ${pausesError}` });
-      if (health.status === 'ok') health.status = 'warning';
-    }
+    if (pausesError) pausesUnreadable(health, pausesError);
     return { health, ipLists, manager };
   }
 
@@ -1590,38 +1570,22 @@ export function createController({
       return [];
     });
     const { health, ipLists, manager } = await healthSummary({ t, byState, lastScheduledCheckAt: checked?.lastScheduledCheckAt ?? null, pausesError, managerState: level.managerState });
-    return {
+    return routerAnswer({
       router: { name: `dmtr-${config.region}`, version: config.version ?? null, build: config.build ?? null },
-      settings: routerSettingsView(level.router),
-      managerSettings: {
-        url: null, hibernate: manager.hibernate ?? null, joinMinutes: manager.joinMinutes ?? null,
-        ...(manager.defaults ? { defaults: manager.defaults } : {}), ...(manager.types ? { types: manager.types } : {}),
-        readAt: manager.readAt ? iso(manager.readAt) : null, error: manager.error ?? null,
-      },
+      settings: level.router, manager,
       configuration: {
         checkSchedule: { value: CHECK_SCHEDULE, source: CLI },
         ipLists: { value: lists.map(({ name, url, action, refreshHours }) => ({ name, url, action, refreshHours })), source: CLI },
         noWakeRules: { value: [], source: CLI },
         metrics: { value: null, source: CLI },
       },
-      pauses: pauses.filter((p) => p.workloadId === null).map(shownPause),
-      workloads: {
-        total: configs.length,
-        byState,
-        paused: pauses.some((p) => p.workloadId === null) ? configs.length : configs.filter((cfg) => pauses.some((p) => p.workloadId === cfg.workloadId)).length,
-        lastActivityAt: lastActivity ? iso(lastActivity) : null,
+      routerPauses: pauses.filter((p) => p.workloadId === null).map(shownPause), pauses, configs, byState, lastActivity,
+      health,
+      figures: {
+        checkSchedule: CHECK_SCHEDULE, lastScheduledCheckAt: checked?.lastScheduledCheckAt, lambda: {}, queues: {},
+        ipLists: ipLists.map((l) => ({ ...l, source: CLI, refreshHours: lists.find((c) => c.name === l.name)?.refreshHours })), concurrency: null, drift24h: 0,
       },
-      health: {
-        ...health,
-        checkSchedule: CHECK_SCHEDULE,
-        lastScheduledCheckAt: checked?.lastScheduledCheckAt ? iso(checked.lastScheduledCheckAt) : null,
-        lambda: {},
-        queues: {},
-        ipLists: ipLists.map((l) => ({ ...l, source: CLI, refreshHours: lists.find((c) => c.name === l.name)?.refreshHours })),
-        concurrency: null,
-        drift24h: 0,
-      },
-    };
+    });
   }
 
   // The counters older than 35 days, once a UTC day: the first check of the day sweeps, the others find the day claimed. An

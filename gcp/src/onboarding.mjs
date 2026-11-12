@@ -24,14 +24,13 @@
 //
 // The waiting page (section 5): AWS's `waiting-page` action, the router's level or a workload's, its answer AWS's (page-settings.mjs's
 // pageViewOf); custom pages need the install's switch (pages.mjs).
-import { createHash } from 'node:crypto';
 import { resolveHibernation, settingsProblems, workloadSettingsProblems } from '../../lambda/src/lib/hibernation.mjs';
 import { checkName } from '../../lambda/src/lib/names.mjs';
 import { joinLevels } from '../../lambda/src/lib/manager-settings.mjs';
-import { pageViewOf, validatePage } from '../../lambda/src/lib/page-settings.mjs';
-import { nextEvents, normalizeSchedule, resolveJoin, scheduleProblems } from '../../lambda/src/lib/schedule.mjs';
+import { createManagerActions, scheduleView } from '../../lambda/src/lib/manager-actions.mjs';
+import { pageViewOf } from '../../lambda/src/lib/page-settings.mjs';
 import { describedRules, SCALAR_KEYS } from '../../lambda/src/lib/settings-levels.mjs';
-import { mergedRouterSettings, resolvedSettings, routerSettingsView, withSettings, writtenRouterView } from '../../lambda/src/lib/settings-writes.mjs';
+import { resolvedSettings, routerSettingsView, withSettings } from '../../lambda/src/lib/settings-writes.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { fallbacksOf } from '../../lambda/src/lib/summary.mjs';
 import { tagsProblem } from '../../lambda/src/lib/tags.mjs';
@@ -961,28 +960,6 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     return workloadOf(cfg, pauses, run, read);
   }
 
-  // The name people see, for a workload onboarded here (AWS's rename answer). A write racing an offboarding puts nothing back.
-  async function setName(id, name, by) {
-    const cfg = await find(id);
-    const checked = checkName(name);
-    if (!checked.name) throw bad('name: required');
-    if (checked.problem) throw bad(checked.problem);
-    if (!(await store.putConfig(cfg.workloadId, { ...cfg, name: checked.name }, { mustExist: true }))) throw notFound(id);
-    log.info('Renamed', { workloadId: cfg.workloadId, name: checked.name, by });
-    return { workloadId: cfg.workloadId, name: checked.name };
-  }
-
-  // The workload's tags, replaced whole (AWS's tag answer). This instance's events carry them from now on; the others' at their next check.
-  async function setTags(id, tags, by) {
-    const cfg = await find(id);
-    const problem = tagsProblem(tags);
-    if (problem) throw bad(problem);
-    if (!(await store.putConfig(cfg.workloadId, { ...cfg, tags }, { mustExist: true }))) throw notFound(id);
-    core.noteTags(cfg.workloadId, tags);
-    log.info('Tagged', { workloadId: cfg.workloadId, tags, by });
-    return { workloadId: cfg.workloadId, tags };
-  }
-
   const show = async (id) => current(await find(id));
 
   async function list() {
@@ -1010,50 +987,37 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   const nap = (id) => move(id, { acts: [STATES.AWAKE], there: STATES.ASLEEP, act: napUnlessPaused });
   const wake = (id) => move(id, { acts: [STATES.ASLEEP, STATES.FAILED, STATES.NAPPING], there: STATES.AWAKE, act: (workloadId) => core.wakeNow(workloadId) });
 
-  // A schedule's answer. One the router cannot read (a time zone Intl refuses) is shown, with no next event. Its joinMinutes as AWS's
-  // answer resolves it: the schedule's own value, then the router level's (`router/settings`), then the organization's (`router/manager`), then the default
-  // (design, section 11); a router level that cannot be read counts as unset, said in `JoinLevelUnreadable`, as AWS's join levels.
-  async function scheduleView(id, schedule) {
-    const shown = schedule && { ...schedule, at: isoOf(schedule.at) };
-    const joins = await joinLevels({ router: () => store.getRouterSettings(), manager: async () => organizationOf((await store.getManagerSettings?.()) ?? null).level, log, fields: { workloadId: id } });
-    const { joinMinutes, from } = resolveJoin({ workload: schedule?.joinMinutes, ...joins });
-    const inherited = resolveJoin(joins);
-    const join = { joinMinutes, joinFrom: from, joinInherited: { joinMinutes: inherited.joinMinutes, joinFrom: inherited.from } };
-    try {
-      return { schedule: shown, nextEvents: nextEvents(schedule, now(), { joinMinutes }), ...join };
-    } catch (err) {
-      log.warn('ScheduleSkipped', { workloadId: id, error: err.message });
-      return { schedule: shown, nextEvents: [], ...join };
-    }
-  }
+  // A schedule's view (manager-actions.mjs's scheduleView): one the router cannot read (a time zone Intl refuses) is shown, with no next
+  // event. Its joinMinutes as AWS's answer resolves it: the schedule's own value, then the router level's (`router/settings`), then the
+  // organization's (`router/manager`), then the default (design, section 11); a level that cannot be read counts as unset, said in
+  // `JoinLevelUnreadable`, as AWS's join levels. No maintenance wake: the status and schedule actions add theirs (actions.mjs).
+  const scheduleOf = (id, schedule) => scheduleView({ now, log }, id, schedule, {
+    joins: () => joinLevels({ router: () => store.getRouterSettings(), manager: async () => organizationOf((await store.getManagerSettings?.()) ?? null).level, log, fields: { workloadId: id } }),
+  });
+  // The REST routes' answers of the shared actions (what CLI 0.11.0 reads): a schedule's next events as `nextEvents`; problems, a 400
+  // naming each, nothing written.
+  const restSchedule = ({ schedule, next, joinMinutes, joinFrom, joinInherited }) => ({ schedule, nextEvents: next, joinMinutes, joinFrom, joinInherited });
+  const answered = (answer) => {
+    if (answer.problems) throw refusedSettings(answer.problems);
+    return answer;
+  };
 
-  async function showSchedule(id) {
+  // A workload's schedule in AWS's view, as the status action shows it.
+  async function workloadSchedule(id) {
     await find(id);
-    return scheduleView(id, await store.getSchedule(id));
+    return scheduleOf(id, await store.getSchedule(id));
   }
+  const showSchedule = async (id) => restSchedule(await workloadSchedule(id));
 
-  // The body is the schedule, as on AWS; `by` says who sets it. A refusal names every problem, as AWS's schedule action answers them.
-  async function setSchedule(id, schedule) {
-    await find(id);
-    const problems = scheduleProblems(schedule, { now: now() });
-    if (problems.length) throw refusedSettings(problems);
-    const stored = { ...normalizeSchedule(schedule), by: schedule.by ?? 'unknown', at: now() };
-    await store.putSchedule(id, stored);
-    log.info('Scheduled', { workloadId: id, by: stored.by });
-    return scheduleView(id, stored);
-  }
+  // The body is the schedule, as on AWS; `by` says who sets it.
+  const setSchedule = async (id, schedule) => restSchedule(answered(await manager.setSchedule({ workloadId: id, schedule, by: schedule?.by })));
 
   // AWS's clear-schedule answer, `{ cleared }`: whether there was one. `by` says who clears it.
-  async function deleteSchedule(id, { by } = {}) {
-    await find(id);
-    const cleared = await store.deleteSchedule(id);
-    log.info('ScheduleCleared', { workloadId: id, cleared, ...(by ? { by } : {}) });
-    return { cleared };
-  }
+  const deleteSchedule = (id, { by } = {}) => manager.clearSchedule({ workloadId: id, by });
 
   async function clearSchedule(id) {
     await deleteSchedule(id);
-    return scheduleView(id, null);
+    return restSchedule(await scheduleOf(id, null));
   }
 
   // The Workload with its pause, and the workloads the pause woke, `woken`, as the pause action answers them.
@@ -1085,42 +1049,19 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     return core.resume(null, by ?? 'unknown');
   }
 
-  // AWS's settings action for a workload, its write shared (settings-writes.mjs): `hibernate` (null removes it), the settings of the
-  // levels (null gives the key back to the levels, its value without any level written for a router before G5), the rules (null: none)
-  // and the type (null: inherited). Every workload here is the CLI's: no Terraform writes one, so none is refused as on AWS. `by` says
-  // who sets them, as a schedule's. A refusal names every problem, with nothing written; a workload offboarded meanwhile is a 404,
-  // never written back.
-  async function setSettings(id, { by, ...settings }) {
-    const cfg = await find(id);
-    const problems = workloadProblems(settings, cfg);
-    if (problems.length) throw refusedSettings(problems);
-    // A configuration from before `inherits` is read as effectiveOf reads it (design section 4.1). Once it has `inherits`, it is the
-    // CLI's, as an onboarding writes it.
-    const next = withSettings(cfg, settings, { inheritsOf, builtIns: builtInsOf });
-    if (Object.hasOwn(next, 'inherits')) next.source ??= 'cli';
-    // The level the answer resolves with, read before the write: a failed read changes nothing.
-    const levels = await levelsOf();
-    if (!(await store.putConfig(id, next, { mustExist: true }))) throw notFound(id);
-    log.info('WorkloadSettings', { workloadId: id, keys: Object.keys(settings), hibernate: next.hibernate ?? null, previous: cfg.hibernate ?? null, by: by ?? 'unknown' });
-    return { level: 'workload', settings: { ...settings }, hibernation: hibernationOf(next, levels.router, levels.organization), resolved: resolvedSettings(effectiveOf(next, levels)) };
-  }
+  // AWS's settings action for a workload (manager-actions.mjs's): `hibernate` (null removes it), the settings of the levels (null gives
+  // the key back to the levels, its value without any level written for a router before G5), the rules (null: none) and the type (null:
+  // inherited). Every workload here is the CLI's or the manager's: no Terraform writes one, so none is refused as on AWS. `by` says who
+  // sets them, as a schedule's. A refusal names every problem, with nothing written; a workload offboarded meanwhile is a 404, never
+  // written back.
+  const setSettings = async (id, { by, ...settings }) => answered(await manager.setWorkloadSettings({ workloadId: id, settings, by }));
 
   const routerSettings = async () => ({ level: 'router', settings: routerSettingsView(await routerLevel()) });
 
-  // AWS's settings action without a workload, its merge shared (settings-writes.mjs): `hibernate`, `joinMinutes` and the `defaults` of
-  // the router's workloads, merged with what it holds; none left, no record. An empty body reads. `by` says who sets them, as a
-  // schedule's. A refusal names every problem, with nothing written.
-  async function setRouterSettings({ by, ...settings }) {
-    const problems = routerProblems(settings);
-    if (problems.length) throw refusedSettings(problems);
-    // A record that cannot be read is not written over.
-    const stored = await routerLevel();
-    if (!Object.keys(settings).length) return { level: 'router', settings: routerSettingsView(stored) };
-    const record = mergedRouterSettings(stored, settings, { by: by ?? 'unknown', at: now() });
-    await store.putRouterSettings(record);
-    log.info('RouterSettings', { hibernate: record.hibernate, joinMinutes: record.joinMinutes, defaults: record.defaults ? Object.keys(record.defaults) : [], by: record.by });
-    return { level: 'router', settings: writtenRouterView(record) };
-  }
+  // AWS's settings action without a workload (manager-actions.mjs's): `hibernate`, `joinMinutes` and the `defaults` of the router's
+  // workloads, merged with what it holds; none left, no record. An empty body reads. `by` says who sets them, as a schedule's. A refusal
+  // names every problem, with nothing written.
+  const setRouterSettings = async ({ by, ...settings }) => answered(await manager.setRouterSettings({ settings, by }));
 
   // The organization's page, the waitingPage of the manager's settings.json in router/manager (organizationOf's), as AWS's view reads
   // it (lambda/src/lib/controller-core.mjs's pageView): one that cannot be read is none, and said.
@@ -1140,39 +1081,46 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     return notServed(customPages, own?.page) ? { ...view, warnings: [CUSTOM_PAGE_NOT_SERVED, ...view.warnings] } : view;
   }
 
-  // AWS's waiting-page action: `level` is 'router' or { workloadId } (as the store's), `op` get, put or delete. A put refused names
-  // every problem, with nothing written; a custom one needs the switch. `by` says who sets it, as a schedule's. The log holds the size
-  // and the SHA-256 of a custom page, never the page.
-  async function waitingPage(level, { op, page, by } = {}) {
-    const workloadId = level === 'router' ? null : level.workloadId;
-    // As AWS's: who sets the page is asked before the workload is looked up.
-    if (op === 'put' && (typeof by !== 'string' || !by)) throw bad('a put needs by: who sets the page');
-    if (workloadId !== null) await find(workloadId);
-    const fields = { level: workloadId ? 'workload' : 'router', workloadId, by: by ?? 'unknown' };
-    switch (op) {
-      case 'get':
-        break;
-      case 'put': {
-        const problems = [...(page?.mode === 'custom' && !customPages ? [CUSTOM_PAGES_REFUSED] : []), ...validatePage(page)];
-        if (problems.length) throw refusedSettings(problems);
-        await store.putWaitingPage(level, page, { by: fields.by, at: now() });
-        const custom = page.mode === 'custom';
-        log.info('WaitingPageSet', {
-          ...fields, mode: page.mode, bytes: custom ? Buffer.byteLength(page.html) : undefined, sha256: custom ? createHash('sha256').update(page.html).digest('hex') : undefined,
-        });
-        break;
-      }
-      case 'delete':
-        log.info('WaitingPageCleared', { ...fields, cleared: await store.deleteWaitingPage(level) });
-        break;
-      default:
-        throw bad(`unknown waiting-page op: ${op}`);
-    }
-    return pageView(level);
-  }
+  // AWS's waiting-page action (manager-actions.mjs's): `level` is 'router' or { workloadId } (as the store's), `op` get, put or delete. A
+  // put refused names every problem, with nothing written; a custom one needs the switch. `by` says who sets it, as a schedule's.
+  const waitingPage = async (level, { op, page, by } = {}) => answered(await manager.waitingPage({ op, workloadId: level === 'router' ? null : level.workloadId, page, by }));
+
+  // The manager's actions (manager-actions.mjs) on this router: the REST routes above and actions.mjs call them.
+  const manager = createManagerActions({
+    store, find, refuse: { invalid: bad, notFound }, who: (by) => by ?? 'unknown',
+    // What Google Cloud holds back: a custom page while the install's switch is off (pages.mjs), at any level, said first.
+    guard: async (write, { page }) => (write === 'page' && page?.mode === 'custom' && !customPages ? [CUSTOM_PAGES_REFUSED] : []),
+    pausesFor: (id) => core.pausesFor(id),
+    napNow: (id, by) => core.napNow(id, { cause: 'manager', by }),
+    // The controller's wakeNow reads the run again and wakes it, or keeps its pending wake: a started wake is answered by the run read
+    // after it.
+    wake: {
+      start: async (id, run, { kind, by }) => ({ woke: await core.wakeNow(id, kind, by), answer: null }),
+      pending: (id, { kind, by }) => core.wakeNow(id, kind, by),
+    },
+    // This instance's events carry the tags from now on; the others' at their next check.
+    tagged: (id, tags) => core.noteTags(id, tags),
+    scheduleView: scheduleOf,
+    settings: {
+      routerProblems,
+      workloadProblems,
+      // A configuration from before `inherits` is read as effectiveOf reads it (design section 4.1). Once it has `inherits`, it is the
+      // CLI's, as an onboarding writes it.
+      next(cfg, settings) {
+        const next = withSettings(cfg, settings, { inheritsOf, builtIns: builtInsOf });
+        if (Object.hasOwn(next, 'inherits')) next.source ??= 'cli';
+        return next;
+      },
+      levels: levelsOf,
+      answer: (id, next, levels) => ({ hibernation: hibernationOf(next, levels.router, levels.organization), resolved: resolvedSettings(effectiveOf(next, levels)) }),
+    },
+    pageView: (workloadId) => pageView(workloadId === null ? 'router' : { workloadId }),
+    now,
+    log,
+  });
 
   return {
-    dryRun, dryRunOf, onboard, onboardWithSteps, offboard, offboardWithSteps, find, setName, setTags, show, list, nap, wake, showSchedule, setSchedule, clearSchedule, deleteSchedule, pause, resume, pauseRouter, resumeRouter, setSettings,
-    routerSettings, setRouterSettings, waitingPage,
+    dryRun, dryRunOf, onboard, onboardWithSteps, offboard, offboardWithSteps, find, show, list, nap, wake, showSchedule, workloadSchedule, setSchedule, clearSchedule, deleteSchedule, pause, resume,
+    pauseRouter, resumeRouter, setSettings, routerSettings, setRouterSettings, waitingPage, manager,
   };
 }

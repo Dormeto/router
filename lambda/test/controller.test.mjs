@@ -1772,20 +1772,33 @@ test('status gives the schedule, its next events and the maintenance time; null 
   assert.equal(status.maintenanceDue, new Date(stateAt + 7 * 86_400_000).toISOString());
 });
 
-test('status survives a corrupt schedule or one the runtime refuses: no schedule, logged', async () => {
-  const s = setup({ run: { state: STATES.ASLEEP, stateAt: Date.UTC(2026, 9, 1) } });
+test('status shows a schedule the runtime refuses with no next events, its own join, logged (B3); a corrupt one is none', async () => {
+  const stateAt = Date.UTC(2026, 9, 1);
+  const s = setup({ run: { state: STATES.ASLEEP, stateAt } });
   const logs = [];
   s.log.warn = (event, fields) => logs.push({ event, ...fields });
-  s.store.state.schedules.demo = { timeZone: 'Nowhere/Land', windows: [{ kind: 'nap', days: ['mon'], start: '20:00', end: '07:00' }], by: 'me', at: s.clock.now() };
+  const stored = { timeZone: 'Nowhere/Land', windows: [{ kind: 'nap', days: ['mon'], start: '20:00', end: '07:00' }], maxNapDays: 3, joinMinutes: 30, by: 'me', at: s.clock.now() };
+  s.store.state.schedules.demo = stored;
   const bad = await s.handler({ action: 'status', workloadId: 'demo' });
-  assert.equal(bad.schedule, null);
+  assert.deepEqual(bad.schedule, { ...stored, at: new Date(s.clock.now()).toISOString() });
   assert.deepEqual(bad.next, []);
+  assert.deepEqual([bad.joinMinutes, bad.joinFrom, bad.joinInherited], [30, 'workload', { joinMinutes: 15, joinFrom: 'default' }]);
+  // Its maximum nap is not shown due: the check applies none of a schedule it cannot read.
   assert.equal(bad.maintenanceDue, null);
+  assert.deepEqual(logs.filter((l) => l.event === 'ScheduleSkipped').map((l) => l.workloadId), ['demo']);
+  // A schedule it reads, asleep: its maximum nap is due.
+  s.store.state.schedules.demo = { ...stored, timeZone: 'Europe/Paris' };
+  assert.equal((await s.handler({ action: 'status', workloadId: 'demo' })).maintenanceDue, new Date(stateAt + 3 * 86_400_000).toISOString());
   assert.equal(logs.filter((l) => l.event === 'ScheduleSkipped').length, 1);
+  // Nothing to show: a stored JSON that does not parse, or a time that is none. As without a schedule, logged.
   s.store.getSchedule = async () => JSON.parse('{not json');
   const corrupt = await s.handler({ action: 'status', workloadId: 'demo' });
   assert.equal(corrupt.schedule, null);
   assert.equal(logs.filter((l) => l.event === 'ScheduleSkipped').length, 2);
+  s.store.getSchedule = async () => ({ ...stored, timeZone: 'Europe/Paris', at: 'not a time' });
+  const timeless = await s.handler({ action: 'status', workloadId: 'demo' });
+  assert.deepEqual([timeless.schedule, timeless.next, timeless.maintenanceDue], [null, [], null]);
+  assert.equal(logs.filter((l) => l.event === 'ScheduleSkipped').length, 3);
 });
 
 test('status fails on a failed schedule read (a store error), not "no schedule"', async () => {

@@ -2884,30 +2884,30 @@ test('dry run: a bad tag is refused as an onboarding would', async () => {
   await assert.rejects(onboarding.dryRun({ ...INPUT, tags: { 'dormeto:x': 'v' } }), refused(400, 'bad-request', /dormeto: prefix is reserved/));
 });
 
-test('setName and setTags: written to the configuration, answered as AWS answers, and shown by show', async () => {
+test('the manager\'s rename and tag: written to the configuration, answered as AWS answers, and shown by show', async () => {
   const { store, onboarding } = setup();
   await onboarding.onboard({ ...INPUT, tags: { team: 'a' } });
-  assert.deepEqual(await onboarding.setName('demo', ' Renamed ', 'ada'), { workloadId: 'demo', name: 'Renamed' });
-  assert.deepEqual(await onboarding.setTags('demo', { team: 'b', env: 'dev' }, 'ada'), { workloadId: 'demo', tags: { team: 'b', env: 'dev' } });
+  assert.deepEqual(await onboarding.manager.rename({ workloadId: 'demo', name: ' Renamed ', by: 'ada' }), { workloadId: 'demo', name: 'Renamed' });
+  assert.deepEqual(await onboarding.manager.tag({ workloadId: 'demo', tags: { team: 'b', env: 'dev' }, by: 'ada' }), { workloadId: 'demo', tags: { team: 'b', env: 'dev' } });
   const cfg = await store.getConfig('demo');
   assert.deepEqual([cfg.name, cfg.tags], ['Renamed', { team: 'b', env: 'dev' }]);
   assert.deepEqual([(await onboarding.show('demo')).name, (await onboarding.show('demo')).tags], ['Renamed', { team: 'b', env: 'dev' }]);
 });
 
-test('setName and setTags: a bad name or tag is a 400, an empty name too, and nothing is written', async () => {
+test('the manager\'s rename and tag: a bad name or tag is a 400, an empty name too, and nothing is written', async () => {
   const { store, onboarding } = setup();
   await onboarding.onboard({ ...INPUT, name: 'Demo', tags: { team: 'a' } });
-  await assert.rejects(onboarding.setName('demo', '  ', 'ada'), refused(400, 'bad-request', /^name: required$/));
-  await assert.rejects(onboarding.setName('demo', 'x'.repeat(65), 'ada'), refused(400, 'bad-request', /^name: at most 64 characters$/));
-  await assert.rejects(onboarding.setTags('demo', { 'dormeto:x': 'v' }, 'ada'), refused(400, 'bad-request', /^tag "dormeto:x": the dormeto: prefix is reserved$/));
+  await assert.rejects(onboarding.manager.rename({ workloadId: 'demo', name: '  ', by: 'ada' }), refused(400, 'bad-request', /^name: required$/));
+  await assert.rejects(onboarding.manager.rename({ workloadId: 'demo', name: 'x'.repeat(65), by: 'ada' }), refused(400, 'bad-request', /^name: at most 64 characters$/));
+  await assert.rejects(onboarding.manager.tag({ workloadId: 'demo', tags: { 'dormeto:x': 'v' }, by: 'ada' }), refused(400, 'bad-request', /^tag "dormeto:x": the dormeto: prefix is reserved$/));
   const cfg = await store.getConfig('demo');
   assert.deepEqual([cfg.name, cfg.tags], ['Demo', { team: 'a' }]);
 });
 
-test('setName and setTags: a workload that is not onboarded, or offboarded while the write was made, is a 404 and nothing is written', async () => {
+test('the manager\'s rename and tag: a workload that is not onboarded, or offboarded while the write was made, is a 404 and nothing is written', async () => {
   const { store, onboarding } = setup();
-  await assert.rejects(onboarding.setName('demo', 'x', 'ada'), refused(404, 'not-found'));
-  await assert.rejects(onboarding.setTags('demo', {}, 'ada'), refused(404, 'not-found'));
+  await assert.rejects(onboarding.manager.rename({ workloadId: 'demo', name: 'x', by: 'ada' }), refused(404, 'not-found'));
+  await assert.rejects(onboarding.manager.tag({ workloadId: 'demo', tags: {}, by: 'ada' }), refused(404, 'not-found'));
   await onboarding.onboard(INPUT);
   // Offboarded between the read and the write: the conditional write puts nothing back.
   const { getConfig } = store;
@@ -2916,12 +2916,12 @@ test('setName and setTags: a workload that is not onboarded, or offboarded while
     store.configs.delete(id);
     return cfg;
   };
-  await assert.rejects(onboarding.setName('demo', 'x', 'ada'), refused(404, 'not-found'));
-  await assert.rejects(onboarding.setTags('demo', { a: 'b' }, 'ada'), refused(404, 'not-found'));
+  await assert.rejects(onboarding.manager.rename({ workloadId: 'demo', name: 'x', by: 'ada' }), refused(404, 'not-found'));
+  await assert.rejects(onboarding.manager.tag({ workloadId: 'demo', tags: { a: 'b' }, by: 'ada' }), refused(404, 'not-found'));
   assert.equal(store.configs.size, 0);
 });
 
-test('setTags: the next state change of this instance carries the new tags, though the configuration was read before', async () => {
+test('the manager\'s tag: the next state change of this instance carries the new tags, though the configuration was read before', async () => {
   const { store, core, onboarding } = setup();
   await onboarding.onboard({ ...INPUT, tags: { team: 'a' } });
   const asked = [];
@@ -2935,7 +2935,7 @@ test('setTags: the next state change of this instance carries the new tags, thou
   store.getRun = async (id) => {
     if (!changed) {
       changed = true;
-      await onboarding.setTags('demo', { team: 'b' }, 'ada');
+      await onboarding.manager.tag({ workloadId: 'demo', tags: { team: 'b' }, by: 'ada' });
     }
     return getRun.call(store, id);
   };

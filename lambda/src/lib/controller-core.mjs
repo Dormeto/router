@@ -1,9 +1,8 @@
 import { Refusal, refused } from './refusal.mjs';
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { STATES } from './state.mjs';
-import { checkName } from './names.mjs';
 import { currentTarget, hostOf, setRoute } from './route.mjs';
-import { cacheFavicon, FAVICON_BUDGET_MS, hostOfRules } from './favicon.mjs';
+import { cacheFavicon, FAVICON_BUDGET_MS, hostOfRules, pageLevels } from './favicon.mjs';
 import { dormetoTargetGroup, ingressDrift, routeIngress } from './kube-route.mjs';
 import { checkRights } from './kube-access.mjs';
 import { pingProxy } from './k8s.mjs';
@@ -13,23 +12,25 @@ import { createStatus } from './status.mjs';
 import { describeRules } from './no-wake.mjs';
 import { describeStoredLists } from './list-cache.mjs';
 import { failedSpec, failureError } from './failures.mjs';
-import { createPauses, pauseHolds, pauseText } from './pauses.mjs';
+import { createPauses, pauseHolds } from './pauses.mjs';
 import { createWakeWatch, unhealthyError } from './wake-watch.mjs';
 import { describeStopped } from './stopped.mjs';
 import { revertInstanceTypes } from './capacity.mjs';
-import { tagsProblem } from './tags.mjs';
-import { ENDED_DAYS_DEFAULT, maintenanceDue, nextEvents, normalizeSchedule, resolveJoin, scheduleProblems } from './schedule.mjs';
+import { ENDED_DAYS_DEFAULT, maintenanceDue } from './schedule.mjs';
 import { createScheduleCheck, scheduleKeeps as keptBySchedule } from './check-schedules.mjs';
 import { runCheck } from './check-run.mjs';
 import { STATS_DAYS, createCount, totals, workloadSummary } from './summary.mjs';
 import { lastRequestAt } from './metrics.mjs';
 import { checkScope } from './check-scope.mjs';
-import { healthOf, lambdaMetrics, queueDepths } from './health.mjs';
-import { pageViewOf, validatePage, withWake } from './page-settings.mjs';
+import { addWarning, healthOf, lambdaMetrics, pausesUnreadable, queueDepths } from './health.mjs';
+import { pageViewOf, withWake } from './page-settings.mjs';
 import { HIBERNATION_MAX_DAYS, hibernationDue, resolveHibernation, settingsProblems, workloadSettingsProblems } from './hibernation.mjs';
 import { joinLevels } from './manager-settings.mjs';
 import { createLevelsReader, describedRules, effectiveConfig } from './settings-levels.mjs';
-import { mergedRouterSettings, resolvedSettings, routerSettingsView, withSettings, writtenRouterView } from './settings-writes.mjs';
+import { resolvedSettings, withSettings } from './settings-writes.mjs';
+import { askedWake, beginWake, pendingWake as setPendingWake } from './asked-wake.mjs';
+import { createManagerActions, listRouter, readPauses, routerAnswer, rowPauses, scheduleView } from './manager-actions.mjs';
+import { requestListRefresh as askListRefresh } from './list-refresh.mjs';
 import {
   backendKey, backendStatuses, isCompanion, resolveBackends, resumeBackends, sleepBackends, startCompanions, stopCompanions, toRecord, wakeBackends,
 } from './backends.mjs';
@@ -99,9 +100,10 @@ export function createController({
   const clients = { ec2, elbv2, autoscaling, ecs, tagging, appscaling, rds, kubernetesOf };
   let budgetEnd = Infinity;
 
+  const notConfigured = (workloadId) => new Refusal('not_found', `workload not configured: ${workloadId}`);
   async function config(workloadId) {
     const cfg = await store.getConfig(workloadId);
-    if (!cfg) throw new Refusal('not_found', `workload not configured: ${workloadId}`);
+    if (!cfg) throw notConfigured(workloadId);
     return cfg;
   }
 
@@ -349,10 +351,7 @@ export function createController({
     const { workloadId } = cfg;
     return cacheFavicon(workloadId, {
       store, fetch, now, budgetMs: faviconBudgetMs, log,
-      levels: async ({ signal }) => {
-        const [organization, router_, workload] = await Promise.all([organizationPage ? organizationPage.read({ signal }) : null, store.getWaitingPage('router'), store.getWaitingPage({ workloadId })]);
-        return [organization, router_?.page, workload?.page];
-      },
+      levels: pageLevels(store, workloadId, { organization: organizationPage ? ({ signal }) => organizationPage.read({ signal }) : null }),
       host: () => hostOfRules(rules),
     });
   }
@@ -722,8 +721,7 @@ export function createController({
       store.getRun(cfg.workloadId),
       store.getStats(cfg.workloadId, STATS_DAYS).catch(() => null),
     ]);
-    const shown = pauses.filter((p) => p.workloadId === cfg.workloadId || p.workloadId === null);
-    return workloadSummary(await effective(cfg, run, levels), run, host, totals(stats), shownPauses(shown), scheduled);
+    return workloadSummary(await effective(cfg, run, levels), run, host, totals(stats), shownPauses(rowPauses(pauses, cfg.workloadId)), scheduled);
   }
 
   // One workload's row to the manager at once, after its onboarding (vision refusals design §2): its host read from its
@@ -734,10 +732,7 @@ export function createController({
     const found = await resolveRules(elbv2, [cfg]).catch(() => new Map());
     const host = (found.get(workloadId)?.rules ?? []).map(hostOf).find(Boolean) ?? null;
     hosts.byWorkload.set(workloadId, host);
-    const pauses = await store.listPauses().catch((err) => {
-      log.warn('PausesUnreadable', { error: err.message });
-      return [];
-    });
+    const { pauses } = await readPauses({ store, log });
     const scheduled = Boolean(await store.getSchedule(workloadId).catch(() => true));
     await publisher.listed({ at: iso(now()), workload: await rowOf(cfg, host, pauses, scheduled, await readLevels()) });
     log.info('WorkloadReported', { workloadId });
@@ -747,31 +742,38 @@ export function createController({
   async function list({ cachedHosts = false } = {}) {
     const { configs, schedules } = await store.listWorkloads();
     const byWorkload = await workloadHosts(configs, { cachedOnly: cachedHosts });
-    let pausesError;
-    const pauses = await store.listPauses().catch((err) => {
-      pausesError = err.message;
-      log.warn('PausesUnreadable', { error: err.message });
-      return [];
-    });
-    const routerPauses = pauses.filter((p) => p.workloadId === null);
+    const { pauses, pausesError } = await readPauses({ store, log });
     const levels = await readLevels();
     const workloads = await Promise.all(configs.map((cfg) => rowOf(cfg, byWorkload.get(cfg.workloadId), pauses, schedules.has(cfg.workloadId), levels)));
     const health = await store.getCheck().catch(() => null);
     return {
-      router: {
+      router: listRouter({
         name: router.name, version: router.version, build: router.build, checkSchedule: router.checkSchedule ?? null,
-        lastScheduledCheckAt: health?.lastScheduledCheckAt ? new Date(health.lastScheduledCheckAt).toISOString() : null,
-        pauses: shownPauses(routerPauses), ...(pausesError ? { pausesError } : {}),
-      },
+        lastScheduledCheckAt: health?.lastScheduledCheckAt ? iso(health.lastScheduledCheckAt) : null,
+        pauses: shownPauses(pauses.filter((p) => p.workloadId === null)), pausesError,
+      }),
       workloads,
     };
   }
 
+  // The maintenance wake due (scheduleView's `dues`): an asleep workload's maximum nap, of a schedule the router reads (the check
+  // applies none of another), or the hibernation's 60-day limit, whichever comes first.
+  function maintenanceOf(schedule, run, { readable }) {
+    const dues = [
+      readable && schedule && run?.state === STATES.ASLEEP && run.stateAt ? maintenanceDue(schedule, run.stateAt) : null,
+      run?.state === STATES.ASLEEP || run?.state === STATES.FAILED ? hibernationDue(run) : null,
+    ].filter((due) => due !== null);
+    return dues.length ? Math.min(...dues) : null;
+  }
+  // A schedule's view (manager-actions.mjs's), with the run and the join levels read.
+  const scheduleOf = (workloadId, schedule, reads) => scheduleView({ now, log, dues: maintenanceOf }, workloadId, schedule, reads);
+
   async function workloadStatus(workloadId) {
     const run = await store.getRun(workloadId);
     const cfg = await effective(await config(workloadId), run);
-    // An unreadable schedule (the stored JSON does not parse, or a zone this runtime refuses) never breaks the status; a
-    // failed read (a store error) does, as any read error would.
+    // A schedule the runtime cannot read is shown, with no next events (B3 of the cloud duplication design). One there is nothing to
+    // show of (its stored JSON does not parse, its time is none) never breaks the status: none, logged; a failed read (a store
+    // error) does, as any read error would.
     const answer = await status(workloadId, cfg, run ?? {}, {
       pauses: await pausesFor(workloadId),
       drift: store.listDrift ? await store.listDrift(workloadId, 10).catch(() => []) : [],
@@ -781,13 +783,14 @@ export function createController({
       loadHibernation: (instanceIds) => hibernationView(cfg, run, instanceIds),
     });
     const joins = await readJoinLevels();
+    const reads = { run, joins: () => joins };
     try {
-      return { ...answer, ...scheduleView(await store.getSchedule(workloadId), run, joins) };
+      return { ...answer, ...(await scheduleOf(workloadId, await store.getSchedule(workloadId), reads)) };
     } catch (err) {
       if (!(err instanceof SyntaxError || err instanceof RangeError)) throw err;
       log.warn('ScheduleSkipped', { workloadId, error: err.message });
       // As without a schedule: the hibernation's maintenance wake still shows.
-      return { ...answer, ...scheduleView(null, run, joins) };
+      return { ...answer, ...(await scheduleOf(workloadId, null, reads)) };
     }
   }
 
@@ -825,52 +828,21 @@ export function createController({
     maxHolders: 'max_holders', failedRetrySeconds: 'failed_retry_seconds', wakeMode: 'wake_mode', noWakeRules: 'no_wake_rules', wakeRules: 'wake_rules', type: 'type',
   };
 
-  // Without workloadId the router's record: hibernate, joinMinutes and the defaults of its workloads (merged with what it
-  // holds, a key sent null removed, null for all of them clears them). With it the configuration of a workload the
-  // manager onboarded (Terraform writes the others'): hibernate (null removes the key), the settings of §4 (null gives the
-  // key back to the levels: its built-in value stays written for an older router), its rules (null: none) and its type
-  // (null: inherited). Bad settings answer the problems, nothing written.
-  async function setSettings({ workloadId, settings, by }) {
-    const cfg = workloadId ? await config(workloadId) : null;
-    if (cfg && !cfg.source) {
-      const first = Object.keys(settings && typeof settings === 'object' ? settings : {}).find((key) => MODULE_VARIABLES[key]) ?? 'hibernate';
-      throw new Refusal('conflict', `workload ${workloadId} was written by Terraform: set ${MODULE_VARIABLES[first]} in its workload module`);
+  // What AWS holds back of the manager's writes (manager-actions.mjs's guard): a workload Terraform wrote (no source) is changed in
+  // its workload module, named by the Terraform variable of what is written; so is a waiting page Terraform wrote (no by), while a
+  // page left from before the workload moved to Terraform can still be cleared.
+  async function terraformGuard(write, { workloadId, cfg, settings, level }) {
+    if (!cfg || cfg.source) return [];
+    if (write === 'page delete') {
+      const stored = await store.getWaitingPage(level);
+      if (!stored || stored.by) return [];
     }
-    const problems = cfg ? workloadSettingsProblems(settings) : settingsProblems(settings);
-    if (problems.length) return { problems };
-    if (!cfg) {
-      // What is not sent stays (settings-writes.mjs), and a record that cannot be read is not written over.
-      const stored = await store.getRouterSettings();
-      if (!Object.keys(settings).length) return { level: 'router', settings: routerSettingsView(stored) };
-      // None set deletes the record.
-      const record = mergedRouterSettings(stored, settings, { by, at: now() });
-      await store.putRouterSettings(record);
-      log.info('RouterSettings', { hibernate: record.hibernate, joinMinutes: record.joinMinutes, defaults: record.defaults ? Object.keys(record.defaults) : [], by });
-      return { level: 'router', settings: writtenRouterView(record) };
-    }
-    // A configuration from before `inherits` inherits what equals the onboarder's old defaults (design §7).
-    const next = withSettings(cfg, settings);
-    // The levels the answer resolves with, read before the write: a failed read changes nothing.
-    const levels = await hibernationLevels();
-    // Conditional: a change racing an offboarding never writes the workload back.
-    if (!(await store.putConfig(workloadId, next, { mustExist: true }))) throw new Refusal('not_found', `workload not configured: ${workloadId}`);
-    log.info('WorkloadSettings', { workloadId, keys: Object.keys(settings), hibernate: next.hibernate ?? null, previous: cfg.hibernate ?? null, by });
-    const instanceIds = await resolveBackends(clients, next).then(({ backends }) => backends.filter((b) => b.kind === 'instance').map((b) => b.id)).catch((err) => {
-      log.warn('HibernationUnread', { workloadId, error: err.message });
-      return null;
-    });
-    const run = await store.getRun(workloadId);
-    const resolved = await effective(next, run);
-    return {
-      level: 'workload', settings: { ...settings },
-      hibernation: await hibernationView(next, run, instanceIds, levels),
-      resolved: resolvedSettings(resolved),
-    };
+    const first = Object.keys(settings && typeof settings === 'object' ? settings : {}).find((key) => MODULE_VARIABLES[key]) ?? 'hibernate';
+    const variable = { name: 'name', tags: 'tags', settings: MODULE_VARIABLES[first], page: 'waiting_page', 'page delete': 'waiting_page' }[write];
+    throw new Refusal('conflict', `workload ${workloadId} was written by Terraform: set ${variable} in its workload module`);
   }
 
   // --- Waiting page (branded waiting page design §5, §11): one document per level, in its own item ----------------------
-
-  const pageLevel = (workloadId) => (workloadId ? { workloadId } : 'router');
 
   // What people read (page-settings.mjs's pageViewOf): the level's own document, what it would inherit, the effective page and where
   // each field comes from, the cached favicon, the warnings and who wrote it. Never throws on a bad stored value.
@@ -888,139 +860,82 @@ export function createController({
     return pageViewOf({ organization, router: upper, own, favicon, workload: Boolean(workloadId), terraform: Boolean(cfg && !cfg.source) });
   }
 
-  // { action: 'waiting-page', op: 'get' | 'put' | 'delete', workloadId?, page?, by }: the router's level, or a workload's.
-  // A workload Terraform wrote refuses a put; it refuses a delete only of an item Terraform wrote (no by), so an item left
-  // from before the workload moved to Terraform can still be cleared. The log holds the size and hash of a page, never it.
-  async function waitingPage({ op, workloadId = null, page, by }) {
-    // Null or absent is the router's level; anything else must be a workload's id, never a falsy value read as the router's.
-    if (workloadId !== null && (typeof workloadId !== 'string' || !workloadId)) throw new Refusal('invalid', 'workloadId must be the id of a workload');
-    if (op === 'put' && (typeof by !== 'string' || !by)) throw new Refusal('invalid', 'a put needs by: who sets the page');
-    const cfg = workloadId ? await config(workloadId) : null;
-    const level = pageLevel(workloadId);
-    const terraformRefuses = () => new Refusal('conflict', `workload ${workloadId} was written by Terraform: set waiting_page in its workload module`);
-    switch (op) {
-      case 'get':
-        break;
-      case 'put': {
-        if (cfg && !cfg.source) throw terraformRefuses();
-        const problems = validatePage(page);
-        if (problems.length) return { problems };
-        await store.putWaitingPage(level, page, { by, at: now() });
-        const bytes = page.mode === 'custom' ? Buffer.byteLength(page.html) : undefined;
-        log.info('WaitingPageSet', { level: workloadId ? 'workload' : 'router', workloadId, mode: page.mode, bytes, sha256: page.mode === 'custom' ? createHash('sha256').update(page.html).digest('hex') : undefined, by });
-        break;
-      }
-      case 'delete': {
-        if (cfg && !cfg.source) {
-          const stored = await store.getWaitingPage(level);
-          if (stored && !stored.by) throw terraformRefuses();
-        }
-        const cleared = await store.deleteWaitingPage(level);
-        log.info('WaitingPageCleared', { level: workloadId ? 'workload' : 'router', workloadId, cleared, by });
-        break;
-      }
-      default:
-        throw new Refusal('invalid', `unknown waiting-page op: ${op}`);
-    }
-    return pageView(workloadId, cfg);
-  }
-
-  // --- Schedules (R12): stored beside the workload, applied by the check ---------------------------------------------
-
-  // What people read: the schedule (its `at` as ISO; null when none), the next events and the maintenance wake, the
-  // schedule's (maxNapDays) or the hibernation's 60-day limit, whichever comes first.
-  function scheduleView(schedule, run, joins) {
-    const dues = [
-      schedule && run?.state === STATES.ASLEEP && run.stateAt ? maintenanceDue(schedule, run.stateAt) : null,
-      run?.state === STATES.ASLEEP || run?.state === STATES.FAILED ? hibernationDue(run) : null,
-    ].filter((due) => due !== null);
-    const join = resolveJoin({ workload: schedule?.joinMinutes, ...joins });
-    const inherited = resolveJoin(joins);
-    return {
-      schedule: schedule && { ...schedule, at: new Date(schedule.at).toISOString() },
-      next: nextEvents(schedule, now(), { joinMinutes: join.joinMinutes }),
-      maintenanceDue: dues.length ? new Date(Math.min(...dues)).toISOString() : null,
-      // The value in force and its level; what removing the workload's own would give.
-      joinMinutes: join.joinMinutes, joinFrom: join.from, joinInherited: { joinMinutes: inherited.joinMinutes, joinFrom: inherited.from },
-    };
-  }
-
-  async function setSchedule({ workloadId, schedule, by }) {
-    await config(workloadId);
-    const problems = scheduleProblems(schedule, { now: now() });
-    if (problems.length) return { problems };
-    const stored = { ...normalizeSchedule(schedule), by, at: now() };
-    await store.putSchedule(workloadId, stored);
-    log.info('Scheduled', { workloadId, by });
-    return scheduleView(stored, await store.getRun(workloadId), await readJoinLevels());
-  }
-
-  async function clearSchedule({ workloadId, by }) {
-    await config(workloadId);
-    const cleared = await store.deleteSchedule(workloadId);
-    log.info('ScheduleCleared', { workloadId, by, cleared });
-    return { cleared };
-  }
-
   const count = createCount({ store, log });
 
-  // A wake asked by an operator (the manager, the work queue, a pause), whatever the retry delay: an asleep or failed workload's
-  // started, a napping one's pending wake set. `answer`: force-wake's; `woke`: whether this call started the wake or set the
-  // pending wake (a pause's woken, B5 of the cloud duplication design). inline (the work queue): the wake runs in this invocation
-  // instead of one of its own.
-  async function askedWake(workloadId, by, kind, { inline = false } = {}) {
-    await config(workloadId);
-    const run = await store.getRun(workloadId);
-    if (run?.state === STATES.ASLEEP || run?.state === STATES.FAILED) {
-      const started = await startWake(workloadId, run, by, kind, { inline });
-      return { woke: started !== null, answer: started ?? { state: (await store.getRun(workloadId))?.state } };
-    }
-    if (run?.state === STATES.NAPPING) return { woke: await pendingWake(workloadId, by, kind), answer: { state: STATES.NAPPING, pendingWake: true } };
-    return { woke: false, answer: { state: run?.state } };
-  }
-
-  // Operator request from the manager: no retry delay; the wake itself runs in its own invocation (inline: in this one).
-  async function forceWake(workloadId, by, kind = 'manager', { inline = false } = {}) {
-    return (await askedWake(workloadId, by, kind, { inline })).answer;
-  }
-
-  // The wake of an asleep or failed workload from the run read, null when its state changed since. set: more of the run
-  // written with the wake (the schedule occurrence it applies).
+  // The wake of an asleep or failed workload from the run read (asked-wake.mjs's beginWake), null when its state changed since.
+  // set: more of the run written with the wake (the schedule occurrence it applies). inline (the work queue): the wake runs in
+  // this invocation instead of one of its own.
   async function startWake(workloadId, run, by, kind, { inline = false, set = {} } = {}) {
-    const wakeId = newId();
-    const next = await store.transition(workloadId, {
-      cond: { state: run.state }, set: { ...set, state: STATES.WAKING, wakeId, wakeStartedAt: now() }, remove: ['failedAt'], increment: ['wakeCount'], cause: kind,
-      ...(by ? { by } : {}),
-    });
-    if (!next) return null;
-    log.info('WakeRequested', { workloadId, wakeId, trigger: { kind, by } });
+    const wakeId = await beginWake({ transition: (id, change) => store.transition(id, change), newId, now, log }, workloadId, run.state, { kind, by, set });
+    if (!wakeId) return null;
     await count(workloadId, `wake:${kind}`);
     if (inline) return wake(workloadId, wakeId);
     await invokeSelf({ action: 'wake', workloadId, wakeId });
     return { state: STATES.WAKING };
   }
 
-  // A napping workload's pending wake (its nap ends awake): true when this call set it, one log line and one counted wake
-  // per pending wake.
-  async function pendingWake(workloadId, by, kind) {
-    if (!(await store.setPendingWake(workloadId))) return false;
-    log.info('PendingWake', { workloadId, trigger: { kind, by } });
-    await count(workloadId, `wake:${kind}`);
-    return true;
+  // A napping workload's pending wake (asked-wake.mjs's): true when this call set it.
+  function pendingWake(workloadId, by, kind) {
+    return setPendingWake({ store, count, log }, workloadId, { kind, by });
+  }
+
+  // A wake asked by an operator (the manager, the work queue, a pause), whatever the retry delay (asked-wake.mjs's askedWake):
+  // `answer`, force-wake's; `woke`, whether this call started the wake or set the pending wake (a pause's woken, B5 of the cloud
+  // duplication design).
+  const wakePorts = {
+    async start(workloadId, run, { by, kind, inline }) {
+      const started = await startWake(workloadId, run, by, kind, { inline });
+      return { woke: started !== null, answer: started };
+    },
+    pending: (workloadId, { by, kind }) => pendingWake(workloadId, by, kind),
+  };
+  const asked = (workloadId, by, kind, { inline = false } = {}) => askedWake({ find: config, store, ...wakePorts }, workloadId, { kind, by, inline });
+
+  // Operator request from the manager: no retry delay; the wake itself runs in its own invocation (inline: in this one).
+  async function forceWake(workloadId, by, kind = 'manager', { inline = false } = {}) {
+    return (await asked(workloadId, by, kind, { inline })).answer;
   }
 
   // IP reputation lists: downloads run in their own invocation, never delaying the workload checks.
   async function requestListRefresh() {
     if (!lists || !invokeSelf) return;
-    try {
-      const names = await lists.due();
-      if (!names.length) return;
-      await invokeSelf({ action: 'refresh-lists', names });
-      log.info('ListRefreshRequested', { names });
-    } catch (err) {
-      log.error('ListRefreshCheckFailed', { error: err.message });
-    }
+    await askListRefresh({ due: () => lists.due(), ask: (names) => invokeSelf({ action: 'refresh-lists', names }), log });
   }
+
+  // --- The manager's actions (lib/manager-actions.mjs): rename, tag, settings, waiting page, schedule, request-nap, force-wake --
+
+  // A schedule's answer: its view with the run and the join levels read then (scheduleOf's).
+  const scheduledView = async (workloadId, stored) => scheduleOf(workloadId, stored, { run: await store.getRun(workloadId), joins: readJoinLevels });
+  const managerActions = createManagerActions({
+    store, find: config, guard: terraformGuard, refuse: { invalid: (message) => new Refusal('invalid', message), notFound: notConfigured },
+    pausesFor: (workloadId) => pausesFor(workloadId),
+    // Run in its own invocation (a nap outlasts the API call), through the work queue when there is one.
+    napNow: async (workloadId, by) => {
+      if (queueWork) await queueWork({ action: 'nap', workloadId, requestedAt: now(), by });
+      else await invokeSelf({ action: 'nap', workloadId, by });
+    },
+    wake: wakePorts,
+    scheduleView: scheduledView,
+    settings: {
+      routerProblems: settingsProblems,
+      workloadProblems: (settings) => workloadSettingsProblems(settings),
+      // A configuration from before `inherits` inherits what equals the onboarder's old defaults (design §7).
+      next: (cfg, settings) => withSettings(cfg, settings),
+      levels: hibernationLevels,
+      // After the write: the hibernation with the instances it reads (not read: logged, never failing), the settings resolved.
+      async answer(workloadId, next, levels) {
+        const instanceIds = await resolveBackends(clients, next).then(({ backends }) => backends.filter((b) => b.kind === 'instance').map((b) => b.id)).catch((err) => {
+          log.warn('HibernationUnread', { workloadId, error: err.message });
+          return null;
+        });
+        const run = await store.getRun(workloadId);
+        const resolved = await effective(next, run);
+        return { hibernation: await hibernationView(next, run, instanceIds, levels), resolved: resolvedSettings(resolved) };
+      },
+    },
+    pageView,
+    now, log,
+  });
 
   async function check(source) {
     const started = now();
@@ -1097,31 +1012,6 @@ export function createController({
     }
   }
 
-  // The name people see (design section 7), for a workload the manager onboarded (Terraform writes the others').
-  async function rename({ workloadId, name, by }) {
-    const cfg = await config(workloadId);
-    if (!cfg.source) throw new Refusal('conflict', `workload ${workloadId} was written by Terraform: set name in its workload module`);
-    const checked = checkName(name);
-    if (!checked.name) throw new Refusal('invalid', 'name: required');
-    if (checked.problem) throw new Refusal('invalid', checked.problem);
-    // Conditional: a rename racing an offboarding never writes the workload back.
-    if (!(await store.putConfig(workloadId, { ...cfg, name: checked.name }, { mustExist: true }))) throw new Refusal('not_found', `workload not configured: ${workloadId}`);
-    log.info('Renamed', { workloadId, name: checked.name, by });
-    return { workloadId, name: checked.name };
-  }
-
-  // The workload's tags (tags design, section 3), replaced whole, for a workload the manager onboarded.
-  async function tag({ workloadId, tags, by }) {
-    const cfg = await config(workloadId);
-    if (!cfg.source) throw new Refusal('conflict', `workload ${workloadId} was written by Terraform: set tags in its workload module`);
-    const problem = tagsProblem(tags);
-    if (problem) throw new Refusal('invalid', problem);
-    // Conditional: a tag racing an offboarding never writes the workload back.
-    if (!(await store.putConfig(workloadId, { ...cfg, tags }, { mustExist: true }))) throw new Refusal('not_found', `workload not configured: ${workloadId}`);
-    log.info('Tagged', { workloadId, tags, by });
-    return { workloadId, tags };
-  }
-
   async function ensureAwake(workloadId) {
     const cfg = await config(workloadId);
     const run = await store.getRun(workloadId);
@@ -1144,7 +1034,7 @@ export function createController({
       await queueWork({ action: 'wake', workloadId, by, kind: 'pause' });
       return true;
     }
-    return (await askedWake(workloadId, by, 'pause')).woke;
+    return (await asked(workloadId, by, 'pause')).woke;
   }
   const pausing = createPauses({ store: pauseStore(store), wake: pauseWake, refuse: (message) => new Refusal('invalid', message), now, log });
   const { expired, shownPauses, pausesFor, isPaused, activePauses } = pausing;
@@ -1169,19 +1059,6 @@ export function createController({
   async function resume({ workloadId = null, by, exclusionId }) {
     if (workloadId !== null && exclusionId == null) await config(workloadId);
     return pausing.resume(workloadId, by, { exclusionId });
-  }
-
-  // Manager nap: refused at once with the reason, else run in its own invocation (a nap outlasts the API call).
-  async function requestNap({ workloadId, by }) {
-    await config(workloadId);
-    const run = await store.getRun(workloadId);
-    if (run?.state !== STATES.AWAKE) return { requested: false, reason: `not awake (${run?.state ?? 'UNKNOWN'})` };
-    const [first] = await pausesFor(workloadId);
-    if (first) return { requested: false, reason: pauseText(first) };
-    if (queueWork) await queueWork({ action: 'nap', workloadId, requestedAt: now(), by });
-    else await invokeSelf({ action: 'nap', workloadId, by });
-    log.info('NapRequested', { workloadId, trigger: { kind: 'manager', by } });
-    return { requested: true };
   }
 
   // --- Work queue: naps and the wakes of a router pause ---------------------------------------------------------------
@@ -1280,7 +1157,6 @@ export function createController({
     });
     const byState = {};
     for (const run of runs) byState[run?.state ?? 'UNKNOWN'] = (byState[run?.state ?? 'UNKNOWN'] ?? 0) + 1;
-    const routerPaused = pauses.some((p) => p.workloadId === null);
     const updated = runs.map((run) => run?.updatedAt ?? 0).filter((ms) => ms > 0);
     const check = await store.getCheck().catch(() => null);
     const own = (await describeStoredLists(store, ipLists)).map((l) => ({ ...l, source: TERRAFORM, refreshHours: ipLists.find((c) => c.name === l.name)?.refreshHours }));
@@ -1298,28 +1174,16 @@ export function createController({
       managerSettingsError: manager?.error ?? null,
       kubeProxies: kubeProxies ?? {},
     });
-    if (pausesError) {
-      health.problems.push({ level: 'warning', code: 'pauses-unreadable', text: `pauses unreadable: ${pausesError}` });
-      if (health.status === 'ok') health.status = 'warning';
-    }
+    if (pausesError) pausesUnreadable(health, pausesError);
     // Repairs of the last 24 hours (R4c): something outside Dormeto keeps changing what onboarding added (the customer's
     // infrastructure as code, or a person).
     const dayAgo = iso(t - 86_400_000);
     const drift24h = (await Promise.all(configs.map((c) => (store.listDrift ? store.listDrift(c.workloadId, 50).catch(() => []) : []))))
       .flat().filter((e) => e.at >= dayAgo).length;
-    if (drift24h) {
-      health.problems.push({ level: 'warning', code: 'drift', text: `${drift24h} drift repair${drift24h === 1 ? '' : 's'} in 24 hours: rules or tags changed outside Dormeto, repaired (see the workloads)` });
-      if (health.status === 'ok') health.status = 'warning';
-    }
-    return {
+    if (drift24h) addWarning(health, 'drift', `${drift24h} drift repair${drift24h === 1 ? '' : 's'} in 24 hours: rules or tags changed outside Dormeto, repaired (see the workloads)`);
+    return routerAnswer({
       router: { name: router.name, version: router.version, build: router.build },
-      settings: routerSettingsView(routerSettings),
-      managerSettings: {
-        url: managerSettings?.url ?? null, hibernate: manager?.hibernate ?? null, joinMinutes: manager?.joinMinutes ?? null,
-        // The organization's defaults and types as this router holds them (settings at scale design §6), when there are some.
-        ...(manager?.defaults ? { defaults: manager.defaults } : {}), ...(manager?.types ? { types: manager.types } : {}),
-        readAt: manager?.readAt ? iso(manager.readAt) : null, error: manager?.error ?? null,
-      },
+      settings: routerSettings, manager, managerUrl: managerSettings?.url ?? null,
       configuration: {
         checkSchedule: { value: router.checkSchedule ?? null, source: TERRAFORM },
         ipLists: { value: ipLists.map(({ name, url, action, refreshHours }) => ({ name, url, action, refreshHours })), source: TERRAFORM },
@@ -1327,24 +1191,11 @@ export function createController({
         noWakeRules: { value: describeRules([{ level: 'router', rules: defaultRules }]), source: TERRAFORM },
         metrics: { value: router.metrics ?? null, source: TERRAFORM },
       },
-      pauses: shownPauses(pauses.filter((p) => p.workloadId === null)),
-      workloads: {
-        total: configs.length,
-        byState,
-        paused: routerPaused ? configs.length : configs.filter((cfg) => pauses.some((p) => p.workloadId === cfg.workloadId)).length,
-        lastActivityAt: updated.length ? iso(Math.max(...updated)) : null,
-      },
-      health: {
-        ...health,
-        checkSchedule: router.checkSchedule ?? null,
-        lastScheduledCheckAt: check?.lastScheduledCheckAt ? iso(check.lastScheduledCheckAt) : null,
-        lambda: measured.lambda,
-        queues: measured.queues,
-        ipLists: lists,
-        concurrency,
-        drift24h,
-      },
-    };
+      routerPauses: shownPauses(pauses.filter((p) => p.workloadId === null)), pauses, configs, byState,
+      lastActivity: updated.length ? Math.max(...updated) : 0,
+      health,
+      figures: { checkSchedule: router.checkSchedule ?? null, lastScheduledCheckAt: check?.lastScheduledCheckAt, lambda: measured.lambda, queues: measured.queues, ipLists: lists, concurrency, drift24h },
+    });
   }
 
   // Whether the router reaches a cluster and may do what Kubernetes workloads need (vision
@@ -1433,16 +1284,16 @@ export function createController({
       case 'list': return list();
       case 'report': return reportWorkload(event);
       case 'status': return workloadStatus(event.workloadId);
-      case 'force-wake': return forceWake(event.workloadId, event.by);
+      case 'force-wake': return managerActions.forceWake(event);
       case 'pause': return pause(event);
       case 'resume': return resume(event);
-      case 'request-nap': return requestNap(event);
-      case 'rename': return rename(event);
-      case 'tag': return tag(event);
-      case 'schedule': return setSchedule(event);
-      case 'clear-schedule': return clearSchedule(event);
-      case 'settings': return setSettings(event);
-      case 'waiting-page': return waitingPage(event);
+      case 'request-nap': return managerActions.requestNap(event);
+      case 'rename': return managerActions.rename(event);
+      case 'tag': return managerActions.tag(event);
+      case 'schedule': return managerActions.setSchedule(event);
+      case 'clear-schedule': return managerActions.clearSchedule(event);
+      case 'settings': return managerActions.setSettings(event);
+      case 'waiting-page': return managerActions.waitingPage(event);
       case 'router': return routerInfo();
       case 'clusterCheck': return clusterCheck(event);
       default: throw new Refusal('unsupported', `unknown action: ${event?.action}`);

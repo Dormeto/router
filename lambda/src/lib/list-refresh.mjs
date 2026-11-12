@@ -46,6 +46,19 @@ export async function downloadText(url, { fetch = globalThis.fetch, getObject, t
   return Buffer.concat(chunks).toString('utf8');
 }
 
+// The check's request of the lists due (`due()`, createListRefresher's), downloaded in a request of their own (`ask(names)`: AWS's
+// invocation, Google Cloud's task), never delaying the workloads' checks: said once asked; a failed ask is said, and fails nothing.
+export async function requestListRefresh({ due, ask, log }) {
+  try {
+    const names = await due();
+    if (!names.length) return;
+    await ask(names);
+    log.info('ListRefreshRequested', { names });
+  } catch (err) {
+    log.error('ListRefreshCheckFailed', { error: err.message });
+  }
+}
+
 export function createListRefresher({ store, lists, download = downloadText, now = Date.now, log }) {
   async function due() {
     const names = [];

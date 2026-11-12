@@ -59,6 +59,7 @@ test('a route switch still throttled when its time is up fails, as before', asyn
   const rule = { RuleArn: 'rule', Actions: [{ Type: 'forward', ForwardConfig: { TargetGroups: [{ TargetGroupArn: cfg.appTargetGroupArn, Weight: 0 }, { TargetGroupArn: cfg.wakerTargetGroupArn, Weight: 1 }] } }] };
   const started = clock.now();
   await assert.rejects(clock.until(setRoute(elb, cfg, 'app', { found: { instrumented: [rule], issues: [] }, sleep: clock.sleep, now: clock.now, until: started + 60_000 })), { name: 'ThrottlingException' });
-  // Tried again until the next wait would pass its time, never after.
-  assert.ok(clock.now() - started >= 50_000 && clock.now() - started <= 60_000, `${(clock.now() - started) / 1000} s`);
+  // Tried again until the next wait would pass its time, never after. A wait may end right at its time, and the try after it then
+  // takes the stub's own 50 ms: the bound is the time plus that call (the random waits sometimes end the last one that late).
+  assert.ok(clock.now() - started >= 50_000 && clock.now() - started <= 60_000 + 50, `${(clock.now() - started) / 1000} s`);
 });

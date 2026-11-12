@@ -80,15 +80,18 @@ export function checkRunContract(cloud, setup) {
     assert.equal((await h.check({ deadline: h.now() })).cursor, null);
   });
 
-  test(`${cloud}: a cursor past every workload, or one that cannot be read, starts at the first`, async () => {
+  test(`${cloud}: a cursor past every workload, or one that cannot be read, starts at the first; one that cannot be read is said`, async () => {
     const h = await harness();
     await h.keep('zz');
     assert.deepEqual(reachedOf((await h.check()).results), ids(8));
+    assert.deepEqual(h.logged('CheckCursorUnread'), []);
     await h.keep('w07');
     const { getCheck } = h.store;
     h.store.getCheck = async () => { throw new Error('unavailable'); };
     const unread = await h.check();
     assert.deepEqual([reachedOf(unread.results), unread.cursor], [ids(8), 'w07']);
+    // Said each check, as a cursor that keeps failing to read takes every check back to the first workload.
+    assert.deepEqual(h.logged('CheckCursorUnread'), [{ error: 'unavailable' }]);
     h.store.getCheck = getCheck;
   });
 

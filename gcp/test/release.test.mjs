@@ -719,6 +719,10 @@ test('the manager and Compute Engine pages say where the next check starts, as t
   assert.match(CORE_SRC, /if \(cursor !== \(last\?\.cursor \?\? null\)\) await store\.setCheckCursor\?\.\(cursor\)[^\n]*\n    await sweepStats\(\);/);
   assert.match(read('gcp/src/firestore.mjs'), /fields: cursor \? toFields\(\{ cursor \}\) : \{\} \}, updateMask: \{ fieldPaths: \['cursor'\] \}/);
   assert.match(flat(read(MANAGER)), /After a check that ran out of its 240 s before it reached every workload, it holds cursor too, the last workload that check started, written alone right after the check's workloads and again with the summary: the next check starts after it, as an AWS router's does, so every workload is checked in turn, even while the summary cannot be written \(check in events then holds the cursor with the last summary written, or alone with null times\)\. A summary that cannot be written fails nothing: the check's work is done\./);
+  // The cursor's write and read that fail, each said (controller-core.mjs, lambda/src/lib/check-run.mjs).
+  assert.match(flat(read(MANAGER)), /A cursor that cannot be written is said in CheckCursorNotStored, and one that cannot be read in CheckCursorUnread: that check starts at the first workload\./);
+  assert.match(read('gcp/src/controller-core.mjs'), /log\.warn\('CheckCursorNotStored', \{ error: err\.message \}\)/);
+  assert.match(read('lambda/src/lib/check-run.mjs'), /log\.warn\('CheckCursorUnread', \{ error: err\.message \}\);/);
   assert.match(flat(read(CE)), /A check takes 8 workloads at a time and starts none after 240 s \(CheckBudgetReached\); the next check starts after the last workload it started \(cursor in \[the check summary\]\(google-cloud-manager\.md#what-the-router-keeps\)\), so on a crowded router every workload is checked in turn, as on AWS \(Not released yet: router 0\.40\.0\)\./);
 });
 

@@ -22,8 +22,12 @@
 // the cursor was read from (null: none, or it could not be read).
 
 export async function runCheck({ store, workloads, checkOne, deadline, concurrency = 8, chunk = null, passes = new Map(), end = null, now, log }) {
-  // Starting after the workload where the previous check stopped; a cursor that cannot be read starts at the first.
-  const check = (await Promise.resolve().then(() => store.getCheck?.()).catch(() => null)) ?? null;
+  // Starting after the workload where the previous check stopped. A cursor that cannot be read starts at the first, and is said: one
+  // that keeps failing would check the first workloads only on a crowded router.
+  const check = (await Promise.resolve().then(() => store.getCheck?.()).catch((err) => {
+    log.warn('CheckCursorUnread', { error: err.message });
+    return null;
+  })) ?? null;
   const cursor = check?.cursor;
   const from = cursor ? workloads.findIndex((c) => c.workloadId > cursor) : 0;
   const order = from > 0 ? [...workloads.slice(from), ...workloads.slice(0, from)] : workloads;

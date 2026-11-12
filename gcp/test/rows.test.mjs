@@ -1,5 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { totals, workloadSummary } from '../../lambda/src/lib/summary.mjs';
+import { effectiveOf } from '../src/levels.mjs';
 import { eventOf, rowOf } from '../src/rows.mjs';
 
 const router = { name: 'dmtr-europe-west1', region: 'europe-west1', project: 'p' };
@@ -81,4 +83,25 @@ test('rowOf: the backends are the AWS kind names, once each, in AWS\'s order: in
   const backends = [{ kind: 'cloudsql', name: 'db' }, { kind: 'k8s' }, { kind: 'mig', name: 'g' }, { kind: 'vm', name: 'a' }, { kind: 'vm', name: 'b' }];
   const row = rowOf({ cfg: { ...cfg, backends }, run: { state: 'AWAKE', stateAt: AT }, stats7d: null, routerName: 'r', now: AT });
   assert.deepEqual(row.backends, ['instance', 'asg', 'k8s', 'cloudsql-instance']);
+});
+
+// --- One row for both routers (lambda/src/lib/summary.mjs's workloadRow) --------------------------------------------------------
+
+test('one workload gives the same shared fields in both routers\' rows: AWS\'s from DynamoDB\'s run, Google Cloud\'s from Firestore\'s', () => {
+  const failure = { kind: 'quota', step: 'wake', message: 'm', at: AT - 60_000 };
+  // Asleep after a failure: its failure, its next attempt, its fallbacks and its hibernation all show.
+  const run = {
+    state: 'ASLEEP', stateAt: AT, wakeCount: 3, awakeSince: AT - 9000, wakeStartedAt: AT - 5000, failedAt: AT - 60_000, failure: JSON.stringify(failure),
+    consecutiveFailures: 2, updatedAt: AT, pendingWake: true,
+  };
+  const types = { 'vm-a': { from: 'n2-standard-2', to: 'e2-standard-2' } };
+  const firestore = { ...run, instanceTypes: types, suspended: ['vm-a'] };
+  const dynamo = { ...run, instanceTypes: JSON.stringify(types), hibernated: JSON.stringify({ ids: ['vm-a'], at: AT }), backendKinds: 'instance,cloudsql-instance' };
+  const pauses = [{ scope: 'workload', reason: 'release', by: 'ada', at: '2026-03-10T11:00:00.000Z', until: null, keepAsleep: false }];
+  const google = rowOf({ cfg, run: firestore, stats7d: stats, routerName: 'r', pauses, scheduled: true });
+  const aws = workloadSummary(effectiveOf(cfg, { run: firestore }), dynamo, cfg.hosts[0], totals(stats), pauses, true);
+  const shared = Object.keys(aws).filter((key) => key !== 'targetGroupArn');
+  assert.equal(shared.length, 26);
+  for (const key of ['failure', 'nextAttemptAt', 'fallbacks', 'hibernated', 'scheduled', 'type', 'settingsFrom']) assert.ok(shared.includes(key), key);
+  assert.deepEqual(Object.fromEntries(shared.map((key) => [key, google[key]])), Object.fromEntries(shared.map((key) => [key, aws[key]])));
 });

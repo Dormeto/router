@@ -95,6 +95,23 @@ export function compileRules(rules, { level = 'workload', onInvalid = () => {} }
   return compiled;
 }
 
+// rulesFor(level, rules): a level's rules compiled once per distinct list for the instance's life, so that an invalid rule is said
+// once (NoWakeRuleInvalid), not at every request. Both routers' wakers and Google Cloud's idle check (gcp/src/activity.mjs) use it.
+export function createRulesFor(log) {
+  const compiled = new Map();
+  return function rulesFor(level, rules) {
+    if (!rules?.length) return [];
+    const key = `${level}:${JSON.stringify(rules)}`;
+    if (!compiled.has(key)) {
+      compiled.set(key, compileRules(rules, {
+        level,
+        onInvalid: (rule, reason) => log.warn('NoWakeRuleInvalid', { level, rule: rule?.name, reason }),
+      }));
+    }
+    return compiled.get(key);
+  };
+}
+
 // For the dashboard: [{ level, rules }] → [{ name, level, conditions, invalid? }].
 export function describeRules(groups) {
   return groups.flatMap(({ level, rules }) => (rules ?? []).map((rule) => {

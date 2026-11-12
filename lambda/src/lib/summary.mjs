@@ -1,4 +1,5 @@
-// Workload summary for the manager `list` action: state table only (configuration, runtime state, rule host).
+// A workload's row for the manager (its `list` action, a check's report), as both routers answer it: AWS's here
+// (workloadSummary), Google Cloud's from Firestore (gcp/src/rows.mjs), each giving its own identity. And the daily statistics.
 import { nextAttemptAt } from './failures.mjs';
 import { STATES } from './state.mjs';
 
@@ -16,10 +17,13 @@ export function failureOf(run) {
   }
 }
 
+// The run's `instanceTypes`, `{ <instance>: { from, to } }`: JSON on DynamoDB, a map on Firestore.
+const instanceTypesOf = (run) => (typeof run?.instanceTypes === 'string' ? JSON.parse(run.instanceTypes || '{}') : run?.instanceTypes ?? {});
+
 // The fallback instance types its instances run on (R7a), until the next nap gives them their own back.
 export function fallbacksOf(run) {
   try {
-    return Object.entries(run?.instanceTypes ? JSON.parse(run.instanceTypes) : {}).map(([instance, { from, to }]) => ({ instance, from, to }));
+    return Object.entries(instanceTypesOf(run)).map(([instance, { from, to }]) => ({ instance, from, to }));
   } catch {
     return [];
   }
@@ -30,14 +34,27 @@ const sum = (counts = {}) => Object.values(counts).reduce((total, n) => total + 
 // 7-day totals of the daily statistics (null when they could not be read).
 export const totals = (stats) => (stats ? { ignored: sum(stats.total.ignored), deferred: sum(stats.total.deferred), wakes: sum(stats.total.wakes) } : null);
 
-export function workloadSummary(cfg, run = {}, host = null, stats7d = null, pauses = [], scheduled = false) {
+// A daily counter (`wake:<trigger>`, `ignored:<reason>`, `deferred:<reason>`): a failed update never changes the answer.
+export const createCount = ({ store, log }) => async (workloadId, counter) => {
+  try {
+    await store.count(workloadId, counter);
+  } catch (err) {
+    log.warn('StatsWriteFailed', { workloadId, counter, error: err.message });
+  }
+};
+
+// The row of a workload from its resolved configuration and its run. What each cloud gives: `identity`, the workload's resources
+// (the manager finds it by them: exclusions, discovery), right after its name; `defaultSource`, the source of a configuration that
+// names none; `host`, its first; `backends`, the kinds of its backends; `hibernated`, whether its nap left something hibernated.
+export function workloadRow(cfg, run, {
+  identity, defaultSource, host = null, backends = [], hibernated = false, stats7d = null, pauses = [], scheduled = false,
+}) {
+  const fallbacks = fallbacksOf(run);
   return {
     workloadId: cfg.workloadId,
     name: cfg.name ?? cfg.workloadId,
-    // The workload's identity in AWS: the manager finds it from its target group (exclusions, discovery).
-    targetGroupArn: cfg.appTargetGroupArn,
-    // Written by the Terraform workload module, or onboarded by the manager (only those are offboarded by it).
-    source: cfg.source ?? 'terraform',
+    ...identity,
+    source: cfg.source ?? defaultSource,
     // Dormeto's own labels (tags design, section 3): the manager groups and grants access by them.
     tags: cfg.tags ?? {},
     state: run?.state ?? 'UNKNOWN',
@@ -54,16 +71,15 @@ export function workloadSummary(cfg, run = {}, host = null, stats7d = null, paus
     // When a request may retry a failed wake (R7a: backed off).
     nextAttemptAt: iso(nextAttemptAt(cfg, run)),
     // Only when some (check events stay small).
-    ...(fallbacksOf(run).length ? { fallbacks: fallbacksOf(run) } : {}),
+    ...(fallbacks.length ? { fallbacks } : {}),
     updatedAt: iso(run?.updatedAt),
     pendingWake: run?.pendingWake === true,
-    // The kinds of its backends (instance, asg, ecs, k8s, then its databases), as the last idle check found them.
-    backends: run?.backendKinds ? run.backendKinds.split(',') : [],
+    backends,
     pauses,
     // Only when the workload has a schedule (R12).
     ...(scheduled ? { scheduled: true } : {}),
-    // Only while asleep with instances its nap hibernated (hibernation design §4).
-    ...(run?.state === STATES.ASLEEP && run.hibernated ? { hibernated: true } : {}),
+    // Only while asleep with what its nap hibernated (hibernation design §4).
+    ...(run?.state === STATES.ASLEEP && hibernated ? { hibernated: true } : {}),
     stats7d,
     // Its type and where each setting comes from (settings at scale design §6): the manager counts what a level reaches.
     ...(cfg.settingsFrom ? { type: cfg.type?.name ?? null, settingsFrom: cfg.settingsFrom } : {}),
@@ -75,4 +91,22 @@ export function workloadSummary(cfg, run = {}, host = null, stats7d = null, paus
       maxHolders: cfg.maxHolders,
     },
   };
+}
+
+// AWS's row: the state table only (configuration, runtime state, rule host).
+export function workloadSummary(cfg, run = {}, host = null, stats7d = null, pauses = [], scheduled = false) {
+  return workloadRow(cfg, run, {
+    // The workload's identity in AWS: the manager finds it from its target group.
+    identity: { targetGroupArn: cfg.appTargetGroupArn },
+    // Written by the Terraform workload module, or onboarded by the manager (only those are offboarded by it).
+    defaultSource: 'terraform',
+    host,
+    // The kinds of its backends (instance, asg, ecs, k8s, then its databases), as the last idle check found them.
+    backends: run?.backendKinds ? run.backendKinds.split(',') : [],
+    // Instances its nap hibernated.
+    hibernated: Boolean(run?.hibernated),
+    stats7d,
+    pauses,
+    scheduled,
+  });
 }

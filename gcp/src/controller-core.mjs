@@ -54,6 +54,7 @@
 // the last check that read log entries, or counted any request, read (`idleReads`).
 import { randomUUID } from 'node:crypto';
 import { retryCapacity } from '../../lambda/src/lib/capacity.mjs';
+import { stateChange } from '../../lambda/src/lib/events.mjs';
 import { classify, failedSpec, failureError } from '../../lambda/src/lib/failures.mjs';
 import { cacheFavicon, FAVICON_BUDGET_MS, hostOfRules } from '../../lambda/src/lib/favicon.mjs';
 import { healthOf } from '../../lambda/src/lib/health.mjs';
@@ -63,6 +64,7 @@ import { awakeStartWithin, CLOSE_START_MS, ENDED_DAYS_DEFAULT, maintenanceDue, o
 import { DAY_MS, STATES, utcDay } from '../../lambda/src/lib/state.mjs';
 import { createListRefresher } from '../../lambda/src/lib/list-refresh.mjs';
 import { routerSettingsView } from '../../lambda/src/lib/settings-writes.mjs';
+import { createCount } from '../../lambda/src/lib/summary.mjs';
 import { withWake } from '../../lambda/src/lib/page-settings.mjs';
 import { createWakeWatch } from '../../lambda/src/lib/wake-watch.mjs';
 import { activityOf, createNoWakeRules } from './activity.mjs';
@@ -267,8 +269,8 @@ export function createController({
       const { items, ...said } = event ?? {};
       // The journal's event is the store's (committed with the run); the line says the same: when, which router, and who asked.
       log.info('StateChanged', {
-        workloadId, from: cond.state, to: set.state, ...(cause ? { cause } : {}), ...(by ? { by } : {}), ...said, ...(items ? { stopped: items } : {}),
-        at: new Date(next.stateAt ?? now()).toISOString(), router: `dmtr-${config.region}`, region: config.region, project: config.project,
+        ...stateChange({ workloadId, from: cond.state, to: set.state, at: next.stateAt ?? now(), cause, by, event: { ...said, ...(items ? { stopped: items } : {}) } }),
+        router: `dmtr-${config.region}`, region: config.region, project: config.project,
       });
     }
     return next;
@@ -841,13 +843,7 @@ export function createController({
   }
 
   // A daily counter: a failed update changes nothing else.
-  async function count(workloadId, counter) {
-    try {
-      await store.count(workloadId, counter);
-    } catch (err) {
-      log.warn('StatsWriteFailed', { workloadId, counter, error: err.message });
-    }
-  }
+  const count = createCount({ store, log });
 
   // A napping workload's wake is kept for the nap's end. True when this call kept it: one log line and one counted wake.
   async function pendingWake(workloadId, kind, by) {

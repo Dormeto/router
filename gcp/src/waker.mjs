@@ -38,13 +38,13 @@ import { failureKind, nextAttemptAt } from '../../lambda/src/lib/failures.mjs';
 import { WAKE_HEADER, header, headerValues, response } from '../../lambda/src/lib/http.mjs';
 import { logger } from '../../lambda/src/lib/log.mjs';
 import { createJoinLevelsCache } from '../../lambda/src/lib/manager-settings.mjs';
-import { PAGE_CSP, languageOf, renderPage } from '../../lambda/src/lib/page.mjs';
-import { wakeHeaders, wakeProgress } from '../../lambda/src/lib/page-settings.mjs';
-import { isJoinMinutes, napEndHeader, napEndOf, occurrenceAt, resolveJoin } from '../../lambda/src/lib/schedule.mjs';
+import { languageOf } from '../../lambda/src/lib/page.mjs';
+import { wakeProgress } from '../../lambda/src/lib/page-settings.mjs';
+import { napEndHeader } from '../../lambda/src/lib/schedule.mjs';
 import { effectiveConfig } from '../../lambda/src/lib/settings-levels.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { createWaitingPages } from '../../lambda/src/lib/waiting-pages.mjs';
-import { createWaker } from '../../lambda/src/lib/waker-core.mjs';
+import { createWaker, napWindow, pageResponse, waitingHeaders } from '../../lambda/src/lib/waker-core.mjs';
 import { createFirestoreStore } from './firestore.mjs';
 import { createGoogle } from './google.mjs';
 import { resendStale } from './heartbeat.mjs';
@@ -65,8 +65,6 @@ const UNKNOWN_POLL_SECONDS = 10;
 // The run could not be read: nothing is claimed, the page says it wakes.
 const UNREAD_STATE = 'UNKNOWN';
 const NAP_UNTIL_HEADER = 'x-dormeto-nap-until';
-// What a nap window can keep a workload in, as the shared code reads it.
-const KEPT_BY_NAP = [STATES.ASLEEP, STATES.NAPPING, STATES.FAILED];
 
 // A `node:http` request as the shared code reads an ALB event. The query string stays encoded, as the ALB passes it. The
 // load balancer appends the client's address and then its own to X-Forwarded-For: its entry is dropped, so that the last
@@ -181,23 +179,9 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], c
   });
 
   // The end of the nap window active now, as the page says it, or null. A schedule that cannot be read counts as none: the
-  // page is served all the same. Its windows join as the shared core's (napWindow) join them: the schedule's own joinMinutes, else the
-  // levels' above it, from the record of them this request read.
-  async function napUntilOf(workloadId, state) {
-    if (!KEPT_BY_NAP.includes(state)) return null;
-    try {
-      const schedule = await getSchedule(workloadId);
-      if (!schedule) return null;
-      const joins = isJoinMinutes(schedule.joinMinutes) ? {} : await levelsCache.levels({ workloadId });
-      const t = now();
-      const occurrence = occurrenceAt(schedule, t, { joinMinutes: resolveJoin({ workload: schedule.joinMinutes, ...joins }).joinMinutes });
-      if (occurrence?.kind !== 'nap') return null;
-      return napEndOf(occurrence, schedule.timeZone, t);
-    } catch (err) {
-      log.warn('ScheduleSkipped', { workloadId, error: err.message });
-      return null;
-    }
-  }
+  // page is served all the same. The shared core's nap window (waker-core.mjs's napWindow), on this request's reads: the schedule's
+  // own joinMinutes, else the levels' above it, from the record of them this request read.
+  const napUntilOf = async (workloadId, state) => (await napWindow({ getSchedule, levelsCache, now, log }, workloadId, state))?.until ?? null;
 
   // The shared code reads the nap window for what it might wake. A request it filters before that (a rule, a bot, a list)
   // read the page all the same, which says the window to everyone here: its probe must not go back to "Waking up". An
@@ -266,24 +250,17 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], c
     const cfg = stored && run ? await resolvedOf(workloadId, stored, run) : null;
     const state = cfg ? run.state : read ? STATES.FAILED : UNREAD_STATE;
     const pollSeconds = cfg ? cfg.pollSeconds : UNKNOWN_POLL_SECONDS;
+    // As AWS's page: why the workload failed and when the next attempt is.
     const retryAt = cfg ? nextAttemptAt(cfg, run) : null;
-    const failed = retryAt === null ? {} : { failure: failureKind(run), retryInMs: Math.max(0, retryAt - now()) };
+    const failed = retryAt === null ? null : { kind: failureKind(run), retryAt };
+    const at = now();
     const napUntil = cfg ? await napUntilOf(workloadId, state) : null;
-    const progress = cfg ? wakeProgress(state, run, now()) : null;
-    const headers = {
-      ...(napUntil ? { [NAP_UNTIL_HEADER]: napEndHeader(napUntil) } : {}),
-      'cache-control': 'no-store', 'retry-after': String(pollSeconds), 'x-dormeto-state': state, 'content-type': 'text/html; charset=utf-8',
-      // As AWS's page: why the workload failed and when the next attempt is.
-      ...(failed.failure ? { 'x-dormeto-failure': failed.failure } : {}),
-      ...(retryAt !== null ? { 'x-dormeto-retry-at': new Date(retryAt).toISOString() } : {}),
-      ...wakeHeaders(progress),
-    };
+    const view = { state, pollSeconds, failed, napUntil, progress: cfg ? wakeProgress(state, run, now()) : null };
+    const headers = { ...waitingHeaders(view), 'content-type': 'text/html; charset=utf-8' };
     if (event.httpMethod === 'HEAD') return response(statusCode, headers);
     const { page, icon } = read ? await pages.pageOf(cfg ? workloadId : null) : { page: null, icon: null };
     const language = languageOf(headerValues(event, 'accept-language').join(','));
-    const body = renderPage({ state, pollSeconds, ...failed, napUntil, probeUrl: WAKE_PATH, cloud: CLOUD, language, page, icon, progress });
-    // A custom page is the customer's: our policy would break it. Any other is ours, and so is its policy.
-    return response(statusCode, { ...headers, vary: 'accept-language', ...(page?.mode === 'custom' ? {} : { 'content-security-policy': PAGE_CSP }) }, body);
+    return pageResponse({ statusCode, headers, ...view, at, language, page, icon, probeUrl: WAKE_PATH, cloud: CLOUD });
   }
 
   return async function handler(request) {

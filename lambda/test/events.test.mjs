@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createPublisher, withTransitionEvents } from '../src/lib/events.mjs';
+import { createPublisher, stateChange, withTransitionEvents } from '../src/lib/events.mjs';
 
 const BUS = 'arn:aws:events:eu-west-1:121014831971:event-bus/dmt-dev-manager';
 const ROUTER = { name: 'dmtr-dev', region: 'eu-west-3', version: '0.21.0', build: 'abc', checkSchedule: 'rate(5 minutes)' };
@@ -137,4 +137,13 @@ test('a workload listed is one entry: the router, when and its row; a failed pub
     assert.deepEqual(JSON.parse(entry.Detail), { router: ROUTER, at: '2026-11-03T10:00:00.000Z', workload });
     assert.equal(log.lines.some(([level, event]) => level === 'warn' && event === 'PublishFailed'), fail !== null, String(fail));
   }
+});
+
+test('stateChange: the workload, its two states, the instant as ISO, the wake, the cause and who asked when known, the caller\'s event, the tags when given', () => {
+  const at = Date.UTC(2026, 9, 5, 12);
+  assert.deepEqual(stateChange({ workloadId: 'a', from: 'ASLEEP', to: 'WAKING', at, wakeId: 'w1' }), { workloadId: 'a', from: 'ASLEEP', to: 'WAKING', at: '2026-10-05T12:00:00.000Z', wakeId: 'w1' });
+  const failure = { kind: 'capacity', step: 'wake', message: 'm', at: '2026-10-05T12:00:00.000Z' };
+  const change = stateChange({ workloadId: 'a', from: 'WAKING', to: 'FAILED', at, cause: 'wake-failed', by: 'ada', event: { wakeId: 'w1', failure }, tags: { team: 'a' } });
+  assert.deepEqual(change, { workloadId: 'a', from: 'WAKING', to: 'FAILED', at: '2026-10-05T12:00:00.000Z', cause: 'wake-failed', by: 'ada', wakeId: 'w1', failure, tags: { team: 'a' } });
+  assert.deepEqual(Object.keys(stateChange({ workloadId: 'a', from: null, to: 'AWAKE', at, cause: '', by: undefined, event: {} })), ['workloadId', 'from', 'to', 'at']);
 });

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { compileRules, describeRules, parseRules } from '../src/lib/no-wake.mjs';
+import { compileRules, createRulesFor, describeRules, parseRules } from '../src/lib/no-wake.mjs';
 import { classify, clientIp } from '../src/lib/http.mjs';
 import { albEvent } from './fakes.mjs';
 
@@ -108,4 +108,19 @@ test('parseRules reads the router defaults from JSON and ignores unreadable valu
   assert.deepEqual(parseRules('{oops', (e) => errors.push(e)), []);
   assert.deepEqual(parseRules('{"name":"x"}', (e) => errors.push(e)), []);
   assert.equal(errors.length, 2);
+});
+
+test('createRulesFor compiles each level\'s list once and says an invalid rule once, not at every request (both routers\' wakers and Google Cloud\'s activity)', () => {
+  const warned = [];
+  const rulesFor = createRulesFor({ info() {}, error() {}, warn: (event, fields) => warned.push({ event, ...fields }) });
+  const rules = [{ name: 'health', pathPrefixes: ['/health'] }, { name: 'bad' }];
+  const first = rulesFor('router', rules);
+  assert.deepEqual(first.map((r) => [r.name, r.level]), [['health', 'router']]);
+  assert.equal(rulesFor('router', structuredClone(rules)), first, 'the same list is compiled once');
+  assert.notEqual(rulesFor('workload', rules), first, 'once per level');
+  assert.deepEqual(warned, [
+    { event: 'NoWakeRuleInvalid', level: 'router', rule: 'bad', reason: 'no condition' },
+    { event: 'NoWakeRuleInvalid', level: 'workload', rule: 'bad', reason: 'no condition' },
+  ]);
+  assert.deepEqual([rulesFor('router', []), rulesFor('router', undefined)], [[], []]);
 });

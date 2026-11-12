@@ -63,6 +63,15 @@ export function createPublisher({ events, busArn, router, log }) {
   };
 }
 
+// A workload's state change as both routers say it (`Workload state changed`, AWS's detail; Google Cloud's journal and its
+// `StateChanged` line): the workload, its two states, the instant (ms) as ISO, the wake, what started or ended it (`cause`) and who
+// asked (`by`) when known, then what the change's caller says of it (`event`: the failure, the wake's duration…), and the tags when
+// given. Each router adds where it runs.
+export const stateChange = ({ workloadId, from, to, at, wakeId, cause, by, event, tags }) => ({
+  workloadId, from, to, at: new Date(at).toISOString(), ...(wakeId ? { wakeId } : {}), ...(cause ? { cause } : {}), ...(by ? { by } : {}), ...event,
+  ...(tags === undefined ? {} : { tags }),
+});
+
 // A transition waits this long at most for its publish: the waker's transitions are on the path of a wake.
 export const PUBLISH_BUDGET_MS = 1000;
 
@@ -79,10 +88,7 @@ export function withTransitionEvents(store, publisher, { now = Date.now, log = n
       const next = await store.transition(workloadId, to ? { ...spec, set: { ...spec.set, stateAt: at } } : spec);
       if (next && to) {
         const from = typeof spec.cond?.state === 'string' ? spec.cond.state : null;
-        const change = {
-          workloadId, from, to, at: new Date(at).toISOString(), ...(spec.set.wakeId ? { wakeId: spec.set.wakeId } : {}),
-          ...(cause ? { cause } : {}), ...(by ? { by } : {}), ...(event ?? {}),
-        };
+        const change = stateChange({ workloadId, from, to, at, wakeId: spec.set.wakeId, cause, by, event });
         let timer;
         const slow = new Promise((resolve) => { timer = setTimeout(() => resolve('slow'), budgetMs); });
         try {

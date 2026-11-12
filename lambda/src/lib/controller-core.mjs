@@ -18,7 +18,7 @@ import { describeStopped } from './stopped.mjs';
 import { revertInstanceTypes } from './capacity.mjs';
 import { tagsProblem } from './tags.mjs';
 import { awakeStartWithin, CLOSE_START_MS, ENDED_DAYS_DEFAULT, maintenanceDue, nextEvents, normalizeSchedule, occurrenceAt, resolveJoin, scheduleProblems, withoutEnded } from './schedule.mjs';
-import { STATS_DAYS, totals, workloadSummary } from './summary.mjs';
+import { STATS_DAYS, createCount, totals, workloadSummary } from './summary.mjs';
 import { lastRequestAt } from './metrics.mjs';
 import { checkScope } from './check-scope.mjs';
 import { healthOf, lambdaMetrics, queueDepths } from './health.mjs';
@@ -1042,13 +1042,7 @@ export function createController({
     return { cleared };
   }
 
-  async function count(workloadId, counter) {
-    try {
-      await store.count(workloadId, counter);
-    } catch (err) {
-      log.warn('StatsWriteFailed', { workloadId, counter, error: err.message });
-    }
-  }
+  const count = createCount({ store, log });
 
   // Operator request from the manager: no retry delay; the wake itself runs in its own invocation.
   // inline (the work queue): the wake runs in this invocation instead of one of its own.

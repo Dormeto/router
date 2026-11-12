@@ -557,8 +557,10 @@ Design: `docs/specs/2026-10-03-mvp-alb-ec2-design.md` in the Dormeto/vision repo
 | Path | Content |
 |---|---|
 | `docs/scenarios` | The supported scenarios: diagrams, services, wake times, behavior, limits |
-| `lambda/src` | Lambda code (Node.js 24, no bundled dependency) |
+| `lambda/src` | Lambda code (Node.js 24, no bundled dependency): the entry points and the AWS clients (`aws/`) |
+| `lambda/src/lib` | Both routers' library: the AWS router's logic, and what the Google Cloud router imports from it (schedules, settings levels, waiting page, waker, rows, events, failures). No cloud SDK: each cloud passes its own store and calls. The Lambda zip and the Cloud Run image both hold it |
 | `lambda/test` | Unit tests (`node --test`) |
+| `gcp/src`, `gcp/test` | The Google Cloud router's two Cloud Run roles (waker, controller) on that library, and their unit tests |
 | `terraform/modules/router` | DynamoDB table, Lambdas, IAM, idle check schedule |
 | `terraform/modules/workload` | Waker target group and workload configuration |
 | `terraform/dev` | `dev` environment: demo VPC, ALB, EC2 on `dev.dormeto.com`, router wiring |

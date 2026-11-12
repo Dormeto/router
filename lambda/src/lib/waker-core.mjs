@@ -5,8 +5,8 @@ import { WAKE_HEADER, acceptsHtml, classify, headerValues, redirectCount, reques
 import { PAGE_CSP, languageOf, renderJson, renderPage } from './page.mjs';
 import { wakeHeaders, wakeProgress } from './page-settings.mjs';
 import { ADMIN_PREFIX, parseAdminPath } from './admin.mjs';
-import { compileRules } from './no-wake.mjs';
-import { STATS_DAYS } from './summary.mjs';
+import { createRulesFor } from './no-wake.mjs';
+import { STATS_DAYS, createCount } from './summary.mjs';
 import { createJoinLevelsCache } from './manager-settings.mjs';
 import { describedRules, effectiveConfig } from './settings-levels.mjs';
 import { isJoinMinutes, napEndHeader, napEndOf, occurrenceAt, resolveJoin } from './schedule.mjs';
@@ -18,6 +18,62 @@ const MAX_REDIRECTS = 2;
 const ROUTE_GRACE_MS = 15_000;
 // Route repairs requested from a warm waker instance: at most one per workload in this interval.
 const ENSURE_INTERVAL_MS = 10_000;
+const HTML = 'text/html; charset=utf-8';
+// What a nap window can keep a workload in.
+const KEPT_BY_NAP = [STATES.ASLEEP, STATES.NAPPING, STATES.FAILED];
+
+// What both routers' wakers say while a workload is not served (AWS's here, Google Cloud's in gcp/src/waker.mjs): a waiting view is
+// `{ state, pollSeconds, failed, napUntil, progress }`. failed: { kind, retryAt } of a failed workload (R7a), the page says why and
+// when the next attempt is; napUntil: { at, local, timeZone } of the nap window that keeps the workload asleep (at and local null: no
+// end known); progress: the wake's elapsed and typical time, in WAKING (page-settings.mjs's wakeProgress).
+
+// The nap window active now for a workload in `state`, `{ wake, until }`, or null: none unless asleep, napping or failed. A bad stored
+// schedule counts as none. The levels of joinMinutes are read only here, through the cache (createJoinLevelsCache's, or a caller's of
+// the same shape: `levels` is called on it), and not when the schedule sets its own.
+export async function napWindow({ getSchedule, levelsCache, now, log }, workloadId, state) {
+  if (!KEPT_BY_NAP.includes(state)) return null;
+  try {
+    const schedule = await getSchedule(workloadId);
+    if (!schedule) return null;
+    const joins = isJoinMinutes(schedule.joinMinutes) ? {} : await levelsCache.levels({ workloadId });
+    const t = now();
+    const occurrence = occurrenceAt(schedule, t, { joinMinutes: resolveJoin({ workload: schedule.joinMinutes, ...joins }).joinMinutes });
+    if (occurrence?.kind !== 'nap') return null;
+    return {
+      wake: occurrence.wake ?? 'never',
+      until: napEndOf(occurrence, schedule.timeZone, t),
+    };
+  } catch (err) {
+    log.warn('ScheduleSkipped', { workloadId, error: err.message });
+    return null;
+  }
+}
+
+// The waiting page's headers: no cache, the poll, the state, the nap window's end, why the workload failed and when it retries, the
+// wake's progress.
+export function waitingHeaders({ state, pollSeconds, failed = null, napUntil = null, progress = null }) {
+  return {
+    ...(napUntil ? { 'x-dormeto-nap-until': napEndHeader(napUntil) } : {}),
+    'cache-control': 'no-store', 'retry-after': String(pollSeconds), 'x-dormeto-state': state,
+    ...(failed?.kind ? { 'x-dormeto-failure': failed.kind } : {}),
+    ...(failed?.retryAt ? { 'x-dormeto-retry-at': new Date(failed.retryAt).toISOString() } : {}),
+    ...wakeHeaders(progress),
+  };
+}
+
+// What renderPage says of a waiting view at `at`: why the workload failed and in how long the next attempt is.
+const pageFields = ({ failed = null, at, ...view }) => ({
+  ...view, failure: failed?.kind, retryInMs: failed?.retryAt ? Math.max(0, failed.retryAt - at) : undefined,
+});
+
+// The branded waiting page (branded waiting page design §9) of a waiting view at `at`, with the page's headers and its status: AWS's
+// 503; Google Cloud's 200 behind a policy, 503 under a swap. `language`, `page` and `icon`, and Google Cloud's `probeUrl` and `cloud`, are
+// renderPage's. A custom page is the customer's: our policy would break it. Any other answer is ours, and so is its policy.
+export function pageResponse({ statusCode, headers, page = null, ...view }) {
+  return response(statusCode, {
+    ...headers, 'content-type': HTML, vary: 'accept-language', ...(page?.mode === 'custom' ? {} : { 'content-security-policy': PAGE_CSP }),
+  }, renderPage(pageFields({ ...view, page })));
+}
 
 // workloadIdOf(event): how a request names its workload; by default, its target group under the prefix.
 export function createWaker({ store, invokeController, prefix, workloadIdOf = (event) => workloadIdFromEvent(event, prefix), now = Date.now, sleep, newId = randomUUID, log, getAdmin, defaultRules = [], listCache = null,
@@ -35,29 +91,12 @@ export function createWaker({ store, invokeController, prefix, workloadIdOf = (e
   const servable = (run) => run.state === STATES.AWAKE && !inRouteGrace(run);
 
   // Compiled once per distinct rule list: an invalid rule is reported once, not on every request.
-  const compiled = new Map();
-  function rulesFor(level, rules) {
-    if (!rules?.length) return [];
-    const key = `${level}:${JSON.stringify(rules)}`;
-    if (!compiled.has(key)) {
-      compiled.set(key, compileRules(rules, {
-        level,
-        onInvalid: (rule, reason) => log.warn('NoWakeRuleInvalid', { level, rule: rule?.name, reason }),
-      }));
-    }
-    return compiled.get(key);
-  }
+  const rulesFor = createRulesFor(log);
   // Every level's rules, the most general first (settings at scale design §6): the first that matches decides.
   const noWakeRules = (cfg) => cfg.ruleLevels.noWake.flatMap(({ level, rules }) => rulesFor(level, rules));
 
   // Daily statistics: a failed counter update never changes the answer.
-  async function count(workloadId, counter) {
-    try {
-      await store.count(workloadId, counter);
-    } catch (err) {
-      log.warn('StatsWriteFailed', { workloadId, counter, error: err.message });
-    }
-  }
+  const count = createCount({ store, log });
 
   async function startWake(workloadId, cond, run, trigger) {
     const wakeId = newId();
@@ -166,56 +205,26 @@ export function createWaker({ store, invokeController, prefix, workloadIdOf = (e
     }
   }
 
-  // failed: { kind, retryAt } of a failed workload (R7a): the page says why and when the next attempt is.
-  // napUntil: { at, local, timeZone } of the nap window that keeps the workload asleep (at and local null: no end known).
-  // workloadId: whose settings the page reads (null: the two upper levels only); run: for the wake's elapsed and typical time.
-  // The settings are read only for the HTML page, which is answered after the wake was triggered and the hold ended.
+  // failed and napUntil: the waiting view's (above). workloadId: whose settings the page reads (null: the two upper levels only);
+  // run: for the wake's elapsed and typical time. The settings are read only for the HTML page, which is answered after the wake was
+  // triggered and the hold ended.
   async function waiter(event, pollSeconds, state, wakeHeader, failed = null, napUntil = null, { workloadId = null, run = null } = {}) {
     // Seconds since the wake started and the typical time of the workload, in WAKING (the probe's answer brings them to the page).
-    const wake = waitingPages ? wakeProgress(state, run, now()) : null;
-    const headers = {
-      ...(napUntil ? { 'x-dormeto-nap-until': napEndHeader(napUntil) } : {}),
-      'cache-control': 'no-store', 'retry-after': String(pollSeconds), 'x-dormeto-state': state,
-      ...(failed?.kind ? { 'x-dormeto-failure': failed.kind } : {}),
-      ...(failed?.retryAt ? { 'x-dormeto-retry-at': new Date(failed.retryAt).toISOString() } : {}),
-      ...wakeHeaders(wake),
-    };
+    const view = { state, pollSeconds, failed, napUntil, progress: waitingPages ? wakeProgress(state, run, now()) : null };
+    const headers = waitingHeaders(view);
     if (event.httpMethod === 'HEAD') return response(503, headers);
     if (acceptsHtml(event)) {
-      const retryInMs = failed?.retryAt ? Math.max(0, failed.retryAt - now()) : undefined;
-      const html = { ...headers, 'content-type': 'text/html; charset=utf-8' };
-      if (!waitingPages) return response(503, html, renderPage({ state, pollSeconds, failure: failed?.kind, retryInMs, napUntil }));
+      const at = now();
+      if (!waitingPages) return response(503, { ...headers, 'content-type': HTML }, renderPage(pageFields({ ...view, at })));
       const { page, icon } = await pageSettings(workloadId);
       const language = languageOf(headerValues(event, 'accept-language').join(','));
-      const body = renderPage({ state, pollSeconds, failure: failed?.kind, retryInMs, napUntil, language, page, icon, progress: wake });
-      // A custom page is the customer's: our policy would break it. Any other answer is ours, and so is its policy.
-      return response(503, { ...html, vary: 'accept-language', ...(page?.mode === 'custom' ? {} : { 'content-security-policy': PAGE_CSP }) }, body);
+      return pageResponse({ statusCode: 503, headers, ...view, at, language, page, icon });
     }
     return response(503, { ...headers, 'content-type': 'application/json' }, renderJson({ state, pollSeconds, wakeHeader, napUntil }));
   }
 
   const joinCache = levelsCache ?? createJoinLevelsCache({ router: () => store.getRouterSettings?.(), manager: () => store.getManagerSettings?.(), now, log });
-
-  // The nap window active now for a workload that is not awake, or null. A bad stored schedule counts as none. The levels
-  // of joinMinutes are read only here, kept 60 seconds, and not when the schedule sets its own.
-  async function napWindow(workloadId, run) {
-    if (![STATES.ASLEEP, STATES.NAPPING, STATES.FAILED].includes(run.state)) return null;
-    try {
-      const schedule = await store.getSchedule(workloadId);
-      if (!schedule) return null;
-      const joins = isJoinMinutes(schedule.joinMinutes) ? {} : await joinCache.levels({ workloadId });
-      const t = now();
-      const occurrence = occurrenceAt(schedule, t, { joinMinutes: resolveJoin({ workload: schedule.joinMinutes, ...joins }).joinMinutes });
-      if (occurrence?.kind !== 'nap') return null;
-      return {
-        wake: occurrence.wake ?? 'never',
-        until: napEndOf(occurrence, schedule.timeZone, t),
-      };
-    } catch (err) {
-      log.warn('ScheduleSkipped', { workloadId, error: err.message });
-      return null;
-    }
-  }
+  const napWindowPorts = { getSchedule: (workloadId) => store.getSchedule(workloadId), levelsCache: joinCache, now, log };
 
   function answer(event, cfg, run, napUntil = null, napWake = null) {
     if (run.state !== STATES.AWAKE) {
@@ -274,7 +283,7 @@ export function createWaker({ store, invokeController, prefix, workloadIdOf = (e
     let run = initial;
     const origin = () => requestOrigin(event, by ?? kind);
     // Inside a nap window nothing wakes on traffic, except the wake header when the window allows it.
-    const nap = kind === 'no-wake' ? null : await napWindow(workloadId, run);
+    const nap = kind === 'no-wake' ? null : await napWindow(napWindowPorts, workloadId, run.state);
     const napBlocks = !!nap && !(nap.wake === 'header' && by === 'header');
     if (napBlocks) {
       log.info('WakeIgnored', { workloadId, reason: 'nap window', trigger: origin() });

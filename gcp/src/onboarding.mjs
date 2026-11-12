@@ -33,6 +33,7 @@ import { nextEvents, normalizeSchedule, resolveJoin, scheduleProblems } from '..
 import { describedRules, SCALAR_KEYS } from '../../lambda/src/lib/settings-levels.mjs';
 import { mergedRouterSettings, resolvedSettings, routerSettingsView, withSettings, writtenRouterView } from '../../lambda/src/lib/settings-writes.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
+import { fallbacksOf } from '../../lambda/src/lib/summary.mjs';
 import { tagsProblem } from '../../lambda/src/lib/tags.mjs';
 import { companionRead, INSTANCE_NAME, isCompanion, statusOf } from './cloudsql.mjs';
 import { groupOf, PauseRefused } from './controller-core.mjs';
@@ -211,10 +212,8 @@ function hibernationOf(cfg, router, organization) {
   };
 }
 
-// The VMs a wake left on a fallback machine type, in AWS's shape (lambda/src/lib/summary.mjs's fallbacksOf): `[{ instance, from, to }]`,
-// `from` its own type, `to` the one it runs on, from the run's `instanceTypes` (AWS's field: `{ <vm>: { from, to } }`, a map here).
-const fallbacksOf = (run) => Object.entries(run?.instanceTypes ?? {}).map(([instance, { from, to }]) => ({ instance, from, to }));
-
+// The REST Workload's failure (what CLI 0.11.0 reads): `at` only when the record has one, unlike the row's (lambda/src/lib/summary.mjs's
+// failureOf). Its `fallbacks` are the row's (summary.mjs's fallbacksOf).
 function failureOf(run) {
   if (!run?.failure) return null;
   try {

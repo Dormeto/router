@@ -4,7 +4,7 @@
 // the no-wake rules of every level (vision docs/specs/2026-11-08-google-cloud-router-features-design.md, section 4.4). A request the
 // waker defers (a deferred list, browser mode) is activity: a visitor's browser behind it wakes the workload through the page's probe.
 import { classify } from '../../lambda/src/lib/http.mjs';
-import { compileRules } from '../../lambda/src/lib/no-wake.mjs';
+import { createRulesFor } from '../../lambda/src/lib/no-wake.mjs';
 import { eventOf } from './waker.mjs';
 
 // A logged request as the waker's event: the user agent a header, and the logged address the client's, the last X-Forwarded-For
@@ -20,20 +20,9 @@ export function activityOf(requests, { lists = [], rules = [] } = {}) {
 }
 
 // A workload's no-wake rules as the waker gets them (lambda/src/lib/waker-core.mjs): every level of the resolved configuration's
-// `ruleLevels`, the most general first, each list compiled once per instance. An invalid rule is skipped, so that its requests are
-// activity (more wakes, never fewer), and said once.
+// `ruleLevels`, the most general first, each list compiled once per instance (no-wake.mjs's createRulesFor). An invalid rule is
+// skipped, so that its requests are activity (more wakes, never fewer), and said once.
 export function createNoWakeRules(log) {
-  const compiled = new Map();
-  function rulesFor(level, rules) {
-    if (!rules?.length) return [];
-    const key = `${level}:${JSON.stringify(rules)}`;
-    if (!compiled.has(key)) {
-      compiled.set(key, compileRules(rules, {
-        level,
-        onInvalid: (rule, reason) => log.warn('NoWakeRuleInvalid', { level, rule: rule?.name, reason }),
-      }));
-    }
-    return compiled.get(key);
-  }
+  const rulesFor = createRulesFor(log);
   return (cfg) => (cfg.ruleLevels?.noWake ?? []).flatMap(({ level, rules }) => rulesFor(level, rules));
 }

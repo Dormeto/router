@@ -117,11 +117,32 @@ async function answers() {
   racing.store.putConfig = async () => false;
   await ask('rename racing an offboarding', racing, refusing({ action: 'rename', workloadId: 'demo', name: 'a', by: 'ann' }));
   await ask('settings racing an offboarding', racing, refusing({ action: 'settings', workloadId: 'demo', settings: { idleMinutes: 30 }, by: 'ann' }));
+
+  // Pauses (lib/pauses.mjs): a workload's, an exclusion's and the router's, their refusals and resumes (B4, B5).
+  const pausing = router({ run: { state: STATES.ASLEEP, stateAt: 1 } });
+  await ask('pause of a workload, asleep', pausing, refusing({ action: 'pause', workloadId: 'demo', reason: 'deploy', until: pausing.clock.now() + 3_600_000, by: 'ops' }));
+  await ask('pause, no reason', pausing, refusing({ action: 'pause', workloadId: 'demo', by: 'ops' }));
+  await ask('pause, an until past', pausing, refusing({ action: 'pause', workloadId: 'demo', reason: 'r', until: 1, by: 'ops' }));
+  await ask('pause of an unknown workload', pausing, refusing({ action: 'pause', workloadId: 'nope', reason: 'r', by: 'ops' }));
+  await ask('pause of an exclusion, another target group', pausing, refusing({ action: 'pause', workloadId: 'demo', reason: 'excluded', exclusionId: 'x1', targetGroupArn: 'arn:aws:elasticloadbalancing:eu-west-1:1:targetgroup/other/1', by: 'mgr' }));
+  await ask('pause of an exclusion', pausing, refusing({ action: 'pause', workloadId: 'demo', reason: 'excluded', exclusionId: 'x1', targetGroupArn: testConfig().appTargetGroupArn, by: 'mgr' }));
+  await ask('pause of the router, keeping asleep', pausing, refusing({ action: 'pause', reason: 'freeze', keepAsleep: true, by: 'adm' }));
+  await ask('status, paused', pausing, refusing({ action: 'status', workloadId: 'demo' }));
+  await ask('resume of an exclusion', pausing, refusing({ action: 'resume', workloadId: 'demo', exclusionId: 'x1', by: 'mgr' }));
+  await ask('resume of a workload', pausing, refusing({ action: 'resume', workloadId: 'demo', by: 'ops' }));
+  await ask('resume of a workload, none left', pausing, refusing({ action: 'resume', workloadId: 'demo', by: 'ops' }));
+  await ask('resume of the router', pausing, refusing({ action: 'resume', by: 'adm' }));
+  await ask('resume of an unknown workload', pausing, refusing({ action: 'resume', workloadId: 'nope', by: 'ops' }));
+  await ask('resume of an unknown workload\'s exclusion', pausing, refusing({ action: 'resume', workloadId: 'nope', exclusionId: 'x1', by: 'mgr' }));
+  await ask('pause of the router, waking', pausing, refusing({ action: 'pause', reason: 'freeze', by: 'adm' }));
+  // Google Cloud's journal: an action an AWS router does not serve.
+  await ask('events', pausing, refusing({ action: 'events', after: null, limit: 10 }));
+  await ask('events, thrown', pausing, { action: 'events', after: null, limit: 10 });
   return found;
 }
 
-// One case a line: its label, and the answer as JSON holds it.
-const written = (found) => `{\n${found.map(([label, answer]) => `  ${JSON.stringify(label)}: ${JSON.stringify(answer)}`).join(',\n')}\n}\n`;
+// One key a line, each case under its label: a rewrite's diff names the key that changed.
+const written = (found) => `${JSON.stringify(Object.fromEntries(found), null, 1)}\n`;
 
 test('the AWS router answers the manager as its stored answers say, keys in order, absent and null as they are', async () => {
   const found = await answers();

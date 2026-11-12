@@ -29,6 +29,11 @@ function router(change) {
   Object.assign(config, { version: '0.40.0', build: 'b7' });
   Object.assign(store, {
     manager: null,
+    events: [],
+    listEvents: async ({ after = null, limit }) => {
+      const events = store.events.filter((e) => after === null || e.id > after).slice(0, limit);
+      return { events: structuredClone(events), next: events.length === limit ? events.at(-1).id : null };
+    },
     getManagerSettings: async () => structuredClone(store.manager),
     putManagerSettings: async (doc) => { store.manager = structuredClone(doc); },
     getStats: async (id, days) => ({ days, since: '2023-11-08', today: NO_COUNTS(), total: NO_COUNTS() }),
@@ -147,11 +152,49 @@ async function answers() {
   await act('rename racing an offboarding', racing, { action: 'rename', workloadId: 'demo', name: 'a', by: 'ann', refusals: true });
   await act('settings racing an offboarding', racing, { action: 'settings', workloadId: 'demo', settings: { idleMinutes: 30 }, by: 'ann', refusals: true });
   await rest('REST settings racing an offboarding', racing, 'PUT', '/v1/workloads/demo/settings', { idleMinutes: 30 });
+
+  // Pauses (lambda/src/lib/pauses.mjs): a workload's, an exclusion's and the router's, their refusals and resumes, through the actions
+  // and the REST routes (B4, B5).
+  const pausing = router();
+  await rest('REST onboard, to pause', pausing, 'POST', '/v1/workloads', INPUT);
+  pausing.store.runs.get('demo').state = STATES.ASLEEP;
+  await both('pause of a workload, asleep', pausing, { action: 'pause', workloadId: 'demo', reason: 'deploy', until: new Date(pausing.clock.now() + 3_600_000).toISOString(), by: 'ops' });
+  await both('pause, no reason', pausing, { action: 'pause', workloadId: 'demo', by: 'ops' });
+  await both('pause of an unknown workload', pausing, { action: 'pause', workloadId: 'nope', reason: 'r', by: 'ops' });
+  await both('pause of an exclusion, another backend service', pausing, { action: 'pause', workloadId: 'demo', reason: 'excluded', exclusionId: 'x1', backendService: 'projects/p/global/backendServices/other', by: 'mgr' });
+  await both('pause, a target group', pausing, { action: 'pause', workloadId: 'demo', reason: 'r', exclusionId: 'x1', targetGroupArn: 'arn:aws:elasticloadbalancing:eu-west-1:1:targetgroup/demo/1', by: 'mgr' });
+  await act('pause of an exclusion', pausing, { action: 'pause', workloadId: 'demo', reason: 'excluded', exclusionId: 'x1', backendService: 'projects/p/global/backendServices/app', by: 'mgr', refusals: true });
+  await act('pause of the router, keeping asleep', pausing, { action: 'pause', reason: 'freeze', keepAsleep: true, by: 'adm', refusals: true });
+  await rest('REST workload, paused', pausing, 'GET', '/v1/workloads/demo');
+  await act('resume of an exclusion', pausing, { action: 'resume', workloadId: 'demo', exclusionId: 'x1', by: 'mgr', refusals: true });
+  await act('resume of a workload', pausing, { action: 'resume', workloadId: 'demo', by: 'ops', refusals: true });
+  await act('resume of a workload, none left', pausing, { action: 'resume', workloadId: 'demo', by: 'ops', refusals: true });
+  await act('resume of the router', pausing, { action: 'resume', by: 'adm', refusals: true });
+  await both('resume of an unknown workload', pausing, { action: 'resume', workloadId: 'nope', by: 'ops' });
+  await act('resume of an unknown workload\'s exclusion', pausing, { action: 'resume', workloadId: 'nope', exclusionId: 'x1', by: 'mgr', refusals: true });
+  await rest('REST pause of a workload', pausing, 'POST', '/v1/workloads/demo/pause', { reason: 'load test', by: 'ops' });
+  await rest('REST resume of a workload', pausing, 'POST', '/v1/workloads/demo/resume', { by: 'ops' });
+  await rest('REST pause of the router', pausing, 'POST', '/v1/pause', { reason: 'freeze', by: 'adm' });
+  await rest('REST resume of the router', pausing, 'POST', '/v1/resume', { by: 'adm' });
+
+  // The journal (§5.3): none yet, then after a check, a page and the next; a record holding only where the next check starts; refusals.
+  const journal = router();
+  await both('events, none', journal, { action: 'events', after: null, limit: 10 });
+  await rest('REST onboard, to journal', journal, 'POST', '/v1/workloads', INPUT);
+  await rest('REST check', journal, 'POST', '/v1/check');
+  journal.store.events = [{ id: '1700000000000-demo-ASLEEP', workloadId: 'demo', state: 'ASLEEP' }, { id: '1700000001000-demo-WAKING', workloadId: 'demo', state: 'WAKING' }];
+  journal.store.manager = { settings: { workloads: { hibernate: false } }, etag: '"e1"', at: 1 };
+  await act('events, a page', journal, { action: 'events', after: null, limit: 1, refusals: true });
+  await act('events, the next page', journal, { action: 'events', after: '1700000000000-demo-ASLEEP', limit: 500, refusals: true });
+  journal.store.router.check = { cursor: 'demo' };
+  await act('events, a record of the cursor alone', journal, { action: 'events', after: null, limit: 10, refusals: true });
+  await both('events, a limit out of range', journal, { action: 'events', after: null, limit: 501 });
+  await both('events, an after that is no event', journal, { action: 'events', after: 'x', limit: 10 });
   return found;
 }
 
-// One case a line: its label, and the answer as JSON holds it.
-const written = (found) => `{\n${found.map(([label, answer]) => `  ${JSON.stringify(label)}: ${JSON.stringify(answer)}`).join(',\n')}\n}\n`;
+// One key a line, each case under its label: a rewrite's diff names the key that changed.
+const written = (found) => `${JSON.stringify(Object.fromEntries(found), null, 1)}\n`;
 
 test('the Google Cloud router answers the manager\'s actions and the CLI\'s REST routes as its stored answers say, keys in order, absent and null as they are', async () => {
   const found = await answers();

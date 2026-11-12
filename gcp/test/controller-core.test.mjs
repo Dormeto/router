@@ -3755,6 +3755,36 @@ test('routerInfo and the check\'s summary show the router pause as AWS\'s answer
   assert.deepEqual(t.store.state.check.pauses, [shown]);
 });
 
+test('routerInfo and the check\'s summary, which the events action returns, hold the router\'s pause alone: a workload\'s own or an exclusion\'s is in neither', async () => {
+  const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
+  pauseFor(t);
+  pauseFor(t, { by: 'mgr', reason: 'excluded: batch', exclusionId: 'x1' });
+  routerPauseFor(t, { by: 'adm', reason: 'freeze' });
+  const shown = [{ scope: 'router', by: 'adm', at: new Date(START - 1000).toISOString(), reason: 'freeze', until: null, keepAsleep: false }];
+  assert.deepEqual((await t.controller.routerInfo()).pauses, shown);
+  await t.controller.check();
+  assert.deepEqual(t.store.state.check.pauses, shown);
+});
+
+test('a router pause wakes its workloads 8 at a time, as the check reads them, never one by one', async () => {
+  const t = setup();
+  const ids = Array.from({ length: 20 }, (_, i) => `w${String(i).padStart(2, '0')}`);
+  t.store.listConfigs = async () => ids.map((workloadId) => ({ workloadId }));
+  const { getRun } = t.store;
+  let running = 0;
+  let most = 0;
+  t.store.getRun = async (id) => {
+    if (!ids.includes(id)) return getRun(id);
+    running += 1;
+    most = Math.max(most, running);
+    await new Promise((resolve) => { setImmediate(resolve); });
+    running -= 1;
+    return null;
+  };
+  assert.deepEqual((await t.controller.pause(null, { reason: 'freeze', by: 'ops' })).woken, []);
+  assert.equal(most, 8);
+});
+
 // --- IP lists --------------------------------------------------------------------------------------------------------
 
 const LISTS = [{ name: 'scanners', url: 'https://lists.example/scanners.txt', action: 'ignore', refreshHours: 24 }];

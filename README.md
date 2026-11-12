@@ -232,10 +232,7 @@ through the embedded metric format of the log lines: no API call, about 0.30 USD
 automatic resume (`until`, at most 366 days ahead). A paused workload, or every workload of a paused router, is never
 napped: the idle check skips it and a nap request is refused (`SKIPPED`, reason `paused`, also when the pause arrives
 during the drain); the reconcile still runs and requests still wake. Pausing wakes the asleep and failed workloads (a
-napping one gets a pending wake) unless `keepAsleep`, and its answer's `woken` lists the wakes this pause started or set,
-a router pause's queued wakes among them. Resuming a workload the router does not know is refused (`not_found`:
-`workload not configured: <id>`), and an exclusion's lift of one answers `{ "resumed": false }`. Not released yet:
-router 0.40.0, for `woken` and the refused resume. Pauses live in the state table (`ROUTER / PAUSE`,
+napping one gets a pending wake) unless `keepAsleep`. Pauses live in the state table (`ROUTER / PAUSE`,
 `WL#<id> / PAUSE`, and `WL#<id> / PAUSE#<exclusion>` for a manager exclusion), never in the configuration item that
 Terraform writes; an expired pause no longer counts and the next idle check deletes it (`PauseExpired`). The manager
 pauses and resumes from its Routers and workload views:
@@ -244,6 +241,10 @@ pauses and resumes from its Routers and workload views:
 aws lambda invoke --function-name dmt-dev-controller --cli-binary-format raw-in-base64-out --payload '{"action":"pause","workloadId":"demo","by":"ops@example.com","reason":"load test","until":"2026-10-06T08:00:00Z"}' /dev/stdout
 aws lambda invoke --function-name dmt-dev-controller --cli-binary-format raw-in-base64-out --payload '{"action":"resume","workloadId":"demo","by":"ops@example.com"}' /dev/stdout
 ```
+
+A pause's answer lists in `woken` the wakes this pause started or set, a router pause's queued wakes among them. Resuming a
+workload the router does not know is refused (`not_found`: `workload not configured: <id>`), and an exclusion's lift of one
+answers `{ "resumed": false }`. Not released yet: router 0.40.0.
 
 **Schedules (router 0.31.0):** weekly awake and nap windows per workload, and a maximum nap. A schedule is an
 operational record like a pause, stored in the state table (`WL#<id> / SCHEDULE`), set by the manager (dashboard, API,

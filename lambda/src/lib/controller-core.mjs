@@ -61,12 +61,14 @@ const NAP_RECHECK_MS = 60_000;
 // A rule switch throttled by ELB (its bucket of mutating calls) is tried again this long (a burst of wakes).
 const ROUTE_RETRY_MS = 180_000;
 
-// The pauses' store (lib/pauses.mjs) on the DynamoDB one, whose delete takes away whatever is there: whether a resume removed a pause
-// is read first.
+// The pauses' store (lib/pauses.mjs) on the DynamoDB one.
 export const pauseStore = (store) => ({
   listPauses: () => store.listPauses(),
   getPauses: (workloadId) => store.getPauses(workloadId),
   putPause: (workloadId, record) => store.putPause(workloadId, record),
+  // Two deletes, told apart by `at`. With it, the expiry's: DynamoDB's delete conditional on that time, false for a newer pause.
+  // Without it, a resume's: DynamoDB deletes whatever is there without saying whether there was anything, so the pause is read
+  // first, false when there is none.
   async deletePause(workloadId, { exclusionId, at } = {}) {
     if (at !== undefined) return store.deletePause(workloadId, { exclusionId, at });
     if (!(await store.getPauses(workloadId)).some((p) => (p.exclusionId ?? null) === (exclusionId ?? null))) return false;
@@ -973,19 +975,24 @@ export function createController({
 
   const count = createCount({ store, log });
 
-  // Operator request from the manager: no retry delay; the wake itself runs in its own invocation.
-  // inline (the work queue): the wake runs in this invocation instead of one of its own.
-  async function forceWake(workloadId, by, kind = 'manager', { inline = false } = {}) {
+  // A wake asked by an operator (the manager, the work queue, a pause), whatever the retry delay: an asleep or failed workload's
+  // started, a napping one's pending wake set. `answer`: force-wake's; `woke`: whether this call started the wake or set the
+  // pending wake (a pause's woken, B5 of the cloud duplication design). inline (the work queue): the wake runs in this invocation
+  // instead of one of its own.
+  async function askedWake(workloadId, by, kind, { inline = false } = {}) {
     await config(workloadId);
     const run = await store.getRun(workloadId);
     if (run?.state === STATES.ASLEEP || run?.state === STATES.FAILED) {
-      return (await startWake(workloadId, run, by, kind, { inline })) ?? { state: (await store.getRun(workloadId))?.state };
+      const started = await startWake(workloadId, run, by, kind, { inline });
+      return { woke: started !== null, answer: started ?? { state: (await store.getRun(workloadId))?.state } };
     }
-    if (run?.state === STATES.NAPPING) {
-      await pendingWake(workloadId, by, kind);
-      return { state: STATES.NAPPING, pendingWake: true };
-    }
-    return { state: run?.state };
+    if (run?.state === STATES.NAPPING) return { woke: await pendingWake(workloadId, by, kind), answer: { state: STATES.NAPPING, pendingWake: true } };
+    return { woke: false, answer: { state: run?.state } };
+  }
+
+  // Operator request from the manager: no retry delay; the wake itself runs in its own invocation (inline: in this one).
+  async function forceWake(workloadId, by, kind = 'manager', { inline = false } = {}) {
+    return (await askedWake(workloadId, by, kind, { inline })).answer;
   }
 
   // The wake of an asleep or failed workload from the run read, null when its state changed since. set: more of the run
@@ -1172,11 +1179,7 @@ export function createController({
       await queueWork({ action: 'wake', workloadId, by, kind: 'pause' });
       return true;
     }
-    await config(workloadId);
-    const run = await store.getRun(workloadId);
-    if (run?.state === STATES.ASLEEP || run?.state === STATES.FAILED) return (await startWake(workloadId, run, by, 'pause')) !== null;
-    if (run?.state === STATES.NAPPING) return pendingWake(workloadId, by, 'pause');
-    return false;
+    return (await askedWake(workloadId, by, 'pause')).woke;
   }
   const pausing = createPauses({ store: pauseStore(store), wake: pauseWake, refuse: (message) => new Refusal('invalid', message), now, log });
   const { expired, shownPauses, pausesFor, isPaused, activePauses } = pausing;

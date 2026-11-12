@@ -66,7 +66,7 @@ import { createScheduleCheck, scheduleKeeps } from '../../lambda/src/lib/check-s
 import { runCheck } from '../../lambda/src/lib/check-run.mjs';
 import { ENDED_DAYS_DEFAULT } from '../../lambda/src/lib/schedule.mjs';
 import { DAY_MS, STATES, utcDay } from '../../lambda/src/lib/state.mjs';
-import { routerAnswer } from '../../lambda/src/lib/manager-actions.mjs';
+import { readActivePauses, routerAnswer } from '../../lambda/src/lib/manager-actions.mjs';
 import { createListRefresher, requestListRefresh as askListRefresh } from '../../lambda/src/lib/list-refresh.mjs';
 import { createLevelsReader } from '../../lambda/src/lib/settings-levels.mjs';
 import { createCount } from '../../lambda/src/lib/summary.mjs';
@@ -1563,11 +1563,7 @@ export function createController({
     const t = now();
     const { configs } = await store.listWorkloads();
     const [{ byState, lastActivity }, checked, level] = await Promise.all([stateCounts(configs), store.getCheck?.().catch(() => null), routerLevel()]);
-    let pausesError;
-    const pauses = await store.listPauses().then((all) => all.filter((p) => !expired(p))).catch((err) => {
-      pausesError = err.message;
-      return [];
-    });
+    const { pauses, pausesError } = await readActivePauses({ store, expired });
     const { health, ipLists, manager } = await healthSummary({ t, byState, lastScheduledCheckAt: checked?.lastScheduledCheckAt ?? null, pausesError, managerState: level.managerState });
     return routerAnswer({
       router: { name: `dmtr-${config.region}`, version: config.version ?? null, build: config.build ?? null },

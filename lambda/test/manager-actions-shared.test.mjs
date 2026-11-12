@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { askedWake, triggerOf } from '../src/lib/asked-wake.mjs';
-import { listRouter, routerAnswer, rowPauses, scheduleView } from '../src/lib/manager-actions.mjs';
+import { listRouter, readActivePauses, routerAnswer, rowPauses, scheduleView } from '../src/lib/manager-actions.mjs';
 import { STATES } from '../src/lib/state.mjs';
 import { managerActionsContract } from './manager-actions-contract.mjs';
 import { fakeStore, testConfig } from './fakes.mjs';
@@ -41,6 +41,13 @@ test('the list\'s router line in the released order, its pauses\' error only whe
   assert.deepEqual(listRouter({ ...line, pausesError: 'throttled' }), { ...line, pausesError: 'throttled' });
   const pauses = [{ workloadId: 'a' }, { workloadId: 'b', exclusionId: 'x' }, { workloadId: null }, { workloadId: 'b' }];
   assert.deepEqual(rowPauses(pauses, 'b'), [pauses[1], pauses[2], pauses[3]]);
+});
+
+test('the pauses in force a router answer reads: the expired ones left out; unreadable, none and the error, nothing said', async () => {
+  const pauses = [{ workloadId: null, until: AT - 1 }, { workloadId: 'a' }, { workloadId: 'b', until: AT + 1 }];
+  const expired = (p) => p.until !== undefined && p.until <= AT;
+  assert.deepEqual(await readActivePauses({ store: { listPauses: async () => pauses }, expired }), { pauses: [pauses[1], pauses[2]] });
+  assert.deepEqual(await readActivePauses({ store: { listPauses: async () => { throw new Error('throttled'); } }, expired }), { pauses: [], pausesError: 'throttled' });
 });
 
 test('a schedule\'s view reads its join levels once it is shown: a time that is none throws first; its next events with the join in force', async () => {

@@ -7,25 +7,24 @@ import { STATES } from './state.mjs';
 export const triggerOf = (kind, by) => ({ trigger: { kind, by } });
 
 // The run to WAKING from the state read (`from`), its cause `kind` and who asked (`by`, in its event), `set`: more of the run written
-// with it (the schedule's occurrence it applies). The wake's id, said in WakeRequested; null when the state changed meanwhile. The
-// ports: `transition` (the cloud's: Google Cloud's adds the tags and its StateChanged line), `newId`, `now`, `log`, and `said(kind,
-// by)`, the fields that line names who asked with.
-export async function beginWake({ transition, newId, now, log, said = triggerOf }, workloadId, from, { kind, by, set = {} } = {}) {
+// with it (the schedule's occurrence it applies). The wake's id, said in WakeRequested with its trigger; null when the state changed
+// meanwhile. The ports: `transition` (the cloud's: Google Cloud's adds the tags and its StateChanged line), `newId`, `now`, `log`.
+export async function beginWake({ transition, newId, now, log }, workloadId, from, { kind, by, set = {} } = {}) {
   const wakeId = newId();
   const next = await transition(workloadId, {
     cond: { state: from }, set: { ...set, state: STATES.WAKING, wakeId, wakeStartedAt: now() }, remove: ['failedAt'], increment: ['wakeCount'], cause: kind,
     ...(by ? { by } : {}),
   });
   if (!next) return null;
-  log.info('WakeRequested', { workloadId, wakeId, ...said(kind, by) });
+  log.info('WakeRequested', { workloadId, wakeId, ...triggerOf(kind, by) });
   return wakeId;
 }
 
 // A napping workload's pending wake (its nap ends awake): true when this call set it, one PendingWake line and one counted wake per
 // pending wake. `count`: summary.mjs's createCount.
-export async function pendingWake({ store, count, log, said = triggerOf }, workloadId, { kind, by } = {}) {
+export async function pendingWake({ store, count, log }, workloadId, { kind, by } = {}) {
   if (!(await store.setPendingWake(workloadId))) return false;
-  log.info('PendingWake', { workloadId, ...said(kind, by) });
+  log.info('PendingWake', { workloadId, ...triggerOf(kind, by) });
   await count(workloadId, `wake:${kind}`);
   return true;
 }

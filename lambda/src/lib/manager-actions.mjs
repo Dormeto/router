@@ -74,6 +74,15 @@ export async function readPauses({ store, log }) {
   }
 }
 
+// The pauses in force as a router answer reads them (pauses.mjs's `expired`): unreadable, none and the error, which its health says.
+export async function readActivePauses({ store, expired }) {
+  try {
+    return { pauses: (await store.listPauses()).filter((p) => !expired(p)) };
+  } catch (err) {
+    return { pauses: [], pausesError: err.message };
+  }
+}
+
 // A row's pauses: its own (an exclusion's among them) and the router's.
 export const rowPauses = (pauses, workloadId) => pauses.filter((p) => p.workloadId === workloadId || p.workloadId === null);
 

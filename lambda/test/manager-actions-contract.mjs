@@ -315,11 +315,6 @@ export function managerActionsContract(cloud, setup) {
       // The state read is no longer the run's: nothing written, nothing said.
       assert.equal(await beginWake(ports, 'demo', state, { kind: 'pause' }), null);
       assert.equal(h.logged('WakeRequested').length, 1);
-      // A cloud that names who asked its own way.
-      const other = await harness({ run: { state } });
-      const said = { ...ports, transition: (id, change) => other.store.transition(id, change), log: { info: (event, data) => other.logs.push([event, data]) }, said: (kind, by) => ({ reason: kind, by }) };
-      await beginWake(said, 'demo', state, { kind: 'pause', by: 'ops' });
-      assert.deepEqual(other.logged('WakeRequested'), [{ workloadId: 'demo', wakeId: 'w1', reason: 'pause', by: 'ops' }]);
     }
   });
 

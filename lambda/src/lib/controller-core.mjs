@@ -29,7 +29,7 @@ import { joinLevels } from './manager-settings.mjs';
 import { createLevelsReader, describedRules, effectiveConfig } from './settings-levels.mjs';
 import { resolvedSettings, withSettings } from './settings-writes.mjs';
 import { askedWake, beginWake, pendingWake as setPendingWake } from './asked-wake.mjs';
-import { createManagerActions, listRouter, readPauses, routerAnswer, rowPauses, scheduleView } from './manager-actions.mjs';
+import { createManagerActions, listRouter, readActivePauses, readPauses, routerAnswer, rowPauses, scheduleView } from './manager-actions.mjs';
 import { requestListRefresh as askListRefresh } from './list-refresh.mjs';
 import {
   backendKey, backendStatuses, isCompanion, resolveBackends, resumeBackends, sleepBackends, startCompanions, stopCompanions, toRecord, wakeBackends,
@@ -1150,11 +1150,7 @@ export function createController({
     const needed = (measured.lambda?.waker?.peakConcurrency ?? 0) + HEADROOM;
     const worstCase = configs.reduce((n, c, i) => n + (runs[i]?.state === STATES.AWAKE ? 0 : c.maxHolders ?? 0), 0) + HEADROOM;
     const concurrency = measured.limit && (measured.limit.error ? { error: measured.limit.error } : { limit: measured.limit.limit, needed, worstCase });
-    let pausesError;
-    const pauses = await store.listPauses().then((all) => all.filter((p) => !expired(p))).catch((err) => {
-      pausesError = err.message;
-      return [];
-    });
+    const { pauses, pausesError } = await readActivePauses({ store, expired });
     const byState = {};
     for (const run of runs) byState[run?.state ?? 'UNKNOWN'] = (byState[run?.state ?? 'UNKNOWN'] ?? 0) + 1;
     const updated = runs.map((run) => run?.updatedAt ?? 0).filter((ms) => ms > 0);

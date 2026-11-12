@@ -2607,29 +2607,36 @@ test('a release that fails stays failed, logged, for the next check to ask again
   assert.equal(t.logged('ReleaseFailed').length, 1);
 });
 
-// B1 (vision docs/specs/2026-11-12-cloud-duplication-design.md, §4): AWS's rotation, the cursor in the check's summary.
-test('the check stops at its 240 s and the next one starts after the last workload it checked, so every workload is checked in turn; one workload\'s failure does not stop the others', async () => {
+// B1 (vision docs/specs/2026-11-12-cloud-duplication-design.md, §4): AWS's rotation, the cursor stored right after the loop and in
+// the check's summary. A router of `ids`, each workload's check taking `costMs` (100 s: 8 started together, a check of 240 s reaches 8);
+// the store keeps router/check as Firestore does: the summary replaced whole, the cursor written alone (setCheckCursor); `change`
+// replaces store methods. `check()` is one check every 5 minutes, as the schedule starts them, with the workloads it reached.
+function rotating({ ids = Array.from({ length: 12 }, (_, i) => `w${String(i).padStart(2, '0')}`), change = {} } = {}) {
   const clock = fakeClock();
-  const ids = Array.from({ length: 12 }, (_, i) => `w${String(i).padStart(2, '0')}`);
   const logs = [];
-  const log = { info() {}, error: (event, fields) => logs.push({ event, ...fields }), warn: (event, fields) => logs.push({ event, ...fields }) };
-  // Each workload's check takes 100 s, 8 started together: a check of 240 s reaches 8 of the 12.
-  let costMs = 100_000;
+  const log = { info: (event, fields) => logs.push({ event, ...fields }), error: (event, fields) => logs.push({ event, ...fields }), warn: (event, fields) => logs.push({ event, ...fields }) };
+  const world = { costMs: 100_000, ids: [...ids], record: null, cursorWrites: [], reads: new Map() };
   const compute = {
-    getInstance: async () => { clock.advance(costMs); return { status: 'RUNNING' }; },
+    getInstance: async () => { clock.advance(world.costMs); return { status: 'RUNNING' }; },
     getBackendService: async () => ({ backends: [] }),
   };
-  let summary = null;
   const store = {
-    listWorkloads: async () => ({ configs: [...ids].reverse().map((workloadId) => ({ workloadId, urlMap: 'lb', backendService: 'app', wakerBackendService: WAKER, backends: [VM_A], idleMinutes: 15, wakeTimeoutSeconds: 600 })), schedules: new Map() }),
+    listWorkloads: async () => ({ configs: [...world.ids].reverse().map((workloadId) => ({ workloadId, urlMap: 'lb', backendService: 'app', wakerBackendService: WAKER, backends: [VM_A], idleMinutes: 15, wakeTimeoutSeconds: 600 })), schedules: new Map() }),
     listPauses: async () => [],
-    getConfig: async (workloadId) => ({ workloadId }),
+    getConfig: async (workloadId) => (world.ids.includes(workloadId) ? { workloadId } : null),
     getRun: async (id) => {
+      world.reads.set(id, (world.reads.get(id) ?? 0) + 1);
       if (id === 'w01') throw new Error('unreadable');
       return { state: STATES.AWAKE, awakeSince: clock.now() };
     },
-    getCheck: async () => summary && fromFields(toFields(summary)),
-    putCheck: async (written) => { summary = written; },
+    getCheck: async () => world.record && fromFields(toFields(world.record)),
+    putCheck: async (written) => { world.record = structuredClone(written); },
+    setCheckCursor: async (cursor) => {
+      world.cursorWrites.push(cursor);
+      const { cursor: gone, ...rest } = world.record ?? {};
+      world.record = cursor ? { ...rest, cursor } : rest;
+    },
+    ...change,
   };
   const controller = createController({
     store,
@@ -2642,37 +2649,93 @@ test('the check stops at its 240 s and the next one starts after the last worklo
     sleep: clock.sleep,
     log,
   });
-  const N = 12;
-  const k = 8;
-  const counts = new Map(ids.map((id) => [id, 0]));
-  const checks = [];
-  // Every 5 minutes, as the schedule starts it.
   const check = async () => {
     const out = await controller.check();
-    for (const r of out) counts.set(r.workloadId, counts.get(r.workloadId) + 1);
-    checks.push({ reached: out.map((r) => r.workloadId).sort(), cursor: summary?.cursor ?? null });
     clock.advance(5 * MINUTE);
-    return out;
+    return out.map((r) => r.workloadId).sort();
   };
-  const first = await check();
-  assert.match(first.find((r) => r.workloadId === 'w01').error, /unreadable/);
-  assert.equal(logs.find((l) => l.event === 'CheckFailed').workloadId, 'w01');
-  while (checks.length < Math.ceil(N / k) + 1 && [...counts.values()].some((n) => n === 0)) await check();
-  assert.ok(checks.length <= Math.ceil(N / k) + 1, `${checks.length} checks`);
+  return { world, store, controller, clock, logs, check, logged: (event) => logs.filter((l) => l.event === event) };
+}
+const N = 12;
+const PER_CHECK = 8;
+const twelveIds = Array.from({ length: N }, (_, i) => `w${String(i).padStart(2, '0')}`);
+
+test('the check stops at its 240 s and the next one starts after the last workload it checked, so every workload is checked in turn; one workload\'s failure does not stop the others', async () => {
+  const r = rotating();
+  const counts = new Map(twelveIds.map((id) => [id, 0]));
+  const checks = [];
+  const check = async () => {
+    const reached = await r.check();
+    for (const id of reached) counts.set(id, counts.get(id) + 1);
+    checks.push({ reached, cursor: r.world.record?.cursor ?? null });
+  };
+  await check();
+  assert.equal(r.logged('CheckFailed')[0].workloadId, 'w01');
+  assert.match(r.logged('CheckFailed')[0].error, /unreadable/);
+  while (checks.length < Math.ceil(N / PER_CHECK) + 1 && [...counts.values()].some((n) => n === 0)) await check();
+  assert.ok(checks.length <= Math.ceil(N / PER_CHECK) + 1, `${checks.length} checks`);
   assert.deepEqual([...counts.keys()].filter((id) => counts.get(id) === 0), [], 'every workload checked');
   // The eight first start together, none after 240 s; the summary says where the next check starts: after the last one checked.
-  assert.deepEqual(checks[0], { reached: ids.slice(0, 8), cursor: 'w07' });
-  assert.deepEqual(checks[1], { reached: [...ids.slice(0, 4), ...ids.slice(8)], cursor: 'w03' });
-  assert.deepEqual(logs.filter((l) => l.event === 'CheckBudgetReached').map(({ checked, workloads, next }) => [checked, workloads, next]), [[8, 12, 'w08'], [8, 12, 'w04']]);
+  assert.deepEqual(checks[0], { reached: twelveIds.slice(0, 8), cursor: 'w07' });
+  assert.deepEqual(checks[1], { reached: [...twelveIds.slice(0, 4), ...twelveIds.slice(8)], cursor: 'w03' });
+  assert.deepEqual(r.logged('CheckBudgetReached').map(({ checked, workloads, next }) => [checked, workloads, next]), [[8, 12, 'w08'], [8, 12, 'w04']]);
   // None starves: the third check takes the 8 after w03, and each workload has been checked twice.
   await check();
-  assert.deepEqual(checks[2], { reached: ids.slice(4), cursor: 'w11' });
+  assert.deepEqual(checks[2], { reached: twelveIds.slice(4), cursor: 'w11' });
   assert.deepEqual([...new Set(counts.values())], [2]);
-  // A check that reaches every workload leaves no cursor in its summary.
-  costMs = 0;
+  // Each check cut short wrote its cursor at once, then in its summary.
+  assert.deepEqual(r.world.cursorWrites, ['w07', 'w03', 'w11']);
+  // A check that reaches every workload clears the cursor stored, its summary without one; the next, with none stored, writes none.
+  r.world.costMs = 0;
   await check();
   assert.equal(checks[3].reached.length, 12);
-  assert.equal('cursor' in summary, false);
+  assert.equal('cursor' in r.world.record, false);
+  await check();
+  assert.deepEqual(r.world.cursorWrites, ['w07', 'w03', 'w11', null]);
+});
+
+// The cursor is stored right after the loop, before the stats sweep and the summary: a check whose summary is never written, or
+// whose request ends before it, still moves the next one on.
+test('a summary that can never be written: the cursor written right after the loop still moves every check on, each workload checked in turn', async () => {
+  const r = rotating({ change: { putCheck: async () => { throw unreadable(); } } });
+  const seen = new Set();
+  for (let i = 0; i < Math.ceil(N / PER_CHECK) + 1 && seen.size < N; i += 1) for (const id of await r.check()) seen.add(id);
+  assert.equal(seen.size, N, `${seen.size} workloads reached`);
+  assert.deepEqual([r.world.cursorWrites, r.world.record], [['w07', 'w03'], { cursor: 'w03' }]);
+  assert.equal(r.logged('CheckNotRecorded').length, 2);
+});
+
+test('a stats sweep that never ends (the request dies before its summary): the cursor written before it moves every check on', async () => {
+  let swept = null;
+  const r = rotating({ change: { claimSweep: () => { swept(); return new Promise(() => {}); } } });
+  // Each check hangs at its sweep: the workloads it reached are those whose run it read.
+  const seen = new Set();
+  for (let i = 0; i < Math.ceil(N / PER_CHECK) + 1 && seen.size < N; i += 1) {
+    const sweeping = new Promise((resolve) => { swept = resolve; });
+    r.world.reads.clear();
+    r.controller.check();
+    await sweeping;
+    for (const id of r.world.reads.keys()) seen.add(id);
+    r.clock.advance(5 * MINUTE);
+  }
+  assert.equal(seen.size, N, `${seen.size} workloads reached`);
+  assert.deepEqual([r.world.cursorWrites, r.world.record], [['w07', 'w03'], { cursor: 'w03' }]);
+});
+
+test('a cursor naming a workload offboarded since: the check starts at the next one by id', async () => {
+  const r = rotating({ ids: twelveIds.filter((id) => id !== 'w05') });
+  r.world.record = { checkedAt: 1, cursor: 'w05' };
+  assert.deepEqual(await r.check(), ['w00', 'w01', 'w06', 'w07', 'w08', 'w09', 'w10', 'w11']);
+  assert.equal(r.world.record.cursor, 'w01');
+});
+
+test('a workload onboarded below the cursor is checked when the order wraps, in the same check', async () => {
+  const r = rotating();
+  await r.check();
+  assert.equal(r.world.record.cursor, 'w07');
+  r.world.ids.push('a00');
+  assert.deepEqual(await r.check(), ['a00', 'w00', 'w01', 'w02', 'w08', 'w09', 'w10', 'w11']);
+  assert.equal(r.world.record.cursor, 'w02');
 });
 
 // --- The waiting page (G5, design §5.2): the wakes' durations, the favicon read at the nap ----------------------------------------
@@ -3401,6 +3464,20 @@ test('30 idle workloads: 20 nap tasks and NapDeferred once for the 10 others; wh
   await core.check();
   assert.deepEqual(napTasksOf(world).sort(), others);
   assert.deepEqual(deferredOf(world), []);
+});
+
+// B1: the 20 naps in flight are taken in the check's order, from the cursor on, not always by the first ids.
+test('30 idle workloads and a cursor at w19: the 10 after it ask their naps, the 10 deferred are among those before it', async () => {
+  const world = crowded(Object.fromEntries(thirty.map((id) => [id, null])));
+  world.store.router.check = { checkedAt: 1, cursor: 'w19' };
+  const out = await world.core.check();
+  const asked = napTasksOf(world);
+  assert.equal(new Set(asked).size, 20);
+  assert.deepEqual(thirty.slice(20).filter((id) => !asked.includes(id)), [], 'the 10 after the cursor');
+  const deferred = out.filter((r) => r.nap === 'deferred').map((r) => r.workloadId);
+  assert.equal(deferred.length, 10);
+  assert.deepEqual(deferred.filter((id) => !thirty.slice(0, 20).includes(id)), []);
+  assert.deepEqual(deferredOf(world), [{ reason: 'cap', count: 10 }]);
 });
 
 test('25 idle workloads and 5 in a nap window: the 5 scheduled naps first, then 15 idle ones, the 10 others deferred', async () => {

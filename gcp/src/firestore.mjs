@@ -2,7 +2,7 @@
 // per router). One document per workload and kind: `workloads/<id>` (the configuration), `runs/<id>` (the state
 // machine), `schedules/<id>`, `pauses/<id>` (a workload's pause, or `<id>#<exclusionId>`: a manager's exclusion's), `router/pause` (the router's), `stats/<id>-<day>` (the day's counters, committed in
 // batches, kept 35 days), `router/sweep` (the day of the last sweep of the old counters), `router/settings` (the router level of the settings:
-// hibernate, joinMinutes, defaults, by, at), `router/check` (the last check's summary), `router/manager` (the organization's settings,
+// hibernate, joinMinutes, defaults, by, at), `router/check` (the last check's summary, and where the next check starts), `router/manager` (the organization's settings,
 // pushed by the manager, as one JSON string), `router/page` (the router's waiting page) and, per workload, `pages/<id>` (its
 // waiting page) and `favicons/<id>` (the favicon read while it was awake); `events/<stateAt, 13 digits>-<id>-<to>` (the journal: a
 // state change, committed with the run's, kept 7 days); and the IP lists:
@@ -518,6 +518,11 @@ export function createFirestoreStore({ google, project, database, region = datab
     },
     async putCheck(summary) {
       await commit([{ update: { name: named('router/check'), fields: toFields(summary) } }]);
+    },
+    // Where the next check starts (null: it reached every workload), written alone right after the check's loop, so a summary that
+    // is not written keeps it all the same (B1); the summary carries it too.
+    async setCheckCursor(cursor) {
+      await commit([{ update: { name: named('router/check'), fields: cursor ? toFields({ cursor }) : {} }, updateMask: { fieldPaths: ['cursor'] } }]);
     },
 
     // The organization's settings as the manager pushed them (router/manager {settingsJson, etag, at}), `settings` parsed from its one

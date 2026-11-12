@@ -710,13 +710,15 @@ test('the manager page says which pauses the check summary holds, which keys the
   assert.match(page, /The rows of list carry AWS's row keys, and status AWS's status keys: what AWS's status reads live and Google Cloud does not \(the last request, the load balancer's rules, the targets\) keeps its key, empty/);
 });
 
-// B1 (vision docs/specs/2026-11-12-cloud-duplication-design.md, §4): the check's cursor, in its summary.
-test('the manager and Compute Engine pages say where the next check starts, as the check writes it in its summary', () => {
+// B1 (vision docs/specs/2026-11-12-cloud-duplication-design.md, §4): the check's cursor, written after its loop and in its summary.
+test('the manager and Compute Engine pages say where the next check starts, as the check writes it after its loop and in its summary', () => {
   // controller-core.mjs's recordCheck and check, lambda/src/lib/check-run.mjs's loop.
   assert.match(CORE_SRC, /const CHECK_BUDGET_MS = 240_000;\nconst CHECK_CONCURRENCY = 8;/);
   assert.match(CORE_SRC, /\.\.\.\(cursor \? \{ cursor \} : \{\}\),/);
   assert.match(read('lambda/src/lib/check-run.mjs'), /cursor: next < order\.length \? \(next > 0 \? order\[next - 1\]\.workloadId : cursor \?\? null\) : null/);
-  assert.match(flat(read(MANAGER)), /After a check that ran out of its 240 s before it reached every workload, it holds cursor too, the last workload that check started: the next check starts after it, as an AWS router's does, so every workload is checked in turn\. A summary that cannot be written fails nothing: the check's work is done, and the next check starts where the last summary written says\./);
+  assert.match(CORE_SRC, /if \(cursor !== \(last\?\.cursor \?\? null\)\) await store\.setCheckCursor\?\.\(cursor\)[^\n]*\n    await sweepStats\(\);/);
+  assert.match(read('gcp/src/firestore.mjs'), /fields: cursor \? toFields\(\{ cursor \}\) : \{\} \}, updateMask: \{ fieldPaths: \['cursor'\] \}/);
+  assert.match(flat(read(MANAGER)), /After a check that ran out of its 240 s before it reached every workload, it holds cursor too, the last workload that check started, written alone right after the check's workloads and again with the summary: the next check starts after it, as an AWS router's does, so every workload is checked in turn, even while the summary cannot be written \(check in events then holds the cursor with the last summary written, or alone with null times\)\. A summary that cannot be written fails nothing: the check's work is done\./);
   assert.match(flat(read(CE)), /A check takes 8 workloads at a time and starts none after 240 s \(CheckBudgetReached\); the next check starts after the last workload it started \(cursor in \[the check summary\]\(google-cloud-manager\.md#what-the-router-keeps\)\), so on a crowded router every workload is checked in turn, as on AWS \(Not released yet: router 0\.40\.0\)\./);
 });
 

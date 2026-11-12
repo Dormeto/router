@@ -172,12 +172,16 @@ test('a nap window: the probe reads it once, and says it', async () => {
 });
 
 // The controller's Cloud Scheduler call: the pauses, the configurations and the schedules listed, the router level (router/settings),
-// once for every workload, then where the last check stopped (router/check, B1) and the workload's run; then the organization's settings
-// (router/manager), read with the levels and kept for the summary, and, for a check the schedule did not start, the last scheduled
-// check's date (router/check). The runs it counts are those the check read.
-test('Firestore reads: a check, one AWAKE workload, 9; the first of the day 3 more, the router\'s sweep claimed, the counters and the events listed', async () => {
+// once for every workload, then the last check's record (router/check, B1: where it stopped) and the workload's run; then the
+// organization's settings (router/manager), read with the levels and kept for the summary. A check the schedule did not start takes
+// the last scheduled check's date from the record it read, and reads router/check again only when there was none. The runs it counts
+// are those the check read. Written: router/check, once, its summary; its cursor too only when it moves (a check cut short, or one
+// that reached every workload after one that did not).
+test('Firestore reads: a check, one AWAKE workload, 9, 8 once router/check exists; the first of the day 3 more, the router\'s sweep claimed, the counters and the events listed; router/check written once', async () => {
   const clock = fakeClock();
-  const { reads, store } = firestoreWith({ state: STATES.AWAKE, version: 0, awakeSince: clock.now(), holders: 0, wakeCount: 0 });
+  const { firestore, reads, store } = firestoreWith({ state: STATES.AWAKE, version: 0, awakeSince: clock.now(), holders: 0, wakeCount: 0 });
+  const checkWrites = () => firestore.calls.filter((c) => c.url.endsWith(':commit') && c.body.writes.some((w) => w.update?.name.endsWith('/router/check')))
+    .map((c) => (c.body.writes[0].updateMask ? 'cursor' : 'summary'));
   await store.putConfig('demo', {
     workloadId: 'demo', urlMap: 'lb', backendService: 'app', wakerBackendService: WAKER, backends: [{ kind: 'vm', location: ZONE, name: 'vm-a' }], idleMinutes: 15, wakeTimeoutSeconds: 600, failedRetrySeconds: 60, pollSeconds: 3,
   });
@@ -189,11 +193,13 @@ test('Firestore reads: a check, one AWAKE workload, 9; the first of the day 3 mo
   assert.deepEqual(out.map((r) => [r.workloadId, r.state]), [['demo', STATES.AWAKE]]);
   assert.equal(reads(), 12);
   await core.check();
-  assert.equal(reads(), 21);
+  assert.equal(reads(), 20);
+  // Every workload reached and no cursor stored: no cursor write.
+  assert.deepEqual(checkWrites(), ['summary', 'summary']);
 });
 
 // Past 20 workloads, the naps in flight can pass their cap (F8): each run is read once more as the check starts, for the NAPPING ones.
-test('Firestore reads: a check of 21 AWAKE workloads reads each run twice, the lists, the router level and where the last check stopped once, 50; of 20, each run once, 28', async () => {
+test('Firestore reads: a check of 21 AWAKE workloads reads each run twice, the lists, the router level and the last check\'s record once, 49; of 20, each run once, 27', async () => {
   const clock = fakeClock();
   const awake = { state: STATES.AWAKE, version: 0, awakeSince: clock.now(), holders: 0, wakeCount: 0 };
   const { firestore, reads, store } = firestoreWith(awake);
@@ -212,9 +218,9 @@ test('Firestore reads: a check of 21 AWAKE workloads reads each run twice, the l
   await core.check();
   let before = reads();
   await core.check();
-  assert.equal(reads() - before, 8 + 2 * 21);
+  assert.equal(reads() - before, 7 + 2 * 21);
   firestore.docs.delete('workloads/w20');
   before = reads();
   await core.check();
-  assert.equal(reads() - before, 8 + 20);
+  assert.equal(reads() - before, 7 + 20);
 });

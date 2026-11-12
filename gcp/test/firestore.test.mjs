@@ -939,6 +939,24 @@ test('router/check: the check\'s summary round trips whole, replaced at each che
   assert.deepEqual([...docs.keys()], ['router/check']);
 });
 
+// B1 (vision docs/specs/2026-11-12-cloud-duplication-design.md, §4): where the next check starts, written right after the check's loop.
+test('router/check\'s cursor: written alone, the summary\'s other fields kept, removed by null; the next summary replaces the whole', async () => {
+  const { store, docs, calls } = setup();
+  await store.setCheckCursor('w07');
+  assert.deepEqual(await store.getCheck(), { cursor: 'w07' });
+  const summary = { checkedAt: 5, durationMs: 120, checkSchedule: '*/5 * * * *', lastScheduledCheckAt: 5, health: { status: 'ok', problems: [] }, pauses: [], counts: { AWAKE: 2 } };
+  await store.putCheck({ ...summary, cursor: 'w07' });
+  await store.setCheckCursor('w03');
+  assert.deepEqual(await store.getCheck(), { ...summary, cursor: 'w03' });
+  await store.setCheckCursor(null);
+  assert.deepEqual(await store.getCheck(), summary);
+  // One write each: the cursor's of the cursor alone, the summary's of the whole document.
+  const masks = commits(calls).map((c) => [c.body.writes.length, c.body.writes[0].update.name, c.body.writes[0].updateMask ?? null]);
+  const mask = { fieldPaths: ['cursor'] };
+  assert.deepEqual(masks, [[1, `${ROOT}/router/check`, mask], [1, `${ROOT}/router/check`, null], [1, `${ROOT}/router/check`, mask], [1, `${ROOT}/router/check`, mask]]);
+  assert.deepEqual([...docs.keys()], ['router/check']);
+});
+
 test('router/manager: the organization\'s settings as the manager pushed them; none before; what is stored is returned as it is', async () => {
   const { store, docs } = setup();
   assert.equal(await store.getManagerSettings(), null);

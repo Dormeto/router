@@ -76,8 +76,8 @@ function withMaintenance(view, run) {
   return { ...view, maintenanceDue: due === null ? null : iso(due) };
 }
 
-// router/check with its times as the manager reads every router's, ISO.
-const checkOf = (check) => check && { ...check, checkedAt: iso(check.checkedAt), lastScheduledCheckAt: isoOrNull(check.lastScheduledCheckAt) };
+// router/check with its times as the manager reads every router's, ISO; null when its summary was never written (its cursor alone).
+const checkOf = (check) => check && { ...check, checkedAt: isoOrNull(check.checkedAt), lastScheduledCheckAt: isoOrNull(check.lastScheduledCheckAt) };
 
 // An onboarding in AWS's onboarder's words (`workloadId`, `databases`: here the Cloud SQL instances), with the Google Cloud resources
 // it names, onboarded by the manager, by who asked (`unknown` when the payload names no one, as AWS's onboardedBy). The REST body's

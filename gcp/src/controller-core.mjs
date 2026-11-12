@@ -1451,7 +1451,7 @@ export function createController({
   }
 
   // 8 workloads at a time, none started past the budget, from where the last check stopped (lambda/src/lib/check-run.mjs, B1: the
-  // cursor in the check's summary); one that fails is logged and stops only itself. The schedules first, whatever the budget. Pauses
+  // cursor in router/check, stored right after the loop); one that fails is logged and stops only itself. The schedules first, whatever the budget. Pauses
   // that cannot be read hold every nap and scheduled wake of this check; the reconcile still runs. At most NAPS_MAX naps in flight:
   // the idle naps past it are said once (`NapDeferred`, with their count), and asked at a later check. Wakes are never held back.
   async function check({ scheduled = false } = {}) {
@@ -1469,7 +1469,7 @@ export function createController({
     const { applied, readable } = await applySchedules(order, schedules, { paused, keptAsleep }, now(), { joins, endedDays: schedules.size ? endedDaysOf(levels) : null, nap: scheduledNaps(deadline, flight) });
     await requestListRefresh();
     const ctx = { schedules: readable, applied, flight, levels, joins };
-    const { results, cursor } = await runCheck({
+    const { results, cursor, check: last } = await runCheck({
       store, workloads: order, deadline, concurrency: CHECK_CONCURRENCY, now, log,
       passes: new Map([...applied].map(([workloadId, schedule]) => [workloadId, { schedule }])),
       checkOne: (cfg) => checkOne(cfg, deadline, paused(cfg.workloadId), ctx),
@@ -1477,9 +1477,11 @@ export function createController({
         if (flight.deferred) log.info('NapDeferred', { reason: 'cap', count: flight.deferred });
       },
     });
+    // Where the next check starts, stored at once, as AWS's: the stats sweep, the health or the summary's write may fail, or the
+    // request end, before the summary is written. Written only when it moves.
+    if (cursor !== (last?.cursor ?? null)) await store.setCheckCursor?.(cursor).catch((err) => log.warn('CheckCursorNotStored', { error: err.message }));
     await sweepStats();
-    // Where the next check starts, in the check's summary.
-    await recordCheck({ started, scheduled, order, results, pauses: (pauses ?? []).filter((p) => p.workloadId === null), pausesError, managerState: levels.managerState, cursor });
+    await recordCheck({ started, scheduled, order, results, pauses: (pauses ?? []).filter((p) => p.workloadId === null), pausesError, managerState: levels.managerState, cursor, last });
     return results;
   }
 
@@ -1533,14 +1535,14 @@ export function createController({
     return { health, ipLists, manager };
   }
 
-  // router/check: written at the end of each check, the date of the last one the schedule started kept by the others; `cursor`, where
-  // the next check starts, when this one stopped short (AWS's, on its CHECK item). A summary that cannot be written fails nothing: the
-  // check's work is done, and the next check starts where the last summary written says.
-  async function recordCheck({ started, scheduled, order, results, pauses, pausesError, managerState, cursor = null }) {
+  // router/check: written at the end of each check, the date of the last one the schedule started kept by the others (from `last`, the
+  // record the check read as it started; read again when there was none); `cursor`, where the next check starts, when this one stopped
+  // short, as the check stored it after its loop. A summary that cannot be written fails nothing: the check's work is done.
+  async function recordCheck({ started, scheduled, order, results, pauses, pausesError, managerState, cursor = null, last = null }) {
     if (!store.putCheck) return;
     try {
       const t = now();
-      const lastScheduledCheckAt = scheduled ? started : (await store.getCheck?.().catch(() => null))?.lastScheduledCheckAt ?? null;
+      const lastScheduledCheckAt = scheduled ? started : (last ?? await store.getCheck?.().catch(() => null))?.lastScheduledCheckAt ?? null;
       const known = new Map(results.filter((r) => ANY_STATE.includes(r.state)).map((r) => [r.workloadId, r.state]));
       const { byState } = await stateCounts(order, known);
       const { health } = await healthSummary({ t, byState, lastScheduledCheckAt, pausesError, managerState });

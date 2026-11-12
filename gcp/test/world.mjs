@@ -628,6 +628,11 @@ export function setup(change = () => {}, { clock = fakeClock() } = {}) {
     putCheck: async (summary) => {
       router.check = structuredClone(summary);
     },
+    // Its cursor alone, as Firestore's masked write (null removes it).
+    setCheckCursor: async (cursor) => {
+      const { cursor: gone, ...rest } = router.check ?? {};
+      router.check = cursor ? { ...rest, cursor } : rest;
+    },
     // As Firestore's: the whole record at each write, none of the three set: no record.
     putRouterSettings: async ({ hibernate, joinMinutes, defaults, by, at }) => {
       const record = {

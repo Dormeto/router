@@ -6,8 +6,9 @@
 // being no failure.
 //
 // The ports, passed by each controller's check:
-// - `store`: the cloud's store, its `getCheck()` (the last check's record: `cursor`, where it stopped, when it stopped short) and
-//   `getConfig(workloadId)` (null once the workload is offboarded), the same on both stores;
+// - `store`: the cloud's store, its `getCheck()` and `getConfig(workloadId)` (null once the workload is offboarded), the same on both
+//   stores. `getCheck()`'s record holds the cursor, `cursor`, on both: AWS's CHECK item (with its lease and its last scheduled check),
+//   Google Cloud's router/check (the check's summary);
 // - `workloads`: the configurations in id order; `checkOne(cfg)`: the cloud's check of one workload, answering its result's fields;
 // - `deadline`: when no workload starts any more (the check's 240 s, and on AWS its Lambda's time); `concurrency`; `now`; `log`;
 // - `chunk`: `{ size, prepare(workloads) }`, the workloads prepared together before they are checked (AWS: their rules, each load
@@ -16,12 +17,14 @@
 // - `passes`: what the passes before the loop did for a workload (id → its result's fields), in its result, and alone in the results
 //   for one the loop did not reach;
 // - `end()`: what the cloud says once the loop is over, before the budget's line.
-// Answers the results and where the next check starts, `cursor`: the last workload this one checked when it stopped short (where this
-// one started when it checked none), null when it reached every workload. Each cloud stores it its own way.
+// Answers the results; where the next check starts, `cursor`: the last workload this one checked when it stopped short (where this
+// one started when it checked none), null when it reached every workload, which each cloud stores right after; and `check`, the record
+// the cursor was read from (null: none, or it could not be read).
 
 export async function runCheck({ store, workloads, checkOne, deadline, concurrency = 8, chunk = null, passes = new Map(), end = null, now, log }) {
   // Starting after the workload where the previous check stopped; a cursor that cannot be read starts at the first.
-  const cursor = (await Promise.resolve().then(() => store.getCheck?.()).catch(() => null))?.cursor;
+  const check = (await Promise.resolve().then(() => store.getCheck?.()).catch(() => null)) ?? null;
+  const cursor = check?.cursor;
   const from = cursor ? workloads.findIndex((c) => c.workloadId > cursor) : 0;
   const order = from > 0 ? [...workloads.slice(from), ...workloads.slice(0, from)] : workloads;
   const size = chunk?.size ?? order.length;
@@ -62,5 +65,5 @@ export async function runCheck({ store, workloads, checkOne, deadline, concurren
   const reached = new Set(results.map((r) => r.workloadId));
   for (const [workloadId, passed] of passes) if (!reached.has(workloadId)) results.push({ workloadId, ...passed });
   // Cut short: the next check starts after the last workload checked (where this one started if it checked none).
-  return { results, cursor: next < order.length ? (next > 0 ? order[next - 1].workloadId : cursor ?? null) : null };
+  return { results, cursor: next < order.length ? (next > 0 ? order[next - 1].workloadId : cursor ?? null) : null, check };
 }

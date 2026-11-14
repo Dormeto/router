@@ -14,9 +14,8 @@
 // the instances' hibernation) keeps its key, empty, as routerInfo keeps the Lambda figures. AWS's onboarder's three (`preview`,
 // `onboard`, `offboard`) answer in its shapes (lambda/src/lib/onboarding.mjs), the Google Cloud resources for its target groups and
 // steps for what the Google Cloud onboarding changed, the REST answers' fields beside them; the REST routes keep their own answers for
-// the CLI. Two actions are Google Cloud's: `events`, the journal (§5.3; the CLI's, and the poll of a manager below 0.25.0: the router reports it
-// since 0.41.0, report.mjs), and `manager-settings`, the organization's
-// level (§5.5).
+// the CLI. One action is Google Cloud's: `manager-settings`, the organization's level (§5.5). The journal is no action's answer: the router
+// reports it (report.mjs).
 import { k8sId } from '../../lambda/src/lib/kubernetes.mjs';
 import { describeStoredLists } from '../../lambda/src/lib/list-cache.mjs';
 import { listRouter, readPauses, rowPauses } from '../../lambda/src/lib/manager-actions.mjs';
@@ -33,9 +32,6 @@ import { isRegionalLb } from './switch.mjs';
 // A refusal's status as AWS's code (lambda/src/lib/refusal.mjs).
 const CODES = { 400: 'invalid', 404: 'not_found', 409: 'conflict' };
 const UNKNOWN_ACTION = 'unknown-action';
-// A page of the journal (§5.3), and an event's id: `<stateAt, 13 digits>-<workloadId>-<state>`.
-const EVENTS_MAX = 500;
-const EVENT_ID = /^\d{13}-[a-z0-9-]+-[A-Z]+$/;
 const ETAG_MAX = 256;
 // Where the router reports (report.mjs): the route's https URL, and the audience of its identity token (the API's endpoint).
 const EVENTS_REFUSED = 'events: { url, audience }, the https URL the router reports to and the audience of its identity token';
@@ -82,7 +78,6 @@ function backendOf(backend) {
 const hibernationOf = (hibernation, manager) => ({ ...hibernation, manager, instances: null, freshBoot: false });
 
 // router/check with its times as the manager reads every router's, ISO; null when its summary was never written (its cursor alone).
-const checkOf = (check) => check && { ...check, checkedAt: isoOrNull(check.checkedAt), lastScheduledCheckAt: isoOrNull(check.lastScheduledCheckAt) };
 
 // An onboarding in AWS's onboarder's words (`workloadId`, `databases`: here the Cloud SQL instances), with the Google Cloud resources
 // it names, onboarded by the manager, by who asked (`unknown` when the payload names no one, as AWS's onboardedBy). The REST body's
@@ -318,15 +313,6 @@ export function createActions({ controller, onboarding, store, router, lists = [
     return { steps, ...answer };
   }
 
-  // The journal after `after` (null: from the oldest kept), `limit` at most (§5.3), with what a manager below 0.25.0 compares: the last check's
-  // summary and the etag of the organization's settings the router holds.
-  async function events({ after = null, limit }) {
-    if (!Number.isInteger(limit) || limit < 1 || limit > EVENTS_MAX) throw invalid(`limit must be a whole number from 1 to ${EVENTS_MAX}`);
-    if (after !== null && (typeof after !== 'string' || !EVENT_ID.test(after))) throw invalid('after must be the id of an event, or null');
-    const [page, check, stored] = await Promise.all([store.listEvents({ after, limit }), store.getCheck(), store.getManagerSettings()]);
-    return { ...page, check: checkOf(check), managerSettings: { etag: stored?.etag ?? null } };
-  }
-
   // The manager's settings.json, pushed whole with its ETag (§5.5), the organization's level from the next read on. One that is not an
   // object is stored as pushed: the level reads it as unset and the health says so. `events` (manager 0.25.0, the push design §4.1):
   // where the router reports, `{ url, audience }`, stored with them; a push without it keeps the one stored, null stops the reports.
@@ -371,7 +357,6 @@ export function createActions({ controller, onboarding, store, router, lists = [
       return { steps, workload: { workloadId: workload.id, ...workload } };
     },
     offboard,
-    events,
     'manager-settings': pushManagerSettings,
   };
 

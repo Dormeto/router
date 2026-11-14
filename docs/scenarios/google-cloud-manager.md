@@ -16,7 +16,7 @@ documented in the CLI's README, not here.
   commit as the state change, never apart from it, and holds AWS's `Workload state changed` detail: `workloadId`, `from`,
   `to`, `router`, `region`, `project`, `at`, the `cause`, the `wakeId` and `durationMs` of a wake, a `failure`, `by` (who
   asked, for a nap, a wake or a pause from the manager), the `fallbacks`, the VMs `hibernated`, the priced items a nap `stopped` (below) and the workload's `tags`.
-  Events are kept 7 days: the daily sweep that removes the old counters removes them too.
+  Events are kept 7 days, for the reports: the daily sweep that removes the old counters removes them too.
 - **The check summary**, `router/check`: replaced whole at each check (every 5 minutes, `checkSchedule` is
   `*/5 * * * *`) with the time of the check and how long it took, the time of the last check the schedule started, the
   router's health (the same problems as AWS's health that apply here, such as a manager settings document that cannot be
@@ -24,7 +24,7 @@ documented in the CLI's README, not here.
   workloads by state. After a check that ran out of its 240 s before it reached every workload, it holds `cursor` too, the
   last workload that check started, written alone right after the check's workloads and again with the summary: the next
   check starts after it, as an AWS router's does, so every workload is checked in turn, even while the summary cannot be
-  written (`check` in `events` then holds the cursor with the last summary written, or alone with null times). A summary
+  written (the summary then holds the cursor with the last summary written, or alone with null times). A summary
   that cannot be written fails nothing: the check's work is done. A cursor that cannot be written is said in
   `CheckCursorNotStored`, and one that cannot be read in `CheckCursorUnread`: that check starts at the first workload.
 - **The organization's level**, `router/manager`: the manager's whole `settings.json` as it pushed it, kept as one JSON
@@ -47,7 +47,7 @@ service: the manager calls it with an ID token of its command service account, w
   `list` carry AWS's row keys, and `status` AWS's status keys: what AWS's status reads live and Google Cloud does not
   (the last request, the load balancer's rules, the targets) keeps its key, empty. A Google Cloud row names its backend
   service where AWS's names its target group.
-- **The two Google Cloud ones:** `events` and `manager-settings` (below).
+- **The Google Cloud one:** `manager-settings` (below). The journal is no action's answer: the router reports it (below), and `{ "action": "events" }` is refused as any action the router does not serve (`unsupported` with `refusals`, else a 400 `unknown-action`).
 - **`router`** answers AWS's keys and `report`, where the router's reports stand (below); `GET /v1/health` answers it too,
   beside the version, for `dormeto gcp routers show`.
 - **The AWS actions it does not answer:** AWS's `wake`, `nap`, `release`, `check`, `ensure-awake`,
@@ -69,15 +69,6 @@ service: the manager calls it with an ID token of its command service account, w
 - **The manager's own actions say who asked**: a wake or a nap from the manager carries `by`, and its events the cause
   `manager`; a pause carries `by` too: the pause itself writes no event, and the wakes it starts write theirs, with the
   cause `pause` and its `by`.
-
-### `events`
-
-`{ "action": "events", "after": <event id or null>, "limit": 1..500 }` answers `{ "events": […], "next", "check",
-"managerSettings": { "etag" } }`: the events after `after` (all that are kept when it is null), the oldest first,
-`limit` at most. `next` is the last id of a full page, since there may be more, else null. `check` is `router/check` with
-its times as ISO dates (null before the first check), and `managerSettings.etag` the ETag of the organization's
-settings the router holds (null when it has none). A `limit` outside 1 to 500, or an `after` that is not an event id, is a
-refusal. The router's reports carry the same events; `events` stays for the CLI and for a manager older than 0.25.0.
 
 ### `manager-settings`
 
@@ -197,11 +188,11 @@ logged, `EndedWindowsRemoved`.
 
 ## Limits
 
-- **The router reports, the manager does not poll.** A router older than 0.41.0 does not report: the manager shows it
+- **The router reports.** A router older than 0.41.0 does not report: the manager shows it
   too old, with the `dormeto gcp routers install` command that upgrades it.
 - **A router older than 0.40.0 has no `/v1/actions`**: the manager lists it with its version and says which
   `dormeto gcp routers install` command upgrades it.
-- **The journal is 7 days.** A manager that refuses or cannot be reached for longer loses the changes in between; its
+- **The journal is 7 days.** When the manager refuses the reports or cannot be reached for longer, it loses the changes in between; its
   history is inferred from the next check's states.
 - **The IP lists stay the router's:** the manager's catalog is in S3, which a Google Cloud router cannot read.
 - **What only the CLI undoes:** `offboard` refuses (`conflict`) a GKE workload, whose Kubernetes access is the

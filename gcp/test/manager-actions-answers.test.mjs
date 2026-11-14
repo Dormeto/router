@@ -177,19 +177,8 @@ async function answers() {
   await rest('REST pause of the router', pausing, 'POST', '/v1/pause', { reason: 'freeze', by: 'adm' });
   await rest('REST resume of the router', pausing, 'POST', '/v1/resume', { by: 'adm' });
 
-  // The journal (§5.3): none yet, then after a check, a page and the next; a record holding only where the next check starts; refusals.
-  const journal = router();
-  await both('events, none', journal, { action: 'events', after: null, limit: 10 });
-  await rest('REST onboard, to journal', journal, 'POST', '/v1/workloads', INPUT);
-  await rest('REST check', journal, 'POST', '/v1/check');
-  journal.store.events = [{ id: '1700000000000-demo-ASLEEP', workloadId: 'demo', state: 'ASLEEP' }, { id: '1700000001000-demo-WAKING', workloadId: 'demo', state: 'WAKING' }];
-  journal.store.manager = { settings: { workloads: { hibernate: false } }, etag: '"e1"', at: 1 };
-  await act('events, a page', journal, { action: 'events', after: null, limit: 1, refusals: true });
-  await act('events, the next page', journal, { action: 'events', after: '1700000000000-demo-ASLEEP', limit: 500, refusals: true });
-  journal.store.router.check = { cursor: 'demo' };
-  await act('events, a record of the cursor alone', journal, { action: 'events', after: null, limit: 10, refusals: true });
-  await both('events, a limit out of range', journal, { action: 'events', after: null, limit: 501 });
-  await both('events, an after that is no event', journal, { action: 'events', after: 'x', limit: 10 });
+  // The journal is no action's answer any more: `events` is refused as any unknown action.
+  await both('events, an action the router does not serve', router(), { action: 'events', after: null, limit: 10 });
   return found;
 }
 

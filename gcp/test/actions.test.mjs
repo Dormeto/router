@@ -700,40 +700,7 @@ test('offboard: a GKE workload, or one whose onboarding turned its request logs 
 const EVENT_A ={ id: '1700000000000-demo-NAPPING', workloadId: 'demo', from: STATES.AWAKE, to: STATES.NAPPING, router: `dmtr-${REGION}`, region: REGION, project: 'p', at: iso(1_700_000_000_000), cause: 'idle', tags: {} };
 const EVENT_B = { ...EVENT_A, id: '1700000060000-demo-ASLEEP', from: STATES.NAPPING, to: STATES.ASLEEP, at: iso(1_700_000_060_000) };
 
-test('events: the journal after `after`, `limit` at most, with the last check\'s summary and the etag of the organization\'s settings', async () => {
-  const { call, act, store, clock } = world();
-  const none = await act({ action: 'events', after: null, limit: 10, refusals: true });
-  assert.deepEqual(none, { status: 200, body: { events: [], next: null, check: null, managerSettings: { etag: null } } });
-  await call('POST', '/v1/workloads', INPUT);
-  await call('POST', '/v1/check');
-  store.events = [EVENT_A, EVENT_B];
-  store.manager = { settings: { workloads: { hibernate: false } }, etag: '"e1"', at: 1 };
-  const first = await act({ action: 'events', after: null, limit: 1 });
-  assert.deepEqual(Object.keys(first.body), ['events', 'next', 'check', 'managerSettings']);
-  assert.deepEqual([first.body.events, first.body.next, first.body.managerSettings], [[EVENT_A], EVENT_A.id, { etag: '"e1"' }]);
-  const stored = store.router.check;
-  assert.deepEqual(first.body.check, { ...stored, checkedAt: iso(clock.now()), lastScheduledCheckAt: null });
-  assert.deepEqual(Object.keys(first.body.check).sort(), ['checkSchedule', 'checkedAt', 'counts', 'durationMs', 'health', 'lastScheduledCheckAt', 'pauses']);
-  const second = await act({ action: 'events', after: first.body.next, limit: 500 });
-  assert.deepEqual([second.body.events, second.body.next], [[EVENT_B], null]);
-  // `after` absent: from the oldest kept.
-  assert.deepEqual((await act({ action: 'events', limit: 2 })).body.events, [EVENT_A, EVENT_B]);
-});
-
-test('events: a limit outside 1..500, or an after that is no event\'s id: 400, or refused with refusals', async () => {
-  const { act } = world();
-  for (const limit of [600, 501, 0, -1, 1.5, '10', null, undefined]) {
-    const res = await act({ action: 'events', after: null, limit });
-    assert.deepEqual(res, { status: 400, body: { error: 'limit must be a whole number from 1 to 500', reason: 'bad-request' } }, String(limit));
-  }
-  for (const after of ['x', '../router/manager', 'events/1700000000000-demo-ASLEEP', 12, '']) {
-    const res = await act({ action: 'events', after, limit: 10 });
-    assert.deepEqual(res, { status: 400, body: { error: 'after must be the id of an event, or null', reason: 'bad-request' } }, String(after));
-  }
-  assert.deepEqual((await act({ action: 'events', after: null, limit: 600, refusals: true })).body, { refused: { code: 'invalid', message: 'limit must be a whole number from 1 to 500' } });
-});
-
-test('manager-settings: stored with its etag and date, answered with the etag; the next router answer and events show the organization\'s level', async () => {
+test('manager-settings: stored with its etag and date, answered with the etag; the next router answer shows the organization\'s level', async () => {
   const { call, act, store, clock } = world();
   await call('POST', '/v1/workloads', INPUT);
   const settings = { workloads: { hibernate: false, joinMinutes: 10, defaults: { idleMinutes: 45 } }, waitingPage: { mode: 'template', title: 'Acme' } };
@@ -743,7 +710,6 @@ test('manager-settings: stored with its etag and date, answered with the etag; t
   const { managerSettings, health } = (await act({ action: 'router' })).body;
   assert.deepEqual(managerSettings, { url: null, hibernate: false, joinMinutes: 10, defaults: { idleMinutes: 45 }, readAt: iso(clock.now()), error: null });
   assert.equal(health.problems.some((p) => p.code === 'manager-settings-unreadable'), false);
-  assert.deepEqual((await act({ action: 'events', after: null, limit: 1 })).body.managerSettings, { etag: '"abc"' });
   const shown = (await call('GET', '/v1/workloads/demo')).body;
   assert.deepEqual([shown.settings.idleMinutes, shown.settingsFrom.idleMinutes, shown.hibernation.from], [45, 'organization', 'manager']);
   // One that is not an object is stored as pushed: unset, and the health says so.
@@ -837,12 +803,11 @@ test('manager-settings over Firestore: a large organization document, 20 custom 
   assert.deepEqual(await post({ action: 'manager-settings', settings: big, etag: 'e2', refusals: true }), { status: 400, body: { error: 'the body is larger than 1048576 bytes', reason: 'bad-request' } });
   await assert.rejects(actions({ action: 'manager-settings', settings: big, etag: 'e2' }), /exceeds the maximum allowed size of 1048576 bytes/);
   assert.deepEqual(await store.getManagerSettings(), { settings, etag: 'e1', at: 7 });
-  assert.deepEqual((await post({ action: 'events', after: null, limit: 1 })).body.managerSettings, { etag: 'e1' });
 });
 
 test('an action the router does not serve: as AWS\'s controller answers it, refused unsupported with refusals, else a 400 unknown-action', async () => {
   const { act, w } = world();
-  for (const action of ['unknown', 'ensure-awake', 'report', 'clusterCheck', 'check', 'wake', 'nap', 'release', 'refresh-lists', 'constructor', '__proto__', undefined]) {
+  for (const action of ['unknown', 'ensure-awake', 'report', 'clusterCheck', 'check', 'wake', 'nap', 'release', 'refresh-lists', 'events', 'constructor', '__proto__', undefined]) {
     const message = `unknown action: ${action}`;
     assert.deepEqual(await act({ action, refusals: true }), { status: 200, body: { refused: { code: 'unsupported', message } } }, `${action} with refusals`);
     assert.deepEqual(await act({ action }), { status: 400, body: { error: message, reason: 'unknown-action' } }, `${action} without`);

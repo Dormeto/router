@@ -633,19 +633,18 @@ test('the manager page names every action the router answers, from the code, and
   const page = flat(read(MANAGER));
   const table = /const ACTIONS = \{([\s\S]*?)\n  \};/.exec(ACTIONS_SRC)[1];
   const names = [...table.matchAll(/^    (?:'([a-z-]+)'|([a-z]+))[:,]/gm)].map((m) => m[1] ?? m[2]);
-  assert.ok(names.length >= 18, names.join());
+  assert.ok(names.length >= 17, names.join());
   for (const name of names) assert.ok(page.includes(name), name);
-  assert.match(page, /The two Google Cloud ones: events and manager-settings/);
+  assert.match(page, /The Google Cloud one: manager-settings \(below\)\. The journal is no action's answer/);
   assert.match(page, /\{ "error": "unknown action: <name>", "reason": "unknown-action" \}/);
   assert.match(page, /invalid, not_found, conflict and unsupported/);
 });
 
-test('the manager page\'s numbers are the code\'s: the journal\'s 7 days, 1 to 500 events, the check every 5 minutes, a year of ended windows', () => {
+test('the manager page\'s numbers are the code\'s: the journal\'s 7 days, the check every 5 minutes, a year of ended windows', () => {
   const page = flat(read(MANAGER));
   assert.match(CORE_SRC, /const EVENTS_KEPT_DAYS = 7;/);
-  assert.match(page, /Events are kept 7 days/);
-  assert.match(ACTIONS_SRC, /const EVENTS_MAX = 500;/);
-  assert.match(page, /"limit": 1\.\.500/);
+  assert.match(page, /Events are kept 7 days, for the reports/);
+  assert.doesNotMatch(ACTIONS_SRC, /EVENTS_MAX/);
   assert.match(CORE_SRC, /export const CHECK_SCHEDULE = '\*\/5 \* \* \* \*';/);
   assert.ok(read(MANAGER).includes('`checkSchedule` is\n  `*/5 * * * *`'));
   assert.match(page, /\bevents\/ in the router's Firestore database/);
@@ -718,7 +717,7 @@ test('the manager and Compute Engine pages say where the next check starts, as t
   assert.match(read('lambda/src/lib/check-run.mjs'), /cursor: next < order\.length \? \(next > 0 \? order\[next - 1\]\.workloadId : cursor \?\? null\) : null/);
   assert.match(CORE_SRC, /if \(cursor !== \(last\?\.cursor \?\? null\)\) await store\.setCheckCursor\?\.\(cursor\)[^\n]*\n    await sweepStats\(\);/);
   assert.match(read('gcp/src/firestore.mjs'), /fields: cursor \? toFields\(\{ cursor \}\) : \{\} \}, updateMask: \{ fieldPaths: \['cursor'\] \}/);
-  assert.match(flat(read(MANAGER)), /After a check that ran out of its 240 s before it reached every workload, it holds cursor too, the last workload that check started, written alone right after the check's workloads and again with the summary: the next check starts after it, as an AWS router's does, so every workload is checked in turn, even while the summary cannot be written \(check in events then holds the cursor with the last summary written, or alone with null times\)\. A summary that cannot be written fails nothing: the check's work is done\./);
+  assert.match(flat(read(MANAGER)), /After a check that ran out of its 240 s before it reached every workload, it holds cursor too, the last workload that check started, written alone right after the check's workloads and again with the summary: the next check starts after it, as an AWS router's does, so every workload is checked in turn, even while the summary cannot be written \(the summary then holds the cursor with the last summary written, or alone with null times\)\. A summary that cannot be written fails nothing: the check's work is done\./);
   // The cursor's write and read that fail, each said (controller-core.mjs, lambda/src/lib/check-run.mjs).
   assert.match(flat(read(MANAGER)), /A cursor that cannot be written is said in CheckCursorNotStored, and one that cannot be read in CheckCursorUnread: that check starts at the first workload\./);
   assert.match(read('gcp/src/controller-core.mjs'), /log\.warn\('CheckCursorNotStored', \{ error: err\.message \}\)/);
@@ -883,6 +882,10 @@ test('the manager page says the router reports, with report.mjs\'s bounds, and t
   assert.match(page, /at most 100 entries and 1 MB a request/);
   assert.doesNotMatch(page, /pushes nothing|The manager polls/);
   assert.doesNotMatch(flat(read(CE)), /The manager polls/);
+  // The `events` action is gone (the pull's removal): the page names no action to read the journal, and keeps the journal for the reports.
+  assert.doesNotMatch(page, /### `events`|manager older than 0\.25\.0|does not poll/);
+  assert.match(page, /Events are kept 7 days, for the reports/);
+  assert.match(page, /\{ "action": "events" \} is refused as any action the router does not serve/);
 });
 
 test('the manager page says a router older than 0.40.0 has no /v1/actions, and names the version once there', () => {

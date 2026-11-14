@@ -956,28 +956,11 @@ test('fromEnvironment: POST /v1/actions over the router\'s Firestore: manager-se
   const settings = { workloads: { hibernate: false, joinMinutes: 10 } };
   assert.deepEqual(await act({ action: 'manager-settings', settings, etag: '"e1"' }), { etag: '"e1"' });
   assert.ok(firestore.docs.has('router/manager'));
-  assert.deepEqual(await act({ action: 'events', after: null, limit: 10 }), { events: [], next: null, check: null, managerSettings: { etag: '"e1"' } });
   const { router, managerSettings } = await act({ action: 'router' });
   assert.deepEqual(router, { name: `dmtr-${REGION}`, version: PACKAGE.version, build: 'b7' });
   assert.deepEqual([managerSettings.hibernate, managerSettings.joinMinutes, managerSettings.error], [false, 10, null]);
   const listed = await act({ action: 'list' });
   assert.deepEqual([listed.router.name, listed.router.version, listed.router.build, listed.workloads.map((w) => w.workloadId)], [`dmtr-${REGION}`, PACKAGE.version, 'b7', ['demo']]);
-});
-
-// B1: the cursor is written right after a check's loop, alone, and again with its summary.
-test('fromEnvironment: the events action\'s check holds where the next check starts, with its summary, or alone when no summary was written', async () => {
-  const { firestore, fetch } = idleWorld();
-  const handler = fromEnvironment(ENV, { fetch, log: silentLog });
-  const checkOf = async () => {
-    const res = await handler(request('POST', '/v1/actions', JSON.stringify({ action: 'events', after: null, limit: 10, refusals: true })));
-    assert.equal(res.statusCode, 200, res.body);
-    return JSON.parse(res.body).check;
-  };
-  firestore.docs.set('router/check', { fields: toFields({ cursor: 'w07' }), updateTime: 't0' });
-  assert.deepEqual(await checkOf(), { cursor: 'w07', checkedAt: null, lastScheduledCheckAt: null });
-  const at = Date.parse('2026-11-12T10:00:00Z');
-  firestore.docs.set('router/check', { fields: toFields({ checkedAt: at, durationMs: 9, lastScheduledCheckAt: at, counts: { AWAKE: 12 }, cursor: 'w07' }), updateTime: 't1' });
-  assert.deepEqual(await checkOf(), { checkedAt: '2026-11-12T10:00:00.000Z', durationMs: 9, lastScheduledCheckAt: '2026-11-12T10:00:00.000Z', counts: { AWAKE: 12 }, cursor: 'w07' });
 });
 
 // R13: the Workload answers with AWS's name beside the CLI's (the released names stay one minor release).

@@ -35,8 +35,9 @@ function world(change, options) {
     events: [],
     stats: new Map(),
     getManagerSettings: async () => structuredClone(store.manager),
+    // As Firestore's: a push without events keeps the stored one; one of events alone leaves the settings and their ETag.
     putManagerSettings: async (doc) => {
-      store.manager = structuredClone(doc);
+      store.manager = structuredClone({ ...(doc.settings === undefined ? store.manager : {}), ...(doc.events === undefined && store.manager?.events !== undefined ? { events: store.manager.events } : {}), ...doc });
     },
     listEvents: async ({ after = null, limit }) => {
       const events = store.events.filter((e) => after === null || e.id > after).slice(0, limit);
@@ -75,13 +76,13 @@ const AWS_STATUS = [
   'wakeMode', 'wakeRules', 'noWakeRules', 'schedule', 'next', 'maintenanceDue', 'joinMinutes', 'joinFrom', 'joinInherited',
 ];
 
-test('router: AWS\'s router answer, routerInfo\'s', async () => {
+test('router: AWS\'s router answer, routerInfo\'s, and where its reports stand (report, Google Cloud\'s: null without events)', async () => {
   const { call, act, core } = world();
   await call('POST', '/v1/workloads', INPUT);
   const res = await act({ action: 'router', refusals: true });
   assert.equal(res.status, 200);
-  assert.deepEqual(Object.keys(res.body), ['router', 'settings', 'managerSettings', 'configuration', 'pauses', 'workloads', 'health']);
-  assert.deepEqual(res.body, await core.routerInfo());
+  assert.deepEqual(Object.keys(res.body), ['router', 'settings', 'managerSettings', 'configuration', 'pauses', 'workloads', 'health', 'report']);
+  assert.deepEqual(res.body, { ...(await core.routerInfo()), report: null });
   assert.deepEqual(res.body.router, { name: `dmtr-${REGION}`, version: '0.40.0', build: 'b7' });
 });
 
@@ -751,6 +752,43 @@ test('manager-settings: stored with its etag and date, answered with the etag; t
   const unreadable = (await act({ action: 'router' })).body;
   assert.deepEqual([unreadable.managerSettings.hibernate, unreadable.managerSettings.error], [null, 'settings.json is invalid: settings.json must be an object']);
   assert.equal(unreadable.health.problems.some((p) => p.code === 'manager-settings-unreadable'), true);
+});
+
+test('manager-settings: where the router reports (events: the route\'s URL and the API\'s audience) is stored with the settings; null stops the reports; the router answer says where it reports', async () => {
+  const { act, store, clock } = world();
+  Object.assign(store, { getReport: async () => ({ sentThrough: null, lastSentAt: clock.now(), recent: [] }) });
+  const events = { url: 'https://abc.execute-api.eu-west-1.amazonaws.com/routers/events', audience: 'https://abc.execute-api.eu-west-1.amazonaws.com' };
+  assert.deepEqual(await act({ action: 'manager-settings', settings: {}, etag: '"e1"', events }), { status: 200, body: { etag: '"e1"' } });
+  assert.deepEqual(store.manager, { settings: {}, etag: '"e1"', at: clock.now(), events });
+  assert.deepEqual((await act({ action: 'router' })).body.report, { host: 'abc.execute-api.eu-west-1.amazonaws.com', lastSentAt: iso(clock.now()), sentThrough: null });
+  await act({ action: 'manager-settings', settings: {}, etag: '"e2"', events: null });
+  assert.deepEqual(store.manager, { settings: {}, etag: '"e2"', at: clock.now(), events: null });
+  assert.equal((await act({ action: 'router' })).body.report, null);
+});
+
+test('manager-settings: events alone (an organization whose settings were never written) stores where to report and leaves the settings and their ETag as they are, none staying none', async () => {
+  const { act, store, clock } = world();
+  const events = { url: 'https://abc.execute-api.eu-west-1.amazonaws.com/routers/events', audience: 'https://abc.execute-api.eu-west-1.amazonaws.com' };
+  assert.deepEqual(await act({ action: 'manager-settings', events, refusals: true }), { status: 200, body: { etag: null } });
+  assert.deepEqual(store.manager, { events });
+  // No settings pushed: the organization's level is unset, not unreadable.
+  assert.deepEqual((await act({ action: 'router' })).body.managerSettings, { url: null, hibernate: null, joinMinutes: null, readAt: null, error: null });
+  await act({ action: 'manager-settings', settings: { workloads: { hibernate: false } }, etag: '"e1"' });
+  const other = { ...events, url: 'https://abc.execute-api.eu-west-1.amazonaws.com/v2/routers/events' };
+  assert.deepEqual(await act({ action: 'manager-settings', events: other }), { status: 200, body: { etag: '"e1"' } });
+  assert.deepEqual(store.manager, { settings: { workloads: { hibernate: false } }, etag: '"e1"', at: clock.now(), events: other });
+  // With settings, the etag is still needed; neither settings nor events: refused as before.
+  assert.deepEqual(await act({ action: 'manager-settings', settings: {}, events }), { status: 400, body: { error: 'etag: the ETag of settings.json, a string of 1 to 256 characters', reason: 'bad-request' } });
+  assert.deepEqual(await act({ action: 'manager-settings' }), { status: 400, body: { error: 'settings: the manager\'s settings.json is needed', reason: 'bad-request' } });
+});
+
+test('manager-settings: events that are not an https URL and an audience, 400, nothing stored', async () => {
+  const { act, store } = world();
+  const error = 'events: { url, audience }, the https URL the router reports to and the audience of its identity token';
+  for (const events of ['x', { url: 'http://api.example.com/routers/events', audience: 'https://api.example.com' }, { url: 'https://api.example.com/routers/events' }, { url: 'nope', audience: 'a' }, { url: `https://${'a'.repeat(2048)}`, audience: 'a' }]) {
+    assert.deepEqual(await act({ action: 'manager-settings', settings: {}, etag: '"e"', events }), { status: 400, body: { error, reason: 'bad-request' } }, JSON.stringify(events).slice(0, 80));
+  }
+  assert.equal(store.manager, null);
 });
 
 test('manager-settings: without settings or a string etag, 400, nothing stored', async () => {

@@ -3,7 +3,7 @@
 // machine), `schedules/<id>`, `pauses/<id>` (a workload's pause, or `<id>#<exclusionId>`: a manager's exclusion's), `router/pause` (the router's), `stats/<id>-<day>` (the day's counters, committed in
 // batches, kept 35 days), `router/sweep` (the day of the last sweep of the old counters), `router/settings` (the router level of the settings:
 // hibernate, joinMinutes, defaults, by, at), `router/check` (the last check's summary, and where the next check starts), `router/manager` (the organization's settings,
-// pushed by the manager, as one JSON string), `router/page` (the router's waiting page) and, per workload, `pages/<id>` (its
+// pushed by the manager, as one JSON string, and where the router reports), `router/report` (where its reports stand, report.mjs), `router/page` (the router's waiting page) and, per workload, `pages/<id>` (its
 // waiting page) and `favicons/<id>` (the favicon read while it was awake); `events/<stateAt, 13 digits>-<id>-<to>` (the journal: a
 // state change, committed with the run's, kept 7 days); and the IP lists:
 // `lists/<name>` (the meta) and `listParts/<name>-<version>-<index>` (the packed parts, 350 kB at most). A transition reads the run, checks its condition, and commits
@@ -531,15 +531,46 @@ export function createFirestoreStore({ google, project, database, region = datab
     async getManagerSettings() {
       const doc = await read('router/manager');
       if (!doc) return null;
-      const { settingsJson, settings, etag, at } = doc.value;
-      return { settings: typeof settingsJson === 'string' ? JSON.parse(settingsJson) : settings, etag: etag ?? null, at: at ?? 0 };
+      const { settingsJson, settings, etag, at, events } = doc.value;
+      // A document of events alone (the manager's organization has no settings.json yet) has no settings: unset.
+      const pushed = typeof settingsJson === 'string' ? { settings: JSON.parse(settingsJson) } : 'settings' in doc.value ? { settings } : {};
+      return { ...pushed, etag: etag ?? null, at: at ?? 0, ...(events ? { events } : {}) };
     },
 
     // The manager's push: its whole settings.json, replacing the last, as one JSON string, since Firestore refuses as fields what a
     // settings.json may hold (a reserved name such as a custom type's tag key `__x__`, an array in an array). The only writer is the
-    // router's `manager-settings` action.
-    async putManagerSettings({ settings, etag, at }) {
-      await commit([{ update: { name: named('router/manager'), fields: toFields({ settingsJson: JSON.stringify(settings), etag: etag ?? null, at }) } }]);
+    // router's `manager-settings` action. `events`, where the router reports (report.mjs): kept when the push has none, removed by null;
+    // a push of events alone (no `settings`) leaves the settings, their ETag and date as they are.
+    async putManagerSettings({ settings, etag, at, events }) {
+      const withSettings = settings !== undefined;
+      const fields = withSettings ? { settingsJson: JSON.stringify(settings), etag: etag ?? null, at, ...(events ? { events } : {}) } : { ...(events ? { events } : {}) };
+      await commit([{
+        update: { name: named('router/manager'), fields: toFields(fields) },
+        updateMask: { fieldPaths: [...(withSettings ? ['settingsJson', 'etag', 'at'] : []), ...(events === undefined ? [] : ['events'])] },
+      }]);
+    },
+
+    // Where the router's reports to the manager stand (report.mjs): router/report, null before the first.
+    async getReport() {
+      return (await read('router/report'))?.value ?? null;
+    },
+    // `change(read)` gives the whole record from the one read (null: none), committed on that read's precondition, read and asked
+    // again when another writer (the waker, another instance) came between.
+    async updateReport(change) {
+      for (let attempt = 1; ; attempt += 1) {
+        const doc = await read('router/report');
+        const next = await change(doc?.value ?? null);
+        try {
+          await commit([{
+            update: { name: named('router/report'), fields: toFields(next) },
+            currentDocument: doc ? { updateTime: doc.updateTime } : { exists: false },
+          }]);
+          return next;
+        } catch (err) {
+          if (!(lostPrecondition(err) || isStatus('ALREADY_EXISTS')(err)) || attempt >= ATTEMPTS) throw err;
+          await sleep(Math.random() * BACKOFF_MS * attempt);
+        }
+      }
     },
 
     // The kinds of a workload's backends, written apart from the transitions (no version change).

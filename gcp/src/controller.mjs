@@ -14,11 +14,12 @@ import { createCompute } from './compute.mjs';
 import { createController } from './controller-core.mjs';
 import { createFirestoreStore } from './firestore.mjs';
 import { createGke } from './gke.mjs';
-import { createGoogle } from './google.mjs';
+import { createGoogle, createIdentityTokens } from './google.mjs';
 import { createLogs } from './logs.mjs';
 import { createMonitoring } from './monitoring.mjs';
 import { createOnboarding, Refusal } from './onboarding.mjs';
 import { customPagesOf } from './pages.mjs';
+import { createReporter, readReport, withReports } from './report.mjs';
 import { createTasks } from './tasks.mjs';
 import { createUrlMaps } from './urlmaps.mjs';
 
@@ -75,8 +76,9 @@ function forceOf(query) {
   return force === 'true';
 }
 
-// `actions`: actions.mjs's `act`, the manager's route; none, the route is not there.
-export function createControllerApi({ core, onboarding, config, actions }) {
+// `actions`: actions.mjs's `act`, the manager's route; none, the route is not there. `report()`: where the router's reports to the
+// manager stand (report.mjs's readReport), in the health; none, the health has no `report`.
+export function createControllerApi({ core, onboarding, config, actions, report }) {
   const TASKS = {
     wake: ({ workloadId, wakeId }) => {
       if (typeof wakeId !== 'string' || !wakeId) throw bad('a wake task needs its wakeId');
@@ -110,7 +112,9 @@ export function createControllerApi({ core, onboarding, config, actions }) {
   // The route's answer, or null when there is none.
   async function route(request, path, query) {
     const { method } = request;
-    if (path === '/v1/health' && method === 'GET') return { version: PACKAGE.version, project: config.project, region: config.region };
+    if (path === '/v1/health' && method === 'GET') {
+      return { version: PACKAGE.version, project: config.project, region: config.region, ...(report ? { report: await report() } : {}) };
+    }
     // Cloud Scheduler's call (its job, the CLI's install) is the scheduled check, whose date the health reads; an operator's is not.
     if (path === '/v1/check' && method === 'POST') return { results: await core.check({ scheduled: SCHEDULER.test(request.headers?.['user-agent'] ?? '') }) };
     if (path === '/v1/tasks' && method === 'POST') return task(await bodyOf(request));
@@ -168,7 +172,14 @@ export function fromEnvironment(env = process.env, { fetch, log = logger } = {})
   const config = {
     project, region: env.DMT_REGION, wakerNeg: env.DMT_WAKER_NEG, controllerUrl: env.DMT_CONTROLLER_URL, version: PACKAGE.version, build: env.DMT_BUILD ?? null,
   };
-  const store = createFirestoreStore({ google, project, database: env.DMT_DATABASE, region: env.DMT_REGION, log });
+  const firestore = createFirestoreStore({ google, project, database: env.DMT_DATABASE, region: env.DMT_REGION, log });
+  // The reports to the manager (report.mjs): after each state change and each check, `Router checked` with the `list` action's rows.
+  let actions = null;
+  const reporter = createReporter({
+    store: firestore, tokens: createIdentityTokens({ fetch }), fetch, region: config.region, log,
+    rows: async () => (await actions({ action: 'list' })).body,
+  });
+  const store = withReports(firestore, reporter, { log });
   const lists = parseLists(env.DMT_IP_LISTS, (error) => log.error('IpListsUnreadable', { error }));
   const compute = createCompute({ google, project });
   const cloudsql = createCloudSql({ google, project });
@@ -191,12 +202,13 @@ export function fromEnvironment(env = process.env, { fetch, log = logger } = {})
     sleep: (ms) => new Promise((resolve) => { setTimeout(resolve, ms); }),
     fetch,
     customPages,
+    reporter,
     log,
   });
   const onboarding = createOnboarding({ store, compute, cloudsql, gke, urlmaps, regionalUrlmaps, core, config, customPages, log });
   const router = { name: `dmtr-${config.region}`, version: config.version, build: config.build, project: config.project, region: config.region };
-  const actions = createActions({ controller: core, onboarding, store, router, lists, log });
-  const handler = createControllerApi({ core, onboarding, config, actions });
+  actions = createActions({ controller: core, onboarding, store, router, lists, log });
+  const handler = createControllerApi({ core, onboarding, config, actions, report: () => readReport(firestore) });
   // SIGTERM commits the buffered stats (server.mjs).
   handler.flush = () => store.flushStats();
   return handler;

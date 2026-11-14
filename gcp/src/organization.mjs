@@ -12,7 +12,8 @@ const isObject = (value) => !!value && typeof value === 'object' && !Array.isArr
 // is dropped and said, the rest applies. `level`: { hibernate, joinMinutes, endedWindowDays, defaults?, types? }, as the AWS router
 // mirrors it; `page`: the waitingPage key's valid part, or null.
 export function organizationOf(stored) {
-  if (!stored) return { level: null, page: null, error: null, readAt: null };
+  // None pushed, or only where the router reports (an organization with no settings.json yet): unset.
+  if (!stored || !Object.hasOwn(stored, 'settings')) return { level: null, page: null, error: null, readAt: null };
   const readAt = stored.at ? stored.at : null;
   try {
     if (!isObject(stored.settings)) throw new Error('settings.json must be an object');

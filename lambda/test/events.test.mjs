@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createPublisher, stateChange, withTransitionEvents } from '../src/lib/events.mjs';
+import { checkedChunks, createPublisher, stateChange, withTransitionEvents } from '../src/lib/events.mjs';
 
 const BUS = 'arn:aws:events:eu-west-1:121014831971:event-bus/dmt-dev-manager';
 const ROUTER = { name: 'dmtr-dev', region: 'eu-west-3', version: '0.21.0', build: 'abc', checkSchedule: 'rate(5 minutes)' };
@@ -54,6 +54,18 @@ test('a checked router is sent in entries under 64 KB, calls under 256 KB and 10
   assert.deepEqual(details.map((d) => d.chunk), details.map((_, i) => ({ index: i, total: details.length })));
   assert.deepEqual(details.flatMap((d) => d.workloads.map((w) => w.workloadId)), workloads.map((w) => w.workloadId));
   for (const d of details) assert.deepEqual([d.router, d.checkedAt, d.counts], [ROUTER, '2026-10-05T12:00:00.000Z', { AWAKE: 300 }]);
+});
+
+test('checkedChunks: the details of Router checked, each under 64 KB, every one with the rest and its chunk, the workloads in order (both routers\' shape)', () => {
+  const workloads = Array.from({ length: 300 }, (_, i) => ({ workloadId: `w${i}`, name: 'x'.repeat(1400) }));
+  const details = checkedChunks({ router: ROUTER, checkedAt: 'x', counts: { AWAKE: 300 }, managerSettings: { etag: '"e"' }, workloads });
+  assert.ok(details.length >= 7);
+  for (const [index, d] of details.entries()) {
+    assert.ok(bytes(JSON.stringify(d)) <= 64 * 1024, `chunk of ${bytes(JSON.stringify(d))} bytes`);
+    assert.deepEqual({ ...d, workloads: undefined }, { router: ROUTER, checkedAt: 'x', counts: { AWAKE: 300 }, managerSettings: { etag: '"e"' }, chunk: { index, total: details.length }, workloads: undefined });
+  }
+  assert.deepEqual(details.flatMap((d) => d.workloads.map((w) => w.workloadId)), workloads.map((w) => w.workloadId));
+  assert.deepEqual(checkedChunks({ router: ROUTER, workloads: [] }), [{ router: ROUTER, chunk: { index: 0, total: 1 }, workloads: [] }]);
 });
 
 test('a router without workloads still sends one checked entry', async () => {

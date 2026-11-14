@@ -776,8 +776,8 @@ wakes the workload, from any address.
 - **One router per project and region**, named `dmtr-<region>`. A workload's ID matches
   `^[a-z]([a-z0-9-]{0,38}[a-z0-9])?$` so that its backend service's name fits Compute Engine's 63 characters; it
   defaults to the application's backend service's name when that matches, else `--id` names it.
-- **The manager polls, the router notifies nobody.** The CLI talks to the controller with the operator's identity; the
-  manager, once connected, reads the router's journal and summary every minute ([the manager page](google-cloud-manager.md)),
+- **The router reports to the manager.** The CLI talks to the controller with the operator's identity; once the manager
+  is connected, the router sends it each state change and each check's state ([the manager page](google-cloud-manager.md#reports-to-the-manager)),
   and a failed wake reaches its alerts from there. The wake also shows in the router's logs and in
   `dormeto gcp workloads show`.
 

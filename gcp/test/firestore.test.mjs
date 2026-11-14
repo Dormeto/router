@@ -976,6 +976,47 @@ test('putManagerSettings stores the manager\'s whole settings.json with its etag
   assert.deepEqual([...docs.keys()], ['router/manager']);
 });
 
+test('putManagerSettings: where the router reports (events) is stored beside the settings; a push without it keeps it, null removes it', async () => {
+  const { store } = setup();
+  const events = { url: 'https://api.example.com/routers/events', audience: 'https://api.example.com' };
+  await store.putManagerSettings({ settings: {}, etag: 'e1', at: 7, events });
+  assert.deepEqual(await store.getManagerSettings(), { settings: {}, etag: 'e1', at: 7, events });
+  await store.putManagerSettings({ settings: { workloads: {} }, etag: 'e2', at: 8 });
+  assert.deepEqual(await store.getManagerSettings(), { settings: { workloads: {} }, etag: 'e2', at: 8, events });
+  await store.putManagerSettings({ settings: {}, etag: 'e3', at: 9, events: null });
+  assert.deepEqual(await store.getManagerSettings(), { settings: {}, etag: 'e3', at: 9 });
+});
+
+test('putManagerSettings with events alone: only events written; before any settings, the document reads with no settings, which is unset', async () => {
+  const { store, docs } = setup();
+  const events = { url: 'https://api.example.com/routers/events', audience: 'https://api.example.com' };
+  await store.putManagerSettings({ events });
+  assert.deepEqual(await store.getManagerSettings(), { etag: null, at: 0, events });
+  assert.deepEqual(Object.keys(docs.get('router/manager').fields), ['events']);
+  await store.putManagerSettings({ settings: {}, etag: 'e1', at: 7 });
+  await store.putManagerSettings({ events: { ...events, url: 'https://api.example.com/v2' } });
+  assert.deepEqual(await store.getManagerSettings(), { settings: {}, etag: 'e1', at: 7, events: { ...events, url: 'https://api.example.com/v2' } });
+});
+
+test('router/report: none before; updateReport writes what its change returns from what it read, again when another writer came between', async () => {
+  const { store, docs, request } = setup();
+  assert.equal(await store.getReport(), null);
+  await store.updateReport((was) => ({ ...(was ?? {}), sentThrough: '0000000000001-a-AWAKE', lastSentAt: 5, recent: ['0000000000001-a-AWAKE'] }));
+  assert.deepEqual(await store.getReport(), { sentThrough: '0000000000001-a-AWAKE', lastSentAt: 5, recent: ['0000000000001-a-AWAKE'] });
+  let raced = false;
+  await store.updateReport(async (was) => {
+    if (!raced) {
+      raced = true;
+      // Another instance writes between this read and this commit: the change is asked again on its write.
+      await request('POST', `${BASE}:commit`, { writes: [{ update: { name: `${ROOT}/router/report`, fields: toFields({ ...was, lastError: 'x' }) } }] });
+    }
+    const { lastError, ...rest } = was;
+    return { ...rest, lastSentAt: 6, seen: lastError ?? null };
+  });
+  assert.deepEqual(await store.getReport(), { sentThrough: '0000000000001-a-AWAKE', lastSentAt: 6, recent: ['0000000000001-a-AWAKE'], seen: 'x' });
+  assert.deepEqual([...docs.keys()], ['router/report']);
+});
+
 test('the fake refuses what Firestore refuses: a reserved field name, an array in an array, a document over 1 MiB; nothing is written', async () => {
   const { store, docs } = setup();
   for (const [config, refused] of [

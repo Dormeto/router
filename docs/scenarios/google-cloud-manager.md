@@ -1,8 +1,11 @@
 # Google Cloud: the router and the manager
 
 From router 0.40.0, the Dormeto manager reads a Google Cloud router and acts through it as it does an AWS one. The router
-pushes nothing: it keeps its journal and its check summary in Firestore, and answers one route, `POST /v1/actions`, which
-the manager polls every minute. This page is what the router keeps, what it answers and what is its own. The connection
+keeps its journal and its check summary in Firestore, answers the manager's calls on one route, `POST /v1/actions`, and
+reports to the manager as an AWS router does: after each state change and each check, it sends its journal and its state
+to the manager's API, which puts them on the manager's event bus, so the manager no longer polls it (router 0.41.0 and
+manager 0.25.0; Not released yet: router 0.41.0). This page is what the router keeps, what it answers, what it reports and
+what is its own. The connection
 (the manager's two service accounts and the grants that reach this router) is made by `dormeto gcp connect`, which is
 documented in the CLI's README, not here.
 
@@ -26,7 +29,11 @@ documented in the CLI's README, not here.
   `CheckCursorNotStored`, and one that cannot be read in `CheckCursorUnread`: that check starts at the first workload.
 - **The organization's level**, `router/manager`: the manager's whole `settings.json` as it pushed it, kept as one JSON
   string (Firestore refuses as a field name some keys a `settings.json` may hold, such as a custom type's tag key
-  `__x__`), with its ETag and the time it was stored. Without a push, the organization level reads as unset.
+  `__x__`), with its ETag and the time it was stored. Without a push, the organization level reads as unset. It holds
+  `events` too, where the router reports (below), once the manager has said it.
+- **Where its reports stand**, `router/report`: `sentThrough`, the id of the last journal event the manager accepted;
+  `lastSentAt`; `recent`, the ids sent within the 5 minutes before `sentThrough`; and, until the next accepted report,
+  `lastError` and `lastRefusal`.
 
 ## `POST /v1/actions`
 
@@ -41,6 +48,8 @@ service: the manager calls it with an ID token of its command service account, w
   (the last request, the load balancer's rules, the targets) keeps its key, empty. A Google Cloud row names its backend
   service where AWS's names its target group.
 - **The two Google Cloud ones:** `events` and `manager-settings` (below).
+- **`router`** answers AWS's keys and `report`, where the router's reports stand (below); `GET /v1/health` answers it too,
+  beside the version, for `dormeto gcp routers show`.
 - **The AWS actions it does not answer:** AWS's `wake`, `nap`, `release`, `check`, `ensure-awake`,
   `refresh-lists`, `report` and `clusterCheck`, which AWS receives as invocations, and any other name, are answered as AWS's
   controller does: with `"refusals": true`, a refusal `unsupported` (`unknown action: <name>`); without it, a 400
@@ -67,13 +76,47 @@ service: the manager calls it with an ID token of its command service account, w
 "managerSettings": { "etag" } }`: the events after `after` (all that are kept when it is null), the oldest first,
 `limit` at most. `next` is the last id of a full page, since there may be more, else null. `check` is `router/check` with
 its times as ISO dates (null before the first check), and `managerSettings.etag` the ETag of the organization's
-settings the router holds (null when it has none), which is what the manager compares with its own file. A `limit` outside
-1 to 500, or an `after` that is not an event id, is a refusal.
+settings the router holds (null when it has none). A `limit` outside 1 to 500, or an `after` that is not an event id, is a
+refusal. The router's reports carry the same events; `events` stays for the CLI and for a manager older than 0.25.0.
 
 ### `manager-settings`
 
-`{ "action": "manager-settings", "settings": <the manager's settings.json>, "etag": <its ETag> }` stores both in
-`router/manager` and answers `{ "etag" }`. The `etag` is a string of 1 to 256 characters; `settings` is needed.
+`{ "action": "manager-settings", "settings": <the manager's settings.json>, "etag": <its ETag>, "events"?: { "url",
+"audience" } }` stores them in `router/manager` and answers `{ "etag" }`. The `etag` is a string of 1 to 256 characters;
+`settings` is needed. `events` is where the router reports: `url`, the https URL of the manager API's route
+`/routers/events`, and `audience`, the API's endpoint, which the router's identity token names. A push without `events`
+keeps the one stored, and `"events": null` stops the reports; anything else than these two strings is a refusal.
+`{ "action": "manager-settings", "events": … }` alone (an organization whose `settings.json` was never written has no
+ETag to push) stores `events` and leaves the settings and their ETag as they are, none staying none: the answer's `etag`
+is the one stored, or null. With `settings`, the `etag` is needed; with neither `settings` nor `events`, the call is refused.
+
+## Reports to the manager
+
+A router whose `router/manager` holds `events` reports; one without reports nothing.
+
+- **What it sends:** `POST <url>` with `{ "events": [{ "detailType", "detail" }] }`, at most 100 entries and 1 MB a
+  request, and `Authorization: Bearer <identity token>`: the token of the router's service account for the `audience`,
+  from the metadata server, kept until 5 minutes before it expires. No role, API or key is added: `gcp/access.json` does
+  not change. The manager's API takes the router's project and region from the token, never from the body.
+- **After each state change** (the controller's and the waker's, once the journal's commit is made): the journal's
+  events after the cursor, each as `Workload state changed` with the event's detail (its id left out).
+- **After each check** (once `router/check` is written): the same, then `Router checked` in chunks under 64 KB, AWS's
+  detail (`router`, the `list` action's router with its `region`; `checkedAt`, `durationMs`, `health`, `pauses`,
+  `counts`, `chunk`, `workloads`, the `list` action's rows) and `managerSettings.etag`, the ETag of the organization's
+  settings the router holds, which the manager compares with its own file to push it again.
+- **The cursor** moves on a 200 only. An event can commit after a later one (its time is taken before its commit, and the
+  waker and the controller are two services): each send reads the journal from 5 minutes before the cursor and leaves
+  out what `recent` holds, so a late event is sent and none is sent twice.
+- **A failed send** holds a state change 2 s at most, a wake's included: one request is 2 s at most, its two tries
+  included (a 429, a 5xx or a lost connection is tried once more; a refusal and a request that ran out of time are not).
+  It is logged (`ReportFailed`; a transition held to its 2 s, `ReportSlow`) and kept in `lastError`, and the next send
+  starts from the cursor: an event waits for the next state change or check, 5 minutes at most.
+- **A refusal**, the manager's 403 `router_unknown` (no Google Cloud connection, or the router is not registered), is
+  kept in `lastRefusal` and logged once a check (`ReportRefused`). While it lasts only the checks send; the first one
+  accepted clears it.
+- **`report`** (in `router` and `GET /v1/health`): `{ "host", "lastSentAt", "sentThrough", "lastError"?,
+  "lastRefusal"? }`, `host` the host of the route's URL; null without `events`, and `{ "error" }` when it cannot be read
+  within 2 s.
 
 ## What a nap's event names
 
@@ -154,12 +197,12 @@ logged, `EndedWindowsRemoved`.
 
 ## Limits
 
-- **The manager polls, the router does not push.** It asks every minute and reads the journal again from 5 minutes
-  before the newest event it has, so an event is read twice and kept once.
-- **A router older than 0.40.0 has no `/v1/actions`**: the manager lists it with its version, does not poll it and
-  says which `dormeto gcp routers install` command upgrades it.
-- **The journal is 7 days.** A manager that cannot read the router for longer loses the changes in between; its history
-  is inferred from the next check's states.
+- **The router reports, the manager does not poll.** A router older than 0.41.0 does not report: the manager shows it
+  too old, with the `dormeto gcp routers install` command that upgrades it.
+- **A router older than 0.40.0 has no `/v1/actions`**: the manager lists it with its version and says which
+  `dormeto gcp routers install` command upgrades it.
+- **The journal is 7 days.** A manager that refuses or cannot be reached for longer loses the changes in between; its
+  history is inferred from the next check's states.
 - **The IP lists stay the router's:** the manager's catalog is in S3, which a Google Cloud router cannot read.
 - **What only the CLI undoes:** `offboard` refuses (`conflict`) a GKE workload, whose Kubernetes access is the
   operator's, and a workload whose onboarding turned its backend service's request logs on, which the manager's accounts

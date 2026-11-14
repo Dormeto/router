@@ -130,3 +130,15 @@ export function fakeFirestore() {
 
   return { request, docs, calls };
 }
+
+// The fake's answer to a request through fetch, as Firestore's REST API answers it (a refusal: Google's error JSON with its code);
+// null for a URL not Firestore's.
+export async function firestoreResponse(firestore, url, init = {}) {
+  if (!url.startsWith('https://firestore.googleapis.com/')) return null;
+  try {
+    return Response.json(await firestore.request(init.method ?? 'GET', url, init.body ? JSON.parse(init.body) : undefined));
+  } catch (err) {
+    if (!(err instanceof GoogleError)) throw err;
+    return Response.json({ error: { code: err.code, message: err.message, status: err.status } }, { status: err.code });
+  }
+}

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createGoogle, GoogleError } from '../src/google.mjs';
+import { createGoogle, createIdentityTokens, GoogleError } from '../src/google.mjs';
 
 const TOKEN_URL = 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token';
 const json = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
@@ -185,4 +185,37 @@ test('waitCompute: past the deadline it gives up', async () => {
 test('waitCompute: giving up says the operation is not done, not that it failed', async () => {
   const { google, state } = harness({ api: (url, init, s) => { s.time += 40_000; return json({ status: 'RUNNING', selfLink: 's', name: 'op' }); } });
   await assert.rejects(google.waitCompute({ status: 'RUNNING', selfLink: 's', name: 'op' }, state.time + 60_000), { reason: 'OPERATION_NOT_DONE' });
+});
+
+// An identity token as the metadata server gives it: a JWT whose payload says its audience and when it expires (s).
+const jwt = (payload) => `h.${Buffer.from(JSON.stringify(payload)).toString('base64url')}.s`;
+
+test('identity tokens: asked of the metadata server for the audience (format full, Metadata-Flavor), cached until 5 minutes before they expire, one per audience', async () => {
+  let time = 1_000_000_000;
+  const calls = [];
+  const fetch = async (url, init = {}) => {
+    calls.push({ url, headers: init.headers, signal: init.signal });
+    const audience = new URL(url).searchParams.get('audience');
+    return new Response(jwt({ aud: audience, exp: Math.floor(time / 1000) + 3600, n: calls.length }), { status: 200 });
+  };
+  const tokens = createIdentityTokens({ fetch, now: () => time });
+  const first = await tokens.token('https://api.example.com');
+  assert.equal(calls[0].url, 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=https%3A%2F%2Fapi.example.com&format=full');
+  assert.equal(calls[0].headers['metadata-flavor'], 'Google');
+  assert.ok(calls[0].signal, 'bounded in time');
+  time += 54 * 60_000;
+  assert.equal(await tokens.token('https://api.example.com'), first, 'kept until 5 minutes before it expires');
+  await tokens.token('https://other.example.com');
+  assert.equal(calls.length, 2, 'another audience, another token');
+  time += 60_000 + 1;
+  assert.notEqual(await tokens.token('https://api.example.com'), first, 'then asked again');
+  assert.equal(calls.length, 3);
+});
+
+test('identity tokens: a refusal of the metadata server throws, and the next call asks again', async () => {
+  let answer = new Response('no', { status: 404 });
+  const tokens = createIdentityTokens({ fetch: async () => answer, now: () => 0 });
+  await assert.rejects(tokens.token('https://api.example.com'), /identity token: 404/);
+  answer = new Response(jwt({ exp: 3600 }), { status: 200 });
+  assert.match(await tokens.token('https://api.example.com'), /^h\./);
 });

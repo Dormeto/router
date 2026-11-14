@@ -6,9 +6,10 @@ import { renderPage } from '../../lambda/src/lib/page.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { FORMAT, dropReserved, packList, parseList } from '../../lambda/src/lib/ip-lists.mjs';
 import { fakeClock, fakeStore, silentLog, testConfig } from '../../lambda/test/fakes.mjs';
-import { toFields } from '../src/firestore.mjs';
+import { fromFields, toFields } from '../src/firestore.mjs';
 import { createTasks } from '../src/tasks.mjs';
 import { createCloudRunWaker, eventOf, fromEnvironment, workloadIdOf } from '../src/waker.mjs';
+import { fakeFirestore, firestoreResponse } from './firestore-fake.mjs';
 import { heartbeatStore } from './world.mjs';
 
 const CONTROLLER = 'https://dmtr-europe-west1-controller-123.europe-west1.run.app';
@@ -1073,6 +1074,36 @@ test('fromEnvironment wires the store and the queue on the environment\'s names'
   assert.equal(tasks[0].body.task.httpRequest.url, `${CONTROLLER}/v1/tasks`);
   assert.equal(tasks[0].body.task.httpRequest.oidcToken.serviceAccountEmail, SERVICE_ACCOUNT);
   assert.ok(calls.some((call) => call.url === `${documents}:commit`));
+});
+
+test('fromEnvironment: the waker reports its state change to the manager (report.mjs) before it asks the controller for the wake, with its identity token', async () => {
+  const firestore = fakeFirestore();
+  const events = { url: 'https://abc.execute-api.eu-west-1.amazonaws.com/routers/events', audience: 'https://abc.execute-api.eu-west-1.amazonaws.com' };
+  firestore.docs.set('workloads/demo', { fields: toFields({ config: testConfig() }), updateTime: 't0' });
+  firestore.docs.set('runs/demo', { fields: toFields({ state: STATES.ASLEEP }), updateTime: 't0' });
+  firestore.docs.set('router/manager', { fields: toFields({ settingsJson: '{}', etag: '"e1"', at: 1, events }), updateTime: 't0' });
+  const order = [];
+  const fetch = async (url, init = {}) => {
+    if (url.includes('/service-accounts/default/identity?')) return new Response(`h.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString('base64url')}.s`);
+    if (url.includes('metadata.google.internal')) return Response.json({ access_token: 'token', expires_in: 3600 });
+    if (url === events.url) {
+      order.push(['report', JSON.parse(init.body).events.map((e) => `${e.detail.workloadId}-${e.detail.to}`)]);
+      return Response.json({ accepted: 1, managerSettings: { etag: '"e1"' } });
+    }
+    if (url.startsWith('https://cloudtasks.googleapis.com/')) {
+      order.push(['task']);
+      return Response.json({ name: 'task' });
+    }
+    return (await firestoreResponse(firestore, url, init)) ?? Response.json({ error: { code: 404, message: 'not found', status: 'NOT_FOUND' } }, { status: 404 });
+  };
+  const handler = fromEnvironment({
+    DMT_PROJECT: 'p', DMT_REGION: 'europe-west1', DMT_DATABASE: 'dmtr-europe-west1', DMT_QUEUE: 'dmtr-europe-west1',
+    DMT_CONTROLLER_URL: CONTROLLER, DMT_SERVICE_ACCOUNT: SERVICE_ACCOUNT,
+  }, { fetch, log: silentLog });
+  const res = await handler(probe());
+  assert.equal(headerOf(res, 'x-dormeto-state'), STATES.WAKING);
+  assert.deepEqual(order, [['report', ['demo-WAKING']], ['task']]);
+  assert.match(fromFields(firestore.docs.get('router/report').fields).sentThrough, /^\d{13}-demo-WAKING$/);
 });
 
 test('fromEnvironment: DMT_CUSTOM_PAGES=1 serves a custom page; without it, the template', async () => {

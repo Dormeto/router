@@ -1,7 +1,8 @@
 // The router's one door to Google Cloud's REST APIs: the access token of the service account the Cloud Run service
 // runs as (from the metadata server, cached until 60 s before it expires), JSON in and out, errors with the code, the
 // status and the reason, and Compute Engine operations waited through their `wait` method. `token()` is the access
-// token itself, for what is not a Google API: a GKE cluster's (gke.mjs), and gcp/tools/probe.mjs.
+// token itself, for what is not a Google API: a GKE cluster's (gke.mjs), and gcp/tools/probe.mjs. createIdentityTokens gives the
+// service account's identity tokens, for the reports to the manager's API (report.mjs).
 const TOKEN_URL = 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token';
 const TOKEN_MARGIN_MS = 60_000;
 // `wait` returns when the operation is done or after about 2 minutes.
@@ -12,6 +13,12 @@ const READ_TRIES = 3;
 const RETRY_PAUSE_MS = 1000;
 // The POSTs that only read. Never a change or a commit: what the first try did is not known.
 const READING_POST = /(\/(operations\/[^/]+\/wait|backendServices\/[^/]+\/getHealth|instanceGroupManagers\/[^/]+\/listManagedInstances|instanceGroups\/[^/]+\/listInstances|networkEndpointGroups\/[^/]+\/listNetworkEndpoints(\?[^/]*)?)|\/documents:batchGet|\/v2\/entries:list)$/;
+
+// The service account's identity tokens (the reports to the manager's API, report.mjs): Google-signed, for one audience.
+const IDENTITY_URL = 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity';
+const IDENTITY_MARGIN_MS = 5 * 60_000;
+// The metadata server is the instance's own: an answer slower than this is none.
+const IDENTITY_TIMEOUT_MS = 1000;
 
 // A GoogleError's reason when `waitCompute` gives up: the operation goes on, whatever becomes of it.
 export const OPERATION_NOT_DONE = 'OPERATION_NOT_DONE';
@@ -39,6 +46,28 @@ function errorOf(method, url, res, text) {
 
 const transient = (err) => err instanceof TypeError || (err instanceof GoogleError && (err.code === 429 || err.code >= 500));
 const pause = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+
+// The identity token of the service account the Cloud Run service runs as, for `audience` (`format=full`: its email and whether
+// it is verified among the claims), from the metadata server, kept until 5 minutes before it expires (its `exp`), one per audience.
+// No role, API or key: the metadata server gives it to the service's own account.
+export function createIdentityTokens({ fetch = globalThis.fetch, now = Date.now } = {}) {
+  const kept = new Map();
+  async function token(audience) {
+    const held = kept.get(audience);
+    if (held && now() < held.refreshAt) return held.value;
+    const query = new URLSearchParams({ audience, format: 'full' });
+    const res = await fetch(`${IDENTITY_URL}?${query}`, { headers: { 'metadata-flavor': 'Google' }, signal: AbortSignal.timeout(IDENTITY_TIMEOUT_MS) });
+    if (!res.ok) throw new GoogleError(`Google: the metadata server refused the identity token: ${res.status}`, { code: res.status });
+    const value = (await res.text()).trim();
+    let exp = 0;
+    try {
+      exp = JSON.parse(Buffer.from(value.split('.')[1] ?? '', 'base64url').toString()).exp ?? 0;
+    } catch { /* unreadable: not kept */ }
+    kept.set(audience, { value, refreshAt: exp * 1000 - IDENTITY_MARGIN_MS });
+    return value;
+  }
+  return { token };
+}
 
 export function createGoogle({ fetch = globalThis.fetch, now = Date.now, sleep = pause } = {}) {
   let pending = null;

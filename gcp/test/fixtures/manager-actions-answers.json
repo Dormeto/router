@@ -2143,7 +2143,8 @@
     "ipLists": [],
     "concurrency": null,
     "drift24h": 0
-   }
+   },
+   "report": null
   }
  },
  "REST router resume": {
@@ -2379,7 +2380,8 @@
     "ipLists": [],
     "concurrency": null,
     "drift24h": 0
-   }
+   },
+   "report": null
   }
  },
  "REST onboard, custom pages on": {

@@ -696,7 +696,7 @@ test('the manager page names the CLI\'s onboarding flags as the CLI has them, --
 
 test('the manager page says router/manager keeps the settings.json as one JSON string, and why', () => {
   // firestore.mjs's putManagerSettings.
-  assert.match(read('gcp/src/firestore.mjs'), /toFields\(\{ settingsJson: JSON\.stringify\(settings\), etag: etag \?\? null, at \}\)/);
+  assert.match(read('gcp/src/firestore.mjs'), /const fields = withSettings \? \{ settingsJson: JSON\.stringify\(settings\), etag: etag \?\? null, at, /);
   assert.match(flat(read(MANAGER)), /the manager's whole settings\.json as it pushed it, kept as one JSON string \(Firestore refuses as a field name some keys a settings\.json may hold, such as a custom type's tag key __x__\), with its ETag and the time it was stored/);
 });
 
@@ -854,7 +854,7 @@ test('the pages do not call 0.38.0 or 0.39.0 a release, say what router 0.40.0 a
   }
   assert.ok(flat(read('README.md')).includes('creates the services, from Dormeto\'s public image by default (router 0.40.0 and CLI 0.14.0 or later) or from your own with --image.'));
   assert.match(flat(read('README.md')), /router 0\.40\.0 \(terraform\/gcp-releases creates the three repositories\), and dormeto gcp routers install uses it by default from CLI 0\.14\.0\. The old names/);
-  assert.match(flat(read(MANAGER)), /^# Google Cloud: the router and the manager From router 0\.40\.0, the Dormeto manager reads a Google Cloud router and acts through it as it does an AWS one\. The router pushes nothing/);
+  assert.match(flat(read(MANAGER)), /^# Google Cloud: the router and the manager From router 0\.40\.0, the Dormeto manager reads a Google Cloud router and acts through it as it does an AWS one\. The router keeps its journal/);
 });
 
 // The review's final fix wave: what 0.37.0 did not have is said on every page that says it, and the index's sentence is true.
@@ -870,6 +870,19 @@ test('the pages that describe what 0.37.0 did not have say what router 0.40.0 ad
   const readme = flat(read('README.md'));
   assert.match(readme, /what was accepted and measured\. Router 0\.40\.0 gives the Google Cloud router AWS's settings by level, the wake mode and the no-wake and wake rules, the branded waiting page, a capacity retry with fallback machine types, and the internal Application Load Balancers/);
   assert.doesNotMatch(readme, /The Google Cloud router has AWS's settings by level/);
+});
+
+// The push design (vision docs/specs/2026-11-14-google-cloud-router-push-design.md, §4): the page says what report.mjs does.
+test('the manager page says the router reports, with report.mjs\'s bounds, and the manager no longer polls', async () => {
+  const page = flat(read(MANAGER));
+  const { REPORT_BUDGET_MS, SEND_MS, ATTEMPTS } = await import('../src/report.mjs');
+  assert.deepEqual([REPORT_BUDGET_MS, SEND_MS, ATTEMPTS], [2000, 2000, 2]);
+  assert.match(page, /so the manager no longer polls it \(router 0\.41\.0 and manager 0\.25\.0; Not released yet: router 0\.41\.0\)/);
+  assert.match(page, /A failed send holds a state change 2 s at most, a wake's included: one request is 2 s at most, its two tries included/);
+  assert.match(page, /logged once a check \(ReportRefused\)/);
+  assert.match(page, /at most 100 entries and 1 MB a request/);
+  assert.doesNotMatch(page, /pushes nothing|The manager polls/);
+  assert.doesNotMatch(flat(read(CE)), /The manager polls/);
 });
 
 test('the manager page says a router older than 0.40.0 has no /v1/actions, and names the version once there', () => {

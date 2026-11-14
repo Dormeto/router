@@ -8,7 +8,7 @@ import { createControllerApi, fromEnvironment } from '../src/controller.mjs';
 import { toFields } from '../src/firestore.mjs';
 import { GoogleError } from '../src/google.mjs';
 import { createCloudRunWaker } from '../src/waker.mjs';
-import { fakeFirestore } from './firestore-fake.mjs';
+import { fakeFirestore, firestoreResponse } from './firestore-fake.mjs';
 import {
   CONTROLLER, DEFAULT_FROM, DEFAULT_SETTINGS, INPUT, REGION, V1, WAKER, ZONE, regional, serviceUrl, setup, unmanagedUrl,
 } from './world.mjs';
@@ -752,10 +752,45 @@ function fakeFetch(answers) {
   return { fetch, seen };
 }
 
-test('fromEnvironment: health answers the image\'s version, not DMT_VERSION', async () => {
+test('fromEnvironment: health answers the image\'s version, not DMT_VERSION, and where the reports stand (none without events)', async () => {
   const handler = fromEnvironment(ENV, { fetch: fakeFetch(() => null).fetch, log: silentLog });
   const res = await handler(request('GET', '/v1/health'));
-  assert.deepEqual(JSON.parse(res.body), { version: PACKAGE.version, project: 'p', region: REGION });
+  assert.deepEqual(JSON.parse(res.body), { version: PACKAGE.version, project: 'p', region: REGION, report: null });
+});
+
+// The manager's route, as report.mjs reaches it.
+const REPORTS = { url: 'https://abc.execute-api.eu-west-1.amazonaws.com/routers/events', audience: 'https://abc.execute-api.eu-west-1.amazonaws.com' };
+
+test('fromEnvironment: once the manager says where (manager-settings\' events), a check reports to it with the identity token for its audience, and the health says when', async () => {
+  const firestore = fakeFirestore();
+  const posts = [];
+  const identity = [];
+  const fetch = async (url, init = {}) => {
+    if (url.startsWith('http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?')) {
+      identity.push(new URL(url).searchParams.get('audience'));
+      return new Response(`h.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString('base64url')}.s`);
+    }
+    if (url.includes('metadata.google.internal')) return Response.json({ access_token: 't', expires_in: 3600 });
+    if (url === REPORTS.url) {
+      posts.push({ authorization: init.headers.authorization, body: JSON.parse(init.body) });
+      return Response.json({ accepted: 1, managerSettings: { etag: '"e1"' } });
+    }
+    return (await firestoreResponse(firestore, url, init)) ?? Response.json({ error: { code: 404, message: 'not found', status: 'NOT_FOUND' } }, { status: 404 });
+  };
+  const handler = fromEnvironment(ENV, { fetch, log: silentLog });
+  const call = async (method, path, body) => JSON.parse((await handler(request(method, path, body === undefined ? '' : JSON.stringify(body)))).body);
+  assert.deepEqual(await call('POST', '/v1/actions', { action: 'manager-settings', settings: {}, etag: '"e1"', events: REPORTS }), { etag: '"e1"' });
+  assert.deepEqual((await call('GET', '/v1/health')).report, { host: 'abc.execute-api.eu-west-1.amazonaws.com', lastSentAt: null, sentThrough: null });
+  await call('POST', '/v1/check');
+  assert.deepEqual(identity, [REPORTS.audience]);
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].authorization.split('.').length, 3);
+  const [{ detailType, detail }] = posts[0].body.events;
+  assert.equal(detailType, 'Router checked');
+  assert.deepEqual([detail.router.name, detail.router.region, detail.managerSettings, detail.chunk, detail.workloads], [`dmtr-${REGION}`, REGION, { etag: '"e1"' }, { index: 0, total: 1 }, []]);
+  const { report } = await call('GET', '/v1/health');
+  assert.equal(typeof report.lastSentAt, 'string');
+  assert.deepEqual((await call('POST', '/v1/actions', { action: 'router' })).report, report);
 });
 
 test('fromEnvironment: the database, the project and the NEG of the environment', async () => {

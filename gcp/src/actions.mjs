@@ -14,7 +14,8 @@
 // the instances' hibernation) keeps its key, empty, as routerInfo keeps the Lambda figures. AWS's onboarder's three (`preview`,
 // `onboard`, `offboard`) answer in its shapes (lambda/src/lib/onboarding.mjs), the Google Cloud resources for its target groups and
 // steps for what the Google Cloud onboarding changed, the REST answers' fields beside them; the REST routes keep their own answers for
-// the CLI. Two actions are Google Cloud's, the manager's poll: `events`, the journal (§5.3), and `manager-settings`, the organization's
+// the CLI. Two actions are Google Cloud's: `events`, the journal (§5.3; the CLI's, and the poll of a manager below 0.25.0: the router reports it
+// since 0.41.0, report.mjs), and `manager-settings`, the organization's
 // level (§5.5).
 import { k8sId } from '../../lambda/src/lib/kubernetes.mjs';
 import { describeStoredLists } from '../../lambda/src/lib/list-cache.mjs';
@@ -25,6 +26,7 @@ import { isPods } from './gke.mjs';
 import { maintenanceDueOf, Refusal } from './onboarding.mjs';
 import { organizationOf } from './organization.mjs';
 import { CUSTOM_PAGES_REFUSED } from './pages.mjs';
+import { readReport } from './report.mjs';
 import { rowOf } from './rows.mjs';
 import { isRegionalLb } from './switch.mjs';
 
@@ -35,6 +37,18 @@ const UNKNOWN_ACTION = 'unknown-action';
 const EVENTS_MAX = 500;
 const EVENT_ID = /^\d{13}-[a-z0-9-]+-[A-Z]+$/;
 const ETAG_MAX = 256;
+// Where the router reports (report.mjs): the route's https URL, and the audience of its identity token (the API's endpoint).
+const EVENTS_REFUSED = 'events: { url, audience }, the https URL the router reports to and the audience of its identity token';
+const URL_MAX = 2048;
+const isHttps = (value) => {
+  if (typeof value !== 'string' || !value || value.length > URL_MAX) return false;
+  try {
+    return new URL(value).protocol === 'https:';
+  } catch {
+    return false;
+  }
+};
+const isEvents = (events) => isObject(events) && isHttps(events.url) && typeof events.audience === 'string' && events.audience.length > 0 && events.audience.length <= URL_MAX;
 const TARGET_GROUP_REFUSED = 'a Google Cloud router has no targetGroupArn: name the backendService';
 const EXCLUSION_ID_MAX = 64;
 // The manager's are UUIDs; part of a document id, so no character a URL or a path changes.
@@ -304,7 +318,7 @@ export function createActions({ controller, onboarding, store, router, lists = [
     return { steps, ...answer };
   }
 
-  // The journal after `after` (null: from the oldest kept), `limit` at most (§5.3), with what the poll compares: the last check's
+  // The journal after `after` (null: from the oldest kept), `limit` at most (§5.3), with what a manager below 0.25.0 compares: the last check's
   // summary and the etag of the organization's settings the router holds.
   async function events({ after = null, limit }) {
     if (!Number.isInteger(limit) || limit < 1 || limit > EVENTS_MAX) throw invalid(`limit must be a whole number from 1 to ${EVENTS_MAX}`);
@@ -314,17 +328,30 @@ export function createActions({ controller, onboarding, store, router, lists = [
   }
 
   // The manager's settings.json, pushed whole with its ETag (§5.5), the organization's level from the next read on. One that is not an
-  // object is stored as pushed: the level reads it as unset and the health says so.
-  async function pushManagerSettings({ settings, etag }) {
-    if (settings === undefined) throw invalid('settings: the manager\'s settings.json is needed');
-    if (typeof etag !== 'string' || !etag || etag.length > ETAG_MAX) throw invalid(`etag: the ETag of settings.json, a string of 1 to ${ETAG_MAX} characters`);
-    await store.putManagerSettings({ settings, etag, at: now() });
-    log.info('ManagerSettingsStored', { etag });
+  // object is stored as pushed: the level reads it as unset and the health says so. `events` (manager 0.25.0, the push design §4.1):
+  // where the router reports, `{ url, audience }`, stored with them; a push without it keeps the one stored, null stops the reports.
+  // `events` alone (an organization whose settings.json was never written has no document and no ETag) stores it and leaves the
+  // settings and their ETag as they are, none staying none; the answer is the ETag stored, or null.
+  async function pushManagerSettings({ settings, etag, events }) {
+    if (settings === undefined && events === undefined) throw invalid('settings: the manager\'s settings.json is needed');
+    if (settings !== undefined && (typeof etag !== 'string' || !etag || etag.length > ETAG_MAX)) throw invalid(`etag: the ETag of settings.json, a string of 1 to ${ETAG_MAX} characters`);
+    if (events !== undefined && events !== null && !isEvents(events)) throw invalid(EVENTS_REFUSED);
+    const reports = events === undefined ? {} : { events: events && { url: events.url, audience: events.audience } };
+    const reportsTo = events === undefined ? {} : { reportsTo: events && new URL(events.url).host };
+    if (settings === undefined) {
+      await store.putManagerSettings(reports);
+      const held = (await store.getManagerSettings())?.etag ?? null;
+      log.info('ManagerSettingsStored', { etag: held, ...reportsTo });
+      return { etag: held };
+    }
+    await store.putManagerSettings({ settings, etag, at: now(), ...reports });
+    log.info('ManagerSettingsStored', { etag, ...reportsTo });
     return { etag };
   }
 
   const ACTIONS = {
-    router: () => controller.routerInfo(),
+    // AWS's answer, and where this router's reports stand (report.mjs): the CLI's `dormeto gcp routers show` reads them too.
+    router: async () => ({ ...(await controller.routerInfo()), report: await readReport(store) }),
     list,
     status,
     'request-nap': (payload) => manager.requestNap(payload),

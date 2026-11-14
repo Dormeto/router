@@ -8,6 +8,24 @@ const ENTRIES_MAX = 10;
 
 const size = (entry) => Buffer.byteLength(entry.Detail) + Buffer.byteLength(entry.DetailType) + Buffer.byteLength(entry.Source);
 
+// The details of `Router checked`, both routers' (AWS's on its bus, Google Cloud's through the manager's API): one per chunk of
+// workloads, each under 64 KB, every one carrying the rest (`base`) and its chunk; one chunk without workloads.
+export function checkedChunks({ workloads = [], ...base }) {
+  const baseSize = Buffer.byteLength(JSON.stringify({ ...base, chunk: { index: 9999, total: 9999 }, workloads: [] }));
+  const chunks = [[]];
+  let used = baseSize;
+  for (const w of workloads) {
+    const bytes = Buffer.byteLength(JSON.stringify(w)) + 1;
+    if (chunks.at(-1).length && used + bytes > ENTRY_MAX) {
+      chunks.push([]);
+      used = baseSize;
+    }
+    chunks.at(-1).push(w);
+    used += bytes;
+  }
+  return chunks.map((part, index) => ({ ...base, chunk: { index, total: chunks.length }, workloads: part }));
+}
+
 export function createPublisher({ events, busArn, router, log }) {
   if (!busArn) return { enabled: false, checked: async () => {}, stateChanged: async () => {}, listed: async () => {} };
   const region = busArn.split(':')[3];
@@ -34,21 +52,8 @@ export function createPublisher({ events, busArn, router, log }) {
   return {
     enabled: true,
     // The router's state: one entry per chunk of workloads, each under 64 KB; every chunk carries the rest.
-    async checked({ workloads = [], ...rest }) {
-      const base = { router, ...rest };
-      const baseSize = Buffer.byteLength(JSON.stringify({ ...base, chunk: { index: 9999, total: 9999 }, workloads: [] }));
-      const chunks = [[]];
-      let used = baseSize;
-      for (const w of workloads) {
-        const bytes = Buffer.byteLength(JSON.stringify(w)) + 1;
-        if (chunks.at(-1).length && used + bytes > ENTRY_MAX) {
-          chunks.push([]);
-          used = baseSize;
-        }
-        chunks.at(-1).push(w);
-        used += bytes;
-      }
-      await send(chunks.map((part, index) => entry('Router checked', { ...base, chunk: { index, total: chunks.length }, workloads: part })), 'checked');
+    async checked(detail) {
+      await send(checkedChunks({ router, ...detail }).map((d) => entry('Router checked', d)), 'checked');
     },
     // The router's region travels in the detail: publishing to the manager's bus in another region stamps the envelope
     // with that region (the envelope's account stays the router's).

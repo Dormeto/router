@@ -88,7 +88,10 @@ test('DMT_ROLE=controller on PORT: its health answers the version built into the
   assert.equal(listened.severity, 'INFO');
   const res = await fetch(`${urlOf(listened)}/v1/health`);
   assert.equal(res.status, 200);
-  assert.deepEqual(await res.json(), { version, project: 'p', region: 'europe-west1' });
+  // No Google here: where the reports stand is said unread, within its bound.
+  const { report, ...health } = await res.json();
+  assert.deepEqual(health, { version, project: 'p', region: 'europe-west1' });
+  assert.equal(typeof report.error, 'string');
   child.kill('SIGTERM');
   const { code, signal } = await exited;
   assert.deepEqual({ code, signal }, { code: 0, signal: null });

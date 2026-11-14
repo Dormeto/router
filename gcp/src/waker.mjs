@@ -46,12 +46,13 @@ import { STATES } from '../../lambda/src/lib/state.mjs';
 import { createWaitingPages } from '../../lambda/src/lib/waiting-pages.mjs';
 import { createWaker, napWindow, pageResponse, waitingHeaders } from '../../lambda/src/lib/waker-core.mjs';
 import { createFirestoreStore } from './firestore.mjs';
-import { createGoogle } from './google.mjs';
+import { createGoogle, createIdentityTokens } from './google.mjs';
 import { resendStale } from './heartbeat.mjs';
 import { wakerConfigOf } from './levels.mjs';
 import { SWITCH_HEADER, WORKLOAD_HEADER, WORKLOAD_ID } from './names.mjs';
 import { organizationOf } from './organization.mjs';
 import { customPagesOf, servedPage, servedStore } from './pages.mjs';
+import { createReporter, withReports } from './report.mjs';
 import { createTasks } from './tasks.mjs';
 import { WAITING_PATH } from './urlmaps.mjs';
 
@@ -284,7 +285,11 @@ export function createCloudRunWaker({ store, tasks, controllerUrl, lists = [], c
 // pages on (pages.mjs).
 export function fromEnvironment(env = process.env, { fetch, log = logger } = {}) {
   const google = createGoogle({ fetch });
-  const store = createFirestoreStore({ google, project: env.DMT_PROJECT, database: env.DMT_DATABASE, region: env.DMT_REGION, log });
+  const firestore = createFirestoreStore({ google, project: env.DMT_PROJECT, database: env.DMT_DATABASE, region: env.DMT_REGION, log });
+  // The waker's state changes (a wake started, or failed to be asked) reported to the manager as the controller's are (report.mjs),
+  // each holding its wake 2 s at most.
+  const reporter = createReporter({ store: firestore, tokens: createIdentityTokens({ fetch }), fetch, region: env.DMT_REGION, log });
+  const store = withReports(firestore, reporter, { log });
   const handler = createCloudRunWaker({
     store,
     tasks: createTasks({ google, project: env.DMT_PROJECT, region: env.DMT_REGION, queue: env.DMT_QUEUE, serviceAccount: env.DMT_SERVICE_ACCOUNT }),

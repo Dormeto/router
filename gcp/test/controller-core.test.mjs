@@ -49,7 +49,7 @@ const notDone = () => new GoogleError('Google: operation op not done in time', {
 // switch (DMT_CUSTOM_PAGES).
 function setup({
   run = { state: STATES.AWAKE, awakeSince: 1 }, cfg = {}, vms = {}, groups = {}, autoscalers = {}, machineTypes = {}, map = mapOf(), requests = 0, unhealthyPolls = 0, lists, download,
-  nodeTimers = false, logs, logConfig, customPages = false, describeBudgetMs,
+  nodeTimers = false, logs, logConfig, customPages = false, describeBudgetMs, reporter,
 } = {}) {
   const network = { fetch: async () => { throw new Error('no network in tests'); }, calls: [] };
   const clock = fakeClock();
@@ -233,6 +233,7 @@ function setup({
     },
     customPages,
     ...(describeBudgetMs === undefined ? {} : { describeBudgetMs }),
+    ...(reporter === undefined ? {} : { reporter }),
   });
   return { controller, store, clock, world, timers, urlmaps, regionalUrlmaps, network, run: () => store.state.run, logged: (event) => world.logs.filter((l) => l.event === event) };
 }
@@ -6083,6 +6084,18 @@ test('a check an operator asked, overlapping a scheduled one, keeps the date tha
   await t.controller.check();
   assert.equal(overlapped, true);
   assert.equal(t.store.state.check.lastScheduledCheckAt, START + 5 * MINUTE);
+});
+
+test('a check reports after its summary is written (report.mjs): the summary written, router/check\'s; one not written, null (the journal alone)', async () => {
+  const reported = [];
+  const t = setup({ run: AWAKE_LONG, vms: RUNNING_VM, reporter: { checked: async (summary) => { reported.push({ summary: structuredClone(summary), written: structuredClone(t.store.state.check ?? null) }); } } });
+  await t.controller.check({ scheduled: true });
+  assert.equal(reported.length, 1);
+  assert.ok(reported[0].summary.checkedAt > 0);
+  assert.deepEqual(reported[0].summary, reported[0].written, 'after router/check is written, with what it holds');
+  t.store.putCheck = async () => { throw unreadable(); };
+  await t.controller.check({ scheduled: true });
+  assert.equal(reported[1].summary, null);
 });
 
 test('a check whose summary cannot be written is not failed: it says so', async () => {

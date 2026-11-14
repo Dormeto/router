@@ -39,7 +39,7 @@
 // the wake), `lastWake` (`{ durationMs }`), `recentWakes` (AWS's: the last 10 wakes' durations, for the waiting page's progress bar), `scheduleApplied` (the last nap or awake window's occurrence applied), `napAborted`
 // (`{ reason, at }`: the last nap given up, its cause, until a nap commits), and the heartbeat's (heartbeat.mjs): `napId` (the
 // running nap's, as `wakeId` is the wake's), `beatAt`, `resentAt` and `resends`. The cause and the event of a state change are
-// logged (`StateChanged`) and committed with it in the journal (`events/`), which the manager reads (G2 spec §5.3).
+// logged (`StateChanged`) and committed with it in the journal (`events/`), which the router reports to the manager (report.mjs).
 //
 // Schedules and pauses as on AWS (vision docs/specs/2026-10-30-google-cloud-coverage-design.md, section 5): a workload's pause and
 // the router's (`router/pause`, G2 spec §5.6), and the manager's exclusions' (`exclusionId`), several per workload.
@@ -259,6 +259,8 @@ export function createController({
   fetch = globalThis.fetch, faviconBudgetMs = FAVICON_BUDGET_MS, customPages = false,
   // The time the description of a nap's stopped items has (injected for the tests).
   describeBudgetMs = DESCRIBE_BUDGET_MS,
+  // The reports to the manager (report.mjs): after each check, its summary (null when it could not be written). It never throws.
+  reporter = { checked: async () => {} },
 }) {
   const clients = { compute, kubernetesOf: (cluster) => gke.kubernetesOf(cluster) };
   const enqueue = (body) => tasks.enqueue({ url: `${config.controllerUrl}/v1/tasks`, body });
@@ -1481,7 +1483,9 @@ export function createController({
     // request end, before the summary is written. Written only when it moves.
     if (cursor !== (last?.cursor ?? null)) await store.setCheckCursor?.(cursor).catch((err) => log.warn('CheckCursorNotStored', { error: err.message }));
     await sweepStats();
-    await recordCheck({ started, scheduled, order, results, pauses: (pauses ?? []).filter((p) => p.workloadId === null), pausesError, managerState: levels.managerState, cursor });
+    const summary = await recordCheck({ started, scheduled, order, results, pauses: (pauses ?? []).filter((p) => p.workloadId === null), pausesError, managerState: levels.managerState, cursor });
+    // The journal and the router's state to the manager, once router/check is written.
+    await reporter.checked(summary);
     return results;
   }
 
@@ -1538,21 +1542,24 @@ export function createController({
   // router/check: written at the end of each check, the date of the last one the schedule started kept by the others, read again at
   // their end (a scheduled check that ran meanwhile wrote a newer one, which the health's check-late reads); `cursor`, where the next
   // check starts, when this one stopped short, as the check stored it after its loop. A summary that cannot be written fails nothing:
-  // the check's work is done.
+  // the check's work is done. The summary written, or null.
   async function recordCheck({ started, scheduled, order, results, pauses, pausesError, managerState, cursor = null }) {
-    if (!store.putCheck) return;
+    if (!store.putCheck) return null;
     try {
       const t = now();
       const lastScheduledCheckAt = scheduled ? started : (await store.getCheck?.().catch(() => null))?.lastScheduledCheckAt ?? null;
       const known = new Map(results.filter((r) => ANY_STATE.includes(r.state)).map((r) => [r.workloadId, r.state]));
       const { byState } = await stateCounts(order, known);
       const { health } = await healthSummary({ t, byState, lastScheduledCheckAt, pausesError, managerState });
-      await store.putCheck({
+      const summary = {
         checkedAt: started, durationMs: t - started, checkSchedule: CHECK_SCHEDULE, lastScheduledCheckAt, health, pauses: pauses.map(shownPause), counts: byState,
         ...(cursor ? { cursor } : {}),
-      });
+      };
+      await store.putCheck(summary);
+      return summary;
     } catch (err) {
       log.warn('CheckNotRecorded', { error: err.message });
+      return null;
     }
   }
 

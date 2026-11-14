@@ -3900,7 +3900,7 @@ test('routerInfo and the check\'s summary show the router pause as AWS\'s answer
   assert.deepEqual(t.store.state.check.pauses, [shown]);
 });
 
-test('routerInfo and the check\'s summary, which the events action returns, hold the router\'s pause alone: a workload\'s own or an exclusion\'s is in neither', async () => {
+test('routerInfo and the check\'s summary, which the reports send, hold the router\'s pause alone: a workload\'s own or an exclusion\'s is in neither', async () => {
   const t = setup({ vms: { 'vm-a': { status: 'RUNNING' } } });
   pauseFor(t);
   pauseFor(t, { by: 'mgr', reason: 'excluded: batch', exclusionId: 'x1' });

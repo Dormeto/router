@@ -181,16 +181,26 @@ test('the router permission is named outside the per-workload statements, in the
   assert.match(module, /statement_id\s+= "dormeto-alb"/);
 });
 
-test('the controller and the waker publish to the manager\'s event bus, within the boundary', () => {
+test('the controller and the waker publish to the manager\'s event bus, within the boundary, with their own source only (dormeto.router: never the relay\'s dormeto.router.gcp)', async () => {
   const b = fill(blueprint({ version: '0.21.0' }), VALUES);
   for (const key of ['controller', 'waker']) {
     assert.equal(b.functions.find((f) => f.key === key).environment.DMT_MANAGER_BUS, VALUES.managerBus, key);
     const statement = b.roles.find((r) => r.key === key).policy.Statement.find((st) => [].concat(st.Action).includes('events:PutEvents'));
     assert.deepEqual([].concat(statement.Resource), [VALUES.managerBus], key);
+    assert.deepEqual(statement.Condition, { StringEquals: { 'events:source': 'dormeto.router' } }, key);
   }
   const bus = routerBoundary().Statement.find((st) => [].concat(st.Action).includes('events:PutEvents'));
   assert.deepEqual([].concat(bus.Resource), ['arn:${partition}:events:*:*:event-bus/dmt-*-manager']);
+  // The routers' own source, and the forwarder's ELB events (EventBridge delivers them through its role, under this boundary).
+  assert.deepEqual(bus.Condition, { StringEqualsIfExists: { 'events:source': ['dormeto.router', 'aws.elasticloadbalancing'] } });
   assert.ok(PLACEHOLDERS.managerBus);
+  // The module: both statements carry the condition.
+  const iam = await readFile(IAM_TF, 'utf8');
+  const statements = [...iam.matchAll(/statement \{[^{}]*actions\s*=\s*\["events:PutEvents"\][^{}]*(condition \{[^{}]*\})?[^{}]*\}/g)].map((m) => m[0]);
+  assert.equal(statements.length, 2);
+  for (const statement of statements) {
+    assert.match(statement, /condition \{\s*test\s*=\s*"StringEquals"\s*variable\s*=\s*"events:source"\s*values\s*=\s*\["dormeto\.router"\]\s*\}/);
+  }
 });
 
 test('naps and router-pause wakes go to a queue the controller reads 10 at a time; drift events to one the onboarder reads in 60 s batches, 2 at a time', async () => {
@@ -231,7 +241,11 @@ test('the forwarder: a role of the account under the routers\' path, trusted by 
   const { role, rule } = fill(blueprint({ version: '0.23.0' }), VALUES).forwarder;
   assert.deepEqual([role.path, role.name], ['/dormeto/router/', 'dmtr-dev-forwarder']);
   assert.deepEqual(role.trust, { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Principal: { Service: 'events.amazonaws.com' }, Action: 'sts:AssumeRole', Condition: { StringEquals: { 'aws:SourceAccount': '121014831971' } } }] });
-  assert.deepEqual(role.policy.Statement, [{ Effect: 'Allow', Action: ['events:PutEvents'], Resource: [VALUES.managerBus] }]);
+  // The ELB events only (the manager's bus policy admits dormeto.router and aws.elasticloadbalancing); IfExists, should EventBridge's
+  // delivery to a bus target carry no source.
+  assert.deepEqual(role.policy.Statement, [{
+    Effect: 'Allow', Action: ['events:PutEvents'], Resource: [VALUES.managerBus], Condition: { StringEqualsIfExists: { 'events:source': 'aws.elasticloadbalancing' } },
+  }]);
   assert.equal(role.policyName, 'forwarder');
   assert.deepEqual(role.tags, { 'dormeto:router': 'dmtr-dev' });
   assert.equal(rule.name, 'dmtr-dev-discovery');
@@ -240,6 +254,8 @@ test('the forwarder: a role of the account under the routers\' path, trusted by 
   // Within the boundary every role Dormeto creates carries.
   const allowed = routerBoundary().Statement.filter((st) => [].concat(st.Action).includes('events:PutEvents'));
   assert.deepEqual(allowed.map((st) => st.Resource), ['arn:${partition}:events:*:*:event-bus/dmt-*-manager']);
+  // Its events keep their source, the pattern's: the boundary's condition lets them through.
+  assert.ok(allowed[0].Condition.StringEqualsIfExists['events:source'].includes(JSON.parse(rule.pattern).source[0]));
 });
 
 test('the forwarder\'s pattern: the ELB calls that change what discovery reads, never target registrations, failed calls nor Dormeto\'s own calls', () => {

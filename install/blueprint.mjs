@@ -37,6 +37,7 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
   const logArn = (role) => `${arn('logs', `log-group:${logGroup(role)}`)}:*`;
   const tagged = { Null: { 'aws:ResourceTag/dormeto:workload': 'false' } };
   const onboarderTagKeys = { 'ForAllValues:StringEquals': { 'aws:TagKeys': ['dormeto:workload', 'dormeto:tagged', 'dormeto:router', 'dormeto:shadows'] } };
+  const ownSource = { StringEquals: { 'events:source': 'dormeto.router' } };
   const allow = (Action, Resource, Condition) => ({ Effect: 'Allow', Action, Resource, ...(Condition ? { Condition } : {}) });
   const policy = (...Statement) => ({ Version: '2012-10-17', Statement });
   const tags = { 'dormeto:router': p.name };
@@ -70,7 +71,8 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
       allow(['sqs:SendMessage'], [queueArn('controller-failures'), queueArn('work'), queueArn('drift')]),
       allow(['sqs:ReceiveMessage', 'sqs:DeleteMessage', 'sqs:GetQueueAttributes', 'sqs:ChangeMessageVisibility'], [queueArn('work')]),
       allow(['sqs:GetQueueAttributes'], [queueArn('controller-failures'), queueArn('check-failures')]),
-      allow(['events:PutEvents'], [p.managerBus]),
+      // Their own source only: the manager's relay puts Google Cloud routers' events as dormeto.router.gcp (router 0.41.0).
+      allow(['events:PutEvents'], [p.managerBus], ownSource),
       allow(['logs:CreateLogStream', 'logs:PutLogEvents'], [logArn('controller')]),
       // The manager's lists: its catalog and manifests (the controller describes them).
       allow(['s3:GetObject'], [listObjects]),
@@ -82,7 +84,8 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
       allow(['lambda:InvokeFunction'], [functionArn('controller')]),
       // Kubernetes workloads behind a private endpoint (R10.6): the proxies of the router's clusters.
       allow(['lambda:InvokeFunction'], [kubeProxies]),
-      allow(['events:PutEvents'], [p.managerBus]),
+      // Their own source only: the manager's relay puts Google Cloud routers' events as dormeto.router.gcp (router 0.41.0).
+      allow(['events:PutEvents'], [p.managerBus], ownSource),
       allow(['logs:CreateLogStream', 'logs:PutLogEvents'], [logArn('waker')]),
       // The manager's lists: its catalog, manifests and data (the waker loads them).
       allow(['s3:GetObject'], [listObjects]),
@@ -212,7 +215,8 @@ export function blueprint({ version, p = PLACEHOLDERS, logRetentionDays = 14, wa
       role: {
         name: `${p.name}-forwarder`, path: ROLE_PATH, tags, policyName: 'forwarder',
         trust: { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Principal: { Service: 'events.amazonaws.com' }, Action: 'sts:AssumeRole', Condition: { StringEquals: { 'aws:SourceAccount': p.account } } }] },
-        policy: policy(allow(['events:PutEvents'], [p.managerBus])),
+        // The ELB events it forwards, their source kept; IfExists, should EventBridge's delivery to a bus target carry none.
+        policy: policy(allow(['events:PutEvents'], [p.managerBus], { StringEqualsIfExists: { 'events:source': 'aws.elasticloadbalancing' } })),
       },
       rule: {
         name: `${p.name}-discovery`,
@@ -240,8 +244,14 @@ export function routerBoundary({ p = PLACEHOLDERS } = {}) {
       { Sid: 'RouterLogs', Effect: 'Allow', Action: ['logs:CreateLogStream', 'logs:PutLogEvents'], Resource: any('logs', 'log-group:/aws/lambda/dmtr-*') },
       // The proxies' roles (R10.6): what Lambda requires of a function in a VPC (the proxies' invoke and logs are above).
       { Sid: 'KubeProxyNetwork', Effect: 'Allow', Action: ['ec2:CreateNetworkInterface', 'ec2:DescribeNetworkInterfaces', 'ec2:DescribeSubnets', 'ec2:DeleteNetworkInterface', 'ec2:AssignPrivateIpAddresses', 'ec2:UnassignPrivateIpAddresses'], Resource: '*' },
-      // The manager's event bus, in the manager's account (its policy admits the organization only).
-      { Sid: 'ManagerBus', Effect: 'Allow', Action: ['events:PutEvents'], Resource: `arn:${p.partition}:events:*:*:event-bus/dmt-*-manager` },
+      // The manager's event bus, in the manager's account (its policy admits the organization only): the routers' own source, and the
+      // discovery forwarder's ELB events, which EventBridge delivers through its role with their source (IfExists: should a delivery
+      // carry none). Never the relay's dormeto.router.gcp (router 0.41.0): a router in the manager's own account, which the bus policy
+      // does not limit, cannot speak for a Google Cloud router.
+      {
+        Sid: 'ManagerBus', Effect: 'Allow', Action: ['events:PutEvents'], Resource: `arn:${p.partition}:events:*:*:event-bus/dmt-*-manager`,
+        Condition: { StringEqualsIfExists: { 'events:source': ['dormeto.router', 'aws.elasticloadbalancing'] } },
+      },
       {
         Sid: 'Workloads', Effect: 'Allow',
         Action: [

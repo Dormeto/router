@@ -65,6 +65,12 @@ data "aws_iam_policy_document" "waker" {
     # Wake starts to the manager (scale design §3).
     actions   = ["events:PutEvents"]
     resources = [local.manager_bus]
+    # Its own source only: the manager's relay puts Google Cloud routers' events as dormeto.router.gcp.
+    condition {
+      test     = "StringEquals"
+      variable = "events:source"
+      values   = ["dormeto.router"]
+    }
   }
   dynamic "statement" {
     # The manager's lists: its catalog, manifests and data (R6b).
@@ -233,6 +239,12 @@ data "aws_iam_policy_document" "controller" {
     # The router's state and state changes to the manager (scale design §3).
     actions   = ["events:PutEvents"]
     resources = [local.manager_bus]
+    # Its own source only: the manager's relay puts Google Cloud routers' events as dormeto.router.gcp.
+    condition {
+      test     = "StringEquals"
+      variable = "events:source"
+      values   = ["dormeto.router"]
+    }
   }
   statement {
     actions   = ["logs:CreateLogStream", "logs:PutLogEvents"]

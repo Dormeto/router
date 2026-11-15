@@ -107,7 +107,11 @@ A router whose `router/manager` holds `events` reports; one without reports noth
   `counts`, `chunk`, `workloads`, the `list` action's rows) and `managerSettings.etag`, the ETag of the organization's
   settings the router holds, which the manager compares with its own file to push it again.
 - **The cursor** moves through the last entry put: a call that PutEvents failed in part (`FailedEntryCount`) moves it to
-  the entry before the first that failed, and the rest goes at the next report. An event can commit after a later one
+  the entry before the first that failed for a while (throttled or internal), and the rest goes at the next report. An
+  entry refused for good (a detail over 64 KB, never sent; another per-entry error; a `ValidationException` to it alone)
+  is dropped, logged `ReportDropped` with its journal id (`check` for a `Router checked` chunk), and passed: the cursor
+  and the other entries go on. An AWS error is kept and logged by its type and its message's first line, 200 characters
+  at most, the session's secrets masked. An event can commit after a later one
   (its time is taken before its commit, and the waker and the controller are two services): each report reads the
   journal from 5 minutes before the cursor and leaves out what `recent` holds, so a late event is put and none is put
   twice.

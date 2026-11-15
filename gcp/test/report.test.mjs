@@ -218,6 +218,114 @@ test('a put that fails some entries moves the cursor through the last entry befo
   assert.equal((await store.getReport()).sentThrough, idOf(START - 996, 'w4', 'ASLEEP'));
 });
 
+test('a transient per-entry failure (InternalFailure) stops the cursor before it as a throttled one does', async () => {
+  const put = (n, body) => (n === 1 ? {
+    status: 200, body: { FailedEntryCount: 1, Entries: body.Entries.map((_, i) => (i === 1 ? { ErrorCode: 'InternalFailure', ErrorMessage: 'try again' } : { EventId: `id-${i}` })) },
+  } : allPut(body));
+  const { store, reporter, firestore, log, ready } = setup({ put });
+  await ready;
+  journalOf(firestore, 3);
+  await reporter.transitioned();
+  assert.equal((await store.getReport()).sentThrough, idOf(START - 1000, 'w0', 'ASLEEP'));
+  assert.ok(!log.lines.some(([, event]) => event === 'ReportDropped'));
+});
+
+test('an entry PutEvents refuses for good (an ErrorCode neither throttling nor internal) is dropped, ReportDropped, and the cursor moves past it to the end', async () => {
+  const put = (n, body) => (n === 1 ? {
+    status: 200,
+    body: { FailedEntryCount: 1, Entries: body.Entries.map((_, i) => (i === 1 ? { ErrorCode: 'MalformedDetail', ErrorMessage: 'Detail is malformed.' } : { EventId: `id-${i}` })) },
+  } : allPut(body));
+  const { puts, store, reporter, firestore, log, ready } = setup({ put });
+  await ready;
+  journalOf(firestore, 14);
+  await reporter.transitioned();
+  assert.deepEqual(puts.map((p) => p.body.Entries.length), [10, 4], 'carried on with the next entries');
+  const report = await store.getReport();
+  assert.equal(report.sentThrough, idOf(START - 1000 + 13, 'w13', 'ASLEEP'));
+  assert.equal(report.lastError, undefined);
+  const dropped = log.lines.filter(([, event]) => event === 'ReportDropped').map(([, , data]) => data);
+  assert.deepEqual(dropped, [{ id: idOf(START - 999, 'w1', 'ASLEEP'), detailType: 'Workload state changed', error: 'MalformedDetail' }]);
+});
+
+test('a 400 ValidationException: a call of one entry drops it; a call of several is put again one entry a call, the bad one dropped', async () => {
+  const bad = idOf(START - 998, 'w2', 'ASLEEP');
+  const put = (n, body) => (body.Entries.some((e) => JSON.parse(e.Detail).workloadId === 'w2') ? { status: 400, body: { __type: 'ValidationException', message: 'invalid' } } : allPut(body));
+  const { puts, store, reporter, firestore, log, ready } = setup({ put });
+  await ready;
+  journalOf(firestore, 4);
+  await reporter.transitioned();
+  assert.deepEqual(puts.map((p) => p.body.Entries.length), [4, 1, 1, 1, 1]);
+  assert.equal((await store.getReport()).sentThrough, idOf(START - 997, 'w3', 'ASLEEP'));
+  assert.deepEqual(log.lines.filter(([, event]) => event === 'ReportDropped').map(([, , data]) => data), [{ id: bad, detailType: 'Workload state changed', error: 'ValidationException' }]);
+});
+
+test('a journal entry whose detail is over 64 KB is dropped without a call, and a check still puts Router checked after it', async () => {
+  const { puts, store, reporter, firestore, log, ready } = setup();
+  await ready;
+  journalOf(firestore, 2);
+  const big = idOf(START - 1000, 'w0', 'ASLEEP');
+  firestore.docs.set(`events/${big}`, { fields: { workloadId: { stringValue: 'w0' }, to: { stringValue: 'ASLEEP' }, note: { stringValue: 'x'.repeat(70 * 1024) } }, updateTime: 't' });
+  await reporter.checked(summaryOf());
+  assert.deepEqual(puts.map(sentIds)[0], ['w1-ASLEEP'], 'the big one never sent');
+  assert.deepEqual(typesOf(puts[1]), ['Router checked']);
+  assert.equal((await store.getReport()).sentThrough, idOf(START - 999, 'w1', 'ASLEEP'));
+  assert.deepEqual(log.lines.filter(([, event]) => event === 'ReportDropped').map(([, , data]) => data), [{ id: big, detailType: 'Workload state changed', error: 'EntryTooLarge' }]);
+});
+
+test('a Router checked chunk refused for good is dropped and logged, and the other chunks are put', async () => {
+  const workloads = Array.from({ length: 1200 }, (_, i) => ({ workloadId: `w${i}`, name: 'x'.repeat(1400), state: 'AWAKE' }));
+  const put = (n, body) => (n === 1 ? {
+    status: 200, body: { FailedEntryCount: 1, Entries: body.Entries.map((_, i) => (i === 0 ? { ErrorCode: 'MalformedDetail', ErrorMessage: 'no' } : { EventId: `id-${i}` })) },
+  } : allPut(body));
+  const { puts, store, reporter, log, ready } = setup({ workloads, put, sendMs: 10_000 });
+  await ready;
+  await reporter.checked(summaryOf());
+  assert.ok(puts.length >= 3, `${puts.length} calls`);
+  assert.deepEqual(log.lines.filter(([, event]) => event === 'ReportDropped').map(([, , data]) => data), [{ id: 'check', detailType: 'Router checked', error: 'MalformedDetail' }]);
+  const report = await store.getReport();
+  assert.deepEqual([report.lastError, report.lastSentAt], [undefined, START]);
+});
+
+test('an AWS error that quotes the credentials never reaches the store nor a log: its type and first line only, 200 characters at most, the secrets masked', async () => {
+  const quoting = `The request signature we calculated does not match the signature you provided. Check your AWS Secret Access Key and signing method.
+The Canonical String for this request should have been
+'POST
+/
+
+content-type:application/x-amz-json-1.1
+host:events.eu-west-1.amazonaws.com
+x-amz-security-token:${SESSION}
+x-amz-target:AWSEvents.PutEvents'`;
+  for (const answer of [
+    { status: 403, body: { __type: 'InvalidSignatureException', message: quoting } },
+    { status: 400, body: { __type: 'ValidationException', message: `key ${KEY_ID} secret ${SECRET} token ${SESSION} ${'y'.repeat(300)}` } },
+  ]) {
+    const t = setup({ put: () => answer });
+    await t.ready;
+    await t.change('a', STATES.AWAKE, STATES.NAPPING);
+    await t.reporter.checked(summaryOf());
+    const stored = JSON.stringify([...t.firestore.docs.values()]);
+    const logged = JSON.stringify(t.log.lines);
+    for (const secret of [SECRET, SESSION, KEY_ID]) {
+      assert.ok(!stored.includes(secret), `stored: ${secret}`);
+      assert.ok(!logged.includes(secret), `logged: ${secret}`);
+    }
+    const { lastError } = await t.store.getReport();
+    if (answer.status === 403) {
+      assert.equal(lastError, '403 InvalidSignatureException: The request signature we calculated does not match the signature you provided. Check your AWS Secret Access Key and signing method.');
+    }
+  }
+  // A per-entry message and the manager's answer are cut and masked the same way.
+  const entry = setup({ put: (n, body) => ({ status: 200, body: { FailedEntryCount: 1, Entries: body.Entries.map(() => ({ ErrorCode: 'ThrottlingException', ErrorMessage: `slow ${SESSION}\nmore ${SECRET}` })) } }) });
+  await entry.ready;
+  await entry.change('a', STATES.AWAKE, STATES.NAPPING);
+  assert.equal((await entry.store.getReport()).lastError, '200 ThrottlingException: slow ***');
+  const manager = setup({ grant: () => ({ status: 500, body: { message: `${'z'.repeat(250)}\nsecond line` } }) });
+  await manager.ready;
+  await manager.change('a', STATES.AWAKE, STATES.NAPPING);
+  assert.equal((await manager.store.getReport()).lastError, `500 ${'z'.repeat(200)}`);
+});
+
 test('a put refused for its credentials (403) drops them and asks again once, within the same report', async () => {
   const { grants, puts, store, change, ready } = setup({ put: (n, body) => (n === 1 ? { status: 403, body: { __type: 'ExpiredTokenException', message: 'expired' } } : allPut(body)) });
   await ready;

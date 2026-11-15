@@ -17,7 +17,7 @@
 // report starts from the cursor. While a refusal lasts, only the checks ask. Without `events` (a manager below 0.25.0, or none),
 // nothing is sent.
 import { STATUS_CODES } from 'node:http';
-import { callsOf, checkedChunks } from '../../lambda/src/lib/events.mjs';
+import { ENTRY_MAX, callsOf, checkedChunks } from '../../lambda/src/lib/events.mjs';
 import { signedHeaders } from './sigv4.mjs';
 
 // A transition waits this long at most for its report: the waker's are on the path of a wake.
@@ -39,6 +39,11 @@ const SOURCE_PREFIX = 'dormeto.router.gcp';
 const REGION_SHAPE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 // PutEvents' errors that say the credentials are refused (expired, or unknown): asked again once.
 const EXPIRED = new Set(['ExpiredTokenException', 'UnrecognizedClientException']);
+// PutEvents' per-entry errors that may pass at a later try: the cursor stops before them. Any other refuses the entry for good.
+const TRANSIENT = new Set(['ThrottlingException', 'InternalFailure', 'InternalException']);
+const VALIDATION = 'ValidationException';
+const TOO_LARGE = 'EntryTooLarge';
+const TEXT_MAX = 200;
 
 // The journal's ids: `<stateAt, 13 digits>-<workloadId>-<state>`. The id before every entry of a millisecond: a workload id starts
 // with a letter, after `0`.
@@ -52,6 +57,13 @@ const hostOf = (url) => {
   }
 };
 const isText = (value) => typeof value === 'string' && value.length > 0;
+// A text an answer gave, as the store and the logs keep it: its first line, the session's secrets and any quoted security token
+// masked, 200 characters at most (AWS's InvalidSignatureException quotes the canonical request, the token in it).
+const clip = (text, secrets = []) => {
+  let line = String(text ?? '').split(/\r?\n/, 1)[0];
+  for (const secret of secrets) if (secret) line = line.split(secret).join('***');
+  return line.replace(/x-amz-security-token[:=]\S*/gi, 'x-amz-security-token:***').slice(0, TEXT_MAX);
+};
 const parsed = (text) => {
   try {
     return JSON.parse(text);
@@ -130,13 +142,13 @@ export function createReporter({
     try {
       token = await tokens.token(events.audience);
     } catch (err) {
-      return { failure: { status: 0, error: err.message } };
+      return { failure: { status: 0, error: clip(err.message) } };
     }
     const answer = await exchange((signal) => fetch(events.url, { method: 'POST', headers: { authorization: `Bearer ${token}` }, signal }), deadline);
-    if (answer.error) return { failure: { status: 0, error: answer.error } };
+    if (answer.error) return { failure: { status: 0, error: clip(answer.error) } };
     const said = parsed(answer.text);
     if (answer.status !== 200) {
-      const reason = said?.error ?? said?.message ?? ((said === null && answer.text.trim().slice(0, 200)) || STATUS_CODES[answer.status] || 'refused');
+      const reason = clip(said?.error ?? said?.message ?? ((said === null && answer.text.trim()) || STATUS_CODES[answer.status] || 'refused'));
       const refusal = answer.status === 403 && said?.error === ROUTER_UNKNOWN ? ROUTER_UNKNOWN : null;
       return { failure: { status: answer.status, error: `${answer.status} ${reason}`, ...(refusal ? { refusal } : {}) } };
     }
@@ -146,36 +158,43 @@ export function createReporter({
     return { session: checked.session };
   }
 
-  // One PutEvents call of `entries` ({ Source, DetailType, Detail }) with `s`: `{ put, failure?, expired? }`, `put` the entries
-  // put before the first that failed.
+  // One PutEvents call of `entries` ({ Source, DetailType, Detail }) with `s`: `{ results }`, each entry's null (put) or
+  // `{ code, message }`; or `{ failure, expired?, validation? }` for the whole call. What AWS says is clipped, the session masked.
   async function putOnce(s, entries, deadline) {
     const url = `https://events.${s.bus.region}.amazonaws.com/`;
+    const secrets = [s.credentials.sessionToken, s.credentials.secretAccessKey, s.credentials.accessKeyId];
     const body = JSON.stringify({ Entries: entries.map((e) => ({ EventBusName: s.bus.name, ...e })) });
     const headers = { 'content-type': 'application/x-amz-json-1.1', 'x-amz-target': 'AWSEvents.PutEvents' };
     const answer = await exchange((signal) => fetch(url, {
       method: 'POST', body, signal,
       headers: signedHeaders({ method: 'POST', url, headers, body, credentials: s.credentials, region: s.bus.region, service: 'events', now: now() }),
     }), deadline);
-    if (answer.error) return { put: 0, failure: { status: 0, error: answer.error } };
+    if (answer.error) return { failure: { status: 0, error: clip(answer.error, secrets) } };
     const said = parsed(answer.text);
     if (answer.status === 200) {
-      if (!said?.FailedEntryCount) return { put: entries.length };
-      const at = Math.max(0, (said.Entries ?? []).findIndex((e) => e?.ErrorCode));
-      const first = said.Entries?.[at];
-      return { put: at, failure: { status: 200, error: `200 ${first?.ErrorCode ?? 'failed'}${first?.ErrorMessage ? `: ${first.ErrorMessage}` : ''}` } };
+      if (!said?.FailedEntryCount) return { results: entries.map(() => null) };
+      const results = entries.map((_, i) => {
+        const e = said.Entries?.[i];
+        return e?.ErrorCode ? { code: clip(e.ErrorCode, secrets), message: clip(e.ErrorMessage, secrets) } : null;
+      });
+      if (!results.some(Boolean)) return { failure: { status: 200, error: '200 failed' } };
+      return { results };
     }
-    const type = String(said?.__type ?? '').split('#').at(-1);
-    const message = said?.message ?? said?.Message;
+    const type = clip(String(said?.__type ?? '').split('#').at(-1), secrets);
+    const message = clip(said?.message ?? said?.Message ?? '', secrets);
     const reason = type ? `${type}${message ? `: ${message}` : ''}` : (STATUS_CODES[answer.status] ?? 'refused');
-    return { put: 0, failure: { status: answer.status, error: `${answer.status} ${reason}` }, expired: answer.status === 403 || EXPIRED.has(type) };
+    return {
+      failure: { status: answer.status, error: `${answer.status} ${reason}` },
+      expired: answer.status === 403 || EXPIRED.has(type), validation: answer.status === 400 && type === VALIDATION,
+    };
   }
 
   // `entries` put in one call, the session asked first when none is held; a put refused for its credentials drops them and asks
-  // again once. `{ put, failure? }`.
+  // again once. putOnce's answer.
   async function put(manager, entries, deadline) {
     for (let renewed = false; ; renewed = true) {
       const s = await session(manager.events, deadline);
-      if (s.failure) return { put: 0, failure: s.failure };
+      if (s.failure) return { failure: s.failure };
       const out = await putOnce(s.session, entries, deadline);
       if (!out.expired || renewed) return out;
       held = null;
@@ -203,22 +222,69 @@ export function createReporter({
     ...(was ?? {}), sentThrough: was?.sentThrough ?? null, lastError: failure.error, ...(failure.refusal ? { lastRefusal: failure.refusal } : {}),
   }));
 
-  // The journal after the cursor, call after call, the cursor moved by each through what it put: the failure that stopped it, or null.
+  const tooLarge = (item) => Buffer.byteLength(item.entry.Detail) > ENTRY_MAX;
+  const dropped = (item, error) => log.warn('ReportDropped', { id: item.id, detailType: item.entry.DetailType, error });
+
+  // `items` ({ id, entry }: a journal id, or `check` for a Router checked chunk) put in order, call after call, within the report's
+  // time. An entry that can never be accepted is dropped (ReportDropped) and counts as done: a detail over 64 KB, before any call; a
+  // per-entry error other than throttling or internal; a 400 ValidationException to a call of one entry (a call of several is put
+  // again one entry a call). `done(ids)` after each step, with the ids put or dropped, in order. The failure that stopped it (a
+  // transient one: the next report starts from the cursor), or null.
+  async function putItems(manager, items, deadline, done) {
+    let singleUntil = 0;
+    for (let i = 0; i < items.length;) {
+      if (tooLarge(items[i])) {
+        dropped(items[i], TOO_LARGE);
+        await done([items[i].id]);
+        i += 1;
+        continue;
+      }
+      let end = i + 1;
+      while (end < items.length && end > singleUntil && !tooLarge(items[end])) end += 1;
+      const run = items.slice(i, end);
+      const call = run.slice(0, callsOf(run.map((item) => item.entry))[0].length);
+      const out = await put(manager, call.map((item) => item.entry), deadline);
+      if (out.failure) {
+        if (!out.validation) return out.failure;
+        if (call.length > 1) {
+          singleUntil = i + call.length;
+          continue;
+        }
+        dropped(call[0], VALIDATION);
+        await done([call[0].id]);
+        i += 1;
+        continue;
+      }
+      const ids = [];
+      let failure = null;
+      for (const [k, result] of out.results.entries()) {
+        if (result && TRANSIENT.has(result.code)) {
+          failure = { status: 200, error: `200 ${result.code}${result.message ? `: ${result.message}` : ''}` };
+          break;
+        }
+        if (result) dropped(call[k], result.code);
+        ids.push(call[k].id);
+      }
+      if (ids.length) await done(ids);
+      if (failure) return failure;
+      i += call.length;
+    }
+    return null;
+  }
+
+  // The journal after the cursor, call after call, the cursor moved by each through what it put or dropped: the failure that stopped
+  // it, or null.
   async function sendJournal(manager, state, deadline) {
     let current = state;
     for (;;) {
       const batch = await unsent(current);
       if (!batch.length) return null;
-      let from = 0;
-      for (const call of callsOf(batch.map((b) => b.entry))) {
-        const out = await put(manager, call, deadline);
-        const ids = batch.slice(from, from + out.put).map((b) => b.id);
-        from += call.length;
-        if (ids.length) current = await store.updateReport((was) => advanced(was, ids, now()));
-        if (out.failure) {
-          await failed(out.failure);
-          return out.failure;
-        }
+      const failure = await putItems(manager, batch, deadline, async (ids) => {
+        current = await store.updateReport((was) => advanced(was, ids, now()));
+      });
+      if (failure) {
+        await failed(failure);
+        return failure;
       }
     }
   }
@@ -274,13 +340,12 @@ export function createReporter({
         managerSettings: { etag: manager.etag },
         workloads: listed.workloads ?? [],
       });
-      for (const call of callsOf(details.map((detail) => ({ Source: source, DetailType: CHECKED, Detail: JSON.stringify(detail) })))) {
-        const { failure: refused } = await put(manager, call, deadline);
-        if (refused) {
-          await failed(refused);
-          said(refused, 'check', manager);
-          return;
-        }
+      const chunks = details.map((detail) => ({ id: 'check', entry: { Source: source, DetailType: CHECKED, Detail: JSON.stringify(detail) } }));
+      const refused = await putItems(manager, chunks, deadline, async () => {});
+      if (refused) {
+        await failed(refused);
+        said(refused, 'check', manager);
+        return;
       }
       await store.updateReport((was) => {
         const { lastError: _e, lastRefusal: _r, ...kept } = was ?? {};

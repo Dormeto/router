@@ -4,7 +4,7 @@ From router 0.40.0, the Dormeto manager reads a Google Cloud router and acts thr
 keeps its journal and its check summary in Firestore, answers the manager's calls on one route, `POST /v1/actions`, and
 reports to the manager as an AWS router does: after each state change and each check, it puts its journal and its state
 on the manager's event bus itself, with credentials the manager's API gives it, so the manager no longer polls it (router
-0.41.0 and manager 0.25.0; Not released yet: router 0.41.0). This page is what the router keeps, what it answers, what it reports and
+0.41.0 and manager 0.25.0). This page is what the router keeps, what it answers, what it reports and
 what is its own. The connection
 (the manager's two service accounts and the grants that reach this router) is made by `dormeto gcp connect`, which is
 documented in the CLI's README, not here.

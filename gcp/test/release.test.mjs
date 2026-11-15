@@ -879,7 +879,7 @@ test('the manager page says the router puts its reports on the bus with the mana
   const { ENTRIES_MAX, CALL_MAX, ENTRY_MAX } = await import('../../lambda/src/lib/events.mjs');
   assert.deepEqual([REPORT_BUDGET_MS, SEND_MS, ATTEMPTS, RENEW_MS, JITTER_MS], [2000, 2000, 2, 300_000, 300_000]);
   assert.deepEqual([ENTRIES_MAX, CALL_MAX, ENTRY_MAX], [10, 256 * 1024, 64 * 1024]);
-  assert.match(page, /so the manager no longer polls it \(router 0\.41\.0 and manager 0\.25\.0; Not released yet: router 0\.41\.0\)/);
+  assert.match(page, /so the manager no longer polls it \(router 0\.41\.0 and manager 0\.25\.0\)/);
   assert.match(page, /A failed report holds a state change 2 s at most, a wake's included, and a check too: one report is 2 s at most, its credentials, its calls and their two tries included/);
   assert.match(page, /logged once a check \(ReportRefused\)/);
   assert.match(page, /asks again 5 minutes before it expires, plus up to 5 minutes drawn by instance/);

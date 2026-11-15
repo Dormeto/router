@@ -644,13 +644,13 @@ sampled, but an empty log leaves the count to decide. GKE refuses a KEDA `minRep
 ```bash
 # Build (podman, linux/amd64) dormeto-router:<version> from gcp/Containerfile; <version> is x.y.z, or a pre-release:
 # x.y.z-dev.<n> for a dev image, x.y.z-rc.<n> for a release candidate (a release's own tag is immutable once pushed)
-./scripts/gcp-image.sh 0.40.0
+./scripts/gcp-image.sh 0.41.0
 # Run the controller's health locally: GET /v1/health -> {"version","project","region"}
-podman run --rm -p 8080:8080 -e DMT_ROLE=controller -e DMT_PROJECT=p -e DMT_REGION=europe-west1 -e DMT_DATABASE=d -e DMT_QUEUE=q dormeto-router:0.40.0
+podman run --rm -p 8080:8080 -e DMT_ROLE=controller -e DMT_PROJECT=p -e DMT_REGION=europe-west1 -e DMT_DATABASE=d -e DMT_QUEUE=q dormeto-router:0.41.0
 # Build and push europe-west1-docker.pkg.dev/dormeto-dev/dormeto/router:<version> (repository `dormeto`; the named gcloud
 # configuration's own access; no default configuration, no default project; --repository can be repeated, and each
 # pushed image's digest is printed)
-./scripts/gcp-image.sh 0.40.0 --push --configuration dormeto-dev --repository europe-west1-docker.pkg.dev/dormeto-dev/dormeto
+./scripts/gcp-image.sh 0.41.0 --push --configuration dormeto-dev --repository europe-west1-docker.pkg.dev/dormeto-dev/dormeto
 ```
 
 Dormeto publishes the image, public, at `<europe|us|asia>-docker.pkg.dev/dormeto-releases/router/router:<version>` from

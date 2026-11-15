@@ -65,7 +65,8 @@ data "aws_iam_policy_document" "waker" {
     # Wake starts to the manager (scale design §3).
     actions   = ["events:PutEvents"]
     resources = [local.manager_bus]
-    # Its own source only: the manager's relay puts Google Cloud routers' events as dormeto.router.gcp.
+    # Its own source only: Google Cloud routers' events are dormeto.router.gcp/<project>/<region>, put by a session of the
+    # manager's own role.
     condition {
       test     = "StringEquals"
       variable = "events:source"
@@ -239,7 +240,8 @@ data "aws_iam_policy_document" "controller" {
     # The router's state and state changes to the manager (scale design §3).
     actions   = ["events:PutEvents"]
     resources = [local.manager_bus]
-    # Its own source only: the manager's relay puts Google Cloud routers' events as dormeto.router.gcp.
+    # Its own source only: Google Cloud routers' events are dormeto.router.gcp/<project>/<region>, put by a session of the
+    # manager's own role.
     condition {
       test     = "StringEquals"
       variable = "events:source"

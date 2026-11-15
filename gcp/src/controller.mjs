@@ -176,7 +176,7 @@ export function fromEnvironment(env = process.env, { fetch, log = logger } = {})
   // The reports to the manager (report.mjs): after each state change and each check, `Router checked` with the `list` action's rows.
   let actions = null;
   const reporter = createReporter({
-    store: firestore, tokens: createIdentityTokens({ fetch }), fetch, region: config.region, log,
+    store: firestore, tokens: createIdentityTokens({ fetch }), fetch, project, region: config.region, log,
     rows: async () => (await actions({ action: 'list' })).body,
   });
   const store = withReports(firestore, reporter, { log });

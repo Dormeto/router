@@ -758,12 +758,13 @@ test('fromEnvironment: health answers the image\'s version, not DMT_VERSION, and
   assert.deepEqual(JSON.parse(res.body), { version: PACKAGE.version, project: 'p', region: REGION, report: null });
 });
 
-// The manager's route, as report.mjs reaches it.
-const REPORTS = { url: 'https://abc.execute-api.eu-west-1.amazonaws.com/routers/events', audience: 'https://abc.execute-api.eu-west-1.amazonaws.com' };
+// The manager's credentials route, as report.mjs reaches it.
+const REPORTS = { url: 'https://abc.execute-api.eu-west-1.amazonaws.com/routers/credentials', audience: 'https://abc.execute-api.eu-west-1.amazonaws.com' };
 
-test('fromEnvironment: once the manager says where (manager-settings\' events), a check reports to it with the identity token for its audience, and the health says when', async () => {
+test('fromEnvironment: once the manager says where (manager-settings\' events), a check asks it for credentials with the identity token for its audience, puts its report on the manager\'s bus, and the health says when', async () => {
   const firestore = fakeFirestore();
   const posts = [];
+  const grants = [];
   const identity = [];
   const fetch = async (url, init = {}) => {
     if (url.startsWith('http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?')) {
@@ -772,8 +773,15 @@ test('fromEnvironment: once the manager says where (manager-settings\' events), 
     }
     if (url.includes('metadata.google.internal')) return Response.json({ access_token: 't', expires_in: 3600 });
     if (url === REPORTS.url) {
+      grants.push(init.headers.authorization);
+      return Response.json({
+        credentials: { accessKeyId: 'ASIA', secretAccessKey: 's', sessionToken: 't', expiration: new Date(Date.now() + 3600_000).toISOString() },
+        bus: { name: 'dmt-dev-manager', region: 'eu-west-1' }, source: `dormeto.router.gcp/p/${REGION}`, managerSettings: { etag: '"e1"' },
+      });
+    }
+    if (url === 'https://events.eu-west-1.amazonaws.com/') {
       posts.push({ authorization: init.headers.authorization, body: JSON.parse(init.body) });
-      return Response.json({ accepted: 1, managerSettings: { etag: '"e1"' } });
+      return Response.json({ FailedEntryCount: 0, Entries: [{ EventId: 'e' }] });
     }
     return (await firestoreResponse(firestore, url, init)) ?? Response.json({ error: { code: 404, message: 'not found', status: 'NOT_FOUND' } }, { status: 404 });
   };
@@ -783,10 +791,13 @@ test('fromEnvironment: once the manager says where (manager-settings\' events), 
   assert.deepEqual((await call('GET', '/v1/health')).report, { host: 'abc.execute-api.eu-west-1.amazonaws.com', lastSentAt: null, sentThrough: null });
   await call('POST', '/v1/check');
   assert.deepEqual(identity, [REPORTS.audience]);
+  assert.equal(grants.length, 1);
+  assert.equal(grants[0].split('.').length, 3);
   assert.equal(posts.length, 1);
-  assert.equal(posts[0].authorization.split('.').length, 3);
-  const [{ detailType, detail }] = posts[0].body.events;
-  assert.equal(detailType, 'Router checked');
+  assert.match(posts[0].authorization, /^AWS4-HMAC-SHA256 Credential=ASIA\/\d{8}\/eu-west-1\/events\/aws4_request, /);
+  const [{ EventBusName, Source, DetailType, Detail }] = posts[0].body.Entries;
+  const detail = JSON.parse(Detail);
+  assert.deepEqual([EventBusName, Source, DetailType], ['dmt-dev-manager', `dormeto.router.gcp/p/${REGION}`, 'Router checked']);
   assert.deepEqual([detail.router.name, detail.router.region, detail.managerSettings, detail.chunk, detail.workloads], [`dmtr-${REGION}`, REGION, { etag: '"e1"' }, { index: 0, total: 1 }, []]);
   const { report } = await call('GET', '/v1/health');
   assert.equal(typeof report.lastSentAt, 'string');

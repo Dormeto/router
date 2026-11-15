@@ -978,7 +978,7 @@ test('putManagerSettings stores the manager\'s whole settings.json with its etag
 
 test('putManagerSettings: where the router reports (events) is stored beside the settings; a push without it keeps it, null removes it', async () => {
   const { store } = setup();
-  const events = { url: 'https://api.example.com/routers/events', audience: 'https://api.example.com' };
+  const events = { url: 'https://api.example.com/routers/credentials', audience: 'https://api.example.com' };
   await store.putManagerSettings({ settings: {}, etag: 'e1', at: 7, events });
   assert.deepEqual(await store.getManagerSettings(), { settings: {}, etag: 'e1', at: 7, events });
   await store.putManagerSettings({ settings: { workloads: {} }, etag: 'e2', at: 8 });
@@ -989,7 +989,7 @@ test('putManagerSettings: where the router reports (events) is stored beside the
 
 test('putManagerSettings with events alone: only events written; before any settings, the document reads with no settings, which is unset', async () => {
   const { store, docs } = setup();
-  const events = { url: 'https://api.example.com/routers/events', audience: 'https://api.example.com' };
+  const events = { url: 'https://api.example.com/routers/credentials', audience: 'https://api.example.com' };
   await store.putManagerSettings({ events });
   assert.deepEqual(await store.getManagerSettings(), { etag: null, at: 0, events });
   assert.deepEqual(Object.keys(docs.get('router/manager').fields), ['events']);

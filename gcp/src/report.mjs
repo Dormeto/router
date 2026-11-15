@@ -1,38 +1,49 @@
-// The router's reports to the manager (vision docs/specs/2026-11-14-google-cloud-router-push-design.md, §4): what an AWS router puts on
-// the manager's event bus, a Google Cloud router sends to the manager's API (`events.url`, the route `POST /routers/events`), which
-// proves the router's project and region from the service account's identity token (audience `events.audience`) and puts the entries
-// on the bus. After each state change, the journal's entries after the cursor; after each check, the same, then `Router checked` in
-// chunks under 64 KB (lambda/src/lib/events.mjs's, AWS's detail) with the ETag of the organization's settings the router holds.
+// The router's reports to the manager (vision docs/specs/2026-11-14-google-cloud-router-push-design.md, §4, and
+// docs/specs/2026-11-15-router-credentials-design.md, §5): what an AWS router puts on the manager's event bus, a Google Cloud router puts
+// there too, with AWS credentials the manager's API gives it. It asks `events.url` (the route `POST /routers/credentials`) with the
+// service account's identity token (audience `events.audience`); the manager proves the router's project and region from the token
+// and answers a session of its own role, an hour long, allowed to put the source `dormeto.router.gcp/<project>/<region>` only, with
+// the bus's name and region. The router keeps it in memory (never in the store, never in a log) and asks again 5 minutes before it
+// expires, plus up to 5 minutes by instance; then it calls PutEvents itself, signed by sigv4.mjs. After each state change, the
+// journal's entries after the cursor; after each check, the same, then `Router checked` in chunks under 64 KB
+// (lambda/src/lib/events.mjs's, AWS's detail) with the ETag of the organization's settings the router holds; in calls of 10 entries
+// and 256 KB at most.
 //
-// The cursor is router/report: `sentThrough`, the last journal id sent, moved on a 200 only; `recent`, the ids sent within 5 minutes
-// before it, since an entry can commit after a later one (its time is taken before its commit, and the waker and the controller are
-// two services): the journal is read again from 5 minutes before the cursor, and what `recent` holds is not sent twice. A failed send
-// is said (`lastError`, `ReportFailed`; a 403 `router_unknown`, `lastRefusal`, and `ReportRefused` once a check) and never holds a
-// transition more than 2 s: the next send starts from the cursor. While a refusal lasts, only the checks send. Without `events` (a
-// manager below 0.25.0, or none), nothing is sent.
+// The cursor is router/report: `sentThrough`, the last journal id put, moved through the last entry before the first that PutEvents
+// failed; `recent`, the ids put within 5 minutes before it, since an entry can commit after a later one (its time is taken before
+// its commit, and the waker and the controller are two services): the journal is read again from 5 minutes before the cursor, and
+// what `recent` holds is not put twice. A failed report is said (`lastError`, `ReportFailed`; the credentials route's 403
+// `router_unknown`, `lastRefusal`, and `ReportRefused` once a check) and never holds a transition nor a check more than 2 s: the next
+// report starts from the cursor. While a refusal lasts, only the checks ask. Without `events` (a manager below 0.25.0, or none),
+// nothing is sent.
 import { STATUS_CODES } from 'node:http';
-import { checkedChunks } from '../../lambda/src/lib/events.mjs';
+import { callsOf, checkedChunks } from '../../lambda/src/lib/events.mjs';
+import { signedHeaders } from './sigv4.mjs';
 
 // A transition waits this long at most for its report: the waker's are on the path of a wake.
 export const REPORT_BUDGET_MS = 2000;
-// One request to the manager's API, its tries included; a try that ran out of that time is not made again.
+// One report, its credentials, its calls and their tries included; a try that ran out of that time is not made again.
 export const SEND_MS = 2000;
 export const ATTEMPTS = 2;
-// The route's limits: entries and bytes a request.
-const ENTRIES_MAX = 100;
-const BODY_MAX = 1_000_000;
+// The credentials are asked again this long before they expire, plus the instance's jitter, up to JITTER_MS: the instances of a
+// fleet do not all ask at once.
+export const RENEW_MS = 5 * 60_000;
+export const JITTER_MS = 5 * 60_000;
 // How long after its time an entry may commit (above a commit's time at worst): the journal is read again this far behind the cursor.
 const OVERLAP_MS = 5 * 60_000;
 const PAGE = 100;
 const STATE_CHANGED = 'Workload state changed';
 const CHECKED = 'Router checked';
 const ROUTER_UNKNOWN = 'router_unknown';
+const SOURCE_PREFIX = 'dormeto.router.gcp';
+const REGION_SHAPE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+// PutEvents' errors that say the credentials are refused (expired, or unknown): asked again once.
+const EXPIRED = new Set(['ExpiredTokenException', 'UnrecognizedClientException']);
 
 // The journal's ids: `<stateAt, 13 digits>-<workloadId>-<state>`. The id before every entry of a millisecond: a workload id starts
 // with a letter, after `0`.
 const msOf = (id) => Number(id.slice(0, 13));
 const idBefore = (ms) => `${String(Math.max(0, ms)).padStart(13, '0')}-0-A`;
-const sizeOf = (entry) => Buffer.byteLength(JSON.stringify(entry)) + 1;
 const hostOf = (url) => {
   try {
     return new URL(url).host;
@@ -40,26 +51,16 @@ const hostOf = (url) => {
     return null;
   }
 };
-
-// Requests of ENTRIES_MAX entries and BODY_MAX bytes at most, in order.
-function requestsOf(entries) {
-  const requests = [];
-  let bytes = 0;
-  for (const entry of entries) {
-    const size = sizeOf(entry);
-    const last = requests.at(-1);
-    if (last && last.length < ENTRIES_MAX && bytes + size <= BODY_MAX) {
-      last.push(entry);
-      bytes += size;
-    } else {
-      requests.push([entry]);
-      bytes = 20 + size;
-    }
+const isText = (value) => typeof value === 'string' && value.length > 0;
+const parsed = (text) => {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
   }
-  return requests;
-}
+};
 
-// The record after a 200 for journal `ids`: the cursor at the last one sent (never back), the ids sent within the window before it,
+// The record after a put of journal `ids`: the cursor at the last one put (never back), the ids put within the window before it,
 // the error and refusal gone.
 function advanced(was, ids, at) {
   const sentThrough = [was?.sentThrough, ...ids].filter(Boolean).sort().at(-1) ?? null;
@@ -68,62 +69,130 @@ function advanced(was, ids, at) {
   return { sentThrough, lastSentAt: at, recent };
 }
 
+// The credentials route's answer, checked: the session, the bus and this router's own source; else why not, in words that name no
+// secret.
+function sessionOf(body, source) {
+  const c = body?.credentials;
+  if (!isText(c?.accessKeyId) || !isText(c.secretAccessKey) || !isText(c.sessionToken) || !Number.isFinite(Date.parse(c.expiration))) {
+    return { error: 'the manager\'s answer holds no credentials' };
+  }
+  if (!isText(body.bus?.name) || typeof body.bus.region !== 'string' || !REGION_SHAPE.test(body.bus.region)) return { error: 'the manager\'s answer names no bus in a region' };
+  if (body.source !== source) return { error: `the manager's answer names another source than ${source}` };
+  return {
+    session: {
+      credentials: { accessKeyId: c.accessKeyId, secretAccessKey: c.secretAccessKey, sessionToken: c.sessionToken },
+      expiresAt: Date.parse(c.expiration), bus: { name: body.bus.name, region: body.bus.region }, source,
+    },
+  };
+}
+
 // `store`: firestore.mjs's (the manager's settings, the journal, router/report); `tokens`: google.mjs's createIdentityTokens; `rows()`:
-// the `list` action's answer ({ router, workloads }), for `Router checked`; `region`: the router's.
-export function createReporter({ store, tokens, fetch = globalThis.fetch, region, rows = async () => null, now = Date.now, log, sendMs = SEND_MS }) {
+// the `list` action's answer ({ router, workloads }), for `Router checked`; `project`, `region`: the router's. `random`: the
+// instance's jitter, drawn once.
+export function createReporter({
+  store, tokens, fetch = globalThis.fetch, project, region, rows = async () => null, now = Date.now, log, sendMs = SEND_MS, random = Math.random,
+}) {
+  const source = `${SOURCE_PREFIX}/${project}/${region}`;
+  const jitterMs = random() * JITTER_MS;
+  // The manager's session, in memory only: { session, url, renewAt }.
+  let held = null;
+
   // Where to report, and the ETag the router holds; null without `events`.
   async function managerOf() {
     const manager = await store.getManagerSettings();
     return manager?.events?.url && manager.events.audience ? { events: manager.events, etag: manager.etag ?? null } : null;
   }
 
-  // One request: null on a 200, else the failure `{ status, error, refusal? }`. A 429, a 5xx or a lost connection is tried once more
-  // within the request's time; a refusal or a request that ran out of time is not.
-  async function post(events, entries) {
-    const body = JSON.stringify({ events: entries });
-    const started = performance.now();
-    let failure = null;
+  // One request, tried once more on a 429, a 5xx or a lost connection while the report has time: `{ status, text }`, or the
+  // failure `{ status: 0, error }`. A request that ran out of the report's time is not tried again.
+  async function exchange(request, deadline) {
+    let last = null;
     for (let attempt = 1; attempt <= ATTEMPTS; attempt += 1) {
-      const left = Math.ceil(sendMs - (performance.now() - started));
+      const left = Math.ceil(deadline - performance.now());
       if (left <= 0) break;
       try {
-        const token = await tokens.token(events.audience);
-        const res = await fetch(events.url, {
-          method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body, signal: AbortSignal.timeout(left),
-        });
-        const text = await res.text();
-        if (res.ok) return null;
-        let said = null;
-        try {
-          said = JSON.parse(text);
-        } catch { /* not JSON */ }
-        const reason = said?.error ?? said?.message ?? ((said === null && text.trim().slice(0, 200)) || STATUS_CODES[res.status] || 'refused');
-        const refusal = res.status === 403 && said?.error === ROUTER_UNKNOWN ? ROUTER_UNKNOWN : null;
-        failure = { status: res.status, error: `${res.status} ${reason}`, ...(refusal ? { refusal } : {}) };
-        if (res.status !== 429 && res.status < 500) break;
+        const res = await request(AbortSignal.timeout(left));
+        last = { status: res.status, text: await res.text() };
+        if (res.ok || (res.status !== 429 && res.status < 500)) return last;
       } catch (err) {
-        failure = { status: 0, error: err.message };
+        last = { status: 0, error: err.message };
         if (err.name === 'TimeoutError' || err.name === 'AbortError') break;
       }
     }
-    return failure;
+    return last ?? { status: 0, error: `not sent within ${sendMs} ms` };
   }
 
-  // The journal's entries not sent yet, oldest first, for one request: from 5 minutes before the cursor, what `recent` holds aside.
+  // The session to put with: the one held while it lasts, else the manager's answer. `{ session }` or `{ failure }`.
+  async function session(events, deadline) {
+    if (held && held.url === events.url && now() < held.renewAt) return { session: held.session };
+    held = null;
+    let token;
+    try {
+      token = await tokens.token(events.audience);
+    } catch (err) {
+      return { failure: { status: 0, error: err.message } };
+    }
+    const answer = await exchange((signal) => fetch(events.url, { method: 'POST', headers: { authorization: `Bearer ${token}` }, signal }), deadline);
+    if (answer.error) return { failure: { status: 0, error: answer.error } };
+    const said = parsed(answer.text);
+    if (answer.status !== 200) {
+      const reason = said?.error ?? said?.message ?? ((said === null && answer.text.trim().slice(0, 200)) || STATUS_CODES[answer.status] || 'refused');
+      const refusal = answer.status === 403 && said?.error === ROUTER_UNKNOWN ? ROUTER_UNKNOWN : null;
+      return { failure: { status: answer.status, error: `${answer.status} ${reason}`, ...(refusal ? { refusal } : {}) } };
+    }
+    const checked = sessionOf(said, source);
+    if (checked.error) return { failure: { status: 200, error: `200 ${checked.error}` } };
+    held = { session: checked.session, url: events.url, renewAt: checked.session.expiresAt - RENEW_MS - jitterMs };
+    return { session: checked.session };
+  }
+
+  // One PutEvents call of `entries` ({ Source, DetailType, Detail }) with `s`: `{ put, failure?, expired? }`, `put` the entries
+  // put before the first that failed.
+  async function putOnce(s, entries, deadline) {
+    const url = `https://events.${s.bus.region}.amazonaws.com/`;
+    const body = JSON.stringify({ Entries: entries.map((e) => ({ EventBusName: s.bus.name, ...e })) });
+    const headers = { 'content-type': 'application/x-amz-json-1.1', 'x-amz-target': 'AWSEvents.PutEvents' };
+    const answer = await exchange((signal) => fetch(url, {
+      method: 'POST', body, signal,
+      headers: signedHeaders({ method: 'POST', url, headers, body, credentials: s.credentials, region: s.bus.region, service: 'events', now: now() }),
+    }), deadline);
+    if (answer.error) return { put: 0, failure: { status: 0, error: answer.error } };
+    const said = parsed(answer.text);
+    if (answer.status === 200) {
+      if (!said?.FailedEntryCount) return { put: entries.length };
+      const at = Math.max(0, (said.Entries ?? []).findIndex((e) => e?.ErrorCode));
+      const first = said.Entries?.[at];
+      return { put: at, failure: { status: 200, error: `200 ${first?.ErrorCode ?? 'failed'}${first?.ErrorMessage ? `: ${first.ErrorMessage}` : ''}` } };
+    }
+    const type = String(said?.__type ?? '').split('#').at(-1);
+    const message = said?.message ?? said?.Message;
+    const reason = type ? `${type}${message ? `: ${message}` : ''}` : (STATUS_CODES[answer.status] ?? 'refused');
+    return { put: 0, failure: { status: answer.status, error: `${answer.status} ${reason}` }, expired: answer.status === 403 || EXPIRED.has(type) };
+  }
+
+  // `entries` put in one call, the session asked first when none is held; a put refused for its credentials drops them and asks
+  // again once. `{ put, failure? }`.
+  async function put(manager, entries, deadline) {
+    for (let renewed = false; ; renewed = true) {
+      const s = await session(manager.events, deadline);
+      if (s.failure) return { put: 0, failure: s.failure };
+      const out = await putOnce(s.session, entries, deadline);
+      if (!out.expired || renewed) return out;
+      held = null;
+    }
+  }
+
+  // The journal's entries not put yet, oldest first, a page at most: from 5 minutes before the cursor, what `recent` holds aside.
   async function unsent(state) {
     const recent = new Set(state?.recent ?? []);
     let after = state?.sentThrough ? idBefore(msOf(state.sentThrough) - OVERLAP_MS) : null;
     const out = [];
-    let bytes = 20;
     for (;;) {
       const { events, next } = await store.listEvents({ after, limit: PAGE });
       for (const { id, ...detail } of events) {
         if (recent.has(id)) continue;
-        const entry = { detailType: STATE_CHANGED, detail };
-        const size = sizeOf(entry);
-        if (out.length >= ENTRIES_MAX || (out.length && bytes + size > BODY_MAX)) return out;
-        out.push({ id, entry });
-        bytes += size;
+        out.push({ id, entry: { Source: source, DetailType: STATE_CHANGED, Detail: JSON.stringify(detail) } });
+        if (out.length >= PAGE) return out;
       }
       if (!next) return out;
       after = next;
@@ -134,18 +203,23 @@ export function createReporter({ store, tokens, fetch = globalThis.fetch, region
     ...(was ?? {}), sentThrough: was?.sentThrough ?? null, lastError: failure.error, ...(failure.refusal ? { lastRefusal: failure.refusal } : {}),
   }));
 
-  // The journal after the cursor, request after request: the failure that stopped it, or null.
-  async function sendJournal(manager, state) {
+  // The journal after the cursor, call after call, the cursor moved by each through what it put: the failure that stopped it, or null.
+  async function sendJournal(manager, state, deadline) {
     let current = state;
     for (;;) {
       const batch = await unsent(current);
       if (!batch.length) return null;
-      const failure = await post(manager.events, batch.map((b) => b.entry));
-      if (failure) {
-        await failed(failure);
-        return failure;
+      let from = 0;
+      for (const call of callsOf(batch.map((b) => b.entry))) {
+        const out = await put(manager, call, deadline);
+        const ids = batch.slice(from, from + out.put).map((b) => b.id);
+        from += call.length;
+        if (ids.length) current = await store.updateReport((was) => advanced(was, ids, now()));
+        if (out.failure) {
+          await failed(out.failure);
+          return out.failure;
+        }
       }
-      current = await store.updateReport((was) => advanced(was, batch.map((b) => b.id), now()));
     }
   }
 
@@ -166,13 +240,14 @@ export function createReporter({ store, tokens, fetch = globalThis.fetch, region
   // After a state change: the journal, unless the manager refused this router (the next check asks again).
   async function afterTransition() {
     queued = null;
+    const deadline = performance.now() + sendMs;
     let manager = null;
     try {
       manager = await managerOf();
       if (!manager) return;
       const state = await store.getReport();
       if (state?.lastRefusal) return;
-      const failure = await sendJournal(manager, state);
+      const failure = await sendJournal(manager, state, deadline);
       if (failure) said(failure, 'state', manager);
     } catch (err) {
       log.warn('ReportFailed', { what: 'state', ...(manager ? { host: hostOf(manager.events.url) } : {}), error: err.message });
@@ -181,11 +256,12 @@ export function createReporter({ store, tokens, fetch = globalThis.fetch, region
 
   // After a check: the journal, then `Router checked` from the check's summary (router/check: `checkedAt` in ms) and the list's rows.
   async function afterCheck(summary) {
+    const deadline = performance.now() + sendMs;
     let manager = null;
     try {
       manager = await managerOf();
       if (!manager) return;
-      const failure = await sendJournal(manager, await store.getReport());
+      const failure = await sendJournal(manager, await store.getReport(), deadline);
       if (failure) {
         said(failure, 'check', manager);
         return;
@@ -198,8 +274,8 @@ export function createReporter({ store, tokens, fetch = globalThis.fetch, region
         managerSettings: { etag: manager.etag },
         workloads: listed.workloads ?? [],
       });
-      for (const entries of requestsOf(details.map((detail) => ({ detailType: CHECKED, detail })))) {
-        const refused = await post(manager.events, entries);
+      for (const call of callsOf(details.map((detail) => ({ Source: source, DetailType: CHECKED, Detail: JSON.stringify(detail) })))) {
+        const { failure: refused } = await put(manager, call, deadline);
         if (refused) {
           await failed(refused);
           said(refused, 'check', manager);

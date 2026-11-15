@@ -288,7 +288,7 @@ export function fromEnvironment(env = process.env, { fetch, log = logger } = {})
   const firestore = createFirestoreStore({ google, project: env.DMT_PROJECT, database: env.DMT_DATABASE, region: env.DMT_REGION, log });
   // The waker's state changes (a wake started, or failed to be asked) reported to the manager as the controller's are (report.mjs),
   // each holding its wake 2 s at most.
-  const reporter = createReporter({ store: firestore, tokens: createIdentityTokens({ fetch }), fetch, region: env.DMT_REGION, log });
+  const reporter = createReporter({ store: firestore, tokens: createIdentityTokens({ fetch }), fetch, project: env.DMT_PROJECT, region: env.DMT_REGION, log });
   const store = withReports(firestore, reporter, { log });
   const handler = createCloudRunWaker({
     store,

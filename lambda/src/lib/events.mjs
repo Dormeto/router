@@ -2,14 +2,33 @@
 // and each workload state change. The envelope's account and region identify the router; publishing never fails the
 // work that triggers it (the next check sends the whole state again).
 const SOURCE = 'dormeto.router';
-const ENTRY_MAX = 64 * 1024; // bytes of one entry's detail: PutEvents allows 256 KB per call
-const CALL_MAX = 256 * 1024;
-const ENTRIES_MAX = 10;
+export const ENTRY_MAX = 64 * 1024; // bytes of one entry's detail: PutEvents allows 256 KB per call
+export const CALL_MAX = 256 * 1024;
+export const ENTRIES_MAX = 10;
 
-const size = (entry) => Buffer.byteLength(entry.Detail) + Buffer.byteLength(entry.DetailType) + Buffer.byteLength(entry.Source);
+export const entrySize = (entry) => Buffer.byteLength(entry.Detail) + Buffer.byteLength(entry.DetailType) + Buffer.byteLength(entry.Source);
 
-// The details of `Router checked`, both routers' (AWS's on its bus, Google Cloud's through the manager's API): one per chunk of
-// workloads, each under 64 KB, every one carrying the rest (`base`) and its chunk; one chunk without workloads.
+// PutEvents entries ({ Source, DetailType, Detail }) in calls of at most 10 entries and 256 KB, in order: both routers' (AWS's
+// through its SDK, Google Cloud's signed by the router itself, gcp/src/report.mjs).
+export function callsOf(entries) {
+  const calls = [];
+  let bytes = 0;
+  for (const e of entries) {
+    const last = calls.at(-1);
+    if (last && last.length < ENTRIES_MAX && bytes + entrySize(e) <= CALL_MAX) {
+      last.push(e);
+      bytes += entrySize(e);
+    } else {
+      calls.push([e]);
+      bytes = entrySize(e);
+    }
+  }
+  return calls;
+}
+
+// The details of `Router checked`, both routers' (each puts them on the manager's bus, Google Cloud's with the manager's
+// credentials): one per chunk of workloads, each under 64 KB, every one carrying the rest (`base`) and its chunk; one chunk
+// without workloads.
 export function checkedChunks({ workloads = [], ...base }) {
   const baseSize = Buffer.byteLength(JSON.stringify({ ...base, chunk: { index: 9999, total: 9999 }, workloads: [] }));
   const chunks = [[]];
@@ -33,13 +52,7 @@ export function createPublisher({ events, busArn, router, log }) {
 
   // Calls of at most 10 entries and 256 KB.
   async function send(entries, what) {
-    const calls = [];
-    for (const e of entries) {
-      const last = calls.at(-1);
-      if (last && last.length < ENTRIES_MAX && last.reduce((n, x) => n + size(x), 0) + size(e) <= CALL_MAX) last.push(e);
-      else calls.push([e]);
-    }
-    for (const call of calls) {
+    for (const call of callsOf(entries)) {
       try {
         const out = await events.putEvents({ Entries: call }, { region });
         if (out?.FailedEntryCount) log.warn('PublishFailed', { what, failed: out.FailedEntryCount, error: out.Entries?.find((x) => x.ErrorCode)?.ErrorCode });

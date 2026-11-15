@@ -2,7 +2,7 @@
 // runs as (from the metadata server, cached until 60 s before it expires), JSON in and out, errors with the code, the
 // status and the reason, and Compute Engine operations waited through their `wait` method. `token()` is the access
 // token itself, for what is not a Google API: a GKE cluster's (gke.mjs), and gcp/tools/probe.mjs. createIdentityTokens gives the
-// service account's identity tokens, for the reports to the manager's API (report.mjs).
+// service account's identity tokens, for the credentials the reports ask of the manager's API (report.mjs).
 const TOKEN_URL = 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token';
 const TOKEN_MARGIN_MS = 60_000;
 // `wait` returns when the operation is done or after about 2 minutes.
@@ -14,7 +14,7 @@ const RETRY_PAUSE_MS = 1000;
 // The POSTs that only read. Never a change or a commit: what the first try did is not known.
 const READING_POST = /(\/(operations\/[^/]+\/wait|backendServices\/[^/]+\/getHealth|instanceGroupManagers\/[^/]+\/listManagedInstances|instanceGroups\/[^/]+\/listInstances|networkEndpointGroups\/[^/]+\/listNetworkEndpoints(\?[^/]*)?)|\/documents:batchGet|\/v2\/entries:list)$/;
 
-// The service account's identity tokens (the reports to the manager's API, report.mjs): Google-signed, for one audience.
+// The service account's identity tokens (the credentials the reports ask of the manager's API, report.mjs): Google-signed, for one audience.
 const IDENTITY_URL = 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity';
 const IDENTITY_MARGIN_MS = 5 * 60_000;
 // The metadata server is the instance's own: an answer slower than this is none.

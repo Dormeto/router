@@ -723,7 +723,7 @@ test('manager-settings: stored with its etag and date, answered with the etag; t
 test('manager-settings: where the router reports (events: the route\'s URL and the API\'s audience) is stored with the settings; null stops the reports; the router answer says where it reports', async () => {
   const { act, store, clock } = world();
   Object.assign(store, { getReport: async () => ({ sentThrough: null, lastSentAt: clock.now(), recent: [] }) });
-  const events = { url: 'https://abc.execute-api.eu-west-1.amazonaws.com/routers/events', audience: 'https://abc.execute-api.eu-west-1.amazonaws.com' };
+  const events = { url: 'https://abc.execute-api.eu-west-1.amazonaws.com/routers/credentials', audience: 'https://abc.execute-api.eu-west-1.amazonaws.com' };
   assert.deepEqual(await act({ action: 'manager-settings', settings: {}, etag: '"e1"', events }), { status: 200, body: { etag: '"e1"' } });
   assert.deepEqual(store.manager, { settings: {}, etag: '"e1"', at: clock.now(), events });
   assert.deepEqual((await act({ action: 'router' })).body.report, { host: 'abc.execute-api.eu-west-1.amazonaws.com', lastSentAt: iso(clock.now()), sentThrough: null });
@@ -734,13 +734,13 @@ test('manager-settings: where the router reports (events: the route\'s URL and t
 
 test('manager-settings: events alone (an organization whose settings were never written) stores where to report and leaves the settings and their ETag as they are, none staying none', async () => {
   const { act, store, clock } = world();
-  const events = { url: 'https://abc.execute-api.eu-west-1.amazonaws.com/routers/events', audience: 'https://abc.execute-api.eu-west-1.amazonaws.com' };
+  const events = { url: 'https://abc.execute-api.eu-west-1.amazonaws.com/routers/credentials', audience: 'https://abc.execute-api.eu-west-1.amazonaws.com' };
   assert.deepEqual(await act({ action: 'manager-settings', events, refusals: true }), { status: 200, body: { etag: null } });
   assert.deepEqual(store.manager, { events });
   // No settings pushed: the organization's level is unset, not unreadable.
   assert.deepEqual((await act({ action: 'router' })).body.managerSettings, { url: null, hibernate: null, joinMinutes: null, readAt: null, error: null });
   await act({ action: 'manager-settings', settings: { workloads: { hibernate: false } }, etag: '"e1"' });
-  const other = { ...events, url: 'https://abc.execute-api.eu-west-1.amazonaws.com/v2/routers/events' };
+  const other = { ...events, url: 'https://abc.execute-api.eu-west-1.amazonaws.com/v2/routers/credentials' };
   assert.deepEqual(await act({ action: 'manager-settings', events: other }), { status: 200, body: { etag: '"e1"' } });
   assert.deepEqual(store.manager, { settings: { workloads: { hibernate: false } }, etag: '"e1"', at: clock.now(), events: other });
   // With settings, the etag is still needed; neither settings nor events: refused as before.
@@ -751,7 +751,7 @@ test('manager-settings: events alone (an organization whose settings were never 
 test('manager-settings: events that are not an https URL and an audience, 400, nothing stored', async () => {
   const { act, store } = world();
   const error = 'events: { url, audience }, the https URL the router reports to and the audience of its identity token';
-  for (const events of ['x', { url: 'http://api.example.com/routers/events', audience: 'https://api.example.com' }, { url: 'https://api.example.com/routers/events' }, { url: 'nope', audience: 'a' }, { url: `https://${'a'.repeat(2048)}`, audience: 'a' }]) {
+  for (const events of ['x', { url: 'http://api.example.com/routers/credentials', audience: 'https://api.example.com' }, { url: 'https://api.example.com/routers/credentials' }, { url: 'nope', audience: 'a' }, { url: `https://${'a'.repeat(2048)}`, audience: 'a' }]) {
     assert.deepEqual(await act({ action: 'manager-settings', settings: {}, etag: '"e"', events }), { status: 400, body: { error, reason: 'bad-request' } }, JSON.stringify(events).slice(0, 80));
   }
   assert.equal(store.manager, null);

@@ -181,7 +181,7 @@ test('the router permission is named outside the per-workload statements, in the
   assert.match(module, /statement_id\s+= "dormeto-alb"/);
 });
 
-test('the controller and the waker publish to the manager\'s event bus, within the boundary, with their own source only (dormeto.router: never the relay\'s dormeto.router.gcp)', async () => {
+test('the controller and the waker publish to the manager\'s event bus, within the boundary, with their own source only (dormeto.router: never a Google Cloud router\'s dormeto.router.gcp/<project>/<region>)', async () => {
   const b = fill(blueprint({ version: '0.21.0' }), VALUES);
   for (const key of ['controller', 'waker']) {
     assert.equal(b.functions.find((f) => f.key === key).environment.DMT_MANAGER_BUS, VALUES.managerBus, key);

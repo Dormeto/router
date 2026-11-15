@@ -871,15 +871,21 @@ test('the pages that describe what 0.37.0 did not have say what router 0.40.0 ad
   assert.doesNotMatch(readme, /The Google Cloud router has AWS's settings by level/);
 });
 
-// The push design (vision docs/specs/2026-11-14-google-cloud-router-push-design.md, §4): the page says what report.mjs does.
-test('the manager page says the router reports, with report.mjs\'s bounds, and the manager no longer polls', async () => {
+// The push design (vision docs/specs/2026-11-14-google-cloud-router-push-design.md, §4) and the credentials design
+// (docs/specs/2026-11-15-router-credentials-design.md, §5): the page says what report.mjs does.
+test('the manager page says the router puts its reports on the bus with the manager\'s credentials, with report.mjs\'s bounds, and the manager no longer polls', async () => {
   const page = flat(read(MANAGER));
-  const { REPORT_BUDGET_MS, SEND_MS, ATTEMPTS } = await import('../src/report.mjs');
-  assert.deepEqual([REPORT_BUDGET_MS, SEND_MS, ATTEMPTS], [2000, 2000, 2]);
+  const { REPORT_BUDGET_MS, SEND_MS, ATTEMPTS, RENEW_MS, JITTER_MS } = await import('../src/report.mjs');
+  const { ENTRIES_MAX, CALL_MAX, ENTRY_MAX } = await import('../../lambda/src/lib/events.mjs');
+  assert.deepEqual([REPORT_BUDGET_MS, SEND_MS, ATTEMPTS, RENEW_MS, JITTER_MS], [2000, 2000, 2, 300_000, 300_000]);
+  assert.deepEqual([ENTRIES_MAX, CALL_MAX, ENTRY_MAX], [10, 256 * 1024, 64 * 1024]);
   assert.match(page, /so the manager no longer polls it \(router 0\.41\.0 and manager 0\.25\.0; Not released yet: router 0\.41\.0\)/);
-  assert.match(page, /A failed send holds a state change 2 s at most, a wake's included: one request is 2 s at most, its two tries included/);
+  assert.match(page, /A failed report holds a state change 2 s at most, a wake's included, and a check too: one report is 2 s at most, its credentials, its calls and their two tries included/);
   assert.match(page, /logged once a check \(ReportRefused\)/);
-  assert.match(page, /at most 100 entries and 1 MB a request/);
+  assert.match(page, /asks again 5 minutes before it expires, plus up to 5 minutes drawn by instance/);
+  assert.match(page, /at most 10 entries and 256 KB a call, a detail under 64 KB/);
+  assert.match(page, /the source dormeto\.router\.gcp\/<project>\/<region> only/);
+  assert.doesNotMatch(page, /\/routers\/events|puts them on the manager's event bus|1 MB a request/);
   assert.doesNotMatch(page, /pushes nothing|The manager polls/);
   assert.doesNotMatch(flat(read(CE)), /The manager polls/);
   // The `events` action is gone (the pull's removal): the page names no action to read the journal, and keeps the journal for the reports.

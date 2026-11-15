@@ -2,9 +2,9 @@
 
 From router 0.40.0, the Dormeto manager reads a Google Cloud router and acts through it as it does an AWS one. The router
 keeps its journal and its check summary in Firestore, answers the manager's calls on one route, `POST /v1/actions`, and
-reports to the manager as an AWS router does: after each state change and each check, it sends its journal and its state
-to the manager's API, which puts them on the manager's event bus, so the manager no longer polls it (router 0.41.0 and
-manager 0.25.0; Not released yet: router 0.41.0). This page is what the router keeps, what it answers, what it reports and
+reports to the manager as an AWS router does: after each state change and each check, it puts its journal and its state
+on the manager's event bus itself, with credentials the manager's API gives it, so the manager no longer polls it (router
+0.41.0 and manager 0.25.0; Not released yet: router 0.41.0). This page is what the router keeps, what it answers, what it reports and
 what is its own. The connection
 (the manager's two service accounts and the grants that reach this router) is made by `dormeto gcp connect`, which is
 documented in the CLI's README, not here.
@@ -31,8 +31,8 @@ documented in the CLI's README, not here.
   string (Firestore refuses as a field name some keys a `settings.json` may hold, such as a custom type's tag key
   `__x__`), with its ETag and the time it was stored. Without a push, the organization level reads as unset. It holds
   `events` too, where the router reports (below), once the manager has said it.
-- **Where its reports stand**, `router/report`: `sentThrough`, the id of the last journal event the manager accepted;
-  `lastSentAt`; `recent`, the ids sent within the 5 minutes before `sentThrough`; and, until the next accepted report,
+- **Where its reports stand**, `router/report`: `sentThrough`, the id of the last journal event put on the manager's bus;
+  `lastSentAt`; `recent`, the ids put within the 5 minutes before `sentThrough`; and, until the next report put,
   `lastError` and `lastRefusal`.
 
 ## `POST /v1/actions`
@@ -75,7 +75,7 @@ service: the manager calls it with an ID token of its command service account, w
 `{ "action": "manager-settings", "settings": <the manager's settings.json>, "etag": <its ETag>, "events"?: { "url",
 "audience" } }` stores them in `router/manager` and answers `{ "etag" }`. The `etag` is a string of 1 to 256 characters;
 `settings` is needed. `events` is where the router reports: `url`, the https URL of the manager API's route
-`/routers/events`, and `audience`, the API's endpoint, which the router's identity token names. A push without `events`
+`/routers/credentials`, and `audience`, the API's endpoint, which the router's identity token names. A push without `events`
 keeps the one stored, and `"events": null` stops the reports; anything else than these two strings is a refusal.
 `{ "action": "manager-settings", "events": … }` alone (an organization whose `settings.json` was never written has no
 ETag to push) stores `events` and leaves the settings and their ETag as they are, none staying none: the answer's `etag`
@@ -85,26 +85,40 @@ is the one stored, or null. With `settings`, the `etag` is needed; with neither 
 
 A router whose `router/manager` holds `events` reports; one without reports nothing.
 
-- **What it sends:** `POST <url>` with `{ "events": [{ "detailType", "detail" }] }`, at most 100 entries and 1 MB a
-  request, and `Authorization: Bearer <identity token>`: the token of the router's service account for the `audience`,
-  from the metadata server, kept until 5 minutes before it expires. No role, API or key is added: `gcp/access.json` does
-  not change. The manager's API takes the router's project and region from the token, never from the body.
+- **Its credentials:** `POST <url>` with `Authorization: Bearer <identity token>` and no body: the token of the router's
+  service account for the `audience`, from the metadata server, kept until 5 minutes before it expires. No role, API or
+  key is added in Google Cloud: `gcp/access.json` does not change. The manager's API takes the router's project and
+  region from the token, never from a body, and answers `{ "credentials": { "accessKeyId", "secretAccessKey",
+  "sessionToken", "expiration" }, "bus": { "name", "region" }, "source", "managerSettings": { "etag" } }`: a session of
+  the manager's own role, an hour long, that may put on the manager's bus the source
+  `dormeto.router.gcp/<project>/<region>` only. The router keeps it in memory, never in Firestore nor in a log, and asks
+  again 5 minutes before it expires, plus up to 5 minutes drawn by instance (the controller and the waker ask on their
+  own). An answer whose `source` is not `dormeto.router.gcp/` followed by the router's own project and region, or whose
+  bus region does not look like a region, is not used: nothing is put (`ReportFailed`).
+- **What it puts:** PutEvents, `POST https://events.<bus region>.amazonaws.com/` (`X-Amz-Target: AWSEvents.PutEvents`),
+  signed with Signature Version 4 by the router itself (no SDK: the image carries no `node_modules`), entries
+  `{ "EventBusName", "Source", "DetailType", "Detail" }` with the session's `source`, at most 10 entries and 256 KB a
+  call, a detail under 64 KB. A put refused for its credentials (a 403, or an expired token) drops them and asks the
+  manager again, once a report.
 - **After each state change** (the controller's and the waker's, once the journal's commit is made): the journal's
   events after the cursor, each as `Workload state changed` with the event's detail (its id left out).
 - **After each check** (once `router/check` is written): the same, then `Router checked` in chunks under 64 KB, AWS's
   detail (`router`, the `list` action's router with its `region`; `checkedAt`, `durationMs`, `health`, `pauses`,
   `counts`, `chunk`, `workloads`, the `list` action's rows) and `managerSettings.etag`, the ETag of the organization's
   settings the router holds, which the manager compares with its own file to push it again.
-- **The cursor** moves on a 200 only. An event can commit after a later one (its time is taken before its commit, and the
-  waker and the controller are two services): each send reads the journal from 5 minutes before the cursor and leaves
-  out what `recent` holds, so a late event is sent and none is sent twice.
-- **A failed send** holds a state change 2 s at most, a wake's included: one request is 2 s at most, its two tries
-  included (a 429, a 5xx or a lost connection is tried once more; a refusal and a request that ran out of time are not).
-  It is logged (`ReportFailed`; a transition held to its 2 s, `ReportSlow`) and kept in `lastError`, and the next send
-  starts from the cursor: an event waits for the next state change or check, 5 minutes at most.
-- **A refusal**, the manager's 403 `router_unknown` (no Google Cloud connection, or the router is not registered), is
-  kept in `lastRefusal` and logged once a check (`ReportRefused`). While it lasts only the checks send; the first one
-  accepted clears it.
+- **The cursor** moves through the last entry put: a call that PutEvents failed in part (`FailedEntryCount`) moves it to
+  the entry before the first that failed, and the rest goes at the next report. An event can commit after a later one
+  (its time is taken before its commit, and the waker and the controller are two services): each report reads the
+  journal from 5 minutes before the cursor and leaves out what `recent` holds, so a late event is put and none is put
+  twice.
+- **A failed report** holds a state change 2 s at most, a wake's included, and a check too: one report is 2 s at most,
+  its credentials, its calls and their two tries included (a 429, a 5xx or a lost connection is tried once more; a
+  refusal and a request that ran out of time are not). It is logged (`ReportFailed`; a transition held to its 2 s,
+  `ReportSlow`) and kept in `lastError`, and the next report starts from the cursor: an event waits for the next state
+  change or check, 5 minutes at most.
+- **A refusal**, the credentials route's 403 `router_unknown` (no Google Cloud connection, or the router is not
+  registered), is kept in `lastRefusal` and logged once a check (`ReportRefused`). While it lasts only the checks ask;
+  the first one put clears it.
 - **`report`** (in `router` and `GET /v1/health`): `{ "host", "lastSentAt", "sentThrough", "lastError"?,
   "lastRefusal"? }`, `host` the host of the route's URL; null without `events`, and `{ "error" }` when it cannot be read
   within 2 s.

@@ -1076,9 +1076,9 @@ test('fromEnvironment wires the store and the queue on the environment\'s names'
   assert.ok(calls.some((call) => call.url === `${documents}:commit`));
 });
 
-test('fromEnvironment: the waker reports its state change to the manager (report.mjs) before it asks the controller for the wake, with its identity token', async () => {
+test('fromEnvironment: the waker puts its state change on the manager\'s bus (report.mjs), with the credentials its identity token gets, before it asks the controller for the wake', async () => {
   const firestore = fakeFirestore();
-  const events = { url: 'https://abc.execute-api.eu-west-1.amazonaws.com/routers/events', audience: 'https://abc.execute-api.eu-west-1.amazonaws.com' };
+  const events = { url: 'https://abc.execute-api.eu-west-1.amazonaws.com/routers/credentials', audience: 'https://abc.execute-api.eu-west-1.amazonaws.com' };
   firestore.docs.set('workloads/demo', { fields: toFields({ config: testConfig() }), updateTime: 't0' });
   firestore.docs.set('runs/demo', { fields: toFields({ state: STATES.ASLEEP }), updateTime: 't0' });
   firestore.docs.set('router/manager', { fields: toFields({ settingsJson: '{}', etag: '"e1"', at: 1, events }), updateTime: 't0' });
@@ -1087,8 +1087,16 @@ test('fromEnvironment: the waker reports its state change to the manager (report
     if (url.includes('/service-accounts/default/identity?')) return new Response(`h.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString('base64url')}.s`);
     if (url.includes('metadata.google.internal')) return Response.json({ access_token: 'token', expires_in: 3600 });
     if (url === events.url) {
-      order.push(['report', JSON.parse(init.body).events.map((e) => `${e.detail.workloadId}-${e.detail.to}`)]);
-      return Response.json({ accepted: 1, managerSettings: { etag: '"e1"' } });
+      order.push(['credentials', init.headers.authorization.split('.').length]);
+      return Response.json({
+        credentials: { accessKeyId: 'ASIA', secretAccessKey: 's', sessionToken: 't', expiration: new Date(Date.now() + 3600_000).toISOString() },
+        bus: { name: 'dmt-dev-manager', region: 'eu-west-1' }, source: 'dormeto.router.gcp/p/europe-west1', managerSettings: { etag: '"e1"' },
+      });
+    }
+    if (url === 'https://events.eu-west-1.amazonaws.com/') {
+      const { Entries } = JSON.parse(init.body);
+      order.push(['report', Entries.map((e) => `${JSON.parse(e.Detail).workloadId}-${JSON.parse(e.Detail).to}`)]);
+      return Response.json({ FailedEntryCount: 0, Entries: Entries.map(() => ({ EventId: 'e' })) });
     }
     if (url.startsWith('https://cloudtasks.googleapis.com/')) {
       order.push(['task']);
@@ -1102,7 +1110,7 @@ test('fromEnvironment: the waker reports its state change to the manager (report
   }, { fetch, log: silentLog });
   const res = await handler(probe());
   assert.equal(headerOf(res, 'x-dormeto-state'), STATES.WAKING);
-  assert.deepEqual(order, [['report', ['demo-WAKING']], ['task']]);
+  assert.deepEqual(order, [['credentials', 3], ['report', ['demo-WAKING']], ['task']]);
   assert.match(fromFields(firestore.docs.get('router/report').fields).sentThrough, /^\d{13}-demo-WAKING$/);
 });
 

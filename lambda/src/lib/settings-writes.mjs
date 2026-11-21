@@ -1,7 +1,7 @@
 // What the settings action writes (hibernation design §4, settings at scale design §8): the router's record merged with
 // what it holds, and a workload's configuration with the settings sent; and how its answers show them. Pure, shared by
 // AWS's controller and Google Cloud's onboarding: the checks, the store and who may write a workload stay theirs.
-import { BUILT_IN, RULE_KEYS, SCALAR_KEYS, TYPE_BUILT_IN, builtInTypeOf, ownSettings } from './settings-levels.mjs';
+import { RULE_KEYS, builtInSettingsOf, keysOf, kindOf, ownSettings } from './settings-levels.mjs';
 
 // The router's settings record as people read it (its time ISO): all null when unset.
 export const routerSettingsView = (record) => ({
@@ -10,9 +10,9 @@ export const routerSettingsView = (record) => ({
 });
 
 // A resolved configuration's settings (effectiveConfig's), as the workload's answer gives them: each value, where it comes from,
-// and the type.
+// and the type: its kind's keys.
 export const resolvedSettings = (resolved) => ({
-  settings: Object.fromEntries(SCALAR_KEYS.map((key) => [key, resolved[key]])), settingsFrom: resolved.settingsFrom, type: resolved.type,
+  settings: Object.fromEntries(keysOf(kindOf(resolved)).map((key) => [key, resolved[key]])), settingsFrom: resolved.settingsFrom, type: resolved.type,
 });
 
 // The router's record once `settings` (hibernate, joinMinutes and the defaults of its workloads) are written over the stored one:
@@ -33,13 +33,10 @@ export const writtenRouterView = (record) => routerSettingsView(record.hibernate
 // AWS's reading of a configuration from before `inherits` (design §7): it inherits what equals the onboarder's old defaults.
 const awsInherits = (cfg) => {
   const own = ownSettings(cfg);
-  return Array.isArray(cfg.inherits) ? cfg.inherits : SCALAR_KEYS.filter((key) => !(key in own));
+  return Array.isArray(cfg.inherits) ? cfg.inherits : keysOf(kindOf(cfg)).filter((key) => !(key in own));
 };
-// AWS's built-in value of each key: its built-in type's, else the built-in one.
-const awsBuiltIns = (cfg) => {
-  const typeName = builtInTypeOf(cfg, null);
-  return Object.fromEntries(SCALAR_KEYS.map((key) => [key, TYPE_BUILT_IN[typeName]?.[key] ?? BUILT_IN[key]]));
-};
+// AWS's built-in value of each key of its kind: its built-in type's, else the built-in one.
+const awsBuiltIns = (cfg) => builtInSettingsOf(cfg);
 
 // A workload's configuration with `settings` written over it: hibernate (null removes the key), the settings of §4 (null gives
 // the key back to the levels: its built-in value stays written for an older router), its rules (null: none) and its type
@@ -52,7 +49,8 @@ export function withSettings(cfg, settings, { inheritsOf = awsInherits, builtIns
     if (typeof settings.hibernate === 'boolean') next.hibernate = settings.hibernate;
     else delete next.hibernate;
   }
-  const scalars = SCALAR_KEYS.filter((key) => Object.hasOwn(settings, key));
+  const keys = keysOf(kindOf(cfg));
+  const scalars = keys.filter((key) => Object.hasOwn(settings, key));
   if (scalars.length) {
     const inherits = new Set(inheritsOf(cfg));
     const builtIn = builtIns(cfg);
@@ -65,7 +63,7 @@ export function withSettings(cfg, settings, { inheritsOf = awsInherits, builtIns
         inherits.delete(key);
       }
     }
-    next.inherits = SCALAR_KEYS.filter((key) => inherits.has(key));
+    next.inherits = keys.filter((key) => inherits.has(key));
   }
   for (const key of RULE_KEYS) if (Object.hasOwn(settings, key)) next[key] = settings[key] ?? [];
   if (Object.hasOwn(settings, 'type')) {

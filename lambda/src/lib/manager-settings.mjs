@@ -104,7 +104,7 @@ export function createManagerSettings({ s3, url, catalogUrl = null, store, now =
       if (out.notModified) next = { ...last, readAt: at, error: last.error?.startsWith('settings.json: ') ? last.error : null };
       else {
         try {
-          const { problems, defaults = {}, types = [], ...values } = parseManagerSettings(out.body.toString('utf8'));
+          const { problems, defaults = {}, types = [], ...values } = parseManagerSettings(out.body.toString('utf8'), { idle: true });
           // An invalid part is dropped and its first problem is the error: the rest applies.
           next = { ...values, defaults, types, etag: out.etag, readAt: at, error: problems ? `settings.json: ${problems[0]}` : null };
         } catch (err) {

@@ -917,8 +917,9 @@ export function createController({
     wake: wakePorts,
     scheduleView: scheduledView,
     settings: {
-      routerProblems: settingsProblems,
-      workloadProblems: (settings) => workloadSettingsProblems(settings),
+      // A level may hold both kinds' keys; a workload, its kind's (standalone workloads design §4).
+      routerProblems: (settings) => settingsProblems(settings, { idle: true }),
+      workloadProblems: (settings, cfg) => workloadSettingsProblems(settings, cfg),
       // A configuration from before `inherits` inherits what equals the onboarder's old defaults (design §7).
       next: (cfg, settings) => withSettings(cfg, settings),
       levels: hibernationLevels,

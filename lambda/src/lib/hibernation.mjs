@@ -1,6 +1,6 @@
 // Whether a nap hibernates EC2 instances (hibernation design): the first level that is set decides. Pure.
 import { isEndedDays, isJoinMinutes, JOIN_MINUTES_MAX } from './schedule.mjs';
-import { defaultsProblems, typesProblems } from './settings-levels.mjs';
+import { defaultsProblems, kindOf, typesProblems } from './settings-levels.mjs';
 
 // The longest an instance may stay hibernated: the maintenance wake comes before AWS's 60-day limit.
 export const HIBERNATION_MAX_DAYS = 59;
@@ -33,15 +33,15 @@ export function resolveHibernation({ workload, fallbackTypes, router, manager } 
 }
 
 // The settings of a router or a workload: `hibernate`, true, false or null (inherit); `joinMinutes`, its minutes or null
-// (inherit), which only a router's take (a workload's is on its schedule).
-export function settingsProblems(settings) {
+// (inherit), which only a router's take (a workload's is on its schedule). `idle`: its defaults may hold the idle signals (AWS's).
+export function settingsProblems(settings, { idle = false } = {}) {
   if (!isObject(settings)) return ['settings must be an object'];
   const problems = [];
   for (const [key, value] of Object.entries(settings)) {
     if (key === 'joinMinutes') {
       if (value !== null && !isJoinMinutes(value)) problems.push(`settings: joinMinutes: must be a whole number from 0 to ${JOIN_MINUTES_MAX}, a multiple of 5, or null`);
     } else if (key === 'defaults') {
-      if (value !== null) problems.push(...defaultsProblems(value).map((p) => `settings: defaults: ${p}`));
+      if (value !== null) problems.push(...defaultsProblems(value, { idle }).map((p) => `settings: defaults: ${p}`));
     } else if (key !== 'hibernate') problems.push(`settings: unknown setting ${key}`);
     else if (value !== null && !isBoolean(value)) problems.push('settings: hibernate must be true, false or null');
   }
@@ -49,23 +49,24 @@ export function settingsProblems(settings) {
 }
 
 // The settings of a workload the manager onboarded (settings at scale design §8): `hibernate` (true, false or null), the
-// settings of the levels and `type`, each a value or null; its joinMinutes is on its schedule.
-export function workloadSettingsProblems(settings) {
+// settings of the levels and `type`, each a value or null; its joinMinutes is on its schedule. With its configuration `cfg`, the
+// keys of its kind only (standalone workloads design §2, §4).
+export function workloadSettingsProblems(settings, cfg = null) {
   if (!isObject(settings)) return ['settings must be an object'];
   const problems = [];
   for (const [key, value] of Object.entries(settings)) {
     if (key === 'joinMinutes') problems.push('settings: a workload\'s joinMinutes is on its schedule');
     else if (key === 'hibernate') {
       if (value !== null && !isBoolean(value)) problems.push('settings: hibernate must be true, false or null');
-    } else problems.push(...defaultsProblems({ [key]: value }, { workload: true }).map((p) => `settings: ${p}`));
+    } else problems.push(...defaultsProblems({ [key]: value }, { workload: true, kind: cfg ? kindOf(cfg) : null }).map((p) => `settings: ${p}`));
   }
   return problems;
 }
 
 // The manager's settings.json: `workloads.hibernate`, true when absent; `workloads.joinMinutes` and
 // `workloads.endedWindowDays`, null when absent or invalid (they have no safety side, so they never lose hibernate); other keys
-// belong to the manager.
-export function parseManagerSettings(text) {
+// belong to the manager. `idle`: the defaults and types may hold the idle signals (AWS's).
+export function parseManagerSettings(text, { idle = false } = {}) {
   const doc = JSON.parse(text);
   if (!isObject(doc)) throw new Error('settings.json must be an object');
   if (!('workloads' in doc)) return { hibernate: true, joinMinutes: null, endedWindowDays: null };
@@ -73,7 +74,7 @@ export function parseManagerSettings(text) {
   const { hibernate } = doc.workloads;
   const joinMinutes = isJoinMinutes(doc.workloads.joinMinutes) ? doc.workloads.joinMinutes : null;
   const endedWindowDays = isEndedDays(doc.workloads.endedWindowDays) ? doc.workloads.endedWindowDays : null;
-  const levels = levelsOf(doc.workloads);
+  const levels = levelsOf(doc.workloads, { idle });
   if (hibernate === undefined) return { hibernate: true, joinMinutes, endedWindowDays, ...levels };
   if (!isBoolean(hibernate)) throw new Error('settings.json: workloads.hibernate must be true or false');
   return { hibernate, joinMinutes, endedWindowDays, ...levels };
@@ -81,7 +82,7 @@ export function parseManagerSettings(text) {
 
 // The organization's defaults and types (settings at scale design §6): what is valid of them, each key and each type on its
 // own; what is not is dropped and said in `problems` (never failing hibernate). Each key only when there is one.
-function levelsOf(workloads) {
+function levelsOf(workloads, { idle }) {
   const problems = [];
   const levels = {};
   if ('defaults' in workloads) {
@@ -89,7 +90,7 @@ function levelsOf(workloads) {
     else {
       const defaults = {};
       for (const [key, value] of Object.entries(workloads.defaults)) {
-        const found = defaultsProblems({ [key]: value });
+        const found = defaultsProblems({ [key]: value }, { idle });
         if (found.length) problems.push(...found.map((p) => `workloads.defaults: ${p}`));
         else if (value !== null) defaults[key] = value;
       }
@@ -97,12 +98,12 @@ function levelsOf(workloads) {
     }
   }
   if ('types' in workloads) {
-    const whole = typesProblems(workloads.types);
+    const whole = typesProblems(workloads.types, { idle });
     if (!Array.isArray(workloads.types) || whole.some((p) => p.startsWith('at most'))) problems.push(...whole.map((p) => `workloads.types: ${p}`));
     else {
       const kept = [];
       for (const type of workloads.types) {
-        const found = typesProblems([...kept, type]).filter((p) => !typesProblems(kept).includes(p));
+        const found = typesProblems([...kept, type], { idle }).filter((p) => !typesProblems(kept, { idle }).includes(p));
         if (found.length) problems.push(...found.map((p) => `workloads.types: ${p}`));
         else kept.push(type);
       }

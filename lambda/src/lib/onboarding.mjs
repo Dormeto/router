@@ -12,7 +12,7 @@ import {
 } from './kube-route.mjs';
 import { healthyCount } from './instances.mjs';
 import { checkRights } from './kube-access.mjs';
-import { SCALAR_KEYS } from './settings-levels.mjs';
+import { IDLE_KEYS, SCALAR_KEYS, notForKind } from './settings-levels.mjs';
 
 const WORKLOAD_TAG = 'dormeto:workload';
 // Target groups per Application Load Balancer: not adjustable (the waker target group counts once its rule uses it).
@@ -298,7 +298,8 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
       } else if (SETTINGS[key]) {
         const [min, max] = SETTINGS[key];
         if (!Number.isInteger(value) || value < min || value > max) problems.push(`settings: ${key}: must be a whole number from ${min} to ${max}`);
-      } else problems.push(`settings: unknown setting ${key}`);
+      } else if (IDLE_KEYS.includes(key)) problems.push(`settings: ${notForKind(key, 'http')}`);
+      else problems.push(`settings: unknown setting ${key}`);
     }
     return problems;
   }

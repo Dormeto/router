@@ -30,7 +30,7 @@ import { joinLevels } from '../../lambda/src/lib/manager-settings.mjs';
 import { createManagerActions, scheduleView } from '../../lambda/src/lib/manager-actions.mjs';
 import { pageViewOf } from '../../lambda/src/lib/page-settings.mjs';
 import { maintenanceDue } from '../../lambda/src/lib/schedule.mjs';
-import { describedRules, keysOf, kindOf, SCALAR_KEYS } from '../../lambda/src/lib/settings-levels.mjs';
+import { describedRules, IDLE_KEYS, keysOf, kindOf, SCALAR_KEYS } from '../../lambda/src/lib/settings-levels.mjs';
 import { resolvedSettings, routerSettingsView, withSettings } from '../../lambda/src/lib/settings-writes.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { fallbacksOf } from '../../lambda/src/lib/summary.mjs';
@@ -1094,6 +1094,8 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   const waitingPage = async (level, { op, page, by } = {}) => answered(await manager.waitingPage({ op, workloadId: level === 'router' ? null : level.workloadId, page, by }));
 
   // The manager's actions (manager-actions.mjs) on this router: the REST routes above and actions.mjs call them.
+  // The standalone workloads whose idle settings a write just changed (their idleNotBefore goes once written).
+  const rereads = new Set();
   const manager = createManagerActions({
     store, find, refuse: { invalid: bad, notFound }, who: (by) => by ?? 'unknown',
     // What Google Cloud holds back: a custom page while the install's switch is off (pages.mjs), at any level, said first.
@@ -1115,12 +1117,22 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
       // A configuration from before `inherits` is read as effectiveOf reads it (design section 4.1). Once it has `inherits`, it is the
       // CLI's, as an onboarding writes it.
       next(cfg, settings) {
+        // A standalone workload whose idle window or idle signals change is read again at the next check (AWS's rule, plan 1).
+        if (kindOf(cfg) === 'standalone' && ['idleMinutes', ...IDLE_KEYS].some((key) => Object.hasOwn(settings, key))) rereads.add(cfg.workloadId);
         const next = withSettings(cfg, settings, { inheritsOf, builtIns: builtInsOf });
         if (Object.hasOwn(next, 'inherits')) next.source ??= 'cli';
         return next;
       },
       levels: levelsOf,
-      answer: (id, next, levels) => ({ hibernation: hibernationOf(next, levels.router, levels.organization), resolved: resolvedSettings(effectiveOf(next, levels)) }),
+      async answer(id, next, levels) {
+        if (rereads.delete(id)) {
+          const run = await store.getRun(id).catch(() => null);
+          if (run?.idleNotBefore !== undefined) {
+            await store.transition(id, { cond: { state: run.state }, remove: ['idleNotBefore'] }).catch((err) => log.warn('IdleNotBeforeKept', { workloadId: id, error: err.message }));
+          }
+        }
+        return { hibernation: hibernationOf(next, levels.router, levels.organization), resolved: resolvedSettings(effectiveOf(next, levels)) };
+      },
     },
     pageView: (workloadId) => pageView(workloadId === null ? 'router' : { workloadId }),
     now,

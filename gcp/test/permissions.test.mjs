@@ -9,12 +9,13 @@ import * as gke from '../src/gke.mjs';
 import * as logs from '../src/logs.mjs';
 import * as urlmaps from '../src/urlmaps.mjs';
 import * as monitoring from '../src/monitoring.mjs';
+import * as idleSignals from '../src/idle-signals.mjs';
 import * as tasks from '../src/tasks.mjs';
 import * as firestore from '../src/firestore.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { GKE_DRY, GKE_INPUT, INPUT, REGION, V1, ZONE, onGke, regional, setup } from './world.mjs';
 
-const ADAPTERS = { cloudsql, compute, gke, urlmaps, regionalUrlmaps: { CALLS: urlmaps.CALLS_REGIONAL }, monitoring, logs, tasks, firestore };
+const ADAPTERS = { cloudsql, compute, gke, urlmaps, regionalUrlmaps: { CALLS: urlmaps.CALLS_REGIONAL }, monitoring, idleSignals, logs, tasks, firestore };
 
 async function granted() {
   const manifest = JSON.parse(await readFile(new URL('../access.json', import.meta.url), 'utf8'));

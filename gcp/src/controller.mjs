@@ -17,6 +17,7 @@ import { createGke } from './gke.mjs';
 import { createGoogle, createIdentityTokens } from './google.mjs';
 import { createLogs } from './logs.mjs';
 import { createMonitoring } from './monitoring.mjs';
+import { createIdleSignals } from './idle-signals.mjs';
 import { createOnboarding, Refusal } from './onboarding.mjs';
 import { customPagesOf } from './pages.mjs';
 import { createReporter, readReport, withReports } from './report.mjs';
@@ -194,6 +195,7 @@ export function fromEnvironment(env = process.env, { fetch, log = logger } = {})
     urlmaps,
     regionalUrlmaps,
     monitoring: createMonitoring({ google, project }),
+    idleSignals: createIdleSignals({ google, project, log }),
     ...(env.DMT_LOG_VIEW ? { logs: createLogs({ google, view: env.DMT_LOG_VIEW, log }) } : {}),
     tasks: createTasks({ google, project, region: env.DMT_REGION, queue: env.DMT_QUEUE, serviceAccount: env.DMT_SERVICE_ACCOUNT }),
     config,

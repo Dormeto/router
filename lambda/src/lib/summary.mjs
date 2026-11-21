@@ -125,11 +125,16 @@ function standaloneSummary(cfg, run, stats7d, pauses, scheduled) {
     pauses,
     scheduled,
   });
+  return standaloneRowOf(row, cfg, run);
+}
+
+// What makes the shared row (workloadRow's, its stats7d already its wakes) a standalone workload's, both clouds': no URL nor wake mode, the
+// check's retry, its kind's settings, `resourceMissing` after its backends while its resource is gone (absent otherwise).
+export function standaloneRowOf(row, cfg, run) {
   delete row.url;
   delete row.wakeMode;
   row.nextAttemptAt = iso(standaloneNextAttemptAt(run));
   row.settings = Object.fromEntries(STANDALONE_KEYS.map((key) => [key, cfg[key]]));
-  // Its resource deleted or untagged (the check's mark): said after its backends, absent otherwise.
   return run?.resourceMissing ? after(row, 'backends', { resourceMissing: true }) : row;
 }
 

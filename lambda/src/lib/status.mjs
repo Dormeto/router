@@ -16,6 +16,9 @@ const CHECK_PERIOD_MS = 5 * 60_000;
 // The setting each idle signal's threshold is.
 const SIGNAL_SETTINGS = { cpu: 'idleCpuPercent', network: 'idleNetworkBytes', metric: 'idleMetric' };
 
+// A standalone workload's signals as its status shows them, both clouds': `underSince` ISO, and the level of each threshold (`from`).
+export const signalsView = (signals, cfg) => signals.map((s) => ({ ...s, underSince: iso(s.underSince), from: cfg.settingsFrom?.[SIGNAL_SETTINGS[s.signal]] ?? null }));
+
 // A standalone workload's nap estimate (vision standalone workloads design §4): the first check whose idle window starts once every
 // applying signal is under and the workload awake (its window ends 10 minutes behind, at a 5-minute boundary); null when none
 // applies, a read failed or a signal's last point is missing (no estimate can be made then).
@@ -80,7 +83,7 @@ export function createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging
       wakeCount: run.wakeCount ?? 0,
       pendingWake: run.pendingWake === true,
       pauses,
-      idle: signals.map((s) => ({ ...s, underSince: iso(s.underSince), from: cfg.settingsFrom?.[SIGNAL_SETTINGS[s.signal]] ?? null })),
+      idle: signalsView(signals, cfg),
       nap: nap && { eligibleAt: iso(nap.eligibleAt), latestAt: iso(nap.latestAt), inSeconds: nap.inSeconds },
       discovery: resolved.mode,
       instances: instanceIds.map((id) => ({ id, state: instances[id] ?? 'unknown' })),

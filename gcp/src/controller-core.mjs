@@ -70,6 +70,8 @@ import { readActivePauses, routerAnswer } from '../../lambda/src/lib/manager-act
 import { createListRefresher, requestListRefresh as askListRefresh } from '../../lambda/src/lib/list-refresh.mjs';
 import { createLevelsReader } from '../../lambda/src/lib/settings-levels.mjs';
 import { failedWakeDecision, idleDecision, idleRecheck, napWindowNow, warnResourceMissing } from '../../lambda/src/lib/standalone-check.mjs';
+import { idleWindow } from '../../lambda/src/lib/activity.mjs';
+import { signalsView, standaloneNapEstimate } from '../../lambda/src/lib/status.mjs';
 import { createCount } from '../../lambda/src/lib/summary.mjs';
 import { withWake } from '../../lambda/src/lib/page-settings.mjs';
 import { createWakeWatch } from '../../lambda/src/lib/wake-watch.mjs';
@@ -1610,6 +1612,18 @@ export function createController({
     return { state: run.state, nap: 'requested' };
   }
 
+  // A standalone workload's signals and nap estimate, as its status shows them (AWS's status.mjs): each signal with the level of its threshold,
+  // the estimate from them (none while paused, or not awake). A resource gone reads no signal.
+  async function idleView(stored, run, { paused = false } = {}) {
+    const cfg = effective(stored, run, await routerLevel());
+    const t = now();
+    const window = idleWindow(cfg, t);
+    const states = await standaloneStates(cfg);
+    const signals = missingOf(cfg, states) || !idleSignals ? await (idleSignals ?? (async () => []))(cfg, [], window) : await readSignals(cfg, states, window);
+    const nap = paused || !run ? null : standaloneNapEstimate({ signals, window, run, now: t });
+    return { idle: signalsView(signals, cfg), nap: nap && { eligibleAt: iso(nap.eligibleAt), latestAt: iso(nap.latestAt), inSeconds: nap.inSeconds } };
+  }
+
   // --- IP lists ------------------------------------------------------------------------------------------------------------
 
   // The router's lists (DMT_IP_LISTS). A download is a task of its own, never held by a check: it fetches, and a list that
@@ -1883,5 +1897,5 @@ export function createController({
     }
   }
 
-  return { noteTags, refreshLists, routerInfo, wake, beginWake, wakeNow, nap, napNow, release, check, pause, resume, pausesFor, shownPauses };
+  return { noteTags, refreshLists, routerInfo, wake, beginWake, wakeNow, nap, napNow, release, check, pause, resume, pausesFor, shownPauses, idleView };
 }

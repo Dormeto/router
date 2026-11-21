@@ -9,6 +9,7 @@ import { createGke } from '../src/gke.mjs';
 import { GoogleError } from '../src/google.mjs';
 import { beats, resendClaim } from '../src/heartbeat.mjs';
 import { createOnboarding } from '../src/onboarding.mjs';
+import { createIdleSignals } from '../src/idle-signals.mjs';
 import { createUrlMaps } from '../src/urlmaps.mjs';
 
 // The controller's timers (`every`, the heartbeat's) on the fake clock: a timer due runs once when a sleep passes its time, before
@@ -703,6 +704,8 @@ export function setup(change = () => {}, { clock = fakeClock() } = {}) {
   const fetch = (...args) => (w.fetch ?? (async () => { throw new Error('no network in tests'); }))(...args);
   const core = createController({
     store, compute, cloudsql, gke, urlmaps, regionalUrlmaps, monitoring: { requestCount: async () => 0 }, tasks, config, now: clock.now, sleep: clock.sleep, every, newId: () => 'wake-1', log,
+    // A standalone workload's signals: Monitoring has no route in this fake, so each one that applies is unread.
+    idleSignals: createIdleSignals({ google, project: 'p', log }),
     fetch, customPages: w.customPages === true,
   });
   const onboarding = createOnboarding({ store, compute, cloudsql, gke, urlmaps, regionalUrlmaps, core, config, now: clock.now, log, customPages: w.customPages === true });

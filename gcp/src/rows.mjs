@@ -2,7 +2,7 @@
 // built by the shared code (lambda/src/lib/events.mjs's stateChange, summary.mjs's workloadRow) from what Firestore holds.
 
 import { stateChange } from '../../lambda/src/lib/events.mjs';
-import { totals, workloadRow } from '../../lambda/src/lib/summary.mjs';
+import { standaloneRowOf, totals, workloadRow } from '../../lambda/src/lib/summary.mjs';
 import { effectiveOf } from './levels.mjs';
 
 // The failure the run stores holds `at` in ms; the event's holds it as an ISO string.
@@ -39,6 +39,20 @@ const KINDS = Object.values(KIND_OF);
 // and `scheduled`: the workload's active pauses and whether it has a schedule. Instead of `targetGroupArn`, its Google resources.
 // Its `hibernated` is true only while it is asleep with a VM suspended, as AWS's.
 export function rowOf({ cfg, run, stats7d = null, routerName, router = null, organization = null, pauses = [], scheduled = false }) {
+  // A standalone workload's (vision standalone workloads design §5): its kind and resource as its identity, AWS's standalone row.
+  if (cfg.kind === 'standalone') {
+    const effective = effectiveOf(cfg, { run, router, organization });
+    const counted = totals(stats7d);
+    return standaloneRowOf(workloadRow(effective, run, {
+      identity: { kind: 'standalone', resource: cfg.resource },
+      defaultSource: 'cli',
+      backends: KINDS.filter((kind) => (cfg.backends ?? []).some((b) => KIND_OF[b.kind] === kind)),
+      hibernated: Boolean(run?.suspended?.length),
+      stats7d: counted && { wakes: counted.wakes },
+      pauses,
+      scheduled,
+    }), effective, run);
+  }
   return workloadRow(effectiveOf(cfg, { run, router, organization }), run, {
     identity: { backendService: cfg.backendService, wakerBackendService: cfg.wakerBackendService, urlMap: cfg.urlMap, lb: cfg.lb ?? { kind: 'global' } },
     defaultSource: 'cli',

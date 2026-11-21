@@ -30,7 +30,7 @@ import { joinLevels } from '../../lambda/src/lib/manager-settings.mjs';
 import { createManagerActions, scheduleView } from '../../lambda/src/lib/manager-actions.mjs';
 import { pageViewOf } from '../../lambda/src/lib/page-settings.mjs';
 import { maintenanceDue } from '../../lambda/src/lib/schedule.mjs';
-import { describedRules, IDLE_KEYS, keysOf, kindOf, SCALAR_KEYS } from '../../lambda/src/lib/settings-levels.mjs';
+import { describedRules, IDLE_KEYS, keysOf, kindOf, SCALAR_KEYS, STANDALONE_KEYS } from '../../lambda/src/lib/settings-levels.mjs';
 import { resolvedSettings, routerSettingsView, withSettings } from '../../lambda/src/lib/settings-writes.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { fallbacksOf } from '../../lambda/src/lib/summary.mjs';
@@ -43,6 +43,7 @@ import {
 import { beatOf } from './heartbeat.mjs';
 import { organizationOf } from './organization.mjs';
 import { effectiveOf, inheritsOf, levelProblems } from './levels.mjs';
+import { resourceOf } from './resources.mjs';
 import { SWITCH_HEADER, WORKLOAD_HEADER, WORKLOAD_ID, swapHeaders } from './names.mjs';
 import { CUSTOM_PAGE_NOT_SERVED, CUSTOM_PAGES_REFUSED, notServed, servedPage } from './pages.mjs';
 import { aKind, headersInMap, inOneUpdate, isRegionalLb, SWAP_WAIT_MS } from './switch.mjs';
@@ -86,6 +87,25 @@ const MANAGED_GROUP_OWNER = /\/instanceGroupManagers\/([^/]+)$/;
 const POLL_SECONDS = 3;
 // The load balancer before it is read: neither the policy nor a swap, so what the settings ask of it waits until it is known.
 const UNREAD_LB = { kind: 'unread' };
+
+// A standalone workload (vision standalone workloads design §2, §5): its resource's path (resources.mjs) in place of the URL map and the
+// backend service.
+const RESOURCE_PATHS = 'the resource must be the path of a Compute Engine VM (projects/<project>/zones/<zone>/instances/<name>), a managed instance group (projects/<project>/zones|regions/<location>/instanceGroupManagers/<name>) or a Cloud SQL instance (projects/<project>/instances/<name>)';
+// GKE's label on its nodes' VMs.
+const GKE_NODE_LABEL = 'goog-gke-node';
+const isStandalone = (cfg) => cfg?.kind === 'standalone';
+// A workload as a refusal names it: its name and id, or its id alone.
+const named = (cfg) => (cfg.name ? `${cfg.name} (${cfg.workloadId})` : cfg.workloadId);
+// Whether `backend` is the standalone workload `cfg`'s own resource (not a companion of it).
+function isResourceOf(cfg, backend) {
+  const own = isStandalone(cfg) ? resourceOf(cfg.resource) : null;
+  return Boolean(own) && own.kind === backend.kind && own.name === backend.name && (backend.kind === 'cloudsql' || own.location === backend.location);
+}
+// What a standalone workload has not (design §2): refused as unsupported, in AWS's words.
+export const standaloneRefusal = (id, what) => new Refusal(400, 'unsupported', `workload ${id} is a standalone workload: ${what}`);
+// A nap window's `wake` (never, header) says what a request may do in it: nothing arrives to wake a standalone workload.
+export const standaloneScheduleProblems = (schedule) => (Array.isArray(schedule?.windows) ? schedule.windows.flatMap((w, i) => (w?.kind === 'nap' && w.wake !== undefined && w.wake !== null
+  ? [`windows[${i}].wake: a standalone workload has no waiting page: nothing arrives to wake it in a nap window`] : [])) : []);
 
 // `problems`: each problem of a refused body, as AWS's settings action answers them.
 export class Refusal extends Error {
@@ -265,6 +285,35 @@ function workloadOf(cfg, pauses, run, { router = null, organization = null } = {
   const effective = effectiveOf(cfg, { run, router, organization });
   const { settings, settingsFrom, type } = resolvedSettings(effective);
   const [paused] = pauses;
+  // A standalone workload's: its kind and resource, no route, no rule, `resourceMissing` while its resource is gone (design §5).
+  if (isStandalone(cfg)) {
+    return {
+      workloadId: cfg.workloadId,
+      id: cfg.workloadId,
+      name: cfg.name ?? cfg.workloadId,
+      tags: cfg.tags ?? {},
+      state: run?.state ?? 'UNKNOWN',
+      kind: 'standalone',
+      resource: cfg.resource,
+      settings,
+      settingsFrom,
+      type,
+      hibernation: hibernationOf(cfg, router, organization),
+      backends: cfg.backends,
+      ...(run?.resourceMissing ? { resourceMissing: true } : {}),
+      ...(Array.isArray(cfg.fallbackInstanceTypes) && cfg.fallbackInstanceTypes.length ? { fallbackInstanceTypes: cfg.fallbackInstanceTypes } : {}),
+      ...(fallbacks.length ? { fallbacks } : {}),
+      ...(cfg.onboardedBy ? { onboardedBy: cfg.onboardedBy } : {}),
+      ...(run?.state === STATES.AWAKE && run.awakeSince !== undefined ? { awakeSince: isoOf(run.awakeSince) } : {}),
+      ...(run?.lastWake ? { lastWake: run.lastWake } : {}),
+      ...(failure ? { failure } : {}),
+      pauses,
+      ...(paused ? { paused } : {}),
+      ...(run?.companionsGone?.length ? { companionsGone: run.companionsGone } : {}),
+      ...(run?.napAborted ? { napAborted: { reason: run.napAborted.reason, at: isoOf(run.napAborted.at) } } : {}),
+      ...(beatAt !== undefined ? { beatAt: isoOf(beatAt) } : {}),
+    };
+  }
   return {
     workloadId: cfg.workloadId,
     id: cfg.workloadId,
@@ -515,12 +564,14 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   // A managed group's own VMs are the group's to tag and to act on, but they must qualify all the same.
   async function backendsOf(service, others, fallbackTypes = []) {
     const holderOf = (kind, location, name) => others.find((c) => c.backends?.some((b) => b.kind === kind && b.location === location && b.name === name));
+    // A resource is in one workload (standalone workloads design §2): a standalone one is named, to offboard first.
+    const heldBy = (what, holder) => (isStandalone(holder) ? `${what} is the standalone workload ${named(holder)}: offboard it first` : `${what} belongs to workload ${holder.workloadId}`);
     const backends = await Promise.all((service.backends ?? []).map((b) => backendOf(b, service.name)));
     const reasons = backends.flatMap((b) => b.reasons);
     const groups = backends.flatMap((b) => (b.group ? [b.group] : []));
     for (const { name, location } of groups) {
       const holder = holderOf('mig', location, name);
-      if (holder) reasons.push(`managed group ${name} belongs to workload ${holder.workloadId}`);
+      if (holder) reasons.push(heldBy(`managed group ${name}`, holder));
     }
     if (groups.length && fallbackTypes.length) reasons.push(FALLBACK_REFUSAL_FOR_GROUPS);
     const unmanaged = new Set(backends.filter((b) => !b.group).flatMap((b) => b.members));
@@ -550,7 +601,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
       if (owner) reasons.push(`VM ${vm.name} is a member of managed group ${owner}, which would repair it once stopped: put the managed group in the backend service instead of its VM in a network endpoint group`);
       if (!unmanaged.has(url)) continue;
       const holder = holderOf('vm', zone, vm.name);
-      if (holder) reasons.push(`VM ${vm.name} belongs to workload ${holder.workloadId}`);
+      if (holder) reasons.push(heldBy(`VM ${vm.name}`, holder));
       vms.push({ zone, name: vm.name, selfLink: vm.selfLink, id: String(vm.id) });
       if (negsOf.has(url)) negs[vm.name] = negsOf.get(url);
       else if (groupOf.has(url)) memberOf[vm.name] = groupOf.get(url);
@@ -571,7 +622,9 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     const found = await Promise.all(names.map(async (name) => {
       const holder = others.find((c) => c.backends?.some((b) => isCompanion(b) && b.name === name));
       const { database, problem } = await companionRead(cloudsql, name);
-      return { database, reasons: [...(holder ? [`Cloud SQL instance ${name} belongs to workload ${holder.workloadId}`] : []), ...(problem ? [problem] : [])] };
+      const own = holder && isResourceOf(holder, { kind: 'cloudsql', name });
+      const held = holder && (isStandalone(holder) ? `Cloud SQL instance ${name} is ${own ? 'the' : 'a companion of the'} standalone workload ${named(holder)}: offboard it first` : `Cloud SQL instance ${name} belongs to workload ${holder.workloadId}`);
+      return { database, reasons: [...(held ? [held] : []), ...(problem ? [problem] : [])] };
     }));
     return { reasons: found.flatMap((f) => f.reasons), databases: found.flatMap((f) => (f.database ? [f.database] : [])) };
   }
@@ -672,6 +725,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   // The dry run with the request as read: AWS's preview answers both (`request`: the workload's id, name and tags, and the Google
   // Cloud resources it names). `dryRun` is the REST route's.
   async function dryRunOf(input) {
+    if (input?.resource !== undefined) return dryRunOfResource(input);
     const asked = requested(input);
     const request = {
       workloadId: asked.id, name: asked.name ?? asked.id, tags: asked.tags ?? {}, urlMap: asked.urlMap, backendService: asked.backendService, wakerBackendService: wakerName(asked.id),
@@ -738,10 +792,189 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
     }
   }
 
+  // --- A standalone workload: onboarding by resource (vision standalone workloads design §2, §5) ------------------------------------
+  //
+  // The router reads; it writes the record and the run. What marks the resource for the router's backend roles, the tag dormeto=managed,
+  // is the CLI's to bind, as for an HTTP workload's backends: the router holds no tag permission (this file's top). Whether a VM or a group
+  // backs a backend service the router cannot tell (it holds no backendServices.list): it refuses what an onboarded workload holds, and
+  // the manager's scan, which lists them, offers only what none backs.
+
+  // The request by resource, or a 400. Its id: the one given, else the resource's name.
+  function requestedResource({ resource, id, name, tags, source = 'cli', settings = {}, cloudSql: cloudSqlAsked, databases, fallbackInstanceTypes: topFallbackTypes, by }) {
+    const { fallbackInstanceTypes: inSettings, ...ownSettings } = isObject(settings) ? settings : {};
+    if (isObject(settings)) settings = ownSettings;
+    const fallbackInstanceTypes = oneOf(inSettings, topFallbackTypes, 'settings.fallbackInstanceTypes', 'fallbackInstanceTypes');
+    const databasesAsked = oneOf(databaseNames(databases), cloudSqlAsked, 'databases', 'cloudSql');
+    const databasesField = databases !== undefined ? 'databases' : 'cloudSql';
+    const cloudSql = databasesAsked === undefined ? [] : databasesAsked;
+    const path = typeof resource === 'string' ? resourceOf(resource) : null;
+    const workloadId = checkedId(id || path?.name || 'resource');
+    const checkedName = checkName(name);
+    if (name !== undefined && checkedName.problem) throw bad(checkedName.problem);
+    const tagged = tags === undefined ? null : tagsProblem(tags);
+    if (tagged) throw bad(tagged);
+    if (source !== 'cli' && source !== 'manager') throw bad('source: cli or manager');
+    const problems = [
+      ...resourceSettingsProblems(settings), ...(databasesAsked === undefined ? [] : cloudSqlProblems(cloudSql, databasesField)),
+      ...(fallbackInstanceTypes === undefined ? [] : fallbackTypesProblems(fallbackInstanceTypes, inSettings !== undefined ? 'settings: fallbackInstanceTypes' : 'fallbackInstanceTypes')),
+    ];
+    if (problems.length) throw bad(problems.join('; '));
+    return { id: workloadId, resource, path, name: checkedName.name || undefined, tags, source, settings, cloudSql, fallbackTypes: fallbackInstanceTypes ?? [], by: by ? String(by) : undefined };
+  }
+
+  // A standalone workload's settings: `hibernate`, and the settings of the levels a standalone workload has (levels.mjs, its kind's).
+  function resourceSettingsProblems(settings) {
+    if (!isObject(settings)) return ['settings: must be an object'];
+    const { hibernate, ...levels } = settings;
+    return [
+      ...(Object.hasOwn(settings, 'hibernate') && typeof hibernate !== 'boolean' ? ['settings: hibernate must be true or false'] : []),
+      ...levelProblems(levels, { level: 'workload', cfg: { kind: 'standalone' } }).map((problem) => `settings: ${problem}`),
+    ];
+  }
+
+  // A VM as a standalone resource: why not (what the HTTP path refuses a backend's VM for, a group's member, a GKE node).
+  async function vmResourceProblems(vm) {
+    const reasons = [];
+    const owner = MANAGED_GROUP_OWNER.exec(vm.metadata?.items?.find((item) => item.key === 'created-by')?.value ?? '')?.[1];
+    if (owner) reasons.push(`VM ${vm.name} is a member of managed group ${owner}: onboard the group (it would repair a stopped VM)`);
+    if (Object.hasOwn(vm.labels ?? {}, GKE_NODE_LABEL)) reasons.push(`VM ${vm.name} is a GKE node: onboard the Kubernetes workloads that run on it`);
+    const machine = vm.machineType ? await compute.getMachineType(zoneOf(vm.machineType) ?? '', nameOf(vm.machineType)).catch(absent) : null;
+    if (vm.guestAccelerators?.length || machine?.accelerators?.length) reasons.push(`VM ${vm.name} has a GPU: GPU VMs are not supported`);
+    if (vm.disks?.some((d) => d.type === LOCAL_SSD)) reasons.push(`VM ${vm.name} has a local SSD: a stop would lose its data`);
+    return reasons;
+  }
+
+  // The resource read: its backend entry (as the record holds it) and why it cannot be a standalone workload.
+  async function resourceRead({ resource, path }) {
+    if (!path) return { reasons: [RESOURCE_PATHS] };
+    if (path.project !== config.project) return { reasons: [`the resource is in project ${path.project}: this router serves project ${config.project}`] };
+    if (path.kind === 'vm') {
+      const vm = await compute.getInstance(path.location, path.name).catch(absent);
+      if (!vm) return { reasons: [`VM ${path.name} not found in zone ${path.location}`] };
+      return { backend: { kind: 'vm', location: path.location, name: path.name, ...(vm.id ? { id: String(vm.id) } : {}) }, label: `VM ${path.name}`, reasons: await vmResourceProblems({ ...vm, name: path.name }) };
+    }
+    if (path.kind === 'mig') {
+      const group = groupOf({ location: path.location, name: path.name });
+      const managed = await compute.getManagedGroup(group).catch(absent);
+      if (!managed) return { reasons: [`managed group ${path.name} not found in ${path.location}`] };
+      const label = `managed group ${path.name}`;
+      const members = (await compute.listManagedInstances(group)).map((m) => m.instance);
+      const reasons = [];
+      if (!members.length) reasons.push(`${label} has no VM: resize it to one at least, then onboard again`);
+      if (managed.status?.stateful?.hasStatefulConfig) reasons.push(`${label} has a stateful configuration: a nap might not keep it`);
+      if (group.kind === 'regional' && (managed.distributionPolicy?.targetShape ?? 'EVEN') === 'EVEN' && (managed.updatePolicy?.instanceRedistributionType ?? 'PROACTIVE') !== 'NONE') {
+        reasons.push(`regional ${label} has the target shape EVEN with instance redistribution on: Google cannot stop or suspend its VMs one by one, set its instance redistribution type to NONE or change its target shape, then onboard again`);
+      }
+      // Its first VM tells whether it holds GKE nodes (GKE's label on each of them).
+      const first = members[0] && await compute.getInstance(zoneOf(members[0]), nameOf(members[0])).catch(absent);
+      if (Object.hasOwn(first?.labels ?? {}, GKE_NODE_LABEL)) reasons.push(`${label} holds GKE nodes: onboard the Kubernetes workloads that run on them`);
+      return { backend: { kind: 'mig', location: path.location, name: path.name, ...(managed.id ? { id: String(managed.id) } : {}) }, label, reasons };
+    }
+    const { database, gone, problem } = await companionRead(cloudsql, path.name);
+    if (gone) return { reasons: [`Cloud SQL instance ${path.name} not found: name an instance of this project`] };
+    const replica = problem && /read replica/.test(problem);
+    const reasons = problem ? [replica ? `Cloud SQL instance ${path.name} is a read replica: Google cannot stop one` : problem] : [];
+    // Unreadable (a router installed without --with cloud-sql): the HTTP path's words, and no backend.
+    return { ...(database ? { backend: { kind: 'cloudsql', name: path.name } } : {}), label: `Cloud SQL instance ${path.name}`, reasons };
+  }
+
+  // Why the resource cannot be onboarded, its backend entry and its companions (design §2): one workload a resource.
+  async function inspectResource(asked) {
+    const reasons = [];
+    const configs = await store.listConfigs();
+    const others = configs.filter((c) => c.workloadId !== asked.id);
+    if (others.length < configs.length) reasons.push(`workload ${asked.id} is onboarded already`);
+    const read = await resourceRead(asked);
+    reasons.push(...read.reasons);
+    const { backend, label } = read;
+    if (backend) {
+      const same = (b) => b.kind === backend.kind && b.name === backend.name && (backend.kind === 'cloudsql' || b.location === backend.location);
+      const holder = others.find((c) => (c.backends ?? []).some(same));
+      if (holder && isResourceOf(holder, backend)) reasons.push(`${label} is already onboarded: workload ${named(holder)}`);
+      else if (holder && backend.kind === 'cloudsql') reasons.push(`${label} is a companion of workload ${named(holder)}`);
+      else if (holder) reasons.push(`${label} belongs to workload ${named(holder)}`);
+    }
+    const companions = await databasesOf(asked.cloudSql, others);
+    reasons.push(...companions.reasons);
+    if (backend?.kind === 'cloudsql' && asked.cloudSql.includes(backend.name)) reasons.push(`Cloud SQL instance ${backend.name} is the workload's resource, not its companion`);
+    return { reasons, backend, databases: companions.databases };
+  }
+
+  // The dry run by resource: `{ request, answer }`, the REST route's answer `{ eligible, reasons, backend, databases, warnings? }`.
+  async function dryRunOfResource(input) {
+    const asked = requestedResource(input);
+    const { reasons, backend, databases } = await inspectResource(asked);
+    const warnings = databases.filter((d) => d.replicas).map((d) => `Cloud SQL instance ${d.name} has read replicas (${d.replicas.join(', ')}): Google stops only the primary, its replicas keep running, and billing, while the workload sleeps`);
+    return {
+      request: { workloadId: asked.id, kind: 'standalone', name: asked.name ?? asked.id, tags: asked.tags ?? {}, resource: asked.resource },
+      answer: { eligible: reasons.length === 0, reasons, ...(backend ? { backend } : {}), databases, ...(warnings.length ? { warnings } : {}) },
+    };
+  }
+
+  // The record and the run: nothing written at Google (the CLI binds the tag before). Steps: the workload configuration.
+  async function onboardResource(input) {
+    const asked = requestedResource(input);
+    const { id, name: personName, tags, source, settings, fallbackTypes, by } = asked;
+    if (await store.getConfig(id)) throw new Refusal(409, 'exists', `workload ${id} is onboarded already`);
+    const { reasons, backend, databases } = await inspectResource(asked);
+    if (reasons.length) throw new Refusal(400, 'not-eligible', `cannot onboard ${id}: ${reasons.join('; ')}`);
+    const above = await levelsOf();
+    const { hibernate, ...levelsAsked } = settings;
+    const levels = Object.fromEntries(Object.entries(levelsAsked).filter(([, value]) => value !== null));
+    const cfg = {
+      workloadId: id,
+      kind: 'standalone',
+      resource: asked.resource,
+      ...(personName ? { name: personName } : {}),
+      ...(tags ? { tags } : {}),
+      backends: [backend, ...databases.map(({ name }) => ({ kind: 'cloudsql', name }))],
+      ...(fallbackTypes.length ? { fallbackInstanceTypes: fallbackTypes } : {}),
+      ...levels,
+      ...(typeof hibernate === 'boolean' ? { hibernate } : {}),
+      inherits: STANDALONE_KEYS.filter((key) => !Object.hasOwn(levels, key)),
+      source,
+      ...(by ? { onboardedBy: by } : {}),
+      onboardedAt: isoOf(now()),
+    };
+    await store.putConfig(id, cfg);
+    await store.initRun(id, now());
+    log.info('Onboarded', { workloadId: id, resource: asked.resource, by: by ?? 'unknown' });
+    const pauses = await core.pausesFor(id).catch(() => []);
+    return { workload: workloadOf(cfg, pauses, await store.getRun(id), above), steps: [stepOf('workload configuration', true)] };
+  }
+
+  // Offboarding a standalone workload: awake first (its resource and companions running for their owner), unless its resource is gone
+  // (deleted: it cannot be woken), then its autoscalers given back and its record deleted. Nothing at Google: the CLI unbinds the tag.
+  async function offboardStandalone(cfg, run, { force, by }) {
+    const id = cfg.workloadId;
+    const gone = run?.resourceMissing === true;
+    if (!force && !gone && [STATES.WAKING, STATES.NAPPING].includes(run?.state)) throw new Refusal(409, 'busy', `cannot offboard ${id}: it is ${run.state}, try again once it is done`);
+    const asleep = !force && !gone && run && run.state !== STATES.AWAKE ? run.state : null;
+    let current = run;
+    if (asleep) {
+      await awaken(id, run);
+      current = await store.getRun(id);
+    }
+    const givenBack = [];
+    for (const a of current?.autoscalers ?? []) {
+      await compute.setAutoscalerMode(a, a.mode).then(() => givenBack.push(autoscalerText(a)), (err) => {
+        if (!gone && !force) throw err;
+        log.warn('AutoscalerNotGivenBack', { workloadId: id, autoscaler: a.name, error: err.message });
+      });
+    }
+    await store.deleteWorkload(id);
+    log.info('Offboarded', { workloadId: id, by: by ?? 'unknown', ...(gone ? { resourceMissing: true } : {}) });
+    return {
+      answer: onFallback(current),
+      steps: [stepOf('wake', Boolean(asleep), asleep && `from ${asleep}`), stepOf('restore autoscalers', givenBack.length > 0, givenBack.join(', ')), stepOf('workload configuration', true)],
+    };
+  }
+
   // The REST route's answer, the Workload; `onboardWithSteps` adds what it changed, as AWS's onboarder's steps.
   const onboard = async (input) => (await onboardWithSteps(input)).workload;
 
   async function onboardWithSteps(input) {
+    if (input?.resource !== undefined) return onboardResource(input);
     const { id, name: personName, tags, source, urlMap, backendService, settings, loadBalancer, cloudSql, gkeAsked, requestLogs, fallbackTypes, by } = requested(input, { needsAll: true });
     if (await store.getConfig(id)) throw new Refusal(409, 'exists', `workload ${id} is onboarded already`);
     const { reasons, vms, groups, negs, memberOf, serviceBackends, podNegs, databases, hosts, wakerExists, lb } = await inspect({ id, urlMap, backendService, loadBalancer, settings, cloudSql, gkeAsked, fallbackTypes });
@@ -938,6 +1171,7 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   async function offboardWithSteps(id, { force = false, by } = {}) {
     const cfg = await find(id);
     let run = await store.getRun(id);
+    if (isStandalone(cfg)) return offboardStandalone(cfg, run, { force, by });
     if (force) return forceOff(cfg, run, by);
     if ([STATES.WAKING, STATES.NAPPING].includes(run?.state)) throw new Refusal(409, 'busy', `cannot offboard ${id}: it is ${run.state}, try again once it is done`);
     const asleep = run && run.state !== STATES.AWAKE ? run.state : null;
@@ -1018,7 +1252,13 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
   const showSchedule = async (id) => restSchedule(await workloadSchedule(id));
 
   // The body is the schedule, as on AWS; `by` says who sets it.
-  const setSchedule = async (id, schedule) => restSchedule(answered(await manager.setSchedule({ workloadId: id, schedule, by: schedule?.by })));
+  const setSchedule = async (id, schedule) => restSchedule(answered(await scheduleSet({ workloadId: id, schedule, by: schedule?.by })));
+  // The shared schedule action, with what a standalone workload refuses first (the REST route's and the action's).
+  async function scheduleSet(payload) {
+    const cfg = await store.getConfig(payload.workloadId).catch(() => null);
+    const problems = isStandalone(cfg) ? standaloneScheduleProblems(payload.schedule) : [];
+    return problems.length ? { problems } : manager.setSchedule(payload);
+  }
 
   // AWS's clear-schedule answer, `{ cleared }`: whether there was one. `by` says who clears it.
   const deleteSchedule = (id, { by } = {}) => manager.clearSchedule({ workloadId: id, by });
@@ -1091,7 +1331,10 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
 
   // AWS's waiting-page action (manager-actions.mjs's): `level` is 'router' or { workloadId } (as the store's), `op` get, put or delete. A
   // put refused names every problem, with nothing written; a custom one needs the switch. `by` says who sets it, as a schedule's.
-  const waitingPage = async (level, { op, page, by } = {}) => answered(await manager.waitingPage({ op, workloadId: level === 'router' ? null : level.workloadId, page, by }));
+  const waitingPage = async (level, { op, page, by } = {}) => {
+    if (level !== 'router' && isStandalone(await store.getConfig(level.workloadId).catch(() => null))) throw standaloneRefusal(level.workloadId, 'it has no waiting page');
+    return answered(await manager.waitingPage({ op, workloadId: level === 'router' ? null : level.workloadId, page, by }));
+  };
 
   // The manager's actions (manager-actions.mjs) on this router: the REST routes above and actions.mjs call them.
   // The standalone workloads whose idle settings a write just changed (their idleNotBefore goes once written).
@@ -1141,6 +1384,6 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
 
   return {
     dryRun, dryRunOf, onboard, onboardWithSteps, offboard, offboardWithSteps, find, show, list, nap, wake, showSchedule, workloadSchedule, setSchedule, clearSchedule, deleteSchedule, pause, resume,
-    pauseRouter, resumeRouter, setSettings, routerSettings, setRouterSettings, waitingPage, manager,
+    pauseRouter, resumeRouter, setSettings, routerSettings, setRouterSettings, waitingPage, manager, scheduleSet,
   };
 }

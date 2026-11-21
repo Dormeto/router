@@ -22,7 +22,7 @@ import { listRouter, readPauses, rowPauses } from '../../lambda/src/lib/manager-
 import { STATS_DAYS } from '../../lambda/src/lib/summary.mjs';
 import { CHECK_SCHEDULE, PauseRefused } from './controller-core.mjs';
 import { isPods } from './gke.mjs';
-import { maintenanceDueOf, Refusal } from './onboarding.mjs';
+import { maintenanceDueOf, Refusal, standaloneRefusal } from './onboarding.mjs';
 import { organizationOf } from './organization.mjs';
 import { CUSTOM_PAGES_REFUSED } from './pages.mjs';
 import { readReport } from './report.mjs';
@@ -83,15 +83,28 @@ const hibernationOf = (hibernation, manager) => ({ ...hibernation, manager, inst
 // it names, onboarded by the manager, by who asked (`unknown` when the payload names no one, as AWS's onboardedBy). The REST body's
 // own names (`cloudSql`, the top-level `fallbackInstanceTypes`) are read too (onboarding.mjs's requested). GKE access and request logs
 // stay with the CLI (§8): not taken here.
-const onboardingOf = ({ workloadId, name, tags, settings, urlMap, backendService, loadBalancer, databases, cloudSql, fallbackInstanceTypes, by }) => ({
-  urlMap, backendService, id: workloadId, name, tags, settings, loadBalancer, databases, cloudSql, fallbackInstanceTypes, source: 'manager', by: by ?? 'unknown',
-});
+const onboardingOf = ({ workloadId, name, tags, settings, urlMap, backendService, loadBalancer, databases, cloudSql, fallbackInstanceTypes, resource, by }) => (resource !== undefined
+  // A standalone workload's: its resource in place of the URL map and the backend service (standalone workloads, plan 5).
+  ? { resource, id: workloadId, name, tags, settings, databases, cloudSql, fallbackInstanceTypes, source: 'manager', by: by ?? 'unknown' }
+  : { urlMap, backendService, id: workloadId, name, tags, settings, loadBalancer, databases, cloudSql, fallbackInstanceTypes, source: 'manager', by: by ?? 'unknown' });
 
 // AWS's preview (lambda/src/lib/onboarding.mjs's preview, :392 and :451): the workload's id, name and tags; instead of the target
 // groups and the load balancer, the Google Cloud resources (the URL map, the backend service, the waker's, `lb`); its backends and
 // databases in AWS's entries (:442, :449), `tagged` unknown: the router cannot see the tags the CLI binds; `ok` and `problems`. The REST
 // dry run's fields beside them. A dry run reads no route the onboarding adds: no `rules`.
-const previewOf = ({ request, answer }) => ({
+// A standalone workload's preview, as AWS's previewResource answers (lambda/src/lib/onboarding.mjs): `resource` its path (AWS's
+// `resourceArn`), its backend entry in AWS's form as `backend`, `ok` and `problems`; the REST dry run's fields beside them.
+const ENTRY_OF = { vm: 'instance', mig: 'asg', cloudsql: 'cloudsql-instance' };
+const resourcePreviewOf = ({ request, answer }) => ({
+  ...request,
+  ...answer,
+  ...(answer.backend ? { backend: { kind: ENTRY_OF[answer.backend.kind], id: answer.backend.name, tagged: null, ...(answer.backend.location ? { location: answer.backend.location } : {}) } } : {}),
+  databases: answer.databases.map((database) => ({ kind: 'cloudsql-instance', id: database.name, tagged: null, ...database })),
+  ok: answer.eligible,
+  problems: answer.reasons,
+});
+
+const previewOf = ({ request, answer }) => (request.kind === 'standalone' ? resourcePreviewOf({ request, answer }) : {
   ...request,
   ...answer,
   backends: [
@@ -102,6 +115,11 @@ const previewOf = ({ request, answer }) => ({
   ok: answer.eligible,
   problems: answer.reasons,
 });
+
+// AWS's standalone status (lambda/src/lib/status.mjs's standaloneStatus): its keys, `resource` for `resourceArn`.
+const STANDALONE_STATUS = ['workloadId', 'name', 'kind', 'resource', 'router', 'source', 'tags', 'state', 'stateAt', 'drift', 'updatedAt', 'awakeSince', 'wakeStartedAt', 'failedAt',
+  'failure', 'consecutiveFailures', 'nextAttemptAt', 'fallbacks', 'wakeCount', 'pendingWake', 'pauses', 'idle', 'nap', 'discovery', 'instances', 'hibernation', 'backends',
+  'ignoredTargets', 'recommendations', 'settings', 'settingsFrom', 'type', 'stats'];
 
 // `controller`: controller-core.mjs's; `onboarding`: onboarding.mjs's; `router`: `{ name, version, build, project, region }`; `lists`:
 // the router's IP lists (DMT_IP_LISTS). `act(payload)` answers `{ status, body }`.
@@ -160,6 +178,7 @@ export function createActions({ controller, onboarding, store, router, lists = [
   // AWS's status (status.mjs, then the schedule's view): the REST Workload's fields, the row's, and AWS's status keys.
   async function status({ workloadId }) {
     const cfg = await onboarding.find(workloadId);
+    if (cfg.kind === 'standalone') return standaloneStatus(cfg);
     const id = cfg.workloadId;
     // One read of the run, for the row and the schedule's maintenance wake.
     const runRead = store.getRun(id);
@@ -204,6 +223,42 @@ export function createActions({ controller, onboarding, store, router, lists = [
     };
   }
 
+  // A standalone workload's status: AWS's keys (STANDALONE_STATUS), its signals and nap estimate from the controller, then the schedule's
+  // view. Its backends in AWS's form, its resource no companion; its stats its wakes alone.
+  async function standaloneStatus(cfg) {
+    const id = cfg.workloadId;
+    const runRead = store.getRun(id);
+    const [shown, run, above, stats, pauses, view] = await Promise.all([
+      onboarding.show(id), runRead, levels(), store.getStats(id, STATS_DAYS).catch((err) => ({ error: err.message })), controller.pausesFor(id), onboarding.workloadSchedule(id, { run: runRead }),
+    ]);
+    const row = rowFor(cfg, { run, stats: stats.error ? null : stats, pauses, scheduled: Boolean(view.schedule), above });
+    const { idle, nap } = await controller.idleView(cfg, run, { paused: pauses.length > 0 });
+    const wakesOnly = (period) => (period ? { wakes: period.wakes ?? {} } : period);
+    const own = (b) => b.kind === 'cloudsql' && cfg.resource?.endsWith(`/instances/${b.name}`);
+    const answer = {
+      ...row,
+      router: { version: router.version ?? 'unknown', build: router.build ?? 'unknown' },
+      drift: [],
+      fallbacks: row.fallbacks ?? [],
+      idle,
+      nap,
+      discovery: 'standalone',
+      instances: [],
+      hibernation: hibernationOf(shown.hibernation, above.manager),
+      backends: cfg.backends.map((b) => {
+        const { companion, ...entry } = backendOf(b);
+        return own(b) ? entry : backendOf(b);
+      }),
+      ignoredTargets: [],
+      recommendations: [],
+      settings: row.settings,
+      settingsFrom: row.settingsFrom,
+      type: shown.type,
+      stats: stats && !stats.error ? { ...stats, today: wakesOnly(stats.today), total: wakesOnly(stats.total) } : stats,
+    };
+    return { ...Object.fromEntries(STANDALONE_STATUS.map((key) => [key, answer[key]]).filter(([, value]) => value !== undefined)), ...(run?.resourceMissing ? { resourceMissing: true } : {}), ...view };
+  }
+
   // The manager's exclusions are AWS's workload pauses with an exclusionId, several per workload beside the operator's. The id is a part
   // of the pause's document id (`<workloadId>#<exclusionId>`): letters, digits, `.`, `_` and `-`. A Google Cloud router has no target group: an exclusion
   // names the backend service it matched instead.
@@ -240,6 +295,7 @@ export function createActions({ controller, onboarding, store, router, lists = [
         throw err;
       });
       const { backendService } = payload;
+      if (backendService != null && cfg.kind === 'standalone') throw standaloneRefusal(cfg.workloadId, 'it has no backend service to exclude');
       if (backendService != null && !isBackendServiceOf(cfg, backendService)) {
         throw new Refusal(404, 'not-found', `workload not configured: ${workloadId} (its backend service is not ${backendService})`);
       }
@@ -283,6 +339,7 @@ export function createActions({ controller, onboarding, store, router, lists = [
   // AWS's waiting-page action, its checks first. A custom page the install's switch keeps off is a conflict (§5.5: the manager
   // answers 409 with these words); the page's other problems, AWS's answer.
   async function waitingPage(payload) {
+    if (payload?.workloadId && (await store.getConfig(payload.workloadId).catch(() => null))?.kind === 'standalone') throw standaloneRefusal(payload.workloadId, 'it has no waiting page');
     const answer = await manager.waitingPage(payload);
     if (answer.problems?.includes(CUSTOM_PAGES_REFUSED)) throw new Refusal(409, 'custom-pages-off', CUSTOM_PAGES_REFUSED);
     return answer;
@@ -290,7 +347,7 @@ export function createActions({ controller, onboarding, store, router, lists = [
 
   // AWS's schedule action: the schedule stored with who set it, and AWS's view of it.
   async function setSchedule(payload) {
-    const view = await manager.setSchedule(payload);
+    const view = await onboarding.scheduleSet(payload);
     if (view.problems) return view;
     // A schedule just stored passed scheduleProblems, which reads its time zone and its windows as the view does: one the router reads.
     const due = maintenanceDueOf(view.schedule, await store.getRun(payload.workloadId), { readable: true });
@@ -378,7 +435,7 @@ export function createActions({ controller, onboarding, store, router, lists = [
     } catch (err) {
       if (!(err instanceof Refusal)) throw err;
       if (payload.refusals !== true) return { status: err.status, body: { error: err.message, reason: err.reason, ...(err.problems ? { problems: err.problems } : {}) } };
-      const code = CODES[err.status] ?? 'invalid';
+      const code = err.reason === 'unsupported' ? 'unsupported' : CODES[err.status] ?? 'invalid';
       log.info('Refused', { action, workloadId: payload.workloadId ?? null, code, message: err.message });
       return { status: 200, body: { refused: { code, message: err.message } } };
     }

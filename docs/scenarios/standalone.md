@@ -71,6 +71,10 @@ On Google Cloud, the onboarding refuses (the router's own words):
 - **A resource of another project:** a router serves its own project.
 - **Whether a VM or a group backs a backend service** the router cannot tell (its role lists no backend service): the
   manager's scan offers only what no backend service uses.
+- **The manager's scan lists a project's Cloud SQL instances** (Not released yet: router 0.42.0): its discovery role,
+  `dormetoDiscovery`, reads them with `cloudsql.instances.get` and `cloudsql.instances.list`, and offers none that is a
+  read replica. In a project where the Cloud SQL Admin API is off (only a router installed with `--with cloud-sql` turns
+  it on), Google refuses the read and the scan says Cloud SQL was not read; nothing turns the API on for it.
 
 A standalone workload may name **companion databases**, as an HTTP workload's: they stop after it and start before it. A
 database alone is a standalone workload whose resource is the database.

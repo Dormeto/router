@@ -396,6 +396,13 @@ test('manager: dormetoDiscovery holds only get, list and monitoring.timeSeries.l
   for (const kind of ['urlMaps', 'regionUrlMaps', 'backendServices', 'regionBackendServices', 'targetHttpProxies', 'targetHttpsProxies', 'regionTargetHttpProxies', 'regionTargetHttpsProxies', 'globalForwardingRules', 'forwardingRules', 'instanceGroups', 'instanceGroupManagers', 'instances', 'networkEndpointGroups']) {
     includesAll(list, [`compute.${kind}.get`, `compute.${kind}.list`], 'dormetoDiscovery');
   }
+  // The scan lists a project's Cloud SQL instances as standalone candidates and tells a read replica (Plan 5's ruling): reads only, after Cloud Run's.
+  includesAll(list, ['cloudsql.instances.get', 'cloudsql.instances.list'], 'dormetoDiscovery');
+  assert.deepEqual(list.filter((p) => p.startsWith('cloudsql.')), ['cloudsql.instances.get', 'cloudsql.instances.list']);
+  assert.deepEqual(list.slice(list.indexOf('run.services.list') + 1), ['cloudsql.instances.get', 'cloudsql.instances.list', 'monitoring.timeSeries.list']);
+  assert.match(manager.roles.dormetoDiscovery.description, /Cloud SQL instances/);
+  assert.match(manager.roles.dormetoDiscovery.description, /Read only\.$/);
+  assert.equal(list.length + org.length, 37);
 });
 
 test('manager: each dormetoCommand permission is a tag permission the onboarding, the offboarding or the Cloud SQL feature already needs', async () => {

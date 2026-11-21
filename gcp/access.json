@@ -571,7 +571,7 @@
     "roles": {
       "dormetoDiscovery": {
         "title": "Dormeto manager discovery",
-        "description": "Lets the Dormeto manager's discovery account read the projects, folders and organizations of its scopes, their load balancers, VMs and groups, their Cloud Run services and their request counts. Read only.",
+        "description": "Lets the Dormeto manager's discovery account read the projects, folders and organizations of its scopes, their load balancers, VMs and groups, their Cloud Run services, their Cloud SQL instances and their request counts. Read only.",
         "permissions": [
           "resourcemanager.projects.get",
           "compute.urlMaps.get",
@@ -604,6 +604,8 @@
           "compute.networkEndpointGroups.list",
           "run.services.get",
           "run.services.list",
+          "cloudsql.instances.get",
+          "cloudsql.instances.list",
           "monitoring.timeSeries.list"
         ],
         "organizationPermissions": [

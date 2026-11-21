@@ -34,3 +34,12 @@ test('the page says the R30 review\'s rulings: a failed wake retried until it su
   assert.ok(page.includes('A failure for a permission'));
   assert.doesNotMatch(page, /leaves every backend stopped ends it/);
 });
+
+test('the page says what the manager\'s discovery role reads of Cloud SQL, as gcp/access.json has it, and the API it needs', () => {
+  const page = flat(read('docs/scenarios/standalone.md'));
+  const discovery = JSON.parse(read('gcp/access.json')).manager.roles.dormetoDiscovery.permissions;
+  const reads = discovery.filter((p) => p.startsWith('cloudsql.'));
+  assert.deepEqual(reads, ['cloudsql.instances.get', 'cloudsql.instances.list']);
+  assert.ok(page.includes(`The manager's scan lists a project's Cloud SQL instances (Not released yet: router 0.42.0): its discovery role, dormetoDiscovery, reads them with ${reads.join(' and ')}`));
+  assert.ok(page.includes('where the Cloud SQL Admin API is off (only a router installed with --with cloud-sql turns it on), Google refuses the read and the scan says Cloud SQL was not read; nothing turns the API on for it'));
+});

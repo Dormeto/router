@@ -1,0 +1,308 @@
+{
+  "onboarded": {
+    "workloadId": "demo",
+    "id": "demo",
+    "name": "Demo",
+    "tags": {
+      "team": "shop"
+    },
+    "state": "AWAKE",
+    "urlMap": "lb",
+    "backendService": "app",
+    "wakerBackendService": "dmtr-europe-west1-demo",
+    "hosts": [
+      "demo.example.com"
+    ],
+    "lb": {
+      "kind": "global"
+    },
+    "settings": {
+      "idleMinutes": 30,
+      "waitSeconds": 0,
+      "drainSeconds": 0,
+      "wakeTimeoutSeconds": 600,
+      "maxHolders": 0,
+      "failedRetrySeconds": 60,
+      "wakeMode": "browser"
+    },
+    "settingsFrom": {
+      "idleMinutes": "workload",
+      "waitSeconds": "fixed",
+      "drainSeconds": "fixed",
+      "wakeTimeoutSeconds": "default",
+      "maxHolders": "fixed",
+      "failedRetrySeconds": "default",
+      "wakeMode": "fixed"
+    },
+    "type": {
+      "name": "instance",
+      "from": "backends"
+    },
+    "noWakeRules": [],
+    "wakeRules": [],
+    "hibernation": {
+      "hibernate": true,
+      "from": "default",
+      "workload": null,
+      "router": null,
+      "manager": null
+    },
+    "backends": [
+      {
+        "kind": "vm",
+        "location": "europe-west1-b",
+        "name": "vm-a",
+        "id": "1001"
+      }
+    ],
+    "awakeSince": "2023-11-14T22:13:20.000Z",
+    "pauses": []
+  },
+  "show": {
+    "workloadId": "demo",
+    "id": "demo",
+    "name": "Demo",
+    "tags": {
+      "team": "shop"
+    },
+    "state": "AWAKE",
+    "urlMap": "lb",
+    "backendService": "app",
+    "wakerBackendService": "dmtr-europe-west1-demo",
+    "hosts": [
+      "demo.example.com"
+    ],
+    "lb": {
+      "kind": "global"
+    },
+    "settings": {
+      "idleMinutes": 30,
+      "waitSeconds": 0,
+      "drainSeconds": 0,
+      "wakeTimeoutSeconds": 600,
+      "maxHolders": 0,
+      "failedRetrySeconds": 60,
+      "wakeMode": "browser"
+    },
+    "settingsFrom": {
+      "idleMinutes": "workload",
+      "waitSeconds": "fixed",
+      "drainSeconds": "fixed",
+      "wakeTimeoutSeconds": "default",
+      "maxHolders": "fixed",
+      "failedRetrySeconds": "default",
+      "wakeMode": "fixed"
+    },
+    "type": {
+      "name": "instance",
+      "from": "backends"
+    },
+    "noWakeRules": [],
+    "wakeRules": [],
+    "hibernation": {
+      "hibernate": true,
+      "from": "default",
+      "workload": null,
+      "router": null,
+      "manager": null
+    },
+    "backends": [
+      {
+        "kind": "vm",
+        "location": "europe-west1-b",
+        "name": "vm-a",
+        "id": "1001"
+      }
+    ],
+    "awakeSince": "2023-11-14T22:13:20.000Z",
+    "pauses": []
+  },
+  "list": {
+    "router": {
+      "name": "dmtr-europe-west1",
+      "version": "0.41.0",
+      "build": "b7",
+      "checkSchedule": "*/5 * * * *",
+      "lastScheduledCheckAt": null,
+      "pauses": []
+    },
+    "workloads": [
+      {
+        "workloadId": "demo",
+        "name": "Demo",
+        "backendService": "app",
+        "wakerBackendService": "dmtr-europe-west1-demo",
+        "urlMap": "lb",
+        "lb": {
+          "kind": "global"
+        },
+        "source": "cli",
+        "tags": {
+          "team": "shop"
+        },
+        "state": "AWAKE",
+        "stateAt": null,
+        "url": "https://demo.example.com/",
+        "wakeMode": "browser",
+        "wakeCount": 0,
+        "awakeSince": "2023-11-14T22:13:20.000Z",
+        "wakeStartedAt": null,
+        "failedAt": null,
+        "failure": null,
+        "consecutiveFailures": 0,
+        "nextAttemptAt": null,
+        "updatedAt": null,
+        "pendingWake": false,
+        "backends": [
+          "instance"
+        ],
+        "pauses": [],
+        "stats7d": {
+          "ignored": 2,
+          "deferred": 0,
+          "wakes": 1
+        },
+        "type": "instance",
+        "settingsFrom": {
+          "idleMinutes": "workload",
+          "waitSeconds": "fixed",
+          "drainSeconds": "fixed",
+          "wakeTimeoutSeconds": "default",
+          "maxHolders": "fixed",
+          "failedRetrySeconds": "default",
+          "wakeMode": "fixed"
+        },
+        "settings": {
+          "waitSeconds": 0,
+          "idleMinutes": 30,
+          "drainSeconds": 0,
+          "wakeTimeoutSeconds": 600,
+          "maxHolders": 0
+        }
+      }
+    ]
+  },
+  "status": {
+    "workloadId": "demo",
+    "id": "demo",
+    "name": "Demo",
+    "tags": {
+      "team": "shop"
+    },
+    "state": "AWAKE",
+    "urlMap": "lb",
+    "backendService": "app",
+    "wakerBackendService": "dmtr-europe-west1-demo",
+    "hosts": [
+      "demo.example.com"
+    ],
+    "lb": {
+      "kind": "global"
+    },
+    "settings": {
+      "idleMinutes": 30,
+      "waitSeconds": 0,
+      "drainSeconds": 0,
+      "wakeTimeoutSeconds": 600,
+      "maxHolders": 0,
+      "failedRetrySeconds": 60
+    },
+    "settingsFrom": {
+      "idleMinutes": "workload",
+      "waitSeconds": "fixed",
+      "drainSeconds": "fixed",
+      "wakeTimeoutSeconds": "default",
+      "maxHolders": "fixed",
+      "failedRetrySeconds": "default",
+      "wakeMode": "fixed"
+    },
+    "type": {
+      "name": "instance",
+      "from": "backends"
+    },
+    "noWakeRules": [],
+    "wakeRules": [],
+    "hibernation": {
+      "hibernate": true,
+      "from": "default",
+      "workload": null,
+      "router": null,
+      "manager": null,
+      "instances": null,
+      "freshBoot": false
+    },
+    "backends": [
+      {
+        "kind": "instance",
+        "id": "vm-a",
+        "status": null,
+        "location": "europe-west1-b",
+        "resourceId": "1001"
+      }
+    ],
+    "awakeSince": "2023-11-14T22:13:20.000Z",
+    "pauses": [],
+    "source": "cli",
+    "stateAt": null,
+    "url": "https://demo.example.com/",
+    "wakeMode": "browser",
+    "wakeCount": 0,
+    "wakeStartedAt": null,
+    "failedAt": null,
+    "failure": null,
+    "consecutiveFailures": 0,
+    "nextAttemptAt": null,
+    "updatedAt": null,
+    "pendingWake": false,
+    "stats7d": {
+      "ignored": 2,
+      "deferred": 0,
+      "wakes": 1
+    },
+    "router": {
+      "version": "0.41.0",
+      "build": "b7"
+    },
+    "drift": [],
+    "fallbacks": [],
+    "holders": 0,
+    "lastRequestAt": null,
+    "nap": null,
+    "route": null,
+    "rules": [],
+    "issues": [],
+    "discovery": null,
+    "instances": [],
+    "ignoredTargets": [],
+    "recommendations": [],
+    "targets": [],
+    "stats": {
+      "days": 7,
+      "since": "2023-11-08",
+      "today": {
+        "ignored": {},
+        "deferred": {},
+        "wakes": {}
+      },
+      "total": {
+        "ignored": {
+          "bot": 2
+        },
+        "deferred": {},
+        "wakes": {
+          "manager": 1
+        }
+      }
+    },
+    "ipLists": [],
+    "schedule": null,
+    "next": [],
+    "maintenanceDue": null,
+    "joinMinutes": 15,
+    "joinFrom": "default",
+    "joinInherited": {
+      "joinMinutes": 15,
+      "joinFrom": "default"
+    }
+  }
+}

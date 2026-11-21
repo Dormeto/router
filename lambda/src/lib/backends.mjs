@@ -1,4 +1,4 @@
-// Backends of a workload: standalone EC2 instances and EC2 Auto Scaling groups feeding the app target group, ECS
+// Backends of a workload: EC2 instances outside an Auto Scaling group and EC2 Auto Scaling groups feeding the app target group, ECS
 // services, a Kubernetes owner (its configuration names it), and their databases.
 // Instances of a group are never managed one by one: the group would replace a stopped instance.
 import { retryCapacity, startWithCapacity } from './capacity.mjs';

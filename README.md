@@ -372,7 +372,7 @@ aws lambda invoke --function-name dmt-dev-controller --cli-binary-format raw-in-
   for maintenance (cause `maintenance`, counted `wake:maintenance`, never as traffic) and napped again by the idle
   check when no traffic comes. A workload asleep since before router 0.26.0 counts from its next state change.
 
-**Hibernation (router 0.32.0):** a nap hibernates the standalone EC2 instances it stops instead of stopping them: AWS
+**Hibernation (router 0.32.0):** a nap hibernates the EC2 instances outside an Auto Scaling group it stops instead of stopping them: AWS
 saves the memory on the encrypted root volume and a start resumes the processes where they were (faster wakes, warm
 caches, sessions kept), at no extra cost. Auto Scaling groups (scaled to 0), ECS, Kubernetes and databases are
 unchanged (AWS forbids it for the first two, the others have none). It is on by default and safe: an instance that was

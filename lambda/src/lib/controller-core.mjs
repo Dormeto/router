@@ -921,7 +921,7 @@ export function createController({
   }
 
   // The hibernation a workload gets (hibernation design §4): the resolution, each level (a failed read of one fails it,
-  // as a failed schedule read fails the status), its standalone instances as one DescribeInstances gives them (null when
+  // as a failed schedule read fails the status), its EC2 instances outside an Auto Scaling group as one DescribeInstances gives them (null when
   // it has none, or when they cannot be described: logged, never failing) and whether its next nap stops them for a
   // fresh boot. levels: already read by the caller.
   async function hibernationView(cfg, run, instanceIds, levels = null) {

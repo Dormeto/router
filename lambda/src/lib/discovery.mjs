@@ -1,4 +1,4 @@
-// Resolve the standalone EC2 instances of a workload (static list, or discovery from the app target group).
+// Resolve the EC2 instances outside an Auto Scaling group of a workload (static list, or discovery from the app target group).
 // Kept for the instance-only callers; resolveBackends (backends.mjs) also resolves Auto Scaling groups.
 import { WORKLOAD_TAG, resolveBackends } from './backends.mjs';
 

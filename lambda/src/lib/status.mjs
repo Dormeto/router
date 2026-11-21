@@ -103,7 +103,7 @@ export function createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging
     return run.resourceMissing ? after(answer, 'backends', { resourceMissing: true }) : answer;
   }
   // Extras that depend on the caller: router rules, wake rules, statistics and IP lists loaders, and the hibernation's
-  // (given the standalone instances, never failing; the controller's status only).
+  // (given the EC2 instances outside an Auto Scaling group, never failing; the controller's status only).
   return async function status(workloadId, cfg, run, { pauses = [], drift = [], noWakeRules = [], wakeRules = [], loadStats = null, loadLists = null, loadHibernation = null } = {}) {
     if (cfg.kind === 'standalone') return standaloneStatus(workloadId, cfg, run, { pauses, drift, loadStats, loadHibernation });
     const t = now();

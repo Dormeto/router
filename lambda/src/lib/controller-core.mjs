@@ -959,6 +959,8 @@ export function createController({
   const MODULE_VARIABLES = {
     hibernate: 'hibernate', idleMinutes: 'idle_minutes', waitSeconds: 'wait_seconds', drainSeconds: 'drain_seconds', wakeTimeoutSeconds: 'wake_timeout_seconds',
     maxHolders: 'max_holders', failedRetrySeconds: 'failed_retry_seconds', wakeMode: 'wake_mode', noWakeRules: 'no_wake_rules', wakeRules: 'wake_rules', type: 'type',
+    // A standalone workload's idle signals (vision standalone workloads design §4).
+    idleCpuPercent: 'idle_cpu_percent', idleNetworkBytes: 'idle_network_bytes', idleMetric: 'idle_metric',
   };
 
   // What AWS holds back of the manager's writes (manager-actions.mjs's guard): a workload Terraform wrote (no source) is changed in

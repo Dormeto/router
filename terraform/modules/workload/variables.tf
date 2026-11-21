@@ -40,16 +40,111 @@ variable "rule_arns" {
 }
 
 variable "app_target_group_arn" {
-  description = "Application target group: it identifies the workload. Its rules are every listener rule of its load balancer that forwards to it, found at runtime. Instrument each one: a weighted forward to this target group (weight 1) and to the waker target group (output waker_target_group_arn, weight 0), the tag dormeto:workload = <workload_id>, and lifecycle ignore_changes = [action]. Any other rule forwarding to the target group keeps the workload awake (shown as an issue in its status)."
+  description = "An HTTP workload's application target group (give it or resource_arn, not both): it identifies the workload. Its rules are every listener rule of its load balancer that forwards to it, found at runtime. Instrument each one: a weighted forward to this target group (weight 1) and to the waker target group (output waker_target_group_arn, weight 0), the tag dormeto:workload = <workload_id>, and lifecycle ignore_changes = [action]. Any other rule forwarding to the target group keeps the workload awake (shown as an issue in its status)."
   type        = string
+  default     = null
+  validation {
+    condition     = var.app_target_group_arn == null || (var.app_target_group_arn_suffix != null && var.load_balancer_arn_suffix != null)
+    error_message = "app_target_group_arn needs app_target_group_arn_suffix and load_balancer_arn_suffix."
+  }
 }
 
 variable "app_target_group_arn_suffix" {
-  type = string
+  description = "An HTTP workload's: the target group's ARN suffix (its CloudWatch dimension)."
+  type        = string
+  default     = null
 }
 
 variable "load_balancer_arn_suffix" {
-  type = string
+  description = "An HTTP workload's: its load balancer's ARN suffix (its CloudWatch dimension)."
+  type        = string
+  default     = null
+}
+
+variable "resource_arn" {
+  description = "A standalone workload's resource, in place of app_target_group_arn (one of the two; Not released yet: router 0.42.0): an EC2 instance outside an Auto Scaling group, an Auto Scaling group, an ECS service, an RDS instance or an Aurora cluster, none behind a load balancer. Tag it dormeto:workload = <workload_id> yourself, and its databases too. No waker target group is made: it naps on its idle signals (idle_cpu_percent, idle_network_bytes, idle_metric), a schedule or a person, and nothing wakes it on demand. The waker's settings (wait_seconds, drain_seconds, max_holders, failed_retry_seconds, wake_mode, no_wake_rules, wake_rules, instance_ids, waiting_page, the admin page, rule_arn(s)) are refused with it."
+  type        = string
+  default     = null
+  validation {
+    condition     = (var.resource_arn == null) != (var.app_target_group_arn == null)
+    error_message = "give app_target_group_arn (an HTTP workload) or resource_arn (a standalone workload), not both."
+  }
+  validation {
+    condition     = var.resource_arn == null || can(regex("^arn:aws[a-z-]*:(ec2:[^:]*:[0-9]+:instance/i-[0-9a-f]+|autoscaling:[^:]*:[0-9]+:autoScalingGroup:[^:]+:autoScalingGroupName/.+|ecs:[^:]*:[0-9]+:service/.+|rds:[^:]*:[0-9]+:(db|cluster):.+)$", var.resource_arn))
+    error_message = "resource_arn must be the ARN of an EC2 instance, an Auto Scaling group, an ECS service, an RDS instance or an Aurora cluster."
+  }
+  validation {
+    condition = var.resource_arn == null || (
+      var.wait_seconds == null && var.drain_seconds == null && var.max_holders == null && var.failed_retry_seconds == null && var.wake_mode == null &&
+      length(var.no_wake_rules) == 0 && length(var.wake_rules) == 0 && length(var.instance_ids) == 0 && var.waiting_page == null && !var.admin_enabled &&
+      var.rule_arn == null && length(var.rule_arns) == 0
+    )
+    error_message = "a standalone workload has no waker: wait_seconds, drain_seconds, max_holders, failed_retry_seconds, wake_mode, no_wake_rules, wake_rules, instance_ids, waiting_page, admin_enabled and rule_arn(s) are for an HTTP workload."
+  }
+}
+
+variable "databases" {
+  description = "A standalone workload's companion databases ([{ kind = \"rds-instance\" or \"rds-cluster\", id }]): napped after it, woken before it; each tagged dormeto:workload = <workload_id> by you. With one, the type databases' built-in signal reads its connections. An HTTP workload's companions are found by their tag alone."
+  type = list(object({
+    kind = string
+    id   = string
+  }))
+  default = []
+  validation {
+    condition     = alltrue([for d in var.databases : contains(["rds-instance", "rds-cluster"], d.kind) && length(d.id) > 0])
+    error_message = "databases: each a kind rds-instance or rds-cluster and an id."
+  }
+  validation {
+    condition     = length(var.databases) == 0 || var.resource_arn != null
+    error_message = "databases are a standalone workload's (an HTTP workload's companions are found by their tag)."
+  }
+}
+
+variable "idle_cpu_percent" {
+  description = "A standalone workload's CPU signal: idle while its maximum stays under this, a number from 0 to 100, or \"off\". null: the router's levels decide (built-in 5; off for a database resource)."
+  type        = string
+  default     = null
+  validation {
+    condition     = var.idle_cpu_percent == null || var.idle_cpu_percent == "off" || (can(tonumber(var.idle_cpu_percent)) && try(tonumber(var.idle_cpu_percent) >= 0 && tonumber(var.idle_cpu_percent) <= 100, false))
+    error_message = "idle_cpu_percent must be a number from 0 to 100, or off."
+  }
+  validation {
+    condition     = var.idle_cpu_percent == null || var.resource_arn != null
+    error_message = "an HTTP workload naps on its requests: idle_cpu_percent is for a standalone workload."
+  }
+}
+
+variable "idle_network_bytes" {
+  description = "A standalone workload's network signal: idle while the bytes in and out, a minute, stay under this, a whole number from 0 to 10000000000, or \"off\". null: the router's levels decide (built-in off)."
+  type        = string
+  default     = null
+  validation {
+    condition     = var.idle_network_bytes == null || var.idle_network_bytes == "off" || (can(tonumber(var.idle_network_bytes)) && try(tonumber(var.idle_network_bytes) >= 0 && tonumber(var.idle_network_bytes) <= 10000000000 && floor(tonumber(var.idle_network_bytes)) == tonumber(var.idle_network_bytes), false))
+    error_message = "idle_network_bytes must be a whole number from 0 to 10000000000, or off."
+  }
+  validation {
+    condition     = var.idle_network_bytes == null || var.resource_arn != null
+    error_message = "an HTTP workload naps on its requests: idle_network_bytes is for a standalone workload."
+  }
+}
+
+variable "idle_metric" {
+  description = "A standalone workload's custom signal: \"off\", or { namespace, name, dimensions (a map, a value may hold $${resource}, the resource's own id), statistic (Maximum, Average or Sum), below }: idle while that CloudWatch metric stays under below. null: the router's levels decide (built-in off; the type databases: its database's connections under 1)."
+  type        = any
+  default     = null
+  validation {
+    condition = var.idle_metric == null || try(var.idle_metric == "off", false) || try(
+      length(var.idle_metric.namespace) >= 1 && length(var.idle_metric.namespace) <= 255 && length(var.idle_metric.name) >= 1 && length(var.idle_metric.name) <= 255 &&
+      contains(["Maximum", "Average", "Sum"], var.idle_metric.statistic) && tonumber(var.idle_metric.below) == tonumber(var.idle_metric.below) &&
+      length(keys(var.idle_metric.dimensions)) <= 30 && alltrue([for k, v in var.idle_metric.dimensions : length(k) >= 1 && length(v) >= 1 && length(v) <= 1024]),
+      false
+    )
+    error_message = "idle_metric must be off or { namespace, name, dimensions (at most 30), statistic Maximum, Average or Sum, below }."
+  }
+  validation {
+    condition     = var.idle_metric == null || var.resource_arn != null
+    error_message = "an HTTP workload naps on its requests: idle_metric is for a standalone workload."
+  }
 }
 
 variable "instance_ids" {

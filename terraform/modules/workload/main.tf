@@ -1,4 +1,30 @@
 locals {
+  # A standalone workload (vision standalone workloads design §5): a resource, no load balancer, no waker target group.
+  standalone = var.resource_arn != null
+  # Its settings, numbers as numbers and off as off; each set one is the workload's, the others are the levels'.
+  number_or_off = { for key, value in { idleCpuPercent = var.idle_cpu_percent, idleNetworkBytes = var.idle_network_bytes } : key => jsondecode(value == "off" ? "\"off\"" : tostring(tonumber(value))) if value != null }
+  standalone_config = merge(
+    {
+      workloadId  = var.workload_id
+      kind        = "standalone"
+      resourceArn = var.resource_arn
+      name        = trimspace(coalesce(var.name, var.workload_id))
+      tags        = var.tags
+      databases   = var.databases
+    },
+    var.idle_minutes == null ? {} : { idleMinutes = var.idle_minutes },
+    var.wake_timeout_seconds == null ? {} : { wakeTimeoutSeconds = var.wake_timeout_seconds },
+    local.number_or_off,
+    var.idle_metric == null ? {} : { idleMetric = var.idle_metric },
+    length(var.fallback_instance_types) == 0 ? {} : { fallbackInstanceTypes = var.fallback_instance_types },
+    {
+      inherits = compact([
+        var.idle_minutes == null ? "idleMinutes" : "", var.wake_timeout_seconds == null ? "wakeTimeoutSeconds" : "",
+        var.idle_cpu_percent == null ? "idleCpuPercent" : "", var.idle_network_bytes == null ? "idleNetworkBytes" : "", var.idle_metric == null ? "idleMetric" : "",
+      ])
+    },
+    var.hibernate == null ? {} : { hibernate = var.hibernate }, var.type == null ? {} : { type = var.type },
+  )
   # Routers before 0.15.0 read a rule list; later ones find the rules from the application target group.
   rule_arns = length(var.rule_arns) > 0 ? var.rule_arns : compact([var.rule_arn])
   # camelCase JSON for the Lambdas; unset conditions stay null or empty (ignored).
@@ -20,7 +46,19 @@ locals {
   }]
 }
 
+# An HTTP workload's (a standalone one has none). Before standalone workloads, one resource each, without count.
+moved {
+  from = aws_lb_target_group.waker
+  to   = aws_lb_target_group.waker[0]
+}
+
+moved {
+  from = aws_lb_target_group_attachment.waker
+  to   = aws_lb_target_group_attachment.waker[0]
+}
+
 resource "aws_lb_target_group" "waker" {
+  count                              = local.standalone ? 0 : 1
   name                               = "${var.router.name}-${var.workload_id}"
   target_type                        = "lambda"
   lambda_multi_value_headers_enabled = true
@@ -37,7 +75,8 @@ removed {
 }
 
 resource "aws_lb_target_group_attachment" "waker" {
-  target_group_arn = aws_lb_target_group.waker.arn
+  count            = local.standalone ? 0 : 1
+  target_group_arn = aws_lb_target_group.waker[0].arn
   target_id        = var.router.waker_function_arn
 }
 
@@ -48,14 +87,14 @@ resource "aws_dynamodb_table_item" "config" {
   item = jsonencode({
     pk = { S = "WL#${var.workload_id}" }
     sk = { S = "CFG" }
-    config = { S = jsonencode(merge({
+    config = { S = local.standalone ? jsonencode(local.standalone_config) : jsonencode(merge({
       workloadId              = var.workload_id
       name                    = trimspace(coalesce(var.name, var.workload_id))
       tags                    = var.tags
       ruleArns                = local.rule_arns
       ruleArn                 = try(local.rule_arns[0], null)
       appTargetGroupArn       = var.app_target_group_arn
-      wakerTargetGroupArn     = aws_lb_target_group.waker.arn
+      wakerTargetGroupArn     = aws_lb_target_group.waker[0].arn
       loadBalancerDimension   = var.load_balancer_arn_suffix
       appTargetGroupDimension = var.app_target_group_arn_suffix
       instanceIds             = var.instance_ids

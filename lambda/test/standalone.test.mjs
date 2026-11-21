@@ -546,3 +546,11 @@ test('a standalone workload is reported to the manager once onboarded (Workload 
   await s.handler({ action: 'check' });
   assert.deepEqual(s.elb.calls, []);
 });
+
+test('a standalone workload written by Terraform: its idle settings are changed in its workload module, named by their variables', async () => {
+  const s = setup({ cfg: { source: undefined } });
+  for (const [key, variable] of [['idleCpuPercent', 'idle_cpu_percent'], ['idleNetworkBytes', 'idle_network_bytes'], ['idleMetric', 'idle_metric'], ['idleMinutes', 'idle_minutes']]) {
+    assert.deepEqual(await s.handler({ action: 'settings', workloadId: ID, settings: { [key]: 'off' }, by: 'ana', refusals: true }),
+      { refused: { code: 'conflict', message: `workload ${ID} was written by Terraform: set ${variable} in its workload module` } }, key);
+  }
+});

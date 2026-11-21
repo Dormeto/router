@@ -57,16 +57,19 @@ export function fakeAccount() {
       });
       return arn;
     },
-    instance(id, { tags = {}, state: s = 'running' } = {}) { state.instances.set(id, { tags, state: s }); },
+    // root: its root device type (instance-store); spot: a Spot instance. Said only when given.
+    instance(id, { tags = {}, state: s = 'running', root, spot = false } = {}) { state.instances.set(id, { tags, state: s, root, spot }); },
     group(name, { targetGroups = [], tags = {}, instances = [] } = {}) { state.groups.set(name, { targetGroups, tags, instances }); },
-    service(name, { cluster = 'shop', targetGroups = [], tags = {} } = {}) {
+    // daemon: the DAEMON scheduling strategy, said only when given.
+    service(name, { cluster = 'shop', targetGroups = [], tags = {}, daemon = false } = {}) {
       const arn = `arn:aws:ecs:${REGION}:${ACCOUNT}:service/${cluster}/${name}`;
-      state.services.set(arn, { cluster: `arn:aws:ecs:${REGION}:${ACCOUNT}:cluster/${cluster}`, targetGroups, tags });
+      state.services.set(arn, { cluster: `arn:aws:ecs:${REGION}:${ACCOUNT}:cluster/${cluster}`, targetGroups, tags, daemon });
       return arn;
     },
-    database(kind, id, { tags = {} } = {}) {
+    // cluster, replicaOf (an instance's), engineMode (a cluster's): said only when given.
+    database(kind, id, { tags = {}, cluster, replicaOf, engineMode } = {}) {
       const arn = `arn:aws:rds:${REGION}:${ACCOUNT}:${kind === 'rds-cluster' ? 'cluster' : 'db'}:${id}`;
-      state.databases.set(arn, { kind, id, tags });
+      state.databases.set(arn, { kind, id, tags, cluster, replicaOf, engineMode });
       return arn;
     },
   };
@@ -202,7 +205,15 @@ export function fakeAccount() {
   const ec2 = {
     async describeInstances({ InstanceIds }) {
       call('describeInstances');
-      return { Reservations: [{ Instances: InstanceIds.filter((id) => state.instances.has(id)).map((id) => ({ InstanceId: id, State: { Name: state.instances.get(id).state }, Tags: tagList(state.instances.get(id).tags) })) }] };
+      const of = (id) => state.instances.get(id);
+      return {
+        Reservations: [{
+          Instances: InstanceIds.filter((id) => state.instances.has(id)).map((id) => ({
+            InstanceId: id, State: { Name: of(id).state }, Tags: tagList(of(id).tags),
+            ...(of(id).root ? { RootDeviceType: of(id).root } : {}), ...(of(id).spot ? { InstanceLifecycle: 'spot' } : {}),
+          })),
+        }],
+      };
     },
     async createTags({ Resources, Tags }) {
       call('createTags');
@@ -252,10 +263,15 @@ export function fakeAccount() {
     async describeServices({ services, include }) {
       call('describeServices');
       return {
-        services: services.map((a) => {
+        // A service the account does not have is a failure, as ECS answers.
+        services: services.filter((a) => state.services.has(a)).map((a) => {
           const s = state.services.get(a);
-          return { serviceArn: a, clusterArn: s.cluster, desiredCount: 1, loadBalancers: s.targetGroups.map((targetGroupArn) => ({ targetGroupArn })), ...(include?.includes('TAGS') ? { tags: Object.entries(s.tags).map(([key, value]) => ({ key, value })) } : {}) };
+          return {
+            serviceArn: a, clusterArn: s.cluster, desiredCount: 1, loadBalancers: s.targetGroups.map((targetGroupArn) => ({ targetGroupArn })), ...(include?.includes('TAGS') ? { tags: Object.entries(s.tags).map(([key, value]) => ({ key, value })) } : {}),
+            ...(s.daemon ? { schedulingStrategy: 'DAEMON' } : {}),
+          };
         }),
+        failures: services.filter((a) => !state.services.has(a)).map((arn) => ({ arn, reason: 'MISSING' })),
       };
     },
     async tagResource({ resourceArn, tags }) { call('tagResource'); Object.assign(state.services.get(resourceArn).tags, Object.fromEntries(tags.map((t) => [t.key, t.value]))); return {}; },
@@ -268,13 +284,14 @@ export function fakeAccount() {
       call('describeDBInstances');
       const found = byId('rds-instance', DBInstanceIdentifier);
       if (!found) throw error('DBInstanceNotFoundFault');
-      return { DBInstances: [{ DBInstanceIdentifier, DBInstanceArn: found[0], TagList: tagList(found[1].tags) }] };
+      const { cluster, replicaOf } = found[1];
+      return { DBInstances: [{ DBInstanceIdentifier, DBInstanceArn: found[0], TagList: tagList(found[1].tags), ...(cluster ? { DBClusterIdentifier: cluster } : {}), ...(replicaOf ? { ReadReplicaSourceDBInstanceIdentifier: replicaOf } : {}) }] };
     },
     async describeDBClusters({ DBClusterIdentifier }) {
       call('describeDBClusters');
       const found = byId('rds-cluster', DBClusterIdentifier);
       if (!found) throw error('DBClusterNotFoundFault');
-      return { DBClusters: [{ DBClusterIdentifier, DBClusterArn: found[0], TagList: tagList(found[1].tags) }] };
+      return { DBClusters: [{ DBClusterIdentifier, DBClusterArn: found[0], TagList: tagList(found[1].tags), ...(found[1].engineMode ? { EngineMode: found[1].engineMode } : {}) }] };
     },
     async addTagsToResource({ ResourceName, Tags }) { call('addTagsToResource'); Object.assign(state.databases.get(ResourceName).tags, Object.fromEntries(Tags.map((t) => [t.Key, t.Value]))); return {}; },
     async removeTagsFromResource({ ResourceName, TagKeys }) {

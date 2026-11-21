@@ -12,7 +12,8 @@ import {
 } from './kube-route.mjs';
 import { healthyCount } from './instances.mjs';
 import { checkRights } from './kube-access.mjs';
-import { IDLE_KEYS, SCALAR_KEYS, notForKind } from './settings-levels.mjs';
+import { IDLE_KEYS, SCALAR_KEYS, STANDALONE_KEYS, defaultsProblems, notForKind, resourceKindOf } from './settings-levels.mjs';
+import { isResourceOf, isStandalone } from './backends.mjs';
 
 const WORKLOAD_TAG = 'dormeto:workload';
 // Target groups per Application Load Balancer: not adjustable (the waker target group counts once its rule uses it).
@@ -67,6 +68,14 @@ const kubernetesConfig = (k) => ({
   } : {}),
   ...(k.autoscaler ? { autoscaler: k.autoscaler } : {}),
 });
+
+// A standalone workload's resource (vision standalone workloads design §2).
+const RESOURCES_TEXT = 'an EC2 instance, an Auto Scaling group, an ECS service, an RDS instance or an Aurora cluster';
+// Tags that say an Auto Scaling group holds the nodes of an EKS cluster (managed node groups, eksctl, Karpenter's, the autoscaler's).
+const EKS_NODE_TAG = /^(eks:cluster-name|eks:nodegroup-name|alpha\.eksctl\.io\/cluster-name|karpenter\.sh\/|kubernetes\.io\/cluster\/|k8s\.io\/cluster-autoscaler\/)/;
+const targetGroupName = (arn) => arn.split(':').at(-1).split('/')[1] ?? arn;
+// A workload as the problems name it: its name and id, or its id alone.
+const named = (cfg, id) => (cfg?.name ? `${cfg.name} (${id})` : id);
 
 const tagsOf = (list = [], key = 'Key', value = 'Value') => Object.fromEntries(list.map((t) => [t[key], t[value]]));
 const chunks = (list, size) => Array.from({ length: Math.ceil(list.length / size) }, (_, i) => list.slice(i * size, (i + 1) * size));
@@ -370,7 +379,13 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
 
   // What onboarding would do, and why it cannot. `found` (onboard) receives the backends and databases it listed.
   // Without an id, the one of the target group (an explicit id: workloads named before 0.20.0, direct use).
-  async function preview({ targetGroupArn, workloadId = targetGroupArn ? workloadIdOf(targetGroupArn) : undefined, name: wanted, settings, databases, kubernetes, tags = {} }, found = {}) {
+  async function preview(event, found = {}) {
+    // By resource: a standalone workload (vision standalone workloads design §5).
+    if (event?.resourceArn !== undefined) return previewResource(event, found);
+    return previewTargetGroup(event, found);
+  }
+
+  async function previewTargetGroup({ targetGroupArn, workloadId = targetGroupArn ? workloadIdOf(targetGroupArn) : undefined, name: wanted, settings, databases, kubernetes, tags = {} }, found = {}) {
     const problems = [];
     const name = wakerName(workloadId ?? '');
     const named = checkName(wanted);
@@ -439,17 +454,227 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
       if (!backends.length) problems.push('no backend: no instance, Auto Scaling group or ECS service feeds the target group');
       for (const b of backends) {
         const tagged = b.tags[WORKLOAD_TAG] ?? null;
-        if (tagged && tagged !== workloadId) problems.push(`${KIND_TEXT[b.kind]} ${b.id} belongs to workload ${tagged}`);
+        const standalone = standaloneOwner(configs, b);
+        if (standalone) problems.push(standalone);
+        else if (tagged && tagged !== workloadId) problems.push(`${KIND_TEXT[b.kind]} ${b.id} belongs to workload ${tagged}`);
         result.backends.push({ kind: b.kind, id: b.id, tagged });
       }
     }
     found.databases = await databasesOf(databases);
     for (const db of found.databases) {
       const tagged = db.tags[WORKLOAD_TAG] ?? null;
-      if (tagged && tagged !== workloadId) problems.push(`${KIND_TEXT[db.kind]} ${db.id} belongs to workload ${tagged}`);
+      const standalone = standaloneOwner(configs, db);
+      if (standalone) problems.push(standalone);
+      else if (tagged && tagged !== workloadId) problems.push(`${KIND_TEXT[db.kind]} ${db.id} belongs to workload ${tagged}`);
       result.databases.push({ kind: db.kind, id: db.id, tagged });
     }
     return { ...result, ok: problems.length === 0, problems };
+  }
+
+  // A resource is in one workload (design §2): a backend of a target group that is a standalone workload, or its companion, is named.
+  function standaloneOwner(configs, b) {
+    const backend = b.kind === 'asg' ? { kind: 'asg', name: b.id } : b;
+    const owner = configs.find((c) => isStandalone(c) && (isResourceOf(c, backend) || b.tags?.[WORKLOAD_TAG] === c.workloadId));
+    if (!owner) return null;
+    const what = isResourceOf(owner, backend) ? 'is the standalone workload' : 'is a companion of the standalone workload';
+    return `${KIND_TEXT[b.kind]} ${b.id} ${what} ${named(owner, owner.workloadId)}: offboard it first`;
+  }
+
+  // --- A standalone workload: onboarding by resource (vision standalone workloads design §2, §5) ---------------------------
+
+  // Its settings: hibernate, the fallback instance types, and the settings of the levels a standalone workload has.
+  function standaloneSettingsProblems(settings = {}) {
+    if (!settings || typeof settings !== 'object' || Array.isArray(settings)) return ['settings must be an object'];
+    const problems = [];
+    for (const [key, value] of Object.entries(settings)) {
+      if (key === 'hibernate') {
+        if (typeof value !== 'boolean') problems.push('settings: hibernate must be true or false');
+      } else if (key === 'fallbackInstanceTypes') problems.push(...settingsProblems({ fallbackInstanceTypes: value }));
+      else problems.push(...defaultsProblems({ [key]: value }, { workload: true, kind: 'standalone' }).map((p) => `settings: ${p}`));
+    }
+    return problems;
+  }
+
+  // Every target group of the region with its targets' ids (instance targets only): whether an instance feeds one.
+  async function instanceTargetGroups() {
+    const groups = (await pages((i) => elbv2.describeTargetGroups(i), 'TargetGroups', { in: 'Marker', out: 'NextMarker' })).filter((g) => g.TargetType === 'instance');
+    const found = [];
+    for (const g of groups) {
+      const { TargetHealthDescriptions = [] } = await elbv2.describeTargetHealth({ TargetGroupArn: g.TargetGroupArn });
+      found.push({ name: g.TargetGroupName, ids: TargetHealthDescriptions.map((d) => d.Target?.Id) });
+    }
+    return found;
+  }
+
+  // The resource as a backend ({ kind, id, arn?, tags }: what tag() and untag() take), its label and its default name, with the
+  // reasons it cannot be a standalone workload: the backend modules' own (what they cannot stop) and "it belongs to an HTTP workload".
+  async function resourceOf(resourceArn) {
+    const resource = resourceKindOf(resourceArn);
+    if (!resource) return { problems: [`the resource must be the ARN of ${RESOURCES_TEXT}`] };
+    const label = `${KIND_TEXT[resource.kind]} ${resource.id}`;
+    const problems = [];
+    const feeds = (arn) => problems.push(`${label} feeds target group ${targetGroupName(arn)}: it belongs to an HTTP workload (onboard its target group)`);
+    const gone = { label, problems: [`${label} not found`] };
+    if (resource.kind === 'instance') {
+      let instance;
+      try {
+        const { Reservations = [] } = await ec2.describeInstances({ InstanceIds: [resource.id] });
+        instance = Reservations.flatMap((r) => r.Instances ?? []).find((i) => i.InstanceId === resource.id);
+      } catch (err) {
+        if (!notFound(err, 'InvalidInstanceID.NotFound', 'InvalidInstanceID.Malformed')) throw err;
+      }
+      if (!instance) return gone;
+      if (['terminated', 'shutting-down'].includes(instance.State?.Name)) return { label, problems: [`${label} is terminated`] };
+      const tags = tagsOf(instance.Tags);
+      if (tags[GROUP_TAG]) problems.push(`${label} is in Auto Scaling group ${tags[GROUP_TAG]}: onboard the group (it would replace a stopped instance)`);
+      if (instance.RootDeviceType === 'instance-store') problems.push(`${label} has an instance store root volume: it cannot be stopped`);
+      if (instance.InstanceLifecycle === 'spot') problems.push(`${label} is a Spot instance: Dormeto stops On-Demand instances only`);
+      if (!tags[GROUP_TAG]) for (const g of await instanceTargetGroups()) if (g.ids.includes(resource.id)) problems.push(`${label} feeds target group ${g.name}: it belongs to an HTTP workload (onboard its target group)`);
+      return { backend: { kind: 'instance', id: resource.id, tags }, label, name: tags.Name || resource.id, problems };
+    }
+    if (resource.kind === 'asg') {
+      const { AutoScalingGroups: [group] = [] } = await autoscaling.describeAutoScalingGroups({ AutoScalingGroupNames: [resource.id] });
+      if (!group) return gone;
+      const tags = tagsOf(group.Tags);
+      for (const arn of group.TargetGroupARNs ?? []) feeds(arn);
+      if (Object.keys(tags).some((key) => EKS_NODE_TAG.test(key))) problems.push(`${label} holds EKS nodes: onboard the Kubernetes workloads that run on them`);
+      return { backend: { kind: 'asg', id: resource.id, tags }, label, name: resource.id, problems };
+    }
+    if (resource.kind === 'ecs') {
+      const cluster = resource.id.includes('/') ? resource.id.split('/')[0] : 'default';
+      let service;
+      try {
+        ({ services: [service] = [] } = await ecs.describeServices({ cluster, services: [resourceArn], include: ['TAGS'] }));
+      } catch (err) {
+        if (!notFound(err, 'ClusterNotFoundException', 'ServiceNotFoundException')) throw err;
+      }
+      if (!service || service.status === 'INACTIVE') return gone;
+      for (const lb of service.loadBalancers ?? []) if (lb.targetGroupArn) feeds(lb.targetGroupArn);
+      if (service.schedulingStrategy === 'DAEMON') problems.push(`${label} uses the daemon scheduling strategy: it has no desired count to set to 0`);
+      return { backend: { kind: 'ecs', id: resourceArn, tags: tagsOf(service.tags, 'key', 'value') }, label, name: resource.id.split('/').at(-1), problems };
+    }
+    let db;
+    try {
+      if (resource.kind === 'rds-cluster') ({ DBClusters: [db] = [] } = await rds.describeDBClusters({ DBClusterIdentifier: resource.id }));
+      else ({ DBInstances: [db] = [] } = await rds.describeDBInstances({ DBInstanceIdentifier: resource.id }));
+    } catch (err) {
+      if (!notFound(err, 'DBInstanceNotFoundFault', 'DBClusterNotFoundFault')) throw err;
+    }
+    if (!db) return gone;
+    // The reasons of rds.mjs's discovery: what RDS cannot stop, or stops through its cluster.
+    if (db.DBClusterIdentifier && resource.kind === 'rds-instance') problems.push(`${label} is a member of Aurora cluster ${db.DBClusterIdentifier}: onboard the cluster`);
+    if (db.ReadReplicaSourceDBInstanceIdentifier) problems.push(`${label} is a read replica: it cannot be stopped`);
+    if (db.EngineMode === 'serverless') problems.push(`${label} is Aurora Serverless v1: it cannot be stopped`);
+    return { backend: { kind: resource.kind, id: resource.id, arn: resourceArn, tags: tagsOf(db.TagList) }, label, name: resource.id, problems };
+  }
+
+  // What onboarding the resource would do, and why it cannot (design §2): `{ ok, problems, workloadId, kind, name, tags, resourceArn,
+  // resource, databases }`. `found` (onboard) receives the resource and the databases read.
+  async function previewResource({ resourceArn, name: wanted, settings, databases, tags = {} }, found = {}) {
+    const workloadId = workloadIdOf(String(resourceArn));
+    const problems = [];
+    const checkedName = checkName(wanted);
+    if (checkedName.problem) problems.push(checkedName.problem);
+    const tagsFault = tagsProblem(tags);
+    if (tagsFault) problems.push(tagsFault);
+    problems.push(...standaloneSettingsProblems(settings));
+    const result = { workloadId, kind: 'standalone', name: checkedName.name || '', tags: tagsFault ? {} : tags, resourceArn, resource: null, databases: [] };
+    const read = await resourceOf(resourceArn);
+    problems.push(...read.problems);
+    if (!read.backend) return { ...result, ok: false, problems };
+    const { backend, label } = read;
+    found.resource = backend;
+    result.name ||= read.name;
+    const configs = await store.listConfigs();
+    const byId = (id) => configs.find((c) => c.workloadId === id);
+    const tagged = backend.tags[WORKLOAD_TAG] ?? null;
+    result.resource = { kind: backend.kind, id: backend.id, tagged };
+    if (byId(workloadId)) problems.push(`${label} is already onboarded: workload ${named(byId(workloadId), workloadId)}`);
+    else if (tagged) problems.push(`${label} belongs to workload ${named(byId(tagged), tagged)}`);
+    const companionOf = configs.find((c) => c.workloadId !== workloadId && (c.databases ?? []).some((d) => d.kind === backend.kind && d.id === backend.id));
+    // Its tag already said whose it is.
+    if (companionOf && tagged !== companionOf.workloadId) problems.push(`${label} is a companion of workload ${named(companionOf, companionOf.workloadId)}`);
+    found.databases = await databasesOf(databases ?? []);
+    for (const db of found.databases) {
+      const dbLabel = `${KIND_TEXT[db.kind]} ${db.id}`;
+      const dbTagged = db.tags[WORKLOAD_TAG] ?? null;
+      if (db.kind === backend.kind && db.id === backend.id) problems.push(`${dbLabel} is the workload's resource, not its companion`);
+      else if (dbTagged && dbTagged !== workloadId) problems.push(`${dbLabel} belongs to workload ${named(byId(dbTagged), dbTagged)}`);
+      result.databases.push({ kind: db.kind, id: db.id, tagged: dbTagged });
+    }
+    return { ...result, ok: problems.length === 0, problems };
+  }
+
+  // Tag the resource and its databases, write the record and the run (design §5): no waker target group, no rule. Undone when it fails.
+  async function onboardResource({ resourceArn, name, settings = {}, databases = [], tags = {}, by }) {
+    const found = {};
+    const checked = await previewResource({ resourceArn, name, settings, databases, tags }, found);
+    const { workloadId } = checked;
+    if (!checked.ok) throw new Error(`cannot onboard ${workloadId}: ${checked.problems.join('; ')}`);
+    const steps = [];
+    const step = (stepName, done, detail) => steps.push({ name: stepName, status: done ? 'done' : 'skipped', ...(detail ? { detail } : {}) });
+    const tagged = [];
+    try {
+      const untagged = [found.resource, ...found.databases].filter((b) => !b.tags[WORKLOAD_TAG]);
+      for (const b of untagged) {
+        await tag(b, workloadId);
+        tagged.push({ kind: b.kind, id: b.id, ...(b.arn ? { arn: b.arn } : {}) });
+      }
+      step('tag resource and databases', untagged.length > 0, untagged.map((b) => `${KIND_TEXT[b.kind]} ${b.id}`).join(', '));
+      // A setting sent null is left to the levels, as one not sent.
+      const own = Object.fromEntries(Object.entries(settings).filter(([, value]) => value !== null));
+      await store.putConfig(workloadId, {
+        workloadId, kind: 'standalone', resourceArn, name: checked.name, tags: checked.tags, databases, ...own,
+        inherits: STANDALONE_KEYS.filter((key) => !Object.hasOwn(own, key)),
+        source: 'manager', onboardedBy: by ?? 'unknown', onboardedAt: new Date(now()).toISOString(), tagged,
+      });
+      await store.initRun(workloadId, now());
+      step('workload configuration', true);
+      log.info('Onboarded', { workloadId, resourceArn, by, steps: steps.filter((x) => x.status === 'done').map((x) => x.name) });
+      return { steps, workload: { workloadId, name: checked.name } };
+    } catch (err) {
+      const undo = await cleanStandalone(workloadId, { resourceArn, databases, tagged });
+      const failed = undo.filter((x) => x.status === 'failed');
+      log.warn('OnboardUndone', { workloadId, error: err.message, failed: failed.map((x) => x.name) });
+      throw new Error(`cannot onboard ${workloadId}: ${err.message} (${failed.length ? `undo incomplete: ${failed.map((x) => `${x.name}: ${x.detail}`).join('; ')}` : 'undone'})`);
+    }
+  }
+
+  // Offboarding a standalone workload: the tags this onboarding added (recorded, or still carrying its marker on the resource and the
+  // databases), then the record. Nothing else was added.
+  async function cleanStandalone(workloadId, { resourceArn, databases = [], tagged = [] }) {
+    const steps = [];
+    const run = async (stepName, work) => {
+      try {
+        const detail = await work();
+        steps.push({ name: stepName, status: detail === false ? 'skipped' : 'done', ...(typeof detail === 'string' && detail ? { detail } : {}) });
+      } catch (err) {
+        steps.push({ name: stepName, status: 'failed', detail: err.message });
+      }
+    };
+    await run('untag resource and databases', async () => {
+      const read = resourceArn ? await resourceOf(resourceArn).catch(() => ({})) : {};
+      const marked = [...(read.backend ? [read.backend] : []), ...(await databasesOf(databases, { skipMissing: true }))]
+        .filter((b) => b.tags[WORKLOAD_TAG] === workloadId && b.tags[MARKER_TAG] === MARKER);
+      const all = [...tagged, ...marked.filter((b) => !tagged.some((t) => t.kind === b.kind && t.id === b.id))];
+      const done = [];
+      for (const b of all) {
+        try {
+          await untag(b);
+          done.push(`${KIND_TEXT[b.kind]} ${b.id}`);
+        } catch (err) {
+          if (!notFound(err, 'InvalidInstanceID.NotFound', 'ValidationError', 'ResourceNotFoundException', 'ServiceNotFoundException', 'DBInstanceNotFoundFault', 'DBClusterNotFoundFault')) throw err;
+        }
+      }
+      return done.length ? done.join(', ') : false;
+    });
+    await run('workload configuration', async () => {
+      if (steps.some((x) => x.status === 'failed')) return false;
+      if (!(await store.getConfig(workloadId)) && !(await store.getRun(workloadId))) return false;
+      await store.deleteWorkload(workloadId);
+      return true;
+    });
+    return steps;
   }
 
   // Tag a backend with the workload and the marker (only if it has no dormeto:workload tag yet).
@@ -469,10 +694,15 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
     else await rds.removeTagsFromResource({ ResourceName: b.arn, TagKeys: keys });
   }
 
-  async function onboard({ targetGroupArn, workloadId = targetGroupArn ? workloadIdOf(targetGroupArn) : undefined, name, settings = {}, databases = [], kubernetes, tags = {}, by }) {
+  async function onboard(event) {
+    if (event?.resourceArn !== undefined) return onboardResource(event);
+    return onboardTargetGroup(event);
+  }
+
+  async function onboardTargetGroup({ targetGroupArn, workloadId = targetGroupArn ? workloadIdOf(targetGroupArn) : undefined, name, settings = {}, databases = [], kubernetes, tags = {}, by }) {
     // The backends and databases its preview listed: listed once per onboarding.
     const found = {};
-    const checked = await preview({ workloadId, targetGroupArn, name, settings, databases, kubernetes, tags }, found);
+    const checked = await previewTargetGroup({ workloadId, targetGroupArn, name, settings, databases, kubernetes, tags }, found);
     if (!checked.ok) throw new Error(`cannot onboard ${workloadId}: ${checked.problems.join('; ')}`);
     const steps = [];
     const step = (name, done, detail) => steps.push({ name, status: done ? 'done' : 'skipped', ...(detail ? { detail } : {}) });
@@ -632,6 +862,8 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
   async function repair({ workloadId, by = 'check' }) {
     const cfg = await store.getConfig(workloadId);
     if (!cfg?.source) return { repaired: [], skipped: 'not onboarded by the manager' };
+    // No rule, no waker target group: nothing drifts that the onboarder repairs (vision standalone workloads design §5).
+    if (isStandalone(cfg)) return { repaired: [], skipped: 'a standalone workload has no route to repair' };
     if ((await store.getPauses(workloadId)).some((p) => p.reason === 'offboarding')) return { repaired: [], skipped: 'being offboarded' };
     const run = await store.getRun(workloadId);
     const repairs = [];
@@ -787,7 +1019,8 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
     if (run && run.state !== 'AWAKE' && !restore) throw new Error(`cannot offboard ${workloadId}: it is ${run.state}, wake it first`);
     const first = restore ? [await restoreReplicas(cfg, run)] : [];
     // Replicas not given back: the switch stays, so requests keep reaching the waker (run it again).
-    const steps = first.some((x) => x.status === 'failed') ? first : [...first, ...await clean(workloadId, cfg?.appTargetGroupArn, cfg?.databases, cfg?.tagged, cfg?.kubernetes)];
+    const cleaned = () => (isStandalone(cfg) ? cleanStandalone(workloadId, cfg) : clean(workloadId, cfg?.appTargetGroupArn, cfg?.databases, cfg?.tagged, cfg?.kubernetes));
+    const steps = first.some((x) => x.status === 'failed') ? first : [...first, ...await cleaned()];
     const failed = steps.filter((s) => s.status === 'failed');
     log.info('Offboarded', { workloadId, by, steps: steps.map((s) => `${s.name} ${s.status}`) });
     if (failed.length) throw new Error(`offboard of ${workloadId} incomplete: ${failed.map((s) => `${s.name}: ${s.detail}`).join('; ')}`);
@@ -807,7 +1040,7 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
   // Repair the workloads an event concerns, each on its own: one failing never stops the others.
   async function repairAll({ by, detail = null }) {
     const workloads = [];
-    for (const cfg of (await store.listConfigs()).filter((c) => c.source && concerns(c, detail))) {
+    for (const cfg of (await store.listConfigs()).filter((c) => c.source && !isStandalone(c) && concerns(c, detail))) {
       try {
         const { repaired } = await repair({ workloadId: cfg.workloadId, by });
         workloads.push({ workloadId: cfg.workloadId, repaired: repaired.map((e) => e.kind) });
@@ -825,7 +1058,7 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
   async function repairEvents(details, requested = []) {
     const names = [...new Set(details.map((d) => d?.eventName ?? 'unknown'))].join(',');
     const workloads = [];
-    for (const cfg of (await store.listConfigs()).filter((c) => c.source && (requested.includes(c.workloadId) || details.some((d) => concerns(c, d))))) {
+    for (const cfg of (await store.listConfigs()).filter((c) => c.source && !isStandalone(c) && (requested.includes(c.workloadId) || details.some((d) => concerns(c, d))))) {
       const by = details.some((d) => concerns(cfg, d)) ? `event:${names}` : 'check';
       try {
         const { repaired } = await repair({ workloadId: cfg.workloadId, by });

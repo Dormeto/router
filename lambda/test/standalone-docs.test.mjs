@@ -39,6 +39,8 @@ test('the page gives the code\'s built-in values, its lag and what is refused', 
   assert.match(page, new RegExp(`ends ${METRIC_LAG_MS / 60_000} minutes behind, at a 5-minute boundary`));
   assert.match(page, /10 to 15 minutes after the idle window/);
   assert.match(page, /Nothing wakes it on demand/);
+  // findings-final-2.md: a workload whose resource is gone is offboarded in any state.
+  assert.match(page, /Offboarding removes the tags and the configuration; it needs the workload awake, unless its resource is gone \(deleted, or its tag removed\), when it is offboarded in any state/);
   // The final review's fix wave: a person's nap is theirs; every listed companion is read.
   assert.match(page, /A queued idle nap delivered more than a minute after it was asked reads the signals again and is skipped if the workload is busy; a person's nap is never read against the signals/);
   assert.match(page, /read for each companion its configuration lists \(databases at onboarding or in the workload module\): each must be under 1\. A companion found by its tag alone is napped and woken with the workload but not read/);

@@ -239,3 +239,45 @@ test('final review, Minor 5: offboarding reads no target group', async () => {
   assert.equal(s.elb().length, before);
   assert.deepEqual(s.a.state.instances.get('i-0aaa').tags, {});
 });
+
+// --- The manager's final review: a resource deleted while its workload slept (findings-final-2.md) -----------------------
+
+for (const state of ['ASLEEP', 'FAILED']) {
+  test(`a standalone workload ${state} whose resource was deleted is offboarded: its database untagged, the instance skipped as gone, the record deleted`, async () => {
+    const s = setup();
+    s.a.customer.instance('i-0aaa');
+    const side = s.a.customer.database('rds-instance', 'side');
+    const { workload } = await s.onboarding.onboard({ resourceArn: ARN.instance('i-0aaa'), databases: [{ kind: 'rds-instance', id: 'side' }] });
+    // Deleted while it slept; the check marked it.
+    s.a.state.instances.delete('i-0aaa');
+    const deleteTags = s.a.ec2.deleteTags;
+    s.a.ec2.deleteTags = async (input) => {
+      if (input.Resources.some((id) => !s.a.state.instances.has(id))) throw Object.assign(new Error('The instance ID \'i-0aaa\' does not exist'), { name: 'InvalidInstanceID.NotFound' });
+      return deleteTags(input);
+    };
+    Object.assign(s.a.items.get(`${workload.workloadId}/RUN`), { state, resourceMissing: true });
+    const off = await s.onboarding.offboard({ workloadId: workload.workloadId, by: 'ana' });
+    assert.deepEqual(off.steps, [
+      { name: 'untag resource and databases', status: 'done', detail: 'RDS instance side; gone, skipped: instance i-0aaa' },
+      { name: 'workload configuration', status: 'done' },
+    ]);
+    assert.deepEqual(s.a.state.databases.get(side).tags, {});
+    assert.deepEqual([...s.a.items.keys()], []);
+  });
+}
+
+test('a standalone workload asleep with its resource is still refused at offboarding', async () => {
+  const s = setup();
+  s.a.customer.instance('i-0aaa');
+  const { workload } = await s.onboarding.onboard({ resourceArn: ARN.instance('i-0aaa') });
+  Object.assign(s.a.items.get(`${workload.workloadId}/RUN`), { state: 'ASLEEP' });
+  await assert.rejects(s.onboarding.offboard({ workloadId: workload.workloadId }), /it is ASLEEP, wake it first/);
+});
+
+test('an HTTP workload asleep is still refused at offboarding, whatever its run says', async () => {
+  const s = setup();
+  await s.a.store.putConfig('shop', { workloadId: 'shop', name: 'Shop', appTargetGroupArn: 'tg', source: 'manager' });
+  await s.a.store.initRun('shop', NOW);
+  Object.assign(s.a.items.get('shop/RUN'), { state: 'ASLEEP', resourceMissing: true });
+  await assert.rejects(s.onboarding.offboard({ workloadId: 'shop' }), /cannot offboard shop: it is ASLEEP, wake it first/);
+});

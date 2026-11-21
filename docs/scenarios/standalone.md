@@ -100,14 +100,17 @@ at all, it never naps on idle: schedules and people only.
 - **A start or stop made outside Dormeto** (the console, a script, AWS's own restart of a database stopped 7 days) is seen
   at the next check: the workload is awake (`external-start`, its stopped companions started) or asleep (`external-stop`).
 - **A resource deleted, or its `dormeto:workload` tag removed:** the workload has no backend, nothing is stopped or
-  started (its databases included), its state stays, and the router's health warns.
+  started (its databases included), its state stays, and the router's health warns. Tag it again to keep the workload,
+  or offboard it: such a workload is offboarded whatever its state (it cannot be woken), its databases untagged, what is gone
+  skipped.
 
 ## Onboarding
 
 - **The manager** calls the onboarder's `preview` and `onboard` with `resourceArn` in place of `targetGroupArn`. The
   onboarding tags the resource and its companion databases `dormeto:workload` (with the marker `dormeto:tagged = onboarder`)
-  and writes the workload's configuration: no waker target group, no rule. Offboarding (the workload awake) removes the tags
-  and the configuration.
+  and writes the workload's configuration: no waker target group, no rule. Offboarding removes the tags and the
+  configuration; it needs the workload awake, unless its resource is gone (deleted, or its tag removed), when it is
+  offboarded in any state and its step says what it skipped.
 - **Terraform:** the `workload` module takes `resource_arn` in place of `app_target_group_arn` (one of the two), the
   settings `idle_minutes`, `wake_timeout_seconds`, `idle_cpu_percent`, `idle_network_bytes`, `idle_metric`, `hibernate`,
   `type`, `fallback_instance_types` and `databases`; the waker's settings are refused with it. Tag the resource and its

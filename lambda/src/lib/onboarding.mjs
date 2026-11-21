@@ -655,10 +655,13 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
   // databases), then the record. Nothing else was added.
   async function cleanStandalone(workloadId, { resourceArn, databases = [], tagged = [] }) {
     const steps = [];
+    // A work answers false (skipped), a detail (done), or { skipped: true, detail } (skipped, with what it skipped).
     const run = async (stepName, work) => {
       try {
-        const detail = await work();
-        steps.push({ name: stepName, status: detail === false ? 'skipped' : 'done', ...(typeof detail === 'string' && detail ? { detail } : {}) });
+        const answer = await work();
+        const skipped = answer === false || answer?.skipped === true;
+        const detail = typeof answer === 'string' ? answer : answer?.detail;
+        steps.push({ name: stepName, status: skipped ? 'skipped' : 'done', ...(detail ? { detail } : {}) });
       } catch (err) {
         steps.push({ name: stepName, status: 'failed', detail: err.message });
       }
@@ -669,15 +672,19 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
         .filter((b) => b.tags[WORKLOAD_TAG] === workloadId && b.tags[MARKER_TAG] === MARKER);
       const all = [...tagged, ...marked.filter((b) => !tagged.some((t) => t.kind === b.kind && t.id === b.id))];
       const done = [];
+      const missing = [];
       for (const b of all) {
         try {
           await untag(b);
           done.push(`${KIND_TEXT[b.kind]} ${b.id}`);
         } catch (err) {
+          // Deleted since onboarding: nothing to untag, said in the step.
           if (!notFound(err, 'InvalidInstanceID.NotFound', 'ValidationError', 'ResourceNotFoundException', 'ServiceNotFoundException', 'DBInstanceNotFoundFault', 'DBClusterNotFoundFault')) throw err;
+          missing.push(`${KIND_TEXT[b.kind]} ${b.id}`);
         }
       }
-      return done.length ? done.join(', ') : false;
+      const detail = [done.join(', '), missing.length ? `gone, skipped: ${missing.join(', ')}` : ''].filter(Boolean).join('; ');
+      return done.length ? detail : { skipped: true, detail };
     });
     await run('workload configuration', async () => {
       if (steps.some((x) => x.status === 'failed')) return false;
@@ -1025,9 +1032,11 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
     const run = await store.getRun(workloadId);
     // Paused first: no nap starts, and a nap already draining aborts at its commit point, while the instrumentation goes.
     if (cfg || run) await store.putPause(workloadId, { by: by ?? 'unknown', at: now(), reason: 'offboarding', keepAsleep: true });
-    // A Kubernetes workload asleep (or failed) is given its replicas back here; any other must be woken first.
+    // A Kubernetes workload asleep (or failed) is given its replicas back here; any other must be woken first. A standalone workload
+    // whose resource is gone (the check's mark) cannot be woken: it is offboarded in any state (findings-final-2.md).
     const restore = cfg?.kubernetes && ['ASLEEP', 'FAILED'].includes(run?.state);
-    if (run && run.state !== 'AWAKE' && !restore) throw new Error(`cannot offboard ${workloadId}: it is ${run.state}, wake it first`);
+    const gone = isStandalone(cfg) && run?.resourceMissing === true;
+    if (run && run.state !== 'AWAKE' && !restore && !gone) throw new Error(`cannot offboard ${workloadId}: it is ${run.state}, wake it first`);
     const first = restore ? [await restoreReplicas(cfg, run)] : [];
     // Replicas not given back: the switch stays, so requests keep reaching the waker (run it again).
     const cleaned = () => (isStandalone(cfg) ? cleanStandalone(workloadId, cfg) : clean(workloadId, cfg?.appTargetGroupArn, cfg?.databases, cfg?.tagged, cfg?.kubernetes));

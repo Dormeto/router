@@ -11,17 +11,18 @@ import { healthyCount, instanceDetails, waitTargetsReleased } from './instances.
 import { createStatus } from './status.mjs';
 import { describeRules } from './no-wake.mjs';
 import { describeStoredLists } from './list-cache.mjs';
-import { failedSpec, failureError, failureStep, standaloneNextAttemptAt } from './failures.mjs';
+import { failedSpec, failureError } from './failures.mjs';
+import { failedWakeDecision, idleDecision, idleRecheck as recheckIdle, napWindowNow, warnResourceMissing } from './standalone-check.mjs';
 import { createPauses, pauseHolds } from './pauses.mjs';
 import { createWakeWatch, unhealthyError } from './wake-watch.mjs';
 import { describeStopped } from './stopped.mjs';
 import { revertInstanceTypes } from './capacity.mjs';
-import { ENDED_DAYS_DEFAULT, maintenanceDue, occurrenceAt } from './schedule.mjs';
-import { createScheduleCheck, joinOf, scheduleKeeps as keptBySchedule } from './check-schedules.mjs';
+import { ENDED_DAYS_DEFAULT, maintenanceDue } from './schedule.mjs';
+import { createScheduleCheck, scheduleKeeps as keptBySchedule } from './check-schedules.mjs';
 import { runCheck } from './check-run.mjs';
 import { STATS_DAYS, createCount, totals, workloadSummary } from './summary.mjs';
 import { lastRequestAt } from './metrics.mjs';
-import { METRIC_LAG_MS, createIdleSignals, idleWindow, isIdle } from './activity.mjs';
+import { createIdleSignals } from './activity.mjs';
 import { checkScope } from './check-scope.mjs';
 import { addWarning, healthOf, lambdaMetrics, pausesUnreadable, queueDepths } from './health.mjs';
 import { pageViewOf, withWake } from './page-settings.mjs';
@@ -653,13 +654,11 @@ export function createController({
     const { workloadId } = cfg;
     const t = now();
     if (run?.resourceMissing) return { state: run.state, resource: 'missing' };
-    // A failed wake, while FAILED: an outside stop that leaves every backend stopped (ASLEEP) ends the retries.
-    const failedWake = run?.state === STATES.FAILED && failureStep(run) === 'wake';
-    if (failedWake) {
-      // The router's own backoff (failures.mjs): failedRetrySeconds is the waker's.
-      if ((standaloneNextAttemptAt(run) ?? Infinity) > t) return { state: run.state };
-      const held = ctx?.keptAsleep?.(workloadId) ? 'a keepAsleep pause' : napWindowNow(workloadId, ctx, t) ? 'a nap window' : null;
-      if (held) return { state: run.state, retry: 'held', reason: held };
+    // A failed wake, retried with the router's own backoff (standalone-check.mjs, shared with Google Cloud's).
+    const retry = failedWakeDecision(run, t, { keptAsleep: Boolean(ctx?.keptAsleep?.(workloadId)), napWindow: napWindowNow(workloadId, ctx, t, log) });
+    if (retry?.wait) return { state: run.state };
+    if (retry?.held) return { state: run.state, retry: 'held', reason: retry.held };
+    if (retry?.retry) {
       if (!(await startWake(workloadId, run, undefined, 'retry'))) return { state: (await store.getRun(workloadId))?.state ?? 'UNKNOWN' };
       return { state: STATES.WAKING, retry: 'requested' };
     }
@@ -677,16 +676,11 @@ export function createController({
     if (paused) return { state: run.state, paused: true };
     const kept = scheduleKeeps(workloadId, ctx, t);
     if (kept) return { state: run.state, ...kept };
-    // Awake for the whole window, and not before the signals can all be under for it.
-    const window = idleWindow(cfg, t);
-    if (run.awakeSince > window.startMs) return { state: run.state };
-    if ((run.idleNotBefore ?? 0) > t) return { state: run.state, idleNotBefore: run.idleNotBefore };
-    const signals = await readIdleSignals(cfg, backends ?? await managedBackends(cfg), window);
-    if (!isIdle(signals, window)) {
-      const idleNotBefore = idleNotBeforeOf(signals, window);
-      if (idleNotBefore === null) return { state: run.state, idle: false };
-      await store.transition(workloadId, { cond: { state: STATES.AWAKE }, set: { idleNotBefore } });
-      return { state: run.state, idle: false, idleNotBefore };
+    // Awake for the whole window, and not before the signals can all be under for it (standalone-check.mjs).
+    const decided = await idleDecision({ cfg, run, t, read: async (window) => readIdleSignals(cfg, backends ?? await managedBackends(cfg), window) });
+    if (!decided.nap) {
+      if (decided.write !== undefined) await store.transition(workloadId, { cond: { state: STATES.AWAKE }, set: { idleNotBefore: decided.write } });
+      return { state: run.state, ...decided.fields };
     }
     const asked = await napSoon(workloadId, t);
     return asked ? { state: run.state, nap: asked } : nap(workloadId);
@@ -696,33 +690,7 @@ export function createController({
   // levels readable (as the check decides nothing on levels it cannot read).
   async function idleRecheck(stored) {
     const cfg = await effective(stored, await store.getRun(stored.workloadId));
-    if (cfg.levelsUnreadable) return 'its settings levels cannot be read';
-    const window = idleWindow(cfg, now());
-    return isIdle(await readIdleSignals(cfg, await managedBackends(cfg), window), window) ? null : 'busy since it was requested';
-  }
-
-  // The earliest check whose window can find every signal under: the window then starts at or after each one's run of points under
-  // (the window's end when its last point is not). Null when none applies or a read failed (read again at the next check).
-  function idleNotBeforeOf(signals, window) {
-    const applying = signals.filter((s) => s.applies);
-    if (!applying.length || applying.some((s) => s.reason)) return null;
-    // A last point missing (late, or not published yet), not over: read again at the next check.
-    if (applying.some((s) => s.underSince === null && (s.value === null || s.value < s.below))) return null;
-    const length = window.endMs - window.startMs;
-    const starts = applying.map((s) => (s.underSince !== null && s.underSince <= window.startMs ? window.startMs : s.underSince ?? window.endMs));
-    return Math.max(...starts) + length + METRIC_LAG_MS;
-  }
-
-  // Whether a nap window of the workload's schedule is in force: a failed wake is not retried in it. One it cannot read: none.
-  function napWindowNow(workloadId, ctx, t) {
-    const schedule = ctx?.schedules?.get(workloadId);
-    if (!schedule) return false;
-    try {
-      return occurrenceAt(schedule, t, joinOf(schedule, ctx.joins))?.kind === 'nap';
-    } catch (err) {
-      log.warn('ScheduleSkipped', { workloadId, error: err.message });
-      return false;
-    }
+    return recheckIdle({ cfg, t: now(), read: async (window) => readIdleSignals(cfg, await managedBackends(cfg), window) });
   }
 
   // A nap lasts minutes: queued (at most 10 at a time), else run in its own invocation, never delaying the check; null
@@ -1324,8 +1292,7 @@ export function createController({
     const drift24h = (await Promise.all(configs.map((c) => (store.listDrift ? store.listDrift(c.workloadId, 50).catch(() => []) : []))))
       .flat().filter((e) => e.at >= dayAgo).length;
     // Standalone workloads whose resource the check could not find (deleted, or its dormeto:workload tag removed).
-    const missing = configs.filter((c, i) => isStandalone(c) && runs[i]?.resourceMissing).length;
-    if (missing) addWarning(health, 'resource-missing', `${missing} standalone workload${missing === 1 ? '' : 's'} without ${missing === 1 ? 'its' : 'their'} resource: deleted, or its dormeto:workload tag removed (see the workloads)`);
+    warnResourceMissing(health, configs.filter((c, i) => isStandalone(c) && runs[i]?.resourceMissing).length);
     if (drift24h) addWarning(health, 'drift', `${drift24h} drift repair${drift24h === 1 ? '' : 's'} in 24 hours: rules or tags changed outside Dormeto, repaired (see the workloads)`);
     return routerAnswer({
       router: { name: router.name, version: router.version, build: router.build },

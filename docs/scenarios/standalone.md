@@ -124,9 +124,13 @@ at all, it never naps on idle: schedules and people only.
 - **Awake** once every backend runs: an instance running, a group at its size with its instances in service, a service
   at its desired count with its tasks running, a database available, within the wake timeout (600 s, 1800 s for the type
   `databases`).
-- **A failed wake** is retried by the check after 60 s, doubled after each failure in a row, at most 30 minutes, while the
-  workload is failed. A keepAsleep pause or a nap window holds the retry; a stop made outside Dormeto that leaves every
-  backend stopped ends it (the workload is asleep).
+- **A failed wake** stays failed and is retried by the check after 60 s, doubled after each failure in a row, at most 30
+  minutes, until a wake succeeds, everything stopped or not: nothing wakes the workload on demand, so a failure for want of
+  capacity must not lose its awake window. A keepAsleep pause or a nap window holds the retry; a person's nap ends it (its
+  backends stop and the workload is asleep).
+- **A failure for a permission** (the role's condition on the resource: on AWS its `dormeto:workload` tag, on Google Cloud
+  the tag `dormeto=managed`, which the failure names) stays on the workload at every check, never read as recovered, until a
+  nap or a wake succeeds, so its status and the manager's alerts show it.
 - **A start or stop made outside Dormeto** (the console, a script, AWS's own restart of a database stopped 7 days) is seen
   at the next check: the workload is awake (`external-start`, its stopped companions started) or asleep (`external-stop`).
 - **On Google Cloud** what marks a resource as the workload's is its record alone: the router's roles act only on what has the

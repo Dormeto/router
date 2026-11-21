@@ -12,7 +12,7 @@ import { createStatus } from './status.mjs';
 import { describeRules } from './no-wake.mjs';
 import { describeStoredLists } from './list-cache.mjs';
 import { failedSpec, failureError } from './failures.mjs';
-import { failedWakeDecision, idleDecision, idleRecheck as recheckIdle, napWindowNow, warnResourceMissing } from './standalone-check.mjs';
+import { failedWakeDecision, failureKept, idleDecision, idleRecheck as recheckIdle, napWindowNow, warnResourceMissing } from './standalone-check.mjs';
 import { createPauses, pauseHolds } from './pauses.mjs';
 import { createWakeWatch, unhealthyError } from './wake-watch.mjs';
 import { describeStopped } from './stopped.mjs';
@@ -271,7 +271,10 @@ export function createController({
   // cause: what asked for it, the idle check or the manager, and by: who, from the manager (the state change event
   // says both).
   async function nap(workloadId, { cause = 'idle', by } = {}) {
-    const cfg = await effective(await config(workloadId), await store.getRun(workloadId));
+    const known = await store.getRun(workloadId);
+    const cfg = await effective(await config(workloadId), known);
+    // A failed standalone workload's nap: its release, which ends its retries.
+    if (isStandalone(cfg) && known?.state === STATES.FAILED) return release(workloadId);
     // A nap requested before a pause (idle check, manager) is refused when it starts.
     if (await isPaused(workloadId)) {
       log.warn('NapSkipped', { workloadId, reason: 'paused' });
@@ -526,7 +529,7 @@ export function createController({
     // No managed primary backend: nothing to infer (every() would be vacuously true).
     const all = (name) => primaries.length > 0 && primaries.every((b) => statuses[backendKey(b)] === name);
     const from = run.state;
-    if (from !== STATES.AWAKE && all('running') && (standalone || (await healthyCount(elbv2, cfg.appTargetGroupArn)) >= 1)) {
+    if (from !== STATES.AWAKE && all('running') && !(standalone && failureKept(run, STATES.AWAKE)) && (standalone || (await healthyCount(elbv2, cfg.appTargetGroupArn)) >= 1)) {
       log.warn(from === STATES.FAILED ? 'FailedRecovered' : 'ExternalWake', { workloadId });
       // GitOps resetting replicas behind the waker's back (section 8 of the Kubernetes design): drift, not a visitor's wake.
       for (const b of from === STATES.ASLEEP ? primaries.filter((p) => p.kind === 'k8s') : []) {
@@ -541,7 +544,7 @@ export function createController({
         cause: from === STATES.FAILED ? 'recovered' : 'external-start',
       }))
         ?? (await store.getRun(workloadId));
-    } else if (from !== STATES.ASLEEP && all('stopped')) {
+    } else if (from !== STATES.ASLEEP && all('stopped') && !(standalone && failureKept(run, STATES.ASLEEP))) {
       log.warn(from === STATES.FAILED ? 'FailedRecovered' : 'ExternalStop', { workloadId });
       // The backend is already stopped: the instrumented rules go to the waker whatever the issues.
       if (!standalone) await routeTo(cfg, 'waker', { allowIssues: true });
@@ -655,7 +658,7 @@ export function createController({
     const t = now();
     if (run?.resourceMissing) return { state: run.state, resource: 'missing' };
     // A failed wake, retried with the router's own backoff (standalone-check.mjs, shared with Google Cloud's).
-    const retry = failedWakeDecision(run, t, { keptAsleep: Boolean(ctx?.keptAsleep?.(workloadId)), napWindow: napWindowNow(workloadId, ctx, t, log) });
+    const retry = failedWakeDecision(run, t, { keptAsleep: Boolean(ctx?.keptAsleep?.(workloadId)), napWindow: () => napWindowNow(workloadId, ctx, t, log) });
     if (retry?.wait) return { state: run.state };
     if (retry?.held) return { state: run.state, retry: 'held', reason: retry.held };
     if (retry?.retry) {
@@ -1021,6 +1024,8 @@ export function createController({
       // A configuration from before `inherits` inherits what equals the onboarder's old defaults (design §7). A standalone workload whose
       // idle window or idle signals change is read again at the next check (final review, Minor 7).
       next: (cfg, settings) => {
+        // Decided at each write, so that one refused after this leaves nothing for the next.
+        rereads.delete(cfg.workloadId);
         if (isStandalone(cfg) && ['idleMinutes', ...IDLE_KEYS].some((key) => Object.hasOwn(settings, key))) rereads.add(cfg.workloadId);
         return withSettings(cfg, settings);
       },
@@ -1184,6 +1189,8 @@ export function createController({
     const run = await store.getRun(workloadId);
     const stale = scheduled && until ? (now() >= until ? 'the nap window ended' : null)
       : now() - requestedAt > NAP_MAX_AGE_MS ? `requested more than ${NAP_MAX_AGE_MS / 60_000} minutes ago` : null;
+    // A failed standalone workload's nap a person asked: its release, which ends its retries.
+    if (run?.state === STATES.FAILED && by && isStandalone(await store.getConfig(workloadId))) return release(workloadId);
     let reason = run?.state !== STATES.AWAKE ? `not awake (${run?.state ?? 'UNKNOWN'})`
       : (run.awakeSince ?? 0) > requestedAt ? 'woken since it was requested' : stale;
     const recheck = !reason && !scheduled && now() - requestedAt > NAP_RECHECK_MS ? await config(workloadId) : null;

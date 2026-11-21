@@ -26,3 +26,11 @@ test('the manager page and the README name standalone workloads, to come in rout
   const readme = flat(read('README.md'));
   assert.ok(readme.includes('[Standalone workloads](docs/scenarios/standalone.md): a Compute Engine VM, a managed instance group or a Cloud SQL instance'));
 });
+
+test('the page says the R30 review\'s rulings: a failed wake retried until it succeeds, a permission failure kept', () => {
+  const page = flat(read('docs/scenarios/standalone.md'));
+  assert.ok(page.includes('A failed wake stays failed and is retried by the check after 60 s, doubled after each failure in a row, at most 30 minutes, until a wake succeeds, everything stopped or not'));
+  assert.ok(page.includes('A keepAsleep pause or a nap window holds the retry; a person\'s nap ends it'));
+  assert.ok(page.includes('A failure for a permission'));
+  assert.doesNotMatch(page, /leaves every backend stopped ends it/);
+});

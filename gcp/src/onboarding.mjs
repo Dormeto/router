@@ -860,7 +860,6 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
       const label = `managed group ${path.name}`;
       const members = (await compute.listManagedInstances(group)).map((m) => m.instance);
       const reasons = [];
-      if (!members.length) reasons.push(`${label} has no VM: resize it to one at least, then onboard again`);
       if (managed.status?.stateful?.hasStatefulConfig) reasons.push(`${label} has a stateful configuration: a nap might not keep it`);
       if (group.kind === 'regional' && (managed.distributionPolicy?.targetShape ?? 'EVEN') === 'EVEN' && (managed.updatePolicy?.instanceRedistributionType ?? 'PROACTIVE') !== 'NONE') {
         reasons.push(`regional ${label} has the target shape EVEN with instance redistribution on: Google cannot stop or suspend its VMs one by one, set its instance redistribution type to NONE or change its target shape, then onboard again`);
@@ -1361,6 +1360,8 @@ export function createOnboarding({ store, compute, cloudsql, gke, urlmaps, regio
       // CLI's, as an onboarding writes it.
       next(cfg, settings) {
         // A standalone workload whose idle window or idle signals change is read again at the next check (AWS's rule, plan 1).
+        // Decided at each write, so that one refused after this leaves nothing for the next.
+        rereads.delete(cfg.workloadId);
         if (kindOf(cfg) === 'standalone' && ['idleMinutes', ...IDLE_KEYS].some((key) => Object.hasOwn(settings, key))) rereads.add(cfg.workloadId);
         const next = withSettings(cfg, settings, { inheritsOf, builtIns: builtInsOf });
         if (Object.hasOwn(next, 'inherits')) next.source ??= 'cli';

@@ -41,7 +41,7 @@ function forbidden(calls, name) {
 // kind: the resource's; up: whether it runs; companion: a Cloud SQL instance beside it; cpu(t): its CPU ratio at a point (undefined: none).
 function setup({ kind = 'vm', up = true, companion = false, run: initial, cfg: overrides = {}, cpu = () => 0.01, size = 2 } = {}) {
   const clock = fakeClock(START);
-  const calls = { forbidden: [], changes: [], tasks: [], monitoring: [] };
+  const calls = { forbidden: [], changes: [], tasks: [], monitoring: [], used: new Set() };
   const world = { vms: {}, groups: {}, sql: {} };
   if (kind === 'vm') world.vms.batch = { status: up ? 'RUNNING' : 'TERMINATED', machineType: `${V1}/zones/${ZONE}/machineTypes/e2-small` };
   if (kind === 'mig') {
@@ -86,6 +86,7 @@ function setup({ kind = 'vm', up = true, companion = false, run: initial, cfg: o
   };
   for (const [action, status] of Object.entries(STATUS)) {
     allowed[`${action}Instance`] = async (zone, name) => {
+      if (world.refuse) throw world.refuse;
       calls.changes.push(`${action} ${name}`);
       world.vms[name].status = status;
     };
@@ -97,7 +98,10 @@ function setup({ kind = 'vm', up = true, companion = false, run: initial, cfg: o
   // Compute Engine: what a standalone workload needs; anything else (backend services, NEGs, groups' listings) forbidden.
   const compute = new Proxy(allowed, {
     get(target, method) {
-      if (method in target) return target[method];
+      if (method in target) {
+        calls.used.add(`compute.${String(method)}`);
+        return target[method];
+      }
       if (method === 'then' || typeof method === 'symbol') return undefined;
       return async () => {
         calls.forbidden.push(`compute.${String(method)}`);
@@ -105,8 +109,9 @@ function setup({ kind = 'vm', up = true, companion = false, run: initial, cfg: o
       };
     },
   });
-  const cloudsql = {
+  const sqlCalls = {
     get: async (name) => {
+      if (world.sqlRefused) throw world.sqlRefused;
       if (!world.sql[name]) throw gone(`Cloud SQL instance ${name}`);
       return structuredClone(world.sql[name]);
     },
@@ -115,9 +120,13 @@ function setup({ kind = 'vm', up = true, companion = false, run: initial, cfg: o
       world.sql[name].settings.activationPolicy = policy;
       return `op-${name}`;
     },
-    listOperations: async () => [],
+    listOperations: async () => structuredClone(world.sqlOperations ?? []),
     getOperation: async () => ({ status: 'DONE' }),
   };
+  const cloudsql = Object.fromEntries(Object.entries(sqlCalls).map(([name, fn]) => [name, (...args) => {
+    calls.used.add(`cloudsql.${name}`);
+    return fn(...args);
+  }]));
   // Cloud Monitoring as the idle signals read it: each VM's CPU, `cpu(t)` a point.
   const google = {
     request: async (method, url) => {
@@ -204,7 +213,7 @@ test('plan 1\'s ruling: an outside start is AWAKE with external-start, its compa
   assert.deepEqual([s.calls.forbidden, stop.calls.forbidden], [[], []]);
 });
 
-test('plan 1\'s ruling: a failed wake is retried by the check with the router\'s own backoff, held by a keepAsleep pause; an outside stop ends it', async () => {
+test('plan 1\'s ruling: a failed wake is retried by the check with the router\'s own backoff, held by a keepAsleep pause; everything stopped, still retried (R30 review, I1)', async () => {
   const failure = JSON.stringify({ kind: 'timeout', step: 'wake', message: 'x' });
   const s = setup({ up: false, run: { state: STATES.FAILED, failedAt: START, consecutiveFailures: 1, failure, failedRetrySeconds: 600 } });
   s.world.vms.batch.status = 'STAGING';
@@ -216,14 +225,22 @@ test('plan 1\'s ruling: a failed wake is retried by the check with the router\'s
   assert.deepEqual((await s.core.check())[0], { workloadId: 'batch', state: STATES.WAKING, retry: 'requested' });
   assert.deepEqual(causes(s).at(-1), [STATES.WAKING, 'retry']);
   assert.equal(s.calls.tasks.at(-1).action, 'wake');
+  // Everything stopped (a start refused for capacity): FAILED, retried at the backoff, and the retry's wake succeeds.
   const stopped = setup({ up: false, run: { state: STATES.FAILED, failedAt: START, consecutiveFailures: 1, failure } });
+  await stopped.core.check();
+  assert.equal(stopped.run().state, STATES.FAILED, 'not called recovered');
   stopped.clock.advance(61_000);
-  await stopped.core.check();
-  assert.deepEqual(causes(stopped), [[STATES.ASLEEP, 'recovered']]);
-  stopped.clock.advance(60 * MINUTE);
-  await stopped.core.check();
-  assert.deepEqual(stopped.calls.tasks, []);
-  assert.deepEqual([s.calls.forbidden, stopped.calls.forbidden], [[], []]);
+  assert.deepEqual((await stopped.core.check())[0], { workloadId: 'batch', state: STATES.WAKING, retry: 'requested' });
+  assert.equal((await stopped.core.wake('batch', stopped.run().wakeId)).state, STATES.AWAKE);
+  // A person's nap of a failed one: its release, the retries over; a nap window holds them.
+  const napped = setup({ up: false, run: { state: STATES.FAILED, failedAt: START, consecutiveFailures: 1, failure } });
+  assert.equal((await napped.core.nap('batch', { cause: 'manager', requestedAt: napped.clock.now() })).state, STATES.ASLEEP);
+  assert.deepEqual(causes(napped), [[STATES.ASLEEP, 'failed-released']]);
+  const windowed = setup({ up: false, run: { state: STATES.FAILED, failedAt: START - 2 * MINUTE, consecutiveFailures: 1, failure } });
+  windowed.store.state.schedules.batch = { timeZone: 'UTC', windows: [{ kind: 'nap', days: ['mon'], start: '09:00', end: '18:00' }], by: 'ops', at: Date.UTC(2026, 10, 20) };
+  const held = (await windowed.core.check()).find((r) => r.workloadId === 'batch');
+  assert.deepEqual([held.state, held.retry, held.reason], [STATES.FAILED, 'held', 'a nap window']);
+  assert.deepEqual([s.calls.forbidden, stopped.calls.forbidden, napped.calls.forbidden, windowed.calls.forbidden], [[], [], [], []]);
 });
 
 test('plan 1\'s ruling: a resource deleted stops nothing, its companion included, marks resourceMissing and warns in the health', async () => {
@@ -324,5 +341,87 @@ test('plan 1\'s ruling: a settings write that touches the idle window or a signa
     t.store.runs.get('batch').idleNotBefore = hold;
     await t.onboarding.setSettings('batch', { ...settings, by: 'ana' });
     assert.equal('idleNotBefore' in t.store.runs.get('batch'), false, JSON.stringify(settings));
+  }
+});
+
+// --- The R30 review's fix round 1 (findings-R30-1.md) -------------------------------------------------------------------------
+
+test('R30 review, I2: a tag removed: the nap fails for a permission naming the tag, and the failure stays at every check, never recovered', async () => {
+  const s = setup();
+  // Google refuses the stop: the router's backend role is granted on the tag dormeto=managed.
+  s.world.refuse = new GoogleError('Google: instances.stop: 403 Required compute.instances.stop permission', { code: 403 });
+  const napped = await s.core.nap('batch', { cause: 'manager', requestedAt: s.clock.now() });
+  assert.equal(napped.state, STATES.FAILED);
+  assert.match(napped.error, /VM batch: Google refused the change: the router may change only a resource with the tag dormeto=managed/);
+  for (let i = 0; i < 3; i += 1) {
+    await s.core.check();
+    assert.deepEqual([s.run().state, JSON.parse(s.run().failure).kind], [STATES.FAILED, 'permission']);
+    s.clock.advance(5 * MINUTE);
+  }
+  assert.deepEqual(causes(s).filter(([, cause]) => cause === 'recovered'), []);
+  assert.deepEqual(s.calls.forbidden, []);
+});
+
+test('R30 review, M3: a Cloud SQL resource with an operation under way is not read as running', async () => {
+  const s = setup({ kind: 'cloudsql', up: false });
+  s.world.sql.orders.settings.activationPolicy = 'ALWAYS';
+  s.world.sqlOperations = [{ name: 'op-1', status: 'RUNNING' }];
+  await s.core.check();
+  assert.equal(s.run().state, STATES.ASLEEP, 'not an outside start while its start is under way');
+  s.world.sqlOperations = [{ name: 'op-1', status: 'DONE' }];
+  await s.core.check();
+  assert.deepEqual(causes(s), [[STATES.AWAKE, 'external-start']]);
+});
+
+test('R30 review, M5: a group sized 0 is awake with no VM; its wake does not wait for one', async () => {
+  const s = setup({ kind: 'mig', size: 0, up: false });
+  s.waking();
+  assert.equal((await s.core.wake('batch', 'w9')).state, STATES.AWAKE);
+});
+
+test('R30 review, M6: a Cloud SQL resource the router may not read is said once a check and in the health, never thrown', async () => {
+  const s = setup({ kind: 'cloudsql' });
+  s.world.sqlRefused = new GoogleError('Google: 403 cloudsql.instances.get', { code: 403 });
+  assert.deepEqual((await s.core.check())[0], { workloadId: 'batch', state: STATES.AWAKE, resource: 'unreadable' });
+  assert.equal(s.logged('CloudSqlUnreadable').length, 1);
+  assert.deepEqual(s.store.state.check.health.problems.filter((p) => p.code === 'cloud-sql-unreadable').map((p) => p.text),
+    ['1 standalone workload with a Cloud SQL instance the router cannot read: install it with --with cloud-sql']);
+  assert.equal((await s.core.nap('batch', { cause: 'manager', requestedAt: s.clock.now() })).state, 'SKIPPED');
+});
+
+test('R30 review, M1: the nap window is read only when a failed wake\'s retry is due', async () => {
+  const { failedWakeDecision } = await import('../../lambda/src/lib/standalone-check.mjs');
+  const never = () => assert.fail('read');
+  assert.equal(failedWakeDecision({ state: STATES.AWAKE }, START, { napWindow: never }), null);
+  assert.deepEqual(failedWakeDecision({ state: STATES.FAILED, failedAt: START, consecutiveFailures: 1, failure: JSON.stringify({ step: 'wake' }) }, START, { napWindow: never }), { wait: true });
+  assert.deepEqual(failedWakeDecision({ state: STATES.FAILED, failedAt: START, consecutiveFailures: 1, failure: JSON.stringify({ step: 'wake' }) }, START + MINUTE * 2, { napWindow: () => true }), { held: 'a nap window' });
+});
+
+test('R30 review, M8: every call a standalone workload makes is in its adapter\'s CALLS, and granted to the router', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const compute = await import('../src/compute.mjs');
+  const cloudsqlAdapter = await import('../src/cloudsql.mjs');
+  const manifest = JSON.parse(await readFile(new URL('../access.json', import.meta.url), 'utf8'));
+  const granted = new Set();
+  const grants = [...manifest.router.map((g) => [g, manifest.roles]), ...Object.values(manifest.features).flatMap((f) => f.router.map((g) => [g, f.roles]))];
+  for (const [{ role }, roles] of grants) {
+    const custom = /\/roles\/(.+)$/.exec(role)?.[1];
+    for (const p of custom ? roles[custom].permissions : manifest.predefined[role]) granted.add(p);
+  }
+  const used = new Set();
+  for (const kind of KINDS) {
+    const s = setup({ kind, companion: kind === 'vm' });
+    await s.core.check();
+    await s.core.nap('batch', { cause: 'manager', requestedAt: s.clock.now() });
+    s.waking();
+    await s.core.wake('batch', 'w9');
+    for (const c of s.calls.used) used.add(c);
+  }
+  const CALLS = { compute: compute.CALLS, cloudsql: cloudsqlAdapter.CALLS };
+  assert.ok(used.size > 5, [...used].join());
+  for (const c of used) {
+    const [adapter, fn] = c.split('.');
+    assert.ok(CALLS[adapter]?.[fn], `${c} is in no CALLS`);
+    for (const p of CALLS[adapter][fn]) assert.ok(granted.has(p), `${c} needs ${p}`);
   }
 });

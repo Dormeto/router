@@ -128,9 +128,11 @@ export function createManagerActions({
 }) {
   // request-nap: refused at once with the reason when the workload is not awake or is paused, else the cloud's nap, asked.
   async function requestNap({ workloadId, by }) {
-    await find(workloadId);
+    const cfg = await find(workloadId);
     const run = await store.getRun(workloadId);
-    if (run?.state !== STATES.AWAKE) return { requested: false, reason: `not awake (${run?.state ?? 'UNKNOWN'})` };
+    // A failed standalone workload's nap request ends its retries: its backends stop and it is asleep (each cloud's release).
+    const failedStandalone = cfg?.kind === 'standalone' && run?.state === STATES.FAILED;
+    if (run?.state !== STATES.AWAKE && !failedStandalone) return { requested: false, reason: `not awake (${run?.state ?? 'UNKNOWN'})` };
     const [first] = await pausesFor(workloadId);
     if (first) return { requested: false, reason: pauseText(first) };
     await napNow(workloadId, by);

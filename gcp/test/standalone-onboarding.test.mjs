@@ -97,7 +97,6 @@ test('each eligibility reason, in plain words', async () => {
     ['a group gone', `projects/p/zones/${ZONE}/instanceGroupManagers/gone`, (w) => w, `managed group gone not found in ${ZONE}`],
     ['a group of GKE nodes', MIG, (w) => { w.vms['workers-1'].labels = { 'goog-gke-node': '' }; }, 'managed group workers holds GKE nodes: onboard the Kubernetes workloads that run on them'],
     ['a stateful group', MIG, (w) => { w.managed.workers.status = { stateful: { hasStatefulConfig: true } }; }, 'managed group workers has a stateful configuration: a nap might not keep it'],
-    ['an empty group', MIG, (w) => { w.managed.workers.members = []; }, 'managed group workers has no VM: resize it to one at least, then onboard again'],
     ['a Cloud SQL replica', SQL, (w) => { w.sql.orders.masterInstanceName = 'p:main'; }, 'Cloud SQL instance orders is a read replica: Google cannot stop one'],
     ['a Cloud SQL instance gone', 'projects/p/instances/gone', (w) => w, 'Cloud SQL instance gone not found: name an instance of this project'],
   ];
@@ -211,4 +210,31 @@ test('the resource path\'s calls are each in the router\'s grants of access.json
     const [adapter, fn] = c.split('.');
     for (const p of CALLS[adapter][fn]) assert.ok(granted.has(p), `${c} needs ${p}`);
   }
+});
+
+// --- The R30 review's fix round 1, on the onboarding ---------------------------------------------------------------------------
+
+test('R30 review, M5: a group sized 0 is onboarded, as AWS onboards a resource at its desired 0', async () => {
+  const t = world((w) => { w.managed.workers.members = []; });
+  assert.deepEqual((await t.call('POST', '/v1/workloads?dryRun=true', { resource: MIG, id: 'batch' })).body.reasons, []);
+});
+
+test('R30 review, M6: a Cloud SQL resource on a router that cannot read it is refused up front, in the HTTP path\'s words', async () => {
+  const { GoogleError } = await import('../src/google.mjs');
+  const t = world((w) => { w.fail['GET sql/instances/orders'] = new GoogleError('Google: 403 not authorized', { code: 403 }); });
+  const dry = (await t.call('POST', '/v1/workloads?dryRun=true', { resource: SQL, id: 'batch' })).body;
+  assert.deepEqual([dry.eligible, dry.reasons], [false, ['the router cannot read Cloud SQL instance orders: it does not exist, or the router was installed without --with cloud-sql: Google: 403 not authorized']]);
+});
+
+test('R30 review, M7: a settings write refused after it was decided leaves no idle hold to clear for the next write', async () => {
+  const t = world();
+  await t.call('POST', '/v1/workloads', { resource: VM, id: 'batch' });
+  const hold = Date.UTC(2026, 10, 24);
+  t.store.runs.get('batch').idleNotBefore = hold;
+  const put = t.store.putConfig;
+  t.store.putConfig = async () => false;
+  await t.onboarding.setSettings('batch', { idleCpuPercent: 10, by: 'ana' }).catch(() => {});
+  t.store.putConfig = put;
+  await t.onboarding.setSettings('batch', { hibernate: false, by: 'ana' });
+  assert.equal(t.store.runs.get('batch').idleNotBefore, hold);
 });

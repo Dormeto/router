@@ -69,7 +69,8 @@ import { DAY_MS, STATES, utcDay } from '../../lambda/src/lib/state.mjs';
 import { readActivePauses, routerAnswer } from '../../lambda/src/lib/manager-actions.mjs';
 import { createListRefresher, requestListRefresh as askListRefresh } from '../../lambda/src/lib/list-refresh.mjs';
 import { createLevelsReader } from '../../lambda/src/lib/settings-levels.mjs';
-import { failedWakeDecision, idleDecision, idleRecheck, napWindowNow, warnResourceMissing } from '../../lambda/src/lib/standalone-check.mjs';
+import { failedWakeDecision, failureKept, idleDecision, idleRecheck, napWindowNow, warnResourceMissing } from '../../lambda/src/lib/standalone-check.mjs';
+import { addWarning } from '../../lambda/src/lib/health.mjs';
 import { idleWindow } from '../../lambda/src/lib/activity.mjs';
 import { signalsView, standaloneNapEstimate } from '../../lambda/src/lib/status.mjs';
 import { createCount } from '../../lambda/src/lib/summary.mjs';
@@ -663,10 +664,10 @@ export function createController({
   }
 
   // `onFallback`: the VMs on a fallback type, stopped, never suspended, so that they get their own type back (AWS's rule).
-  async function sleepBackend(backend, hibernate, deadline, owners, onFallback) {
-    // A standalone workload's Cloud SQL resource: asked to stop, with no wait (a stop takes minutes).
+  async function sleepBackend(backend, hibernate, deadline, owners, onFallback, stillGoing) {
+    // A standalone workload's Cloud SQL resource: asked to stop, with no wait (a stop takes minutes), not once the run is another's.
     if (isCompanion(backend)) {
-      await stopDatabase(cloudsql, backend.name, deadline);
+      await stopDatabase(cloudsql, backend.name, deadline, stillGoing);
       return { stopped: [backend.name], suspended: [], vms: [], pods: [] };
     }
     if (isPods(backend)) {
@@ -722,7 +723,7 @@ export function createController({
     // The workload's own, else none with fallback machine types (the type a VM wakes on may not suspend), else the router's. Its
     // level unreadable, a plain stop, as on AWS: the built-in true could suspend against the router's "off".
     const hibernate = !cfg.levelsUnreadable && resolveHibernation({ workload: cfg.hibernate, fallbackTypes: cfg.fallbackInstanceTypes, router: router?.hibernate, manager: organization }).hibernate;
-    const done = await each(primariesOf(cfg), (backend) => sleepBackend(backend, hibernate, deadline, owners, Object.keys(instanceTypes ?? {})));
+    const done = await each(primariesOf(cfg), (backend) => sleepBackend(backend, hibernate, deadline, owners, Object.keys(instanceTypes ?? {}), stillGoing));
     for (;;) {
       const up = (await allVms(cfg)).filter((vm) => !GONE.has(vm.status));
       if (!up.length) break;
@@ -1400,7 +1401,9 @@ export function createController({
       const text = `${backend.kind}:${backend.name}`;
       try {
         if (isCompanion(backend)) {
-          const status = statusOf(await cloudsql.get(backend.name));
+          // Its operations too (cloudsql.mjs's statusOf): RUNNABLE alone cannot tell a start under way. A list refused reads none.
+          const [instance, operations] = await Promise.all([cloudsql.get(backend.name), cloudsql.listOperations(backend.name).catch(() => [])]);
+          const status = statusOf(instance, operations);
           return { backend, status, text: `${text} is ${status}` };
         }
         if (backend.kind === 'mig') {
@@ -1408,7 +1411,8 @@ export function createController({
           const { targetSize = 0 } = await compute.getManagedGroup(group);
           const vms = await vmsOf(backend);
           const running = vms.filter((vm) => vm.status === 'RUNNING').length;
-          const status = targetSize > 0 && running >= targetSize && running === vms.length ? 'running' : vms.length && vms.every((vm) => DOWN.has(vm.status)) ? 'stopped' : 'transitioning';
+          // A group sized 0 has nothing to wait for: it runs at its size (R30 review, M5).
+          const status = running >= targetSize && running === vms.length ? 'running' : vms.length && vms.every((vm) => DOWN.has(vm.status)) ? 'stopped' : 'transitioning';
           return { backend, status, text: `${text} has ${running} of its ${targetSize} VMs running`, vms: names(vms) };
         }
         const [vm] = await vmsOf(backend);
@@ -1416,10 +1420,20 @@ export function createController({
         return { backend, status, text: `${text} is ${vm.status ?? 'unknown'}` };
       } catch (err) {
         if (isGone(err)) return { backend, status: 'missing', text: `${text} is gone` };
+        // A Cloud SQL instance the router may not read: installed without the feature (R30 review, M6). Said, never thrown.
+        if (isCompanion(backend) && err?.code === 403) return { backend, status: 'unreadable', text: `the router cannot read Cloud SQL instance ${backend.name}: install it with --with cloud-sql` };
         throw err;
       }
     });
   }
+  const unreadableOf = (states) => states.find((s) => s.status === 'unreadable');
+  // A change of a VM or a group Google refused for a permission (I2): what to check, the tag the router's backend role needs.
+  const tagHint = (cfg) => (err) => {
+    if (err?.code !== 403 || err.kind) throw err;
+    const [primary] = primariesOf(cfg);
+    const label = primary?.kind === 'mig' ? `managed group ${primary.name}` : `VM ${primary?.name}`;
+    throw failureError('permission', `${label}: Google refused the change: the router may change only a resource with the tag dormeto=managed: ${err.message}`);
+  };
   const missingOf = (cfg, states) => (!primariesOf(cfg).length || states.some((s) => s.status === 'missing'));
 
   // Its signals over `window`: a group with its VMs' names, as read with its states.
@@ -1431,14 +1445,16 @@ export function createController({
 
   async function standaloneWake({ workloadId, wakeId, run, cfg, since, deadline, isCurrent, unread, superseded, fail }) {
     try {
-      if (missingOf(cfg, await standaloneStates(cfg))) throw failureError('configuration', `the resource is missing: ${cfg.resource} deleted`);
+      const before = await standaloneStates(cfg);
+      if (missingOf(cfg, before)) throw failureError('configuration', `the resource is missing: ${cfg.resource} deleted`);
+      if (unreadableOf(before)) throw failureError('permission', unreadableOf(before).text);
       if (companionsOf(cfg).length) {
         const gone = await each(companionsOf(cfg), async ({ name }) => ((await startDatabase(cloudsql, name, { now, sleep, deadline, unread })) === COMPANION_GONE ? name : null));
         await saidGone(workloadId, run, { state: STATES.WAKING, wakeId }, gone.filter(Boolean));
         if (!(await isCurrent())) return superseded();
       }
       const types = wakeTypes(cfg, run, wakeId, deadline);
-      await wakeBackends(cfg, run, deadline, types);
+      await wakeBackends(cfg, run, deadline, types).catch(tagHint(cfg));
       // Readiness (design §3): every primary at full size, within the wake timeout.
       for (;;) {
         const states = await standaloneStates(cfg);
@@ -1466,7 +1482,14 @@ export function createController({
 
   // A nap with no route: an idle one (no `cause` given, the check's) reads its signals again first; a person's or a schedule's never.
   async function standaloneNap(workloadId, { cfg, router, organization, cause, by, started, latest }) {
+    // A failed one's nap (a person's): its release, which ends its retries.
+    const known = await store.getRun(workloadId);
+    if (known?.state === STATES.FAILED) return standaloneRelease(workloadId, { cfg, run: known, router, organization, latest });
     const states = await standaloneStates(cfg);
+    if (unreadableOf(states)) {
+      log.warn('NapSkipped', { workloadId, reason: unreadableOf(states).text });
+      return { state: 'SKIPPED', reason: unreadableOf(states).text };
+    }
     if (missingOf(cfg, states)) {
       log.warn('NapSkipped', { workloadId, reason: 'the resource is missing' });
       return { state: 'SKIPPED', reason: 'the resource is missing' };
@@ -1502,7 +1525,7 @@ export function createController({
         slept = await putToSleep(cfg, { autoscalers, owners: [], router, organization, instanceTypes: napping.instanceTypes }, latest, async () => {
           const current = await store.getRun(workloadId);
           return current?.state === STATES.NAPPING && !current.pendingWake;
-        });
+        }).catch(tagHint(cfg));
         types = await revertTypes(cfg, napping.instanceTypes);
       } catch (err) {
         return napFailed(workloadId, err);
@@ -1515,7 +1538,7 @@ export function createController({
     try {
       const autoscalers = await autoscalersToRecord(cfg, run);
       if (!(await transition(workloadId, { cond: { state: STATES.FAILED }, set: { autoscalers } }))) return { state: 'SUPERSEDED' };
-      const slept = await putToSleep(cfg, { autoscalers, owners: [], router, organization, instanceTypes: run.instanceTypes }, latest, async () => (await store.getRun(workloadId))?.state === STATES.FAILED);
+      const slept = await putToSleep(cfg, { autoscalers, owners: [], router, organization, instanceTypes: run.instanceTypes }, latest, async () => (await store.getRun(workloadId))?.state === STATES.FAILED).catch(tagHint(cfg));
       const types = await revertTypes(cfg, run.instanceTypes);
       const asleep = await transition(workloadId, {
         cond: { state: STATES.FAILED }, set: { state: STATES.ASLEEP, ...runOf(slept), ...types.set }, remove: types.remove, cause: 'failed-released', event: eventOfSlept(slept),
@@ -1535,7 +1558,7 @@ export function createController({
     const { workloadId } = cfg;
     const from = run.state;
     const all = (status) => states.length > 0 && states.every((s) => s.status === status);
-    if (from !== STATES.AWAKE && all('running')) {
+    if (from !== STATES.AWAKE && all('running') && !failureKept(run, STATES.AWAKE)) {
       log.warn(from === STATES.FAILED ? 'FailedRecovered' : 'ExternalWake', { workloadId });
       const givenBack = await gaveBackAutoscalers(workloadId, run);
       return (await transition(workloadId, {
@@ -1545,7 +1568,7 @@ export function createController({
         cause: from === STATES.FAILED ? 'recovered' : 'external-start',
       })) ?? (await store.getRun(workloadId));
     }
-    if (from !== STATES.ASLEEP && all('stopped')) {
+    if (from !== STATES.ASLEEP && all('stopped') && !failureKept(run, STATES.ASLEEP)) {
       log.warn(from === STATES.FAILED ? 'FailedRecovered' : 'ExternalStop', { workloadId });
       return (await transition(workloadId, { cond: { state: from }, set: { state: STATES.ASLEEP }, cause: from === STATES.FAILED ? 'recovered' : 'external-stop' })) ?? store.getRun(workloadId);
     }
@@ -1567,12 +1590,16 @@ export function createController({
       if (!run.resourceMissing) run = (await transition(workloadId, { cond: { state: run.state }, set: { resourceMissing: true } })) ?? run;
       return { state: run.state, resource: 'missing' };
     }
+    if (unreadableOf(states)) {
+      log.warn('CloudSqlUnreadable', { workloadId, error: unreadableOf(states).text });
+      return { state: run.state, resource: 'unreadable' };
+    }
     if (run.resourceMissing) run = (await transition(workloadId, { cond: { state: run.state }, remove: ['resourceMissing'] })) ?? run;
     run = await reconcileStandalone(cfg, run, states);
     await companionsFollow(cfg, run);
     if (cfg.levelsUnreadable) return { state: run?.state ?? 'UNKNOWN', settings: 'unreadable' };
     const t = now();
-    const retry = failedWakeDecision(run, t, { keptAsleep: Boolean(ctx.keptAsleep?.(workloadId)), napWindow: napWindowNow(workloadId, ctx, t, log) });
+    const retry = failedWakeDecision(run, t, { keptAsleep: Boolean(ctx.keptAsleep?.(workloadId)), napWindow: () => napWindowNow(workloadId, ctx, t, log) });
     if (retry?.wait) return { state: run.state };
     if (retry?.held) return { state: run.state, retry: 'held', reason: retry.held };
     if (retry?.retry) {
@@ -1835,6 +1862,8 @@ export function createController({
       const counted = await stateCounts(order, known);
       const missing = counted.missing + results.filter((r) => r.resource === 'missing').length;
       const { health } = await healthSummary({ t, byState: counted.byState, lastScheduledCheckAt, pausesError, managerState, missing });
+      const unreadable = results.filter((r) => r.resource === 'unreadable').length;
+      if (unreadable) addWarning(health, 'cloud-sql-unreadable', `${unreadable} standalone workload${unreadable === 1 ? '' : 's'} with a Cloud SQL instance the router cannot read: install it with --with cloud-sql`);
       const summary = {
         checkedAt: started, durationMs: t - started, checkSchedule: CHECK_SCHEDULE, lastScheduledCheckAt, health, pauses: pauses.map(shownPause), counts: counted.byState,
         ...(cursor ? { cursor } : {}),

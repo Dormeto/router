@@ -3,7 +3,7 @@
 // its own way (lambda/src/lib/controller-core.mjs, gcp/src/controller-core.mjs); the rules are here, once. Pure.
 import { METRIC_LAG_MS, idleWindow, isIdle } from './activity.mjs';
 import { joinOf } from './check-schedules.mjs';
-import { failureStep, standaloneNextAttemptAt } from './failures.mjs';
+import { failureKind, failureStep, standaloneNextAttemptAt } from './failures.mjs';
 import { addWarning } from './health.mjs';
 import { occurrenceAt } from './schedule.mjs';
 import { STATES } from './state.mjs';
@@ -11,12 +11,23 @@ import { STATES } from './state.mjs';
 // A failed wake, while FAILED (an outside stop that leaves every backend stopped, ASLEEP, ends the retries): null for any other run;
 // `{ wait: true }` before its backoff (the router's own, failures.mjs); `{ held }`, why it waits (a keepAsleep pause, a nap window in
 // force); `{ retry: true }` when the check wakes it again (cause `retry`).
+// `napWindow`: a value, or a function read only when the decision needs it (a schedule is read at a retry only).
 export function failedWakeDecision(run, t, { keptAsleep = false, napWindow = false } = {}) {
   if (run?.state !== STATES.FAILED || failureStep(run) !== 'wake') return null;
   if ((standaloneNextAttemptAt(run) ?? Infinity) > t) return { wait: true };
   if (keptAsleep) return { held: 'a keepAsleep pause' };
-  if (napWindow) return { held: 'a nap window' };
+  if (typeof napWindow === 'function' ? napWindow() : napWindow) return { held: 'a nap window' };
   return { retry: true };
+}
+
+// Whether the check's reconcile must leave a failed standalone workload FAILED rather than call it recovered in state `to` (the
+// R30 review's rulings, both clouds): a failed wake whose backends are all stopped stays FAILED and is retried (nothing wakes it on
+// demand: ASLEEP would lose its awake window for one transient failure); a failure for a permission stays visible until a nap or
+// a wake succeeds. A person who wants it asleep naps or pauses it.
+export function failureKept(run, to) {
+  if (run?.state !== STATES.FAILED) return false;
+  if (failureKind(run) === 'permission') return true;
+  return to === STATES.ASLEEP && failureStep(run) === 'wake';
 }
 
 // Whether a nap window of the workload's schedule is in force at `t` (`ctx`: the check's schedules and joins). One it cannot read:

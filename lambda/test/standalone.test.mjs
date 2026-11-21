@@ -414,20 +414,43 @@ test('finding 3: a failed wake is not retried while the resource is missing, and
   assert.match(failed.error, /the resource is missing or no longer tagged dormeto:workload/);
 });
 
-test('finding 5: an outside stop that leaves every backend stopped ends the retries', async () => {
+// The R30 review's I1 (amends plan 1's "an outside stop ends the retries"): a failed wake with everything stopped stays FAILED and is retried.
+test('R30 review, I1: a wake that failed with everything stopped stays FAILED, is retried at the backoff and succeeds; a nap request ends the retries', async () => {
   const s = setup({ state: 'stopped' });
-  s.ec2.state.onStart.push(() => { s.ec2.state.instances['i-0aaa'] = 'pending'; });
-  s.store.state.run = { state: STATES.WAKING, wakeId: 'w9', wakeStartedAt: s.clock.now() };
-  await s.handler({ action: 'wake', workloadId: ID, wakeId: 'w9' });
-  // Stopped in the console.
-  s.ec2.state.instances['i-0aaa'] = 'stopped';
+  s.store.state.run = { state: STATES.FAILED, failedAt: s.clock.now(), consecutiveFailures: 1, failure: JSON.stringify({ kind: 'capacity', step: 'wake', message: 'no capacity' }) };
+  await s.handler({ action: 'check' });
+  assert.equal(s.store.state.run.state, STATES.FAILED, 'not called recovered');
   s.clock.advance(61_000);
-  await s.handler({ action: 'check' });
-  assert.deepEqual(s.causes().at(-1), [STATES.ASLEEP, 'recovered']);
-  s.clock.advance(60 * MINUTE);
-  await s.handler({ action: 'check' });
-  assert.equal(s.store.state.run.state, STATES.ASLEEP);
-  assert.equal(s.invocations.filter((i) => i.action === 'wake').length, 0);
+  assert.deepEqual((await s.handler({ action: 'check' }))[0], { workloadId: ID, state: STATES.WAKING, retry: 'requested' });
+  const { wakeId } = s.store.state.run;
+  assert.deepEqual(await s.handler({ action: 'wake', workloadId: ID, wakeId }), { state: STATES.AWAKE });
+  // A person's nap of a failed one: its release, the retries over.
+  const napped = setup({ state: 'stopped' });
+  napped.store.state.run = { state: STATES.FAILED, failedAt: napped.clock.now(), consecutiveFailures: 1, failure: JSON.stringify({ kind: 'capacity', step: 'wake', message: 'x' }) };
+  assert.deepEqual(await napped.handler({ action: 'request-nap', workloadId: ID, by: 'ana' }), { requested: true });
+  await napped.deliver(napped.queued[0]);
+  assert.deepEqual(napped.causes().at(-1), [STATES.ASLEEP, 'failed-released']);
+  napped.clock.advance(60 * MINUTE);
+  await napped.handler({ action: 'check' });
+  assert.equal(napped.invocations.filter((i) => i.action === 'wake').length, 0);
+  assert.deepEqual([s.elb.calls, napped.elb.calls], [[], []]);
+});
+
+test('R30 review, I1: a nap window holds the retry of a failed wake', async () => {
+  const s = setup({ state: 'stopped', run: { state: STATES.FAILED, failedAt: Date.UTC(2026, 10, 23, 9, 0), consecutiveFailures: 1, failure: JSON.stringify({ kind: 'capacity', step: 'wake', message: 'x' }) } });
+  s.store.state.schedules[ID] = { timeZone: 'UTC', windows: [{ kind: 'nap', days: ['mon'], start: '09:00', end: '18:00' }], by: 'ops', at: Date.UTC(2026, 10, 20) };
+  const [answer] = await s.handler({ action: 'check' });
+  assert.deepEqual([answer.state, answer.retry, answer.reason], [STATES.FAILED, 'held', 'a nap window']);
+});
+
+test('R30 review, I2: a failure for a permission stays on the run at every check, never read as recovered, until a nap or a wake succeeds', async () => {
+  const s = setup({ run: { state: STATES.FAILED, failedAt: Date.UTC(2026, 10, 23, 9, 58), consecutiveFailures: 2, failure: JSON.stringify({ kind: 'permission', step: 'nap', message: 'not authorized' }) } });
+  for (let i = 0; i < 2; i += 1) {
+    await s.handler({ action: 'check' });
+    assert.deepEqual([s.store.state.run.state, JSON.parse(s.store.state.run.failure).kind, s.store.state.run.consecutiveFailures], [STATES.FAILED, 'permission', 2]);
+    s.clock.advance(5 * MINUTE);
+  }
+  assert.deepEqual(s.causes(), []);
 });
 
 test('finding 7: a missing last point is read again at the next check', async () => {

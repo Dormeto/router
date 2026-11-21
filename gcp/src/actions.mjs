@@ -19,7 +19,7 @@
 import { k8sId } from '../../lambda/src/lib/kubernetes.mjs';
 import { describeStoredLists } from '../../lambda/src/lib/list-cache.mjs';
 import { listRouter, readPauses, rowPauses } from '../../lambda/src/lib/manager-actions.mjs';
-import { STATS_DAYS } from '../../lambda/src/lib/summary.mjs';
+import { STATS_DAYS, after } from '../../lambda/src/lib/summary.mjs';
 import { CHECK_SCHEDULE, PauseRefused } from './controller-core.mjs';
 import { isPods } from './gke.mjs';
 import { maintenanceDueOf, Refusal, standaloneRefusal } from './onboarding.mjs';
@@ -256,7 +256,9 @@ export function createActions({ controller, onboarding, store, router, lists = [
       type: shown.type,
       stats: stats && !stats.error ? { ...stats, today: wakesOnly(stats.today), total: wakesOnly(stats.total) } : stats,
     };
-    return { ...Object.fromEntries(STANDALONE_STATUS.map((key) => [key, answer[key]]).filter(([, value]) => value !== undefined)), ...(run?.resourceMissing ? { resourceMissing: true } : {}), ...view };
+    const picked = Object.fromEntries(STANDALONE_STATUS.map((key) => [key, answer[key]]).filter(([, value]) => value !== undefined));
+    // Its resource gone (the check's mark): after its backends, as AWS's.
+    return { ...(run?.resourceMissing ? after(picked, 'backends', { resourceMissing: true }) : picked), ...view };
   }
 
   // The manager's exclusions are AWS's workload pauses with an exclusionId, several per workload beside the operator's. The id is a part

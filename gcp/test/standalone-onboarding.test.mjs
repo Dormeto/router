@@ -156,11 +156,11 @@ test('the row, the status and the REST Workload of a standalone workload: AWS\'s
   assert.deepEqual(Object.keys(row), ROW_KEYS);
   assert.deepEqual([row.kind, row.resource, row.backends, row.stats7d], ['standalone', VM, ['instance'], { wakes: 1 }]);
   assert.deepEqual(Object.keys(row.settings), STANDALONE_KEYS);
-  const status = (await t.act({ action: 'status', workloadId: 'batch' })).body;
-  assert.deepEqual(Object.keys(status).slice(0, STATUS_KEYS.length), STATUS_KEYS);
-  assert.deepEqual(Object.keys(status).slice(STATUS_KEYS.length), ['schedule', 'next', 'maintenanceDue', 'joinMinutes', 'joinFrom', 'joinInherited']);
-  assert.deepEqual(status.idle.map((s) => [s.signal, s.applies, s.from]), [['cpu', true, 'default'], ['network', false, 'default'], ['metric', false, 'default']]);
-  assert.deepEqual(Object.keys(status.stats.total), ['wakes']);
+  const shownStatus = (await t.act({ action: 'status', workloadId: 'batch' })).body;
+  assert.deepEqual(Object.keys(shownStatus).slice(0, STATUS_KEYS.length), STATUS_KEYS);
+  assert.deepEqual(Object.keys(shownStatus).slice(STATUS_KEYS.length), ['schedule', 'next', 'maintenanceDue', 'joinMinutes', 'joinFrom', 'joinInherited']);
+  assert.deepEqual(shownStatus.idle.map((s) => [s.signal, s.applies, s.from]), [['cpu', true, 'default'], ['network', false, 'default'], ['metric', false, 'default']]);
+  assert.deepEqual(Object.keys(shownStatus.stats.total), ['wakes']);
   const shown = (await t.call('GET', '/v1/workloads/batch')).body;
   assert.deepEqual(Object.keys(shown), WORKLOAD_KEYS);
   assert.deepEqual([shown.kind, shown.resource], ['standalone', VM]);
@@ -169,6 +169,8 @@ test('the row, the status and the REST Workload of a standalone workload: AWS\'s
   const missing = (await t.act({ action: 'list' })).body.workloads[0];
   assert.deepEqual(Object.keys(missing).slice(Object.keys(missing).indexOf('backends'), Object.keys(missing).indexOf('backends') + 2), ['backends', 'resourceMissing']);
   assert.equal((await t.call('GET', '/v1/workloads/batch')).body.resourceMissing, true);
+  const status = (await t.act({ action: 'status', workloadId: 'batch' })).body;
+  assert.deepEqual(Object.keys(status).slice(Object.keys(status).indexOf('backends'), Object.keys(status).indexOf('backends') + 2), ['backends', 'resourceMissing']);
   assert.deepEqual(t.routeCalls(), []);
 });
 

@@ -11,7 +11,7 @@ import { healthyCount, instanceDetails, waitTargetsReleased } from './instances.
 import { createStatus } from './status.mjs';
 import { describeRules } from './no-wake.mjs';
 import { describeStoredLists } from './list-cache.mjs';
-import { failedSpec, failureError, nextAttemptAt } from './failures.mjs';
+import { failedSpec, failureError, standaloneNextAttemptAt } from './failures.mjs';
 import { createPauses, pauseHolds } from './pauses.mjs';
 import { createWakeWatch, unhealthyError } from './wake-watch.mjs';
 import { describeStopped } from './stopped.mjs';
@@ -64,9 +64,6 @@ const NAP_MAX_AGE_MS = 10 * 60_000;
 const NAP_RECHECK_MS = 60_000;
 // A rule switch throttled by ELB (its bucket of mutating calls) is tried again this long (a burst of wakes).
 const ROUTE_RETRY_MS = 180_000;
-// Between the check's retries of a standalone workload's failed wake: the first delay, doubled after each failure (at most 30
-// minutes, failures.mjs). failedRetrySeconds is the waker's and does not apply (vision standalone workloads design §3).
-const STANDALONE_RETRY_SECONDS = 60;
 
 // The pauses' store (lib/pauses.mjs) on the DynamoDB one.
 export const pauseStore = (store) => ({
@@ -659,7 +656,8 @@ export function createController({
     // A failed wake, while FAILED: an outside stop that leaves every backend stopped (ASLEEP) ends the retries.
     const failedWake = run?.state === STATES.FAILED && failureStep(run) === 'wake';
     if (failedWake) {
-      if ((nextAttemptAt({ ...cfg, failedRetrySeconds: STANDALONE_RETRY_SECONDS }, run) ?? Infinity) > t) return { state: run.state };
+      // The router's own backoff (failures.mjs): failedRetrySeconds is the waker's.
+      if ((standaloneNextAttemptAt(run) ?? Infinity) > t) return { state: run.state };
       const held = ctx?.keptAsleep?.(workloadId) ? 'a keepAsleep pause' : napWindowNow(workloadId, ctx, t) ? 'a nap window' : null;
       if (held) return { state: run.state, retry: 'held', reason: held };
       if (!(await startWake(workloadId, run, undefined, 'retry'))) return { state: (await store.getRun(workloadId))?.state ?? 'UNKNOWN' };
@@ -831,7 +829,7 @@ export function createController({
 
   // --- Manager interface: list, status, force-wake ------------------------------------------------------------------
 
-  const status = createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, kubernetesOf, now, version: router });
+  const status = createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, kubernetesOf, now, version: router, log });
   const hosts = { at: 0, byWorkload: new Map() };
   // Host of each workload: the first of its rules (found from its target group) with a host condition; one listing per
   // load balancer for all workloads, cached five minutes.
@@ -1153,6 +1151,7 @@ export function createController({
 
   async function ensureAwake(workloadId) {
     const cfg = await config(workloadId);
+    if (isStandalone(cfg)) throw standaloneRefusal(workloadId, 'it has no route to repair');
     const run = await store.getRun(workloadId);
     if (run?.state !== STATES.AWAKE) return { state: run?.state };
     if ((await healthyCount(elbv2, cfg.appTargetGroupArn)) < 1) return { state: run.state, healthy: 0 };
@@ -1185,6 +1184,7 @@ export function createController({
     if (workloadId) {
       // An exclusion names the target group it matched: another workload of the same id (another router) is not it.
       const cfg = await config(workloadId);
+      if (event.targetGroupArn && isStandalone(cfg)) throw standaloneRefusal(workloadId, 'it has no target group to exclude');
       if (event.targetGroupArn && cfg.appTargetGroupArn !== event.targetGroupArn) {
         throw new Refusal('not_found', `workload not configured: ${workloadId} (its target group is not ${event.targetGroupArn})`);
       }
@@ -1398,6 +1398,16 @@ export function createController({
     }
   }
 
+  // What a standalone workload has not (vision standalone workloads design §2, §5): refused as unsupported.
+  const standaloneRefusal = (workloadId, what) => new Refusal('unsupported', `workload ${workloadId} is a standalone workload: ${what}`);
+  const storedStandalone = async (workloadId) => typeof workloadId === 'string' && workloadId !== '' && isStandalone(await store.getConfig(workloadId));
+  // A nap window's `wake` (never, header) says what a request may do in it: nothing arrives to wake a standalone workload.
+  async function standaloneScheduleProblems({ workloadId, schedule }) {
+    if (!(await storedStandalone(workloadId)) || !Array.isArray(schedule?.windows)) return [];
+    return schedule.windows.flatMap((w, i) => (w?.kind === 'nap' && w.wake !== undefined && w.wake !== null
+      ? [`windows[${i}].wake: a standalone workload has no waiting page: nothing arrives to wake it in a nap window`] : []));
+  }
+
   // A refusal is an answer for a caller that reads them (refusals: true, the manager's), else thrown as before (vision
   // refusals design §1); the router's own invocations never send the flag.
   return async function handler(event, context) {
@@ -1430,10 +1440,15 @@ export function createController({
       case 'request-nap': return managerActions.requestNap(event);
       case 'rename': return managerActions.rename(event);
       case 'tag': return managerActions.tag(event);
-      case 'schedule': return managerActions.setSchedule(event);
+      case 'schedule': {
+        const problems = await standaloneScheduleProblems(event);
+        return problems.length ? { problems } : managerActions.setSchedule(event);
+      }
       case 'clear-schedule': return managerActions.clearSchedule(event);
       case 'settings': return managerActions.setSettings(event);
-      case 'waiting-page': return managerActions.waitingPage(event);
+      case 'waiting-page':
+        if (await storedStandalone(event.workloadId)) throw standaloneRefusal(event.workloadId, 'it has no waiting page');
+        return managerActions.waitingPage(event);
       case 'router': return routerInfo();
       case 'clusterCheck': return clusterCheck(event);
       default: throw new Refusal('unsupported', `unknown action: ${event?.action}`);

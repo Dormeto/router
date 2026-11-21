@@ -1,7 +1,8 @@
 // A workload's row for the manager (its `list` action, a check's report), as both routers answer it: AWS's here
 // (workloadSummary), Google Cloud's from Firestore (gcp/src/rows.mjs), each giving its own identity. And the daily statistics.
-import { nextAttemptAt } from './failures.mjs';
+import { nextAttemptAt, standaloneNextAttemptAt } from './failures.mjs';
 import { STATES } from './state.mjs';
+import { STANDALONE_KEYS } from './settings-levels.mjs';
 
 export const STATS_DAYS = 7;
 
@@ -95,6 +96,7 @@ export function workloadRow(cfg, run, {
 
 // AWS's row: the state table only (configuration, runtime state, rule host).
 export function workloadSummary(cfg, run = {}, host = null, stats7d = null, pauses = [], scheduled = false) {
+  if (cfg.kind === 'standalone') return standaloneSummary(cfg, run, stats7d, pauses, scheduled);
   return workloadRow(cfg, run, {
     // The workload's identity in AWS: the manager finds it from its target group.
     identity: { targetGroupArn: cfg.appTargetGroupArn },
@@ -109,4 +111,23 @@ export function workloadSummary(cfg, run = {}, host = null, stats7d = null, paus
     pauses,
     scheduled,
   });
+}
+
+// A standalone workload's row (vision standalone workloads design §5): its kind and resource as its identity; no URL, wake mode nor
+// waker counter (absent, not null); its retry the check's; its settings its kind's.
+function standaloneSummary(cfg, run, stats7d, pauses, scheduled) {
+  const row = workloadRow(cfg, run, {
+    identity: { kind: 'standalone', resourceArn: cfg.resourceArn },
+    defaultSource: 'terraform',
+    backends: run?.backendKinds ? run.backendKinds.split(',') : [],
+    hibernated: Boolean(run?.hibernated),
+    stats7d: stats7d && { wakes: stats7d.wakes },
+    pauses,
+    scheduled,
+  });
+  delete row.url;
+  delete row.wakeMode;
+  row.nextAttemptAt = iso(standaloneNextAttemptAt(run));
+  row.settings = Object.fromEntries(STANDALONE_KEYS.map((key) => [key, cfg[key]]));
+  return row;
 }

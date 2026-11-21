@@ -2,15 +2,32 @@
 // admin page (waker) and by the controller `status` action (manager).
 import { recommendations } from './advice.mjs';
 import { failureOf, fallbacksOf } from './summary.mjs';
-import { nextAttemptAt } from './failures.mjs';
+import { nextAttemptAt, standaloneNextAttemptAt } from './failures.mjs';
 import { STATES } from './state.mjs';
 import { conditionsOf, currentTarget, routeOf } from './route.mjs';
 import { resolveRules } from './rules.mjs';
 import { instanceStates } from './instances.mjs';
-import { backendKey, backendStatuses, resolveBackends } from './backends.mjs';
+import { backendKey, backendStatuses, isResourceOf, resolveBackends, standaloneStatuses } from './backends.mjs';
 import { lastRequestAt } from './metrics.mjs';
+import { METRIC_LAG_MS, PERIOD_MS, createIdleSignals, idleWindow } from './activity.mjs';
+import { STANDALONE_KEYS } from './settings-levels.mjs';
 
 const CHECK_PERIOD_MS = 5 * 60_000;
+// The setting each idle signal's threshold is.
+const SIGNAL_SETTINGS = { cpu: 'idleCpuPercent', network: 'idleNetworkBytes', metric: 'idleMetric' };
+
+// A standalone workload's nap estimate (vision standalone workloads design §4): the first check whose idle window starts once every
+// applying signal is under and the workload awake (its window ends 10 minutes behind, at a 5-minute boundary); null when none
+// applies, a read failed or a signal's last point is missing (no estimate can be made then).
+export function standaloneNapEstimate({ signals, window, run, now }) {
+  if (run.state !== STATES.AWAKE) return null;
+  const applying = signals.filter((s) => s.applies);
+  if (!applying.length || applying.some((s) => s.reason || (s.underSince === null && (s.value === null || s.value < s.below)))) return null;
+  const length = window.endMs - window.startMs;
+  const from = Math.max(run.awakeSince ?? now, ...applying.map((s) => (s.underSince !== null && s.underSince <= window.startMs ? window.startMs : s.underSince ?? window.endMs)));
+  const eligibleAt = Math.ceil((from + length) / PERIOD_MS) * PERIOD_MS + METRIC_LAG_MS;
+  return { eligibleAt, latestAt: eligibleAt + CHECK_PERIOD_MS, inSeconds: Math.max(0, Math.ceil((eligibleAt - now) / 1000)) };
+}
 
 export function napEstimate({ cfg, run, lastRequest, now }) {
   if (run.state !== STATES.AWAKE) return null;
@@ -20,11 +37,73 @@ export function napEstimate({ cfg, run, lastRequest, now }) {
 
 const iso = (ms) => (typeof ms === 'number' && ms > 0 ? new Date(ms).toISOString() : null);
 
-export function createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, kubernetesOf, now = Date.now, version = {} }) {
+export function createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging, appscaling, rds, kubernetesOf, now = Date.now, version = {}, log = { info() {}, warn() {}, error() {} } }) {
   const clients = { ec2, elbv2, autoscaling, ecs, tagging, appscaling, rds, kubernetesOf };
+  const readIdleSignals = createIdleSignals({ cloudwatch, log });
+
+  // A standalone workload's (design §4, §5): its kind and resource, its idle signals with the level of each threshold and the nap
+  // estimate from them, its backends; no route, rule, target, holder, request or list (absent, not null).
+  async function standaloneStatus(workloadId, cfg, run, { pauses, drift, loadStats, loadHibernation }) {
+    const t = now();
+    const resolved = await resolveBackends(clients, cfg);
+    const instanceIds = resolved.backends.filter((b) => b.kind === 'instance').map((b) => b.id);
+    const window = idleWindow(cfg, t);
+    const [statuses, instances, signals, hibernation] = await Promise.all([
+      standaloneStatuses(clients, resolved.backends),
+      instanceIds.length ? instanceStates(ec2, instanceIds) : {},
+      readIdleSignals(cfg, resolved.backends, window),
+      loadHibernation ? loadHibernation(instanceIds) : null,
+    ]);
+    const nap = pauses.length ? null : standaloneNapEstimate({ signals, window, run, now: t });
+    const stats = loadStats ? await loadStats().catch((err) => ({ error: err.message })) : null;
+    // Its wakes only: nothing is ignored nor deferred without a waker.
+    const wakesOnly = (period) => (period ? { wakes: period.wakes ?? {} } : period);
+    return {
+      workloadId,
+      name: cfg.name ?? workloadId,
+      kind: 'standalone',
+      resourceArn: cfg.resourceArn,
+      router: { version: version.version ?? 'unknown', build: version.build ?? 'unknown' },
+      source: cfg.source ?? 'terraform',
+      tags: cfg.tags ?? {},
+      state: run.state,
+      stateAt: iso(run.stateAt),
+      drift,
+      updatedAt: iso(run.updatedAt),
+      awakeSince: iso(run.awakeSince),
+      wakeStartedAt: iso(run.wakeStartedAt),
+      failedAt: iso(run.failedAt),
+      failure: failureOf(run),
+      consecutiveFailures: run.consecutiveFailures ?? 0,
+      nextAttemptAt: iso(standaloneNextAttemptAt(run)),
+      fallbacks: fallbacksOf(run),
+      wakeCount: run.wakeCount ?? 0,
+      pendingWake: run.pendingWake === true,
+      pauses,
+      idle: signals.map((s) => ({ ...s, underSince: iso(s.underSince), from: cfg.settingsFrom?.[SIGNAL_SETTINGS[s.signal]] ?? null })),
+      nap: nap && { eligibleAt: iso(nap.eligibleAt), latestAt: iso(nap.latestAt), inSeconds: nap.inSeconds },
+      discovery: resolved.mode,
+      instances: instanceIds.map((id) => ({ id, state: instances[id] ?? 'unknown' })),
+      ...(hibernation ? { hibernation } : {}),
+      backends: resolved.backends.map((b) => {
+        const status = statuses[backendKey(b)];
+        if (b.kind === 'asg') return { kind: 'asg', id: b.name, status, min: b.min, max: b.max, desired: b.desired, warmPool: b.warmPool };
+        if (b.kind === 'ecs') return { kind: 'ecs', id: b.id, status, desired: b.desired, scalable: b.scalable };
+        // A database is a companion unless it is the workload's own resource.
+        if (b.kind.startsWith('rds-')) return { kind: b.kind, id: b.id, status, ...(isResourceOf(cfg, b) ? {} : { companion: true }) };
+        return { kind: 'instance', id: b.id, status };
+      }),
+      ignoredTargets: resolved.ignored,
+      recommendations: recommendations(resolved.backends),
+      settings: Object.fromEntries(STANDALONE_KEYS.map((key) => [key, cfg[key]])),
+      ...(cfg.settingsFrom ? { settingsFrom: cfg.settingsFrom, type: cfg.type } : {}),
+      stats: stats && !stats.error ? { ...stats, today: wakesOnly(stats.today), total: wakesOnly(stats.total) } : stats,
+    };
+  }
   // Extras that depend on the caller: router rules, wake rules, statistics and IP lists loaders, and the hibernation's
   // (given the standalone instances, never failing; the controller's status only).
   return async function status(workloadId, cfg, run, { pauses = [], drift = [], noWakeRules = [], wakeRules = [], loadStats = null, loadLists = null, loadHibernation = null } = {}) {
+    if (cfg.kind === 'standalone') return standaloneStatus(workloadId, cfg, run, { pauses, drift, loadStats, loadHibernation });
     const t = now();
     const resolved = await resolveBackends(clients, cfg);
     const instanceIds = resolved.backends.filter((b) => b.kind === 'instance').map((b) => b.id);

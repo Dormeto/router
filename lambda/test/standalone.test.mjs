@@ -61,7 +61,7 @@ function idleCloudWatch(values = {}) {
 }
 
 // kind: the resource's; state: AWS's at the start ('running' or 'stopped'); companion: an RDS instance beside it.
-function setup({ kind = 'instance', state = 'running', run = { state: state === 'running' ? STATES.AWAKE : STATES.ASLEEP }, companion = false, cfg: overrides = {}, metrics = { cpu: () => 1 }, queue = true, start } = {}) {
+function setup({ kind = 'instance', state = 'running', run = { state: state === 'running' ? STATES.AWAKE : STATES.ASLEEP }, companion = false, cfg: overrides = {}, metrics = { cpu: () => 1 }, queue = true, start, publisher } = {}) {
   const clock = fakeClock(start ?? Date.UTC(2026, 10, 23, 10, 0));
   const running = state === 'running';
   const cfg = { workloadId: ID, kind: 'standalone', resourceArn: ARNS[kind], name: 'Batch', tags: {}, databases: companion ? [{ kind: 'rds-instance', id: 'side' }] : [], source: 'manager', inherits: STANDALONE_KEYS, ...overrides };
@@ -95,7 +95,7 @@ function setup({ kind = 'instance', state = 'running', run = { state: state === 
   const handler = createController({
     store: wrapped, ec2, elbv2: elb.client, cloudwatch, autoscaling, ecs, tagging, appscaling: fakeAppScaling(), rds,
     invokeSelf: async (payload) => { invocations.push(payload); }, ...(queue ? { queueWork: async (m) => { queued.push(m); } } : {}),
-    now: clock.now, sleep: clock.sleep, newId: () => `w${++ids}`, log, router: { name: 'dmt-dev' },
+    now: clock.now, sleep: clock.sleep, newId: () => `w${++ids}`, log, router: { name: 'dmt-dev' }, ...(publisher ? { publisher } : {}),
   });
   const deliver = (m) => handler({ Records: [{ messageId: 'm', eventSource: 'aws:sqs', body: JSON.stringify(m) }] });
   const causes = () => changes.map((c) => [c.to, c.cause ?? null]);
@@ -454,4 +454,95 @@ test('finding 9: the retry\'s backoff is the router\'s own for a standalone work
   s.ec2.state.instances['i-0aaa'] = 'pending';
   s.clock.advance(61_000);
   assert.deepEqual(await s.handler({ action: 'check' }), [{ workloadId: ID, state: STATES.WAKING, retry: 'requested' }]);
+});
+
+// --- R26: rows, status, events and refusals of a standalone workload --------------------------------------------------------
+
+const ROW_KEYS = ['workloadId', 'name', 'kind', 'resourceArn', 'source', 'tags', 'state', 'stateAt', 'wakeCount', 'awakeSince', 'wakeStartedAt', 'failedAt', 'failure',
+  'consecutiveFailures', 'nextAttemptAt', 'updatedAt', 'pendingWake', 'backends', 'pauses', 'stats7d', 'type', 'settingsFrom', 'settings'];
+
+test('a standalone row: its kind and resource, no url, target group, wake mode nor waker counters; its settings its kind\'s', async () => {
+  const s = setup();
+  await s.handler({ action: 'check' });
+  const { workloads: [row] } = await s.handler({ action: 'list' });
+  assert.deepEqual(Object.keys(row), ROW_KEYS);
+  assert.deepEqual([row.kind, row.resourceArn, row.backends], ['standalone', ARNS.instance, ['instance']]);
+  assert.deepEqual(row.stats7d, { wakes: 0 });
+  assert.deepEqual(row.settings, { idleMinutes: 120, wakeTimeoutSeconds: 600, idleCpuPercent: 5, idleNetworkBytes: 'off', idleMetric: 'off' });
+  assert.deepEqual(Object.keys(row.settingsFrom), STANDALONE_KEYS);
+  assert.equal(row.type, 'instance');
+  assert.deepEqual(s.elb.calls, []);
+});
+
+const STATUS_KEYS = ['workloadId', 'name', 'kind', 'resourceArn', 'router', 'source', 'tags', 'state', 'stateAt', 'drift', 'updatedAt', 'awakeSince', 'wakeStartedAt', 'failedAt',
+  'failure', 'consecutiveFailures', 'nextAttemptAt', 'fallbacks', 'wakeCount', 'pendingWake', 'pauses', 'idle', 'nap', 'discovery', 'instances', 'hibernation', 'backends',
+  'ignoredTargets', 'recommendations', 'settings', 'settingsFrom', 'type', 'stats'];
+
+test('a standalone status: its signals with their levels, the nap estimate from them, its backends; no route, rule, target, holder or list', async () => {
+  // CPU over at 09:20 (the window's points are 07:50 to 09:45): under since 09:25.
+  const s = setup({ metrics: { cpu: (t) => (t === Date.UTC(2026, 10, 23, 9, 20) ? 40 : 1) }, cfg: { idleNetworkBytes: 1000, inherits: ['idleMinutes', 'wakeTimeoutSeconds', 'idleCpuPercent', 'idleMetric'] } });
+  await s.store.putRouterSettings({ defaults: { idleCpuPercent: 10 }, by: 'ops', at: 1 });
+  const status = await s.handler({ action: 'status', workloadId: ID });
+  const own = Object.keys(status).filter((k) => !STATUS_KEYS.includes(k));
+  assert.deepEqual(Object.keys(status).filter((k) => STATUS_KEYS.includes(k)), STATUS_KEYS);
+  // The rest is the schedule's view, as for an HTTP workload.
+  assert.deepEqual(own, ['schedule', 'next', 'maintenanceDue', 'joinMinutes', 'joinFrom', 'joinInherited']);
+  assert.deepEqual([status.kind, status.resourceArn, status.discovery], ['standalone', ARNS.instance, 'standalone']);
+  assert.deepEqual(status.idle, [
+    { signal: 'cpu', below: 10, value: 1, underSince: '2026-11-23T09:25:00.000Z', applies: true, from: 'router' },
+    { signal: 'network', below: 1000, value: null, underSince: null, applies: true, from: 'workload' },
+    { signal: 'metric', below: null, value: null, underSince: null, applies: false, reason: 'off', from: 'default' },
+  ]);
+  // Its network has no point: no estimate.
+  assert.equal(status.nap, null);
+  assert.deepEqual(status.backends, [{ kind: 'instance', id: 'i-0aaa', status: 'running' }]);
+  assert.deepEqual(status.settings, { idleMinutes: 120, wakeTimeoutSeconds: 600, idleCpuPercent: 10, idleNetworkBytes: 1000, idleMetric: 'off' });
+  assert.deepEqual(Object.keys(status.stats ?? {}).filter((k) => ['today', 'total'].includes(k)).map((k) => Object.keys(status.stats[k])), [['wakes'], ['wakes']]);
+  assert.deepEqual(s.elb.calls, []);
+});
+
+test('the nap estimate of a standalone status: the first check whose window finds every signal under, its awake time included', async () => {
+  const s = setup({ metrics: { cpu: (t) => (t === Date.UTC(2026, 10, 23, 9, 20) ? 40 : 1) } });
+  const { nap } = await s.handler({ action: 'status', workloadId: ID });
+  // Under since 09:25: a window starting there ends at 11:25, read 10 minutes later.
+  assert.deepEqual(nap, { eligibleAt: '2026-11-23T11:35:00.000Z', latestAt: '2026-11-23T11:40:00.000Z', inSeconds: 95 * 60 });
+  const recent = setup({ run: { state: STATES.AWAKE, awakeSince: Date.UTC(2026, 10, 23, 9, 2) } });
+  assert.deepEqual((await recent.handler({ action: 'status', workloadId: ID })).nap.eligibleAt, '2026-11-23T11:15:00.000Z');
+  const asleep = setup({ state: 'stopped' });
+  assert.equal((await asleep.handler({ action: 'status', workloadId: ID })).nap, null);
+});
+
+test('refused for a standalone workload: ensure-awake, the waiting page, a pause\'s exclusion by target group, a nap window\'s wake', async () => {
+  const s = setup();
+  const refusal = (message) => ({ refused: { code: 'unsupported', message } });
+  assert.deepEqual(await s.handler({ action: 'ensure-awake', workloadId: ID, refusals: true }), refusal(`workload ${ID} is a standalone workload: it has no route to repair`));
+  await assert.rejects(s.handler({ action: 'ensure-awake', workloadId: ID }), { message: `workload ${ID} is a standalone workload: it has no route to repair` });
+  for (const op of ['get', 'put', 'delete']) {
+    assert.deepEqual(await s.handler({ action: 'waiting-page', op, workloadId: ID, page: {}, by: 'ana', refusals: true }), refusal(`workload ${ID} is a standalone workload: it has no waiting page`), op);
+  }
+  assert.deepEqual(await s.handler({ action: 'pause', workloadId: ID, by: 'ops', reason: 'x', exclusionId: 'e1', targetGroupArn: 'arn:aws:elasticloadbalancing:eu-west-1:111122223333:targetgroup/x/1', refusals: true }),
+    refusal(`workload ${ID} is a standalone workload: it has no target group to exclude`));
+  const schedule = (wake) => ({ timeZone: 'UTC', windows: [{ kind: 'awake', days: ['mon'], start: '08:00', end: '18:00' }, { kind: 'nap', days: ['sat'], start: '00:00', end: '23:00', ...(wake ? { wake } : {}) }] });
+  assert.deepEqual(await s.handler({ action: 'schedule', workloadId: ID, schedule: schedule('header'), by: 'ana' }),
+    { problems: ['windows[1].wake: a standalone workload has no waiting page: nothing arrives to wake it in a nap window'] });
+  assert.equal((await s.handler({ action: 'schedule', workloadId: ID, schedule: schedule(), by: 'ana' })).schedule.windows.length, 2);
+  assert.deepEqual(s.elb.calls, []);
+});
+
+test('a standalone workload is reported to the manager once onboarded (Workload listed), and its nap and wake events carry what HTTP ones do', async () => {
+  const listed = [];
+  const changes = [];
+  const publisher = { enabled: true, checked: async () => {}, stateChanged: async (c) => { changes.push(c); }, listed: async (l) => { listed.push(l); } };
+  const s = setup({ publisher });
+  assert.deepEqual(await s.handler({ action: 'report', workloadId: ID }), { reported: true });
+  assert.deepEqual([listed.length, listed[0].workload.kind, listed[0].workload.resourceArn, 'url' in listed[0].workload], [1, 'standalone', ARNS.instance, false]);
+  await s.handler({ action: 'nap', workloadId: ID });
+  const asleep = s.changes.find((c) => c.to === STATES.ASLEEP);
+  assert.deepEqual(asleep.stopped, [{ kind: 'ec2', type: 't3.medium', count: 1, os: 'Linux' }]);
+  s.store.state.run = { ...s.store.state.run, state: STATES.WAKING, wakeId: 'w9', wakeStartedAt: s.clock.now() };
+  await s.handler({ action: 'wake', workloadId: ID, wakeId: 'w9' });
+  assert.equal(typeof s.changes.find((c) => c.to === STATES.AWAKE).durationMs, 'number');
+  // The check's report too.
+  await s.handler({ action: 'check' });
+  assert.deepEqual(s.elb.calls, []);
 });

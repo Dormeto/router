@@ -65,6 +65,11 @@ export const failureError = (kind, message) => Object.assign(new Error(message),
 const RETRY_MAX_MS = 30 * 60_000;
 export const retryDelayMs = (cfg, run) => Math.min((cfg.failedRetrySeconds ?? 60) * 1000 * 2 ** (Math.max(1, run?.consecutiveFailures ?? 1) - 1), RETRY_MAX_MS);
 
+// A standalone workload's failed wake (vision standalone workloads design §3): retried by the check while FAILED, the router's own
+// first delay doubled as above (failedRetrySeconds is the waker's and does not apply).
+export const STANDALONE_RETRY_SECONDS = 60;
+export const standaloneNextAttemptAt = (run) => (run?.state === 'FAILED' ? (run.failedAt ?? 0) + retryDelayMs({ failedRetrySeconds: STANDALONE_RETRY_SECONDS }, run) : null);
+
 // When a request may retry a failed wake (ms), or null when the workload has not failed. A failed workload back to
 // ASLEEP (released after its idle window, or found stopped at a check) keeps its failure until a successful wake, and
 // backs off as well: otherwise a waiting page left open would start it again at once, every time.

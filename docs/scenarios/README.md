@@ -1,9 +1,11 @@
 # Supported scenarios
 
 What the router naps and wakes, as of router 0.41.0. Router 0.40.0 adds what the Google Cloud pages say
-beyond 0.37.0, and the manager page. A **workload** is an Application Load Balancer target group and
-the backends behind it: the router naps them together once the target group has had no request for the idle window, and
-wakes them on the next request. Each page below gives the scenario's diagram, the services it uses, its measured wake
+beyond 0.37.0, and the manager page. A workload is of one of two kinds. An **HTTP workload** is an Application Load
+Balancer target group and the backends behind it: the router naps them together once the target group has had no request
+for the idle window, and wakes them on the next request. A **standalone workload** is one stoppable resource no load
+balancer serves, napped when its metrics stay idle, by a schedule or by a person, and never woken on demand: see
+[Standalone workloads](standalone.md) (Not released yet: router 0.42.0). The rest of this page is an HTTP workload's. Each page below gives the scenario's diagram, the services it uses, its measured wake
 time, its behavior and its limits.
 
 | Scenario | What naps | Measured wake | Default wake timeout |
@@ -12,6 +14,7 @@ time, its behavior and its limits.
 | [Auto Scaling groups](auto-scaling-groups.md) | Group scaled to 0, then given back its size | 35–44 s with a stopped warm pool, 41–51 s without | 600 s |
 | [ECS services](ecs-services.md) | Desired count 0, Application Auto Scaling suspended | 25–57 s on Fargate | 600 s |
 | [RDS and Aurora databases](databases.md) | Stopped after the application, started before it | 6–15 min with PostgreSQL | 1800 s |
+| [Standalone workloads](standalone.md) | An EC2 instance, an Auto Scaling group, an ECS service or a database with no load balancer, stopped when its idle signals stay under their thresholds | No request wakes it: a schedule or a person, within the wake timeout | 600 s, 1800 s with a database |
 | [Kubernetes on EKS](kubernetes.md) | Deployment or StatefulSet scaled to 0 | 22–26 s on EC2 nodes, 62–74 s on Fargate | 600 s |
 | [Google Cloud: Compute Engine VMs](google-cloud-compute-engine.md) | VMs of groups or zonal NEGs suspended or stopped, then resumed or started, behind a global, regional, classic or internal load balancer | 13–25 s after a resume, 37–41 s after a start (Compute Engine's part); through a regional load balancer 62 s from `POST /_dormeto/wake`, a classic one 2 min 16 s (a resume) | 600 s |
 | [Google Cloud: Cloud SQL databases](google-cloud-sql.md) | Activation policy `NEVER` after the application, `ALWAYS` before it | 9.2 min through the router with a `db-f1-micro` companion, 9.4 min for its start alone (one run each) | 1700 s |

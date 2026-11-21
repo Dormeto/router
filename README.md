@@ -12,7 +12,7 @@ Data plane of [Dormeto](https://dormeto.com) ("nap" in Esperanto): it puts idle 
 sleep and wakes them just-in-time on the next request.
 
 **[Supported scenarios](docs/scenarios/README.md):** EC2 instances, Auto Scaling groups, ECS services, RDS and Aurora
-databases, Kubernetes on EKS, and on Google Cloud Compute Engine VMs, Cloud SQL databases and Kubernetes on GKE, each with
+databases, standalone workloads, Kubernetes on EKS, and on Google Cloud Compute Engine VMs, Cloud SQL databases and Kubernetes on GKE, each with
 its diagram, services, measured wake time, behavior and limits.
 
 On AWS the router is two Lambda functions for the workloads behind an Application Load Balancer (on Google Cloud, [two Cloud
@@ -23,6 +23,13 @@ Run services](#google-cloud) of the same two roles):
 - `controller` Lambda: switches the ALB rule weights, naps idle workloads (scheduled check of the ALB `RequestCount`) and
   wakes them: it stops and starts EC2 instances and databases, scales Auto Scaling groups, ECS services and Kubernetes
   Deployments to 0 and back, and reconciles external changes.
+
+**Standalone workloads** (Not released yet: router 0.42.0): a workload may also be one EC2 instance, Auto Scaling group, ECS
+service, RDS instance or Aurora cluster that no load balancer serves (its configuration has `kind: "standalone"` and
+`resourceArn`). It naps when its idle signals (CPU, network, a CloudWatch metric of your own) stay under their thresholds
+for its idle window (120 minutes by default), on a schedule or on a person's word, and wakes on a schedule or on a person's
+word: nothing wakes it on demand, and it has no waker target group, rule or waiting page. See
+[Standalone workloads](docs/scenarios/standalone.md). The rest of this section is an HTTP workload's.
 
 A workload is identified by its **application target group**. Its **rules** are every listener rule of the target
 group's load balancer that forwards to it, found at each nap, wake and idle check: a nap switches all of them to the waker
@@ -484,7 +491,10 @@ removes those of manager workloads; the `workload` module only forgets its own, 
 the configuration and covers every rule forwarding to the target group; each step finds what exists first, and a failed
 onboarding of a new workload is undone. Offboarding (the workload awake) removes only what onboarding added: shadows,
 rules back to a plain forward, waker target group, permission, the tags carrying the marker, the configuration. A
-workload written by the `workload` module is refused (remove the module instead).
+workload written by the `workload` module is refused (remove the module instead). A standalone workload (Not released
+yet: router 0.42.0) is onboarded from its resource: `preview` and `onboard` take `resourceArn` in place of `targetGroupArn`,
+and tag the resource and its databases; the reasons a resource cannot be one are on
+[its page](docs/scenarios/standalone.md#what-can-be-standalone).
 
 **Workload tags (router 0.30.0):** Dormeto's own labels on a workload, key and value (`team = payments`, `env = staging`),
 never AWS tags: the manager groups workloads and grants access by them. At most 50 per workload; a key of 1 to 128
@@ -568,7 +578,7 @@ Design: `docs/specs/2026-10-03-mvp-alb-ec2-design.md` in the Dormeto/vision repo
 | `lambda/test` | Unit tests (`node --test`) |
 | `gcp/src`, `gcp/test` | The Google Cloud router's two Cloud Run roles (waker, controller) on that library, and their unit tests |
 | `terraform/modules/router` | DynamoDB table, Lambdas, IAM, idle check schedule |
-| `terraform/modules/workload` | Waker target group and workload configuration |
+| `terraform/modules/workload` | Waker target group and workload configuration; a standalone workload's configuration from `resource_arn` |
 | `terraform/dev` | `dev` environment: demo VPC, ALB, EC2 on `dev.dormeto.com`, router wiring |
 | `scripts/e2e.sh` | End-to-end acceptance against `dev` |
 | `kubernetes/dormeto-router.yaml` | The rights of the group `dormeto:router` in an EKS cluster (ClusterRole, binding, admission policy) |

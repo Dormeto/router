@@ -51,10 +51,10 @@ export function resourceKindOf(arn) {
 }
 
 // The database whose connections say a standalone workload of the type databases is idle: its resource when it is one, else
-// its first companion; null without one.
+// its first companion; null without one. `own`: the resource is the database.
 function databaseOf(cfg) {
   const own = resourceKindOf(cfg?.resourceArn);
-  if (own?.kind.startsWith('rds-')) return own;
+  if (own?.kind.startsWith('rds-')) return { ...own, own: true };
   const companion = Array.isArray(cfg?.databases) ? cfg.databases.find((db) => isObject(db) && typeof db.id === 'string') : null;
   return companion ? { kind: companion.kind === 'rds-cluster' ? 'rds-cluster' : 'rds-instance', id: companion.id } : null;
 }
@@ -64,11 +64,14 @@ const connectionsOf = (database) => ({
 });
 
 // Each key's built-in value for a kind and a built-in type. A standalone workload of the type databases: the slow start's wake
-// timeout, CPU off (an idle database's CPU is not near zero) and its database's connections under 1.
+// timeout and its database's connections under 1; CPU off only when its own resource is the database (an idle database's CPU
+// is not near zero): a server with a companion database keeps its CPU signal, and both must be idle (design §4).
 function builtInsOf(kind, typeName, database) {
   if (kind !== 'standalone') return Object.fromEntries(SCALAR_KEYS.map((key) => [key, TYPE_BUILT_IN[typeName]?.[key] ?? BUILT_IN[key]]));
   if (typeName !== 'databases') return { ...STANDALONE_BUILT_IN };
-  return { ...STANDALONE_BUILT_IN, ...TYPE_BUILT_IN.databases, idleCpuPercent: 'off', idleMetric: database ? connectionsOf(database) : 'off' };
+  return {
+    ...STANDALONE_BUILT_IN, ...TYPE_BUILT_IN.databases, ...(database?.own ? { idleCpuPercent: 'off' } : {}), idleMetric: database ? connectionsOf(database) : 'off',
+  };
 }
 
 // Derived from the kinds the last check found, else from the configuration: databases first (the slow start decides). A

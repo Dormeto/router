@@ -43,16 +43,16 @@ test('resolveSettings for a standalone workload: each key from the most specific
   assert.deepEqual(resolveSettings({ kind: 'standalone' }).values, STANDALONE_BUILT_IN);
 });
 
-test('the type databases: CPU off, the database\'s connections under 1, the slow start\'s wake timeout', () => {
+test('the type databases: the database\'s connections under 1, the slow start\'s wake timeout; CPU off when the resource is the database', () => {
   const values = (cfg) => effectiveConfig(cfg, {});
   const own = values(standalone({ resourceArn: DB_ARN }));
   assert.deepEqual(own.type, { name: 'databases', from: 'backends' });
   assert.deepEqual([own.idleCpuPercent, own.idleNetworkBytes, own.idleMetric, own.wakeTimeoutSeconds, own.idleMinutes], ['off', 'off', connections({ DBInstanceIdentifier: 'orders' }), 1800, 120]);
   assert.equal(own.settingsFrom.idleMetric, 'default');
   assert.deepEqual(values(standalone({ resourceArn: CLUSTER_ARN })).idleMetric, connections({ DBClusterIdentifier: 'ledger' }));
-  // A server with a companion database: its database's connections.
+  // A server with a companion database keeps its CPU signal and gains its database's connections: both must be idle.
   const companion = values(standalone({ databases: [{ kind: 'rds-cluster', id: 'ledger' }] }));
-  assert.deepEqual([companion.type.name, companion.idleCpuPercent, companion.idleMetric], ['databases', 'off', connections({ DBClusterIdentifier: 'ledger' })]);
+  assert.deepEqual([companion.type.name, companion.idleCpuPercent, companion.idleMetric], ['databases', 5, connections({ DBClusterIdentifier: 'ledger' })]);
   // A level's value wins over the type's built-in one.
   const set = effectiveConfig(standalone({ resourceArn: DB_ARN }), { router: { defaults: { idleCpuPercent: 10, idleMetric: 'off' } } });
   assert.deepEqual([set.idleCpuPercent, set.idleMetric, set.settingsFrom.idleMetric], [10, 'off', 'router']);

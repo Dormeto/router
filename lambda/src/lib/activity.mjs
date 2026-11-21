@@ -176,3 +176,7 @@ export function isIdle(signals, window) {
   const applying = (signals ?? []).filter((s) => s.applies);
   return applying.length > 0 && applying.every((s) => s.underSince !== null && s.underSince <= window.startMs);
 }
+
+// Both clouds' (Google Cloud's reader, gcp/src/idle-signals.mjs): a signal's measure from its series' points, and a signal that does
+// not apply.
+export { measured as measureSignal, notApplying };

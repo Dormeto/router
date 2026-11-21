@@ -37,11 +37,13 @@ export async function discoverEcsServices({ ecs, tagging, appscaling }, cfg, wak
   const described = await describe(ecs, candidates);
   const managed = [];
   const ignored = [];
+  // A standalone workload's service is the one its record names (vision standalone workloads design §5).
+  const standalone = cfg.kind === 'standalone';
   for (const { id } of candidates) {
     const service = described.get(id);
     if (!service) continue;
-    if (!(service.loadBalancers ?? []).some((lb) => lb.targetGroupArn === cfg.appTargetGroupArn)) {
-      ignored.push({ id, reason: 'ECS service does not feed the target group' });
+    if (standalone ? service.serviceArn !== cfg.resourceArn : !(service.loadBalancers ?? []).some((lb) => lb.targetGroupArn === cfg.appTargetGroupArn)) {
+      ignored.push({ id, reason: standalone ? 'ECS service is not the workload\'s resource' : 'ECS service does not feed the target group' });
       continue;
     }
     managed.push(service);

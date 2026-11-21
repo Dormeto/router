@@ -11,16 +11,17 @@ import { healthyCount, instanceDetails, waitTargetsReleased } from './instances.
 import { createStatus } from './status.mjs';
 import { describeRules } from './no-wake.mjs';
 import { describeStoredLists } from './list-cache.mjs';
-import { failedSpec, failureError } from './failures.mjs';
+import { failedSpec, failureError, nextAttemptAt } from './failures.mjs';
 import { createPauses, pauseHolds } from './pauses.mjs';
 import { createWakeWatch, unhealthyError } from './wake-watch.mjs';
 import { describeStopped } from './stopped.mjs';
 import { revertInstanceTypes } from './capacity.mjs';
-import { ENDED_DAYS_DEFAULT, maintenanceDue } from './schedule.mjs';
-import { createScheduleCheck, scheduleKeeps as keptBySchedule } from './check-schedules.mjs';
+import { ENDED_DAYS_DEFAULT, maintenanceDue, occurrenceAt } from './schedule.mjs';
+import { createScheduleCheck, joinOf, scheduleKeeps as keptBySchedule } from './check-schedules.mjs';
 import { runCheck } from './check-run.mjs';
 import { STATS_DAYS, createCount, totals, workloadSummary } from './summary.mjs';
 import { lastRequestAt } from './metrics.mjs';
+import { METRIC_LAG_MS, createIdleSignals, idleWindow, isIdle } from './activity.mjs';
 import { checkScope } from './check-scope.mjs';
 import { addWarning, healthOf, lambdaMetrics, pausesUnreadable, queueDepths } from './health.mjs';
 import { pageViewOf, withWake } from './page-settings.mjs';
@@ -32,7 +33,8 @@ import { askedWake, beginWake, pendingWake as setPendingWake } from './asked-wak
 import { createManagerActions, listRouter, readActivePauses, readPauses, routerAnswer, rowPauses, scheduleView } from './manager-actions.mjs';
 import { requestListRefresh as askListRefresh } from './list-refresh.mjs';
 import {
-  backendKey, backendStatuses, isCompanion, resolveBackends, resumeBackends, sleepBackends, startCompanions, stopCompanions, toRecord, wakeBackends,
+  backendKey, backendStatuses, companionsOf, isStandalone, primariesOf, resolveBackends, resumeBackends, sleepBackends, startCompanions, stopCompanions, toRecord,
+  wakeBackends,
 } from './backends.mjs';
 
 const HEALTH_POLL_MS = 3000;
@@ -189,16 +191,19 @@ export function createController({
       });
       // Launch and placement failures end the wake when AWS reports them, not at its timeout (R7a).
       const watch = createWakeWatch(clients, records, { since: run.wakeStartedAt ?? now(), now });
-      const serving = await servingGroup(cfg);
-      while ((await healthyCount(elbv2, serving)) < 1) {
-        const seen = await watch.check();
-        if (seen) throw seen;
-        if (now() >= wakeDeadline) throw watch.capacity ?? await unhealthyError(elbv2, serving);
-        if (now() >= timing.deadline) throw new Error('wake timeout: no healthy target');  // the Lambda time budget
-        await sleep(HEALTH_POLL_MS);
+      if (isStandalone(cfg)) await untilRunning(records, watch, timing);
+      else {
+        const serving = await servingGroup(cfg);
+        while ((await healthyCount(elbv2, serving)) < 1) {
+          const seen = await watch.check();
+          if (seen) throw seen;
+          if (now() >= wakeDeadline) throw watch.capacity ?? await unhealthyError(elbv2, serving);
+          if (now() >= timing.deadline) throw new Error('wake timeout: no healthy target');  // the Lambda time budget
+          await sleep(HEALTH_POLL_MS);
+        }
       }
       if (!(await current())) return superseded();
-      await routeTo(cfg, 'app');
+      if (!isStandalone(cfg)) await routeTo(cfg, 'app');
       const durationMs = now() - (run.wakeStartedAt ?? now());
       const done = await store.transition(workloadId, {
         cond: { state: STATES.WAKING, wakeId },
@@ -222,6 +227,22 @@ export function createController({
     }
   }
 
+  // A standalone workload's readiness (vision standalone workloads design §3): every backend it woke runs, an instance running, a
+  // group with its instances in service, a service with its tasks, a database available; at its timeout, those that do not.
+  async function untilRunning(records, watch, timing) {
+    for (;;) {
+      const statuses = await backendStatuses(clients, records);
+      const waiting = records.filter((r) => statuses[backendKey(r)] !== 'running');
+      if (!waiting.length) return;
+      const seen = await watch.check();
+      if (seen) throw seen;
+      const which = waiting.map((r) => `${backendKey(r)} is ${statuses[backendKey(r)] ?? 'unknown'}`).join(', ');
+      if (now() >= timing.wakeDeadline) throw watch.capacity ?? failureError('timeout', `not every backend runs: ${which}`);
+      if (now() >= timing.deadline) throw new Error(`wake timeout: not every backend runs: ${which}`);  // the Lambda time budget
+      await sleep(HEALTH_POLL_MS);
+    }
+  }
+
   // A failed workload whose backends run for nothing is stopped like a nap and left asleep behind the waker, its failure
   // kept (the last wake failed); requests wake it again, backed off (R7a, FinOps).
   async function release(workloadId) {
@@ -230,7 +251,7 @@ export function createController({
     if (await isPaused(workloadId)) return { state: 'SKIPPED', reason: 'paused' };
     const cfg = await config(workloadId);
     const backends = await managedBackends(cfg);
-    await routeTo(cfg, 'waker', { allowIssues: true });
+    if (!isStandalone(cfg)) await routeTo(cfg, 'waker', { allowIssues: true });
     const records = await sleepBackends(clients, backends, { sleep, now, deadline: now() + STOP_TIMEOUT_MS }, await stopOptions(cfg, run));
     await revertInstanceTypes(ec2, backends.filter((b) => b.kind === 'instance').map((b) => b.id), log);
     const asleep = await store.transition(workloadId, {
@@ -258,14 +279,18 @@ export function createController({
       log.warn('NapSkipped', { workloadId, reason: 'no-instances' });
       return { state: 'SKIPPED', reason: 'no-instances' };
     }
-    // A rule the router cannot switch would send traffic to the stopped backend: no nap until it is fixed.
-    const { issues, rules } = await rulesFor(cfg);
-    if (issues.length) {
-      log.warn('NapSkipped', { workloadId, reason: 'rules not instrumented', issues: reasons(issues) });
-      return { state: 'SKIPPED', reason: 'rules not instrumented', issues: reasons(issues) };
+    // A standalone workload has no route (vision standalone workloads design §3): no rule, no favicon, no switch, no drain.
+    const routed = !isStandalone(cfg);
+    if (routed) {
+      // A rule the router cannot switch would send traffic to the stopped backend: no nap until it is fixed.
+      const { issues, rules } = await rulesFor(cfg);
+      if (issues.length) {
+        log.warn('NapSkipped', { workloadId, reason: 'rules not instrumented', issues: reasons(issues) });
+        return { state: 'SKIPPED', reason: 'rules not instrumented', issues: reasons(issues) };
+      }
+      // The nap is decided, and the route still reaches the application: the only moment its home page can be read.
+      await faviconAtNap(cfg, rules);
     }
-    // The nap is decided, and the route still reaches the application: the only moment its home page can be read.
-    await faviconAtNap(cfg, rules);
     const napping = await store.transition(workloadId, {
       cond: { state: STATES.AWAKE },
       set: { state: STATES.NAPPING, napBackends: JSON.stringify(backends.map(toRecord)) },
@@ -279,24 +304,26 @@ export function createController({
     // The instances AWS accepted to hibernate, said in the ASLEEP event.
     const hibernated = [];
     try {
-      try {
-        await routeTo(cfg, 'waker');
-      } catch (err) {
-        // A Kubernetes switch the load balancer did not apply: nothing is stopped yet, the application keeps serving
-        // (review focus 2); the next check tries again.
-        if (!kubeRouted(cfg)) throw err;
-        await routeTo(cfg, 'app', { allowIssues: true, wait: false }).catch((back) => log.error('RouteNotRestored', { workloadId, error: back.message }));
-        await store.transition(workloadId, { cond: { state: STATES.NAPPING }, set: { state: STATES.AWAKE, awakeSince: now() }, remove: ['pendingWake'], cause: 'switch-failed' });
-        log.warn('NapAborted', { workloadId, reason: err.message });
-        return { state: STATES.AWAKE, aborted: true, error: err.message };
+      if (routed) {
+        try {
+          await routeTo(cfg, 'waker');
+        } catch (err) {
+          // A Kubernetes switch the load balancer did not apply: nothing is stopped yet, the application keeps serving
+          // (review focus 2); the next check tries again.
+          if (!kubeRouted(cfg)) throw err;
+          await routeTo(cfg, 'app', { allowIssues: true, wait: false }).catch((back) => log.error('RouteNotRestored', { workloadId, error: back.message }));
+          await store.transition(workloadId, { cond: { state: STATES.NAPPING }, set: { state: STATES.AWAKE, awakeSince: now() }, remove: ['pendingWake'], cause: 'switch-failed' });
+          log.warn('NapAborted', { workloadId, reason: err.message });
+          return { state: STATES.AWAKE, aborted: true, error: err.message };
+        }
+        await sleep(cfg.drainSeconds * 1000);
       }
-      await sleep(cfg.drainSeconds * 1000);
       // Commit point: after this transition the instances are stopped even if a request arrives. A pause written since the
       // nap started aborts it, like a request.
       const paused = await isPaused(workloadId);
       const committed = !paused && (await store.transition(workloadId, { cond: { state: STATES.NAPPING, pendingWake: false }, set: { stopping: true } }));
       if (!committed) {
-        await routeTo(cfg, 'app');
+        if (routed) await routeTo(cfg, 'app');
         await store.transition(workloadId, {
           cond: { state: STATES.NAPPING },
           set: { state: STATES.AWAKE, awakeSince: now() },
@@ -311,7 +338,7 @@ export function createController({
       await sleepBackends(clients, backends, { sleep, now, deadline: now() + STOP_TIMEOUT_MS }, await stopOptions(cfg, committed, hibernated));
       // A fallback instance type is for one wake only (R7a, FinOps): stopped, an instance gets its own type back.
       await revertInstanceTypes(ec2, backends.filter((b) => b.kind === 'instance').map((b) => b.id), log);
-      if (!(await waitTargetsReleased(elbv2, cfg.appTargetGroupArn, { sleep, now, deadline: now() + RELEASE_TIMEOUT_MS, draining: !cfg.kubernetes }))) {
+      if (routed && !(await waitTargetsReleased(elbv2, cfg.appTargetGroupArn, { sleep, now, deadline: now() + RELEASE_TIMEOUT_MS, draining: !cfg.kubernetes }))) {
         log.warn('TargetsNotReleased', { workloadId });
       }
     } catch (err) {
@@ -440,7 +467,8 @@ export function createController({
   }
 
   // ctx (an idle check): its rules snapshot (what it compares; anything it changes is read again) and its clients.
-  async function reconcile(cfg, ctx = null, known = undefined) {
+  // seen: given, it gets the backends resolved (the check's idle signals read them).
+  async function reconcile(cfg, ctx = null, known = undefined, seen = {}) {
     const { workloadId } = cfg;
     let run = known === undefined ? await store.getRun(workloadId) : known;
     if (!run) return null;
@@ -472,10 +500,12 @@ export function createController({
     if (![STATES.AWAKE, STATES.ASLEEP, STATES.FAILED].includes(run.state)) return run;
 
     const backends = await managedBackends(cfg, ctx?.scope);
+    seen.backends = backends;
     const statuses = backends.length ? await backendStatuses(clients, backends) : {};
-    // The primary backends decide the state; companions (databases) follow it.
-    const primaries = backends.filter((b) => !isCompanion(b));
-    const companions = backends.filter(isCompanion);
+    // The primary backends decide the state; companions (databases) follow it. A standalone workload's primary is its resource.
+    const standalone = isStandalone(cfg);
+    const primaries = primariesOf(cfg, backends);
+    const companions = companionsOf(cfg, backends);
     // The kinds of its backends, for the manager's lists: written when they change.
     const kinds = [...new Set([...primaries, ...companions].map((b) => b.kind))].join(',');
     if (kinds !== (run.backendKinds ?? '')) {
@@ -484,7 +514,7 @@ export function createController({
     // No managed primary backend: nothing to infer (every() would be vacuously true).
     const all = (name) => primaries.length > 0 && primaries.every((b) => statuses[backendKey(b)] === name);
     const from = run.state;
-    if (from !== STATES.AWAKE && all('running') && (await healthyCount(elbv2, cfg.appTargetGroupArn)) >= 1) {
+    if (from !== STATES.AWAKE && all('running') && (standalone || (await healthyCount(elbv2, cfg.appTargetGroupArn)) >= 1)) {
       log.warn(from === STATES.FAILED ? 'FailedRecovered' : 'ExternalWake', { workloadId });
       // GitOps resetting replicas behind the waker's back (section 8 of the Kubernetes design): drift, not a visitor's wake.
       for (const b of from === STATES.ASLEEP ? primaries.filter((p) => p.kind === 'k8s') : []) {
@@ -492,7 +522,7 @@ export function createController({
       }
       if (run.napBackends) await resumeBackends(clients, JSON.parse(run.napBackends));
       else await startCompanions(clients, companions);
-      await routeTo(cfg, 'app');
+      if (!standalone) await routeTo(cfg, 'app');
       run = (await store.transition(workloadId, {
         cond: { state: from }, set: { state: STATES.AWAKE, awakeSince: now(), ...(hibernatedTooLong(run) ? { freshBoot: true } : {}) },
         remove: ['napBackends', 'napInstances', 'failure', 'consecutiveFailures', 'hibernated'],
@@ -502,7 +532,7 @@ export function createController({
     } else if (from !== STATES.ASLEEP && all('stopped')) {
       log.warn(from === STATES.FAILED ? 'FailedRecovered' : 'ExternalStop', { workloadId });
       // The backend is already stopped: the instrumented rules go to the waker whatever the issues.
-      await routeTo(cfg, 'waker', { allowIssues: true });
+      if (!standalone) await routeTo(cfg, 'waker', { allowIssues: true });
       await stopCompanions(clients, companions);
       run = (await store.transition(workloadId, { cond: { state: from }, set: { state: STATES.ASLEEP, holders: 0 }, cause: from === STATES.FAILED ? 'recovered' : 'external-stop' }))
         ?? (await store.getRun(workloadId));
@@ -517,7 +547,7 @@ export function createController({
     // Keep the route consistent with the state, for example after a Terraform apply reset the weights.
     // A FAILED workload stays behind the waker, so that requests retry the wake.
     const expected = run.state === STATES.AWAKE ? 'app' : [STATES.ASLEEP, STATES.FAILED].includes(run.state) ? 'waker' : null;
-    if (expected) {
+    if (expected && !standalone) {
       // Kubernetes changes do not reach CloudTrail: the check sees what drifted in the switching Ingress; the route repair
       // below applies it again.
       if (kubeRouted(cfg)) {
@@ -567,9 +597,11 @@ export function createController({
     // Its run read once: it tells the type (the backends' kinds), and the reconcile goes on from it.
     const known = await store.getRun(stored.workloadId);
     const cfg = await effective(stored, known, ctx?.levels);
-    const run = await reconcile(cfg, ctx, known);
+    const seen = {};
+    const run = await reconcile(cfg, ctx, known, seen);
     // Its levels unreadable (never read here): no decision on an idle window it may not have.
     if (cfg.levelsUnreadable) return { state: run?.state ?? 'UNKNOWN', settings: 'unreadable' };
+    if (isStandalone(cfg)) return checkStandalone(cfg, run, paused, ctx, seen.backends);
     // A failed workload still paying (its backends run without a healthy target: the reconcile left it FAILED) is stopped
     // once its idle window has passed since the failure (R7a, FinOps); a paused one is left for its team.
     if (run?.state === STATES.FAILED && !paused && (run.failedAt ?? 0) <= now() - cfg.idleMinutes * 60_000) {
@@ -600,6 +632,81 @@ export function createController({
     }
     const asked = await napSoon(cfg.workloadId, t);
     return asked ? { state: run.state, nap: asked } : nap(cfg.workloadId);
+  }
+
+  // A standalone workload at the check (vision standalone workloads design §3, §4): a failed wake retried after its backoff (unless a
+  // keepAsleep pause or a nap window holds it), a failed nap released after its idle window, an awake one napped when its idle
+  // signals say so for its whole idle window, read once it can be idle. A failed or missing read never naps it.
+  const readIdleSignals = createIdleSignals({ cloudwatch, log });
+  async function checkStandalone(cfg, run, paused, ctx, backends) {
+    const { workloadId } = cfg;
+    const t = now();
+    const failedWake = run && (run.state === STATES.FAILED || (run.state === STATES.ASLEEP && run.failure)) && failureStep(run) === 'wake';
+    if (failedWake) {
+      if ((nextAttemptAt(cfg, run) ?? Infinity) > t) return { state: run.state };
+      const held = ctx?.keptAsleep?.(workloadId) ? 'a keepAsleep pause' : napWindowNow(workloadId, ctx, t) ? 'a nap window' : null;
+      if (held) return { state: run.state, retry: 'held', reason: held };
+      if (!(await startWake(workloadId, run, undefined, 'retry'))) return { state: (await store.getRun(workloadId))?.state ?? 'UNKNOWN' };
+      return { state: STATES.WAKING, retry: 'requested' };
+    }
+    if (run?.state === STATES.FAILED && !paused && (run.failedAt ?? 0) <= t - cfg.idleMinutes * 60_000) {
+      if (queueWork) await queueWork({ action: 'release', workloadId, requestedAt: t });
+      else if (invokeSelf) await invokeSelf({ action: 'release', workloadId });
+      log.info('ReleaseRequested', { workloadId });
+      return { state: run.state, release: 'requested' };
+    }
+    if (!run || run.state !== STATES.AWAKE) return { state: run?.state ?? 'UNKNOWN' };
+    if (!run.awakeSince) {
+      await store.transition(workloadId, { cond: { state: STATES.AWAKE }, set: { awakeSince: t } });
+      return { state: run.state };
+    }
+    if (paused) return { state: run.state, paused: true };
+    const kept = scheduleKeeps(workloadId, ctx, t);
+    if (kept) return { state: run.state, ...kept };
+    // Awake for the whole window, and not before the signals can all be under for it.
+    const window = idleWindow(cfg, t);
+    if (run.awakeSince > window.startMs) return { state: run.state };
+    if ((run.idleNotBefore ?? 0) > t) return { state: run.state, idleNotBefore: run.idleNotBefore };
+    const signals = await readIdleSignals(cfg, backends ?? await managedBackends(cfg), window);
+    if (!isIdle(signals, window)) {
+      const idleNotBefore = idleNotBeforeOf(signals, window);
+      if (idleNotBefore === null) return { state: run.state, idle: false };
+      await store.transition(workloadId, { cond: { state: STATES.AWAKE }, set: { idleNotBefore } });
+      return { state: run.state, idle: false, idleNotBefore };
+    }
+    const asked = await napSoon(workloadId, t);
+    return asked ? { state: run.state, nap: asked } : nap(workloadId);
+  }
+
+  // The earliest check whose window can find every signal under: the window then starts at or after each one's run of points under
+  // (the window's end when its last point is not). Null when none applies or a read failed (read again at the next check).
+  function idleNotBeforeOf(signals, window) {
+    const applying = signals.filter((s) => s.applies);
+    if (!applying.length || applying.some((s) => s.reason)) return null;
+    const length = window.endMs - window.startMs;
+    const starts = applying.map((s) => (s.underSince !== null && s.underSince <= window.startMs ? window.startMs : s.underSince ?? window.endMs));
+    return Math.max(...starts) + length + METRIC_LAG_MS;
+  }
+
+  // The step the run's last failure was in (wake, nap), or null.
+  function failureStep(run) {
+    try {
+      return run?.failure ? JSON.parse(run.failure).step ?? null : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // Whether a nap window of the workload's schedule is in force: a failed wake is not retried in it. One it cannot read: none.
+  function napWindowNow(workloadId, ctx, t) {
+    const schedule = ctx?.schedules?.get(workloadId);
+    if (!schedule) return false;
+    try {
+      return occurrenceAt(schedule, t, joinOf(schedule, ctx.joins))?.kind === 'nap';
+    } catch (err) {
+      log.warn('ScheduleSkipped', { workloadId, error: err.message });
+      return false;
+    }
   }
 
   // A nap lasts minutes: queued (at most 10 at a time), else run in its own invocation, never delaying the check; null
@@ -704,8 +811,11 @@ export function createController({
   // Host of each workload: the first of its rules (found from its target group) with a host condition; one listing per
   // load balancer for all workloads, cached five minutes.
   // cachedOnly (the report after a check): the hosts the check found, none for a workload it has not reached yet.
-  async function workloadHosts(configs, { cachedOnly = false } = {}) {
+  async function workloadHosts(all, { cachedOnly = false } = {}) {
+    // A standalone workload has no host: no rule is read for it.
+    const configs = all.filter((c) => !isStandalone(c));
     if (cachedOnly || (now() - hosts.at < 5 * 60_000 && configs.every((c) => hosts.byWorkload.has(c.workloadId)))) return hosts.byWorkload;
+    if (!configs.length) return hosts.byWorkload;
     return rememberHosts(configs, await resolveRules(elbv2, configs).catch(() => new Map()), now());
   }
   // The check's own listing fills the cache as it goes (the workloads it reached): its report lists no load balancer again.
@@ -729,7 +839,7 @@ export function createController({
   async function reportWorkload({ workloadId }) {
     const cfg = await config(workloadId);
     if (!publisher.enabled) return { reported: false };
-    const found = await resolveRules(elbv2, [cfg]).catch(() => new Map());
+    const found = isStandalone(cfg) ? new Map() : await resolveRules(elbv2, [cfg]).catch(() => new Map());
     const host = (found.get(workloadId)?.rules ?? []).map(hostOf).find(Boolean) ?? null;
     hosts.byWorkload.set(workloadId, host);
     const { pauses } = await readPauses({ store, log });
@@ -973,12 +1083,15 @@ export function createController({
       // Then the loop (lib/check-run.mjs), from where the previous check stopped. The rules of the workloads, a chunk at a time in
       // the check's order, each load balancer listed once (the listing cache); backends found by tag once.
       const listing = { balancers: new Map(), listed: new Map(), tags: new Map() };
-      const ctx = { rules: new Map(), scope: checkScope(clients), schedules: readable, applied, joins, levels };
+      const ctx = { rules: new Map(), scope: checkScope(clients), schedules: readable, applied, joins, levels, keptAsleep };
       const { results, cursor } = await runCheck({
         store, workloads: configs, deadline: Math.min(started + CHECK_BUDGET_MS, budgetEnd), concurrency: CHECK_CONCURRENCY, passes, now, log,
         chunk: {
           size: CHECK_CHUNK,
-          async prepare(chunk) {
+          async prepare(all) {
+            // A standalone workload has no rules (vision standalone workloads design §5).
+            const chunk = all.filter((c) => !isStandalone(c));
+            if (!chunk.length) return;
             const listedAt = now();
             const found = await resolveRules(elbv2, chunk, listing).catch((err) => {
               log.warn('CheckRulesUnread', { error: err.message });
@@ -1076,7 +1189,8 @@ export function createController({
     let reason = run?.state !== STATES.AWAKE ? `not awake (${run?.state ?? 'UNKNOWN'})`
       : (run.awakeSince ?? 0) > requestedAt ? 'woken since it was requested' : stale;
     const recheck = !reason && !scheduled && now() - requestedAt > NAP_RECHECK_MS ? await config(workloadId) : null;
-    if (recheck && (await lastRequestAt(cloudwatch, recheck, requestedAt, now(), recheck.kubernetes ? await otherRequestGroups(recheck) : [])) !== null) {
+    // A standalone workload has no request to read again (its signals are read at each check).
+    if (recheck && !isStandalone(recheck) && (await lastRequestAt(cloudwatch, recheck, requestedAt, now(), recheck.kubernetes ? await otherRequestGroups(recheck) : [])) !== null) {
       reason = 'requests since it was requested';
     }
     if (reason) {

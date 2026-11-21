@@ -6,6 +6,7 @@ import { instanceStates, stopInstances } from './instances.mjs';
 import { discoverEcsServices, ecsRecord, ecsStatuses, resumeEcs, sleepEcs, wakeEcs } from './ecs.mjs';
 import { discoverDatabases, isCompanion, rdsStatuses, startDatabases, stopDatabases } from './rds.mjs';
 import { k8sBackend, k8sRecord, k8sStatus, resumeK8s, sleepK8s, wakeK8s } from './kubernetes.mjs';
+import { resourceKindOf } from './settings-levels.mjs';
 
 export { isCompanion };
 
@@ -51,7 +52,51 @@ function asgBackend(group) {
   };
 }
 
+// A standalone workload's (vision standalone workloads design §5): the backend its record names, while it carries the workload tag,
+// and its companions (databases) by tag; no target group. Its resource is its primary backend, a database too.
+export const isStandalone = (cfg) => cfg?.kind === 'standalone';
+export function isResourceOf(cfg, backend) {
+  const resource = resourceKindOf(cfg.resourceArn);
+  if (!resource || resource.kind !== backend.kind) return false;
+  if (backend.kind === 'asg') return backend.name === resource.id;
+  if (backend.kind === 'ecs') return backend.id === cfg.resourceArn;
+  return backend.id === resource.id;
+}
+// The backends whose states decide the workload's, and those that follow them.
+export const primariesOf = (cfg, backends) => backends.filter((b) => (isStandalone(cfg) ? isResourceOf(cfg, b) : !isCompanion(b)));
+export const companionsOf = (cfg, backends) => backends.filter((b) => (isStandalone(cfg) ? !isResourceOf(cfg, b) : isCompanion(b)));
+
+async function standaloneBackends({ ec2, autoscaling, ecs, tagging, appscaling, rds }, cfg) {
+  const resource = resourceKindOf(cfg.resourceArn);
+  const databases = rds && tagging ? await discoverDatabases({ rds, tagging }, cfg) : { backends: [], ignored: [] };
+  const ignored = [...databases.ignored];
+  const untagged = (id, tags = {}) => {
+    const workload = tags[WORKLOAD_TAG];
+    ignored.push({ id, reason: workload ? `tagged for workload ${workload}` : 'untagged' });
+    return null;
+  };
+  const own = (tags) => tags[WORKLOAD_TAG] === cfg.workloadId;
+  let primary = null;
+  if (!resource) ignored.push({ id: cfg.resourceArn ?? null, reason: 'not a resource Dormeto can nap' });
+  else if (resource.kind === 'instance') {
+    const out = await ec2.describeInstances({ InstanceIds: [resource.id] });
+    const instance = (out.Reservations ?? []).flatMap((r) => r.Instances ?? []).find((i) => i.InstanceId === resource.id);
+    const tags = tagMap(instance?.Tags);
+    primary = instance && own(tags) ? { kind: 'instance', id: resource.id } : untagged(resource.id, tags);
+  } else if (resource.kind === 'asg') {
+    const { AutoScalingGroups: [group] = [] } = await autoscaling.describeAutoScalingGroups({ AutoScalingGroupNames: [resource.id] });
+    const tags = tagMap(group?.Tags);
+    primary = group && own(tags) ? asgBackend(group) : untagged(resource.id, tags);
+  } else if (resource.kind === 'ecs') {
+    const services = ecs && tagging ? await discoverEcsServices({ ecs, tagging, appscaling }, cfg, WAKE_DESIRED_TAG) : { backends: [], ignored: [] };
+    primary = services.backends.find((b) => b.id === cfg.resourceArn) ?? untagged(cfg.resourceArn);
+  } else primary = databases.backends.find((b) => isResourceOf(cfg, b)) ?? untagged(resource.id);
+  const companions = databases.backends.filter((b) => !isResourceOf(cfg, b));
+  return { mode: 'standalone', backends: [...(primary ? [primary] : []), ...companions], ignored };
+}
+
 export async function resolveBackends({ ec2, elbv2, autoscaling, ecs, tagging, appscaling, rds, kubernetesOf }, cfg) {
+  if (isStandalone(cfg)) return standaloneBackends({ ec2, autoscaling, ecs, tagging, appscaling, rds }, cfg);
   if (cfg.kubernetes) {
     // Kubernetes objects carry no AWS tags: the owner is the one the configuration names; databases still by tag.
     const owner = await k8sBackend({ elbv2, kubernetesOf }, cfg);

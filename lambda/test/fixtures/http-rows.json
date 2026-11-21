@@ -1,0 +1,572 @@
+{
+  "awake": {
+    "list": {
+      "router": {
+        "name": "dmt-dev",
+        "version": "0.41.0",
+        "build": "b1",
+        "checkSchedule": null,
+        "lastScheduledCheckAt": null,
+        "pauses": []
+      },
+      "workloads": [
+        {
+          "workloadId": "demo",
+          "name": "Demo",
+          "targetGroupArn": "arn:aws:elasticloadbalancing:eu-west-1:111122223333:targetgroup/dmt-dev-demo-app/111",
+          "source": "manager",
+          "tags": {
+            "team": "shop"
+          },
+          "state": "AWAKE",
+          "stateAt": null,
+          "url": null,
+          "wakeMode": "any",
+          "wakeCount": 3,
+          "awakeSince": "2023-11-14T21:56:40.000Z",
+          "wakeStartedAt": null,
+          "failedAt": null,
+          "failure": null,
+          "consecutiveFailures": 0,
+          "nextAttemptAt": null,
+          "updatedAt": null,
+          "pendingWake": false,
+          "backends": [
+            "instance"
+          ],
+          "pauses": [],
+          "stats7d": {
+            "ignored": 0,
+            "deferred": 0,
+            "wakes": 0
+          },
+          "type": "instance",
+          "settingsFrom": {
+            "idleMinutes": "default",
+            "waitSeconds": "workload",
+            "drainSeconds": "workload",
+            "wakeTimeoutSeconds": "workload",
+            "maxHolders": "workload",
+            "failedRetrySeconds": "workload",
+            "wakeMode": "default"
+          },
+          "settings": {
+            "waitSeconds": 20,
+            "idleMinutes": 15,
+            "drainSeconds": 10,
+            "wakeTimeoutSeconds": 600,
+            "maxHolders": 5
+          }
+        }
+      ]
+    },
+    "status": {
+      "workloadId": "demo",
+      "name": "Demo",
+      "router": {
+        "version": "0.41.0",
+        "build": "b1"
+      },
+      "targetGroupArn": "arn:aws:elasticloadbalancing:eu-west-1:111122223333:targetgroup/dmt-dev-demo-app/111",
+      "servingTargetGroupArn": "arn:aws:elasticloadbalancing:eu-west-1:111122223333:targetgroup/dmt-dev-demo-app/111",
+      "source": "manager",
+      "tags": {
+        "team": "shop"
+      },
+      "state": "AWAKE",
+      "stateAt": null,
+      "drift": [],
+      "updatedAt": null,
+      "awakeSince": "2023-11-14T21:56:40.000Z",
+      "wakeStartedAt": null,
+      "failedAt": null,
+      "failure": null,
+      "consecutiveFailures": 0,
+      "nextAttemptAt": null,
+      "fallbacks": [],
+      "wakeCount": 3,
+      "holders": 0,
+      "pendingWake": false,
+      "pauses": [],
+      "lastRequestAt": null,
+      "nap": {
+        "eligibleAt": "2023-11-14T22:11:40.000Z",
+        "latestAt": "2023-11-14T22:16:40.000Z",
+        "inSeconds": 0
+      },
+      "route": "app",
+      "rules": [
+        {
+          "arn": "arn:aws:elasticloadbalancing:eu-west-1:111122223333:listener-rule/app/dmt-dev-demo/aaa/bbb/ccc",
+          "priority": "10",
+          "conditions": "any",
+          "route": "app"
+        }
+      ],
+      "issues": [],
+      "discovery": "static",
+      "instances": [
+        {
+          "id": "i-0123456789abcdef0",
+          "state": "running"
+        }
+      ],
+      "hibernation": {
+        "hibernate": true,
+        "from": "default",
+        "workload": null,
+        "router": null,
+        "manager": null,
+        "instances": [
+          {
+            "id": "i-0123456789abcdef0",
+            "configured": false,
+            "hibernated": false
+          }
+        ],
+        "freshBoot": false
+      },
+      "backends": [
+        {
+          "kind": "instance",
+          "id": "i-0123456789abcdef0",
+          "status": "running"
+        }
+      ],
+      "ignoredTargets": [],
+      "recommendations": [],
+      "targets": [
+        {
+          "id": "i-0",
+          "state": "healthy"
+        }
+      ],
+      "settings": {
+        "waitSeconds": 20,
+        "idleMinutes": 15,
+        "drainSeconds": 10,
+        "wakeTimeoutSeconds": 600,
+        "maxHolders": 5,
+        "failedRetrySeconds": 60
+      },
+      "settingsFrom": {
+        "idleMinutes": "default",
+        "waitSeconds": "workload",
+        "drainSeconds": "workload",
+        "wakeTimeoutSeconds": "workload",
+        "maxHolders": "workload",
+        "failedRetrySeconds": "workload",
+        "wakeMode": "default"
+      },
+      "type": {
+        "name": "instance",
+        "from": "backends"
+      },
+      "stats": {
+        "days": 7,
+        "since": "fake",
+        "today": {
+          "ignored": {},
+          "deferred": {},
+          "wakes": {}
+        },
+        "total": {
+          "ignored": {},
+          "deferred": {},
+          "wakes": {}
+        }
+      },
+      "ipLists": [],
+      "wakeMode": "any",
+      "wakeRules": [],
+      "noWakeRules": [],
+      "schedule": null,
+      "next": [],
+      "maintenanceDue": null,
+      "joinMinutes": 15,
+      "joinFrom": "default",
+      "joinInherited": {
+        "joinMinutes": 15,
+        "joinFrom": "default"
+      }
+    }
+  },
+  "failed": {
+    "list": {
+      "router": {
+        "name": "dmt-dev",
+        "version": "0.41.0",
+        "build": "b1",
+        "checkSchedule": null,
+        "lastScheduledCheckAt": null,
+        "pauses": []
+      },
+      "workloads": [
+        {
+          "workloadId": "demo",
+          "name": "demo",
+          "targetGroupArn": "arn:aws:elasticloadbalancing:eu-west-1:111122223333:targetgroup/dmt-dev-demo-app/111",
+          "source": "terraform",
+          "tags": {},
+          "state": "FAILED",
+          "stateAt": null,
+          "url": null,
+          "wakeMode": "any",
+          "wakeCount": 0,
+          "awakeSince": null,
+          "wakeStartedAt": null,
+          "failedAt": "2023-11-14T22:05:00.000Z",
+          "failure": {
+            "kind": "capacity",
+            "step": "wake",
+            "message": "no capacity",
+            "at": "2023-11-14T22:05:00.000Z"
+          },
+          "consecutiveFailures": 2,
+          "nextAttemptAt": "2023-11-14T22:07:00.000Z",
+          "fallbacks": [
+            {
+              "instance": "i-0123456789abcdef0",
+              "from": "t3.medium",
+              "to": "t3a.medium"
+            }
+          ],
+          "updatedAt": null,
+          "pendingWake": false,
+          "backends": [],
+          "pauses": [],
+          "stats7d": {
+            "ignored": 0,
+            "deferred": 0,
+            "wakes": 0
+          },
+          "type": null,
+          "settingsFrom": {
+            "idleMinutes": "workload",
+            "waitSeconds": "workload",
+            "drainSeconds": "workload",
+            "wakeTimeoutSeconds": "workload",
+            "maxHolders": "workload",
+            "failedRetrySeconds": "workload",
+            "wakeMode": "default"
+          },
+          "settings": {
+            "waitSeconds": 20,
+            "idleMinutes": 15,
+            "drainSeconds": 10,
+            "wakeTimeoutSeconds": 600,
+            "maxHolders": 5
+          }
+        }
+      ]
+    },
+    "status": {
+      "workloadId": "demo",
+      "name": "demo",
+      "router": {
+        "version": "0.41.0",
+        "build": "b1"
+      },
+      "targetGroupArn": "arn:aws:elasticloadbalancing:eu-west-1:111122223333:targetgroup/dmt-dev-demo-app/111",
+      "servingTargetGroupArn": "arn:aws:elasticloadbalancing:eu-west-1:111122223333:targetgroup/dmt-dev-demo-app/111",
+      "source": "terraform",
+      "tags": {},
+      "state": "FAILED",
+      "stateAt": null,
+      "drift": [],
+      "updatedAt": null,
+      "awakeSince": null,
+      "wakeStartedAt": null,
+      "failedAt": "2023-11-14T22:05:00.000Z",
+      "failure": {
+        "kind": "capacity",
+        "step": "wake",
+        "message": "no capacity",
+        "at": "2023-11-14T22:05:00.000Z"
+      },
+      "consecutiveFailures": 2,
+      "nextAttemptAt": "2023-11-14T22:07:00.000Z",
+      "fallbacks": [
+        {
+          "instance": "i-0123456789abcdef0",
+          "from": "t3.medium",
+          "to": "t3a.medium"
+        }
+      ],
+      "wakeCount": 0,
+      "holders": 0,
+      "pendingWake": false,
+      "pauses": [],
+      "lastRequestAt": null,
+      "nap": null,
+      "route": "waker",
+      "rules": [
+        {
+          "arn": "arn:aws:elasticloadbalancing:eu-west-1:111122223333:listener-rule/app/dmt-dev-demo/aaa/bbb/ccc",
+          "priority": "10",
+          "conditions": "any",
+          "route": "waker"
+        }
+      ],
+      "issues": [],
+      "discovery": "static",
+      "instances": [
+        {
+          "id": "i-0123456789abcdef0",
+          "state": "stopped"
+        }
+      ],
+      "hibernation": {
+        "hibernate": true,
+        "from": "default",
+        "workload": null,
+        "router": null,
+        "manager": null,
+        "instances": [
+          {
+            "id": "i-0123456789abcdef0",
+            "configured": false,
+            "hibernated": false
+          }
+        ],
+        "freshBoot": false
+      },
+      "backends": [
+        {
+          "kind": "instance",
+          "id": "i-0123456789abcdef0",
+          "status": "stopped"
+        }
+      ],
+      "ignoredTargets": [],
+      "recommendations": [],
+      "targets": [],
+      "settings": {
+        "waitSeconds": 20,
+        "idleMinutes": 15,
+        "drainSeconds": 10,
+        "wakeTimeoutSeconds": 600,
+        "maxHolders": 5,
+        "failedRetrySeconds": 60
+      },
+      "settingsFrom": {
+        "idleMinutes": "workload",
+        "waitSeconds": "workload",
+        "drainSeconds": "workload",
+        "wakeTimeoutSeconds": "workload",
+        "maxHolders": "workload",
+        "failedRetrySeconds": "workload",
+        "wakeMode": "default"
+      },
+      "type": {
+        "name": null,
+        "from": null
+      },
+      "stats": {
+        "days": 7,
+        "since": "fake",
+        "today": {
+          "ignored": {},
+          "deferred": {},
+          "wakes": {}
+        },
+        "total": {
+          "ignored": {},
+          "deferred": {},
+          "wakes": {}
+        }
+      },
+      "ipLists": [],
+      "wakeMode": "any",
+      "wakeRules": [],
+      "noWakeRules": [],
+      "schedule": null,
+      "next": [],
+      "maintenanceDue": null,
+      "joinMinutes": 15,
+      "joinFrom": "default",
+      "joinInherited": {
+        "joinMinutes": 15,
+        "joinFrom": "default"
+      }
+    }
+  },
+  "asleep": {
+    "list": {
+      "router": {
+        "name": "dmt-dev",
+        "version": "0.41.0",
+        "build": "b1",
+        "checkSchedule": null,
+        "lastScheduledCheckAt": null,
+        "pauses": []
+      },
+      "workloads": [
+        {
+          "workloadId": "demo",
+          "name": "demo",
+          "targetGroupArn": "arn:aws:elasticloadbalancing:eu-west-1:111122223333:targetgroup/dmt-dev-demo-app/111",
+          "source": "manager",
+          "tags": {},
+          "state": "ASLEEP",
+          "stateAt": "2023-11-14T21:40:00.000Z",
+          "url": null,
+          "wakeMode": "browser",
+          "wakeCount": 0,
+          "awakeSince": null,
+          "wakeStartedAt": null,
+          "failedAt": null,
+          "failure": null,
+          "consecutiveFailures": 0,
+          "nextAttemptAt": null,
+          "updatedAt": null,
+          "pendingWake": false,
+          "backends": [],
+          "pauses": [],
+          "hibernated": true,
+          "stats7d": {
+            "ignored": 0,
+            "deferred": 0,
+            "wakes": 0
+          },
+          "type": null,
+          "settingsFrom": {
+            "idleMinutes": "default",
+            "waitSeconds": "workload",
+            "drainSeconds": "workload",
+            "wakeTimeoutSeconds": "default",
+            "maxHolders": "workload",
+            "failedRetrySeconds": "default",
+            "wakeMode": "workload"
+          },
+          "settings": {
+            "waitSeconds": 20,
+            "idleMinutes": 15,
+            "drainSeconds": 10,
+            "wakeTimeoutSeconds": 600,
+            "maxHolders": 5
+          }
+        }
+      ]
+    },
+    "status": {
+      "workloadId": "demo",
+      "name": "demo",
+      "router": {
+        "version": "0.41.0",
+        "build": "b1"
+      },
+      "targetGroupArn": "arn:aws:elasticloadbalancing:eu-west-1:111122223333:targetgroup/dmt-dev-demo-app/111",
+      "servingTargetGroupArn": "arn:aws:elasticloadbalancing:eu-west-1:111122223333:targetgroup/dmt-dev-demo-app/111",
+      "source": "manager",
+      "tags": {},
+      "state": "ASLEEP",
+      "stateAt": "2023-11-14T21:40:00.000Z",
+      "drift": [],
+      "updatedAt": null,
+      "awakeSince": null,
+      "wakeStartedAt": null,
+      "failedAt": null,
+      "failure": null,
+      "consecutiveFailures": 0,
+      "nextAttemptAt": null,
+      "fallbacks": [],
+      "wakeCount": 0,
+      "holders": 0,
+      "pendingWake": false,
+      "pauses": [],
+      "lastRequestAt": null,
+      "nap": null,
+      "route": "waker",
+      "rules": [
+        {
+          "arn": "arn:aws:elasticloadbalancing:eu-west-1:111122223333:listener-rule/app/dmt-dev-demo/aaa/bbb/ccc",
+          "priority": "10",
+          "conditions": "any",
+          "route": "waker"
+        }
+      ],
+      "issues": [],
+      "discovery": "static",
+      "instances": [
+        {
+          "id": "i-0123456789abcdef0",
+          "state": "stopped"
+        }
+      ],
+      "hibernation": {
+        "hibernate": true,
+        "from": "default",
+        "workload": null,
+        "router": null,
+        "manager": null,
+        "instances": [
+          {
+            "id": "i-0123456789abcdef0",
+            "configured": false,
+            "hibernated": false
+          }
+        ],
+        "freshBoot": false
+      },
+      "backends": [
+        {
+          "kind": "instance",
+          "id": "i-0123456789abcdef0",
+          "status": "stopped"
+        }
+      ],
+      "ignoredTargets": [],
+      "recommendations": [],
+      "targets": [],
+      "settings": {
+        "waitSeconds": 20,
+        "idleMinutes": 15,
+        "drainSeconds": 10,
+        "wakeTimeoutSeconds": 600,
+        "maxHolders": 5,
+        "failedRetrySeconds": 60
+      },
+      "settingsFrom": {
+        "idleMinutes": "default",
+        "waitSeconds": "workload",
+        "drainSeconds": "workload",
+        "wakeTimeoutSeconds": "default",
+        "maxHolders": "workload",
+        "failedRetrySeconds": "default",
+        "wakeMode": "workload"
+      },
+      "type": {
+        "name": null,
+        "from": null
+      },
+      "stats": {
+        "days": 7,
+        "since": "fake",
+        "today": {
+          "ignored": {},
+          "deferred": {},
+          "wakes": {}
+        },
+        "total": {
+          "ignored": {},
+          "deferred": {},
+          "wakes": {}
+        }
+      },
+      "ipLists": [],
+      "wakeMode": "browser",
+      "wakeRules": [],
+      "noWakeRules": [],
+      "schedule": null,
+      "next": [],
+      "maintenanceDue": "1970-03-01T00:00:00.001Z",
+      "joinMinutes": 15,
+      "joinFrom": "default",
+      "joinInherited": {
+        "joinMinutes": 15,
+        "joinFrom": "default"
+      }
+    }
+  }
+}

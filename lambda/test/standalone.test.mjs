@@ -302,11 +302,156 @@ test('hibernation: an instance launched with it is hibernated by the nap, as an 
   assert.equal(off.ec2.state.stops.at(-1).Hibernate, undefined);
 });
 
-test('a queued idle nap is not checked against requests: a standalone workload has none', async () => {
+test('a queued idle nap reads the signals again once it waited a minute: busy now, no nap (fix round 1, finding 6)', async () => {
   const s = setup();
   await s.handler({ action: 'check' });
   s.clock.advance(2 * MINUTE);
   await s.deliver(s.queued[0]);
   assert.equal(s.store.state.run.state, STATES.ASLEEP);
-  assert.equal(s.cloudwatch.calls.length, 1, 'only the check read');
+  assert.equal(s.cloudwatch.calls.length, 2, 'the check read, then the nap');
+  const busy = setup();
+  await busy.handler({ action: 'check' });
+  busy.clock.advance(2 * MINUTE);
+  busy.cloudwatch.values.cpu = () => 60;
+  assert.deepEqual(await busy.deliver(busy.queued[0]), { batchItemFailures: [] });
+  assert.equal(busy.store.state.run.state, STATES.AWAKE);
+  assert.deepEqual(busy.logged('NapSkipped'), [{ workloadId: ID, reason: 'busy since it was requested' }]);
+  // Delivered within the minute: not read again, as an HTTP queued nap.
+  const soon = setup();
+  await soon.handler({ action: 'check' });
+  await soon.deliver(soon.queued[0]);
+  assert.deepEqual([soon.store.state.run.state, soon.cloudwatch.calls.length], [STATES.ASLEEP, 1]);
+  assert.deepEqual([s.elb.calls, busy.elb.calls], [[], []]);
+});
+
+// --- Fix round 1 of the review (findings-R24-1.md) ---------------------------------------------------------------------
+
+test('finding 1: a group is AWAKE at the size its nap recorded, with every instance in service; short of it, the wake times out', async () => {
+  const s = setup({ kind: 'asg' });
+  const group = s.autoscaling.state.groups[0];
+  Object.assign(group, { MinSize: 3, MaxSize: 3, DesiredCapacity: 3, Instances: [0, 1, 2].map((k) => ({ InstanceId: `i-workers-${k}`, LifecycleState: 'InService' })) });
+  await s.handler({ action: 'nap', workloadId: ID });
+  const update = s.autoscaling.updateAutoScalingGroup.bind(s.autoscaling);
+  // Only one of the three comes in service.
+  s.autoscaling.updateAutoScalingGroup = async (input) => {
+    await update(input);
+    if (input.DesiredCapacity) group.Instances = [{ InstanceId: 'i-workers-0', LifecycleState: 'InService' }, { InstanceId: 'i-workers-1', LifecycleState: 'Pending' }];
+  };
+  s.store.state.run = { ...s.store.state.run, state: STATES.WAKING, wakeId: 'w9', wakeStartedAt: s.clock.now() };
+  const failed = await s.handler({ action: 'wake', workloadId: ID, wakeId: 'w9' });
+  assert.equal(failed.state, STATES.FAILED);
+  assert.match(failed.error, /not every backend runs: asg:workers is transitioning/);
+  assert.deepEqual(s.elb.calls, []);
+});
+
+test('finding 1: a service is AWAKE at the count its nap recorded, with every task running', async () => {
+  const s = setup({ kind: 'ecs' });
+  const service = s.ecs.state.services[0];
+  Object.assign(service, { desiredCount: 3, runningCount: 3 });
+  await s.handler({ action: 'nap', workloadId: ID });
+  const update = s.ecs.updateService.bind(s.ecs);
+  s.ecs.updateService = async (input) => {
+    await update(input);
+    if (input.desiredCount) service.runningCount = 1;
+  };
+  s.store.state.run = { ...s.store.state.run, state: STATES.WAKING, wakeId: 'w9', wakeStartedAt: s.clock.now() };
+  const failed = await s.handler({ action: 'wake', workloadId: ID, wakeId: 'w9' });
+  assert.equal(failed.state, STATES.FAILED);
+  assert.match(failed.error, /ecs:arn:aws:ecs:eu-west-1:111122223333:service\/jobs\/worker is transitioning/);
+  // All three running: AWAKE.
+  s.ecs.updateService = update;
+  s.store.state.run = { ...s.store.state.run, state: STATES.WAKING, wakeId: 'w10', wakeStartedAt: s.clock.now() };
+  assert.deepEqual(await s.handler({ action: 'wake', workloadId: ID, wakeId: 'w10' }), { state: STATES.AWAKE });
+  assert.equal(service.runningCount, 3);
+});
+
+test('finding 1: an outside start is AWAKE once a group runs its whole desired capacity', async () => {
+  const s = setup({ kind: 'asg', state: 'stopped' });
+  const group = s.autoscaling.state.groups[0];
+  Object.assign(group, { DesiredCapacity: 2, Instances: [{ InstanceId: 'i-workers-0', LifecycleState: 'InService' }, { InstanceId: 'i-workers-1', LifecycleState: 'Pending' }] });
+  await s.handler({ action: 'check' });
+  assert.equal(s.store.state.run.state, STATES.ASLEEP, 'not yet');
+  group.Instances[1].LifecycleState = 'InService';
+  await s.handler({ action: 'check' });
+  assert.deepEqual(s.causes(), [[STATES.AWAKE, 'external-start']]);
+});
+
+test('findings 3 and 4: a resource untagged or deleted: nothing stopped (its database included), the state kept, said once a check and in the health', async () => {
+  for (const lost of ['untagged', 'deleted']) {
+    const s = setup({ companion: true });
+    if (lost === 'untagged') s.ec2.state.tags['i-0aaa'] = {};
+    else s.ec2.describeInstances = async () => { throw Object.assign(new Error('The instance ID \'i-0aaa\' does not exist'), { name: 'InvalidInstanceID.NotFound' }); };
+    const [answer] = await s.handler({ action: 'check' });
+    assert.deepEqual(answer, { workloadId: ID, state: STATES.AWAKE, resource: 'missing' }, lost);
+    assert.deepEqual(s.rds.state.calls, [], `${lost}: the database is not stopped`);
+    assert.equal(s.cloudwatch.calls.length, 0);
+    assert.deepEqual(s.logged('ResourceMissing'), [{ workloadId: ID, resourceArn: ARNS.instance }], lost);
+    assert.equal(s.store.state.run.resourceMissing, true);
+    assert.deepEqual(await s.handler({ action: 'nap', workloadId: ID }), { state: 'SKIPPED', reason: 'no-instances' });
+    const { health } = await s.handler({ action: 'router' });
+    assert.deepEqual(health.problems.filter((p) => p.code === 'resource-missing'), [{
+      level: 'warning', code: 'resource-missing', text: '1 standalone workload without its resource: deleted, or its dormeto:workload tag removed (see the workloads)',
+    }], lost);
+    assert.deepEqual(s.elb.calls, []);
+  }
+  // Found again: the mark goes.
+  const back = setup();
+  back.ec2.state.tags['i-0aaa'] = {};
+  await back.handler({ action: 'check' });
+  back.ec2.state.tags['i-0aaa'] = { 'dormeto:workload': ID };
+  await back.handler({ action: 'check' });
+  assert.equal('resourceMissing' in back.store.state.run, false);
+});
+
+test('finding 3: a failed wake is not retried while the resource is missing, and a wake without it fails', async () => {
+  const s = setup({ state: 'stopped', run: { state: STATES.FAILED, failedAt: Date.UTC(2026, 10, 23, 9, 0), failure: JSON.stringify({ kind: 'timeout', step: 'wake', message: 'x' }), consecutiveFailures: 1 } });
+  s.ec2.state.instances['i-0aaa'] = 'pending';
+  s.ec2.state.tags['i-0aaa'] = {};
+  assert.deepEqual(await s.handler({ action: 'check' }), [{ workloadId: ID, state: STATES.FAILED, resource: 'missing' }]);
+  s.store.state.run = { state: STATES.WAKING, wakeId: 'w9', wakeStartedAt: s.clock.now() };
+  const failed = await s.handler({ action: 'wake', workloadId: ID, wakeId: 'w9' });
+  assert.deepEqual([failed.state, JSON.parse(s.store.state.run.failure).kind], [STATES.FAILED, 'configuration']);
+  assert.match(failed.error, /the resource is missing or no longer tagged dormeto:workload/);
+});
+
+test('finding 5: an outside stop that leaves every backend stopped ends the retries', async () => {
+  const s = setup({ state: 'stopped' });
+  s.ec2.state.onStart.push(() => { s.ec2.state.instances['i-0aaa'] = 'pending'; });
+  s.store.state.run = { state: STATES.WAKING, wakeId: 'w9', wakeStartedAt: s.clock.now() };
+  await s.handler({ action: 'wake', workloadId: ID, wakeId: 'w9' });
+  // Stopped in the console.
+  s.ec2.state.instances['i-0aaa'] = 'stopped';
+  s.clock.advance(61_000);
+  await s.handler({ action: 'check' });
+  assert.deepEqual(s.causes().at(-1), [STATES.ASLEEP, 'recovered']);
+  s.clock.advance(60 * MINUTE);
+  await s.handler({ action: 'check' });
+  assert.equal(s.store.state.run.state, STATES.ASLEEP);
+  assert.equal(s.invocations.filter((i) => i.action === 'wake').length, 0);
+});
+
+test('finding 7: a missing last point is read again at the next check', async () => {
+  const last = Date.UTC(2026, 10, 23, 9, 45);
+  const s = setup({ metrics: { cpu: (t) => (t === last ? undefined : 1) } });
+  assert.deepEqual(await s.handler({ action: 'check' }), [{ workloadId: ID, state: STATES.AWAKE, idle: false }]);
+  assert.equal('idleNotBefore' in s.store.state.run, false);
+  s.cloudwatch.values.cpu = () => 1;
+  s.clock.advance(5 * MINUTE);
+  assert.deepEqual(await s.handler({ action: 'check' }), [{ workloadId: ID, state: STATES.AWAKE, nap: 'queued' }]);
+});
+
+test('finding 8: an outside start of a server starts its stopped database, as an HTTP workload\'s reconcile does', async () => {
+  const s = setup({ state: 'stopped', companion: true });
+  s.ec2.state.instances['i-0aaa'] = 'running';
+  await s.handler({ action: 'check' });
+  assert.deepEqual(s.causes(), [[STATES.AWAKE, 'external-start']]);
+  assert.deepEqual(s.rds.state.calls, [['start', 'side']]);
+  assert.deepEqual(s.elb.calls, []);
+});
+
+test('finding 9: the retry\'s backoff is the router\'s own for a standalone workload, whatever failedRetrySeconds a record holds', async () => {
+  const s = setup({ state: 'stopped', cfg: { failedRetrySeconds: 600 }, run: { state: STATES.FAILED, failedAt: Date.UTC(2026, 10, 23, 10, 0), failure: JSON.stringify({ kind: 'timeout', step: 'wake', message: 'x' }), consecutiveFailures: 1 } });
+  s.ec2.state.instances['i-0aaa'] = 'pending';
+  s.clock.advance(61_000);
+  assert.deepEqual(await s.handler({ action: 'check' }), [{ workloadId: ID, state: STATES.WAKING, retry: 'requested' }]);
 });

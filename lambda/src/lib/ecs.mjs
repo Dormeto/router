@@ -69,6 +69,12 @@ export async function discoverEcsServices({ ecs, tagging, appscaling }, cfg, wak
   return { backends, ignored };
 }
 
+// Each service's desired and running counts, by its ARN (a standalone workload's readiness, backends.mjs).
+export async function ecsCounts({ ecs }, backends) {
+  const described = await describe(ecs, backends);
+  return new Map(backends.map((b) => [b.id, { desired: described.get(b.id)?.desiredCount ?? 0, running: described.get(b.id)?.runningCount ?? 0 }]));
+}
+
 function serviceStatus(service) {
   if (!service) return 'transitioning';
   if (service.desiredCount === 0 && service.runningCount === 0 && service.pendingCount === 0) return 'stopped';

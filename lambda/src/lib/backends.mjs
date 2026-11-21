@@ -3,7 +3,7 @@
 // Instances of a group are never managed one by one: the group would replace a stopped instance.
 import { retryCapacity, startWithCapacity } from './capacity.mjs';
 import { instanceStates, stopInstances } from './instances.mjs';
-import { discoverEcsServices, ecsRecord, ecsStatuses, resumeEcs, sleepEcs, wakeEcs } from './ecs.mjs';
+import { discoverEcsServices, ecsCounts, ecsRecord, ecsStatuses, resumeEcs, sleepEcs, wakeEcs } from './ecs.mjs';
 import { discoverDatabases, isCompanion, rdsStatuses, startDatabases, stopDatabases } from './rds.mjs';
 import { k8sBackend, k8sRecord, k8sStatus, resumeK8s, sleepK8s, wakeK8s } from './kubernetes.mjs';
 import { resourceKindOf } from './settings-levels.mjs';
@@ -79,10 +79,17 @@ async function standaloneBackends({ ec2, autoscaling, ecs, tagging, appscaling, 
   let primary = null;
   if (!resource) ignored.push({ id: cfg.resourceArn ?? null, reason: 'not a resource Dormeto can nap' });
   else if (resource.kind === 'instance') {
-    const out = await ec2.describeInstances({ InstanceIds: [resource.id] });
-    const instance = (out.Reservations ?? []).flatMap((r) => r.Instances ?? []).find((i) => i.InstanceId === resource.id);
+    let instance;
+    try {
+      const out = await ec2.describeInstances({ InstanceIds: [resource.id] });
+      instance = (out.Reservations ?? []).flatMap((r) => r.Instances ?? []).find((i) => i.InstanceId === resource.id);
+    } catch (err) {
+      // Deleted: not a backend, as a group gone is not (the check says it, never fails on it).
+      if (err?.name !== 'InvalidInstanceID.NotFound') throw err;
+    }
     const tags = tagMap(instance?.Tags);
-    primary = instance && own(tags) ? { kind: 'instance', id: resource.id } : untagged(resource.id, tags);
+    if (!instance || ['terminated', 'shutting-down'].includes(instance.State?.Name)) primary = (ignored.push({ id: resource.id, reason: 'not found' }), null);
+    else primary = own(tags) ? { kind: 'instance', id: resource.id } : untagged(resource.id, tags);
   } else if (resource.kind === 'asg') {
     const { AutoScalingGroups: [group] = [] } = await autoscaling.describeAutoScalingGroups({ AutoScalingGroupNames: [resource.id] });
     const tags = tagMap(group?.Tags);
@@ -92,7 +99,35 @@ async function standaloneBackends({ ec2, autoscaling, ecs, tagging, appscaling, 
     primary = services.backends.find((b) => b.id === cfg.resourceArn) ?? untagged(cfg.resourceArn);
   } else primary = databases.backends.find((b) => isResourceOf(cfg, b)) ?? untagged(resource.id);
   const companions = databases.backends.filter((b) => !isResourceOf(cfg, b));
-  return { mode: 'standalone', backends: [...(primary ? [primary] : []), ...companions], ignored };
+  // Without its resource it has no backend at all: its companions are never stopped nor started alone.
+  if (!primary) return { mode: 'standalone', backends: [], ignored: [...ignored, ...companions.map((b) => ({ id: b.id, reason: 'the workload\'s resource is missing' }))] };
+  return { mode: 'standalone', backends: [primary, ...companions], ignored };
+}
+
+// The size a woken group or service must reach (what wakeBackends sets): the nap's record, else dormeto:wake-desired, else 1.
+export const wakeSizeOf = (record) => (record.desired > 0 ? record.desired : (record.wakeDesired ?? 1));
+
+// A standalone workload's backend statuses (vision standalone workloads design §3): a group runs at its size with every instance in
+// service, a service at its desired count with every task running. `sizes`: the size each must reach (backendKey → size, a wake's);
+// else its own desired capacity or count.
+export async function standaloneStatuses(clients, backends, sizes = new Map()) {
+  const statuses = backends.length ? await backendStatuses(clients, backends) : {};
+  const groups = backends.filter((b) => b.kind === 'asg' && statuses[backendKey(b)] === 'running');
+  const described = await describeGroups(clients.autoscaling, groups.map((g) => g.name));
+  for (const g of groups) {
+    const found = described.get(g.name);
+    const size = sizes.get(backendKey(g)) ?? found?.DesiredCapacity ?? 0;
+    const inService = (found?.Instances ?? []).filter((i) => i.LifecycleState === 'InService').length;
+    if (!found || found.DesiredCapacity < size || inService < Math.max(size, found.DesiredCapacity)) statuses[backendKey(g)] = 'transitioning';
+  }
+  const services = backends.filter((b) => b.kind === 'ecs' && statuses[backendKey(b)] === 'running');
+  const counts = services.length ? await ecsCounts(clients, services) : new Map();
+  for (const svc of services) {
+    const { desired, running } = counts.get(svc.id);
+    const size = sizes.get(backendKey(svc)) ?? desired;
+    if (desired < size || running < Math.max(size, desired)) statuses[backendKey(svc)] = 'transitioning';
+  }
+  return statuses;
 }
 
 export async function resolveBackends({ ec2, elbv2, autoscaling, ecs, tagging, appscaling, rds, kubernetesOf }, cfg) {

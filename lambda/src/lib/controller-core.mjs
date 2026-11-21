@@ -33,8 +33,8 @@ import { askedWake, beginWake, pendingWake as setPendingWake } from './asked-wak
 import { createManagerActions, listRouter, readActivePauses, readPauses, routerAnswer, rowPauses, scheduleView } from './manager-actions.mjs';
 import { requestListRefresh as askListRefresh } from './list-refresh.mjs';
 import {
-  backendKey, backendStatuses, companionsOf, isStandalone, primariesOf, resolveBackends, resumeBackends, sleepBackends, startCompanions, stopCompanions, toRecord,
-  wakeBackends,
+  backendKey, backendStatuses, companionsOf, isStandalone, primariesOf, resolveBackends, resumeBackends, sleepBackends, standaloneStatuses, startCompanions,
+  stopCompanions, toRecord, wakeBackends, wakeSizeOf,
 } from './backends.mjs';
 
 const HEALTH_POLL_MS = 3000;
@@ -64,6 +64,9 @@ const NAP_MAX_AGE_MS = 10 * 60_000;
 const NAP_RECHECK_MS = 60_000;
 // A rule switch throttled by ELB (its bucket of mutating calls) is tried again this long (a burst of wakes).
 const ROUTE_RETRY_MS = 180_000;
+// Between the check's retries of a standalone workload's failed wake: the first delay, doubled after each failure (at most 30
+// minutes, failures.mjs). failedRetrySeconds is the waker's and does not apply (vision standalone workloads design §3).
+const STANDALONE_RETRY_SECONDS = 60;
 
 // The pauses' store (lib/pauses.mjs) on the DynamoDB one.
 export const pauseStore = (store) => ({
@@ -181,6 +184,8 @@ export function createController({
     const fallbacks = {};
     try {
       const records = await wakeRecords(run, cfg);
+      // A standalone workload without its resource (deleted, or untagged): nothing to wake.
+      if (isStandalone(cfg) && !primariesOf(cfg, records).length) throw failureError('configuration', 'the resource is missing or no longer tagged dormeto:workload');
       await wakeBackends(clients, records, timing, {
         fallbackTypes: cfg.fallbackInstanceTypes ?? [],
         log,
@@ -230,8 +235,9 @@ export function createController({
   // A standalone workload's readiness (vision standalone workloads design §3): every backend it woke runs, an instance running, a
   // group with its instances in service, a service with its tasks, a database available; at its timeout, those that do not.
   async function untilRunning(records, watch, timing) {
+    const sizes = new Map(records.filter((r) => r.kind === 'asg' || r.kind === 'ecs').map((r) => [backendKey(r), wakeSizeOf(r)]));
     for (;;) {
-      const statuses = await backendStatuses(clients, records);
+      const statuses = await standaloneStatuses(clients, records, sizes);
       const waiting = records.filter((r) => statuses[backendKey(r)] !== 'running');
       if (!waiting.length) return;
       const seen = await watch.check();
@@ -501,9 +507,10 @@ export function createController({
 
     const backends = await managedBackends(cfg, ctx?.scope);
     seen.backends = backends;
-    const statuses = backends.length ? await backendStatuses(clients, backends) : {};
-    // The primary backends decide the state; companions (databases) follow it. A standalone workload's primary is its resource.
     const standalone = isStandalone(cfg);
+    // A standalone workload's groups and services run at their full size (vision standalone workloads design §3).
+    const statuses = standalone ? await standaloneStatuses(clients, backends) : backends.length ? await backendStatuses(clients, backends) : {};
+    // The primary backends decide the state; companions (databases) follow it. A standalone workload's primary is its resource.
     const primaries = primariesOf(cfg, backends);
     const companions = companionsOf(cfg, backends);
     // The kinds of its backends, for the manager's lists: written when they change.
@@ -511,6 +518,13 @@ export function createController({
     if (kinds !== (run.backendKinds ?? '')) {
       await store.setBackendKinds(workloadId, kinds).catch((err) => log.warn('BackendKindsUnwritten', { workloadId, error: err.message }));
     }
+    // A standalone workload whose resource is missing (deleted, or its tag removed): said once a check and marked on its run (the
+    // router's health counts them); its state stays, nothing is stopped or started.
+    if (standalone && !primaries.length) {
+      log.warn('ResourceMissing', { workloadId, resourceArn: cfg.resourceArn });
+      return run.resourceMissing ? run : (await store.transition(workloadId, { cond: { state: run.state }, set: { resourceMissing: true } })) ?? run;
+    }
+    if (standalone && run.resourceMissing) run = (await store.transition(workloadId, { cond: { state: run.state }, remove: ['resourceMissing'] })) ?? run;
     // No managed primary backend: nothing to infer (every() would be vacuously true).
     const all = (name) => primaries.length > 0 && primaries.every((b) => statuses[backendKey(b)] === name);
     const from = run.state;
@@ -641,9 +655,11 @@ export function createController({
   async function checkStandalone(cfg, run, paused, ctx, backends) {
     const { workloadId } = cfg;
     const t = now();
-    const failedWake = run && (run.state === STATES.FAILED || (run.state === STATES.ASLEEP && run.failure)) && failureStep(run) === 'wake';
+    if (run?.resourceMissing) return { state: run.state, resource: 'missing' };
+    // A failed wake, while FAILED: an outside stop that leaves every backend stopped (ASLEEP) ends the retries.
+    const failedWake = run?.state === STATES.FAILED && failureStep(run) === 'wake';
     if (failedWake) {
-      if ((nextAttemptAt(cfg, run) ?? Infinity) > t) return { state: run.state };
+      if ((nextAttemptAt({ ...cfg, failedRetrySeconds: STANDALONE_RETRY_SECONDS }, run) ?? Infinity) > t) return { state: run.state };
       const held = ctx?.keptAsleep?.(workloadId) ? 'a keepAsleep pause' : napWindowNow(workloadId, ctx, t) ? 'a nap window' : null;
       if (held) return { state: run.state, retry: 'held', reason: held };
       if (!(await startWake(workloadId, run, undefined, 'retry'))) return { state: (await store.getRun(workloadId))?.state ?? 'UNKNOWN' };
@@ -678,11 +694,20 @@ export function createController({
     return asked ? { state: run.state, nap: asked } : nap(workloadId);
   }
 
+  // Whether a standalone workload is still idle (a queued nap delivered late): its signals read again over its window now.
+  async function stillIdle(stored) {
+    const cfg = await effective(stored, await store.getRun(stored.workloadId));
+    const window = idleWindow(cfg, now());
+    return isIdle(await readIdleSignals(cfg, await managedBackends(cfg), window), window);
+  }
+
   // The earliest check whose window can find every signal under: the window then starts at or after each one's run of points under
   // (the window's end when its last point is not). Null when none applies or a read failed (read again at the next check).
   function idleNotBeforeOf(signals, window) {
     const applying = signals.filter((s) => s.applies);
     if (!applying.length || applying.some((s) => s.reason)) return null;
+    // A last point missing (late, or not published yet), not over: read again at the next check.
+    if (applying.some((s) => s.underSince === null && (s.value === null || s.value < s.below))) return null;
     const length = window.endMs - window.startMs;
     const starts = applying.map((s) => (s.underSince !== null && s.underSince <= window.startMs ? window.startMs : s.underSince ?? window.endMs));
     return Math.max(...starts) + length + METRIC_LAG_MS;
@@ -1189,7 +1214,8 @@ export function createController({
     let reason = run?.state !== STATES.AWAKE ? `not awake (${run?.state ?? 'UNKNOWN'})`
       : (run.awakeSince ?? 0) > requestedAt ? 'woken since it was requested' : stale;
     const recheck = !reason && !scheduled && now() - requestedAt > NAP_RECHECK_MS ? await config(workloadId) : null;
-    // A standalone workload has no request to read again (its signals are read at each check).
+    // A standalone workload's signals are read again, as an HTTP workload's requests: busy now, no nap.
+    if (recheck && isStandalone(recheck) && !(await stillIdle(recheck))) reason = 'busy since it was requested';
     if (recheck && !isStandalone(recheck) && (await lastRequestAt(cloudwatch, recheck, requestedAt, now(), recheck.kubernetes ? await otherRequestGroups(recheck) : [])) !== null) {
       reason = 'requests since it was requested';
     }
@@ -1291,6 +1317,9 @@ export function createController({
     const dayAgo = iso(t - 86_400_000);
     const drift24h = (await Promise.all(configs.map((c) => (store.listDrift ? store.listDrift(c.workloadId, 50).catch(() => []) : []))))
       .flat().filter((e) => e.at >= dayAgo).length;
+    // Standalone workloads whose resource the check could not find (deleted, or its dormeto:workload tag removed).
+    const missing = configs.filter((c, i) => isStandalone(c) && runs[i]?.resourceMissing).length;
+    if (missing) addWarning(health, 'resource-missing', `${missing} standalone workload${missing === 1 ? '' : 's'} without ${missing === 1 ? 'its' : 'their'} resource: deleted, or its dormeto:workload tag removed (see the workloads)`);
     if (drift24h) addWarning(health, 'drift', `${drift24h} drift repair${drift24h === 1 ? '' : 's'} in 24 hours: rules or tags changed outside Dormeto, repaired (see the workloads)`);
     return routerAnswer({
       router: { name: router.name, version: router.version, build: router.build },

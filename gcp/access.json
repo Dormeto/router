@@ -305,6 +305,15 @@
         "compute.regionBackendServices.update",
         "compute.globalOperations.get",
         "compute.regionOperations.get"
+      ],
+      "resourceCheck": [
+        "compute.backendServices.list",
+        "compute.regionBackendServices.list",
+        "compute.targetPools.list",
+        "compute.targetInstances.list",
+        "compute.instanceGroups.list",
+        "compute.networkEndpointGroups.list",
+        "compute.instanceGroupManagers.get"
       ]
     },
     "offboard": {
@@ -571,7 +580,7 @@
     "roles": {
       "dormetoDiscovery": {
         "title": "Dormeto manager discovery",
-        "description": "Lets the Dormeto manager's discovery account read the projects, folders and organizations of its scopes, their load balancers, VMs and groups, their Cloud Run services, their Cloud SQL instances and their request counts. Read only.",
+        "description": "Lets the Dormeto manager's discovery account read the projects, folders and organizations of its scopes, their load balancers, target pools and target instances, VMs and groups, Cloud Run services, Cloud SQL instances and request counts. Read only.",
         "permissions": [
           "resourcemanager.projects.get",
           "compute.urlMaps.get",
@@ -594,6 +603,8 @@
           "compute.globalForwardingRules.list",
           "compute.forwardingRules.get",
           "compute.forwardingRules.list",
+          "compute.targetPools.list",
+          "compute.targetInstances.list",
           "compute.instanceGroups.get",
           "compute.instanceGroups.list",
           "compute.instanceGroupManagers.get",

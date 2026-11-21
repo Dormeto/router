@@ -27,7 +27,8 @@ const STEPS = {
   'install-router': ['image', 'cloudRun', 'neg', 'job'],
   uninstall: ['read', 'job', 'neg', 'cloudRun', 'logView', 'queue', 'database', 'projectBindings', 'tag', 'serviceAccount', 'roles'],
   workloads: ['invoke'],
-  onboard: ['invoke', 'tag', 'requestLogs'],
+  // resourceCheck: what onboarding a standalone resource (--resource) reads, as requestLogs is what --request-logs needs.
+  onboard: ['invoke', 'tag', 'requestLogs', 'resourceCheck'],
   offboard: ['invoke', 'tag', 'requestLogs'],
   connect: ['read', 'apis', 'federation', 'serviceAccounts', 'roles', 'projectBindings', 'folderBindings', 'organizationBindings', 'controller', 'tag'],
   disconnect: ['read', 'controller', 'tag', 'projectBindings', 'folderBindings', 'organizationBindings', 'roles', 'serviceAccounts', 'federation'],
@@ -256,6 +257,22 @@ test('the log view\'s steps and the request logs\' steps, exactly', async () => 
   for (const p of ['compute.backendServices.update', 'compute.regionBackendServices.update']) assert.ok(!roles.dormetoRouter.permissions.includes(p), p);
 });
 
+// The CLI's load-balancer check before it onboards a standalone resource (cli internal/gcponboard/standalone.go lbCheck): with the
+// operator's own rights, the aggregated listings of backend services (both scopes), target pools and target instances, the members of
+// a backend's instance group or network endpoint group, and a managed group's targetPools. Reads only, a step of their own: an operator
+// who onboards HTTP workloads only needs none of them.
+test('onboard.resourceCheck: the reads of the load-balancer check before a standalone resource is onboarded, exactly', async () => {
+  const { operator: o } = await load();
+  assert.deepEqual(o.onboard.resourceCheck, [
+    'compute.backendServices.list', 'compute.regionBackendServices.list', 'compute.targetPools.list', 'compute.targetInstances.list',
+    'compute.instanceGroups.list', 'compute.networkEndpointGroups.list', 'compute.instanceGroupManagers.get',
+  ]);
+  for (const p of o.onboard.resourceCheck) assert.ok(/\.(get|list)$/.test(p), p);
+  // Not in the steps every onboarding needs.
+  for (const step of ['invoke', 'tag']) assert.deepEqual(o.onboard[step].filter((p) => o.onboard.resourceCheck.includes(p)), [], step);
+  assert.equal('resourceCheck' in o.offboard, false);
+});
+
 // A refused or interrupted onboarding takes back what it added (the CLI's undoBindings and undoGrant), for the operator `check` approved.
 test('onboard: its step holds the deletes of its undo, each with what it undoes', async () => {
   const { operator: { onboard }, features } = await load();
@@ -402,7 +419,14 @@ test('manager: dormetoDiscovery holds only get, list and monitoring.timeSeries.l
   assert.deepEqual(list.slice(list.indexOf('run.services.list') + 1), ['cloudsql.instances.get', 'cloudsql.instances.list', 'monitoring.timeSeries.list']);
   assert.match(manager.roles.dormetoDiscovery.description, /Cloud SQL instances/);
   assert.match(manager.roles.dormetoDiscovery.description, /Read only\.$/);
-  assert.equal(list.length + org.length, 37);
+  // A target pool's Network Load Balancer and a target instance (protocol forwarding) use a VM with no backend service: the scan reads
+  // them so that it never offers such a VM as standalone. Their lists only (the aggregated lists take the same permission), after the
+  // forwarding rules that name them.
+  assert.deepEqual(list.filter((p) => /^compute\.target(Pools|Instances)\./.test(p)), ['compute.targetPools.list', 'compute.targetInstances.list']);
+  assert.deepEqual(list.slice(list.indexOf('compute.forwardingRules.list') + 1, list.indexOf('compute.forwardingRules.list') + 3), ['compute.targetPools.list', 'compute.targetInstances.list']);
+  assert.match(manager.roles.dormetoDiscovery.description, /target pools and target instances/);
+  assert.equal(list.length, 36);
+  assert.equal(list.length + org.length, 39);
 });
 
 test('manager: each dormetoCommand permission is a tag permission the onboarding, the offboarding or the Cloud SQL feature already needs', async () => {

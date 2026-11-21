@@ -84,6 +84,10 @@ On AWS, the onboarding refuses a resource that cannot be one, with a reason:
 - **An RDS instance** that is a member of an Aurora cluster (onboard the cluster) or a read replica, and **an Aurora
   Serverless v1 cluster**: RDS cannot stop them.
 
+A resource behind a Classic Load Balancer, which uses no target group, is not told apart: the router refuses what feeds a
+target group only, so an instance, an Auto Scaling group or an ECS service behind a Classic Load Balancer can be onboarded as a
+standalone workload, and its schedule or its idle signals would stop it. Onboard only what no load balancer serves.
+
 On Google Cloud, the onboarding refuses (the router's own words):
 
 - **It is in another workload:** a backend of an onboarded workload, another standalone workload's resource or companion, or
@@ -102,6 +106,16 @@ On Google Cloud, the onboarding refuses (the router's own words):
   `dormetoDiscovery`, reads them with `cloudsql.instances.get` and `cloudsql.instances.list`, and offers none that is a
   read replica. In a project where the Cloud SQL Admin API is off (only a router installed with `--with cloud-sql` turns
   it on), Google refuses the read and the scan says Cloud SQL was not read; nothing turns the API on for it.
+- **The manager's scan reads target pools and target instances** (Not released yet: router 0.42.0):
+  `compute.targetPools.list` and `compute.targetInstances.list` (their aggregated lists take the same permissions), with
+  `dormetoDiscovery`. A VM that a target-pool Network Load Balancer or a target instance (protocol forwarding) uses has no
+  backend service, and it is never offered as a standalone workload.
+- **The CLI checks that a VM or a group serves no load balancer** (Not released yet: router 0.42.0) before it onboards it,
+  with the operator's own rights: `compute.backendServices.list`, `compute.regionBackendServices.list`,
+  `compute.targetPools.list`, `compute.targetInstances.list`, `compute.instanceGroups.list`,
+  `compute.networkEndpointGroups.list` and `compute.instanceGroupManagers.get`, the onboarding step `resourceCheck` of
+  `gcp/access.json`, needed to onboard a standalone resource only. Without them the CLI stops and names the listings it could
+  not make, unless `--unchecked` is given.
 
 A standalone workload may name **companion databases**, as an HTTP workload's: they stop after it and start before it. A
 database alone is a standalone workload whose resource is the database.

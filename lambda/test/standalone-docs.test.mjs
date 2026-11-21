@@ -60,3 +60,8 @@ test('the workload module has a variable for each idle setting the Terraform gua
   }
   assert.match(variables, /variable "resource_arn"/);
 });
+
+test('the page says the limit of a Classic Load Balancer (the user, 2026-11-21: ignored)', () => {
+  const page = flat(read(PAGE));
+  assert.ok(page.includes('A resource behind a Classic Load Balancer, which uses no target group, is not told apart: the router refuses what feeds a target group only, so an instance, an Auto Scaling group or an ECS service behind a Classic Load Balancer can be onboarded as a standalone workload, and its schedule or its idle signals would stop it'));
+});

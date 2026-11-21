@@ -61,3 +61,20 @@ test('the page says the final review\'s fixes (plan 5): the group sized 0, Spot 
   assert.ok(page.includes('journaled as the person\'s nap (cause manager, with by)'));
   assert.ok(page.includes('nextAttemptAt is the retry\'s time only while one is coming'));
 });
+
+test('the page says why the manager\'s discovery role reads target pools and target instances, as gcp/access.json has it', () => {
+  const page = flat(read('docs/scenarios/standalone.md'));
+  const discovery = JSON.parse(read('gcp/access.json')).manager.roles.dormetoDiscovery.permissions;
+  const reads = discovery.filter((p) => /^compute\.target(Pools|Instances)\./.test(p));
+  assert.deepEqual(reads, ['compute.targetPools.list', 'compute.targetInstances.list']);
+  assert.ok(page.includes(`The manager's scan reads target pools and target instances (Not released yet: router 0.42.0): ${reads.join(' and ')}`));
+  assert.ok(page.includes('A VM that a target-pool Network Load Balancer or a target instance (protocol forwarding) uses has no backend service, and it is never offered as a standalone workload'));
+});
+
+test('the page says what the CLI\'s load-balancer check reads with the operator\'s rights, as onboard.resourceCheck has it, and what it does without them', () => {
+  const page = flat(read('docs/scenarios/standalone.md'));
+  const reads = JSON.parse(read('gcp/access.json')).operator.onboard.resourceCheck;
+  assert.ok(page.includes(`The CLI checks that a VM or a group serves no load balancer (Not released yet: router 0.42.0) before it onboards it, with the operator's own rights: ${reads.slice(0, -1).join(', ')} and ${reads.at(-1)}`));
+  assert.ok(page.includes('the onboarding step resourceCheck of gcp/access.json, needed to onboard a standalone resource only'));
+  assert.ok(page.includes('Without them the CLI stops and names the listings it could not make, unless --unchecked is given'));
+});

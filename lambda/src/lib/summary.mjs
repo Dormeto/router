@@ -129,5 +129,9 @@ function standaloneSummary(cfg, run, stats7d, pauses, scheduled) {
   delete row.wakeMode;
   row.nextAttemptAt = iso(standaloneNextAttemptAt(run));
   row.settings = Object.fromEntries(STANDALONE_KEYS.map((key) => [key, cfg[key]]));
-  return row;
+  // Its resource deleted or untagged (the check's mark): said after its backends, absent otherwise.
+  return run?.resourceMissing ? after(row, 'backends', { resourceMissing: true }) : row;
 }
+
+// The object with `extra` right after its key `key`.
+export const after = (object, key, extra) => Object.fromEntries(Object.entries(object).flatMap((entry) => (entry[0] === key ? [entry, ...Object.entries(extra)] : [entry])));

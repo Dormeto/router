@@ -71,11 +71,14 @@ at all, it never naps on idle: schedules and people only.
 - **Levels.** These settings resolve as every other: the workload's own, its type's, the router's, the organization's,
   then the built-in value. `off` at a level turns off a signal a level above sets. The status says each threshold's level.
 - **The type `databases`.** A workload with a database, as its resource or as a companion, has its connections under 1
-  as a signal. A server with a companion database keeps its CPU signal too: both must be idle.
+  as a signal, read for each companion its configuration lists (`databases` at onboarding or in the `workload` module): each
+  must be under 1. A companion found by its tag alone is napped and woken with the workload but not read. A server with a
+  companion database keeps its CPU signal too: all must be idle.
 - **The 10-minute lag.** CloudWatch publishes a point minutes after its period ends, so the window the router reads ends
   10 minutes behind, at a 5-minute boundary. An idle nap therefore comes 10 to 15 minutes after the idle window, on the next
   5-minute check. A busy workload is read again once its window can be idle; a missing last point, at the next check. A
-  queued nap delivered more than a minute after it was asked reads the signals again and is skipped if the workload is busy.
+  queued idle nap delivered more than a minute after it was asked reads the signals again and is skipped if the workload is
+  busy; a person's nap is never read against the signals.
 - **The status** shows each signal: its threshold, its level, its last value, since when it is under, and the nap
   estimate from them.
 - An HTTP workload keeps its one signal, its requests: these settings are refused on it.

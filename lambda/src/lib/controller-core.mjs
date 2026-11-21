@@ -11,7 +11,7 @@ import { healthyCount, instanceDetails, waitTargetsReleased } from './instances.
 import { createStatus } from './status.mjs';
 import { describeRules } from './no-wake.mjs';
 import { describeStoredLists } from './list-cache.mjs';
-import { failedSpec, failureError, standaloneNextAttemptAt } from './failures.mjs';
+import { failedSpec, failureError, failureStep, standaloneNextAttemptAt } from './failures.mjs';
 import { createPauses, pauseHolds } from './pauses.mjs';
 import { createWakeWatch, unhealthyError } from './wake-watch.mjs';
 import { describeStopped } from './stopped.mjs';
@@ -27,7 +27,7 @@ import { addWarning, healthOf, lambdaMetrics, pausesUnreadable, queueDepths } fr
 import { pageViewOf, withWake } from './page-settings.mjs';
 import { HIBERNATION_MAX_DAYS, hibernationDue, resolveHibernation, settingsProblems, workloadSettingsProblems } from './hibernation.mjs';
 import { joinLevels } from './manager-settings.mjs';
-import { createLevelsReader, describedRules, effectiveConfig } from './settings-levels.mjs';
+import { IDLE_KEYS, createLevelsReader, describedRules, effectiveConfig } from './settings-levels.mjs';
 import { resolvedSettings, withSettings } from './settings-writes.mjs';
 import { askedWake, beginWake, pendingWake as setPendingWake } from './asked-wake.mjs';
 import { createManagerActions, listRouter, readActivePauses, readPauses, routerAnswer, rowPauses, scheduleView } from './manager-actions.mjs';
@@ -692,11 +692,13 @@ export function createController({
     return asked ? { state: run.state, nap: asked } : nap(workloadId);
   }
 
-  // Whether a standalone workload is still idle (a queued nap delivered late): its signals read again over its window now.
-  async function stillIdle(stored) {
+  // Why a queued idle nap of a standalone workload no longer naps it, else null: its signals read again over its window now, its
+  // levels readable (as the check decides nothing on levels it cannot read).
+  async function idleRecheck(stored) {
     const cfg = await effective(stored, await store.getRun(stored.workloadId));
+    if (cfg.levelsUnreadable) return 'its settings levels cannot be read';
     const window = idleWindow(cfg, now());
-    return isIdle(await readIdleSignals(cfg, await managedBackends(cfg), window), window);
+    return isIdle(await readIdleSignals(cfg, await managedBackends(cfg), window), window) ? null : 'busy since it was requested';
   }
 
   // The earliest check whose window can find every signal under: the window then starts at or after each one's run of points under
@@ -709,15 +711,6 @@ export function createController({
     const length = window.endMs - window.startMs;
     const starts = applying.map((s) => (s.underSince !== null && s.underSince <= window.startMs ? window.startMs : s.underSince ?? window.endMs));
     return Math.max(...starts) + length + METRIC_LAG_MS;
-  }
-
-  // The step the run's last failure was in (wake, nap), or null.
-  function failureStep(run) {
-    try {
-      return run?.failure ? JSON.parse(run.failure).step ?? null : null;
-    } catch {
-      return null;
-    }
   }
 
   // Whether a nap window of the workload's schedule is in force: a failed wake is not retried in it. One it cannot read: none.
@@ -1041,6 +1034,8 @@ export function createController({
 
   // A schedule's answer: its view with the run and the join levels read then (scheduleOf's).
   const scheduledView = async (workloadId, stored) => scheduleOf(workloadId, stored, { run: await store.getRun(workloadId), joins: readJoinLevels });
+  // The standalone workloads whose idle settings a write just changed (their idleNotBefore goes once written).
+  const rereads = new Set();
   const managerActions = createManagerActions({
     store, find: config, guard: terraformGuard, refuse: { invalid: (message) => new Refusal('invalid', message), notFound: notConfigured },
     pausesFor: (workloadId) => pausesFor(workloadId),
@@ -1055,11 +1050,19 @@ export function createController({
       // A level may hold both kinds' keys; a workload, its kind's (standalone workloads design §4).
       routerProblems: (settings) => settingsProblems(settings, { idle: true }),
       workloadProblems: (settings, cfg) => workloadSettingsProblems(settings, cfg),
-      // A configuration from before `inherits` inherits what equals the onboarder's old defaults (design §7).
-      next: (cfg, settings) => withSettings(cfg, settings),
+      // A configuration from before `inherits` inherits what equals the onboarder's old defaults (design §7). A standalone workload whose
+      // idle window or idle signals change is read again at the next check (final review, Minor 7).
+      next: (cfg, settings) => {
+        if (isStandalone(cfg) && ['idleMinutes', ...IDLE_KEYS].some((key) => Object.hasOwn(settings, key))) rereads.add(cfg.workloadId);
+        return withSettings(cfg, settings);
+      },
       levels: hibernationLevels,
       // After the write: the hibernation with the instances it reads (not read: logged, never failing), the settings resolved.
       async answer(workloadId, next, levels) {
+        if (rereads.delete(workloadId)) {
+          await store.transition(workloadId, { cond: { state: (await store.getRun(workloadId))?.state }, remove: ['idleNotBefore'] })
+            .catch((err) => log.warn('IdleNotBeforeKept', { workloadId, error: err.message }));
+        }
         const instanceIds = await resolveBackends(clients, next).then(({ backends }) => backends.filter((b) => b.kind === 'instance').map((b) => b.id)).catch((err) => {
           log.warn('HibernationUnread', { workloadId, error: err.message });
           return null;
@@ -1216,8 +1219,9 @@ export function createController({
     let reason = run?.state !== STATES.AWAKE ? `not awake (${run?.state ?? 'UNKNOWN'})`
       : (run.awakeSince ?? 0) > requestedAt ? 'woken since it was requested' : stale;
     const recheck = !reason && !scheduled && now() - requestedAt > NAP_RECHECK_MS ? await config(workloadId) : null;
-    // A standalone workload's signals are read again, as an HTTP workload's requests: busy now, no nap.
-    if (recheck && isStandalone(recheck) && !(await stillIdle(recheck))) reason = 'busy since it was requested';
+    // A standalone workload's idle nap (no one asked it) has its signals read again, as an HTTP workload's requests: busy now, no nap.
+    // A person's nap is theirs: never read against the signals (final review, Important 1).
+    if (recheck && isStandalone(recheck) && !by) reason = await idleRecheck(recheck);
     if (recheck && !isStandalone(recheck) && (await lastRequestAt(cloudwatch, recheck, requestedAt, now(), recheck.kubernetes ? await otherRequestGroups(recheck) : [])) !== null) {
       reason = 'requests since it was requested';
     }

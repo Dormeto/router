@@ -68,7 +68,18 @@ export const retryDelayMs = (cfg, run) => Math.min((cfg.failedRetrySeconds ?? 60
 // A standalone workload's failed wake (vision standalone workloads design §3): retried by the check while FAILED, the router's own
 // first delay doubled as above (failedRetrySeconds is the waker's and does not apply).
 export const STANDALONE_RETRY_SECONDS = 60;
-export const standaloneNextAttemptAt = (run) => (run?.state === 'FAILED' ? (run.failedAt ?? 0) + retryDelayMs({ failedRetrySeconds: STANDALONE_RETRY_SECONDS }, run) : null);
+// Only a failed wake is retried: a failed nap is released after the idle window (final review, Minor 1).
+export const standaloneNextAttemptAt = (run) => (run?.state === 'FAILED' && failureStep(run) === 'wake'
+  ? (run.failedAt ?? 0) + retryDelayMs({ failedRetrySeconds: STANDALONE_RETRY_SECONDS }, run) : null);
+
+// The step the run's last failure was in (wake, nap), or null.
+export function failureStep(run) {
+  try {
+    return run?.failure ? JSON.parse(run.failure).step ?? null : null;
+  } catch {
+    return null;
+  }
+}
 
 // When a request may retry a failed wake (ms), or null when the workload has not failed. A failed workload back to
 // ASLEEP (released after its idle window, or found stopped at a check) keeps its failure until a successful wake, and

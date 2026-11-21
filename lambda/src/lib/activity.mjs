@@ -94,12 +94,17 @@ function plan(cfg, backends) {
   if (metric === 'off' || !metric) signals.push(notApplying('metric', null, 'off'));
   else {
     const resource = own[0] ? resourceIdOf(own[0]) : null;
-    const values = Object.values(metric.dimensions ?? {});
+    // A list of dimensions (the type databases' built-in with several databases): each read, each must be under.
+    const sets = Array.isArray(metric.dimensions) ? metric.dimensions : [metric.dimensions ?? {}];
+    const values = sets.flatMap((d) => Object.values(d));
     if (resource === null && values.some((v) => v.includes(RESOURCE))) signals.push(notApplying('metric', metric.below, `no backend to replace ${RESOURCE}`));
     else {
-      const dimensions = Object.entries(metric.dimensions ?? {}).map(([Name, v]) => ({ Name, Value: v.replaceAll(RESOURCE, resource) }));
-      queries.push(query('metric', metric.namespace, metric.name, dimensions, metric.statistic));
-      signals.push({ signal: 'metric', below: metric.below, series: [{ ids: ['metric'], scale: same }] });
+      const series = sets.map((d, i) => {
+        const id = Array.isArray(metric.dimensions) ? `metric_${i}` : 'metric';
+        queries.push(query(id, metric.namespace, metric.name, Object.entries(d).map(([Name, v]) => ({ Name, Value: v.replaceAll(RESOURCE, resource) })), metric.statistic));
+        return { ids: [id], scale: same };
+      });
+      signals.push({ signal: 'metric', below: metric.below, series });
     }
   }
   return { signals, queries };

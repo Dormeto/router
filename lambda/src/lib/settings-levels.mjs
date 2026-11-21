@@ -50,18 +50,20 @@ export function resourceKindOf(arn) {
   return null;
 }
 
-// The database whose connections say a standalone workload of the type databases is idle: its resource when it is one, else
-// its first companion; null without one. `own`: the resource is the database.
+// The databases whose connections say a standalone workload of the type databases is idle: its resource when it is one, else every
+// companion its record lists (final review, Minor 8); null without one. `own`: the resource is the database.
 function databaseOf(cfg) {
   const own = resourceKindOf(cfg?.resourceArn);
-  if (own?.kind.startsWith('rds-')) return { ...own, own: true };
-  const companion = Array.isArray(cfg?.databases) ? cfg.databases.find((db) => isObject(db) && typeof db.id === 'string') : null;
-  return companion ? { kind: companion.kind === 'rds-cluster' ? 'rds-cluster' : 'rds-instance', id: companion.id } : null;
+  if (own?.kind.startsWith('rds-')) return { databases: [own], own: true };
+  const listed = Array.isArray(cfg?.databases) ? cfg.databases.filter((db) => isObject(db) && typeof db.id === 'string') : [];
+  return listed.length ? { databases: listed.map((db) => ({ kind: db.kind === 'rds-cluster' ? 'rds-cluster' : 'rds-instance', id: db.id })) } : null;
 }
 
-const connectionsOf = (database) => ({
-  namespace: 'AWS/RDS', name: 'DatabaseConnections', dimensions: { [database.kind === 'rds-cluster' ? 'DBClusterIdentifier' : 'DBInstanceIdentifier']: database.id }, statistic: 'Maximum', below: 1,
-});
+// One database: its dimensions; several: the list of each one's, every one under the threshold (activity.mjs reads each).
+const connectionsOf = ({ databases }) => {
+  const each = databases.map((db) => ({ [db.kind === 'rds-cluster' ? 'DBClusterIdentifier' : 'DBInstanceIdentifier']: db.id }));
+  return { namespace: 'AWS/RDS', name: 'DatabaseConnections', dimensions: each.length === 1 ? each[0] : each, statistic: 'Maximum', below: 1 };
+};
 
 // Each key's built-in value for a kind and a built-in type. A standalone workload of the type databases: the slow start's wake
 // timeout and its database's connections under 1; CPU off only when its own resource is the database (an idle database's CPU

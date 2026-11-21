@@ -508,7 +508,8 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
 
   // The resource as a backend ({ kind, id, arn?, tags }: what tag() and untag() take), its label and its default name, with the
   // reasons it cannot be a standalone workload: the backend modules' own (what they cannot stop) and "it belongs to an HTTP workload".
-  async function resourceOf(resourceArn) {
+  // `eligibility: false` (offboarding): the resource and its tags only, no target group read.
+  async function resourceOf(resourceArn, { eligibility = true } = {}) {
     const resource = resourceKindOf(resourceArn);
     if (!resource) return { problems: [`the resource must be the ARN of ${RESOURCES_TEXT}`] };
     const label = `${KIND_TEXT[resource.kind]} ${resource.id}`;
@@ -529,7 +530,7 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
       if (tags[GROUP_TAG]) problems.push(`${label} is in Auto Scaling group ${tags[GROUP_TAG]}: onboard the group (it would replace a stopped instance)`);
       if (instance.RootDeviceType === 'instance-store') problems.push(`${label} has an instance store root volume: it cannot be stopped`);
       if (instance.InstanceLifecycle === 'spot') problems.push(`${label} is a Spot instance: Dormeto stops On-Demand instances only`);
-      if (!tags[GROUP_TAG]) for (const g of await instanceTargetGroups()) if (g.ids.includes(resource.id)) problems.push(`${label} feeds target group ${g.name}: it belongs to an HTTP workload (onboard its target group)`);
+      if (eligibility && !tags[GROUP_TAG]) for (const g of await instanceTargetGroups()) if (g.ids.includes(resource.id)) problems.push(`${label} feeds target group ${g.name}: it belongs to an HTTP workload (onboard its target group)`);
       return { backend: { kind: 'instance', id: resource.id, tags }, label, name: tags.Name || resource.id, problems };
     }
     if (resource.kind === 'asg') {
@@ -590,7 +591,7 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
     const tagged = backend.tags[WORKLOAD_TAG] ?? null;
     result.resource = { kind: backend.kind, id: backend.id, tagged };
     if (byId(workloadId)) problems.push(`${label} is already onboarded: workload ${named(byId(workloadId), workloadId)}`);
-    else if (tagged) problems.push(`${label} belongs to workload ${named(byId(tagged), tagged)}`);
+    else if (tagged && tagged !== workloadId) problems.push(`${label} belongs to workload ${named(byId(tagged), tagged)}`);
     const companionOf = configs.find((c) => c.workloadId !== workloadId && (c.databases ?? []).some((d) => d.kind === backend.kind && d.id === backend.id));
     // Its tag already said whose it is.
     if (companionOf && tagged !== companionOf.workloadId) problems.push(`${label} is a companion of workload ${named(companionOf, companionOf.workloadId)}`);
@@ -621,6 +622,16 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
         tagged.push({ kind: b.kind, id: b.id, ...(b.arn ? { arn: b.arn } : {}) });
       }
       step('tag resource and databases', untagged.length > 0, untagged.map((b) => `${KIND_TEXT[b.kind]} ${b.id}`).join(', '));
+      // Another onboarding may have tagged one at once (the preview read them before): read again, and give way, naming it.
+      const configs = await store.listConfigs();
+      for (const b of untagged) {
+        const owner = (await currentTags(b))?.[WORKLOAD_TAG];
+        if (owner && owner !== workloadId) {
+          // Its tag is the other workload's now: not ours to remove.
+          tagged.splice(tagged.findIndex((t) => t.kind === b.kind && t.id === b.id), 1);
+          throw new Error(`${KIND_TEXT[b.kind]} ${b.kind === 'ecs' ? resourceKindOf(b.id)?.id ?? b.id : b.id} belongs to workload ${named(configs.find((c) => c.workloadId === owner), owner)}`);
+        }
+      }
       // A setting sent null is left to the levels, as one not sent.
       const own = Object.fromEntries(Object.entries(settings).filter(([, value]) => value !== null));
       await store.putConfig(workloadId, {
@@ -653,7 +664,7 @@ export function createOnboarding({ elbv2, ec2, autoscaling, ecs, rds, lambda, st
       }
     };
     await run('untag resource and databases', async () => {
-      const read = resourceArn ? await resourceOf(resourceArn).catch(() => ({})) : {};
+      const read = resourceArn ? await resourceOf(resourceArn, { eligibility: false }).catch(() => ({})) : {};
       const marked = [...(read.backend ? [read.backend] : []), ...(await databasesOf(databases, { skipMissing: true }))]
         .filter((b) => b.tags[WORKLOAD_TAG] === workloadId && b.tags[MARKER_TAG] === MARKER);
       const all = [...tagged, ...marked.filter((b) => !tagged.some((t) => t.kind === b.kind && t.id === b.id))];

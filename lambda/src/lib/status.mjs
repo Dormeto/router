@@ -1,7 +1,7 @@
 // Live status of a workload: state, route, backends, targets, nap estimate, statistics, rules, lists. Served by the
 // admin page (waker) and by the controller `status` action (manager).
 import { recommendations } from './advice.mjs';
-import { failureOf, fallbacksOf } from './summary.mjs';
+import { after, failureOf, fallbacksOf } from './summary.mjs';
 import { nextAttemptAt, standaloneNextAttemptAt } from './failures.mjs';
 import { STATES } from './state.mjs';
 import { conditionsOf, currentTarget, routeOf } from './route.mjs';
@@ -58,7 +58,7 @@ export function createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging
     const stats = loadStats ? await loadStats().catch((err) => ({ error: err.message })) : null;
     // Its wakes only: nothing is ignored nor deferred without a waker.
     const wakesOnly = (period) => (period ? { wakes: period.wakes ?? {} } : period);
-    return {
+    const answer = {
       workloadId,
       name: cfg.name ?? workloadId,
       kind: 'standalone',
@@ -99,6 +99,8 @@ export function createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging
       ...(cfg.settingsFrom ? { settingsFrom: cfg.settingsFrom, type: cfg.type } : {}),
       stats: stats && !stats.error ? { ...stats, today: wakesOnly(stats.today), total: wakesOnly(stats.total) } : stats,
     };
+    // Its resource deleted or untagged (the check's mark): said after its backends, absent otherwise.
+    return run.resourceMissing ? after(answer, 'backends', { resourceMissing: true }) : answer;
   }
   // Extras that depend on the caller: router rules, wake rules, statistics and IP lists loaders, and the hibernation's
   // (given the standalone instances, never failing; the controller's status only).

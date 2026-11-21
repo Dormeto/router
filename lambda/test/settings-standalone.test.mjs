@@ -144,12 +144,29 @@ test('a workload refuses the other kind\'s keys: the waker\'s for a standalone o
   assert.deepEqual(workloadSettingsProblems({ waitSeconds: 30, wakeMode: 'browser' }, testConfig()), []);
 });
 
-test('without the idle signals asked for, the checks are as before: an idle key is an unknown setting (Google Cloud\'s)', () => {
+test('without the idle signals asked for, a level\'s check is as before: an idle key is an unknown setting (Google Cloud\'s)', () => {
   assert.deepEqual(defaultsProblems({ idleCpuPercent: 5 }), ['unknown setting idleCpuPercent']);
   assert.deepEqual(defaultsProblems({ idleMetric: 'off' }, { workload: true }), ['unknown setting idleMetric']);
   assert.deepEqual(typesProblems([{ name: 'databases', settings: { idleNetworkBytes: 1 } }]), ['type databases: settings: unknown setting idleNetworkBytes']);
-  assert.deepEqual(parseManagerSettings('{"workloads":{"defaults":{"idleCpuPercent":5,"idleMinutes":30}}}').problems, ['workloads.defaults: unknown setting idleCpuPercent']);
   assert.deepEqual(parseManagerSettings('{"workloads":{"defaults":{"idleCpuPercent":5,"idleMinutes":30}}}', { idle: true }).defaults, { idleCpuPercent: 5, idleMinutes: 30 });
+});
+
+test('final review, Important 2: settings.json read without the idle signals (Google Cloud\'s) ignores them silently: the type and the other keys are kept, no error', () => {
+  const text = JSON.stringify({ workloads: { defaults: { idleCpuPercent: 5, idleMinutes: 30 }, types: [{ name: 'batch', tags: { team: 'x' }, settings: { idleMinutes: 240, idleCpuPercent: 10, idleMetric: 'off' } }] } });
+  const parsed = parseManagerSettings(text);
+  assert.deepEqual(parsed.defaults, { idleMinutes: 30 });
+  assert.deepEqual(parsed.types, [{ name: 'batch', tags: { team: 'x' }, settings: { idleMinutes: 240 } }]);
+  assert.equal('problems' in parsed, false);
+  // An idle key that is not valid is ignored the same way; any other key is still checked.
+  const other = parseManagerSettings(JSON.stringify({ workloads: { defaults: { idleCpuPercent: 'none', waitSeconds: 1 } } }));
+  assert.deepEqual(other.problems, ['workloads.defaults: waitSeconds: must be a whole number from 5 to 120']);
+});
+
+test('final review, Minor 8: the type databases reads every listed companion\'s connections (each must be under 1)', () => {
+  const two = effectiveConfig(standalone({ databases: [{ kind: 'rds-instance', id: 'orders' }, { kind: 'rds-cluster', id: 'ledger' }] }), {});
+  assert.deepEqual(two.idleMetric, { namespace: 'AWS/RDS', name: 'DatabaseConnections', dimensions: [{ DBInstanceIdentifier: 'orders' }, { DBClusterIdentifier: 'ledger' }], statistic: 'Maximum', below: 1 });
+  // One: the object form, as before.
+  assert.deepEqual(effectiveConfig(standalone({ databases: [{ kind: 'rds-cluster', id: 'ledger' }] }), {}).idleMetric.dimensions, { DBClusterIdentifier: 'ledger' });
 });
 
 test('the AWS router reads the organization\'s idle signals from settings.json', async () => {

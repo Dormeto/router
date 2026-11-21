@@ -554,3 +554,64 @@ test('a standalone workload written by Terraform: its idle settings are changed 
       { refused: { code: 'conflict', message: `workload ${ID} was written by Terraform: set ${variable} in its workload module` } }, key);
   }
 });
+
+// --- The final review's fix wave (findings-final-1.md) -------------------------------------------------------------------
+
+test('final review, Important 1: a person\'s nap of a busy workload, delivered 2 minutes later, naps it: only an idle nap is read again', async () => {
+  const s = setup({ metrics: { cpu: () => 60 } });
+  assert.deepEqual(await s.handler({ action: 'request-nap', workloadId: ID, by: 'ana' }), { requested: true });
+  s.clock.advance(2 * MINUTE);
+  await s.deliver(s.queued[0]);
+  assert.equal(s.store.state.run.state, STATES.ASLEEP);
+  assert.equal(s.cloudwatch.calls.length, 0, 'not read');
+  assert.deepEqual(s.causes()[0], [STATES.NAPPING, 'manager']);
+});
+
+test('final review, Important 1: a queued idle nap is not decided on settings levels that cannot be read', async () => {
+  const s = setup();
+  await s.handler({ action: 'check' });
+  // A new instance, its levels never read: unreadable.
+  const handler = createController({
+    store: s.store, ec2: s.ec2, elbv2: s.elb.client, cloudwatch: s.cloudwatch, autoscaling: s.autoscaling, ecs: s.ecs, tagging: undefined, appscaling: fakeAppScaling(), rds: s.rds,
+    invokeSelf: async () => {}, queueWork: async () => {}, now: s.clock.now, sleep: s.clock.sleep, newId: () => 'w1', log: { info() {}, warn() {}, error() {} }, router: { name: 'dmt-dev' },
+  });
+  s.store.getRouterSettings = async () => { throw new Error('ThrottlingException'); };
+  s.clock.advance(2 * MINUTE);
+  await handler({ Records: [{ messageId: 'm', eventSource: 'aws:sqs', body: JSON.stringify(s.queued[0]) }] });
+  assert.equal(s.store.state.run.state, STATES.AWAKE);
+});
+
+test('final review, Minor 1: a failed nap shows no next attempt (only a failed wake is retried)', async () => {
+  const s = setup({ run: { state: STATES.FAILED, failedAt: Date.UTC(2026, 10, 23, 9, 58), consecutiveFailures: 1, failure: JSON.stringify({ kind: 'unknown', step: 'nap', message: 'x' }) } });
+  s.ecs.state.services = [];
+  const status = await s.handler({ action: 'status', workloadId: ID });
+  assert.equal(status.nextAttemptAt, null);
+  const { workloads: [row] } = await s.handler({ action: 'list' });
+  assert.equal(row.nextAttemptAt, null);
+  s.store.state.run.failure = JSON.stringify({ kind: 'timeout', step: 'wake', message: 'x' });
+  assert.equal((await s.handler({ action: 'status', workloadId: ID })).nextAttemptAt, '2026-11-23T09:59:00.000Z');
+});
+
+test('final review, Minor 2: resourceMissing is in the row and the status, after backends, only while the resource is missing', async () => {
+  const s = setup();
+  s.ec2.state.tags['i-0aaa'] = {};
+  await s.handler({ action: 'check' });
+  const { workloads: [row] } = await s.handler({ action: 'list' });
+  assert.deepEqual(Object.keys(row).slice(Object.keys(row).indexOf('backends'), Object.keys(row).indexOf('backends') + 3), ['backends', 'resourceMissing', 'pauses']);
+  assert.equal(row.resourceMissing, true);
+  const status = await s.handler({ action: 'status', workloadId: ID });
+  assert.deepEqual(Object.keys(status).slice(Object.keys(status).indexOf('backends'), Object.keys(status).indexOf('backends') + 3), ['backends', 'resourceMissing', 'ignoredTargets']);
+  assert.equal(status.resourceMissing, true);
+});
+
+test('final review, Minor 7: a settings change of an idle signal or the idle window clears idleNotBefore; another one keeps it', async () => {
+  const s = setup({ run: { state: STATES.AWAKE, awakeSince: Date.UTC(2026, 10, 23, 0), idleNotBefore: Date.UTC(2026, 10, 24) } });
+  await s.handler({ action: 'settings', workloadId: ID, settings: { hibernate: false }, by: 'ana' });
+  assert.equal(s.store.state.run.idleNotBefore, Date.UTC(2026, 10, 24));
+  for (const settings of [{ idleCpuPercent: 10 }, { idleMinutes: 60 }, { idleMetric: null }]) {
+    s.store.state.run.idleNotBefore = Date.UTC(2026, 10, 24);
+    await s.handler({ action: 'settings', workloadId: ID, settings, by: 'ana' });
+    assert.equal('idleNotBefore' in s.store.state.run, false, JSON.stringify(settings));
+  }
+  assert.deepEqual(s.elb.calls, []);
+});

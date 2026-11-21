@@ -1,6 +1,6 @@
 // Whether a nap hibernates EC2 instances (hibernation design): the first level that is set decides. Pure.
 import { isEndedDays, isJoinMinutes, JOIN_MINUTES_MAX } from './schedule.mjs';
-import { defaultsProblems, kindOf, typesProblems } from './settings-levels.mjs';
+import { IDLE_KEYS, defaultsProblems, kindOf, typesProblems } from './settings-levels.mjs';
 
 // The longest an instance may stay hibernated: the maintenance wake comes before AWS's 60-day limit.
 export const HIBERNATION_MAX_DAYS = 59;
@@ -82,7 +82,17 @@ export function parseManagerSettings(text, { idle = false } = {}) {
 
 // The organization's defaults and types (settings at scale design §6): what is valid of them, each key and each type on its
 // own; what is not is dropped and said in `problems` (never failing hibernate). Each key only when there is one.
-function levelsOf(workloads, { idle }) {
+// Without `idle` (a router with no standalone workload: Google Cloud's), the idle signals the organization sets for AWS routers are
+// none of its business: ignored silently, never a reason to drop a type or to report an error (final review, Important 2).
+const withoutIdle = (settings) => (settings && typeof settings === 'object' && !Array.isArray(settings)
+  ? Object.fromEntries(Object.entries(settings).filter(([key]) => !IDLE_KEYS.includes(key))) : settings);
+
+function levelsOf(source, { idle }) {
+  const workloads = idle ? source : {
+    ...source,
+    ...('defaults' in source ? { defaults: withoutIdle(source.defaults) } : {}),
+    ...(Array.isArray(source.types) ? { types: source.types.map((t) => (isObject(t) && isObject(t.settings) ? { ...t, settings: withoutIdle(t.settings) } : t)) } : {}),
+  };
   const problems = [];
   const levels = {};
   if ('defaults' in workloads) {

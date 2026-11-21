@@ -39,6 +39,9 @@ test('the page gives the code\'s built-in values, its lag and what is refused', 
   assert.match(page, new RegExp(`ends ${METRIC_LAG_MS / 60_000} minutes behind, at a 5-minute boundary`));
   assert.match(page, /10 to 15 minutes after the idle window/);
   assert.match(page, /Nothing wakes it on demand/);
+  // The final review's fix wave: a person's nap is theirs; every listed companion is read.
+  assert.match(page, /A queued idle nap delivered more than a minute after it was asked reads the signals again and is skipped if the workload is busy; a person's nap is never read against the signals/);
+  assert.match(page, /read for each companion its configuration lists \(databases at onboarding or in the workload module\): each must be under 1\. A companion found by its tag alone is napped and woken with the workload but not read/);
   for (const reason of ['a target of a target group', 'attached to a target group', 'registered with one', 'another workload\'s dormeto:workload tag', 'a companion database of another workload',
     'onboarded already', 'not found or terminated', 'is in an Auto Scaling group', 'instance store', 'Spot instance', 'holds EKS nodes', 'daemon scheduling strategy',
     'member of an Aurora cluster', 'read replica', 'Aurora Serverless v1']) {

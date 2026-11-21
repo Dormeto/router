@@ -180,3 +180,16 @@ test('a throttled call is not idle and is logged', async () => {
   assert.equal(isIdle(signals, WINDOW), false);
   assert.deepEqual(log.lines, [['warn', 'IdleSignalsUnread', { workloadId: 'batch', error: 'ThrottlingException: Rate exceeded' }]]);
 });
+
+test('final review, Minor 8: a metric with a list of dimensions reads each, and is under when each is', async () => {
+  const connections = { namespace: 'AWS/RDS', name: 'DatabaseConnections', dimensions: [{ DBInstanceIdentifier: 'orders' }, { DBClusterIdentifier: 'ledger' }], statistic: 'Maximum', below: 1 };
+  const config = cfg({ idleCpuPercent: 'off', idleMetric: connections });
+  const idle = await read(config, [instance, db, cluster], { metric_0: [0, 0, 0], metric_1: [0, 0, 0] });
+  assert.deepEqual(idle.queries.map(stat), [
+    ['metric_0', 'AWS/RDS', 'DatabaseConnections', [{ Name: 'DBInstanceIdentifier', Value: 'orders' }], 'Maximum', 300],
+    ['metric_1', 'AWS/RDS', 'DatabaseConnections', [{ Name: 'DBClusterIdentifier', Value: 'ledger' }], 'Maximum', 300],
+  ]);
+  assert.equal(isIdle(idle.signals, WINDOW), true);
+  const busy = await read(config, [instance, db, cluster], { metric_0: [0, 0, 0], metric_1: [0, 2, 0] });
+  assert.equal(isIdle(busy.signals, WINDOW), false);
+});

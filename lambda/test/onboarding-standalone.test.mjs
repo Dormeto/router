@@ -200,3 +200,42 @@ test('drift and repair skip a standalone workload without an error', async () =>
   assert.deepEqual(await s.onboarding.repairBatch([{ body: JSON.stringify({ detail }) }, { body: JSON.stringify({ action: 'repair', workloadId: workload.workloadId }) }]), { batchItemFailures: [], workloads: [] });
   assert.deepEqual(s.elb().filter((c) => c !== 'describeTargetGroups'), []);
 });
+
+// --- The final review's fix wave ---------------------------------------------------------------------------------------
+
+test('final review, Minor 3: a resource already tagged with its own workload id is accepted, and its tag left as it was', async () => {
+  const s = setup();
+  const workloadId = workloadIdOf(ARN.instance('i-0bbb'));
+  s.a.customer.instance('i-0bbb', { tags: { [WORKLOAD]: workloadId } });
+  const preview = await s.onboarding.preview({ resourceArn: ARN.instance('i-0bbb') });
+  assert.deepEqual([preview.ok, preview.problems], [true, []]);
+  const done = await s.onboarding.onboard({ resourceArn: ARN.instance('i-0bbb') });
+  assert.equal(done.steps[0].status, 'skipped');
+});
+
+test('final review, Minor 4: another onboarding that tags the same resource at once: undone, naming that workload, its tag kept', async () => {
+  const s = setup();
+  s.a.customer.instance('i-0aaa');
+  await s.a.store.putConfig('shop', { workloadId: 'shop', name: 'Shop', appTargetGroupArn: 'tg', source: 'manager' });
+  const create = s.a.ec2.createTags;
+  // The other onboarding's tag lands just after ours.
+  s.a.ec2.createTags = async (input) => {
+    await create(input);
+    s.a.state.instances.get('i-0aaa').tags[WORKLOAD] = 'shop';
+  };
+  const workloadId = workloadIdOf(ARN.instance('i-0aaa'));
+  await assert.rejects(s.onboarding.onboard({ resourceArn: ARN.instance('i-0aaa') }), { message: `cannot onboard ${workloadId}: instance i-0aaa belongs to workload Shop (shop) (undone)` });
+  assert.equal(s.a.state.instances.get('i-0aaa').tags[WORKLOAD], 'shop');
+  assert.equal(await s.a.store.getConfig(workloadId), null);
+});
+
+test('final review, Minor 5: offboarding reads no target group', async () => {
+  const s = setup();
+  s.a.customer.instance('i-0aaa');
+  s.a.customer.targetGroup('other', { targets: [{ Id: 'i-0fff' }] });
+  const { workload } = await s.onboarding.onboard({ resourceArn: ARN.instance('i-0aaa') });
+  const before = s.elb().length;
+  await s.onboarding.offboard({ workloadId: workload.workloadId });
+  assert.equal(s.elb().length, before);
+  assert.deepEqual(s.a.state.instances.get('i-0aaa').tags, {});
+});

@@ -9,6 +9,16 @@ what is its own. The connection
 (the manager's two service accounts and the grants that reach this router) is made by `dormeto gcp connect`, which is
 documented in the CLI's README, not here.
 
+## Standalone workloads
+
+Not released yet: router 0.42.0. A workload is of one of two kinds: an HTTP workload (a backend service of an Application
+Load Balancer) or a standalone workload, one Compute Engine VM, managed instance group or Cloud SQL instance that no load
+balancer serves ([Standalone workloads](standalone.md)). A standalone workload's row, status and REST `Workload` carry
+`kind: "standalone"` and `resource`, its path, and none of `urlMap`, `backendService`, `wakerBackendService`, `lb` or the
+waker's settings; its status carries its idle signals and the nap estimate from them. The `preview` and `onboard` actions
+take `resource` in place of `urlMap` and `backendService`; `waiting-page`, an exclusion naming a backend service and a nap
+window's `wake` are refused for it.
+
 ## What the router keeps
 
 - **The event journal**, `events/` in the router's Firestore database: one document for each change of a workload's state,

@@ -1,0 +1,28 @@
+// The standalone workloads page says both clouds (plan 5, R31): Google Cloud's resources, metrics, custom metric's shape, what marks a
+// resource and its limits, once; the manager page and the README name it, in the router's form for what is to come.
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { IDLE_METRIC_ALIGNERS, CLOUD_SQL_CONNECTIONS } from '../../lambda/src/lib/settings-levels.mjs';
+
+const read = (path) => readFileSync(new URL(`../../${path}`, import.meta.url), 'utf8');
+const flat = (text) => text.replace(/[`*]/g, '').replace(/\s+/g, ' ');
+
+test('the standalone page says Google Cloud\'s resources, metrics, metric shape, mark and limits, once', () => {
+  const page = flat(read('docs/scenarios/standalone.md'));
+  for (const said of ['Google Cloud: Compute Engine VM outside a managed instance group', 'Google Cloud: managed instance group', 'Google Cloud: Cloud SQL instance',
+    'compute.googleapis.com/instance/cpu/utilization', 'cloudsql.googleapis.com/database/cpu/utilization', 'received_bytes_count + sent_bytes_count', CLOUD_SQL_CONNECTIONS,
+    'idleMetric there is { type, filter, aligner, below }', `the aligner ${IDLE_METRIC_ALIGNERS.slice(0, -1).join(', ')} or ${IDLE_METRIC_ALIGNERS.at(-1)}`,
+    'the tag dormeto=managed', 'a resource is missing when Google says it is deleted', 'The wake timeout is 1700 s at most on Google Cloud',
+    'is a member of a managed instance group (onboard the group: it would repair a stopped VM)', 'holds GKE nodes', 'a read replica', 'Whether a VM or a group backs a backend service the router cannot tell']) {
+    assert.ok(page.includes(said.replace(/[`*]/g, '')), said);
+  }
+});
+
+test('the manager page and the README name standalone workloads, to come in router 0.42.0', () => {
+  const manager = flat(read('docs/scenarios/google-cloud-manager.md'));
+  assert.match(manager, /## Standalone workloads Not released yet: router 0\.42\.0\. A workload is of one of two kinds/);
+  assert.ok(manager.includes('[Standalone workloads](standalone.md)'));
+  const readme = flat(read('README.md'));
+  assert.ok(readme.includes('[Standalone workloads](docs/scenarios/standalone.md): a Compute Engine VM, a managed instance group or a Cloud SQL instance'));
+});

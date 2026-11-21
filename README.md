@@ -627,6 +627,9 @@ default (router 0.40.0 and CLI 0.14.0 or later) or from your own with `--image`.
   application and started before it, from 0.37.0.
 - [Kubernetes on GKE](docs/scenarios/google-kubernetes-engine.md): a Deployment or StatefulSet behind standalone network
   endpoint groups, scaled to 0 and back, from 0.37.0.
+- [Standalone workloads](docs/scenarios/standalone.md): a Compute Engine VM, a managed instance group or a Cloud SQL
+  instance that no load balancer serves, napped on its Cloud Monitoring signals, a schedule or a person (Not released yet:
+  router 0.42.0).
 - [The router and the manager](docs/scenarios/google-cloud-manager.md): the journal, the check summary and `POST
   /v1/actions`, through which the Dormeto manager reads and acts on a Google Cloud router, from 0.40.0.
 

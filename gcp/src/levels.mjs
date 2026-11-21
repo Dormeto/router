@@ -1,7 +1,8 @@
 // A Google Cloud workload's settings through AWS's levels (design §3): the shared resolution, with what Google imposes
 // applied on top and named `fixed`. Pure: no store, no Google.
-import { defaultsProblems, effectiveConfig, ownSettings, SCALAR_KEYS, SETTING_RANGES } from '../../lambda/src/lib/settings-levels.mjs';
+import { defaultsProblems, effectiveConfig, keysOf, kindOf, ownSettings, SETTING_RANGES } from '../../lambda/src/lib/settings-levels.mjs';
 import { aKind, SWAP_WAIT_MS } from './switch.mjs';
+import { resourceOf } from './resources.mjs';
 
 // What Google Cloud fixes whatever the level says; the swap's wait + 60 s is the wake's floor behind a swap.
 const FIXED_ZERO = ['waitSeconds', 'maxHolders', 'drainSeconds'];
@@ -46,12 +47,22 @@ function sharedView(cfg, run) {
 export function inheritsOf(cfg) {
   if (Array.isArray(cfg?.inherits)) return cfg.inherits;
   const own = ownSettings(sharedView(cfg, null).cfg);
-  return SCALAR_KEYS.filter((key) => !Object.hasOwn(own, key));
+  return keysOf(kindOf(cfg)).filter((key) => !Object.hasOwn(own, key));
+}
+
+// A standalone workload's databases, for the type databases' connections (vision standalone workloads design §4): its resource when it
+// is a Cloud SQL instance (its CPU then off), else each Cloud SQL companion among its backends; null without one.
+function databasesOf(cfg) {
+  const own = resourceOf(cfg?.resource);
+  if (own?.kind === 'cloudsql') return { databases: [{ kind: 'cloudsql', name: own.name }], own: true };
+  const listed = (Array.isArray(cfg?.backends) ? cfg.backends : []).filter((b) => b?.kind === 'cloudsql' && typeof b.name === 'string');
+  return listed.length ? { databases: listed.map((b) => ({ kind: 'cloudsql', name: b.name })) } : null;
 }
 
 export function effectiveOf(cfg, { run = null, router = null, organization = null } = {}) {
   const view = sharedView(cfg, run);
-  const got = effectiveConfig(view.cfg, { run: view.run, router, organization });
+  const standalone = kindOf(cfg) === 'standalone';
+  const got = effectiveConfig(view.cfg, { run: view.run, router, organization, cloud: 'gcp', ...(standalone ? { database: databasesOf(cfg) } : {}) });
   // The result is the configuration's own, not the view's.
   if (Array.isArray(cfg?.inherits)) got.inherits = cfg.inherits;
   else delete got.inherits;
@@ -60,9 +71,12 @@ export function effectiveOf(cfg, { run = null, router = null, organization = nul
     got[key] = value;
     got.settingsFrom[key] = 'fixed';
   };
-  for (const key of FIXED_ZERO) fix(key, 0);
-  if (isPolicy(cfg?.lb)) fix('wakeMode', 'browser');
-  const floor = swapFloorOf(cfg?.lb) ?? 0;
+  // A standalone workload has no waker (none of these keys) and no load balancer: only the controller's request limit holds.
+  if (!standalone) {
+    for (const key of FIXED_ZERO) fix(key, 0);
+    if (isPolicy(cfg?.lb)) fix('wakeMode', 'browser');
+  }
+  const floor = standalone ? 0 : swapFloorOf(cfg?.lb) ?? 0;
   const bounded = Math.min(Math.max(got.wakeTimeoutSeconds, floor), WAKE_TIMEOUT_MAX);
   if (bounded !== got.wakeTimeoutSeconds) fix('wakeTimeoutSeconds', bounded);
   return got;
@@ -82,26 +96,32 @@ export function wakerConfigOf(cfg, { run = null, router = null, organization = n
 }
 
 // The shared checks, and what Google Cloud refuses at a level. `cfg` is the workload's, for its load balancer.
+// The idle signals are known at every level (vision standalone workloads, plan 5), in Google Cloud's shape; a workload's are its kind's:
+// a standalone workload refuses the waker's keys (AWS's text, before what Google Cloud fixes), an HTTP one the idle signals.
 export function levelProblems(settings, { level, cfg } = {}) {
   const workload = level === 'workload';
+  const standalone = workload && kindOf(cfg) === 'standalone';
   const isObject = !!settings && typeof settings === 'object' && !Array.isArray(settings);
-  const fixed = isObject ? FIXED_ZERO.filter((key) => settings[key] !== undefined && settings[key] !== null) : [];
+  const fixed = isObject && !standalone ? FIXED_ZERO.filter((key) => settings[key] !== undefined && settings[key] !== null) : [];
   // A key of Object's prototype (constructor, __proto__) is an unknown setting: the shared check would look it up as a range.
   const prototyped = isObject ? Object.keys(settings).filter((key) => key in Object.prototype) : [];
   // The wake timeout's range is Google Cloud's own, said once below: AWS's would let 2000 through to a second text.
   const rest = isObject ? Object.fromEntries(Object.entries(settings).filter(([key]) => !fixed.includes(key) && !prototyped.includes(key) && key !== 'wakeTimeoutSeconds')) : settings;
-  const problems = [...fixed.map((key) => REASONS[key]), ...prototyped.map((key) => `unknown setting ${key}`), ...defaultsProblems(rest, { workload })];
+  const problems = [
+    ...fixed.map((key) => REASONS[key]), ...prototyped.map((key) => `unknown setting ${key}`),
+    ...defaultsProblems(rest, { workload, idle: true, cloud: 'gcp', ...(workload ? { kind: kindOf(cfg) } : {}) }),
+  ];
   if (!isObject) return problems;
   const asked = settings.wakeTimeoutSeconds;
   if (asked !== undefined && asked !== null && (!Number.isInteger(asked) || asked < WAKE_TIMEOUT_MIN || asked > WAKE_TIMEOUT_MAX)) {
     problems.push(`wakeTimeoutSeconds: must be a whole number from ${WAKE_TIMEOUT_MIN} to ${WAKE_TIMEOUT_MAX}`);
   } else if (Number.isInteger(asked)) {
-    const floor = workload ? swapFloorOf(cfg?.lb) : null;
+    const floor = workload && !standalone ? swapFloorOf(cfg?.lb) : null;
     if (floor && asked < floor) {
       const change = SWAP_WAIT_MS[cfg.lb.kind] / 1000;
       problems.push(`wakeTimeoutSeconds ${asked} is too short for ${aKind(cfg.lb.kind)} load balancer: its wake includes the URL map's change, ${change} s: use more than ${floor - 1}`);
     }
   }
-  if (workload && settings.wakeMode === 'any' && isPolicy(cfg?.lb)) problems.push(BROWSER_ONLY);
+  if (workload && !standalone && settings.wakeMode === 'any' && isPolicy(cfg?.lb)) problems.push(BROWSER_ONLY);
   return problems;
 }

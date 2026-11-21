@@ -59,8 +59,16 @@ function databaseOf(cfg) {
   return listed.length ? { databases: listed.map((db) => ({ kind: db.kind === 'rds-cluster' ? 'rds-cluster' : 'rds-instance', id: db.id })) } : null;
 }
 
-// One database: its dimensions; several: the list of each one's, every one under the threshold (activity.mjs reads each).
-const connectionsOf = ({ databases }) => {
+// One database: its dimensions; several: the list of each one's, every one under the threshold (activity.mjs reads each). On Google
+// Cloud (`cloud: 'gcp'`, databases `{ kind: 'cloudsql', name }`): Cloud Monitoring's connections, one filter a database, a list for
+// several (the router's project's instance of that name).
+export const CLOUD_SQL_CONNECTIONS = 'cloudsql.googleapis.com/database/network/connections';
+const cloudSqlFilter = (name) => `resource.type = "cloudsql_database" AND resource.labels.database_id = ends_with(":${name}")`;
+const connectionsOf = ({ databases }, cloud = 'aws') => {
+  if (cloud === 'gcp') {
+    const each = databases.map((db) => cloudSqlFilter(db.name));
+    return { type: CLOUD_SQL_CONNECTIONS, filter: each.length === 1 ? each[0] : each, aligner: 'ALIGN_MAX', below: 1 };
+  }
   const each = databases.map((db) => ({ [db.kind === 'rds-cluster' ? 'DBClusterIdentifier' : 'DBInstanceIdentifier']: db.id }));
   return { namespace: 'AWS/RDS', name: 'DatabaseConnections', dimensions: each.length === 1 ? each[0] : each, statistic: 'Maximum', below: 1 };
 };
@@ -68,11 +76,11 @@ const connectionsOf = ({ databases }) => {
 // Each key's built-in value for a kind and a built-in type. A standalone workload of the type databases: the slow start's wake
 // timeout and its database's connections under 1; CPU off only when its own resource is the database (an idle database's CPU
 // is not near zero): a server with a companion database keeps its CPU signal, and both must be idle (design §4).
-function builtInsOf(kind, typeName, database) {
+function builtInsOf(kind, typeName, database, cloud = 'aws') {
   if (kind !== 'standalone') return Object.fromEntries(SCALAR_KEYS.map((key) => [key, TYPE_BUILT_IN[typeName]?.[key] ?? BUILT_IN[key]]));
   if (typeName !== 'databases') return { ...STANDALONE_BUILT_IN };
   return {
-    ...STANDALONE_BUILT_IN, ...TYPE_BUILT_IN.databases, ...(database?.own ? { idleCpuPercent: 'off' } : {}), idleMetric: database ? connectionsOf(database) : 'off',
+    ...STANDALONE_BUILT_IN, ...TYPE_BUILT_IN.databases, ...(database?.own ? { idleCpuPercent: 'off' } : {}), idleMetric: database ? connectionsOf(database, cloud) : 'off',
   };
 }
 
@@ -129,11 +137,11 @@ export function ownSettings(cfg) {
 // Each scalar of its kind's from the first level that sets it, else the type's built-in value, else the built-in value; `off`
 // is a value like any other (the signal's reader says it does not apply). `database`: a standalone workload's, for the type
 // databases' connections.
-export function resolveSettings({ own = {}, type = {}, router = {}, organization = {}, typeName = null, kind = 'http', database = null } = {}) {
+export function resolveSettings({ own = {}, type = {}, router = {}, organization = {}, typeName = null, kind = 'http', database = null, cloud = 'aws' } = {}) {
   const values = {};
   const from = {};
   const levels = [['workload', own], ['type', type], ['router', router], ['organization', organization]];
-  const builtIns = builtInsOf(kind, typeName, database);
+  const builtIns = builtInsOf(kind, typeName, database, cloud);
   for (const key of keysOf(kind)) {
     const level = levels.find(([, set]) => isSet(set?.[key]));
     if (level) {
@@ -153,14 +161,16 @@ export const builtInSettingsOf = (cfg) => builtInsOf(kindOf(cfg), builtInTypeOf(
 // The configuration a wake, a nap, a check, a status or a request acts on: the stored one with each scalar resolved, where
 // each comes from, the type, and the rules of every level, the most general first (the first that matches decides).
 // router: ROUTER/SETTINGS ({ defaults }); organization: the mirror of settings.json ({ defaults, types }); either null.
-export function effectiveConfig(cfg, { run = null, router = null, organization = null, terraformRules = [] } = {}) {
+// `cloud`: 'aws' (the default) or 'gcp', the shape of the built-in idleMetric; `database`: the cloud's own reading of the databases of a
+// standalone workload (Google Cloud's levels.mjs gives it), else AWS's (databaseOf).
+export function effectiveConfig(cfg, { run = null, router = null, organization = null, terraformRules = [], cloud = 'aws', database } = {}) {
   const types = Array.isArray(organization?.types) ? organization.types : [];
   const type = typeOf(cfg, run, types);
   const typeSettings = types.find((t) => isObject(t) && t.name === type.name)?.settings ?? {};
   // The built-in values follow the backends, whatever type picks the workload: a slow start stays slow (review, 2026-11-04).
   const kind = kindOf(cfg);
   const { values, from } = resolveSettings({
-    own: ownSettings(cfg), type: typeSettings, router: router?.defaults, organization: organization?.defaults, typeName: builtInTypeOf(cfg, run), kind, database: databaseOf(cfg),
+    own: ownSettings(cfg), type: typeSettings, router: router?.defaults, organization: organization?.defaults, typeName: builtInTypeOf(cfg, run), kind, database: database === undefined ? databaseOf(cfg) : database, cloud,
   });
   // A standalone workload has no waker: no rule of any level applies to it.
   if (kind === 'standalone') return { ...cfg, ...values, settingsFrom: from, type, ruleLevels: { noWake: [], wake: [] } };
@@ -213,9 +223,32 @@ function rulesProblems(key, rules) {
 
 const isText = (value, max) => typeof value === 'string' && value.length >= 1 && value.length <= max;
 
-// idleMetric (design §4): off, or one CloudWatch metric and its threshold, `${resource}` the only value replaced.
-function idleMetricProblems(value) {
+export const IDLE_METRIC_ALIGNERS = ['ALIGN_MAX', 'ALIGN_MEAN', 'ALIGN_SUM'];
+const METRIC_TYPE = /^[a-z0-9][a-z0-9.-]*\/[A-Za-z0-9_./-]+$/;
+const ofList = (list) => `${list.slice(0, -1).join(', ')} or ${list.at(-1)}`;
+
+// Google Cloud's idleMetric (design §4): off, or one Cloud Monitoring metric type, an optional filter (`${resource}` the only value
+// replaced), its aligner and threshold.
+function gcpIdleMetricProblems(value) {
+  if (!isObject(value)) return ['idleMetric: must be off or a metric { type, filter, aligner, below }'];
+  const problems = [];
+  const fields = ['type', 'filter', 'aligner', 'below'];
+  problems.push(...Object.keys(value).filter((key) => !fields.includes(key)).map((key) => `idleMetric: unknown field ${key}`));
+  if (!isText(value.type, 512) || !METRIC_TYPE.test(value.type)) problems.push('idleMetric: type must be a Cloud Monitoring metric type of at most 512 characters, such as custom.googleapis.com/queue/depth');
+  if (isSet(value.filter)) {
+    if (!isText(value.filter, 2048)) problems.push('idleMetric: filter must be text of 1 to 2048 characters');
+    else if (value.filter.replaceAll(RESOURCE, '').includes('${')) problems.push(`idleMetric: filter: only ${RESOURCE} is replaced`);
+  }
+  if (!IDLE_METRIC_ALIGNERS.includes(value.aligner)) problems.push(`idleMetric: aligner must be ${ofList(IDLE_METRIC_ALIGNERS)}`);
+  if (typeof value.below !== 'number' || !Number.isFinite(value.below)) problems.push('idleMetric: below must be a number');
+  return problems;
+}
+
+// idleMetric (design §4): off (for every cloud, here), or one metric and its threshold in the router's cloud's shape: on AWS a
+// CloudWatch metric, `${resource}` the only value replaced.
+function idleMetricProblems(value, cloud = 'aws') {
   if (value === 'off') return [];
+  if (cloud === 'gcp') return gcpIdleMetricProblems(value);
   if (!isObject(value)) return ['idleMetric: must be off or a metric { namespace, name, dimensions, statistic, below }'];
   const problems = [];
   const fields = ['namespace', 'name', 'dimensions', 'statistic', 'below'];
@@ -231,8 +264,8 @@ function idleMetricProblems(value) {
   return problems;
 }
 
-function idleProblems(key, value) {
-  if (key === 'idleMetric') return idleMetricProblems(value);
+function idleProblems(key, value, cloud) {
+  if (key === 'idleMetric') return idleMetricProblems(value, cloud);
   if (value === 'off') return [];
   if (key === 'idleCpuPercent') return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 100 ? [] : ['idleCpuPercent: must be a number from 0 to 100, or off'];
   return Number.isInteger(value) && value >= 0 && value <= IDLE_NETWORK_BYTES_MAX ? [] : [`idleNetworkBytes: must be a whole number from 0 to ${IDLE_NETWORK_BYTES_MAX}, or off`];
@@ -245,8 +278,9 @@ export const notForKind = (key, kind) => (kind === 'standalone'
 
 // A level's settings (null unsets a key); `type` only at a workload's. `idle`: the idle signals are known (AWS's levels: a type, the
 // router or the organization may hold both kinds' keys, each applying to its kind); without, they are unknown settings, as on
-// Google Cloud. `kind`: a workload's, which refuses the other kind's keys whatever their value.
-export function defaultsProblems(defaults, { workload = false, idle = false, kind = null } = {}) {
+// Google Cloud before it knew them. `kind`: a workload's, which refuses the other kind's keys whatever their value. `cloud`: 'aws' (the
+// default) or 'gcp': the shape idleMetric must have.
+export function defaultsProblems(defaults, { workload = false, idle = false, kind = null, cloud = 'aws' } = {}) {
   if (!isObject(defaults)) return ['settings must be an object'];
   const problems = [];
   const idleKnown = idle || kind !== null;
@@ -256,7 +290,7 @@ export function defaultsProblems(defaults, { workload = false, idle = false, kin
       continue;
     }
     if (idleKnown && IDLE_KEYS.includes(key)) {
-      if (value !== null) problems.push(...idleProblems(key, value));
+      if (value !== null) problems.push(...idleProblems(key, value, cloud));
       continue;
     }
     if (value === null && (SCALAR_KEYS.includes(key) || RULE_KEYS.includes(key) || (workload && key === 'type'))) continue;
@@ -275,7 +309,7 @@ export function defaultsProblems(defaults, { workload = false, idle = false, kin
 }
 
 // The organization's types: the built-in ones' defaults (no tags) and at most 20 custom ones, each selected by its tags.
-export function typesProblems(types, { idle = false } = {}) {
+export function typesProblems(types, { idle = false, cloud = 'aws' } = {}) {
   if (!Array.isArray(types)) return ['types must be a list'];
   if (custom(types).length > TYPES_MAX) return [`at most ${TYPES_MAX} custom types`];
   const problems = [];
@@ -299,7 +333,7 @@ export function typesProblems(types, { idle = false } = {}) {
     if (isSet(type.description) && (typeof type.description !== 'string' || type.description.length > DESCRIPTION_MAX)) {
       problems.push(`${at}: description must be text of at most ${DESCRIPTION_MAX} characters`);
     }
-    if (isSet(type.settings)) problems.push(...defaultsProblems(type.settings, { idle }).map((p) => `${at}: settings: ${p}`));
+    if (isSet(type.settings)) problems.push(...defaultsProblems(type.settings, { idle, cloud }).map((p) => `${at}: settings: ${p}`));
   }
   return problems;
 }

@@ -66,7 +66,8 @@ export function workloadSettingsProblems(settings, cfg = null) {
 // The manager's settings.json: `workloads.hibernate`, true when absent; `workloads.joinMinutes` and
 // `workloads.endedWindowDays`, null when absent or invalid (they have no safety side, so they never lose hibernate); other keys
 // belong to the manager. `idle`: the defaults and types may hold the idle signals (AWS's).
-export function parseManagerSettings(text, { idle = false } = {}) {
+// `cloud` ('aws', the default, or 'gcp'): the shape of idleMetric this router reads; one of the other cloud's is ignored silently.
+export function parseManagerSettings(text, { idle = false, cloud = 'aws' } = {}) {
   const doc = JSON.parse(text);
   if (!isObject(doc)) throw new Error('settings.json must be an object');
   if (!('workloads' in doc)) return { hibernate: true, joinMinutes: null, endedWindowDays: null };
@@ -74,7 +75,7 @@ export function parseManagerSettings(text, { idle = false } = {}) {
   const { hibernate } = doc.workloads;
   const joinMinutes = isJoinMinutes(doc.workloads.joinMinutes) ? doc.workloads.joinMinutes : null;
   const endedWindowDays = isEndedDays(doc.workloads.endedWindowDays) ? doc.workloads.endedWindowDays : null;
-  const levels = levelsOf(doc.workloads, { idle });
+  const levels = levelsOf(doc.workloads, { idle, cloud });
   if (hibernate === undefined) return { hibernate: true, joinMinutes, endedWindowDays, ...levels };
   if (!isBoolean(hibernate)) throw new Error('settings.json: workloads.hibernate must be true or false');
   return { hibernate, joinMinutes, endedWindowDays, ...levels };
@@ -87,11 +88,16 @@ export function parseManagerSettings(text, { idle = false } = {}) {
 const withoutIdle = (settings) => (settings && typeof settings === 'object' && !Array.isArray(settings)
   ? Object.fromEntries(Object.entries(settings).filter(([key]) => !IDLE_KEYS.includes(key))) : settings);
 
-function levelsOf(source, { idle }) {
-  const workloads = idle ? source : {
+// On Google Cloud, an idleMetric in AWS's shape (it names a CloudWatch namespace) is AWS routers' business: ignored silently, as above.
+const withoutAwsMetric = (settings) => (isObject(settings) && isObject(settings.idleMetric) && Object.hasOwn(settings.idleMetric, 'namespace')
+  ? Object.fromEntries(Object.entries(settings).filter(([key]) => key !== 'idleMetric')) : settings);
+
+function levelsOf(source, { idle, cloud }) {
+  const strip = !idle ? withoutIdle : cloud === 'gcp' ? withoutAwsMetric : null;
+  const workloads = !strip ? source : {
     ...source,
-    ...('defaults' in source ? { defaults: withoutIdle(source.defaults) } : {}),
-    ...(Array.isArray(source.types) ? { types: source.types.map((t) => (isObject(t) && isObject(t.settings) ? { ...t, settings: withoutIdle(t.settings) } : t)) } : {}),
+    ...('defaults' in source ? { defaults: strip(source.defaults) } : {}),
+    ...(Array.isArray(source.types) ? { types: source.types.map((t) => (isObject(t) && isObject(t.settings) ? { ...t, settings: strip(t.settings) } : t)) } : {}),
   };
   const problems = [];
   const levels = {};
@@ -100,7 +106,7 @@ function levelsOf(source, { idle }) {
     else {
       const defaults = {};
       for (const [key, value] of Object.entries(workloads.defaults)) {
-        const found = defaultsProblems({ [key]: value }, { idle });
+        const found = defaultsProblems({ [key]: value }, { idle, cloud });
         if (found.length) problems.push(...found.map((p) => `workloads.defaults: ${p}`));
         else if (value !== null) defaults[key] = value;
       }
@@ -108,12 +114,12 @@ function levelsOf(source, { idle }) {
     }
   }
   if ('types' in workloads) {
-    const whole = typesProblems(workloads.types, { idle });
+    const whole = typesProblems(workloads.types, { idle, cloud });
     if (!Array.isArray(workloads.types) || whole.some((p) => p.startsWith('at most'))) problems.push(...whole.map((p) => `workloads.types: ${p}`));
     else {
       const kept = [];
       for (const type of workloads.types) {
-        const found = typesProblems([...kept, type], { idle }).filter((p) => !typesProblems(kept, { idle }).includes(p));
+        const found = typesProblems([...kept, type], { idle, cloud }).filter((p) => !typesProblems(kept, { idle, cloud }).includes(p));
         if (found.length) problems.push(...found.map((p) => `workloads.types: ${p}`));
         else kept.push(type);
       }

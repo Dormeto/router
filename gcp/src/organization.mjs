@@ -17,7 +17,8 @@ export function organizationOf(stored) {
   const readAt = stored.at ? stored.at : null;
   try {
     if (!isObject(stored.settings)) throw new Error('settings.json must be an object');
-    const { problems, defaults = {}, types = [], ...values } = parseManagerSettings(JSON.stringify(stored.settings));
+    // With the idle signals in Google Cloud's shape (standalone workloads, plan 5); an AWS-shaped idleMetric is AWS routers' business.
+    const { problems, defaults = {}, types = [], ...values } = parseManagerSettings(JSON.stringify(stored.settings), { idle: true, cloud: 'gcp' });
     return {
       level: { ...values, ...(Object.keys(defaults).length ? { defaults } : {}), ...(types.length ? { types } : {}) },
       page: cleanPage(stored.settings.waitingPage),

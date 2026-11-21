@@ -30,7 +30,7 @@ import { joinLevels } from '../../lambda/src/lib/manager-settings.mjs';
 import { createManagerActions, scheduleView } from '../../lambda/src/lib/manager-actions.mjs';
 import { pageViewOf } from '../../lambda/src/lib/page-settings.mjs';
 import { maintenanceDue } from '../../lambda/src/lib/schedule.mjs';
-import { describedRules, SCALAR_KEYS } from '../../lambda/src/lib/settings-levels.mjs';
+import { describedRules, keysOf, kindOf, SCALAR_KEYS } from '../../lambda/src/lib/settings-levels.mjs';
 import { resolvedSettings, routerSettingsView, withSettings } from '../../lambda/src/lib/settings-writes.mjs';
 import { STATES } from '../../lambda/src/lib/state.mjs';
 import { fallbacksOf } from '../../lambda/src/lib/summary.mjs';
@@ -199,7 +199,7 @@ function cloudSqlProblems(cloudSql, field = 'cloudSql') {
 
 // What each key left to the levels resolves to without any level (the built-in value, with what Google Cloud fixes): the value a
 // router before G5 reads, as AWS writes its built-in values for an older router.
-const builtInsOf = (cfg) => effectiveOf({ ...cfg, inherits: SCALAR_KEYS });
+const builtInsOf = (cfg) => effectiveOf({ ...cfg, inherits: keysOf(kindOf(cfg)) });
 
 // AWS's hibernation of a workload, as its status and its settings answer give it: the resolution (its own, none with fallback machine
 // types, the router's, the built-in), each level's value, and the manager's (the organization's level, router/manager).

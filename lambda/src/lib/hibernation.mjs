@@ -88,13 +88,16 @@ export function parseManagerSettings(text, { idle = false, cloud = 'aws' } = {})
 const withoutIdle = (settings) => (settings && typeof settings === 'object' && !Array.isArray(settings)
   ? Object.fromEntries(Object.entries(settings).filter(([key]) => !IDLE_KEYS.includes(key))) : settings);
 
-// On Google Cloud, an idleMetric in AWS's shape (it names a CloudWatch namespace) is AWS routers' business: ignored silently, as above.
-const withoutAwsMetric = (settings) => (isObject(settings) && isObject(settings.idleMetric) && Object.hasOwn(settings.idleMetric, 'namespace')
+// An idleMetric in the other cloud's shape is that cloud's routers' business: ignored silently, as above. AWS's names a CloudWatch
+// `namespace`, Google Cloud's a Cloud Monitoring `type`; a level holds one metric, so a custom metric for both clouds takes one type a
+// cloud. Read in settings.json only: set at the router's or a workload's level, it is refused (its check says why).
+const OTHER_SHAPE = { aws: (m) => Object.hasOwn(m, 'type') && !Object.hasOwn(m, 'namespace'), gcp: (m) => Object.hasOwn(m, 'namespace') };
+const withoutOtherMetric = (cloud) => (settings) => (isObject(settings) && isObject(settings.idleMetric) && OTHER_SHAPE[cloud](settings.idleMetric)
   ? Object.fromEntries(Object.entries(settings).filter(([key]) => key !== 'idleMetric')) : settings);
 
 function levelsOf(source, { idle, cloud }) {
-  const strip = !idle ? withoutIdle : cloud === 'gcp' ? withoutAwsMetric : null;
-  const workloads = !strip ? source : {
+  const strip = idle ? withoutOtherMetric(cloud) : withoutIdle;
+  const workloads = {
     ...source,
     ...('defaults' in source ? { defaults: strip(source.defaults) } : {}),
     ...(Array.isArray(source.types) ? { types: source.types.map((t) => (isObject(t) && isObject(t.settings) ? { ...t, settings: strip(t.settings) } : t)) } : {}),

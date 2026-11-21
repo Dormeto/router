@@ -214,3 +214,17 @@ test('the HTTP onboarding refuses the idle signals with the same words', async (
   const bad = await onboarding.preview({ workloadId: 'shop', targetGroupArn: tg, settings: { idleCpuPercent: 5, idleMinutes: 30 } });
   assert.deepEqual(bad.problems.filter((p) => p.startsWith('settings')), ['settings: idleCpuPercent: an HTTP workload naps on its requests: the idle signals are for a standalone workload']);
 });
+
+test('settings.json on AWS: an idleMetric in Google Cloud\'s shape is ignored silently, the type and its other keys kept; set at a level directly, it is refused', () => {
+  const google = { type: 'custom.googleapis.com/queue/depth', aligner: 'ALIGN_MAX', below: 1 };
+  const text = JSON.stringify({ workloads: { defaults: { idleMinutes: 30, idleMetric: google }, types: [{ name: 'nightly', tags: { team: 'x' }, settings: { idleMinutes: 240, idleMetric: google } }] } });
+  const parsed = parseManagerSettings(text, { idle: true });
+  assert.deepEqual(parsed.defaults, { idleMinutes: 30 });
+  assert.deepEqual(parsed.types, [{ name: 'nightly', tags: { team: 'x' }, settings: { idleMinutes: 240 } }]);
+  assert.equal('problems' in parsed, false);
+  // An AWS one is kept.
+  assert.deepEqual(parseManagerSettings(JSON.stringify({ workloads: { defaults: { idleMetric: metric() } } }), { idle: true }).defaults, { idleMetric: metric() });
+  // The router's level and a workload's: told.
+  assert.match(settingsProblems({ defaults: { idleMetric: google } }, { idle: true })[0], /^settings: defaults: idleMetric: unknown field type$/);
+  assert.match(workloadSettingsProblems({ idleMetric: google }, standalone())[0], /^settings: idleMetric: unknown field type$/);
+});

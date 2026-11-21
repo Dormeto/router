@@ -17,3 +17,11 @@ export function resourceOf(path) {
   if (m) return { kind: 'cloudsql', project: m[1], name: m[2] };
   return null;
 }
+
+// Whether `backend` (a record's: `{ kind, location?, name }`) is the standalone workload `cfg`'s own resource, not a companion of it:
+// the same kind, name and location (a Cloud SQL instance has none). The one test of it, for the controller, the onboarding and the
+// status (final review of plan 5, M3).
+export function isResourceOf(cfg, backend) {
+  const own = cfg?.kind === 'standalone' ? resourceOf(cfg.resource) : null;
+  return Boolean(own) && own.kind === backend?.kind && own.name === backend.name && (backend.kind === 'cloudsql' || own.location === backend.location);
+}

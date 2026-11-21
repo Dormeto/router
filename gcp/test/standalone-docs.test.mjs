@@ -43,3 +43,21 @@ test('the page says what the manager\'s discovery role reads of Cloud SQL, as gc
   assert.ok(page.includes(`The manager's scan lists a project's Cloud SQL instances (Not released yet: router 0.42.0): its discovery role, dormetoDiscovery, reads them with ${reads.join(' and ')}`));
   assert.ok(page.includes('where the Cloud SQL Admin API is off (only a router installed with --with cloud-sql turns it on), Google refuses the read and the scan says Cloud SQL was not read; nothing turns the API on for it'));
 });
+
+test('the page says the final review\'s fixes (plan 5): the group sized 0, Spot on each cloud, cloud-sql-unreadable, the calls a read makes, both sequences, a person\'s nap', () => {
+  const raw = read('docs/scenarios/standalone.md');
+  const page = flat(raw);
+  assert.doesNotMatch(page, /A managed instance group not found, with no VM/);
+  assert.ok(page.includes('A group sized 0 is accepted: it is awake with no VM'));
+  assert.ok(page.includes('Spot instances are refused on AWS; Google Cloud accepts Spot and preemptible VMs'));
+  assert.ok(page.includes('the router\'s health warns cloud-sql-unreadable'));
+  assert.ok(page.includes('one GetMetricData call for all its signals'));
+  assert.ok(page.includes('one timeSeries.list call a metric type, a managed instance group\'s VMs listed first'));
+  assert.ok(page.includes('The status reads them live'));
+  assert.match(raw, /participant C as Controller Lambda[\s\S]*participant G as Controller \(Cloud Run\)|participant G as Controller \(Cloud Run\)/);
+  assert.ok(raw.includes('participant CM as Cloud Monitoring'));
+  assert.ok(page.includes('A person\'s nap asked stops the retry at once'));
+  assert.ok(page.includes('a release that fails is recorded as a nap\'s failure, tried again once an idle window, never followed by a wake'));
+  assert.ok(page.includes('journaled as the person\'s nap (cause manager, with by)'));
+  assert.ok(page.includes('nextAttemptAt is the retry\'s time only while one is coming'));
+});

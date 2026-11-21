@@ -429,7 +429,8 @@ test('R30 review, I1: a wake that failed with everything stopped stays FAILED, i
   napped.store.state.run = { state: STATES.FAILED, failedAt: napped.clock.now(), consecutiveFailures: 1, failure: JSON.stringify({ kind: 'capacity', step: 'wake', message: 'x' }) };
   assert.deepEqual(await napped.handler({ action: 'request-nap', workloadId: ID, by: 'ana' }), { requested: true });
   await napped.deliver(napped.queued[0]);
-  assert.deepEqual(napped.causes().at(-1), [STATES.ASLEEP, 'failed-released']);
+  // Journaled as the person's nap (final review of plan 5, M10).
+  assert.deepEqual(napped.causes().at(-1), [STATES.ASLEEP, 'manager']);
   napped.clock.advance(60 * MINUTE);
   await napped.handler({ action: 'check' });
   assert.equal(napped.invocations.filter((i) => i.action === 'wake').length, 0);
@@ -637,4 +638,104 @@ test('final review, Minor 7: a settings change of an idle signal or the idle win
     assert.equal('idleNotBefore' in s.store.state.run, false, JSON.stringify(settings));
   }
   assert.deepEqual(s.elb.calls, []);
+});
+
+// --- The final review of the router, plan 5 (findings-final-router-1.md): the same rules on AWS --------------------------------
+
+const wakeFailure = (kind = 'timeout') => JSON.stringify({ kind, step: 'wake', message: 'x' });
+const refusedStop = () => Object.assign(new Error('You are not authorized to perform this operation.'), { name: 'UnauthorizedOperation' });
+
+test('final review (plan 5), I1 and I2: a person\'s nap whose release fails writes a nap\'s failure: never woken again, the release tried once an idle window', async () => {
+  const s = setup();
+  s.store.state.run = { state: STATES.FAILED, failedAt: s.clock.now() - MINUTE, consecutiveFailures: 1, failure: wakeFailure() };
+  s.ec2.stopInstances = async () => { throw refusedStop(); };
+  assert.deepEqual(await s.handler({ action: 'request-nap', workloadId: ID, by: 'ana' }), { requested: true });
+  // Recorded, not thrown past the queue (M9): the message is done.
+  assert.deepEqual(await s.deliver(s.queued.shift()), { batchItemFailures: [] });
+  const run = s.store.state.run;
+  assert.deepEqual([run.state, JSON.parse(run.failure).step, JSON.parse(run.failure).kind, run.failedAt, run.consecutiveFailures, 'napRequestedAt' in run],
+    [STATES.FAILED, 'nap', 'permission', s.clock.now(), 2, false]);
+  assert.equal(s.logged('ReleaseFailed').length, 1);
+  // 130 minutes of checks, the built-in idleMinutes 120 among them, each release asked delivered: no wake, one release, at its idle
+  // window, refused again and recorded again.
+  const released = [];
+  for (let m = 0; m < 26; m += 1) {
+    s.clock.advance(5 * MINUTE);
+    await s.handler({ action: 'check' });
+    for (const message of s.queued.splice(0)) {
+      released.push(s.clock.now());
+      await s.deliver(message);
+    }
+  }
+  assert.deepEqual(s.causes().filter(([to]) => to === STATES.WAKING), []);
+  assert.deepEqual(released, [Date.UTC(2026, 10, 23, 12, 0)]);
+  assert.deepEqual([s.store.state.run.consecutiveFailures, s.store.state.run.failedAt, s.logged('ReleaseFailed').length], [3, released[0], 2]);
+  assert.deepEqual(s.elb.calls, []);
+});
+
+test('final review (plan 5), I1, M1, M10: a nap request wins over a due retry; its release is journaled as the person\'s and clears the failure', async () => {
+  const s = setup({ state: 'stopped' });
+  s.store.state.run = { state: STATES.FAILED, failedAt: s.clock.now(), consecutiveFailures: 1, failure: wakeFailure('capacity') };
+  assert.deepEqual(await s.handler({ action: 'request-nap', workloadId: ID, by: 'ana' }), { requested: true });
+  s.clock.advance(61_000);
+  assert.deepEqual(await s.handler({ action: 'check' }), [{ workloadId: ID, state: STATES.FAILED }]);
+  const { workloads: [held] } = await s.handler({ action: 'list' });
+  assert.equal(held.nextAttemptAt, null, 'no retry is coming');
+  await s.deliver(s.queued.find((m) => m.action === 'nap'));
+  assert.deepEqual(s.causes(), [[STATES.ASLEEP, 'manager']]);
+  assert.equal(s.changes.at(-1).by, 'ana');
+  const run = s.store.state.run;
+  assert.deepEqual(['failure', 'consecutiveFailures', 'napRequestedAt'].filter((key) => key in run), []);
+  const { workloads: [row] } = await s.handler({ action: 'list' });
+  assert.deepEqual([row.state, row.failure, row.consecutiveFailures], [STATES.ASLEEP, null, 0]);
+  assert.deepEqual(s.elb.calls, []);
+});
+
+test('final review (plan 5), M9: only a person\'s nap releases a failed workload; a nap no one asked is skipped', async () => {
+  const s = setup({ state: 'stopped', run: { state: STATES.FAILED, failedAt: Date.UTC(2026, 10, 23, 9, 59), consecutiveFailures: 1, failure: wakeFailure() } });
+  assert.deepEqual(await s.handler({ action: 'nap', workloadId: ID }), { state: 'SKIPPED', reason: 'not awake (FAILED)' });
+  assert.equal(s.store.state.run.state, STATES.FAILED);
+  assert.deepEqual(await s.handler({ action: 'nap', workloadId: ID, by: 'ana' }), { state: STATES.ASLEEP });
+  assert.deepEqual(s.causes(), [[STATES.ASLEEP, 'manager']]);
+});
+
+test('final review (plan 5), M2: nextAttemptAt only while the check will retry then: none while a pause, a nap window, the levels or the resource hold it', async () => {
+  const at = Date.UTC(2026, 10, 23, 9, 0);
+  const failed = { state: STATES.FAILED, failedAt: at, consecutiveFailures: 1, failure: wakeFailure() };
+  const shown = async (s) => [(await s.handler({ action: 'list' })).workloads[0].nextAttemptAt, (await s.handler({ action: 'status', workloadId: ID })).nextAttemptAt];
+  const due = new Date(at + MINUTE).toISOString();
+  // Nothing holds it: the backoff's time.
+  const free = setup({ state: 'stopped', run: { ...failed } });
+  assert.deepEqual(await shown(free), [due, due]);
+  // A keepAsleep pause: none, at once.
+  const paused = setup({ state: 'stopped', run: { ...failed } });
+  await paused.store.putPause(ID, { by: 'ops', at: paused.clock.now(), keepAsleep: true });
+  assert.deepEqual(await shown(paused), [null, null]);
+  // A nap window: none once a check found it held; the retry when it ends.
+  const windowed = setup({ state: 'stopped', run: { ...failed } });
+  windowed.store.state.schedules[ID] = { timeZone: 'UTC', windows: [{ kind: 'nap', days: ['mon'], start: '09:00', end: '18:00' }], by: 'ops', at: Date.UTC(2026, 10, 20) };
+  assert.equal((await windowed.handler({ action: 'check' }))[0].retry, 'held');
+  assert.deepEqual(await shown(windowed), [null, null]);
+  // Levels it cannot read: none once a check found them so.
+  const unread = setup({ state: 'stopped', run: { ...failed } });
+  unread.store.getRouterSettings = async () => { throw new Error('ThrottlingException'); };
+  // A new instance, its levels never read (the first one's are in its memory): unreadable.
+  const fresh = createController({
+    store: unread.store, ec2: unread.ec2, elbv2: unread.elb.client, cloudwatch: unread.cloudwatch, autoscaling: unread.autoscaling, ecs: unread.ecs, tagging: undefined, appscaling: fakeAppScaling(), rds: unread.rds,
+    invokeSelf: async () => {}, queueWork: async () => {}, now: unread.clock.now, sleep: unread.clock.sleep, newId: () => 'w1', log: { info() {}, warn() {}, error() {} }, router: { name: 'dmt-dev' },
+  });
+  assert.equal((await fresh({ action: 'check' }))[0].settings, 'unreadable');
+  assert.deepEqual(await shown(unread), [null, null]);
+  // The resource missing: none.
+  const missing = setup({ state: 'stopped', run: { ...failed, resourceMissing: true } });
+  assert.deepEqual(await shown(missing), [null, null]);
+  // A later failure is not held by an earlier one's hold.
+  windowed.store.state.run = { ...windowed.store.state.run, failedAt: at + 30 * MINUTE };
+  delete windowed.store.state.schedules[ID];
+  assert.deepEqual(await shown(windowed), [new Date(at + 31 * MINUTE).toISOString(), new Date(at + 31 * MINUTE).toISOString()]);
+});
+
+test('final review (plan 5), M7: the shared check rules export only what the routers use', async () => {
+  const shared = await import('../src/lib/standalone-check.mjs');
+  assert.equal('idleNotBeforeOf' in shared, false);
 });

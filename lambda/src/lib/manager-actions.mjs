@@ -135,6 +135,8 @@ export function createManagerActions({
     if (run?.state !== STATES.AWAKE && !failedStandalone) return { requested: false, reason: `not awake (${run?.state ?? 'UNKNOWN'})` };
     const [first] = await pausesFor(workloadId);
     if (first) return { requested: false, reason: pauseText(first) };
+    // Marked first: a check that runs before its release does not retry the wake the person napped (final review of plan 5, I1).
+    if (failedStandalone) await store.transition(workloadId, { cond: { state: STATES.FAILED }, set: { napRequestedAt: (now ?? Date.now)() } });
     await napNow(workloadId, by);
     log.info('NapRequested', { workloadId, trigger: { kind: 'manager', by } });
     return { requested: true };

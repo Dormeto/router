@@ -238,3 +238,12 @@ test('R30 review, M7: a settings write refused after it was decided leaves no id
   await t.onboarding.setSettings('batch', { hibernate: false, by: 'ana' });
   assert.equal(t.store.runs.get('batch').idleNotBefore, hold);
 });
+
+test('final review (plan 5), M3: the status names a Cloud SQL companion that has the VM\'s name a companion', async () => {
+  const t = world((w) => { w.sql.batch = {}; });
+  const onboarded = await t.call('POST', '/v1/workloads', { resource: VM, id: 'batch', cloudSql: ['batch'] });
+  assert.equal(onboarded.body.resource, VM);
+  const status = (await t.act({ action: 'status', workloadId: 'batch' })).body;
+  assert.deepEqual(status.backends.map((b) => [b.kind, b.id, b.companion ?? false]), [['instance', 'batch', false], ['cloudsql-instance', 'batch', true]]);
+  assert.deepEqual(t.routeCalls(), []);
+});

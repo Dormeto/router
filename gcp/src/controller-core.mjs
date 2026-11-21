@@ -69,7 +69,9 @@ import { DAY_MS, STATES, utcDay } from '../../lambda/src/lib/state.mjs';
 import { readActivePauses, routerAnswer } from '../../lambda/src/lib/manager-actions.mjs';
 import { createListRefresher, requestListRefresh as askListRefresh } from '../../lambda/src/lib/list-refresh.mjs';
 import { createLevelsReader } from '../../lambda/src/lib/settings-levels.mjs';
-import { failedWakeDecision, failureKept, idleDecision, idleRecheck, napWindowNow, warnResourceMissing } from '../../lambda/src/lib/standalone-check.mjs';
+import {
+  RELEASED_REMOVE, failedWakeDecision, failureKept, idleDecision, idleRecheck, napWindowNow, releaseCause, releaseFailedChange, retryDue, retryHeldChange, warnResourceMissing,
+} from '../../lambda/src/lib/standalone-check.mjs';
 import { addWarning } from '../../lambda/src/lib/health.mjs';
 import { idleWindow } from '../../lambda/src/lib/activity.mjs';
 import { signalsView, standaloneNapEstimate } from '../../lambda/src/lib/status.mjs';
@@ -88,7 +90,7 @@ import { KIND_OF } from './rows.mjs';
 import { describeStopped } from './stopped.mjs';
 import { effectiveOf, SWAP_WAKE_ROOM_SECONDS, WAKE_TIMEOUT_MAX } from './levels.mjs';
 import { faviconReachable, servedPage } from './pages.mjs';
-import { resourceOf } from './resources.mjs';
+import { isResourceOf } from './resources.mjs';
 import { inOneUpdate, isRegionalLb, switchOf } from './switch.mjs';
 import { listenerRulesOf, mapBusy, references, UrlMapRefused } from './urlmaps.mjs';
 
@@ -205,11 +207,6 @@ const eventOfSlept = ({ suspended, items }) => ({ suspended, items });
 // A standalone workload (vision standalone workloads design §5): one resource (resources.mjs's path) and its companions, no route. Its
 // resource is its primary, a Cloud SQL instance too; the others are its companions.
 const isStandalone = (cfg) => cfg?.kind === 'standalone';
-function isResourceOf(cfg, backend) {
-  const resource = resourceOf(cfg.resource);
-  if (!resource || resource.kind !== backend.kind || resource.name !== backend.name) return false;
-  return backend.kind === 'cloudsql' || resource.location === backend.location;
-}
 const primariesOf = (cfg) => cfg.backends.filter((b) => (isStandalone(cfg) ? isResourceOf(cfg, b) : !isCompanion(b)));
 const companionsOf = (cfg) => cfg.backends.filter((b) => (isStandalone(cfg) ? !isResourceOf(cfg, b) : isCompanion(b)));
 // What says a resource is gone: Google's 404 (cloudsql.mjs's companionGone, Compute Engine's the same).
@@ -1482,9 +1479,13 @@ export function createController({
 
   // A nap with no route: an idle one (no `cause` given, the check's) reads its signals again first; a person's or a schedule's never.
   async function standaloneNap(workloadId, { cfg, router, organization, cause, by, started, latest }) {
-    // A failed one's nap (a person's): its release, which ends its retries.
+    // A failed one's nap a person asked: its release, which ends its retries; one no one asked is not a release (AWS's rule).
     const known = await store.getRun(workloadId);
-    if (known?.state === STATES.FAILED) return standaloneRelease(workloadId, { cfg, run: known, router, organization, latest });
+    if (known?.state === STATES.FAILED) {
+      if (by) return standaloneRelease(workloadId, { cfg, run: known, router, organization, latest, by });
+      log.warn('NapSkipped', { workloadId, reason: 'not awake (FAILED)' });
+      return { state: 'SKIPPED', reason: 'not awake (FAILED)' };
+    }
     const states = await standaloneStates(cfg);
     if (unreadableOf(states)) {
       log.warn('NapSkipped', { workloadId, reason: unreadableOf(states).text });
@@ -1534,22 +1535,35 @@ export function createController({
     });
   }
 
-  async function standaloneRelease(workloadId, { cfg, run, router, organization, latest }) {
+  // A standalone workload's release (standalone-check.mjs, both clouds): once asleep, its failure goes; a person's (`by`) is journaled as
+  // theirs; one that fails is a nap's failure, its time now, so the retry of a wake stops and the next release waits an idle window.
+  async function standaloneRelease(workloadId, { cfg, run, router, organization, latest, by }) {
     try {
       const autoscalers = await autoscalersToRecord(cfg, run);
       if (!(await transition(workloadId, { cond: { state: STATES.FAILED }, set: { autoscalers } }))) return { state: 'SUPERSEDED' };
       const slept = await putToSleep(cfg, { autoscalers, owners: [], router, organization, instanceTypes: run.instanceTypes }, latest, async () => (await store.getRun(workloadId))?.state === STATES.FAILED).catch(tagHint(cfg));
       const types = await revertTypes(cfg, run.instanceTypes);
       const asleep = await transition(workloadId, {
-        cond: { state: STATES.FAILED }, set: { state: STATES.ASLEEP, ...runOf(slept), ...types.set }, remove: types.remove, cause: 'failed-released', event: eventOfSlept(slept),
+        cond: { state: STATES.FAILED }, set: { state: STATES.ASLEEP, ...runOf(slept), ...types.set }, remove: [...types.remove, ...RELEASED_REMOVE],
+        cause: releaseCause(by), ...(by ? { by } : {}), event: eventOfSlept(slept),
       });
       if (!asleep) return { state: 'SUPERSEDED' };
       log.warn('FailedReleased', { workloadId, ...runOf(slept) });
       return { state: STATES.ASLEEP };
     } catch (err) {
-      log.error('ReleaseFailed', { workloadId, error: err.message });
+      const at = now();
+      const failed = failedFrom(err, { step: 'nap', at });
+      log.error('ReleaseFailed', { workloadId, error: err.message, kind: failed.event.failure.kind });
+      await transition(workloadId, releaseFailedChange(failed, at));
       return { state: STATES.FAILED, error: err.message };
     }
+  }
+
+  // The check holds a due retry of a failed wake (a nap window, its levels unreadable): recorded once on the run, so the row and the
+  // status show no next attempt.
+  async function holdRetry(workloadId, run) {
+    const change = retryHeldChange(run);
+    if (change) await transition(workloadId, change).catch((err) => log.warn('RetryHoldUnwritten', { workloadId, error: err.message }));
   }
 
   // The run brought back to what its primaries say: all running, AWAKE (`external-start`, or `recovered` from FAILED), its autoscalers
@@ -1564,7 +1578,8 @@ export function createController({
       return (await transition(workloadId, {
         cond: { state: from },
         set: { state: STATES.AWAKE, awakeSince: now() },
-        remove: ['stopped', 'suspended', ...(givenBack ? ['autoscalers', 'owners'] : []), 'failure', 'consecutiveFailures', 'failedAt'],
+        // failedAt kept, as AWS's reconcile does (final review of plan 5, M9).
+        remove: ['stopped', 'suspended', ...(givenBack ? ['autoscalers', 'owners'] : []), 'failure', 'consecutiveFailures'],
         cause: from === STATES.FAILED ? 'recovered' : 'external-start',
       })) ?? (await store.getRun(workloadId));
     }
@@ -1590,18 +1605,28 @@ export function createController({
       if (!run.resourceMissing) run = (await transition(workloadId, { cond: { state: run.state }, set: { resourceMissing: true } })) ?? run;
       return { state: run.state, resource: 'missing' };
     }
+    // A Cloud SQL resource it may not read: marked on the run while it lasts (the healths count the marks, M4).
     if (unreadableOf(states)) {
       log.warn('CloudSqlUnreadable', { workloadId, error: unreadableOf(states).text });
+      if (!run.resourceUnreadable) run = (await transition(workloadId, { cond: { state: run.state }, set: { resourceUnreadable: true } })) ?? run;
       return { state: run.state, resource: 'unreadable' };
     }
-    if (run.resourceMissing) run = (await transition(workloadId, { cond: { state: run.state }, remove: ['resourceMissing'] })) ?? run;
+    if (run.resourceMissing || run.resourceUnreadable) {
+      run = (await transition(workloadId, { cond: { state: run.state }, remove: ['resourceMissing', 'resourceUnreadable'] })) ?? run;
+    }
     run = await reconcileStandalone(cfg, run, states);
     await companionsFollow(cfg, run);
-    if (cfg.levelsUnreadable) return { state: run?.state ?? 'UNKNOWN', settings: 'unreadable' };
+    if (cfg.levelsUnreadable) {
+      if (retryDue(run, now())) await holdRetry(workloadId, run);
+      return { state: run?.state ?? 'UNKNOWN', settings: 'unreadable' };
+    }
     const t = now();
     const retry = failedWakeDecision(run, t, { keptAsleep: Boolean(ctx.keptAsleep?.(workloadId)), napWindow: () => napWindowNow(workloadId, ctx, t, log) });
     if (retry?.wait) return { state: run.state };
-    if (retry?.held) return { state: run.state, retry: 'held', reason: retry.held };
+    if (retry?.held) {
+      if (retry.held === 'a nap window') await holdRetry(workloadId, run);
+      return { state: run.state, retry: 'held', reason: retry.held };
+    }
     if (retry?.retry) {
       if (!(await startWake(workloadId, run, 'retry'))) return { state: (await store.getRun(workloadId))?.state ?? 'UNKNOWN' };
       return { state: STATES.WAKING, retry: 'requested' };
@@ -1803,6 +1828,7 @@ export function createController({
     const byState = {};
     let lastActivity = 0;
     let missing = 0;
+    let unreadable = 0;
     let next = 0;
     await Promise.all(Array.from({ length: Math.min(CHECK_CONCURRENCY, configs.length) }, async () => {
       while (next < configs.length) {
@@ -1811,9 +1837,10 @@ export function createController({
         byState[run?.state ?? 'UNKNOWN'] = (byState[run?.state ?? 'UNKNOWN'] ?? 0) + 1;
         lastActivity = Math.max(lastActivity, run?.updatedAt ?? 0);
         if (run?.resourceMissing) missing += 1;
+        if (run?.resourceUnreadable) unreadable += 1;
       }
     }));
-    return { byState: Object.fromEntries(Object.entries(byState).sort(([a], [b]) => a.localeCompare(b))), lastActivity, missing };
+    return { byState: Object.fromEntries(Object.entries(byState).sort(([a], [b]) => a.localeCompare(b))), lastActivity, missing, unreadable };
   }
 
   // The organization's level for the health and routerInfo: what AWS's manager settings answer (organizationOf, the reading the levels
@@ -1835,7 +1862,7 @@ export function createController({
   // Lambda, queue or concurrency figure (AWS's), and no Cloud Run request error (the router holds no role to read them). IP lists whose
   // records cannot be read are each a problem with the read's error, as a failed read is in the status action, and the summary is
   // still written.
-  async function healthSummary({ t, byState, lastScheduledCheckAt, pausesError, managerState, missing = 0 }) {
+  async function healthSummary({ t, byState, lastScheduledCheckAt, pausesError, managerState, missing = 0, unreadable = 0 }) {
     const ipLists = lists.length
       ? await describeStoredLists(store, lists).catch((err) => lists.map(({ name, action, url }) => ({ name, action, url, error: err.message })))
       : [];
@@ -1846,6 +1873,8 @@ export function createController({
     if (pausesError) pausesUnreadable(health, pausesError);
     // A standalone workload's resource the check found gone: the record alone names it (no permission reads a mark of its own).
     warnResourceMissing(health, missing, 'deleted');
+    // A standalone workload's Cloud SQL resource the router may not read (its run's mark): it is neither napped nor woken.
+    if (unreadable) addWarning(health, 'cloud-sql-unreadable', `${unreadable} standalone workload${unreadable === 1 ? '' : 's'} with a Cloud SQL instance the router cannot read: install it with --with cloud-sql`);
     return { health, ipLists, manager };
   }
 
@@ -1860,10 +1889,10 @@ export function createController({
       const lastScheduledCheckAt = scheduled ? started : (await store.getCheck?.().catch(() => null))?.lastScheduledCheckAt ?? null;
       const known = new Map(results.filter((r) => ANY_STATE.includes(r.state)).map((r) => [r.workloadId, r.state]));
       const counted = await stateCounts(order, known);
+      // The workloads this check saw are counted from its results, the others from their runs' marks.
       const missing = counted.missing + results.filter((r) => r.resource === 'missing').length;
-      const { health } = await healthSummary({ t, byState: counted.byState, lastScheduledCheckAt, pausesError, managerState, missing });
-      const unreadable = results.filter((r) => r.resource === 'unreadable').length;
-      if (unreadable) addWarning(health, 'cloud-sql-unreadable', `${unreadable} standalone workload${unreadable === 1 ? '' : 's'} with a Cloud SQL instance the router cannot read: install it with --with cloud-sql`);
+      const unreadable = counted.unreadable + results.filter((r) => r.resource === 'unreadable').length;
+      const { health } = await healthSummary({ t, byState: counted.byState, lastScheduledCheckAt, pausesError, managerState, missing, unreadable });
       const summary = {
         checkedAt: started, durationMs: t - started, checkSchedule: CHECK_SCHEDULE, lastScheduledCheckAt, health, pauses: pauses.map(shownPause), counts: counted.byState,
         ...(cursor ? { cursor } : {}),
@@ -1882,9 +1911,9 @@ export function createController({
   async function routerInfo() {
     const t = now();
     const { configs } = await store.listWorkloads();
-    const [{ byState, lastActivity, missing }, checked, level] = await Promise.all([stateCounts(configs), store.getCheck?.().catch(() => null), routerLevel()]);
+    const [{ byState, lastActivity, missing, unreadable }, checked, level] = await Promise.all([stateCounts(configs), store.getCheck?.().catch(() => null), routerLevel()]);
     const { pauses, pausesError } = await readActivePauses({ store, expired });
-    const { health, ipLists, manager } = await healthSummary({ t, byState, lastScheduledCheckAt: checked?.lastScheduledCheckAt ?? null, pausesError, managerState: level.managerState, missing });
+    const { health, ipLists, manager } = await healthSummary({ t, byState, lastScheduledCheckAt: checked?.lastScheduledCheckAt ?? null, pausesError, managerState: level.managerState, missing, unreadable });
     return routerAnswer({
       router: { name: `dmtr-${config.region}`, version: config.version ?? null, build: config.build ?? null },
       settings: level.router, manager,

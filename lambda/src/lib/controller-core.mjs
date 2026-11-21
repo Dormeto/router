@@ -12,7 +12,9 @@ import { createStatus } from './status.mjs';
 import { describeRules } from './no-wake.mjs';
 import { describeStoredLists } from './list-cache.mjs';
 import { failedSpec, failureError } from './failures.mjs';
-import { failedWakeDecision, failureKept, idleDecision, idleRecheck as recheckIdle, napWindowNow, warnResourceMissing } from './standalone-check.mjs';
+import {
+  RELEASED_REMOVE, failedWakeDecision, failureKept, idleDecision, idleRecheck as recheckIdle, napWindowNow, releaseCause, releaseFailedChange, retryDue, retryHeldChange, warnResourceMissing,
+} from './standalone-check.mjs';
 import { createPauses, pauseHolds } from './pauses.mjs';
 import { createWakeWatch, unhealthyError } from './wake-watch.mjs';
 import { describeStopped } from './stopped.mjs';
@@ -248,24 +250,50 @@ export function createController({
   }
 
   // A failed workload whose backends run for nothing is stopped like a nap and left asleep behind the waker, its failure
-  // kept (the last wake failed); requests wake it again, backed off (R7a, FinOps).
-  async function release(workloadId) {
+  // kept (the last wake failed); requests wake it again, backed off (R7a, FinOps). A standalone workload's (no waker, no request) ends
+  // its failure once asleep, is journaled as the person's nap when one asked it (`by`), and a release that fails is recorded as a
+  // nap's failure, not thrown (the final review of plan 5, I1, I2, M1, M9, M10).
+  async function release(workloadId, { by } = {}) {
     const run = await store.getRun(workloadId);
     if (run?.state !== STATES.FAILED) return { state: 'SKIPPED', reason: run?.state ?? 'unknown' };
     if (await isPaused(workloadId)) return { state: 'SKIPPED', reason: 'paused' };
     const cfg = await config(workloadId);
-    const backends = await managedBackends(cfg);
-    if (!isStandalone(cfg)) await routeTo(cfg, 'waker', { allowIssues: true });
-    const records = await sleepBackends(clients, backends, { sleep, now, deadline: now() + STOP_TIMEOUT_MS }, await stopOptions(cfg, run));
-    await revertInstanceTypes(ec2, backends.filter((b) => b.kind === 'instance').map((b) => b.id), log);
+    const standalone = isStandalone(cfg);
+    let records;
+    try {
+      const backends = await managedBackends(cfg);
+      if (!standalone) await routeTo(cfg, 'waker', { allowIssues: true });
+      records = await sleepBackends(clients, backends, { sleep, now, deadline: now() + STOP_TIMEOUT_MS }, await stopOptions(cfg, run));
+      await revertInstanceTypes(ec2, backends.filter((b) => b.kind === 'instance').map((b) => b.id), log);
+    } catch (err) {
+      if (!standalone) throw err;
+      return releaseFailed(workloadId, err);
+    }
     const asleep = await store.transition(workloadId, {
       cond: { state: STATES.FAILED, failedAt: run.failedAt },
       set: { state: STATES.ASLEEP, holders: 0, napBackends: JSON.stringify(records) },
-      remove: ['instanceTypes'],
-      cause: 'failed-released',
+      remove: ['instanceTypes', ...(standalone ? RELEASED_REMOVE : [])],
+      cause: standalone ? releaseCause(by) : 'failed-released',
+      ...(standalone && by ? { by } : {}),
     });
     log.warn('FailedReleased', { workloadId, backends: records.length });
     return { state: asleep ? STATES.ASLEEP : 'SUPERSEDED' };
+  }
+
+  // A standalone workload's release that failed: a nap's failure, its time now (standalone-check.mjs).
+  async function releaseFailed(workloadId, err) {
+    const at = now();
+    const failed = failedSpec(err, { step: 'nap', at });
+    log.error('ReleaseFailed', { workloadId, error: err.message, kind: failed.event.failure.kind });
+    await store.transition(workloadId, releaseFailedChange(failed, at));
+    return { state: STATES.FAILED, error: err.message };
+  }
+
+  // The check holds a due retry of a failed wake (a nap window, its levels unreadable): recorded once on the run, so the row and the
+  // status show no next attempt.
+  async function holdRetry(workloadId, run) {
+    const change = retryHeldChange(run);
+    if (change) await store.transition(workloadId, change).catch((err) => log.warn('RetryHoldUnwritten', { workloadId, error: err.message }));
   }
 
   // cause: what asked for it, the idle check or the manager, and by: who, from the manager (the state change event
@@ -273,8 +301,12 @@ export function createController({
   async function nap(workloadId, { cause = 'idle', by } = {}) {
     const known = await store.getRun(workloadId);
     const cfg = await effective(await config(workloadId), known);
-    // A failed standalone workload's nap: its release, which ends its retries.
-    if (isStandalone(cfg) && known?.state === STATES.FAILED) return release(workloadId);
+    // A failed standalone workload's nap a person asked: its release, which ends its retries; one no one asked is not a release.
+    if (isStandalone(cfg) && known?.state === STATES.FAILED) {
+      if (by) return release(workloadId, { by });
+      log.warn('NapSkipped', { workloadId, reason: 'not awake (FAILED)' });
+      return { state: 'SKIPPED', reason: 'not awake (FAILED)' };
+    }
     // A nap requested before a pause (idle check, manager) is refused when it starts.
     if (await isPaused(workloadId)) {
       log.warn('NapSkipped', { workloadId, reason: 'paused' });
@@ -614,8 +646,11 @@ export function createController({
     const cfg = await effective(stored, known, ctx?.levels);
     const seen = {};
     const run = await reconcile(cfg, ctx, known, seen);
-    // Its levels unreadable (never read here): no decision on an idle window it may not have.
-    if (cfg.levelsUnreadable) return { state: run?.state ?? 'UNKNOWN', settings: 'unreadable' };
+    // Its levels unreadable (never read here): no decision on an idle window it may not have, nor a retry of a failed wake.
+    if (cfg.levelsUnreadable) {
+      if (isStandalone(cfg) && retryDue(run, now())) await holdRetry(cfg.workloadId, run);
+      return { state: run?.state ?? 'UNKNOWN', settings: 'unreadable' };
+    }
     if (isStandalone(cfg)) return checkStandalone(cfg, run, paused, ctx, seen.backends);
     // A failed workload still paying (its backends run without a healthy target: the reconcile left it FAILED) is stopped
     // once its idle window has passed since the failure (R7a, FinOps); a paused one is left for its team.
@@ -660,7 +695,10 @@ export function createController({
     // A failed wake, retried with the router's own backoff (standalone-check.mjs, shared with Google Cloud's).
     const retry = failedWakeDecision(run, t, { keptAsleep: Boolean(ctx?.keptAsleep?.(workloadId)), napWindow: () => napWindowNow(workloadId, ctx, t, log) });
     if (retry?.wait) return { state: run.state };
-    if (retry?.held) return { state: run.state, retry: 'held', reason: retry.held };
+    if (retry?.held) {
+      if (retry.held === 'a nap window') await holdRetry(workloadId, run);
+      return { state: run.state, retry: 'held', reason: retry.held };
+    }
     if (retry?.retry) {
       if (!(await startWake(workloadId, run, undefined, 'retry'))) return { state: (await store.getRun(workloadId))?.state ?? 'UNKNOWN' };
       return { state: STATES.WAKING, retry: 'requested' };
@@ -1190,7 +1228,7 @@ export function createController({
     const stale = scheduled && until ? (now() >= until ? 'the nap window ended' : null)
       : now() - requestedAt > NAP_MAX_AGE_MS ? `requested more than ${NAP_MAX_AGE_MS / 60_000} minutes ago` : null;
     // A failed standalone workload's nap a person asked: its release, which ends its retries.
-    if (run?.state === STATES.FAILED && by && isStandalone(await store.getConfig(workloadId))) return release(workloadId);
+    if (run?.state === STATES.FAILED && by && isStandalone(await store.getConfig(workloadId))) return release(workloadId, { by });
     let reason = run?.state !== STATES.AWAKE ? `not awake (${run?.state ?? 'UNKNOWN'})`
       : (run.awakeSince ?? 0) > requestedAt ? 'woken since it was requested' : stale;
     const recheck = !reason && !scheduled && now() - requestedAt > NAP_RECHECK_MS ? await config(workloadId) : null;

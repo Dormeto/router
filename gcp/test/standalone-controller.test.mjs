@@ -234,8 +234,9 @@ test('plan 1\'s ruling: a failed wake is retried by the check with the router\'s
   assert.equal((await stopped.core.wake('batch', stopped.run().wakeId)).state, STATES.AWAKE);
   // A person's nap of a failed one: its release, the retries over; a nap window holds them.
   const napped = setup({ up: false, run: { state: STATES.FAILED, failedAt: START, consecutiveFailures: 1, failure } });
-  assert.equal((await napped.core.nap('batch', { cause: 'manager', requestedAt: napped.clock.now() })).state, STATES.ASLEEP);
-  assert.deepEqual(causes(napped), [[STATES.ASLEEP, 'failed-released']]);
+  // Journaled as the person's nap (final review of plan 5, M10).
+  assert.equal((await napped.core.nap('batch', { cause: 'manager', by: 'ana', requestedAt: napped.clock.now() })).state, STATES.ASLEEP);
+  assert.deepEqual(causes(napped), [[STATES.ASLEEP, 'manager']]);
   const windowed = setup({ up: false, run: { state: STATES.FAILED, failedAt: START - 2 * MINUTE, consecutiveFailures: 1, failure } });
   windowed.store.state.schedules.batch = { timeZone: 'UTC', windows: [{ kind: 'nap', days: ['mon'], start: '09:00', end: '18:00' }], by: 'ops', at: Date.UTC(2026, 10, 20) };
   const held = (await windowed.core.check()).find((r) => r.workloadId === 'batch');
@@ -424,4 +425,113 @@ test('R30 review, M8: every call a standalone workload makes is in its adapter\'
     assert.ok(CALLS[adapter]?.[fn], `${c} is in no CALLS`);
     for (const p of CALLS[adapter][fn]) assert.ok(granted.has(p), `${c} needs ${p}`);
   }
+});
+
+// --- The final review of the router, plan 5 (findings-final-router-1.md) --------------------------------------------------------
+
+const wakeFailure = (kind = 'timeout') => JSON.stringify({ kind, step: 'wake', message: 'x' });
+// The manager's request-nap on this controller, as onboarding.mjs wires it.
+async function managerOf(s) {
+  const { createManagerActions } = await import('../../lambda/src/lib/manager-actions.mjs');
+  return createManagerActions({
+    store: s.store, find: async () => s.cfg, refuse: { invalid: (m) => new Error(m), notFound: (id) => new Error(id) },
+    pausesFor: (id) => s.core.pausesFor(id), napNow: (id, by) => s.core.napNow(id, { cause: 'manager', by }), wake: {}, now: s.clock.now,
+    log: { info() {}, warn() {}, error() {} },
+  });
+}
+const queuedNap = (s) => s.calls.tasks.findLast((task) => task.action === 'nap');
+
+test('final review (plan 5), I1 and I2: a person\'s nap whose release Google refuses writes a nap\'s failure: never woken again, the release tried once an idle window', async () => {
+  const s = setup({ run: { state: STATES.FAILED, failedAt: START - MINUTE, consecutiveFailures: 1, failure: wakeFailure() } });
+  s.world.refuse = new GoogleError('Google: instances.stop: 403 Required compute.instances.stop permission', { code: 403 });
+  assert.deepEqual(await (await managerOf(s)).requestNap({ workloadId: 'batch', by: 'ana' }), { requested: true });
+  const { workloadId, ...task } = queuedNap(s);
+  assert.equal((await s.core.nap(workloadId, task)).state, STATES.FAILED);
+  const failed = s.run();
+  assert.deepEqual([failed.state, JSON.parse(failed.failure).step, JSON.parse(failed.failure).kind, failed.failedAt, failed.consecutiveFailures, 'napRequestedAt' in failed],
+    [STATES.FAILED, 'nap', 'permission', s.clock.now(), 2, false]);
+  assert.equal(s.logged('ReleaseFailed').length, 1);
+  // 130 minutes of checks, the built-in idleMinutes 120 among them, each release asked run: no wake, one release, at its idle window,
+  // refused again and recorded again.
+  const released = [];
+  for (let m = 0; m < 26; m += 1) {
+    s.clock.advance(5 * MINUTE);
+    const before = s.calls.tasks.length;
+    await s.core.check();
+    for (const t of s.calls.tasks.slice(before).filter((task) => task.action === 'release')) {
+      released.push(s.clock.now());
+      await s.core.release(t.workloadId);
+    }
+  }
+  assert.deepEqual(causes(s).filter(([to]) => to === STATES.WAKING), []);
+  assert.deepEqual(s.calls.tasks.filter((t) => t.action === 'wake'), []);
+  assert.deepEqual(released, [START + 120 * MINUTE]);
+  assert.deepEqual([s.run().consecutiveFailures, s.run().failedAt, s.logged('ReleaseFailed').length], [3, released[0], 2]);
+  assert.deepEqual(s.calls.forbidden, []);
+});
+
+test('final review (plan 5), I1, M1, M10: a nap request wins over a due retry; its release is journaled as the person\'s and clears the failure', async () => {
+  const s = setup({ up: false, run: { state: STATES.FAILED, failedAt: START, consecutiveFailures: 1, failure: wakeFailure('capacity') } });
+  assert.deepEqual(await (await managerOf(s)).requestNap({ workloadId: 'batch', by: 'ana' }), { requested: true });
+  s.clock.advance(61_000);
+  assert.deepEqual((await s.core.check())[0], { workloadId: 'batch', state: STATES.FAILED });
+  const { workloadId, ...task } = queuedNap(s);
+  assert.equal((await s.core.nap(workloadId, task)).state, STATES.ASLEEP);
+  assert.deepEqual(causes(s), [[STATES.ASLEEP, 'manager']]);
+  assert.equal(s.logged('StateChanged').at(-1).by, 'ana');
+  assert.deepEqual(['failure', 'consecutiveFailures', 'napRequestedAt'].filter((key) => key in s.run()), []);
+  assert.deepEqual(s.calls.forbidden, []);
+});
+
+test('final review (plan 5), M9: only a person\'s nap releases a failed workload; a recovery keeps failedAt, as on AWS', async () => {
+  const s = setup({ up: false, run: { state: STATES.FAILED, failedAt: START - MINUTE, consecutiveFailures: 1, failure: wakeFailure() } });
+  assert.deepEqual(await s.core.nap('batch', { cause: 'idle', requestedAt: s.clock.now() }), { state: 'SKIPPED', reason: 'not awake (FAILED)' });
+  assert.equal((await s.core.nap('batch', { cause: 'manager', by: 'ana', requestedAt: s.clock.now() })).state, STATES.ASLEEP);
+  const recovered = setup({ run: { state: STATES.FAILED, failedAt: START - 3 * MINUTE, consecutiveFailures: 1, failure: JSON.stringify({ kind: 'unknown', step: 'nap', message: 'x' }) } });
+  await recovered.core.check();
+  assert.deepEqual([recovered.run().state, recovered.run().failedAt, 'failure' in recovered.run()], [STATES.AWAKE, START - 3 * MINUTE, false]);
+});
+
+test('final review (plan 5), M2: no nextAttemptAt while a nap window or the levels hold the retry; the check marks the failure it holds', async () => {
+  const { standaloneRowOf } = await import('../../lambda/src/lib/summary.mjs');
+  const rowOf = (s) => standaloneRowOf({ pauses: [] }, s.cfg, s.run()).nextAttemptAt;
+  const failed = () => ({ state: STATES.FAILED, failedAt: START - 2 * MINUTE, consecutiveFailures: 1, failure: wakeFailure() });
+  const free = setup({ up: false, run: failed() });
+  assert.equal(rowOf(free), new Date(START - MINUTE).toISOString());
+  const windowed = setup({ up: false, run: failed() });
+  windowed.store.state.schedules.batch = { timeZone: 'UTC', windows: [{ kind: 'nap', days: ['mon'], start: '09:00', end: '18:00' }], by: 'ops', at: Date.UTC(2026, 10, 20) };
+  await windowed.core.check();
+  assert.equal(rowOf(windowed), null);
+  const unread = setup({ up: false, run: failed() });
+  unread.store.getRouterSettings = async () => { throw new Error('Firestore: 503'); };
+  assert.equal((await unread.core.check())[0].settings, 'unreadable');
+  assert.equal(rowOf(unread), null);
+});
+
+test('final review (plan 5), M4: a Cloud SQL resource the router cannot read is marked on its run and in both healths, every such workload counted', async () => {
+  const s = setup({ kind: 'cloudsql', run: { state: STATES.FAILED, failedAt: START - 2 * MINUTE, consecutiveFailures: 1, failure: wakeFailure() } });
+  s.world.sqlRefused = new GoogleError('Google: 403 cloudsql.instances.get', { code: 403 });
+  await s.core.check();
+  assert.equal(s.run().resourceUnreadable, true);
+  const { standaloneRowOf } = await import('../../lambda/src/lib/summary.mjs');
+  assert.equal(standaloneRowOf({ pauses: [] }, s.cfg, s.run()).nextAttemptAt, null, 'no retry while it cannot be read');
+  const text = '1 standalone workload with a Cloud SQL instance the router cannot read: install it with --with cloud-sql';
+  const codes = (health) => health.problems.filter((p) => p.code === 'cloud-sql-unreadable').map((p) => p.text);
+  assert.deepEqual(codes(s.store.state.check.health), [text]);
+  assert.deepEqual(codes((await s.core.routerInfo()).health), [text]);
+  // Readable again: the mark goes.
+  delete s.world.sqlRefused;
+  await s.core.check();
+  assert.equal('resourceUnreadable' in s.run(), false);
+  assert.deepEqual(codes((await s.core.routerInfo()).health), []);
+});
+
+test('final review (plan 5), M3: one isResourceOf for Google Cloud: a VM is not the Cloud SQL instance of its name', async () => {
+  const { isResourceOf } = await import('../src/resources.mjs');
+  const cfg = { kind: 'standalone', resource: RESOURCES.vm.resource };
+  assert.equal(isResourceOf(cfg, { kind: 'vm', location: ZONE, name: 'batch' }), true);
+  assert.equal(isResourceOf(cfg, { kind: 'cloudsql', name: 'batch' }), false);
+  assert.equal(isResourceOf(cfg, { kind: 'vm', location: 'europe-west1-c', name: 'batch' }), false);
+  assert.equal(isResourceOf({ kind: 'standalone', resource: RESOURCES.cloudsql.resource }, { kind: 'cloudsql', name: 'orders' }), true);
+  assert.equal(isResourceOf({ resource: RESOURCES.vm.resource }, { kind: 'vm', location: ZONE, name: 'batch' }), false, 'an HTTP workload has no resource of its own');
 });

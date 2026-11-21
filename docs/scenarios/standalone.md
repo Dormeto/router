@@ -10,6 +10,8 @@ request to see, so there is no waiting page, no wake rule, no wake mode and no h
 It is the same on AWS and on Google Cloud: the same settings, levels, idle rule, schedules and states. What differs is said once
 below: the resources, the metrics read, the custom metric's shape, what marks a resource as the workload's, and the limits.
 
+On AWS:
+
 ```mermaid
 sequenceDiagram
   autonumber
@@ -27,6 +29,30 @@ sequenceDiagram
   C->>R: Start (or scale back)
   loop Every 3 s
     C->>R: Running at its full size?
+  end
+```
+
+On Google Cloud, the same steps through a Cloud Tasks task:
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant G as Controller (Cloud Run)
+  participant CM as Cloud Monitoring
+  participant R as VM, group or Cloud SQL instance
+  participant D as Cloud SQL companions
+  Note over G: Every 5 minutes, Cloud Scheduler's check
+  G->>R: Read its state (a group: its VMs listed)
+  G->>CM: timeSeries.list: each signal's metric type over the idle window
+  CM-->>G: Every 5-minute point under its threshold
+  Note over G: The nap, a task of its own
+  G->>R: Stop or suspend (a group: its VMs in place, its autoscaler off; Cloud SQL: activation NEVER)
+  G->>D: Activation NEVER
+  Note over G: Later: a schedule's awake window, or a person's wake
+  G->>D: Activation ALWAYS, wait until runnable
+  G->>R: Start or resume (Cloud SQL: ALWAYS)
+  loop Until the wake timeout
+    G->>R: Running at its full size?
   end
 ```
 
@@ -65,8 +91,9 @@ On Google Cloud, the onboarding refuses (the router's own words):
   workload's, naming it.
 - **A VM** not found, that is a member of a managed instance group (onboard the group: it would repair a stopped VM), that
   is a GKE node (its `goog-gke-node` label), or that has a GPU or a local SSD.
-- **A managed instance group** not found, with no VM, with a stateful configuration, regional with the target shape `EVEN`
-  and instance redistribution on, or that holds GKE nodes.
+- **A managed instance group** not found, with a stateful configuration, regional with the target shape `EVEN` and
+  instance redistribution on, or that holds GKE nodes. A group sized 0 is accepted: it is awake with no VM.
+- **Spot and preemptible VMs** are accepted on Google Cloud, a VM or a group's.
 - **A Cloud SQL instance** not found, or a read replica; on a router installed without `--with cloud-sql`, it cannot be read.
 - **A resource of another project:** a router serves its own project.
 - **Whether a VM or a group backs a backend service** the router cannot tell (its role lists no backend service): the
@@ -115,6 +142,10 @@ at all, it never naps on idle: schedules and people only.
   busy; a person's nap is never read against the signals.
 - **The status** shows each signal: its threshold, its level, its last value, since when it is under, and the nap
   estimate from them.
+- **What a read calls.** On AWS, one GetMetricData call for all its signals, a group's by its name. On Google Cloud, one
+  timeSeries.list call a metric type, a managed instance group's VMs listed first (listManagedInstances), and each check
+  reads the resource's state first (a Cloud SQL instance: its settings and its operations under way). The check reads the
+  signals only once the workload can be idle. The status reads them live, at each status asked.
 - An HTTP workload keeps its one signal, its requests: these settings are refused on it.
 
 ## Schedules, people and changes made outside Dormeto
@@ -131,12 +162,21 @@ at all, it never naps on idle: schedules and people only.
 - **A failed wake** stays failed and is retried by the check after 60 s, doubled after each failure in a row, at most 30
   minutes, until a wake succeeds, everything stopped or not: nothing wakes the workload on demand, so a failure for want of
   capacity must not lose its awake window. A keepAsleep pause or a nap window holds the retry; a person's nap ends it (its
-  backends stop and the workload is asleep).
+  backends stop and the workload is asleep). A person's nap asked stops the retry at once, before its release runs; a
+  release that fails is recorded as a nap's failure, tried again once an idle window, never followed by a wake. A release
+  is journaled as the person's nap (cause `manager`, with `by`); the check's own release of a failed nap after its idle
+  window, as `failed-released`. Once asleep the failure goes. The row's and the status's `nextAttemptAt` is the retry's time
+  only while one is coming: none while a pause or a nap window holds it, its settings levels or its resource cannot be read,
+  its resource is missing, or a person's nap is asked. Only a person's nap releases a failed workload: an idle or a
+  schedule's nap of it is skipped.
 - **A failure for a permission** (the role's condition on the resource: on AWS its `dormeto:workload` tag, on Google Cloud
   the tag `dormeto=managed`, which the failure names) stays on the workload at every check, never read as recovered, until a
   nap or a wake succeeds, so its status and the manager's alerts show it.
 - **A start or stop made outside Dormeto** (the console, a script, AWS's own restart of a database stopped 7 days) is seen
   at the next check: the workload is awake (`external-start`, its stopped companions started) or asleep (`external-stop`).
+- **A Cloud SQL resource the router may not read** (a router installed without `--with cloud-sql`): read at each check,
+  refused, the workload is neither napped, nor woken, nor retried, and the router's health warns `cloud-sql-unreadable`
+  with the count of such workloads, in the check's summary and in the router's answer.
 - **On Google Cloud** what marks a resource as the workload's is its record alone: the router's roles act only on what has the
   tag `dormeto=managed`, which the CLI binds, but the router cannot read it, so a resource is missing when Google says it
   is deleted.
@@ -169,7 +209,10 @@ at all, it never naps on idle: schedules and people only.
 
 - **Nothing wakes it on demand:** no connection, request or message wakes a standalone workload, nor keeps it awake.
 - **One custom metric** a workload.
-- **Spot instances** are refused (AWS).
+- **Spot instances** are refused on AWS; Google Cloud accepts Spot and preemptible VMs (a preempted VM is stopped by Google,
+  which the next check reads as a stop made outside Dormeto).
 - **Google Cloud:** the router cannot tell a VM or a group behind a backend service it does not know; the wake timeout is
-  1700 s at most; a Cloud SQL instance's network is not a signal.
+  1700 s at most; a Cloud SQL instance's network is not a signal. Two onboardings of one resource under two ids at the same
+  moment are not serialised: both may pass the check that the resource is in no workload, as for an HTTP workload's
+  backends.
 - **Timing.** Naps start on the 5-minute check, 10 to 15 minutes after the idle window.

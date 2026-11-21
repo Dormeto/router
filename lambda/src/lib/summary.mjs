@@ -1,6 +1,7 @@
 // A workload's row for the manager (its `list` action, a check's report), as both routers answer it: AWS's here
 // (workloadSummary), Google Cloud's from Firestore (gcp/src/rows.mjs), each giving its own identity. And the daily statistics.
-import { nextAttemptAt, standaloneNextAttemptAt } from './failures.mjs';
+import { nextAttemptAt } from './failures.mjs';
+import { standaloneRetryAt } from './standalone-check.mjs';
 import { STATES } from './state.mjs';
 import { STANDALONE_KEYS } from './settings-levels.mjs';
 
@@ -133,7 +134,8 @@ function standaloneSummary(cfg, run, stats7d, pauses, scheduled) {
 export function standaloneRowOf(row, cfg, run) {
   delete row.url;
   delete row.wakeMode;
-  row.nextAttemptAt = iso(standaloneNextAttemptAt(run));
+  // The check's retry, only while one is coming then (standalone-check.mjs).
+  row.nextAttemptAt = iso(standaloneRetryAt(run, row.pauses));
   row.settings = Object.fromEntries(STANDALONE_KEYS.map((key) => [key, cfg[key]]));
   return run?.resourceMissing ? after(row, 'backends', { resourceMissing: true }) : row;
 }

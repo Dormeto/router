@@ -43,7 +43,7 @@ import {
 import { beatOf } from './heartbeat.mjs';
 import { organizationOf } from './organization.mjs';
 import { effectiveOf, inheritsOf, levelProblems } from './levels.mjs';
-import { resourceOf } from './resources.mjs';
+import { isResourceOf, resourceOf } from './resources.mjs';
 import { SWITCH_HEADER, WORKLOAD_HEADER, WORKLOAD_ID, swapHeaders } from './names.mjs';
 import { CUSTOM_PAGE_NOT_SERVED, CUSTOM_PAGES_REFUSED, notServed, servedPage } from './pages.mjs';
 import { aKind, headersInMap, inOneUpdate, isRegionalLb, SWAP_WAIT_MS } from './switch.mjs';
@@ -96,11 +96,6 @@ const GKE_NODE_LABEL = 'goog-gke-node';
 const isStandalone = (cfg) => cfg?.kind === 'standalone';
 // A workload as a refusal names it: its name and id, or its id alone.
 const named = (cfg) => (cfg.name ? `${cfg.name} (${cfg.workloadId})` : cfg.workloadId);
-// Whether `backend` is the standalone workload `cfg`'s own resource (not a companion of it).
-function isResourceOf(cfg, backend) {
-  const own = isStandalone(cfg) ? resourceOf(cfg.resource) : null;
-  return Boolean(own) && own.kind === backend.kind && own.name === backend.name && (backend.kind === 'cloudsql' || own.location === backend.location);
-}
 // What a standalone workload has not (design §2): refused as unsupported, in AWS's words.
 export const standaloneRefusal = (id, what) => new Refusal(400, 'unsupported', `workload ${id} is a standalone workload: ${what}`);
 // A nap window's `wake` (never, header) says what a request may do in it: nothing arrives to wake a standalone workload.

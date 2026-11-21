@@ -26,6 +26,7 @@ import { maintenanceDueOf, Refusal, standaloneRefusal } from './onboarding.mjs';
 import { organizationOf } from './organization.mjs';
 import { CUSTOM_PAGES_REFUSED } from './pages.mjs';
 import { readReport } from './report.mjs';
+import { isResourceOf } from './resources.mjs';
 import { rowOf } from './rows.mjs';
 import { isRegionalLb } from './switch.mjs';
 
@@ -234,7 +235,6 @@ export function createActions({ controller, onboarding, store, router, lists = [
     const row = rowFor(cfg, { run, stats: stats.error ? null : stats, pauses, scheduled: Boolean(view.schedule), above });
     const { idle, nap } = await controller.idleView(cfg, run, { paused: pauses.length > 0 });
     const wakesOnly = (period) => (period ? { wakes: period.wakes ?? {} } : period);
-    const own = (b) => b.kind === 'cloudsql' && cfg.resource?.endsWith(`/instances/${b.name}`);
     const answer = {
       ...row,
       router: { version: router.version ?? 'unknown', build: router.build ?? 'unknown' },
@@ -247,7 +247,7 @@ export function createActions({ controller, onboarding, store, router, lists = [
       hibernation: hibernationOf(shown.hibernation, above.manager),
       backends: cfg.backends.map((b) => {
         const { companion, ...entry } = backendOf(b);
-        return own(b) ? entry : backendOf(b);
+        return isResourceOf(cfg, b) ? entry : backendOf(b);
       }),
       ignoredTargets: [],
       recommendations: [],

@@ -2,7 +2,8 @@
 // admin page (waker) and by the controller `status` action (manager).
 import { recommendations } from './advice.mjs';
 import { after, failureOf, fallbacksOf } from './summary.mjs';
-import { nextAttemptAt, standaloneNextAttemptAt } from './failures.mjs';
+import { nextAttemptAt } from './failures.mjs';
+import { standaloneRetryAt } from './standalone-check.mjs';
 import { STATES } from './state.mjs';
 import { conditionsOf, currentTarget, routeOf } from './route.mjs';
 import { resolveRules } from './rules.mjs';
@@ -78,7 +79,7 @@ export function createStatus({ ec2, elbv2, cloudwatch, autoscaling, ecs, tagging
       failedAt: iso(run.failedAt),
       failure: failureOf(run),
       consecutiveFailures: run.consecutiveFailures ?? 0,
-      nextAttemptAt: iso(standaloneNextAttemptAt(run)),
+      nextAttemptAt: iso(standaloneRetryAt(run, pauses)),
       fallbacks: fallbacksOf(run),
       wakeCount: run.wakeCount ?? 0,
       pendingWake: run.pendingWake === true,

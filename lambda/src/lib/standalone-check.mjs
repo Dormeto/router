@@ -8,17 +8,51 @@ import { addWarning } from './health.mjs';
 import { occurrenceAt } from './schedule.mjs';
 import { STATES } from './state.mjs';
 
-// A failed wake, while FAILED (an outside stop that leaves every backend stopped, ASLEEP, ends the retries): null for any other run;
-// `{ wait: true }` before its backoff (the router's own, failures.mjs); `{ held }`, why it waits (a keepAsleep pause, a nap window in
-// force); `{ retry: true }` when the check wakes it again (cause `retry`).
+// Whether a person's nap of the failed workload is asked since its last failure (requestNap's mark, `napRequestedAt`): its release
+// is coming, and the retry of a wake must not undo it (the final review of plan 5, I1). A later failure makes the mark stale.
+export const napAsked = (run) => (run?.napRequestedAt ?? -Infinity) >= (run?.failedAt ?? 0);
+
+// Whether the check holds the retry of this failure (`retryHeldFor`, the failure's failedAt it recorded: a nap window, its settings
+// levels unreadable; final review of plan 5, M2).
+const retryHeld = (run) => run?.retryHeldFor !== undefined && run.retryHeldFor === run.failedAt;
+
+// Whether a failed wake is due for its retry at `t`, what holds it aside: FAILED in a wake, no person's nap asked since, its backoff
+// (the router's own, failures.mjs) passed.
+export const retryDue = (run, t) => run?.state === STATES.FAILED && failureStep(run) === 'wake' && !napAsked(run) && (standaloneNextAttemptAt(run) ?? Infinity) <= t;
+
+// A failed wake, while FAILED (whatever its backends say: the R30 review's I1): null for any other run, or once a person's nap is asked;
+// `{ wait: true }` before its backoff; `{ held }`, why it waits (a keepAsleep pause, a nap window in force); `{ retry: true }` when the
+// check wakes it again (cause `retry`).
 // `napWindow`: a value, or a function read only when the decision needs it (a schedule is read at a retry only).
 export function failedWakeDecision(run, t, { keptAsleep = false, napWindow = false } = {}) {
-  if (run?.state !== STATES.FAILED || failureStep(run) !== 'wake') return null;
-  if ((standaloneNextAttemptAt(run) ?? Infinity) > t) return { wait: true };
+  if (run?.state !== STATES.FAILED || failureStep(run) !== 'wake' || napAsked(run)) return null;
+  if (!retryDue(run, t)) return { wait: true };
   if (keptAsleep) return { held: 'a keepAsleep pause' };
   if (typeof napWindow === 'function' ? napWindow() : napWindow) return { held: 'a nap window' };
   return { retry: true };
 }
+
+// The run's change that records a held retry (null when it is recorded already): the row and the status then show no next attempt.
+export const retryHeldChange = (run) => (retryHeld(run) ? null : { cond: { state: STATES.FAILED }, set: { retryHeldFor: run.failedAt } });
+
+// When the check will retry a failed wake (the row's and the status's `nextAttemptAt`, final review of plan 5, M2): its backoff's time,
+// null when no retry is coming then: a person's nap asked, a keepAsleep pause among its `pauses` (as shown), a hold the check recorded,
+// its resource missing or unreadable.
+export function standaloneRetryAt(run, pauses = []) {
+  const at = standaloneNextAttemptAt(run);
+  if (at === null || napAsked(run) || retryHeld(run) || run.resourceMissing || run.resourceUnreadable) return null;
+  return (pauses ?? []).some((p) => p.keepAsleep === true) ? null : at;
+}
+
+// A release (a failed workload stopped like a nap), both clouds. Its cause: a person's nap (`manager`, with `by`), else the check's
+// (`failed-released`). Once asleep, the failure goes with its count and marks (M1): it is not kept past a nap that succeeded.
+export const releaseCause = (by) => (by ? 'manager' : 'failed-released');
+export const RELEASED_REMOVE = ['failure', 'consecutiveFailures', 'napRequestedAt', 'retryHeldFor'];
+// A release that failed (I1, I2): a nap's failure (`failed`, the cloud's failedSpec with step nap), failedAt now and the count
+// incremented, the marks gone: the retry of a wake stops, and the next release waits an idle window.
+export const releaseFailedChange = (failed, at) => ({
+  cond: { state: STATES.FAILED }, set: { failedAt: at, ...failed.set }, increment: failed.increment, remove: ['napRequestedAt', 'retryHeldFor'],
+});
 
 // Whether the check's reconcile must leave a failed standalone workload FAILED rather than call it recovered in state `to` (the
 // R30 review's rulings, both clouds): a failed wake whose backends are all stopped stays FAILED and is retried (nothing wakes it on
@@ -46,7 +80,7 @@ export function napWindowNow(workloadId, ctx, t, log) {
 // The earliest check whose window can find every signal under: the window then starts at or after each one's run of points under
 // (the window's end when its last point is not). Null when none applies, a read failed, or a last point is missing (late, or not
 // published yet): read again at the next check.
-export function idleNotBeforeOf(signals, window) {
+function idleNotBeforeOf(signals, window) {
   const applying = signals.filter((s) => s.applies);
   if (!applying.length || applying.some((s) => s.reason)) return null;
   if (applying.some((s) => s.underSince === null && (s.value === null || s.value < s.below))) return null;

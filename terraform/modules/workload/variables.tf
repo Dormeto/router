@@ -133,13 +133,17 @@ variable "idle_metric" {
   type        = any
   default     = null
   validation {
+    # As the router's check (settings-levels.mjs): these five fields only, below a number, at most 30 dimensions of a name of 1 to 255
+    # characters and a value of 1 to 1024, $${resource} the only placeholder.
     condition = var.idle_metric == null || try(var.idle_metric == "off", false) || try(
+      length(setsubtract(keys(var.idle_metric), ["namespace", "name", "dimensions", "statistic", "below"])) == 0 &&
       length(var.idle_metric.namespace) >= 1 && length(var.idle_metric.namespace) <= 255 && length(var.idle_metric.name) >= 1 && length(var.idle_metric.name) <= 255 &&
-      contains(["Maximum", "Average", "Sum"], var.idle_metric.statistic) && tonumber(var.idle_metric.below) == tonumber(var.idle_metric.below) &&
-      length(keys(var.idle_metric.dimensions)) <= 30 && alltrue([for k, v in var.idle_metric.dimensions : length(k) >= 1 && length(v) >= 1 && length(v) <= 1024]),
+      contains(["Maximum", "Average", "Sum"], var.idle_metric.statistic) && var.idle_metric.below + 0 == var.idle_metric.below &&
+      length(keys(var.idle_metric.dimensions)) <= 30 &&
+      alltrue([for k, v in var.idle_metric.dimensions : length(k) >= 1 && length(k) <= 255 && length(v) >= 1 && length(v) <= 1024 && !strcontains(replace(v, "$${resource}", ""), "$${")]),
       false
     )
-    error_message = "idle_metric must be off or { namespace, name, dimensions (at most 30), statistic Maximum, Average or Sum, below }."
+    error_message = "idle_metric must be off or { namespace, name, dimensions (at most 30, names of 1 to 255 characters, values of 1 to 1024, $${resource} the only placeholder), statistic Maximum, Average or Sum, below a number }, no other field."
   }
   validation {
     condition     = var.idle_metric == null || var.resource_arn != null

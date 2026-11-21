@@ -151,3 +151,39 @@ run "idle_metric_off_is_written" {
     error_message = "off is written"
   }
 }
+
+run "idle_metric_only_resource_is_replaced" {
+  command = plan
+  variables {
+    resource_arn = "arn:aws:ec2:eu-west-1:111111111111:instance/i-0123456789abcdef0"
+    idle_metric  = { namespace = "Batch", name = "QueueDepth", dimensions = { Queue = "$${instance}" }, statistic = "Maximum", below = 1 }
+  }
+  expect_failures = [var.idle_metric]
+}
+
+run "idle_metric_a_dimension_name_of_at_most_255" {
+  command = plan
+  variables {
+    resource_arn = "arn:aws:ec2:eu-west-1:111111111111:instance/i-0123456789abcdef0"
+    idle_metric  = { namespace = "Batch", name = "QueueDepth", dimensions = { (join("", [for i in range(256) : "d"])) = "v" }, statistic = "Maximum", below = 1 }
+  }
+  expect_failures = [var.idle_metric]
+}
+
+run "idle_metric_no_unknown_field" {
+  command = plan
+  variables {
+    resource_arn = "arn:aws:ec2:eu-west-1:111111111111:instance/i-0123456789abcdef0"
+    idle_metric  = { namespace = "Batch", name = "QueueDepth", dimensions = {}, statistic = "Maximum", below = 1, unit = "Count" }
+  }
+  expect_failures = [var.idle_metric]
+}
+
+run "idle_metric_below_a_number" {
+  command = plan
+  variables {
+    resource_arn = "arn:aws:ec2:eu-west-1:111111111111:instance/i-0123456789abcdef0"
+    idle_metric  = { namespace = "Batch", name = "QueueDepth", dimensions = {}, statistic = "Maximum", below = "1" }
+  }
+  expect_failures = [var.idle_metric]
+}

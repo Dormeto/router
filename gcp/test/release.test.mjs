@@ -931,9 +931,10 @@ test('compareVersions: a dev version is below its release, and a lower minor is 
 
 // The versions a text's "Not released yet: router X" sentences name, a sentence split across lines included.
 const notYet = (text) => [...spaced(text).matchAll(/Not released yet: router (\d+\.\d+\.\d+)/g)].map(([, version]) => version);
-// Every Markdown file of the README, docs/ and terraform/ (not what terraform init downloads).
+// Every Markdown and Terraform file of the README, docs/ and terraform/ (a variable's description is a doc; not what terraform
+// init downloads).
 const MARKDOWN = ['README.md', ...['docs', 'terraform'].flatMap((dir) => readdirSync(`${ROOT}${dir}`, { recursive: true })
-  .filter((path) => path.endsWith('.md') && !path.split('/').includes('.terraform')).map((path) => `${dir}/${path}`))];
+  .filter((path) => /\.(md|tf)$/.test(path) && !path.split('/').includes('.terraform')).map((path) => `${dir}/${path}`))];
 
 test('notYet finds each "Not released yet: router X" sentence, across a line break too, and nothing else', () => {
   assert.deepEqual(notYet('Done. Not\nreleased yet: router 0.41.0 and CLI 0.15.0. A (Not released yet: router 1.0.0).'), ['0.41.0', '1.0.0']);
@@ -945,6 +946,14 @@ test('every "Not released yet: router X" sentence names a version above the pack
   const found = MARKDOWN.flatMap((file) => notYet(read(file)).map((version) => [file, version]));
   const reached = found.filter(([, version]) => compareVersions(PACKAGE.version, version) >= 0);
   assert.deepEqual(reached, [], `the package is at ${PACKAGE.version}: these sentences are released, rewrite them`);
+});
+
+// dormeto-release router rewrites each sentence its version reaches ("router X" in parentheses, "From router X" at a sentence's
+// start), then runs these tests: one that pins the sentence would fail the release.
+test('no other test pins a "Not released yet: router X" sentence: the release rewrites the docs, not the tests', () => {
+  const pinned = ['lambda/test', 'gcp/test'].flatMap((dir) => readdirSync(`${ROOT}${dir}`).filter((name) => name.endsWith('.mjs')).map((name) => `${dir}/${name}`))
+    .filter((file) => file !== 'gcp/test/release.test.mjs' && /Not released yet: router \\?\d/.test(read(file)));
+  assert.deepEqual(pinned, [], 'match the words around the sentence, or the version alone (router 0\\.43\\.0): the release changes the sentence');
 });
 
 // The CLI's move of the router commands under `dormeto gcp routers`: the docs name the new ones, and the old names only in one sentence

@@ -112,8 +112,9 @@ On Google Cloud, the onboarding refuses (the router's own words):
   backend service, and it is never offered as a standalone workload.
 - **The CLI checks that a VM or a group serves no load balancer** (Not released yet: router 0.42.0) before it onboards it,
   with the operator's own rights: `compute.backendServices.list`, `compute.regionBackendServices.list`,
-  `compute.targetPools.list`, `compute.targetInstances.list`, `compute.instanceGroups.list`,
-  `compute.networkEndpointGroups.list` and `compute.instanceGroupManagers.get`, the onboarding step `resourceCheck` of
+  `compute.targetPools.list`, `compute.targetInstances.list`, `compute.instanceGroups.list`, `compute.instanceGroups.get`,
+  `compute.networkEndpointGroups.list`, `compute.networkEndpointGroups.get` and `compute.instanceGroupManagers.get` (a
+  backend's group or network endpoint group listed, then its members read), the onboarding step `resourceCheck` of
   `gcp/access.json`, needed to onboard a standalone resource only. Without them the CLI stops and names the listings it could
   not make, unless `--unchecked` is given.
 

@@ -265,7 +265,10 @@ test('onboard.resourceCheck: the reads of the load-balancer check before a stand
   const { operator: o } = await load();
   assert.deepEqual(o.onboard.resourceCheck, [
     'compute.backendServices.list', 'compute.regionBackendServices.list', 'compute.targetPools.list', 'compute.targetInstances.list',
-    'compute.instanceGroups.list', 'compute.networkEndpointGroups.list', 'compute.instanceGroupManagers.get',
+    // A backend's group or network endpoint group listed, then its members read: listInstances (zonal and regional) asks
+    // compute.instanceGroups.get, listNetworkEndpoints compute.networkEndpointGroups.get (Google's reference; compute.mjs's CALLS).
+    'compute.instanceGroups.list', 'compute.instanceGroups.get', 'compute.networkEndpointGroups.list', 'compute.networkEndpointGroups.get',
+    'compute.instanceGroupManagers.get',
   ]);
   for (const p of o.onboard.resourceCheck) assert.ok(/\.(get|list)$/.test(p), p);
   // Not in the steps every onboarding needs.

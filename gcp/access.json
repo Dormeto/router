@@ -312,7 +312,9 @@
         "compute.targetPools.list",
         "compute.targetInstances.list",
         "compute.instanceGroups.list",
+        "compute.instanceGroups.get",
         "compute.networkEndpointGroups.list",
+        "compute.networkEndpointGroups.get",
         "compute.instanceGroupManagers.get"
       ]
     },

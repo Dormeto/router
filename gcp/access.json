@@ -274,7 +274,9 @@
         "iam.serviceAccounts.delete"
       ],
       "roles": [
-        "iam.roles.get",
+        "iam.roles.get"
+      ],
+      "rolesDelete": [
         "iam.roles.delete"
       ]
     },
@@ -427,7 +429,9 @@
         "resourcemanager.organizations.setIamPolicy"
       ],
       "roles": [
-        "iam.roles.get",
+        "iam.roles.get"
+      ],
+      "rolesDelete": [
         "iam.roles.delete"
       ],
       "serviceAccounts": [

@@ -353,4 +353,6 @@ GOOGLE_OAUTH_ACCESS_TOKEN="$(gcloud config config-helper --min-expiry=30m --form
 
 Stopped, suspended or switched (plainly or with weights), everything goes: the URL maps depend on all their backend
 services, so the destroy deletes them first, whichever service they name. What `dormeto gcp routers install` made (the APIs,
-the roles, the service account, the tag) stays until `dormeto gcp routers uninstall`.
+the roles, the service account, the tag) stays until `dormeto gcp routers uninstall`, which leaves the custom roles in place,
+granting nothing, unless `--delete-roles` (Google undeletes a role within 7 days, then blocks its ID until it is deleted for good,
+up to 44 days after the delete).

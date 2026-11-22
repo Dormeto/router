@@ -25,13 +25,14 @@ const STEPS = {
   check: ['read'],
   install: ['read', 'apis', 'roles', 'serviceAccount', 'projectBindings', 'tag', 'database', 'queue', 'logView'],
   'install-router': ['image', 'cloudRun', 'neg', 'job'],
-  uninstall: ['read', 'job', 'neg', 'cloudRun', 'logView', 'queue', 'database', 'projectBindings', 'tag', 'serviceAccount', 'roles'],
+  // rolesDelete: asked only with --delete-roles (the user, 2026-11-22: the custom roles are kept by default), as resourceCheck with --resource.
+  uninstall: ['read', 'job', 'neg', 'cloudRun', 'logView', 'queue', 'database', 'projectBindings', 'tag', 'serviceAccount', 'roles', 'rolesDelete'],
   workloads: ['invoke'],
   // resourceCheck: what onboarding a standalone resource (--resource) reads, as requestLogs is what --request-logs needs.
   onboard: ['invoke', 'tag', 'requestLogs', 'resourceCheck'],
   offboard: ['invoke', 'tag', 'requestLogs'],
   connect: ['read', 'apis', 'federation', 'serviceAccounts', 'roles', 'projectBindings', 'folderBindings', 'organizationBindings', 'controller', 'tag'],
-  disconnect: ['read', 'controller', 'tag', 'projectBindings', 'folderBindings', 'organizationBindings', 'roles', 'serviceAccounts', 'federation'],
+  disconnect: ['read', 'controller', 'tag', 'projectBindings', 'folderBindings', 'organizationBindings', 'roles', 'rolesDelete', 'serviceAccounts', 'federation'],
 };
 
 // Every list of permissions in the manifest, named for the failure messages.
@@ -294,7 +295,19 @@ test('uninstall: the matching deletes, step by step, and the project policy', as
   includesAll(u.projectBindings, ['resourcemanager.projects.getIamPolicy', 'resourcemanager.projects.setIamPolicy'], 'uninstall.projectBindings');
   includesAll(u.tag, ['resourcemanager.tagValues.delete', 'resourcemanager.tagKeys.delete'], 'uninstall.tag');
   includesAll(u.serviceAccount, ['iam.serviceAccounts.delete'], 'uninstall.serviceAccount');
-  includesAll(u.roles, ['iam.roles.delete'], 'uninstall.roles');
+  includesAll(u.rolesDelete, ['iam.roles.delete'], 'uninstall.rolesDelete');
+});
+
+// The user, 2026-11-22 ("disconnect keeps the roles"; cli 4d20804): disconnect and routers uninstall read each custom role and leave it
+// in place, granting nothing; --delete-roles deletes it (Google undeletes a role within 7 days, then blocks its ID until it is deleted
+// for good, up to 44 days after the delete). The default path asks no deletion.
+test('disconnect and uninstall keep the custom roles: roles reads them, rolesDelete (--delete-roles only) deletes them', async () => {
+  const { operator: o } = await load();
+  for (const command of ['disconnect', 'uninstall']) {
+    assert.deepEqual(o[command].roles, ['iam.roles.get'], `${command}.roles`);
+    assert.deepEqual(o[command].rolesDelete, ['iam.roles.delete'], `${command}.rolesDelete`);
+    for (const [step, list] of Object.entries(o[command])) if (step !== 'rolesDelete') assert.ok(!list.includes('iam.roles.delete'), `${command}.${step}`);
+  }
 });
 
 test('no permission Google does not have: resourcemanager.tagValues.use appears nowhere', async () => {

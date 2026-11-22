@@ -1,6 +1,6 @@
 # Standalone workloads
 
-Not released yet: router 0.42.0.
+From router 0.42.0.
 
 A **standalone workload** is one stoppable resource that no load balancer serves: a batch server, a build agent, a worker
 service, a database used by hand. The router naps it when its idle signals show nothing happening for its idle window, on a
@@ -102,15 +102,15 @@ On Google Cloud, the onboarding refuses (the router's own words):
 - **A resource of another project:** a router serves its own project.
 - **Whether a VM or a group backs a backend service** the router cannot tell (its role lists no backend service): the
   manager's scan offers only what no backend service uses.
-- **The manager's scan lists a project's Cloud SQL instances** (Not released yet: router 0.42.0): its discovery role,
+- **The manager's scan lists a project's Cloud SQL instances** (router 0.42.0): its discovery role,
   `dormetoDiscovery`, reads them with `cloudsql.instances.get` and `cloudsql.instances.list`, and offers none that is a
   read replica. In a project where the Cloud SQL Admin API is off (only a router installed with `--with cloud-sql` turns
   it on), Google refuses the read and the scan says Cloud SQL was not read; nothing turns the API on for it.
-- **The manager's scan reads target pools and target instances** (Not released yet: router 0.42.0):
+- **The manager's scan reads target pools and target instances** (router 0.42.0):
   `compute.targetPools.list` and `compute.targetInstances.list` (their aggregated lists take the same permissions), with
   `dormetoDiscovery`. A VM that a target-pool Network Load Balancer or a target instance (protocol forwarding) uses has no
   backend service, and it is never offered as a standalone workload.
-- **The CLI checks that a VM or a group serves no load balancer** (Not released yet: router 0.42.0) before it onboards it,
+- **The CLI checks that a VM or a group serves no load balancer** (router 0.42.0) before it onboards it,
   with the operator's own rights: `compute.backendServices.list`, `compute.regionBackendServices.list`,
   `compute.targetPools.list`, `compute.targetInstances.list`, `compute.instanceGroups.list`, `compute.instanceGroups.get`,
   `compute.networkEndpointGroups.list`, `compute.networkEndpointGroups.get` and `compute.instanceGroupManagers.get` (a

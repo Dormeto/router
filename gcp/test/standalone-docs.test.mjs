@@ -1,5 +1,5 @@
 // The standalone workloads page says both clouds (plan 5, R31): Google Cloud's resources, metrics, custom metric's shape, what marks a
-// resource and its limits, once; the manager page and the README name it, in the router's form for what is to come.
+// resource and its limits, once; the manager page and the README name it, as router 0.42.0's.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -19,9 +19,9 @@ test('the standalone page says Google Cloud\'s resources, metrics, metric shape,
   }
 });
 
-test('the manager page and the README name standalone workloads, to come in router 0.42.0', () => {
+test('the manager page and the README name standalone workloads, from router 0.42.0', () => {
   const manager = flat(read('docs/scenarios/google-cloud-manager.md'));
-  assert.match(manager, /## Standalone workloads Not released yet: router 0\.42\.0\. A workload is of one of two kinds/);
+  assert.match(manager, /## Standalone workloads From router 0\.42\.0\. A workload is of one of two kinds/);
   assert.ok(manager.includes('[Standalone workloads](standalone.md)'));
   const readme = flat(read('README.md'));
   assert.ok(readme.includes('[Standalone workloads](docs/scenarios/standalone.md): a Compute Engine VM, a managed instance group or a Cloud SQL instance'));
@@ -40,7 +40,7 @@ test('the page says what the manager\'s discovery role reads of Cloud SQL, as gc
   const discovery = JSON.parse(read('gcp/access.json')).manager.roles.dormetoDiscovery.permissions;
   const reads = discovery.filter((p) => p.startsWith('cloudsql.'));
   assert.deepEqual(reads, ['cloudsql.instances.get', 'cloudsql.instances.list']);
-  assert.ok(page.includes(`The manager's scan lists a project's Cloud SQL instances (Not released yet: router 0.42.0): its discovery role, dormetoDiscovery, reads them with ${reads.join(' and ')}`));
+  assert.ok(page.includes(`The manager's scan lists a project's Cloud SQL instances (router 0.42.0): its discovery role, dormetoDiscovery, reads them with ${reads.join(' and ')}`));
   assert.ok(page.includes('where the Cloud SQL Admin API is off (only a router installed with --with cloud-sql turns it on), Google refuses the read and the scan says Cloud SQL was not read; nothing turns the API on for it'));
 });
 
@@ -67,14 +67,14 @@ test('the page says why the manager\'s discovery role reads target pools and tar
   const discovery = JSON.parse(read('gcp/access.json')).manager.roles.dormetoDiscovery.permissions;
   const reads = discovery.filter((p) => /^compute\.target(Pools|Instances)\./.test(p));
   assert.deepEqual(reads, ['compute.targetPools.list', 'compute.targetInstances.list']);
-  assert.ok(page.includes(`The manager's scan reads target pools and target instances (Not released yet: router 0.42.0): ${reads.join(' and ')}`));
+  assert.ok(page.includes(`The manager's scan reads target pools and target instances (router 0.42.0): ${reads.join(' and ')}`));
   assert.ok(page.includes('A VM that a target-pool Network Load Balancer or a target instance (protocol forwarding) uses has no backend service, and it is never offered as a standalone workload'));
 });
 
 test('the page says what the CLI\'s load-balancer check reads with the operator\'s rights, as onboard.resourceCheck has it, and what it does without them', () => {
   const page = flat(read('docs/scenarios/standalone.md'));
   const reads = JSON.parse(read('gcp/access.json')).operator.onboard.resourceCheck;
-  assert.ok(page.includes(`The CLI checks that a VM or a group serves no load balancer (Not released yet: router 0.42.0) before it onboards it, with the operator's own rights: ${reads.slice(0, -1).join(', ')} and ${reads.at(-1)}`));
+  assert.ok(page.includes(`The CLI checks that a VM or a group serves no load balancer (router 0.42.0) before it onboards it, with the operator's own rights: ${reads.slice(0, -1).join(', ')} and ${reads.at(-1)}`));
   assert.ok(page.includes('the onboarding step resourceCheck of gcp/access.json, needed to onboard a standalone resource only'));
   assert.ok(page.includes('Without them the CLI stops and names the listings it could not make, unless --unchecked is given'));
 });

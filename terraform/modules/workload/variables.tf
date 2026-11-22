@@ -62,7 +62,7 @@ variable "load_balancer_arn_suffix" {
 }
 
 variable "resource_arn" {
-  description = "A standalone workload's resource, in place of app_target_group_arn (one of the two; Not released yet: router 0.42.0): an EC2 instance outside an Auto Scaling group, an Auto Scaling group, an ECS service, an RDS instance or an Aurora cluster, none behind a load balancer. Tag it dormeto:workload = <workload_id> yourself, and its databases too. No waker target group is made: it naps on its idle signals (idle_cpu_percent, idle_network_bytes, idle_metric), a schedule or a person, and nothing wakes it on demand. The waker's settings (wait_seconds, drain_seconds, max_holders, failed_retry_seconds, wake_mode, no_wake_rules, wake_rules, instance_ids, waiting_page, the admin page, rule_arn(s)) are refused with it."
+  description = "A standalone workload's resource, in place of app_target_group_arn (one of the two; router 0.42.0): an EC2 instance outside an Auto Scaling group, an Auto Scaling group, an ECS service, an RDS instance or an Aurora cluster, none behind a load balancer. Tag it dormeto:workload = <workload_id> yourself, and its databases too. No waker target group is made: it naps on its idle signals (idle_cpu_percent, idle_network_bytes, idle_metric), a schedule or a person, and nothing wakes it on demand. The waker's settings (wait_seconds, drain_seconds, max_holders, failed_retry_seconds, wake_mode, no_wake_rules, wake_rules, instance_ids, waiting_page, the admin page, rule_arn(s)) are refused with it."
   type        = string
   default     = null
   validation {

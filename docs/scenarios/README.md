@@ -5,7 +5,7 @@ beyond 0.37.0, and the manager page. A workload is of one of two kinds. An **HTT
 Balancer target group and the backends behind it: the router naps them together once the target group has had no request
 for the idle window, and wakes them on the next request. A **standalone workload** is one stoppable resource no load
 balancer serves, napped when its metrics stay idle, by a schedule or by a person, and never woken on demand: see
-[Standalone workloads](standalone.md) (Not released yet: router 0.42.0). The rest of this page is an HTTP workload's. Each page below gives the scenario's diagram, the services it uses, its measured wake
+[Standalone workloads](standalone.md) (router 0.42.0). The rest of this page is an HTTP workload's. Each page below gives the scenario's diagram, the services it uses, its measured wake
 time, its behavior and its limits.
 
 | Scenario | What naps | Measured wake | Default wake timeout |

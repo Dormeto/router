@@ -24,7 +24,7 @@ Run services](#google-cloud) of the same two roles):
   wakes them: it stops and starts EC2 instances and databases, scales Auto Scaling groups, ECS services and Kubernetes
   Deployments to 0 and back, and reconciles external changes.
 
-**Standalone workloads** (Not released yet: router 0.42.0): a workload may also be one EC2 instance, Auto Scaling group, ECS
+**Standalone workloads** (router 0.42.0): a workload may also be one EC2 instance, Auto Scaling group, ECS
 service, RDS instance or Aurora cluster that no load balancer serves (its configuration has `kind: "standalone"` and
 `resourceArn`). It naps when its idle signals (CPU, network, a CloudWatch metric of your own) stay under their thresholds
 for its idle window (120 minutes by default), on a schedule or on a person's word, and wakes on a schedule or on a person's
@@ -491,8 +491,8 @@ removes those of manager workloads; the `workload` module only forgets its own, 
 the configuration and covers every rule forwarding to the target group; each step finds what exists first, and a failed
 onboarding of a new workload is undone. Offboarding (the workload awake) removes only what onboarding added: shadows,
 rules back to a plain forward, waker target group, permission, the tags carrying the marker, the configuration. A
-workload written by the `workload` module is refused (remove the module instead). A standalone workload (Not released
-yet: router 0.42.0) is onboarded from its resource: `preview` and `onboard` take `resourceArn` in place of `targetGroupArn`,
+workload written by the `workload` module is refused (remove the module instead). A standalone workload (router
+0.42.0) is onboarded from its resource: `preview` and `onboard` take `resourceArn` in place of `targetGroupArn`,
 and tag the resource and its databases; the reasons a resource cannot be one are on
 [its page](docs/scenarios/standalone.md#what-can-be-standalone).
 
@@ -628,8 +628,8 @@ default (router 0.40.0 and CLI 0.14.0 or later) or from your own with `--image`.
 - [Kubernetes on GKE](docs/scenarios/google-kubernetes-engine.md): a Deployment or StatefulSet behind standalone network
   endpoint groups, scaled to 0 and back, from 0.37.0.
 - [Standalone workloads](docs/scenarios/standalone.md): a Compute Engine VM, a managed instance group or a Cloud SQL
-  instance that no load balancer serves, napped on its Cloud Monitoring signals, a schedule or a person (Not released yet:
-  router 0.42.0).
+  instance that no load balancer serves, napped on its Cloud Monitoring signals, a schedule or a person (router
+  0.42.0).
 - [The router and the manager](docs/scenarios/google-cloud-manager.md): the journal, the check summary and `POST
   /v1/actions`, through which the Dormeto manager reads and acts on a Google Cloud router, from 0.40.0.
 

@@ -21,11 +21,11 @@ test('the standalone page is linked from the scenarios index and the README, and
   }
 });
 
-test('the index says the two kinds, and every standalone sentence about what is to come names the version after the package\'s', () => {
+test('the index says the two kinds, and the page, the index and the README say standalone workloads are router 0.42.0\'s', () => {
   const index = flat(read('docs/scenarios/README.md'));
   assert.match(index, /A workload is of one of two kinds\. An HTTP workload is an Application Load Balancer target group/);
   assert.match(index, /A standalone workload is one stoppable resource no load balancer serves/);
-  for (const file of [PAGE, 'docs/scenarios/README.md', 'README.md']) assert.match(flat(read(file)), /Not released yet: router 0\.42\.0/, file);
+  for (const file of [PAGE, 'docs/scenarios/README.md', 'README.md']) assert.match(flat(read(file)), /\(router 0\.42\.0\)|From router 0\.42\.0\./, file);
   assert.doesNotMatch(read(PAGE), /unreleased/i);
 });
 

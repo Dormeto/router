@@ -11,7 +11,7 @@ documented in the CLI's README, not here.
 
 ## Standalone workloads
 
-Not released yet: router 0.42.0. A workload is of one of two kinds: an HTTP workload (a backend service of an Application
+From router 0.42.0. A workload is of one of two kinds: an HTTP workload (a backend service of an Application
 Load Balancer) or a standalone workload, one Compute Engine VM, managed instance group or Cloud SQL instance that no load
 balancer serves ([Standalone workloads](standalone.md)). A standalone workload's row, status and REST `Workload` carry
 `kind: "standalone"` and `resource`, its path, and none of `urlMap`, `backendService`, `wakerBackendService`, `lb` or the

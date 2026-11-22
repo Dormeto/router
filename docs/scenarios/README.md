@@ -1,6 +1,6 @@
 # Supported scenarios
 
-What the router naps and wakes, as of router 0.41.0. Router 0.40.0 adds what the Google Cloud pages say
+What the router naps and wakes, as of router 0.42.0. Router 0.40.0 adds what the Google Cloud pages say
 beyond 0.37.0, and the manager page. A workload is of one of two kinds. An **HTTP workload** is an Application Load
 Balancer target group and the backends behind it: the router naps them together once the target group has had no request
 for the idle window, and wakes them on the next request. A **standalone workload** is one stoppable resource no load

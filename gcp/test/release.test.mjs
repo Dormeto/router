@@ -176,7 +176,7 @@ test('the README does not say the hand-made repository can grant nothing', () =>
 test('the README has a Google Cloud section naming the image script and the dev repository', () => {
   const readme = read('README.md');
   assert.match(readme, /^## Google Cloud$/m);
-  for (const needle of ['scripts/gcp-image.sh', 'gcp/Containerfile', 'europe-west1-docker.pkg.dev/dormeto-dev/dormeto/router', 'gcloud artifacts repositories create dormeto']) {
+  for (const needle of ['scripts/gcp-image.sh', 'gcp/Containerfile', 'europe-west1-docker.pkg.dev/dormeto-dev2/dormeto/router', 'gcloud artifacts repositories create dormeto']) {
     assert.ok(readme.includes(needle), needle);
   }
 });

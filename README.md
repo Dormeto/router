@@ -585,7 +585,7 @@ Design: `docs/specs/2026-10-03-mvp-alb-ec2-design.md` in the Dormeto/vision repo
 | `terraform/modules/eks-access` | The router roles' access entries, `DmtDiscoveryRole`'s view policy, the manifest |
 | `terraform/dev-eks` | `dev-eks`: an EKS cluster written as a customer would, with six demo workloads (about 155 USD a month while it exists) |
 | `lambda/test-k8s`, `scripts/kind-*.sh` | Kubernetes integration tests in kind (podman by default) |
-| `terraform/gcp-dev` | `gcp-dev`: Google Cloud demo VMs behind a global and a regional external Application Load Balancer in `dormeto-dev`, no IAM (about 80 USD a month while it exists) |
+| `terraform/gcp-dev` | `gcp-dev`: Google Cloud demo VMs behind a global and a regional external Application Load Balancer in `dormeto-dev2`, no IAM (about 80 USD a month while it exists) |
 | `gcp/tools/measure.mjs` | G0's measures on `gcp-dev`: URL map switch (plain or weighted), VM and managed group wake, `request_count` delay, the health of a backend service out of service |
 | `gcp/Containerfile`, `scripts/gcp-image.sh` | The Google Cloud router's container image (Node 24, distroless) and its build script |
 
@@ -660,10 +660,10 @@ sampled, but an empty log leaves the count to decide. GKE refuses a KEDA `minRep
 ./scripts/gcp-image.sh 0.42.0
 # Run the controller's health locally: GET /v1/health -> {"version","project","region"}
 podman run --rm -p 8080:8080 -e DMT_ROLE=controller -e DMT_PROJECT=p -e DMT_REGION=europe-west1 -e DMT_DATABASE=d -e DMT_QUEUE=q dormeto-router:0.42.0
-# Build and push europe-west1-docker.pkg.dev/dormeto-dev/dormeto/router:<version> (repository `dormeto`; the named gcloud
+# Build and push europe-west1-docker.pkg.dev/dormeto-dev2/dormeto/router:<version> (repository `dormeto`; the named gcloud
 # configuration's own access; no default configuration, no default project; --repository can be repeated, and each
 # pushed image's digest is printed)
-./scripts/gcp-image.sh 0.42.0 --push --configuration dormeto-dev --repository europe-west1-docker.pkg.dev/dormeto-dev/dormeto
+./scripts/gcp-image.sh 0.42.0 --push --configuration dormeto-dev2 --repository europe-west1-docker.pkg.dev/dormeto-dev2/dormeto
 ```
 
 Dormeto publishes the image, public, at `<europe|us|asia>-docker.pkg.dev/dormeto-releases/router/router:<version>` from
@@ -674,12 +674,12 @@ Building your own is for `--image`, for example inside a VPC Service Controls pe
 repository out. An image in another project needs Artifact Registry Reader for the project's Cloud Run service agent,
 which the customer gives.
 
-The dev repository `dormeto` is created once, by hand, in `dormeto-dev`. Creating it grants nothing of ours, but it can
+The dev repository `dormeto` is created once, by hand, in `dormeto-dev2`. Creating it grants nothing of ours, but it can
 create Artifact Registry's service agent and its binding: Google's own, the CLI shows it at its next run. Cloud Run's
 service agent reads the project's repositories, so the same project needs no grant:
 
 ```bash
-gcloud artifacts repositories create dormeto --repository-format=docker --location=europe-west1 --configuration=dormeto-dev
+gcloud artifacts repositories create dormeto --repository-format=docker --location=europe-west1 --configuration=dormeto-dev2
 ```
 
 The image carries `package.json`, `lambda/src/lib` and `gcp/src` only, on `gcr.io/distroless/nodejs24-debian12` (Node

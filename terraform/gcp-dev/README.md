@@ -1,12 +1,12 @@
 # gcp-dev
 
-G0's demo workloads in the Google Cloud project `dormeto-dev` (vision `docs/specs/2026-10-29-google-cloud-design.md`,
+G0's demo workloads in the Google Cloud project `dormeto-dev2` (vision `docs/specs/2026-10-29-google-cloud-design.md`,
 section 12): web VMs behind a global and a regional external Application Load Balancer, written as a customer would,
 with no Dormeto resource. `gcp/tools/measure.mjs` measures them: how fast a URL map switch takes effect, how fast
 stopped or suspended VMs come back healthy, Cloud Monitoring's request count delay, and whether Google health checks a
 backend service out of service.
 
-- **What it holds** (project `dormeto-dev`, region `europe-west1`, zone `europe-west1-b`): the VPC `dmt-dev` (subnet
+- **What it holds** (project `dormeto-dev2`, region `europe-west1`, zone `europe-west1-b`): the VPC `dmt-dev` (subnet
   `10.10.0.0/24`, proxy-only subnet `dmt-dev-proxy` `10.10.1.0/24`), the firewall rule `dmt-dev-demo` (Google's front
   ends and health checkers, `35.191.0.0/16` and `130.211.0.0/22`, and the proxy-only subnet, to TCP 80 and 8080 of the
   VMs tagged `dmt-demo`); the VM `dmt-demo` (`e2-small`, Debian 12, no external address) in the unmanaged instance
@@ -39,7 +39,7 @@ backend service out of service.
 - **No IAM, no API**: every IAM change and every API turned on in the project go through `dormeto gcp routers install` or
   `uninstall`. This root holds no `google_*_iam_*` resource, no service account and no `google_project_service`, and its
   VMs and template run without a service account (attaching one is an IAM grant); `gcp/test/gcp-dev.test.mjs` checks
-  it. It needs the `compute` and `monitoring` APIs, which `dormeto gcp routers install --project dormeto-dev --region
+  it. It needs the `compute` and `monitoring` APIs, which `dormeto gcp routers install --project dormeto-dev2 --region
   europe-west1` turns on.
 - **Cost** while it exists, at list prices: about $0.11 an hour, $80 a month: the three `e2-small` VMs about $40 a
   month while running, their 10 GB balanced disks $3 (also while stopped; a suspended VM also pays for its memory's
@@ -70,11 +70,11 @@ binding for a resource it makes (a service agent's).
 **Needs first.** `enable_sql` and `enable_gke` need the `sqladmin` and `container` APIs, which this root does not turn on
 (no `google_project_service`, by design): `dormeto gcp routers install --with cloud-sql,gke` does, and **not in `europe-west1`
 before 2026-11-02**. The probe's Cloud Run job (below) needs a router image holding `probe.mjs`: one built and pushed
-for the measures (`scripts/gcp-image.sh <version> --push --configuration dormeto-dev --repository <host>/<project>/<repo>`, which pushes `<repository>/router:<version>`).
+for the measures (`scripts/gcp-image.sh <version> --push --configuration dormeto-dev2 --repository <host>/<project>/<repo>`, which pushes `<repository>/router:<version>`).
 
 The NEG VM and the GKE load balancer have no domain name, and the root has no output for them (an output the defaults do
 not store would show in a plan): read an address with `gcloud compute addresses describe dmt-dev-neg --global
---format='value(address)' --configuration=dormeto-dev` (`dmt-dev-classic`, `dmt-dev-gke` the same), and give the measuring tool
+--format='value(address)' --configuration=dormeto-dev2` (`dmt-dev-classic`, `dmt-dev-gke` the same), and give the measuring tool
 `--url http://<address>/`. The demo VM still belongs to one workload at a time (G1's rule):
 the global, regional and classic load balancers share its group, so the acceptance offboards between them, and a nap on
 one takes the others' backends down meanwhile. If Compute Engine refuses the group as the backend of both an `EXTERNAL`
@@ -85,31 +85,31 @@ and an `EXTERNAL_MANAGED` service at the apply, the classic backend services mov
 HTTPRoute (the Gateway's load balancer is GKE's own: M10 writes a policy on its URL map). The measure applies it, on the
 user's "run it", with the owner's own rights (the project owner is cluster-admin through IAM, the DNS endpoint and
 `gcloud container clusters get-credentials`): no Role or binding is written for it, the router's RBAC is the CLI's
-(`dormeto gcp workloads access`). Then the NEG is attached to the backend service, by `gcloud` with the `dormeto-dev`
+(`dormeto gcp workloads access`). Then the NEG is attached to the backend service, by `gcloud` with the `dormeto-dev2`
 configuration (no IAM):
 
 ```
-gcloud container clusters get-credentials dmt-demo-gke --zone europe-west1-b --dns-endpoint --configuration=dormeto-dev
+gcloud container clusters get-credentials dmt-demo-gke --zone europe-west1-b --dns-endpoint --configuration=dormeto-dev2
 kubectl apply -f terraform/gcp-dev/gke-demo.yaml
 gcloud compute backend-services add-backend dmt-demo-gke --global --network-endpoint-group=dmt-demo-gke \
-  --network-endpoint-group-zone=europe-west1-b --balancing-mode=RATE --max-rate-per-endpoint=100 --configuration=dormeto-dev
+  --network-endpoint-group-zone=europe-west1-b --balancing-mode=RATE --max-rate-per-endpoint=100 --configuration=dormeto-dev2
 ```
 
 (The backend service ignores its `backend` in Terraform, so a later plan does not remove the NEG.)
 
 **Teardown, in this order**: Google refuses to delete a NEG a backend service still uses, and the NEG was attached by
 hand. (1) Detach it: `gcloud compute backend-services remove-backend dmt-demo-gke --global --network-endpoint-group=dmt-demo-gke
---network-endpoint-group-zone=europe-west1-b --configuration=dormeto-dev`. (2) Delete the manifest: `kubectl delete -f
+--network-endpoint-group-zone=europe-west1-b --configuration=dormeto-dev2`. (2) Delete the manifest: `kubectl delete -f
 terraform/gcp-dev/gke-demo.yaml` (the Service's NEG and the Gateway's load balancer go with it). (3) `plan -out` with
 `enable_gke` off, read it, apply the saved plan. Terraform has no dependency between the cluster and the backend service, so
 they are destroyed in parallel: a cluster deleted while the Service still exists leaves its NEG behind, and the NEG then
 blocks nothing but stays. A leftover NEG costs nothing: check `gcloud compute network-endpoint-groups list
---configuration=dormeto-dev` after the apply and delete a leftover `dmt-demo-gke` by hand.
+--configuration=dormeto-dev2` after the apply and delete a leftover `dmt-demo-gke` by hand.
 
 ### Measure the optional parts
 
 ```
-addr() { gcloud compute addresses describe "$1" --global --format='value(address)' --configuration=dormeto-dev; }
+addr() { gcloud compute addresses describe "$1" --global --format='value(address)' --configuration=dormeto-dev2; }
 # S3: a stopped VM in a NEG keeps its endpoint? (M1)
 node gcp/tools/measure.mjs neg stop  --url "http://$(addr dmt-dev-neg)/"
 node gcp/tools/measure.mjs neg start --url "http://$(addr dmt-dev-neg)/"
@@ -135,7 +135,7 @@ node gcp/tools/measure.mjs switch --hold --suspend --region europe-west1 --url-m
 node gcp/tools/measure.mjs metric --url-map dmt-dev-classic --url "http://$(addr dmt-dev-classic)/" \
   --metric loadbalancing.googleapis.com/https/request_count
 # The regional request count (M5): its URL map as the metric labels it
-number="$(gcloud projects describe dormeto-dev --format='value(projectNumber)' --configuration=dormeto-dev)"
+number="$(gcloud projects describe dormeto-dev2 --format='value(projectNumber)' --configuration=dormeto-dev2)"
 node gcp/tools/measure.mjs metric --url-map "URL_MAP/${number}_dmt-dev-regional" --url http://regional.gcp.dev.dormeto.com/ \
   --metric loadbalancing.googleapis.com/https/external/regional/request_count
 # S5: Cloud SQL stopped and started by its activation policy, until its operation is done; state and policy read every 10 s (M6)
@@ -184,25 +184,25 @@ endpoint `<region>-cloudresourcemanager.googleapis.com`: both confirmed live.
 
 The owner would bypass a condition or an RBAC rule, so these two calls are made as the router's service account:
 `gcp/tools/probe.mjs` is in the router's image and makes one call with the account's token from the metadata server,
-printing the status and the body. It runs as a Cloud Run job with `--service-account dmtr-<region>@dormeto-dev.iam.gserviceaccount.com`
+printing the status and the body. It runs as a Cloud Run job with `--service-account dmtr-<region>@dormeto-dev2.iam.gserviceaccount.com`
 (the owner can act as that account: no IAM change, nothing granted; if Google refuses, the measure waits for the
 code of S5 or S6 on a workload). What the router holds comes from `dormeto gcp routers install --with cloud-sql,gke` and its RBAC
 from the CLI's onboarding step; nothing is applied by hand.
 
 ```
-gcloud run jobs deploy dmt-probe --configuration=dormeto-dev --region europe-west1 \
-  --image europe-west1-docker.pkg.dev/dormeto-dev/dormeto/router:<version> \
-  --service-account dmtr-europe-west1@dormeto-dev.iam.gserviceaccount.com --max-retries 0 \
+gcloud run jobs deploy dmt-probe --configuration=dormeto-dev2 --region europe-west1 \
+  --image europe-west1-docker.pkg.dev/dormeto-dev2/dormeto/router:<version> \
+  --service-account dmtr-europe-west1@dormeto-dev2.iam.gserviceaccount.com --max-retries 0 \
   --args=gcp/tools/probe.mjs,GET,https://<the cluster's DNS endpoint>/apis/apps/v1/namespaces/default/deployments/dmt-demo-gke/scale
-gcloud run jobs execute dmt-probe --configuration=dormeto-dev --region europe-west1 --wait
-gcloud run jobs delete dmt-probe --configuration=dormeto-dev --region europe-west1
+gcloud run jobs execute dmt-probe --configuration=dormeto-dev2 --region europe-west1 --wait
+gcloud run jobs delete dmt-probe --configuration=dormeto-dev2 --region europe-west1
 ```
 
-The job's log (Cloud Logging, `gcloud run jobs executions` with `--configuration=dormeto-dev`) holds the status line and the
+The job's log (Cloud Logging, `gcloud run jobs executions` with `--configuration=dormeto-dev2`) holds the status line and the
 body. For a call with a JSON body, give the arguments with another delimiter, `--args=^@^gcp/tools/probe.mjs@PUT@https://…@{"spec":{"replicas":0}}`.
 Delete the job after (`jobs deploy` again for the next call).
 
-**Needs** gcloud's configuration `dormeto-dev` signed in as the project's owner (spec section 15), and the AWS profile
+**Needs** gcloud's configuration `dormeto-dev2` signed in as the project's owner (spec section 15), and the AWS profile
 `kloudy-dormeto-prd` (state, Route 53). Google's credentials are never in the code or a file: each command takes
 gcloud's token from the environment, with at least 30 minutes left (`--min-expiry=30m` refreshes one closer to its
 expiry; `gcloud auth print-access-token` refreshes only within 5 minutes of it, so its token may not outlast an apply).
@@ -211,17 +211,17 @@ The state is in the S3 bucket, key `router/gcp-dev.tfstate`.
 ```
 cd terraform/gcp-dev
 tfenv exec init
-GOOGLE_OAUTH_ACCESS_TOKEN="$(gcloud config config-helper --min-expiry=30m --format='value(credential.access_token)' --configuration dormeto-dev)" tfenv exec plan -out gcp-dev.tfplan   # read it
-GOOGLE_OAUTH_ACCESS_TOKEN="$(gcloud config config-helper --min-expiry=30m --format='value(credential.access_token)' --configuration dormeto-dev)" tfenv exec apply gcp-dev.tfplan       # the user's go-ahead
+GOOGLE_OAUTH_ACCESS_TOKEN="$(gcloud config config-helper --min-expiry=30m --format='value(credential.access_token)' --configuration dormeto-dev2)" tfenv exec plan -out gcp-dev.tfplan   # read it
+GOOGLE_OAUTH_ACCESS_TOKEN="$(gcloud config config-helper --min-expiry=30m --format='value(credential.access_token)' --configuration dormeto-dev2)" tfenv exec apply gcp-dev.tfplan       # the user's go-ahead
 ```
 
 The certificate becomes active 15 to 60 minutes after the records resolve (`gcloud compute ssl-certificates describe
-dmt-dev --global --configuration dormeto-dev`); until then `https://gcp.dev.dormeto.com/` fails its TLS handshake. The
+dmt-dev --global --configuration dormeto-dev2`); until then `https://gcp.dev.dormeto.com/` fails its TLS handshake. The
 regional load balancer, HTTP, needs no certificate.
 
 ## Measure
 
-From the router's root, with Node 24 and gcloud's `dormeto-dev` configuration: the tool asks `gcloud config
+From the router's root, with Node 24 and gcloud's `dormeto-dev2` configuration: the tool asks `gcloud config
 config-helper --min-expiry=20m` for a token and its expiry, asks again 5 minutes before it expires, and after a 401 asks
 for a forced refresh and sends the request once more. Each command prints a timeline, one line per event,
 `<seconds since start>s  <what>  <value>`, then its summary, and exits 0 when it saw the end, 1 on a timeout or a
@@ -284,7 +284,7 @@ refusal, 2 on a bad flag. Run each several times (G0: five). `--help` lists ever
 
    ```
    node gcp/tools/measure.mjs metric
-   number="$(gcloud projects describe dormeto-dev --format='value(projectNumber)' --configuration=dormeto-dev)"
+   number="$(gcloud projects describe dormeto-dev2 --format='value(projectNumber)' --configuration=dormeto-dev2)"
    node gcp/tools/measure.mjs metric --url-map "URL_MAP/${number}_dmt-dev-regional" --url http://regional.gcp.dev.dormeto.com/ \
      --metric loadbalancing.googleapis.com/https/external/regional/request_count
    ```
@@ -347,8 +347,8 @@ so it had no status at the update. The propagation ended at +10.9 s with the las
 ## Destroy
 
 ```
-GOOGLE_OAUTH_ACCESS_TOKEN="$(gcloud config config-helper --min-expiry=30m --format='value(credential.access_token)' --configuration dormeto-dev)" tfenv exec plan -destroy -out gcp-dev.tfplan
-GOOGLE_OAUTH_ACCESS_TOKEN="$(gcloud config config-helper --min-expiry=30m --format='value(credential.access_token)' --configuration dormeto-dev)" tfenv exec apply gcp-dev.tfplan
+GOOGLE_OAUTH_ACCESS_TOKEN="$(gcloud config config-helper --min-expiry=30m --format='value(credential.access_token)' --configuration dormeto-dev2)" tfenv exec plan -destroy -out gcp-dev.tfplan
+GOOGLE_OAUTH_ACCESS_TOKEN="$(gcloud config config-helper --min-expiry=30m --format='value(credential.access_token)' --configuration dormeto-dev2)" tfenv exec apply gcp-dev.tfplan
 ```
 
 Stopped, suspended or switched (plainly or with weights), everything goes: the URL maps depend on all their backend

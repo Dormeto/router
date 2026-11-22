@@ -1,7 +1,7 @@
 variable "project" {
   description = "The Google Cloud project."
   type        = string
-  default     = "dormeto-dev"
+  default     = "dormeto-dev2"
 }
 
 variable "region" {

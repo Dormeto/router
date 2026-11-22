@@ -119,7 +119,7 @@ const variableBlock = (variables, name) => new RegExp(`variable\\s+"${name}"\\s*
 
 test('each optional part is behind a variable that is false by default, and the regional map ignores what Dormeto writes', async () => {
   const variables = uncommented(await readFile(join(ROOT, 'variables.tf'), 'utf8'));
-  for (const name of ['enable_classic', 'enable_classic_standard', 'enable_ten', 'enable_neg', 'enable_sql', 'enable_gke', 'enable_internal']) {
+  for (const name of ['enable_classic', 'enable_classic_standard', 'enable_ten', 'enable_neg', 'enable_sql', 'enable_gke', 'enable_internal', 'enable_standalone']) {
     const block = variableBlock(variables, name);
     assert.ok(block, `${name} is declared`);
     assert.match(block, /^\s*type\s*=\s*bool\s*$/m, name);
@@ -132,7 +132,7 @@ test('each optional part is behind a variable that is false by default, and the 
 });
 
 test('every resource of an optional file has a count or a for_each on its own variable, so a plan with the defaults shows no change', async () => {
-  const optional = { 'classic.tf': 'enable_classic', 'classic-standard.tf': 'enable_classic_standard', 'neg.tf': 'enable_neg', 'sql.tf': 'enable_sql', 'gke.tf': 'enable_gke', 'internal.tf': 'enable_internal' };
+  const optional = { 'classic.tf': 'enable_classic', 'classic-standard.tf': 'enable_classic_standard', 'neg.tf': 'enable_neg', 'sql.tf': 'enable_sql', 'gke.tf': 'enable_gke', 'internal.tf': 'enable_internal', 'standalone.tf': 'enable_standalone' };
   for (const [file, variable] of Object.entries(optional)) {
     const code = uncommented(await readFile(join(ROOT, file), 'utf8'));
     const resources = [...code.matchAll(/^resource\s+"([^"]+)"\s+"([^"]+)"/gm)];
@@ -311,4 +311,22 @@ test('internal_region defaults to null (var.region), and only the regional inter
   assert.match(proxy, /ip_cidr_range\s*=\s*"10\.10\.5\.0\/24"/);
   assert.match(proxy, /purpose\s*=\s*"REGIONAL_MANAGED_PROXY"/);
   assert.match(proxy, /region\s*=\s*local\.internal_region/);
+});
+
+test('standalone.tf: one small VM behind no load balancer, for a standalone workload, and its resource path as an output (the instance\'s id: projects/<p>/zones/<z>/instances/<n>)', async () => {
+  const variables = uncommented(await readFile(join(ROOT, 'variables.tf'), 'utf8'));
+  assert.match(variableBlock(variables, 'enable_standalone'), /description\s*=\s*"A small VM behind no load balancer, for a standalone workload\."/);
+  const code = uncommented(await readFile(join(ROOT, 'standalone.tf'), 'utf8'));
+  assert.deepEqual([...code.matchAll(/^resource\s+"([^"]+)"\s+"([^"]+)"/gm)].map(([, type, name]) => `${type}.${name}`), ['google_compute_instance.standalone']);
+  const [[, vm]] = bodies(code, 'google_compute_instance');
+  assert.match(vm, /name\s*=\s*"\$\{local\.demo\}-standalone"/);
+  assert.match(vm, /zone\s*=\s*var\.zone/);
+  assert.match(vm, /machine_type\s*=\s*"e2-micro"/);
+  assert.match(vm, /subnetwork\s*=\s*google_compute_subnetwork\.dev\.id/);
+  assert.match(vm, /ignore_changes\s*=\s*\[boot_disk\[0\]\.initialize_params\[0\]\.image\]/);
+  // No external address (the demo VMs have none), no startup script, no group; no desired_status, so an apply never starts a VM Dormeto stopped.
+  assert.doesNotMatch(vm, /access_config|startup-script|desired_status/);
+  const outputs = uncommented(await readFile(join(ROOT, 'outputs-standalone.tf'), 'utf8'));
+  assert.match(outputs, /output "standalone" \{[\s\S]*?var\.enable_standalone \? google_compute_instance\.standalone\[0\]\.id : null/);
+  assert.match(await readFile(join(ROOT, 'README.md'), 'utf8'), /\| `enable_standalone` \| `standalone\.tf`/);
 });

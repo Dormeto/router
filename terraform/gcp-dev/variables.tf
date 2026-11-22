@@ -136,3 +136,9 @@ variable "internal_region" {
   type        = string
   default     = null
 }
+
+variable "enable_standalone" {
+  description = "A small VM behind no load balancer, for a standalone workload."
+  type        = bool
+  default     = false
+}
